@@ -179,9 +179,9 @@ notify_bridge_reserve(
         }
     }
     if (slot == NOTIFY_TIMER_TABLE_SIZE) {
-        axl_warning("notify table full (%d slots) - "
-                    "increase NOTIFY_TIMER_TABLE_SIZE if you hit this",
-                    NOTIFY_TIMER_TABLE_SIZE);
+        axl_debug("notify table full (%d slots) - "
+                  "increase NOTIFY_TIMER_TABLE_SIZE if you hit this",
+                  NOTIFY_TIMER_TABLE_SIZE);
         return NULL;
     }
 

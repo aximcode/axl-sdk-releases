@@ -307,8 +307,8 @@ kcs_send_raw(void *vctx,
         }
         uint8_t state = status & KCS_STATE_MASK;
         if (state == KCS_STATE_ERROR) {
-            axl_warning("KCS error state during read (status=0x%02x)",
-                        status);
+            axl_debug("KCS error state during read (status=0x%02x)",
+                      status);
             return -1;
         }
         if (state == KCS_STATE_IDLE) {
@@ -320,8 +320,8 @@ kcs_send_raw(void *vctx,
             break;
         }
         if (state != KCS_STATE_READ) {
-            axl_warning("KCS unexpected state during read (status=0x%02x)",
-                        status);
+            axl_debug("KCS unexpected state during read (status=0x%02x)",
+                      status);
             return -1;
         }
         /* state == READ; wait for OBF if not yet set */

@@ -435,7 +435,7 @@ axl_strndup(const char *s, size_t n)
 
     char *dup = axl_malloc(len + 1);
     if (dup == NULL) {
-        axl_warning("strndup allocation failed");
+        axl_debug("strndup allocation failed");
         return NULL;
     }
 
@@ -1083,7 +1083,7 @@ axl_utf8_to_ucs2(const char *s)
 
     out = (unsigned short *)axl_malloc((count + 1) * sizeof (unsigned short));
     if (out == NULL) {
-        axl_warning("utf8_to_ucs2 allocation failed");
+        axl_debug("utf8_to_ucs2 allocation failed");
         return NULL;
     }
 
@@ -1207,7 +1207,7 @@ axl_ucs2_to_utf8(const unsigned short *s)
 
     out = (char *)axl_malloc(bytes + 1);
     if (out == NULL) {
-        axl_warning("ucs2_to_utf8 allocation failed");
+        axl_debug("ucs2_to_utf8 allocation failed");
         return NULL;
     }
 

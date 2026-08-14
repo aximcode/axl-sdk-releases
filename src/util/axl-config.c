@@ -356,8 +356,8 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
      * any side effect. Catches "port=99999" overflowing a uint16_t —
      * which used to silently truncate to 34463. */
     if (auto_apply(NULL, desc, value) != 0) {
-        axl_warning("config: '%s' value '%s' out of range for declared type",
-                    key, value);
+        axl_debug("config: '%s' value '%s' out of range for declared type",
+                  key, value);
         return AXL_ERR;
     }
 
@@ -794,14 +794,14 @@ axl_config_from_string(AxlConfig *cfg, const char *in)
         size_t val_enc_len = (eq < amp) ? (size_t)(amp - eq - 1) : 0;
 
         if (key_enc_len == 0) {
-            axl_warning("axl_config_from_string: empty key at offset %zd",
-                        (intptr_t)(p - in));
+            axl_debug("axl_config_from_string: empty key at offset %zd",
+                      (intptr_t)(p - in));
             return AXL_ERR;
         }
         if (key_enc_len >= sizeof(key_buf) ||
             val_enc_len >= sizeof(val_buf)) {
-            axl_warning("axl_config_from_string: pair too large at offset %zd",
-                        (intptr_t)(p - in));
+            axl_debug("axl_config_from_string: pair too large at offset %zd",
+                      (intptr_t)(p - in));
             return AXL_ERR;
         }
 
@@ -817,17 +817,17 @@ axl_config_from_string(AxlConfig *cfg, const char *in)
         enc_val[val_enc_len] = '\0';
 
         if (axl_url_decode(enc_key, key_buf, sizeof(key_buf)) < 0) {
-            axl_warning("axl_config_from_string: bad key encoding");
+            axl_debug("axl_config_from_string: bad key encoding");
             return AXL_ERR;
         }
         if (axl_url_decode(enc_val, val_buf, sizeof(val_buf)) < 0) {
-            axl_warning("axl_config_from_string: bad value encoding");
+            axl_debug("axl_config_from_string: bad value encoding");
             return AXL_ERR;
         }
 
         if (axl_config_set(cfg, key_buf, val_buf) != AXL_OK) {
-            axl_warning("axl_config_from_string: set('%s', '%s') failed",
-                        key_buf, val_buf);
+            axl_debug("axl_config_from_string: set('%s', '%s') failed",
+                      key_buf, val_buf);
             return AXL_ERR;
         }
 
@@ -880,6 +880,8 @@ axl_config_descs_append(
     }
 
     if (n > cap) {
+        /* log-level: 0 is indistinguishable from an empty source array, so a too-small cap
+           drops every descriptor without any caller being able to notice */
         axl_warning("axl_config_descs_append: cap=%zu cannot hold %zu entries",
                     cap, n);
         return 0;

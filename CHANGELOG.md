@@ -3,6 +3,124 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 3.2.3 — 2026-08-14
+
+### Changed
+
+- **The library stops warning about what it already returns.** 213 of 358
+  `axl_warning` calls under `src/` sat immediately before a `return AXL_ERR`
+  / `NULL` / `-1` / `false` / `AXL_NOT_FOUND`, telling the caller a second
+  time something the status already said — and asserting a severity only the
+  caller has the context to judge. They are now `axl_debug`, still visible
+  under `-v`. The census moves from 138/358/1/169 (error/warning/info/debug)
+  to 138/145/1/382: warnings are now rare enough to mean something.
+
+  Nothing was swept blind. A warning stays when the caller **cannot** see the
+  event in the return value, and those were left alone: 53 in `void` helpers,
+  ~67 where the block carries on so the eventual return does not describe the
+  warned event (a skipped config field, a clamped worker count, a torn-down
+  connection on a socket that keeps accepting), and the rest judged by hand.
+
+  **Fifteen were restored on review**, in three groups.
+
+  *The caller never finds out.* "The block returns a failure" is not the same
+  as "someone learns of it": a status can be checked one frame up and
+  discarded the frame above that. `axl_attempt_begin()`'s callers all drop its
+  `bool` — including the idiom its own header documents — so a breadcrumb that
+  failed to persist takes next-boot driver quarantine with it, silently.
+  `webdav`'s `ensure_headers()` is checked by an `insert_header()` returning
+  `void`, so a response ships successfully minus `DAV` / `Allow` /
+  `Content-Range`. Same shape in `axl-console-device.c` (a refused pointer
+  eviction) and `axl-9p-server.c` (a server bug that reaps a live connection
+  while the listener keeps accepting).
+
+  *The status is not merely unheard but wrong.* A 9P cross-directory rename
+  that copied and then failed to unlink returns `AXL_ERR` — "the rename
+  failed" — when the file now exists at **both** paths. And the descriptor
+  builders in `axl-net-opts.c` / `axl-config.c` return a `size_t` count where
+  `0` is equally the legitimate "nothing requested", so an under-sized array
+  is indistinguishable from an empty one and a tool silently ships with no
+  `--nic` / `--port` options.
+
+  *The level was a documented promise.* `axl-cpu.h` and
+  `axl-console-device.h` state in prose that these paths warn — the first so a
+  consumer reads it as "monitoring unavailable on this firmware" rather than
+  going silently un-monitored. A documented level is part of the public
+  contract, so a checkable return does not make it a duplicate.
+
+- **`make check-log-levels` now gates warnings too.** It flags an
+  `axl_warning` whose block then returns a failure, and takes the existing
+  `/* log-level: */` marker as the opt-out. Requiring a marker on every
+  legitimate warning would have meant ~129 of them and taught authors to
+  paste one unread; gating the provable duplicate does not.
+
+  Seventeen calls carry the marker: the fifteen restored above, plus
+  `axl-service.c` reporting a service that declined to start — the framework
+  carries on, so the run continues with it simply absent and nothing returns
+  "one was supposed to be here" — and `axl-http-ws.c` reporting an oversized
+  frame **dropped** on a connection that stays up, which is silent data loss
+  the peer cannot see. Tests assert some of these, but that follows from them
+  mattering and is not the reason for the level.
+
+  **The gate's own failure-sentinel list was wrong** and is fixed here: it
+  counted a bare `return 0` and every `EFI_*` including `EFI_SUCCESS` as an
+  error return, so it flagged warnings on **success** paths — the inverse of
+  the rule, and the reason several of the restorations above had been demoted
+  in the first place. `AXL_OK` is `0`, so a bare `0` is usually success and is
+  no longer treated as a sentinel at all. The gate now errs toward missing a
+  duplicate rather than toward flagging a success path: an unflagged duplicate
+  is noise, a wrongly-flagged success path is lost signal.
+
+### Breaking
+
+- **`axl-cc --depfile` is removed.** Pass gcc's own `-MD -MP -MF <path>`
+  instead; `axl-cc` forwards them like any other compile flag.
+
+  It existed to post-process the dependency file so every path was absolute,
+  because a *relative* source makes gcc emit compile-cwd-relative
+  prerequisites that CMake's `DEPFILE` resolved against the wrong directory.
+  Pass an absolute source — which the generated CMake package now does — and
+  gcc's output is already absolute.
+
+  **This also fixes a staleness bug.** `--depfile` used `-MMD` internally,
+  which omits `-isystem` headers by definition; the SDK arrives that way, so
+  it tracked no SDK header at all and editing one did not rebuild a
+  consumer's object. `-MD` lists them.
+
+- **`axl-c++ --hosted` and the CMake `HOSTED` keyword are removed.** Both now
+  fail with a message naming the removal. C++ is compiled hosted
+  unconditionally, so `std::vector`, `std::string`, `std::map` and
+  `std::unordered_map` work with no flag at all — the flag only ever switched
+  off a freestanding C++ mode that no longer exists, and removing it from a
+  build produces byte-identical output.
+
+  ```console
+  # before
+  $ axl-c++ --hosted containers.cpp -o app.efi
+  # after
+  $ axl-c++ containers.cpp -o app.efi
+  ```
+
+  ```cmake
+  # before
+  axl_add_app(myapp myapp.cpp HOSTED)
+  # after
+  axl_add_app(myapp myapp.cpp)
+  ```
+
+  C sources are unaffected and still compile `-ffreestanding`; a mixed C/C++
+  image links exactly as before.
+
+### Changed
+
+- **x64 C++ compiles with AXL's own `x86_64-elf-g++`**, not the host's. The
+  SDK now takes no compiler, assembler or linker from the distro on either
+  arch, and the `.deb`/`.rpm` depend only on `curl` and `xz-utils` (to fetch
+  the toolchains). Install with `axl-install-toolchain all`.
+- **A staged C++ build no longer needs a flag to link.** `axl-c++ -c a.cpp`
+  followed by `axl-c++ a.o -o app.efi` previously failed on an undefined
+  `operator delete`; the C++ runtime archive is now selected from the objects.
+
 ## 3.2.2 — 2026-08-14
 
 ### Fixed

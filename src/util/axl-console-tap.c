@@ -512,7 +512,7 @@ axl_console_tap_install(AxlConsoleTap **out, const AxlConsoleOps *ops, void *use
         return AXL_ERR;
     }
     if (g_tap != NULL) {
-        axl_warning("console tap already installed");
+        axl_debug("console tap already installed");
         return AXL_ERR;
     }
 

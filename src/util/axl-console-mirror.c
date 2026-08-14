@@ -65,7 +65,7 @@ axl_console_mirror_install(const AxlConsoleMirrorConfig *cfg, AxlConsoleMirror *
         return AXL_ERR;
     }
     if (g_mirror != NULL) {
-        axl_warning("console mirror already installed");
+        axl_debug("console mirror already installed");
         return AXL_ERR;
     }
 

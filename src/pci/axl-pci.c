@@ -46,7 +46,7 @@ axl_pci_ensure_init(
         return -1;
     }
     if (axl_acpi_read_mcfg(&cached_mcfg) != AXL_OK || cached_mcfg.count == 0) {
-        axl_warning("MCFG unavailable; PCI access disabled");
+        axl_debug("MCFG unavailable; PCI access disabled");
         init_failed = true;
         return -1;
     }

@@ -589,6 +589,17 @@ under `src/` to carry a justification marker:
 axl_info("...");
 ```
 
+The same gate holds the warning half, by a different test. Demanding a
+marker on all ~129 legitimate warnings would teach authors to paste one
+without reading it, so instead it flags only the violation that is
+mechanically provable: an `axl_warning` whose block then **returns a
+failure**, which the caller reads from the status anyway. The same marker
+admits the exceptions — a warning the return genuinely does not describe.
+Two live examples are worth reading before adding a third:
+`axl-service.c` (the framework declines to attach and carries on, so the
+rc never reaches a human) and `axl-http-ws.c` (a caller bug that used to
+wedge the single-threaded server).
+
 **Reporting is not announcing.** The one marked call in the tree is
 `axl_mem_dump_leaks`, which returns `void` and exists *to* report — its
 output is its return value, not commentary on an operation that already

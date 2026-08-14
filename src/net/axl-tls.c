@@ -206,7 +206,7 @@ axl_tls_init(void)
                                 &g_entropy,
                                 (const unsigned char *)"AXL", 3);
     if (ret != 0) {
-        axl_warning("CTR-DRBG seed failed: -0x%04x", (unsigned)-ret);
+        axl_debug("CTR-DRBG seed failed: -0x%04x", (unsigned)-ret);
         return AXL_ERR;
     }
 
@@ -216,7 +216,7 @@ axl_tls_init(void)
         MBEDTLS_SSL_TRANSPORT_STREAM,
         MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) {
-        axl_warning("SSL config defaults failed: -0x%04x", (unsigned)-ret);
+        axl_debug("SSL config defaults failed: -0x%04x", (unsigned)-ret);
         return AXL_ERR;
     }
 
@@ -293,7 +293,7 @@ axl_tls_generate_self_signed(
 
     ret = mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
     if (ret != 0) {
-        axl_warning("pk_setup failed: -0x%04x", (unsigned)-ret);
+        axl_debug("pk_setup failed: -0x%04x", (unsigned)-ret);
         mbedtls_pk_free(&pk);
         return AXL_ERR;
     }
@@ -302,7 +302,7 @@ axl_tls_generate_self_signed(
                               mbedtls_pk_ec(pk),
                               mbedtls_ctr_drbg_random, &g_ctr_drbg);
     if (ret != 0) {
-        axl_warning("key generation failed: -0x%04x", (unsigned)-ret);
+        axl_debug("key generation failed: -0x%04x", (unsigned)-ret);
         mbedtls_pk_free(&pk);
         return AXL_ERR;
     }
@@ -311,7 +311,7 @@ axl_tls_generate_self_signed(
     uint8_t key_buf[256];
     ret = mbedtls_pk_write_key_der(&pk, key_buf, sizeof(key_buf));
     if (ret < 0) {
-        axl_warning("key export failed: -0x%04x", (unsigned)-ret);
+        axl_debug("key export failed: -0x%04x", (unsigned)-ret);
         mbedtls_pk_free(&pk);
         return AXL_ERR;
     }
@@ -494,7 +494,7 @@ axl_tls_server_set_cert(
     ret = mbedtls_x509_crt_parse_der(&g_server_cert,
                                      cert_der, cert_len);
     if (ret != 0) {
-        axl_warning("cert parse failed: -0x%04x", (unsigned)-ret);
+        axl_debug("cert parse failed: -0x%04x", (unsigned)-ret);
         return AXL_ERR;
     }
 
@@ -507,7 +507,7 @@ axl_tls_server_set_cert(
                                NULL, 0,
                                mbedtls_ctr_drbg_random, &g_ctr_drbg);
     if (ret != 0) {
-        axl_warning("key parse failed: -0x%04x", (unsigned)-ret);
+        axl_debug("key parse failed: -0x%04x", (unsigned)-ret);
         return AXL_ERR;
     }
 
@@ -515,7 +515,7 @@ axl_tls_server_set_cert(
     ret = mbedtls_ssl_conf_own_cert(&g_tls_config,
                                     &g_server_cert, &g_server_key);
     if (ret != 0) {
-        axl_warning("conf_own_cert failed: -0x%04x", (unsigned)-ret);
+        axl_debug("conf_own_cert failed: -0x%04x", (unsigned)-ret);
         return AXL_ERR;
     }
 
@@ -553,7 +553,7 @@ axl_tls_accept(AxlTcp *sock)
 
     int ret = mbedtls_ssl_setup(&ctx->ssl, &g_tls_config);
     if (ret != 0) {
-        axl_warning("ssl_setup failed: -0x%04x", (unsigned)-ret);
+        axl_debug("ssl_setup failed: -0x%04x", (unsigned)-ret);
         axl_free(ctx->out_buf);
         axl_free(ctx);
         return NULL;
@@ -943,8 +943,8 @@ handshake_flush_async(AxlTlsContext *ctx, AxlLoop *loop)
         axl_free(wctx);
         /* No AXL_BUSY case any more: axl_tcp_send_async accepts or fails,
            it never refuses for capacity. A failure here is a real failure. */
-        axl_warning("tls: handshake flush failed to submit %llu byte(s)",
-                    (unsigned long long)n);
+        axl_debug("tls: handshake flush failed to submit %llu byte(s)",
+                  (unsigned long long)n);
         return AXL_ERR;   /* out_len left intact — bytes not lost */
     }
     ctx->out_len = 0;     /* consumed only on a successful submission */

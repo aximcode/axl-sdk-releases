@@ -197,19 +197,19 @@ axl_ring_buf_new_full(
 
     AxlRingBuf *rb = axl_calloc(1, sizeof(AxlRingBuf));
     if (rb == NULL) {
-        axl_warning(
-            "axl_ring_buf_new_full: OOM allocating header (%zu bytes)",
-            sizeof(AxlRingBuf)
-            );
+        axl_debug(
+          "axl_ring_buf_new_full: OOM allocating header (%zu bytes)",
+          sizeof(AxlRingBuf)
+          );
         return NULL;
     }
 
     uint8_t *buf = axl_malloc(size);
     if (buf == NULL) {
-        axl_warning(
-            "axl_ring_buf_new_full: OOM allocating %u-byte storage buffer",
-            (unsigned)size
-            );
+        axl_debug(
+          "axl_ring_buf_new_full: OOM allocating %u-byte storage buffer",
+          (unsigned)size
+          );
         axl_free(rb);
         return NULL;
     }
@@ -251,10 +251,10 @@ axl_ring_buf_new_with_buffer(
 
     AxlRingBuf *rb = axl_calloc(1, sizeof(AxlRingBuf));
     if (rb == NULL) {
-        axl_warning(
-            "axl_ring_buf_new_with_buffer: OOM allocating header (%zu bytes)",
-            sizeof(AxlRingBuf)
-            );
+        axl_debug(
+          "axl_ring_buf_new_with_buffer: OOM allocating header (%zu bytes)",
+          sizeof(AxlRingBuf)
+          );
         return NULL;
     }
 

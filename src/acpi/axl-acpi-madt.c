@@ -86,7 +86,7 @@ axl_acpi_read_madt(
         return AXL_ERR;
     }
     if (!axl_acpi_checksum_ok(h)) {
-        axl_warning("MADT checksum invalid");
+        axl_debug("MADT checksum invalid");
         return AXL_ERR;
     }
 

@@ -240,9 +240,17 @@ so consumers lose everything CMake would otherwise give them:
 - no `compile_commands.json` for the real targets → clangd and Visual Studio
   are blind → **axl-utils' entire phantom `-ide` shadow build exists for this
   single reason**,
-- no `target_compile_options` / `target_compile_definitions` per target,
-- CMake cannot do its own header dependency scanning → this is precisely why
-  `axl-cc --depfile` had to be invented,
+- no `target_compile_options` / `target_compile_definitions` per target
+  (**partly addressed 2026-08-14**: the package grew an `OPTIONS` keyword,
+  because `axl_add_app` makes a custom target and `target_compile_options`
+  rejects it outright — so before that there was no way to pass a compile flag
+  at all),
+- CMake cannot do its own header dependency scanning → this is why
+  `axl-cc --depfile` was invented. **REMOVED 2026-08-14**: the package now
+  passes ABSOLUTE sources, so plain `-MD` already emits an all-absolute
+  depfile and the post-processing had nothing left to do. The flag also used
+  `-MMD` internally, which omits `-isystem` headers — so it tracked NO SDK
+  header, and editing one did not rebuild a consumer's object,
 - `project(LANGUAGES NONE)` and no Visual Studio generator.
 
 The idiomatic answer for a cross-compilation target is a **toolchain file**:

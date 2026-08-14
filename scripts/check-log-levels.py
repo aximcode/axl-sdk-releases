@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""check-log-levels.py -- axl_info in library code must justify itself.
+"""check-log-levels.py -- library log levels must justify themselves.
+
+Two checks, because axl_info and axl_warning fail in different shapes.
+INFO is banned outright on a success path and opts in by marker. WARNING is
+legitimate in most of the places it appears, so gating "every warning needs a
+marker" would demand ~129 markers and teach authors to paste one without
+reading it. Instead this gates the one violation that is mechanically
+PROVABLE: a warning whose block then returns an error, which the caller reads
+from the status anyway.
 
 THE RULE (docs/AXL-Coding-Style.md, "Log levels in library code"). A library
 must not log above debug for a condition it reports to its caller through a
@@ -70,6 +78,35 @@ MARKER = re.compile(r"(/\*|//)\s*log-level:")
 # matching only the macro leaves a way to emit INFO that the gate cannot see.
 CALL = re.compile(r"\baxl_info\s*\(|\baxl_log(?:_full)?\s*\(\s*AXL_LOG_INFO\b")
 
+WARN_CALL = re.compile(
+    r"\baxl_warning\s*\(|\baxl_log(?:_full)?\s*\(\s*AXL_LOG_WARNING\b")
+
+# AXL's failure sentinels are not one token. AXL_ERR is the generic, but the
+# tree also returns AXL_NOT_FOUND, AXL_*_INVALID, AXL_*_ERROR, AXL_EFI_ABORTED,
+# and the bare NULL/false/-1/0 that ID-, handle- and size-returning functions
+# use. Matching only AXL_ERR passes half the duplicates.
+# Deliberately conservative: this gate exists to flag the PROVABLE duplicate,
+# so a sentinel whose meaning depends on the function's contract is left out
+# rather than guessed at.
+#
+# `return 0` is NOT here. AXL_OK is 0, so for most int-returning functions in
+# this tree a bare 0 is SUCCESS -- and a gate that reads a success path as a
+# duplicated error return tells authors to demote a warning the rule wants
+# kept, which is worse than missing one. `EFI_SUCCESS` is excluded for exactly
+# the same reason; every other EFI_* status is an error.
+#
+# The cost is a few genuine duplicates going unflagged in size- and
+# handle-returning functions. That is the right side to err on: an unflagged
+# duplicate is noise, a wrongly-flagged success path is lost signal.
+RETURN_ERR = re.compile(
+    r"^\s*return\s+("
+    r"AXL_ERR\w*|AXL_NOT_FOUND|AXL_\w*_INVALID|AXL_\w*_ERROR|AXL_EFI_ABORTED"
+    r"|NULL|false|-1"
+    r"|EFI_(?!SUCCESS\b)\w+"
+    r")\s*;")
+RETURN_ANY = re.compile(r"^\s*return\b")
+FLOW = re.compile(r"^\s*(continue|break|goto)\b")
+
 REPO = Path(__file__).resolve().parent.parent
 SCAN_ROOT = REPO / "src"
 
@@ -123,6 +160,63 @@ def justified(lines: list[str], idx: int) -> bool:
     return False
 
 
+def returns_error(lines: list[str], idx: int) -> bool:
+    """True if the block holding the warning at @idx then returns an error.
+
+    Tracks brace depth and scans PAST cleanup to the statement that actually
+    ends the block. Stopping at the first non-return line is wrong and quietly
+    so: `axl_free(t); return NULL;` then reads as "this one continues", and the
+    check keeps a warning the caller can plainly see in the return value. That
+    is not hypothetical -- an earlier draft of this rule's sweep mis-kept ~100
+    sites exactly that way, and only a hand spot-check caught it.
+
+    A block that ends without returning, or returns something that is not a
+    failure sentinel, is left alone: the function carried on, so its eventual
+    return does not describe the warned event and the log is the only signal.
+    """
+    depth_paren, i, started = 0, idx, False
+    while i < len(lines):
+        depth_paren += lines[i].count("(") - lines[i].count(")")
+        if "(" in lines[i]:
+            started = True
+        if started and depth_paren <= 0:
+            break
+        i += 1
+
+    depth = 0
+    for j in range(i + 1, min(len(lines), i + 40)):
+        text = lines[j].strip()
+        if not text or text.startswith(("/*", "*", "//")):
+            continue
+        depth += text.count("{") - text.count("}")
+        if depth < 0:
+            return False           # fell out of the block without returning
+        if depth > 0:
+            continue
+        if RETURN_ERR.match(text):
+            return True
+        if RETURN_ANY.match(text) or FLOW.match(text):
+            return False
+    return False
+
+
+def warn_violations() -> list[tuple[Path, int, str]]:
+    """Every axl_warning under src/ that duplicates its own error return."""
+    found: list[tuple[Path, int, str]] = []
+    paths: set[Path] = set()
+    for suffix in SCAN_SUFFIXES:
+        paths.update(SCAN_ROOT.rglob(suffix))
+
+    for path in sorted(paths):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for idx, line in enumerate(lines):
+            if not WARN_CALL.search(line) or justified(lines, idx):
+                continue
+            if returns_error(lines, idx):
+                found.append((path.relative_to(REPO), idx + 1, line.strip()))
+    return found
+
+
 def violations() -> list[tuple[Path, int, str]]:
     """Every axl_info call under src/ that carries no justification marker."""
     found: list[tuple[Path, int, str]] = []
@@ -142,9 +236,32 @@ def violations() -> list[tuple[Path, int, str]]:
 
 
 def main() -> int:
+    warn_bad = warn_violations()
+    if warn_bad:
+        print(f"check-log-levels: {len(warn_bad)} axl_warning call(s) under src/ "
+              f"that duplicate their own error return\n", file=sys.stderr)
+        for path, line_no, text in warn_bad:
+            print(f"  {path}:{line_no}: {text[:96]}", file=sys.stderr)
+        print(
+            "\nThe block containing each of these returns a failure, so the caller\n"
+            "already learns it from the status -- and only the caller knows whether\n"
+            "it matters. Demote to axl_debug; the line is still there under -v.\n"
+            "\n"
+            "warning is for what the caller CANNOT see in the return value: a\n"
+            "void-returning helper that skipped its work, silent truncation, a\n"
+            "degraded fallback the return does not describe, a leak. If one of\n"
+            "these is really that, say so on the line above it:\n"
+            "\n"
+            "    /* log-level: <why the return value does not say this> */\n"
+            "\n"
+            "See docs/AXL-Coding-Style.md, \"Log Levels in Library Code\".",
+            file=sys.stderr)
+        return 1
+
     bad = violations()
     if not bad:
-        print("check-log-levels: clean (every axl_info under src/ is justified)")
+        print("check-log-levels: clean "
+              "(every axl_info justified; no axl_warning duplicates its error return)")
         return 0
 
     print(f"check-log-levels: {len(bad)} unjustified axl_info call(s) under src/\n",

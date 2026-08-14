@@ -79,9 +79,10 @@ INCLUDE_RE = re.compile(r"^\s*#\s*include\s*[<\"]uefi/", re.MULTILINE)
 #
 # include/axl.h is a sibling FILE of include/axl/, not inside it, so scanning
 # only the directory missed the single most-included public header -- the one
-# place a regression would do the most damage. include/compat/ ships too and
-# axl-cc puts it on -isystem, so it is public surface as well.
-PUBLIC_API_ROOTS = (ROOT / "include" / "axl", ROOT / "include" / "compat")
+# place a regression would do the most damage. include/compat/ used to be a
+# second root (it shipped, and axl-cc put it on -isystem); it is gone, and a
+# root that does not exist scans nothing while the gate still reports clean.
+PUBLIC_API_ROOTS = (ROOT / "include" / "axl",)
 PUBLIC_API_FILES = (ROOT / "include" / "axl.h",)
 
 # Rule 2: declared exceptions. A file here still shows up in `rg EFI_`, but now

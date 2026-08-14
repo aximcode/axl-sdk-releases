@@ -68,7 +68,7 @@ find_or_create_topic(AxlLoop *loop, const char *name)
 
     /* Append new slot */
     if (loop->topic_count >= AXL_MAX_TOPICS) {
-        axl_warning("topic table full (%u slots)", AXL_MAX_TOPICS);
+        axl_debug("topic table full (%u slots)", AXL_MAX_TOPICS);
         return NULL;
     }
 

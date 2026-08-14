@@ -291,8 +291,8 @@ console_transcode_alloc(
         unsigned short *hb = (unsigned short *)axl_malloc(heap_cap
                                                           * sizeof(unsigned short));
         if (hb == NULL) {
-            axl_warning("console_transcode_alloc: OOM allocating %zu UCS-2 chars",
-                        heap_cap);
+            axl_debug("console_transcode_alloc: OOM allocating %zu UCS-2 chars",
+                      heap_cap);
             return false;
         }
         /* heap_cap is the absolute worst case — a second overflow is

@@ -91,7 +91,7 @@ axl_path_get_dirname(const char *path)
         /* Path starts with separator, e.g. "/foo" -> "/" */
         result = axl_malloc(2);
         if (result == NULL) {
-            axl_warning("path allocation failed");
+            axl_debug("path allocation failed");
             return NULL;
         }
         result[0] = path[0];
@@ -101,7 +101,7 @@ axl_path_get_dirname(const char *path)
 
     result = axl_malloc(len + 1);
     if (result == NULL) {
-        axl_warning("path allocation failed");
+        axl_debug("path allocation failed");
         return NULL;
     }
 
@@ -283,7 +283,7 @@ axl_path_join(const char *dir, const char *name)
     total = dir_len + (need_sep ? 1 : 0) + name_len;
     result = axl_malloc(total + 1);
     if (result == NULL) {
-        axl_warning("path allocation failed");
+        axl_debug("path allocation failed");
         return NULL;
     }
 

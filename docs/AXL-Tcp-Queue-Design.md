@@ -9,24 +9,29 @@ per-step state and §6b for what review left open.
    step 3 is what fixes the §1a connection drop.
 2. **Cut v3.2.0** — so the release ships WITHOUT that known, reproducible
    defect. `docs/RELEASING.md`.
-3. **gcc/newlib toolchain work**, which reimplements `AxlTcp` over POSIX/libc
-   and settles the layering question this design does not prejudge (§3.7, §4).
-4. **Steps 5-6 after that.** Step 5 ports the RECEIVE queue, and doing it
-   against a transport about to be reimplemented on POSIX sockets is the part
-   that would be redone.
+3. **gcc/newlib toolchain work.** CORRECTED 2026-08-13: this does NOT
+   reimplement `AxlTcp` over POSIX, and it does not settle the layering
+   question — newlib ships no sockets, and the layering decision is the
+   ROADMAP's conditional revisit. See §3.7.
+4. **Steps 5-6 after that.** CORRECTED 2026-08-13: both changed shape under
+   later commits and neither is the work this line described. Step 6's
+   watermarks were DELETED by `23c75ee0`, so there is nothing left to measure
+   (§6 step 6); step 5's receive queue has no consumer that can use it, which
+   is a decision rather than an implementation (§6g).
 
 An earlier revision of this header had the release first and paused ALL of the
-queue behind it, reasoning that the POSIX move made this work throwaway. That
-reasoning applies only to step 5 — steps 2-4 cost nothing extra by being done
-now, and doing them first keeps a live defect out of the tag.
+queue behind it, reasoning that a POSIX move made this work throwaway. Both
+halves of that were wrong — there is no such move (§3.7), and steps 2-4 cost
+nothing extra by being done now, which kept a live defect out of the tag.
 
 Decisions taken at acceptance:
-- **Do this before the POSIX-layering revisit.** That revisit is deferred to the
-  C++/newlib toolchain track, which carries its own layering changes; settling
-  both at once avoids two independent refactors of the same boundary. §4's
-  no-new-public-API constraint is what keeps the two separable, so it is now a
-  hard requirement rather than a preference — if the implementation finds new
-  public API unavoidable, stop and reassess (§4).
+- **Do this before the layering revisit.** CORRECTED 2026-08-13: that revisit
+  is NOT carried by the C++/newlib toolchain track, as this bullet used to say
+  — newlib brings no sockets. It is `docs/ROADMAP.md`'s conditional item, gated
+  on a consumer that makes the `AxlSocket` veneer load-bearing (§3.7). §4's
+  no-new-public-API constraint keeps the two separable either way, so it stays
+  a hard requirement — if the implementation finds new public API unavoidable,
+  stop and reassess (§4).
 - **The two live `AXL_BUSY` misclassifications in `axl-http-response.c` stay
   unpatched** until the queue lands. Patching them directly would add the
   fourth serialisation mechanism §6 exists to avoid. See §1a.
@@ -47,7 +52,9 @@ one is outstanding gets `AXL_BUSY`.
 
 That is an AXL restriction, not a firmware one. The UEFI spec describes
 `EFI_TCP4_PROTOCOL.Transmit` as *"Queue outgoing data into the transmit queue"*,
-with a matching receive queue.
+with a matching receive queue. §2a reads what that queue actually promises: it
+may refuse when full (`EFI_NOT_READY`) and it guarantees nothing about the
+completion ORDER of multiple outstanding tokens.
 
 Because there is no queue, **every caller has invented its own serialisation**:
 
@@ -165,6 +172,169 @@ one EFI token in flight and queues above it, which requires no such assumption.
 Structural note: EDK2's socket layer sits above TcpDxe's own TCP engine, whereas
 AXL sits above `EFI_TCP4`. The layering is the same shape — a token queue above
 a single transport flow — so the mechanism transfers directly.
+
+### 2a. CORRECTED 2026-08-13 — the mechanism is DUPLICATED, and the spec says keep it anyway
+
+Read at the cited commit (`46548b1`), `NetworkPkg/TcpDxe/SockInterface.c`:
+`EFI_TCP4.Transmit` lands in **`SockSend`**, and `SockSend` IS this queue.
+
+```
+FreeSpace = SockGetFreeSpace (Sock, SOCK_SND_BUF);
+if ((FreeSpace < Sock->SndBuffer.LowWater) || !SOCK_IS_CONNECTED (Sock)) {
+    SockToken = SockBufferToken (Sock, &Sock->SndTokenList, SndToken, DataLen);
+} else {
+    SockToken = SockBufferToken (Sock, &Sock->ProcessingSndTokenList, ...);
+    Status    = SockProcessTcpSndData (Sock, TxData);
+}
+```
+
+Two lists, deferred and processing, chosen on a low-water mark — the same
+mechanism §3 ports, one layer DOWN. `SOCKET` carries `SndTokenList`,
+`ProcessingSndTokenList` and `RcvTokenList` directly, and the watermarks are
+`SndBuffer.HighWater` / `LowWater` in TcpDxe's own `SOCK_BUFFER`.
+
+**TcpDxe never refuses for capacity** — that branch only chooses WHICH list to
+buffer into. So AXL's queue is not filling a gap in the protocol; it is a second
+implementation of the protocol's own mechanism.
+
+#### What the SPEC says, which is not what TcpDxe does
+
+UEFI 2.11 §28.1.10, `EFI_TCP4_PROTOCOL.Transmit()` status codes — the two that
+decide this design:
+
+> **`EFI_NOT_READY`** — The completion token could not be queued because the
+> transmit queue is full.
+>
+> **`EFI_ACCESS_DENIED`** — A transmit completion token with the same
+> `Token->CompletionToken.Event` was already in the transmission queue. *(also:
+> instance closed, passive instance listening, `Close()` already called)*
+
+plus `EFI_NOT_STARTED`, `EFI_NO_MAPPING`, `EFI_INVALID_PARAMETER`,
+`EFI_OUT_OF_RESOURCES`, `EFI_NETWORK_UNREACHABLE`, `EFI_NO_MEDIA`. `Receive()`
+carries the same `EFI_NOT_READY` ("the receive queue is full").
+
+Two consequences, and they point opposite ways:
+
+1. **A conforming `Transmit` MAY refuse when full.** TcpDxe never does; the spec
+   plainly allows it. So an N-token submit path would have to handle
+   `EFI_NOT_READY` — by deferring the token, which is a queue. **The queue is
+   therefore not removable, only re-depthable.** That is the argument that
+   survives everything else here, and it is spec text rather than caution.
+2. **Nothing specifies COMPLETION ORDER for multiple outstanding tokens.** The
+   Description promises only that the event "will be signaled once the data is
+   sent out or some error occurs". TCP is a byte stream, so a stack that
+   serialises two outstanding tokens in the wrong order corrupts it silently, as
+   data rather than as an error.
+
+Also spec, and easy to trip over: **each concurrent token needs its own
+`EFI_EVENT`.** EDK2 enforces this more broadly than the spec text describes —
+`SockTokenExisted` checks the four token lists *and* `ConnectionToken` and
+`CloseToken`, so a transmit token may not share an event with the receive,
+connect or close token either.
+
+##### `EFI_NOT_READY` is the firmware's `AXL_BUSY`. `EFI_ACCESS_DENIED` is not.
+
+Worth separating, because the two read alike and behave nothing alike:
+
+| status | meaning | retryable? |
+|---|---|---|
+| `EFI_NOT_READY` | the transmit queue is full | **yes** — the genuine `AXL_BUSY` analogue |
+| `EFI_ACCESS_DENIED` | *one of:* duplicate event already queued; instance in `Tcp4StateClosed`; passive instance in `Tcp4StateListen`; `Close()` already called | **mostly no** |
+
+`EFI_ACCESS_DENIED` is overloaded exactly the way §1a's `AXL_BUSY` was: it
+carries one transient condition (the duplicate event, which clears when the
+earlier token retires) and three terminal ones. A caller cannot tell "retry
+me" from "this connection is gone" — the same conflation that dropped healthy
+connections, arriving this time inside a firmware return code rather than ours.
+
+**We are immune to that half only by construction.** AXL gives every role on a
+socket its own event — `acc_token`, `rx_token`, `tx_token`, `conn_token`, and a
+freshly created one for close — so the duplicate-event branch is unreachable,
+which leaves `EFI_ACCESS_DENIED` unambiguously terminal for us. That is why
+mapping every `EFI_ERROR` from `Transmit` to "this send failed" is correct
+today.
+
+**`EFI_NOT_READY` is a live gap, though.** `tcp_send_arm_chunk`'s caller
+(`axl-tcp-async.c:925`) treats every `EFI_ERROR` as fatal for the send, so on a
+stack that actually returns `EFI_NOT_READY` a retryable "queue full" becomes a
+dropped send — §1a's shape once more, this time handed up from below. TcpDxe
+never returns it, so nothing in this tree can reproduce it; that makes it a
+latent portability defect rather than a live one. The queue is where the fix
+belongs when it is written: `EFI_NOT_READY` should leave the token on
+`send_queued` and re-arm on the next completion, which is the behaviour the
+queue already implements for every other reason a send waits.
+
+##### What the event rule costs the N-token path
+
+Today it costs nothing: one outstanding transmit means one `tx_token` whose
+event is created once per socket and reused across every send.
+
+Going N-token does **not** require an event create/close per send, as an
+earlier draft of this section claimed. `SockTokenExisted` scans only tokens
+*currently on the lists*, so a retired token's event is immediately reusable —
+which is exactly why today's single event is reused, and why the spike harness
+creates its events once and submits 32 tokens against them. A per-socket POOL
+of N events, sized to max-outstanding and disjoint from the receive, connect
+and close tokens, satisfies the rule with no per-send churn. The real delta
+over today is one event create/close per socket per pool slot, on top of the
+`axl_malloc` per accepted send that `axl_tcp_send_async` already pays (§6e).
+
+What the rule does add is a **failure mode that does not exist today**. A pool
+that is undersized, or that accidentally includes the receive token's event,
+fails as `EFI_ACCESS_DENIED` — indistinguishable, by the table above, from
+"this connection is closed". And the connections where it would bite are the
+worst ones to debug: a long-lived connection that pushes asynchronously (the
+server-push / WebSocket shape) is **permanently armed for receive**, so
+`RcvTokenList` is never empty there, while a short request/response connection
+re-arms its receive only after the response is sent and would never show it.
+The symptom would be an intermittent send failure on exactly the long-lived
+sessions, reproducing on none of the tests that use short ones.
+
+That is not an argument that the pool cannot be built — it can. It is an
+argument that the N-token path needs its event allocation to be correct by
+construction the way today's is, and that the cheapest way to keep that
+property is to not have a pool at all.
+
+#### What this corrects in this document
+
+- **§1a's `AXL_BUSY` was self-inflicted.** It came from `AxlTcp` holding a
+  single `tx_token`, not from the firmware being busy. Measured: OVMF accepts
+  **32 concurrent tokens / 2 MB**, all outstanding at once, all retired in
+  submission order — `MTX_TOKENS=32 ./test/integration/test-tcp-multi-transmit-qemu.sh`
+  (a flag, not a rebuild, precisely so this citation stays reproducible).
+  "The firmware would have refused us" was never true *of this firmware*.
+- **`TCP_SEND_HIGH_WATER` / `_LOW_WATER` were NOT duplicates of EDK2's**, as an
+  earlier draft of this section claimed. Same names, different mechanisms:
+  AXL's `HIGH_WATER` gated a REFUSAL (`axl_tcp_send_queue_full`, and
+  `send_queued_bytes >= TCP_SEND_HIGH_WATER` → `return AXL_BUSY`), which EDK2
+  has nowhere; EDK2's `LowWater` only routes between two lists. `_LOW_WATER`
+  was defined and never referenced. `23c75ee0` deleting them removed a refusal
+  the spec does not require of us, not a copy of TcpDxe's routing.
+- **The duplication is SOURCE-LEVEL, not runtime.** With one token outstanding,
+  TcpDxe's lists never hold more than one entry, so we are not running two
+  queues in series at runtime — we are maintaining two implementations of one
+  idea. That is a maintenance cost, not a throughput one, and the trade should
+  be weighed as such.
+- **What is genuinely ours** is narrower than §3 implies: deferred callback
+  delivery onto the SUBMITTER'S `AxlLoop` (the firmware signals an `EFI_EVENT`;
+  AXL wants the callback at the top of a specific loop iteration), the 32 KB
+  chunk bound, close-time retirement, and back-pressure visibility. None of
+  those four require a queue — chunk-bounding and close semantics are
+  independent of it.
+
+**DECISION 2026-08-13: keep the queue and the one-token limit; do not build an
+N-token submit path.** Not on the "never refuse" reasoning of §1a, which was
+ours to cause, but on the two spec facts above: a conforming stack may return
+`EFI_NOT_READY`, so the queue would have to exist regardless, and completion
+order is unspecified, so holding one token is what keeps a byte stream from
+being reordered by firmware we do not control.
+
+Revisit if a throughput measurement shows the one-token limit is a bottleneck —
+nothing does today, and the send path already pipelines by chunk-chaining a
+single buffer. The honest counterweight: most firmware in the field is
+EDK2-derived, which both never refuses and completes in order, so the stack
+this insures against may be rarer than the cost of maintaining the mechanism
+twice.
 
 ## 3. The EDK2 mechanism, as ported
 
@@ -291,25 +461,49 @@ Arm the cancellable only at promotion (as the first implementation did) and the
 wrapper frees a context a queued token still points at — a use-after-free the
 queue would have introduced. See §7.
 
-## 3.7 Forward fit: this survives the move to POSIX/newlib
+## 3.7 CORRECTED 2026-08-13 — there is no POSIX move, and the queue never needed one
 
-`AxlTcp` is expected to be reimplemented over POSIX sockets when the newlib
-toolchain lands. That does NOT make this port throwaway work — the token queue
-is the same shape every POSIX async stack uses, and the parts that look
-EFI-specific are the ones that map most directly:
+This section used to open *"`AxlTcp` is expected to be reimplemented over POSIX
+sockets when the newlib toolchain lands"*, and §7 leaned on that as the queue's
+strongest justification. **The premise was wrong**, on three counts:
 
-| here (EFI_TCP4) | there (POSIX) |
-|---|---|
-| one `EFI_TCP4_IO_TOKEN` in flight | one `send()` outstanding until it returns |
-| completion event retires the token | writability (`poll`/`epoll` `POLLOUT`) drains it |
-| `remaining` is 0-or-untouched | a PARTIAL `send()` retires part of a token — `remaining` finally earns its keep |
-| `high_water` / `low_water` | identical; it is a userspace send buffer either way |
+- **Newlib supplies no sockets.** It is a libc for embedded targets; BSD
+  sockets come from an operating system. The toolchain move hands `AxlTcp`
+  nothing. "Moving to POSIX sockets" would mean writing a socket layer over
+  `EFI_TCP4` ourselves — a separate project, not a consequence of the
+  toolchain.
+- **Neither substrate document mentions networking.**
+  `AXL-Libc-Substrate-Design.md` and `AXL-Newlib-Investigation.md` contain zero
+  occurrences of socket / tcp / network; the substrate's layer diagram is
+  `string, math, stdio, stdlib`.
+- **The inverted layering is a deliberate, recorded decision.** `docs/ROADMAP.md`
+  (Open backlog → "Networking layering") states it: `AxlTcp`/`AxlUdp` is the
+  transport substrate and `AxlSocket` a BSD veneer BESIDE the protocols,
+  because a blocking `accept()` in a resident driver freezes single-threaded
+  firmware. Its revisit is conditional — *"IF a future socket-based server or a
+  broader POSIX-compat push makes the veneer load-bearing"* — and it says in
+  terms: do not build speculatively. This section had quietly promoted that
+  conditional into a plan.
 
-So keep the transport-facing seam NARROW — "submit one token" and "N bytes
-retired" — which is what EDK2 does via `SockProcessTcpSndData`. Then swapping
-`EFI_TCP4.Transmit` for `send()` is a local change inside that seam rather than
-a requeue of the whole design. The chunk-chaining currently inside
-`axl_tcp_send_async` belongs BELOW that seam for the same reason.
+**What actually justifies the queue**, with the POSIX argument removed: EDK2's
+socket layer does exactly this and has for years (§2); the one-token limit is
+OURS, not `EFI_TCP4`'s (§7); and the callers that had invented their own
+serialisation against it were dropping ~1 request in 3 under concurrent TLS
+handshakes (§1a, measured). That is sufficient on its own.
+
+**`remaining` needs no future to justify it either.** This section used to keep
+it on the grounds that *"a PARTIAL POSIX `send()` retires part of a token —
+`remaining` finally earns its keep"*. It earns its keep TODAY, as the live
+chunk cursor: `tcp_send_arm_chunk` submits from
+`tok->buf + (tok->len - tok->remaining)` and `on_send_complete` walks it down
+one bounded Transmit at a time (§6e). The old claim that it is
+"0-or-untouched over EFI_TCP4" is no longer true of this code.
+
+What survives, because it was never really about POSIX: **keep the
+transport-facing seam NARROW** — "submit one token", "N bytes retired" — the
+way EDK2 does via `SockProcessTcpSndData`. That is what keeps the chunk-chaining
+an implementation detail below the seam, and it is worth doing as structure,
+not as preparation for a swap nobody has scheduled.
 
 ## 4. Public API impact
 
@@ -325,9 +519,11 @@ parked POSIX-layering question. Two corrections from the owner:
 - **We own every consumer**, so a public API change is a coordinated edit, not a
   compatibility event. "Do not add API" is therefore not the goal — *do what a
   TCP-wrapping library does*, following EDK2, is.
-- The layering question is being settled by the **newlib/POSIX move** (§3.7),
-  not by this queue. Avoiding public surface here does not buy the freedom the
-  old text claimed it did, because that decision is happening elsewhere anyway.
+- The layering question is not this queue's to settle, and — CORRECTED
+  2026-08-13 — it is not the newlib move's either (§3.7). It is the ROADMAP's
+  conditional revisit, gated on a consumer that makes the `AxlSocket` veneer
+  load-bearing. Avoiding public surface here would not have bought the freedom
+  the old text claimed, because that decision is not pending on this work.
 
 What survives as a real constraint is narrower and is about lifetime, not
 surface: the BEHAVIOUR change is not internal, because a caller in this library
@@ -419,14 +615,126 @@ Branch: `worktree-tcp-token-queue`. Status as of 2026-08-12.
    serialisation role is gone (the dead `AXL_BUSY` branch in `ws_outq_pump` is
    deleted); its lossy-backpressure POLICY is not a workaround and has no
    equivalent below it.
-5. **TODO.** Port the receive queue.
-6. **TODO.** Measure `high_water` / `low_water` rather than inheriting EDK2's
-   numbers. The values shipped in step 1 are PLACEHOLDERS
-   (`TCP_SEND_HIGH_WATER` / `_LOW_WATER` in `axl-tcp-internal.h`) and are
-   explicitly not tuned.
+5. **DROP — see §6g.** Port the receive queue. Closed 2026-08-13 on two
+   independent grounds: no consumer in this tree can use one (caller survey),
+   and the window it would close is ~4% of a bulk transfer, measured, on a path
+   where the firmware already buffers.
+7. **NEW 2026-08-13 — map the `Transmit`/`Receive` status instead of
+   collapsing it.** `tcp_send_arm_chunk`'s caller treats every `EFI_ERROR` as
+   fatal for the send, which loses the one distinction that matters:
+   `EFI_NOT_READY` ("the queue is full") is retryable and `EFI_ACCESS_DENIED`
+   is not. A conforming stack that returns `EFI_NOT_READY` gets its send
+   dropped — §1a's defect handed up from below.
+
+   **No new status code is needed.** `AxlStatus` already carries both:
+   `AXL_BUSY` (-10), whose docstring is already "resource temporarily
+   unavailable ... retry later", and `AXL_DENIED` (-6). The work is the
+   MAPPING, not the vocabulary — and per §2a the queue should ABSORB
+   `EFI_NOT_READY` (leave the token on `send_queued`, re-arm on the next
+   completion) rather than surface it, so `AXL_BUSY` becomes the transport's
+   internal word for "the firmware is full" and never reaches a consumer.
+
+   **The blocker is testability, and it should be solved before the code is
+   written.** Neither path is reachable from a test today:
+
+   - TcpDxe never returns `EFI_NOT_READY` — `SockSend` buffers instead of
+     refusing (§2a). No OVMF run can produce it.
+   - `EFI_ACCESS_DENIED`'s reachable cause is a send after `Close()`, and
+     `axl_tcp_send_async` refuses on `sock->closed` before the firmware is
+     ever called. The guard is correct and should stay.
+
+   So implementing this without a seam means shipping a branch no test
+   exercises, which is the thing this tree does not do. The seam wanted is
+   fault injection at the `Transmit` call — a debug-build hook that returns a
+   chosen `EFI_STATUS` for the next N submits — after which the deferral is
+   testable exactly like any other queue behaviour, and the same hook pays for
+   itself on every future "what if the firmware returns X" question. That is a
+   small design of its own, and it is the actual first step of this item.
+6. ~~Measure `high_water` / `low_water` rather than inheriting EDK2's
+   numbers.~~ **MOOT since `23c75ee0` — there are no watermarks to measure.**
+   That commit ("follow EDK2 exactly — never refuse a send") DELETED
+   `TCP_SEND_HIGH_WATER` (256 KB) and `TCP_SEND_LOW_WATER` (32 KB) outright and
+   replaced them with a single `TCP_SEND_QUEUE_WARN_BYTES` (1 MB), which logs
+   once rather than gating anything. A send is never refused for depth, so
+   there is no threshold whose value changes behaviour, and "tune the
+   placeholders" describes a mechanism the tree no longer has.
+
+   The question that SURVIVES the deletion is §7's, and it is a design
+   question rather than a measurement: **does the queue need a depth cap at
+   all?** It is unbounded today, as EDK2's is. A pathological caller queueing
+   many tiny sends costs one `AxlTcpToken` each, and `TCP_SEND_QUEUE_WARN_BYTES`
+   makes that visible without bounding it. Answering it means deciding what a
+   cap would DO — refuse, block, or drop — and "never refuse a send" was just
+   settled deliberately, so the honest options are narrower than they look.
+   Recorded here rather than silently dropped, because the step number was
+   still being handed forward as work after the thing it names was removed.
 
 Steps 2–4 are the point. If any of them cannot be completed, stop and reassess
 rather than shipping a fourth serialisation mechanism.
+
+### 6g. Step 5 — every consumer surveyed can NOT use a receive queue
+
+Surveyed 2026-08-13, before writing any of it, per "grep for the callers before
+designing around a feature". §3.4's benefit is stated as latency/throughput —
+the window between completion and re-arm where nothing is outstanding — and it
+is explicitly "not a correctness one". So the question is only whether a
+consumer can keep more than one receive outstanding. Every caller in the tree:
+
+| caller | can it queue a second receive? |
+|---|---|
+| `axl-http-conn.c` (`on_conn_data`) | **No.** The next buffer is chosen by connection PHASE — `header_buf + header_len`, `chunk_read_buf`, `body + body_bytes_read`, `tls_cipher_buf` — and the phase is only known after the current result is parsed. |
+| `axl-9p-server.c` | **No, and it depends on the opposite.** `rbuf` is a single reassembly buffer BORROWED by the transport, and `s9p_conn_grow_buffers` refuses to `axl_realloc` while it is lent, "because axl_realloc would free the very block the firmware is writing into". One outstanding receive is what makes "is it lent?" answerable. |
+| `axl-http-client-async.c` | No — one `recv_chunk`, re-armed after parsing. |
+| `sdk/examples/tcp-echo-server.c` | No — re-arms the SAME buffer after the echo completes. Two outstanding receives into one buffer is a data race. |
+| `axl-tcp-sync.c` | No — it is a one-shot wrapper around a single receive. |
+
+The pattern is the same everywhere and it is not incidental: **a stream reader's
+next buffer is a function of what the last read returned.** Queueing ahead
+requires N buffers whose contents the consumer does not need to predict, which
+is a pool-fed reader — nothing here is one.
+
+So step 5 as designed would ship a mechanism with no caller, and would make the
+9P server's borrow invariant harder to state (N lent buffers instead of one)
+for a benefit no consumer collects. That is the "speculative internal
+generality" case rather than the "user-facing richness" case.
+
+**MEASURED 2026-08-13: the window is ~4% of a bulk transfer, and that is an
+UPPER bound on what a receive queue could recover.**
+
+Instrumented `axl-tcp-async.c` temporarily (timestamp at each `Receive` submit
+and at each completion, `axl_time_get_us`), then pulled 1.5 MB over plain HTTP
+with the existing `test-http-async-qemu.sh` workload
+(`AxlTestNet.efi get-size .../large?size=1572864`):
+
+| | |
+|---|---|
+| receives | 1094 |
+| armed (a `Receive` outstanding) | 84,524 us |
+| unarmed (completion -> next submit) | 3,927 us |
+| **unarmed share** | **~4%** |
+
+Per receive that is ~3.6 us of re-arm against ~77 us waiting for data. And 4%
+is the CEILING, not the saving: the firmware buffers across the window (§2a),
+so the bytes are not lost, only delivered on the next `Receive` — a queue would
+recover whatever fraction of those 3.6 us windows had data already waiting,
+which is less.
+
+Probe caveats, so the number is not over-read: the accumulators are global and
+never reset, so a second fetch in the same run reports cumulatively and
+includes the idle gap between fetches (the HTTPS line read 51%, which is that
+artifact, not a measurement). One firmware, one topology, one workload. The
+instrumentation was reverted; the numbers above are from the run, not from a
+shipped counter.
+
+**Recommendation: drop step 5.** It now fails on both counts independently —
+no consumer in the tree can use a receive queue (the survey above), and the
+window it would close is ~4% of a transfer on a path where the firmware already
+buffers. If receive latency ever does matter, the measurement points at
+re-arming sooner rather than queueing deeper: the cost is in the completion ->
+submit path, not in the depth of what is outstanding.
+
+Not dropped unilaterally — recorded here with the survey so the call is made on
+evidence.
 
 ### 6a. Step 1 is neutral on the §1a defect — measured, not assumed
 
@@ -706,11 +1014,12 @@ millisecond.
   queue, whereas we sit above `EFI_TCP4`, which is. The structural note in §2
   acknowledges the difference and then treats it as "the same shape".
 
-  The strongest argument for our own queue is one §2 does not make: the
-  newlib/POSIX move (§3.7). There is no firmware queue under POSIX — a
-  non-blocking `send()` returns partial or `EAGAIN` and the caller queues — so
-  this is the piece that survives, and `remaining` already exists for the
-  partial-send case.
+  An earlier revision answered this with "the newlib/POSIX move needs it
+  anyway". CORRECTED 2026-08-13: there is no such move (§3.7), so that
+  argument is withdrawn rather than weakened. What stands in its place is
+  smaller and true — the queue fixed a measured defect (§1a), and `remaining`
+  is load-bearing today as the chunk cursor, not as preparation for a partial
+  `send()`.
 
   What is NOT established: that multiple outstanding tokens actually misbehave.
   That is spec-based caution, never measured. The bounded spike is to submit 4
@@ -718,6 +1027,67 @@ millisecond.
   and status. Worth doing before anyone asserts the firmware queue is unusable
   — and worth doing anyway, since a "yes, it works" would simplify the POSIX
   layer's EFI sibling if that ever needs to coexist.
+
+  **MEASURED 2026-08-13. OVMF handles four concurrent Transmits cleanly.**
+  `test/integration/test-tcp-multi-transmit-qemu.sh` (guest side:
+  `AxlTestNet.efi tcp-multi-tx`, raw `EFI_TCP4` with no `AxlTcp` in the path,
+  4 x 64 KB payloads of distinct marker bytes):
+
+  | Observation | Result |
+  |---|---|
+  | status of each `Transmit` at submit | `EFI_SUCCESS` x4 |
+  | tokens still outstanding after the 4th submit | **4** |
+  | completion order / status | submission order, `EFI_SUCCESS` x4 |
+  | bytes on the wire (host recorder) | `A:65536,B:65536,C:65536,D:65536` |
+
+  All 262144 bytes arrived, in submission order, with no interleaving.
+
+  **Both headline numbers have a control, because neither is worth anything
+  without one.** Each was, in its first version, incapable of reporting the
+  answer it was supposed to be able to report:
+
+  - `MTX_GAP_MS=400` waits between submits, and the outstanding count falls
+    from 4 to 2. Without that, "4 outstanding" would read identically if the
+    firmware only ever wrote `Status` from inside our own `Poll`.
+  - `MTX_ORDER=reverse` submits 3,2,1,0; completions then record 3,2,1,0 and
+    the wire shows `D,C,B,A`. This one caught a real defect: the original
+    collector polled `CheckEvent` over the slots in INDEX order every 10 ms, so
+    two tokens retiring in the same window were always recorded ascending. It
+    could not have printed anything but "in order" — for a reason that had
+    nothing to do with the firmware. The transmit tokens now use
+    `EVT_NOTIFY_SIGNAL`, so the firmware records the order itself, at its own
+    TPL, and the reverse run demonstrates a non-ascending sequence being
+    reported.
+
+  The reverse run also doubles the evidence: the firmware follows SUBMISSION
+  order, not buffer or index order.
+
+  **This does NOT license removing the one-token limit, and it is worth being
+  precise about why.** §2 never claimed multiple tokens misbehave. Its argument
+  is PORTABILITY: TcpDxe completing in order is *implementation, not spec*, and
+  building on it would repeat the `ArmPsciMpServicesDxe` `EFI_TIMEOUT`
+  generalisation this tree already got burned by. The measurement confirms
+  TcpDxe's behaviour — the very thing §2 already granted — so §2's reasoning is
+  untouched. What the spike retires is the weaker §7 framing above: nobody
+  should now say "the firmware queue is unusable", only "we decline to depend
+  on it".
+
+  Scope of the measurement, stated so it is not over-read: one firmware
+  (OVMF/EDK2 TcpDxe), one topology (QEMU SLIRP), one run shape. A vendor stack
+  on real hardware is exactly the case §2 protects against and exactly the case
+  this does not cover.
+
+  Standing decision: **keep the one-token limit.** An N-token submit path is now
+  a known-available optimisation rather than a suspected hazard, but the win is
+  speculative — the send path already pipelines by chunk-chaining a single
+  buffer — and it would be bought with the assumption §2 declines to make.
+
+  **See §2a**, which reads `SockSend` and the spec. `EFI_TCP4.Transmit` IS a
+  token queue of the same shape, so ours duplicates it at the source level; but
+  the spec sanctions `EFI_NOT_READY` ("the transmit queue is full"), which
+  TcpDxe never returns and a vendor stack may — so an N-token path would need a
+  queue anyway. The 4-token run here was later repeated at 32 tokens / 2 MB
+  (`MTX_TOKENS=32`) with the same result.
 
 - Does the queue need a depth cap? It is unbounded (§3.2), as EDK2's is. A
   pathological caller queueing many tiny sends allocates one `AxlTcpToken`

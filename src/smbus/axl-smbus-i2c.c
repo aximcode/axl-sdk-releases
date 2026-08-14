@@ -306,7 +306,7 @@ axl_smbus_i2c_open(AxlSmbusTransportOps *ops)
         return AXL_ERR;
     }
     if (i2c->StartRequest == NULL) {
-        axl_warning("EFI_I2C_MASTER_PROTOCOL found but StartRequest is NULL");
+        axl_debug("EFI_I2C_MASTER_PROTOCOL found but StartRequest is NULL");
         return AXL_ERR;
     }
 

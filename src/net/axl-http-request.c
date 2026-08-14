@@ -24,7 +24,7 @@ grow_buffer(
 {
     void *new_buf = axl_malloc(new_size);
     if (new_buf == NULL) {
-        axl_warning("body buffer grow failed: %zu bytes", new_size);
+        axl_debug("body buffer grow failed: %zu bytes", new_size);
         return NULL;
     }
 

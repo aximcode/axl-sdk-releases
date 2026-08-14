@@ -79,7 +79,7 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        axl_warning("utf8_to_ucs2 failed: %s", path);
+        axl_debug("utf8_to_ucs2 failed: %s", path);
         return AXL_ERR;
     }
 
@@ -100,7 +100,7 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
 
     data = axl_malloc(file_size + 1);
     if (data == NULL) {
-        axl_warning("allocation failed for %zu bytes", file_size);
+        axl_debug("allocation failed for %zu bytes", file_size);
         axl_backend_file_close(&handle);
         return AXL_ERR;
     }
@@ -110,7 +110,7 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
     axl_backend_file_close(&handle);
 
     if (rc != AXL_OK) {
-        axl_warning("read failed: %s", path);
+        axl_debug("read failed: %s", path);
         axl_free(data);
         return AXL_ERR;
     }
@@ -158,7 +158,7 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        axl_warning("utf8_to_ucs2 failed: %s", path);
+        axl_debug("utf8_to_ucs2 failed: %s", path);
         return AXL_ERR;
     }
 
@@ -201,7 +201,7 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
     axl_backend_file_close(&handle);
 
     if (rc != AXL_OK) {
-        axl_warning("write failed: %s", path);
+        axl_debug("write failed: %s", path);
         return AXL_ERR;
     }
     return AXL_OK;

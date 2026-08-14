@@ -152,13 +152,20 @@ axl_service_attach_driver(
     int rc = svc->setup(loop, svc->user);
     axl_debug("service '%s': setup EXIT rc=%d", nm, rc);
     if (rc != AXL_OK) {
+        /* log-level: the framework DECLINES to attach and carries on, so the
+           run continues with the service simply absent. Nothing downstream
+           returns "a service was supposed to be here", which makes this line
+           the only report that one failed to start rather than being silently
+           swallowed. (test-service-startfail and test-service-reload-fail
+           assert it, but that is a consequence of it mattering, not the
+           reason it is a warning.) */
         axl_warning("service '%s': setup returned %d - not attaching", nm, rc);
         return rc;
     }
 
     if (axl_loop_attach_driver(loop, tick_ms) != AXL_OK) {
-        axl_warning("service '%s': attach_driver failed - running teardown",
-                    nm);
+        axl_debug("service '%s': attach_driver failed - running teardown",
+                  nm);
         axl_service_teardown(svc);
         return AXL_ERR;
     }
@@ -398,7 +405,7 @@ _axl_service_driver_init(
     if (axl_protocol_install(&svc_guid,
                              (void *)svc,
                              &m_drv_handle) != AXL_OK) {
-        axl_warning("AXL_SERVICE_DRIVER: protocol_install failed");
+        axl_debug("AXL_SERVICE_DRIVER: protocol_install failed");
         if (m_drv_cfg != NULL) {
             axl_config_free(m_drv_cfg); m_drv_cfg = NULL;
         }
@@ -482,10 +489,10 @@ axl_service_start_embedded(const AxlServiceDeploy *deploy)
        this disk file") are contradictory — fail fast on the misconfiguration
        rather than silently honoring one. */
     if (deploy->embedded_only && deploy->driver_path != NULL) {
-        axl_warning("service '%s': embedded_only and driver_path are mutually "
-                    "exclusive",
-                    deploy->service->name != NULL ? deploy->service->name
-                                                  : "(unnamed)");
+        axl_debug("service '%s': embedded_only and driver_path are mutually "
+                  "exclusive",
+                  deploy->service->name != NULL ? deploy->service->name
+                                                : "(unnamed)");
         return AXL_ERR;
     }
     /* Required fields depend on the route. driver_name is the filename the
@@ -508,7 +515,7 @@ axl_service_start_embedded(const AxlServiceDeploy *deploy)
     const AxlService *svc = deploy->service;
     AxlGuid           svc_guid;
     if (axl_service_guid(svc, &svc_guid) != AXL_OK) {
-        axl_warning("service: start_embedded - descriptor missing name");
+        axl_debug("service: start_embedded - descriptor missing name");
         return AXL_ERR;
     }
 
@@ -534,10 +541,10 @@ axl_service_start_embedded(const AxlServiceDeploy *deploy)
     if (svc->opts_descs != NULL && svc->user != NULL) {
         if (axl_config_target_to_string(svc->opts_descs, svc->user,
                                         body_buf, body_size) != AXL_OK) {
-            axl_warning("service '%s': options too large for "
-                        "%d-byte LoadOptions buffer",
-                        svc->name != NULL ? svc->name : "(unnamed)",
-                        SERVICE_LOAD_OPTIONS_MAX);
+            axl_debug("service '%s': options too large for "
+                      "%d-byte LoadOptions buffer",
+                      svc->name != NULL ? svc->name : "(unnamed)",
+                      SERVICE_LOAD_OPTIONS_MAX);
             return AXL_ERR;
         }
     }
@@ -585,7 +592,7 @@ axl_service_stop(const AxlServiceDeploy *deploy)
     }
     AxlGuid svc_guid;
     if (axl_service_guid(deploy->service, &svc_guid) != AXL_OK) {
-        axl_warning("service: stop - descriptor missing name");
+        axl_debug("service: stop - descriptor missing name");
         return AXL_ERR;
     }
     const char *nm = deploy->service->name;
@@ -598,7 +605,7 @@ axl_service_stop(const AxlServiceDeploy *deploy)
     void   **handles = NULL;
     size_t   count   = 0;
     if (axl_protocol_enumerate_guid(&svc_guid, &handles, &count) != AXL_OK) {
-        axl_warning("service '%s': enumerate_guid failed", nm);
+        axl_debug("service '%s': enumerate_guid failed", nm);
         return AXL_ERR;
     }
     if (count == 0) {

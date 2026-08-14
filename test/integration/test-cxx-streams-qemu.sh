@@ -11,9 +11,14 @@
 #
 # What each case pins, and why it is here rather than implied:
 #
-#   1. FREESTANDING. Built with no --hosted, so this is the configuration the
-#      whole layer exists for -- if these needed --hosted, std::string would
-#      have been the right answer and axl::string should not exist.
+#   1. Builds with NO FLAG. This used to read "FREESTANDING -- if these needed
+#      --hosted, std::string would have been the right answer and axl::string
+#      should not exist", and that reasoning no longer applies: T3 retired the
+#      freestanding C++ mode, so <string> is always available and this case
+#      can no longer speak to whether axl::string earns its place. That is now
+#      an open question for T5 (AXL-Cxx-Stdlib-Surface.md), not something this
+#      assertion answers. What it still pins is that the fixture builds the
+#      way a consumer builds anything -- which is what cases 2+ run against.
 #   2. The globals are CONSTANT-INITIALISED. axl::cout / cerr / cin must emit
 #      no .init_array entry: a dynamic initialiser would reintroduce the
 #      static-init-order question, and .init_array was being eaten by
@@ -153,7 +158,7 @@ if [[ -x "$AXL_CXX" && -f "$LIB_DIR/libaxl-cxx.a" ]]; then
     check "staged headers match include/axl (else: install.sh --arch all --cpp)" \
         diff -rq "$PROJECT_DIR/include/axl" "$PROJECT_DIR/out/include/axl-sdk/axl"
 
-    check "axl-c++ builds the fixture freestanding (no --hosted)" \
+    check "axl-c++ builds the fixture with no mode flag" \
         "$AXL_CXX" --arch "$_native_arch" --release "$SRC" -o "$WORK/consumer.efi"
 else
     echo "  NOTE: no staged C++ SDK at $LIB_DIR/libaxl-cxx.a;"

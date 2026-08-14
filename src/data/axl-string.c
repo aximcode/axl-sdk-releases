@@ -52,7 +52,7 @@ grow(
        the doubling loop exits immediately with a buffer far too small,
        and the caller's memcpy runs off the end of the heap block. */
     if (need > (size_t)-1 - b->len - 1) {
-        axl_warning("strbuf grow: %zu + %zu overflows size_t", b->len, need);
+        axl_debug("strbuf grow: %zu + %zu overflows size_t", b->len, need);
         return false;
     }
     want = b->len + need + 1;
@@ -76,7 +76,7 @@ grow(
     fresh   = (b->buf == NULL);
     new_buf = (char *)axl_realloc(b->buf, new_alloc);
     if (new_buf == NULL) {
-        axl_warning("strbuf grow failed");
+        axl_debug("strbuf grow failed");
         return false;
     }
 
@@ -197,7 +197,7 @@ via_copy(
 
     tmp = (char *)axl_memdup(data, len);
     if (tmp == NULL) {
-        axl_warning("strbuf: OOM copying a self-referencing source");
+        axl_debug("strbuf: OOM copying a self-referencing source");
         return AXL_ERR;
     }
 
@@ -256,7 +256,7 @@ axl_string_new_size(size_t reserve)
         reserve = MIN_CAPACITY;
     }
     if (reserve == (size_t)-1) {
-        axl_warning("strbuf new_size: %zu + 1 overflows size_t", reserve);
+        axl_debug("strbuf new_size: %zu + 1 overflows size_t", reserve);
         return NULL;
     }
     /* +1 so @a reserve means USABLE CONTENT BYTES, the same thing
@@ -267,13 +267,13 @@ axl_string_new_size(size_t reserve)
 
     b = axl_new(AxlString);
     if (b == NULL) {
-        axl_warning("strbuf allocation failed");
+        axl_debug("strbuf allocation failed");
         return NULL;
     }
 
     b->buf = (char *)axl_malloc(reserve);
     if (b->buf == NULL) {
-        axl_warning("strbuf buffer allocation failed");
+        axl_debug("strbuf buffer allocation failed");
         axl_free(b);
         return NULL;
     }
@@ -324,7 +324,7 @@ axl_string_append_printf(AxlString *b, const char *fmt, ...)
         char *tmp = axl_strdup(fmt);
 
         if (tmp == NULL) {
-            axl_warning("strbuf: OOM copying a self-referencing format string");
+            axl_debug("strbuf: OOM copying a self-referencing format string");
             return AXL_ERR;
         }
         b->error = false;
@@ -491,15 +491,15 @@ axl_string_overwrite(AxlString *b, size_t pos, const char *s)
        counts and str() cannot see -- refuse it, as g_string_overwrite does.
        pos == len stays legal: that is an append. */
     if (pos > b->len) {
-        axl_warning("strbuf overwrite: pos %zu is past the end (%zu)",
-                    pos, b->len);
+        axl_debug("strbuf overwrite: pos %zu is past the end (%zu)",
+                  pos, b->len);
         return AXL_ERR;
     }
     /* pos + slen must be representable. Unguarded it wrapped, `end` landed
        BELOW len, grow() was never consulted, and the memcpy below wrote
        OUTSIDE the allocation -- a wild write, not merely a bad read. */
     if (slen > (size_t)-1 - pos) {
-        axl_warning("strbuf overwrite: %zu + %zu overflows size_t", pos, slen);
+        axl_debug("strbuf overwrite: %zu + %zu overflows size_t", pos, slen);
         return AXL_ERR;
     }
 

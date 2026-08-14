@@ -51,7 +51,7 @@ axl_base64_encode(const void *data, size_t len)
     out_len = 4 * ((len + 2) / 3);
     out = (char *)axl_malloc(out_len + 1);
     if (out == NULL) {
-        axl_warning("base64_encode allocation failed");
+        axl_debug("base64_encode allocation failed");
         return NULL;
     }
 
@@ -112,7 +112,7 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
     raw_len = (in_len / 4) * 3 - pad;
     raw = (uint8_t *)axl_malloc(raw_len + 1);
     if (raw == NULL) {
-        axl_warning("base64_decode allocation failed");
+        axl_debug("base64_decode allocation failed");
         return AXL_ERR;
     }
 
@@ -191,7 +191,7 @@ axl_base64url_encode(const void *data, size_t len)
     out_len = full * 4 + (rem != 0 ? rem + 1 : 0);
     out = (char *)axl_malloc(out_len + 1);
     if (out == NULL) {
-        axl_warning("base64url_encode allocation failed");
+        axl_debug("base64url_encode allocation failed");
         return NULL;
     }
 
@@ -247,7 +247,7 @@ axl_base64url_decode(const char *s, size_t len, void **out, size_t *out_len)
     raw_len = full * 3 + (rem == 2 ? 1 : rem == 3 ? 2 : 0);
     raw = (uint8_t *)axl_malloc(raw_len + 1);
     if (raw == NULL) {
-        axl_warning("base64url_decode allocation failed");
+        axl_debug("base64url_decode allocation failed");
         return AXL_ERR;
     }
 

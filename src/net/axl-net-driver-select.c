@@ -724,8 +724,8 @@ axl_net_try_driver(
     EFI_STATUS st = axl_efi_call(axl_bs()->StartImage, 3,
         (EFI_HANDLE)drv, &exit_data_size, NULL);
     if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
-        axl_warning("try_driver: StartImage failed for '%s': 0x%llx",
-                    load_path, (unsigned long long)st);
+        axl_debug("try_driver: StartImage failed for '%s': 0x%llx",
+                  load_path, (unsigned long long)st);
         axl_driver_unload(drv);
         r->unloaded = true;
         if (before != NULL) {

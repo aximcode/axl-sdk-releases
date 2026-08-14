@@ -108,7 +108,7 @@ axl_9p_transact(Axl9pClient *c, const uint8_t *req, size_t req_len,
         axl_9p_r_init(&er, c->rbuf + 7, size - 7);
         uint32_t ecode = axl_9p_r_u32(&er);
         c->last_errno  = ecode;
-        axl_warning("9p: server error errno=%u", ecode);
+        axl_debug("9p: server error errno=%u", ecode);
         return AXL_ERR;
     }
     return (type == expect_type) ? AXL_OK : AXL_ERR;
@@ -803,8 +803,8 @@ rename_xdev_copy(Axl9pClient *c, const char *from, const char *to)
     uint32_t existing_fid = 0;
     if (axl_9p_client_walk(c, to, &existing_fid) == AXL_OK) {
         axl_9p_client_clunk(c, existing_fid);
-        axl_warning("9p: cross-directory rename refuses to overwrite the "
-                    "existing destination %s", to);
+        axl_debug("9p: cross-directory rename refuses to overwrite the "
+                  "existing destination %s", to);
         return AXL_ERR;
     }
 
@@ -822,15 +822,15 @@ rename_xdev_copy(Axl9pClient *c, const char *from, const char *to)
         return AXL_ERR;
     }
     if ((mode & AXL_9P_S_IFDIR) != 0) {
-        axl_warning("9p: cross-directory rename of a directory is not "
-                    "supported (server answered EXDEV)");
+        axl_debug("9p: cross-directory rename of a directory is not "
+                  "supported (server answered EXDEV)");
         return AXL_ERR;
     }
     if (size > AXL_9P_XDEV_COPY_MAX) {
-        axl_warning("9p: cross-directory rename of %llu bytes exceeds the "
-                    "%u-byte copy limit",
-                    (unsigned long long)size,
-                    (unsigned)AXL_9P_XDEV_COPY_MAX);
+        axl_debug("9p: cross-directory rename of %llu bytes exceeds the "
+                  "%u-byte copy limit",
+                  (unsigned long long)size,
+                  (unsigned)AXL_9P_XDEV_COPY_MAX);
         return AXL_ERR;
     }
     if (axl_9p_read_file(c, from, &data) != AXL_OK) {
@@ -843,9 +843,9 @@ rename_xdev_copy(Axl9pClient *c, const char *from, const char *to)
        size, and axl_9p_read_file's own ceiling (256 MiB) is far looser than
        the 32 MiB this fallback promises. */
     if (len > AXL_9P_XDEV_COPY_MAX) {
-        axl_warning("9p: cross-directory rename read %zu bytes, exceeding "
-                    "the %u-byte copy limit; refusing the write",
-                    len, (unsigned)AXL_9P_XDEV_COPY_MAX);
+        axl_debug("9p: cross-directory rename read %zu bytes, exceeding "
+                  "the %u-byte copy limit; refusing the write",
+                  len, (unsigned)AXL_9P_XDEV_COPY_MAX);
         axl_bytes_unref(data);
         return AXL_ERR;
     }
@@ -855,6 +855,12 @@ rename_xdev_copy(Axl9pClient *c, const char *from, const char *to)
         return AXL_ERR;
     }
     if (axl_9p_remove(c, from) != AXL_OK) {
+        /* log-level: the status says "the rename failed", which is not what
+           happened -- the copy SUCCEEDED and only the unlink did, so the file
+           now exists at both paths. A caller acting on AXL_ERR alone will
+           retry or report a failure and leave the duplicate behind; there is
+           no return value that can express "half done, and here is which
+           half". That is the partial-completion case warning is for. */
         axl_warning("9p: cross-directory rename copied %s to %s but could "
                     "not remove the source; both now exist", from, to);
         return AXL_ERR;

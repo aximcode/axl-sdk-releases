@@ -794,8 +794,8 @@ axl_loop_attach_driver(AxlLoop *loop, uint64_t interval_ms)
     }
 
     if (loop->driver_timer != NULL) {
-        axl_warning("axl_loop_attach_driver: loop already attached "
-                    "- call axl_loop_detach_driver first");
+        axl_debug("axl_loop_attach_driver: loop already attached "
+                  "- call axl_loop_detach_driver first");
         return AXL_ERR;
     }
 

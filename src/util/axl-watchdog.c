@@ -35,9 +35,9 @@ axl_watchdog_set(
         0,        /* DataSize */
         NULL);    /* WatchdogData */
     if (EFI_ERROR(status)) {
-        axl_warning("SetWatchdogTimer(%llu) failed: 0x%llx",
-                    (unsigned long long)seconds,
-                    (unsigned long long)status);
+        axl_debug("SetWatchdogTimer(%llu) failed: 0x%llx",
+                  (unsigned long long)seconds,
+                  (unsigned long long)status);
         return AXL_ERR;
     }
     last_seconds = seconds;

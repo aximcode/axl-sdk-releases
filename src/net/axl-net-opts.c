@@ -78,6 +78,7 @@ axl_config_descs_net(
     size_t         base_offset)
 {
     if (out == NULL) {
+        /* log-level: returns size_t 0, which is ALSO the legitimate answer for kinds == 0 */
         axl_warning("axl_config_descs_net: NULL out");
         return 0;
     }
@@ -91,6 +92,8 @@ axl_config_descs_net(
     if (kinds & AXL_NET_OPT_LISTEN_IP) { need++; }
 
     if (need > cap) {
+        /* log-level: 0 here is indistinguishable from "nothing requested", so an under-sized
+           array silently ships a tool with no --nic/--port options */
         axl_warning("axl_config_descs_net: cap=%zu cannot hold %zu entries",
                     cap, need);
         return 0;
@@ -158,10 +161,12 @@ axl_config_descs_net_static(
     size_t         base_offset)
 {
     if (out == NULL) {
+        /* log-level: returns size_t 0, which a caller cannot tell from "nothing to add" */
         axl_warning("axl_config_descs_net_static: NULL out");
         return 0;
     }
     if (AXL_NET_STATIC_DESC_COUNT > cap) {
+        /* log-level: 0 is indistinguishable from "nothing to add"; the options vanish silently */
         axl_warning("axl_config_descs_net_static: cap=%zu cannot hold %u entries",
                     cap, AXL_NET_STATIC_DESC_COUNT);
         return 0;
@@ -241,7 +246,7 @@ axl_net_init_static(
     } else if (axl_strcmp(mode, "static") == 0) {
         is_static = true;
     } else {
-        axl_warning("axl_net_init_static: unrecognized mode '%s'", mode);
+        axl_debug("axl_net_init_static: unrecognized mode '%s'", mode);
         return AXL_ERR;
     }
 
@@ -258,7 +263,7 @@ axl_net_init_static(
         uint8_t ip[4], mask[4], gw[4];
         if (parse_opt_ipv4(cfg->ip, ip) != 1
             || parse_opt_ipv4(cfg->netmask, mask) != 1) {
-            axl_warning("axl_net_init_static: static mode needs valid ip + netmask");
+            axl_debug("axl_net_init_static: static mode needs valid ip + netmask");
             return AXL_ERR;
         }
         int gwr = parse_opt_ipv4(cfg->gateway, gw);

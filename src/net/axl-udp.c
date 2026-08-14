@@ -164,7 +164,7 @@ udp_open_internal(
     }
 
     if (create_udp_child(sock) != 0) {
-        axl_warning("failed to create UDP4 child");
+        axl_debug("failed to create UDP4 child");
         axl_free(sock);
         return AXL_ERR;
     }
@@ -192,8 +192,8 @@ udp_open_internal(
     EFI_STATUS status = axl_efi_call(sock->udp4->Configure, 2,
                                      sock->udp4, &sock->cfg);
     if (status != 0) {
-        axl_warning("UDP4 configure failed: 0x%llx",
-                   (unsigned long long)status);
+        axl_debug("UDP4 configure failed: 0x%llx",
+                 (unsigned long long)status);
         EFI_GUID udp_guid = EFI_UDP4_PROTOCOL_GUID;
         axl_bs()->CloseProtocol(sock->udp_handle, &udp_guid,
                                 gImageHandle, sock->udp_handle);
@@ -859,7 +859,7 @@ axl_udp_recv_async(
     }
 
     if (sock->loop != NULL) {
-        axl_warning("recv already started");
+        axl_debug("recv already started");
         return AXL_ERR;
     }
 

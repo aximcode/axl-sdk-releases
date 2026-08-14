@@ -196,7 +196,7 @@ axl_smbus_hc_open(AxlSmbusTransportOps *ops)
         return AXL_ERR;
     }
     if (hc->Execute == NULL) {
-        axl_warning("EFI_SMBUS_HC_PROTOCOL found but Execute is NULL");
+        axl_debug("EFI_SMBUS_HC_PROTOCOL found but Execute is NULL");
         return AXL_ERR;
     }
 

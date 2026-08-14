@@ -64,6 +64,31 @@ echo "==> clang -Wall -Wextra over every TU (compiler diagnostics, not tidy)"
 # the scope measurement and the single deliberate suppression.
 python3 scripts/check-clang-warnings.py
 
+# Where the CROSS toolchain keeps its libc headers. clang-tidy replays the
+# compile database with clang, infers the freestanding target from the recorded
+# compiler's NAME (x86_64-elf-gcc), and then has no cross libc to go with it --
+# so <string.h> resolves to the HOST's /usr/include. That is glibc, and it is
+# clean on this box only because EL/Fedora keep bits/ directly in /usr/include;
+# CI's ubuntu:26.04 puts it in the multiarch subdirectory clang adds only for a
+# linux-gnu target, and the job died there. Passing the directory explicitly
+# makes tidy read the same headers the objects were compiled against.
+#
+# The Makefile owns the value (asked of $(CC), so a toolchain override moves it
+# too) and this reads it back, rather than keeping a second copy -- the same
+# arrangement as LINT_GATES above. It fails rather than reporting an empty
+# string, so this cannot silently revert to analyzing the host libc.
+#
+# -nostdlibinc + -idirafter, NOT -isystem. -isystem puts the libc AHEAD of
+# clang's own builtin headers, where the build searches the COMPILER's headers
+# first and the libc after -- measured: it flips which limits.h / stdint.h /
+# stdatomic.h / tgmath.h is read, and defines PATH_MAX where the gcc build
+# leaves it undefined. -nostdlibinc drops /usr/include entirely, so a missing
+# cross header is now a loud error instead of a silent fall-back to glibc.
+# (What remains is clang's builtin headers standing in for gcc's, which is
+# inherent to linting a gcc build with clang and predates this.)
+CT_LIBC=(--extra-arg=-nostdlibinc
+         "--extra-arg=-idirafter$(make -s print-cc-libc-include)")
+
 echo "==> clang-tidy ($CT) over src/ (-n1, parallel)"
 # Mirror ci.yml exactly: per-file (-n1) so path-sensitive analyzer checks are
 # deterministic; exclude the backend + the mbedtls platform shim (compile DB
@@ -72,7 +97,7 @@ find src -name '*.c' \
     -not -path '*/backend/*' \
     -not -name 'axl-mbedtls-platform.c' \
     -print0 \
-  | xargs -0 -n1 -P"$(nproc)" "$CT" -p . -quiet
+  | xargs -0 -n1 -P"$(nproc)" "$CT" -p . -quiet "${CT_LIBC[@]}"
 
 echo "==> clang-tidy ($CT) over test/unit/ and tools/ (bugprone-* only)"
 # Test sources are where "passes for the wrong reason" lives, and nothing linted
@@ -105,7 +130,7 @@ echo "==> clang-tidy ($CT) over test/unit/ and tools/ (bugprone-* only)"
 # default flags and emit nonsense "file not found" errors rather than real
 # analysis. See docs/RELEASING.md for the scope table.
 find test/unit tools -name '*.c' -print0 \
-  | xargs -0 -n1 -P"$(nproc)" "$CT" -p . -quiet --checks='-clang-analyzer-*'
+  | xargs -0 -n1 -P"$(nproc)" "$CT" -p . -quiet "${CT_LIBC[@]}" --checks='-clang-analyzer-*'
 
 echo "==> clang-tidy ($CT) over C++ translation units"
 # The C++ layer. Nothing linted C++ before this: the compile database was
@@ -132,8 +157,42 @@ if [[ "$CXX_COUNT" -lt 1 ]]; then
     echo "       Check the AXL_CPP=1 on the bear line above." >&2
     exit 1
 fi
+#
+# The CROSS libstdc++, matching $CT_LIBC's cross libc one library down. This
+# pass used to read the HOST libstdc++ and said so at this comment: the compile
+# database named host `g++`, clang inferred a linux-gnu target from that name
+# and found /usr/include/c++. T2 moved x64 C++ to the bare-metal cross, the
+# accident stopped working, and every C++ TU failed with `'string' file not
+# found` -- the better failure, but still one. So the deferred half landed here.
+#
+# THREE flags, and each is load-bearing:
+#   -nostdinc++     drops clang's own C++ search (libc++ on some boxes), so a
+#                   missing cross header is a loud error rather than a silent
+#                   fall-back to a different standard library.
+#   -isystem <dirs> the cross toolchain's three C++ directories. -isystem, NOT
+#                   -idirafter: unlike the libc case these MUST come first --
+#                   there is nothing of clang's they could displace, and
+#                   -idirafter would leave them behind the (now empty) default
+#                   search and find nothing.
+#   $CT_LIBC        <string> includes <cstring> includes <string.h>, so the C++
+#                   pass needs the cross LIBC too. It was omitted here on the
+#                   grounds that it "mixes two libcs", which was true only
+#                   while the C++ headers came from the host.
+#
+# Captured into a variable FIRST, then iterated. `for _d in $(make ...)` would
+# swallow the target's exit 1 -- a command substitution in a `for` word list is
+# not a command, so `set -e` never sees it -- and the Makefile guard's
+# "Refusing to report nothing" would never reach the operator. The pass would
+# instead fail every C++ TU on `'string' file not found`, which names the
+# symptom three layers below the cause. $CT_LIBC's plain assignment above is
+# correct for the same reason, and this used to differ from it.
+CXX_INCS=$(make -s print-cxx-include-dirs)
+CT_CXX=(--extra-arg=-nostdinc++)
+for _d in $CXX_INCS; do
+    CT_CXX+=("--extra-arg=-isystem$_d")
+done
 printf '%s\n' "$CXX_TUS" \
-  | xargs -n1 -P"$(nproc)" "$CT" -p . -quiet
+  | xargs -n1 -P"$(nproc)" "$CT" -p . -quiet "${CT_LIBC[@]}" "${CT_CXX[@]}"
 
 # One summary line, so verify.sh's table can quote it without counting steps
 # (a hardcoded step count in the caller goes stale the moment a pass is added).

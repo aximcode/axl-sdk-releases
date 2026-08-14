@@ -53,7 +53,7 @@ file_write(void *ctx, const void *data, size_t count)
     rc = axl_backend_file_write(f->handle, &size, data);
     file_touched(f);   /* even a failed write may have moved bytes */
     if (rc != 0) {
-        axl_warning("write failed");
+        axl_debug("write failed");
         return -1;
     }
     return (axl_ssize_t)size;
@@ -68,7 +68,7 @@ file_read(void *ctx, void *data, size_t count)
 
     rc = axl_backend_file_read(f->handle, &size, data);
     if (rc != 0) {
-        axl_warning("read failed");
+        axl_debug("read failed");
         return -1;
     }
     return (axl_ssize_t)size;
@@ -88,7 +88,7 @@ file_pread(void *ctx, void *data, size_t count, size_t offset)
     /* Seek to offset */
     rc = axl_backend_file_set_position(f->handle, (uint64_t)offset);
     if (rc != 0) {
-        axl_warning("seek failed");
+        axl_debug("seek failed");
         return -1;
     }
 
@@ -98,7 +98,7 @@ file_pread(void *ctx, void *data, size_t count, size_t offset)
     axl_backend_file_set_position(f->handle, saved_pos);
 
     if (rc != 0) {
-        axl_warning("pread failed");
+        axl_debug("pread failed");
         return -1;
     }
     return (axl_ssize_t)size;
@@ -116,7 +116,7 @@ file_pwrite(void *ctx, const void *data, size_t count, size_t offset)
 
     rc = axl_backend_file_set_position(f->handle, (uint64_t)offset);
     if (rc != 0) {
-        axl_warning("seek failed");
+        axl_debug("seek failed");
         return -1;
     }
 
@@ -126,7 +126,7 @@ file_pwrite(void *ctx, const void *data, size_t count, size_t offset)
     axl_backend_file_set_position(f->handle, saved_pos);
 
     if (rc != 0) {
-        axl_warning("pwrite failed");
+        axl_debug("pwrite failed");
         return -1;
     }
     return (axl_ssize_t)size;
@@ -244,7 +244,7 @@ axl_fopen(const char *path, const char *mode)
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        axl_warning("utf8_to_ucs2 failed: %s", path);
+        axl_debug("utf8_to_ucs2 failed: %s", path);
         return NULL;
     }
 
@@ -270,7 +270,7 @@ axl_fopen(const char *path, const char *mode)
 
     f = axl_new(FileCtx);
     if (f == NULL) {
-        axl_warning("allocation failed");
+        axl_debug("allocation failed");
         axl_backend_file_close(&handle);
         return NULL;
     }
@@ -296,7 +296,7 @@ axl_fopen(const char *path, const char *mode)
            to release — the same contract a consumer gets. file_close IS that
            release and nothing more (shut the handle, free the struct), so
            calling it directly cannot drift from what close does. */
-        axl_warning("allocation failed");
+        axl_debug("allocation failed");
         file_close(f);
         return NULL;
     }

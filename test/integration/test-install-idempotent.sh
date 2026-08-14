@@ -190,16 +190,37 @@ rc=$?
 [[ "$rc" -ne 0 ]] && grep -qi "not found (needed for x64" "$CPPW/nox64.log"
 check "$?" "--arch x64 --cpp still fails when the x64 compiler is absent (rc=$rc)"
 
-# `all` DOES consult host g++: without one the x64 arm fails first and the log
-# carries THAT message, so the ARM grep would go red for the wrong reason.
-if command -v g++ >/dev/null 2>&1; then
+# `all` DOES consult the x64 C++ compiler: without it the x64 arm fails first
+# and the log carries THAT message, so the ARM grep would go red for the wrong
+# reason.
+#
+# Resolved through the manifest rather than `command -v g++`. x64 C++ moved off
+# the host compiler in T2, so probing for host g++ answers a question nothing
+# asks any more -- and it answers it WRONG in both directions: green on a box
+# with g++ and no cross (the run then fails for the reason this guard exists to
+# avoid), and skipped on a box with the cross and no g++ (retiring coverage
+# that would have run).
+# shellcheck source=/dev/null
+. "$PROJECT_DIR/scripts/axl-toolchains.conf"
+X64_CXX="${AXL_X64_GXX:-$AXL_X64_GXX_DEFAULT}"
+# The predicate must MATCH install.sh's, not merely resemble it. install.sh
+# accepts a bare name found on PATH as well as a path, and AXL_X64_GXX spelled
+# as a bare name is a supported override (the Makefile's guard says so
+# explicitly). A plain `-x` test rejects that spelling and SKIPS the gate --
+# quietly returning the wrong answer, which is the failure this guard was
+# rewritten to stop doing.
+have_x64_cxx() {
+    [[ -n "$X64_CXX" ]] &&
+        { [[ -x "$X64_CXX" ]] || command -v "$X64_CXX" >/dev/null 2>&1; }
+}
+if have_x64_cxx; then
     AXL_AA64_GXX="$NOARM" "$PROJECT_DIR/scripts/install.sh" \
         --arch all --cpp --prefix "$CPPW/all" > "$CPPW/all.log" 2>&1
     rc=$?
     [[ "$rc" -ne 0 ]] && grep -qi "ARM bare-metal g++ not found" "$CPPW/all.log"
     check "$?" "--arch all --cpp still fails when the AArch64 toolchain is absent (rc=$rc)"
 else
-    check 0 "SKIP: no host g++ — --arch all --cpp gate not run"
+    check 0 "SKIP: no x64 bare-metal g++ — --arch all --cpp gate not run"
 fi
 
 # THE DISCRIMINATOR. The three gates above all pass against the OLD, broken
@@ -214,8 +235,8 @@ fi
 # from-scratch RELEASE build against a `# test-meta:` est of 45s.
 if [[ "$INSTALL_ARCH" != "x64" ]]; then
     check 0 "SKIP: aa64 shard — the discriminating x64 --cpp gate runs on the x64 shard"
-elif ! command -v g++ >/dev/null 2>&1; then
-    check 0 "SKIP: no host g++ — the discriminating x64 --cpp gate not run"
+elif ! have_x64_cxx; then
+    check 0 "SKIP: no x64 bare-metal g++ — the discriminating x64 --cpp gate not run"
 else
     AXL_AA64_GXX="$NOARM" "$PROJECT_DIR/scripts/install.sh" \
         --arch x64 --cpp --prefix "$CPPW/x64" > "$CPPW/x64.log" 2>&1

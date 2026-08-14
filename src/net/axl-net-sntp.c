@@ -47,7 +47,7 @@ axl_net_sntp_query(const char *server, uint16_t port, size_t timeout_ms,
 
     AxlIPv4Address dest;
     if (axl_net_resolve(server, &dest) != AXL_OK) {
-        axl_warning("sntp: cannot resolve '%s'", server);
+        axl_debug("sntp: cannot resolve '%s'", server);
         return AXL_ERR;
     }
 

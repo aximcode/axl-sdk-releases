@@ -176,6 +176,9 @@ s9p_txbuf_check(S9pConn *conn)
     if (!conn->tx_busy) {
         return true;
     }
+        /* log-level: false dies inside the library (s9p_send_reply -> s9p_dispatch -> s9p_pump,
+           void, from an event callback); a server bug reaps a live connection
+           while the listener keeps accepting */
     axl_warning("9p: reply encoded while a send was still in flight over "
                 "txbuf (server bug) -- closing connection %s",
                 conn->client_addr);
@@ -238,6 +241,8 @@ s9p_send_reply(S9pConn *conn, Axl9pWriter *w)
            once negotiated), so this should be unreachable in practice; kept
            as a hard backstop so a future handler bug can never smuggle a
            wire write past the end of txbuf. */
+        /* log-level: a memory-safety backstop against a handler writing past txbuf. If it ever
+           fires the connection is reaped and nobody upstream is told */
         axl_warning("9p: reply encode overflow (unreachable)");
         s9p_reap(conn);
         return false;

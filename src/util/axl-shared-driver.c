@@ -210,8 +210,8 @@ axl_shared_driver_locate_with_image_info(
         &guid, driver_filename, embed_blob, embed_len,
         /* override_name */ NULL, load_options, load_options_size, info);
     if (_rc != AXL_OK) {
-        axl_warning("axl_shared_driver_locate: failed to load '%s'",
-                    driver_filename);
+        axl_debug("axl_shared_driver_locate: failed to load '%s'",
+                  driver_filename);
         return _rc;   /* was AXL_ERR — now AXL_NOT_FOUND when not found */
     }
 
@@ -220,9 +220,9 @@ axl_shared_driver_locate_with_image_info(
        branch from masking a future contract drift. Cheap. */
     if (axl_protocol_find_guid(&guid, out_iface) != AXL_OK
         || *out_iface == NULL) {
-        axl_warning("axl_shared_driver_locate: '%s' loaded but "
-                    "protocol for '%s' not published",
-                    driver_filename, name);
+        axl_debug("axl_shared_driver_locate: '%s' loaded but "
+                  "protocol for '%s' not published",
+                  driver_filename, name);
         /* Loaded but the vtable isn't there -> uniform AXL_NOT_FOUND (the
            requested entity doesn't exist), matching locate_sibling. */
         return AXL_NOT_FOUND;
@@ -300,13 +300,13 @@ axl_shared_driver_locate_sibling(
     AxlDriverHandle h = NULL;
     int lrc = axl_driver_load_sibling(driver_filename, &h);
     if (lrc != AXL_OK) {
-        axl_warning("axl_shared_driver_locate_sibling: '%s' not staged "
-                    "beside the launcher", driver_filename);
+        axl_debug("axl_shared_driver_locate_sibling: '%s' not staged "
+                  "beside the launcher", driver_filename);
         return lrc;
     }
     if (axl_driver_start(h) != AXL_OK) {
-        axl_warning("axl_shared_driver_locate_sibling: start failed for '%s'",
-                    driver_filename);
+        axl_debug("axl_shared_driver_locate_sibling: start failed for '%s'",
+                  driver_filename);
         axl_driver_unload(h);
         /* Couldn't bring the sibling up -> no usable vtable. Uniform with the
            multi-path family: AXL_NOT_FOUND means "the vtable isn't available",
@@ -315,8 +315,8 @@ axl_shared_driver_locate_sibling(
     }
     if (axl_protocol_find_guid(&guid, out_iface) != AXL_OK
         || *out_iface == NULL) {
-        axl_warning("axl_shared_driver_locate_sibling: '%s' loaded but "
-                    "protocol for '%s' not published", driver_filename, name);
+        axl_debug("axl_shared_driver_locate_sibling: '%s' loaded but "
+                  "protocol for '%s' not published", driver_filename, name);
         /* Started but didn't publish -> unload to keep system state clean
            (mirrors driver_start_and_verify), clear the out param, and report
            AXL_NOT_FOUND (the vtable doesn't exist) to match the multi-path

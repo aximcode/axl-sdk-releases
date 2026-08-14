@@ -222,7 +222,7 @@ encode_load_option(
         DevicePathFromTextProtocol *dpft = get_from_text();
         if (dpft == NULL || dpft->ConvertTextToDevicePath == NULL) {
             axl_free(desc_w);
-            axl_warning("DevicePathFromText protocol unavailable; cannot encode boot option");
+            axl_debug("DevicePathFromText protocol unavailable; cannot encode boot option");
             return -1;
         }
         unsigned short *path_w = axl_utf8_to_ucs2(opt->device_path);

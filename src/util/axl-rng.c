@@ -66,8 +66,8 @@ axl_rng_bytes(
     }
     EFI_STATUS status = rng->GetRNG(rng, NULL, (UINTN)len, (uint8_t *)out);
     if (EFI_ERROR(status)) {
-        axl_warning("GetRNG(%zu) failed: 0x%llx",
-                    len, (unsigned long long)status);
+        axl_debug("GetRNG(%zu) failed: 0x%llx",
+                  len, (unsigned long long)status);
         return AXL_ERR;
     }
     return AXL_OK;

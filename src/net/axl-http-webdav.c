@@ -97,6 +97,11 @@ ensure_headers(AxlHttpResponse *r)
         if (axl_hash_table_owns_entries(r->headers)) {
             return true;
         }
+        /* log-level: this bool IS checked -- by insert_header(), which returns
+           void. So the status stops one frame up and reaches nobody, while the
+           response still goes out successfully, just missing DAV / Allow /
+           Content-Range. A caller cannot discover that from any return value,
+           and a WebDAV client failing on absent headers gives no clue why. */
         axl_warning("webdav: r->headers pre-allocated with wrong "
                     "destroy-func contract; DAV / Allow / "
                     "Content-Range headers will NOT be inserted "

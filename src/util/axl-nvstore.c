@@ -110,8 +110,8 @@ axl_nvstore_register_namespace(
     }
     size_t len = axl_strnlen(name, NS_NAME_MAX);
     if (len == 0 || len >= NS_NAME_MAX) {
-        axl_warning("namespace name '%s' too long (max %d)",
-                    name, NS_NAME_MAX - 1);
+        axl_debug("namespace name '%s' too long (max %d)",
+                  name, NS_NAME_MAX - 1);
         return AXL_ERR;
     }
 
@@ -131,14 +131,14 @@ axl_nvstore_register_namespace(
                                (const AxlGuid *)backend_token)) {
                 return AXL_OK;
             }
-            axl_warning("namespace '%s' already registered with different token",
-                        name);
+            axl_debug("namespace '%s' already registered with different token",
+                      name);
             return AXL_ERR;
         }
     }
 
     if (num_namespaces >= MAX_NAMESPACES) {
-        axl_warning("namespace table full (max %d)", MAX_NAMESPACES);
+        axl_debug("namespace table full (max %d)", MAX_NAMESPACES);
         return AXL_ERR;
     }
 
@@ -169,7 +169,7 @@ axl_nvstore_get(
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
-        axl_warning("get: namespace '%s' not registered", ns ? ns : "(null)");
+        axl_debug("get: namespace '%s' not registered", ns ? ns : "(null)");
         return AXL_ERR;
     }
 
@@ -279,7 +279,7 @@ axl_nvstore_set(
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
-        axl_warning("set: namespace '%s' not registered", ns ? ns : "(null)");
+        axl_debug("set: namespace '%s' not registered", ns ? ns : "(null)");
         return AXL_ERR;
     }
 
@@ -294,8 +294,8 @@ axl_nvstore_set(
         (void *)buf);
 
     if (EFI_ERROR(status)) {
-        axl_warning("nvstore set failed: key='%s' status=0x%llx",
-                    key, (unsigned long long)status);
+        axl_debug("nvstore set failed: key='%s' status=0x%llx",
+                  key, (unsigned long long)status);
         return AXL_ERR;
     }
     return AXL_OK;
@@ -350,8 +350,8 @@ axl_nvstore_delete(
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
-        axl_warning("delete: namespace '%s' not registered",
-                    ns ? ns : "(null)");
+        axl_debug("delete: namespace '%s' not registered",
+                  ns ? ns : "(null)");
         return AXL_ERR;
     }
 
@@ -465,8 +465,8 @@ axl_nvstore_iter(
     }
     const EFI_GUID *target = ns_to_guid(ns);
     if (target == NULL) {
-        axl_warning("iter: namespace '%s' not registered",
-                    ns ? ns : "(null)");
+        axl_debug("iter: namespace '%s' not registered",
+                  ns ? ns : "(null)");
         return AXL_ERR;
     }
 

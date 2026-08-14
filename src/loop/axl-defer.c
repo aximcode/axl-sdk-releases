@@ -37,7 +37,7 @@ axl_defer(
 
     if (axl_ring_buf_push_elem(&loop->defer_ring, &entry) != AXL_OK)
     {
-        axl_warning("defer queue full");
+        axl_debug("defer queue full");
         return 0;
     }
 

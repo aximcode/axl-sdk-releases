@@ -2,12 +2,13 @@
 /* Copyright 2026 AximCode */
 
 /** @file cxx-streams.cpp
-    axl::cout / axl::cin / axl::cerr and axl::string, FREESTANDING.
+    axl::cout / axl::cin / axl::cerr and axl::string.
 
-    No `--hosted`: this is the configuration the stream layer exists for.
-    `<string>` is gated behind `bits/requires_hosted.h`, so a plain
-    freestanding translation unit has no owning string at all -- which is
-    why axl::string is here beside std::string rather than instead of it.
+    `axl::string` predates the retirement of the freestanding C++ mode, when
+    `<string>` was gated behind `bits/requires_hosted.h` and a translation
+    unit had no owning string at all. `std::string` is always available now,
+    so `axl::string` is a choice rather than a necessity: it is the smaller
+    one, and it converts at the seam.
 
     Build and run:
 

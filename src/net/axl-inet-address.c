@@ -43,10 +43,10 @@ axl_inet_address_new_from_string(const char *str)
 
     addr = axl_calloc(1, sizeof(*addr));
     if (addr == NULL) {
-        axl_warning(
-            "axl_inet_address_new_from_string: OOM allocating AxlInetAddress (%zu bytes)",
-            sizeof(*addr)
-            );
+        axl_debug(
+          "axl_inet_address_new_from_string: OOM allocating AxlInetAddress (%zu bytes)",
+          sizeof(*addr)
+          );
         return NULL;
     }
 
@@ -74,10 +74,10 @@ axl_inet_address_new_from_bytes(const uint8_t *bytes)
 
     addr = axl_calloc(1, sizeof(*addr));
     if (addr == NULL) {
-        axl_warning(
-            "axl_inet_address_new_from_bytes: OOM allocating AxlInetAddress (%zu bytes)",
-            sizeof(*addr)
-            );
+        axl_debug(
+          "axl_inet_address_new_from_bytes: OOM allocating AxlInetAddress (%zu bytes)",
+          sizeof(*addr)
+          );
         return NULL;
     }
 
@@ -94,10 +94,10 @@ axl_inet_address_new_any(void)
 
     addr = axl_calloc(1, sizeof(*addr));
     if (addr == NULL) {
-        axl_warning(
-            "axl_inet_address_new_any: OOM allocating AxlInetAddress (%zu bytes)",
-            sizeof(*addr)
-            );
+        axl_debug(
+          "axl_inet_address_new_any: OOM allocating AxlInetAddress (%zu bytes)",
+          sizeof(*addr)
+          );
         return NULL;
     }
     /* addr->addr is already zeroed by calloc */

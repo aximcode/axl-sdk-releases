@@ -569,7 +569,7 @@ axl_net_bring_up(
                same way. */
         EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_ex(nic_index, &used);
         if (cfg == NULL) {
-            axl_warning("bring_up: no IP4Config2 for nic %zu", nic_index);
+            axl_debug("bring_up: no IP4Config2 for nic %zu", nic_index);
             return AXL_ERR;
         }
         static const uint8_t mask24[4] = { 255, 255, 255, 0 };
@@ -616,8 +616,8 @@ static_ip_apply(
         (size_t)sizeof(static_policy), &static_policy);
 
     if (EFI_ERROR(status)) {
-        axl_warning("failed to set static policy: %llx",
-                   (unsigned long long)status);
+        axl_debug("failed to set static policy: %llx",
+                 (unsigned long long)status);
         return AXL_ERR;
     }
 
@@ -632,8 +632,8 @@ static_ip_apply(
         (size_t)sizeof(manual), &manual);
 
     if (EFI_ERROR(status)) {
-        axl_warning("failed to set manual address: %llx",
-                   (unsigned long long)status);
+        axl_debug("failed to set manual address: %llx",
+                 (unsigned long long)status);
         return AXL_ERR;
     }
 
@@ -669,7 +669,7 @@ axl_net_set_static_ip(
 
     EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for(nic_index);
     if (cfg == NULL) {
-        axl_warning("set_static_ip: no IP4Config2 for nic %zu", nic_index);
+        axl_debug("set_static_ip: no IP4Config2 for nic %zu", nic_index);
         return AXL_ERR;
     }
 
@@ -691,7 +691,7 @@ axl_net_set_static_ip_by_mac(
     if (cfg == NULL) {
         char macbuf[18];
         axl_mac_format(mac, macbuf, sizeof macbuf);
-        axl_warning("set_static_ip_by_mac: no IP4Config2 NIC carrying %s", macbuf);
+        axl_debug("set_static_ip_by_mac: no IP4Config2 NIC carrying %s", macbuf);
         return AXL_ERR;   /* no fallback -- a MAC that names no NIC is an error */
     }
 
@@ -724,9 +724,9 @@ axl_net_set_dns(size_t nic_index, const uint8_t dns[4], const uint8_t *dns2)
         Ip4Config2DataTypeDnsServer,
         (size_t)(nserv * sizeof(EFI_IPv4_ADDRESS)), servers);
     if (EFI_ERROR(st)) {
-        axl_warning("set_dns: SetData(DnsServer) failed: 0x%llx "
-                    "(DNS is read-only under DHCP policy)",
-                    (unsigned long long)st);
+        axl_debug("set_dns: SetData(DnsServer) failed: 0x%llx "
+                  "(DNS is read-only under DHCP policy)",
+                  (unsigned long long)st);
         return AXL_ERR;
     }
     return AXL_OK;
@@ -1221,7 +1221,7 @@ axl_net_drivers_up(void)
         NULL,
         5ULL * 1000ULL * 1000ULL); /* timeout_us = 5 s */
     if (rc != AXL_OK) {
-        axl_warning("no link detected on any NIC");
+        axl_debug("no link detected on any NIC");
         return AXL_ERR;
     }
     return AXL_OK;
@@ -1371,7 +1371,7 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
             g_config_method = AXL_NET_CONFIG_PXE_BC;
             return AXL_OK;
         }
-        axl_warning("no IP4Config2 and no DHCP4-SB/PXE fallback succeeded");
+        axl_debug("no IP4Config2 and no DHCP4-SB/PXE fallback succeeded");
         return AXL_ERR;
     }
 
@@ -1455,7 +1455,7 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
         return AXL_OK;
     }
 
-    axl_warning("DHCP timeout after %zu seconds", timeout);
+    axl_debug("DHCP timeout after %zu seconds", timeout);
     return AXL_ERR;
 }
 

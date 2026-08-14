@@ -67,7 +67,7 @@ axl_socket_new(AxlSocketType type)
 
     if (type == AXL_SOCKET_DATAGRAM) {
         if (axl_udp_open(&sock->udp, 0) != AXL_OK) {
-            axl_warning("socket: failed to open UDP socket");
+            axl_debug("socket: failed to open UDP socket");
             axl_free(sock);
             return NULL;
         }
@@ -138,7 +138,7 @@ axl_socket_bind(AxlSocket *sock, uint16_t port)
         return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_DATAGRAM) {
-        axl_warning("socket: bind on non-datagram socket");
+        axl_debug("socket: bind on non-datagram socket");
         return AXL_ERR;
     }
 
@@ -147,7 +147,7 @@ axl_socket_bind(AxlSocket *sock, uint16_t port)
     sock->udp = NULL;
 
     if (axl_udp_open(&sock->udp, port) != AXL_OK) {
-        axl_warning("socket: bind to port %u failed", (unsigned)port);
+        axl_debug("socket: bind to port %u failed", (unsigned)port);
         return AXL_ERR;
     }
 
@@ -165,11 +165,11 @@ axl_socket_connect(AxlSocket *sock, AxlSocketAddress *addr)
         return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM) {
-        axl_warning("socket: connect on non-stream socket");
+        axl_debug("socket: connect on non-stream socket");
         return AXL_ERR;
     }
     if (sock->tcp != NULL) {
-        axl_warning("socket: already connected");
+        axl_debug("socket: already connected");
         return AXL_ERR;
     }
 
@@ -191,11 +191,11 @@ axl_socket_listen(AxlSocket *sock, uint16_t port)
         return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM) {
-        axl_warning("socket: listen on non-stream socket");
+        axl_debug("socket: listen on non-stream socket");
         return AXL_ERR;
     }
     if (sock->tcp != NULL) {
-        axl_warning("socket: already connected/listening");
+        axl_debug("socket: already connected/listening");
         return AXL_ERR;
     }
 
@@ -236,7 +236,7 @@ axl_socket_send(AxlSocket *sock, const void *data, size_t size,
         return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
-        axl_warning("socket: send on non-stream or unconnected socket");
+        axl_debug("socket: send on non-stream or unconnected socket");
         return AXL_ERR;
     }
 
@@ -254,7 +254,7 @@ axl_socket_send_to(AxlSocket *sock, const void *data, size_t size,
         return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_DATAGRAM || sock->udp == NULL) {
-        axl_warning("socket: send_to on non-datagram socket");
+        axl_debug("socket: send_to on non-datagram socket");
         return AXL_ERR;
     }
 
@@ -271,7 +271,7 @@ axl_socket_receive(AxlSocket *sock, void *buf, size_t *size,
         return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
-        axl_warning("socket: receive on non-stream or unconnected socket");
+        axl_debug("socket: receive on non-stream or unconnected socket");
         return AXL_ERR;
     }
 

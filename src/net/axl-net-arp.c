@@ -67,7 +67,7 @@ axl_net_arp_list(size_t nic, AxlArpEntry *out, size_t cap, size_t *count)
     }
     axl_backend_free(handles);
     if (sb == NULL) {
-        axl_warning("arp_list: no ARP service binding for nic %zu", nic);
+        axl_debug("arp_list: no ARP service binding for nic %zu", nic);
         return AXL_ERR;
     }
 

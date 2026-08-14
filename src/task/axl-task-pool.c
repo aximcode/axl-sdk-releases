@@ -614,8 +614,8 @@ axl_task_pool_submit(
         }
     }
 
-    axl_warning("all %llu worker(s) busy, cannot submit task",
-               (unsigned long long)pool->worker_count);
+    axl_debug("all %llu worker(s) busy, cannot submit task",
+             (unsigned long long)pool->worker_count);
     return AXL_TASK_ID_INVALID;
 }
 

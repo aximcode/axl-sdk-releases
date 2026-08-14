@@ -62,19 +62,19 @@ radix_node_new(
 {
     RadixNode *n = axl_calloc(1, sizeof(RadixNode));
     if (n == NULL) {
-        axl_warning(
-            "radix_node_new: OOM allocating node (%zu bytes)",
-            sizeof(RadixNode)
-            );
+        axl_debug(
+          "radix_node_new: OOM allocating node (%zu bytes)",
+          sizeof(RadixNode)
+          );
         return NULL;
     }
 
     n->edge = axl_malloc(edge_len + 1);
     if (n->edge == NULL) {
-        axl_warning(
-            "radix_node_new: OOM allocating edge label (%zu bytes)",
-            edge_len + 1
-            );
+        axl_debug(
+          "radix_node_new: OOM allocating edge label (%zu bytes)",
+          edge_len + 1
+          );
         axl_free(n);
         return NULL;
     }
@@ -120,10 +120,10 @@ radix_node_add_child(
                          : parent->child_cap * 2;
         RadixNode **new_arr = axl_calloc(new_cap, sizeof(RadixNode *));
         if (new_arr == NULL) {
-            axl_warning(
-                "radix_node_add_child: OOM growing children array to %zu entries",
-                new_cap
-                );
+            axl_debug(
+              "radix_node_add_child: OOM growing children array to %zu entries",
+              new_cap
+              );
             return -1;
         }
 
@@ -188,16 +188,16 @@ axl_radix_tree_new_full(
 {
     AxlRadixTree *tree = axl_calloc(1, sizeof(AxlRadixTree));
     if (tree == NULL) {
-        axl_warning(
-            "axl_radix_tree_new_full: OOM allocating tree (%zu bytes)",
-            sizeof(AxlRadixTree)
-            );
+        axl_debug(
+          "axl_radix_tree_new_full: OOM allocating tree (%zu bytes)",
+          sizeof(AxlRadixTree)
+          );
         return NULL;
     }
 
     tree->root = radix_node_new("", 0);
     if (tree->root == NULL) {
-        axl_warning("axl_radix_tree_new_full: OOM allocating root node");
+        axl_debug("axl_radix_tree_new_full: OOM allocating root node");
         axl_free(tree);
         return NULL;
     }
@@ -288,10 +288,10 @@ axl_radix_tree_insert(
 
         child->edge = axl_malloc(old_len - match_len + 1);
         if (child->edge == NULL) {
-            axl_warning(
-                "axl_radix_tree_insert: OOM splitting edge (%zu bytes)",
-                old_len - match_len + 1
-                );
+            axl_debug(
+              "axl_radix_tree_insert: OOM splitting edge (%zu bytes)",
+              old_len - match_len + 1
+              );
             child->edge = old_edge;
             axl_free(split->edge);
             axl_free(split);
@@ -318,9 +318,9 @@ axl_radix_tree_insert(
             split->children = axl_calloc(RADIX_CHILDREN_INIT_CAP,
                                          sizeof(RadixNode *));
             if (split->children == NULL) {
-                axl_warning(
-                    "axl_radix_tree_insert: OOM allocating split children array"
-                    );
+                axl_debug(
+                  "axl_radix_tree_insert: OOM allocating split children array"
+                  );
                 /* Reconstruct child's original edge and restore in parent */
                 size_t full_len = split->edge_len + child->edge_len;
                 char *full_edge = axl_malloc(full_len + 1);

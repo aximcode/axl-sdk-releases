@@ -57,7 +57,7 @@ dns4_open_configured(
                     &handle_count,
                     &handles);
     if (EFI_ERROR(status) || handle_count == 0) {
-        axl_warning("no DNS4 service binding - cannot resolve");
+        axl_debug("no DNS4 service binding - cannot resolve");
         return AXL_ERR;
     }
 

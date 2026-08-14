@@ -50,7 +50,7 @@ axl_shell_launch(
 {
     char path[256];
     if (axl_driver_locate("Shell.efi", path, sizeof(path)) != AXL_OK) {
-        axl_warning("shell launch: Shell.efi not found");
+        axl_debug("shell launch: Shell.efi not found");
         if (out_exit_code != NULL) {
             *out_exit_code = 0;
         }
@@ -80,7 +80,7 @@ axl_shell_launch_fv(
             return AXL_OK;
         }
     }
-    axl_warning("shell launch_fv: no firmware-embedded Shell in a readable FV");
+    axl_debug("shell launch_fv: no firmware-embedded Shell in a readable FV");
     return AXL_ERR;
 }
 

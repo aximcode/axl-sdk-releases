@@ -174,13 +174,26 @@ axl_attempt_begin(
        into a bounded buffer and axl_nvstore_get returns AXL_ERR (not a
        truncated read) when the value is larger, so an over-long name would
        leave a dangling breadcrumb that crash-recovery can never see or clear. */
+    /* The two failures below both return false, and nobody listens: the
+       documented idiom in axl-attempt.h calls this bare, and so does the one
+       in-tree caller (axl-driver.c's sweep) -- deliberately, since there is
+       nothing useful to do about it mid-sweep. The consequence is not local.
+       The breadcrumb is what NAMES the culprit after a driver wedges or
+       resets the box, so a silent failure here means the next boot cannot
+       quarantine it and the hang repeats forever: the protection is gone
+       exactly when it was about to be needed, and this line is the only
+       notice anyone gets. */
     if (axl_strlen(name) + 1 > at->name_max) {
+        /* log-level: false reaches no caller; a skipped breadcrumb disables
+           next-boot quarantine for this driver. */
         axl_warning("name too long for breadcrumb (>= %zu bytes); skipping",
                     at->name_max);
         return false;
     }
     if (axl_nvstore_set(at->ns, at->trying_key, name, axl_strlen(name) + 1,
                         at->flags) != AXL_OK) {
+        /* log-level: false reaches no caller; crash recovery is now off for
+           this boot and only this line says so. */
         axl_warning("could not persist breadcrumb (read-only/full NVRAM?)");
         return false;
     }

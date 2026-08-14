@@ -23,7 +23,7 @@ axl_http_server_add_websocket(AxlHttpServer *s, const char *path,
     }
 
     if (s->ws_route_count >= 8) {
-        axl_warning("too many WebSocket routes (max 8)");
+        axl_debug("too many WebSocket routes (max 8)");
         return AXL_ERR;
     }
 
@@ -47,7 +47,7 @@ axl_http_server_add_websocket_ex(AxlHttpServer *s, const char *path,
         return AXL_ERR;
     }
     if (s->ws_route_count >= 8) {
-        axl_warning("too many WebSocket routes (max 8)");
+        axl_debug("too many WebSocket routes (max 8)");
         return AXL_ERR;
     }
 
@@ -209,6 +209,12 @@ ws_outq_enqueue(HttpConn *conn, const void *frame, size_t len)
        (slow read / mid-send close) then wedged the entire single-threaded
        server. A frame this large is a caller bug — chunk the payload. */
     if (len > WS_OUT_MAX_BYTES) {
+        /* log-level: the rc does reach the caller, but the frame is DROPPED on
+           a connection that stays up -- silent data loss the peer cannot see
+           and the status does not describe, which is what warning is for. It
+           is also a caller bug that used to wedge the entire single-threaded
+           server. (test-http.sh asserts it; that follows from it mattering,
+           and is not the reason for the level.) */
         axl_warning("ws: frame %zu B exceeds outbound budget %u B; dropping "
                     "(chunk larger payloads)", len, WS_OUT_MAX_BYTES);
         return AXL_ERR;

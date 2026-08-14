@@ -299,8 +299,8 @@ ssif_read_response(SsifCtx *s, uint8_t *resp, size_t *resp_len)
             }
         }
         if (!terminated) {
-            axl_warning("SSIF multi-part read did not terminate after %zu blocks",
-                        max_middle_blocks);
+            axl_debug("SSIF multi-part read did not terminate after %zu blocks",
+                      max_middle_blocks);
             return -1;
         }
 
@@ -313,8 +313,8 @@ ssif_read_response(SsifCtx *s, uint8_t *resp, size_t *resp_len)
         // fail rather than returning garbage to the caller.
         //
         if (total < 2) {
-            axl_warning("SSIF multi-part response too short (%zu bytes) to strip NetFn/Cmd",
-                        total);
+            axl_debug("SSIF multi-part response too short (%zu bytes) to strip NetFn/Cmd",
+                      total);
             *resp_len = 0;
             return -1;
         }

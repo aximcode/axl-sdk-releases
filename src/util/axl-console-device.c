@@ -810,6 +810,8 @@ evict_one_pointer_handle(AxlConsoleDevice *d, EFI_HANDLE h)
     /* Capacity-check BEFORE uninstalling: an evicted pointer we cannot record could
        never be restored, so leave a surplus findable rather than orphan it. */
     if (d->evicted_ptr_count >= DEVICE_MAX_EVICTED) {
+        /* log-level: false is discarded by evict_pointer_devices(), which returns void, so no
+           caller learns the take-over is partial and a guest keeps a pointer */
         axl_warning("console device: >%d pointers present; the surplus stays visible "
                     "to guests", DEVICE_MAX_EVICTED);
         return false;
@@ -825,6 +827,8 @@ evict_one_pointer_handle(AxlConsoleDevice *d, EFI_HANDLE h)
         /* A driver holding the pointer BY_DRIVER (e.g. ConSplitter aggregation) makes
            this EFI_ACCESS_DENIED; the guest then keeps a locatable pointer. Warn so a
            silently-ineffective take-over on such firmware is diagnosable. */
+        /* log-level: same void caller; the comment above says it outright -- a silently
+           ineffective take-over is only diagnosable from this line */
         axl_warning("console device: SimplePointer uninstall refused (0x%llx); the "
                     "guest keeps this pointer", (unsigned long long)st);
         return false;
@@ -1091,7 +1095,7 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
         return AXL_ERR;
     }
     if (g_dev != NULL) {
-        axl_warning("console device already installed");
+        axl_debug("console device already installed");
         return AXL_ERR;
     }
     /* Co-painting requires physical geometry. Two consoles drawing one screen must
@@ -1103,6 +1107,10 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
        both wants something incoherent, and failing loudly beats a garbled local
        display or a firmware hang. cols/rows 0 resolves to the physical mode. */
     if (cfg->passthrough_local && (cfg->cols != 0 || cfg->rows != 0)) {
+        /* log-level: axl-console-device.h documents the geometry request as
+           "Ignored (with a warning)" here, so the level is part of the public
+           contract. The caller asked for a size and did not get it; the status
+           says the install failed, not which field was refused. */
         axl_warning("console device: passthrough_local requires physical geometry "
                     "(cols/rows must be 0); refusing %ux%u",
                     (unsigned)cfg->cols, (unsigned)cfg->rows);
@@ -1148,7 +1156,7 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
     if (cfg->take_input) {
         axl_console_input_init(&d->in);
         if (!publish_console_in(d)) {
-            axl_warning("console device: could not publish the input relay");
+            axl_debug("console device: could not publish the input relay");
             g_dev = NULL;
             gBS->UninstallMultipleProtocolInterfaces(
                 d->my_handle,

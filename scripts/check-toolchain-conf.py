@@ -32,6 +32,11 @@ from pathlib import Path
 # -- exactly the "one was bumped without the other" failure this gate names.
 BUILDER = "toolchain/x86_64-elf/build-toolchain.sh"
 BUILDER_VER_RE = re.compile(r'^GCC_VER="\$\{GCC_VER:-([^}"]+)\}"', re.MULTILINE)
+# AXL's own build revision on top of the upstream GCC version. The manifest
+# version is GCC_VER + AXL_REV ("14.3.0" + "-axl"), because a rebuild with
+# different configure flags is a different toolchain while being the same
+# upstream release. Comparing GCC_VER alone reported a false mismatch.
+BUILDER_REV_RE = re.compile(r'^AXL_REV="\$\{AXL_REV:-([^}"]*)\}"', re.MULTILINE)
 
 REPO = Path(__file__).resolve().parent.parent
 CONF = REPO / "scripts" / "axl-toolchains.conf"
@@ -125,9 +130,11 @@ def main() -> int:
                 f"{BUILDER}: could not find the GCC_VER default; this gate"
                 " can no longer compare it against the manifest"
             )
-        elif m.group(1) != conf.get("AXL_X64_TOOLCHAIN_VERSION"):
+        elif (m.group(1) + (BUILDER_REV_RE.search(builder.read_text()).group(1)
+                            if BUILDER_REV_RE.search(builder.read_text()) else "")
+              ) != conf.get("AXL_X64_TOOLCHAIN_VERSION"):
             errors.append(
-                f"{BUILDER}: builds GCC {m.group(1)}, but the manifest declares"
+                f"{BUILDER}: builds GCC {m.group(1)} + AXL_REV, but the manifest declares"
                 f" {conf.get('AXL_X64_TOOLCHAIN_VERSION')} -- the installed"
                 " toolchain would not be at the path axl-cc looks in"
             )

@@ -124,7 +124,7 @@ axl_ipmi_dell_open(AxlIpmiTransportOps *ops)
         return AXL_ERR;
     }
     if (dell->IpmiSubmitCommand == NULL) {
-        axl_warning("Dell EFI_IPMI_TRANSPORT found but IpmiSubmitCommand is NULL");
+        axl_debug("Dell EFI_IPMI_TRANSPORT found but IpmiSubmitCommand is NULL");
         return AXL_ERR;
     }
 

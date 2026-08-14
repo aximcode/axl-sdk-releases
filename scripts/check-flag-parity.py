@@ -101,6 +101,36 @@ def main(argv: list[str]) -> int:
     bodies = {name: uncommented(path) for name, path in PATHS.items()}
     problems: list[str] = []
 
+    # A path that DELEGATES to axl-cc cannot drift from it, so it is exempted
+    # from the comparison -- but the delegation is PROVED, not assumed.
+    #
+    # scripts/install.sh used to reimplement axl-cc's pipeline inside the
+    # generated axl-config.cmake: its own compile line, ld, objcopy and
+    # pe-set-debug, ~200 lines of it. That was the third path this gate exists
+    # to police, and policing it was never as good as removing it -- a gate
+    # comparing SPELLINGS could confirm both said `-j .eh_frame` and not that
+    # the CMake package could build an exceptions image, which for a while it
+    # could not.
+    #
+    # So the exemption is conditional on the marker below. Reintroduce a
+    # hand-rolled compile or objcopy there and the file stops delegating; if it
+    # then also lacks the flags, this fires exactly as it used to.
+    # `COMMAND ${AXL_CC}`, not a bare mention of the variable. The file also
+    # names it in a FATAL_ERROR string, and matching that made a sabotage
+    # replacing BOTH invocations read as still-delegating -- the same "named
+    # only in prose" trap this file's docstring warns about for
+    # -fno-stack-protector.
+    #
+    # A path that stops delegating is NOT an error by itself: it simply rejoins
+    # the comparison below and has to carry every flag itself, which is what it
+    # did before this exemption existed. Failing outright would contradict this
+    # gate's own message ("fix the one that drifted").
+    delegated: list[str] = []
+    for name, body in list(bodies.items()):
+        if name == "scripts/install.sh" and "COMMAND ${AXL_CC}" in body:
+            delegated.append(name)
+            del bodies[name]
+
     for flag in CRITICAL_C_FLAGS:
         absent = [name for name, body in bodies.items() if flag not in body]
         if absent:
@@ -132,8 +162,12 @@ def main(argv: list[str]) -> int:
               "drifted, do not relax this list.")
         return 1
 
+    note = ""
+    if delegated:
+        note = f"; {', '.join(delegated)} delegates to axl-cc"
     print(f"check-flag-parity: clean — {len(CRITICAL_C_FLAGS)} critical flags and "
-          f"{len(union)} objcopy sections agree across {len(PATHS)} build paths")
+          f"{len(union)} objcopy sections agree across {len(bodies)} build "
+          f"path(s){note}")
     return 0
 
 

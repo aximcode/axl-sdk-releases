@@ -304,6 +304,11 @@ axl_cpu_register_exception(
 
     EFI_CPU_ARCH_PROTOCOL *p = cpu_arch();
     if (p == NULL) {
+        /* log-level: axl-cpu.h documents this as a WARNING to domain "cpu",
+           with the reason spelled out there -- a consumer is meant to read it
+           as "monitoring unavailable on this firmware" rather than silently
+           go un-monitored. A documented level is part of the public contract,
+           so the return value being checkable does not make it a duplicate. */
         axl_warning("EFI_CPU_ARCH_PROTOCOL not published - "
                     "exception monitoring unavailable");
         return AXL_ERR;
@@ -332,8 +337,8 @@ axl_cpu_register_exception(
         p->RegisterInterruptHandler(p, efi_type, NULL);
         g_slots[kind].cb   = NULL;
         g_slots[kind].user = NULL;
-        axl_warning("RegisterInterruptHandler(kind=%d) failed: 0x%lx",
-                    (int)kind, (unsigned long)status);
+        axl_debug("RegisterInterruptHandler(kind=%d) failed: 0x%lx",
+                  (int)kind, (unsigned long)status);
         return AXL_ERR;
     }
     return AXL_OK;

@@ -788,8 +788,8 @@ axl_input_attach_mouse(
         return 0;
     }
     if (mouse_state_used) {
-        axl_warning("axl_input_attach_mouse: already attached "
-                    "(only one mouse source per process for v0.1)");
+        axl_debug("axl_input_attach_mouse: already attached "
+                  "(only one mouse source per process for v0.1)");
         return 0;
     }
 
@@ -845,8 +845,8 @@ axl_input_attach_mouse_ifaces(
         return 0;
     }
     if (mouse_state_used) {
-        axl_warning("axl_input_attach_mouse_ifaces: already attached "
-                    "(only one mouse source per process for v0.1)");
+        axl_debug("axl_input_attach_mouse_ifaces: already attached "
+                  "(only one mouse source per process for v0.1)");
         return 0;
     }
 
@@ -949,8 +949,8 @@ axl_input_attach_key(
         return 0;
     }
     if (key_state_used) {
-        axl_warning("axl_input_attach_key: already attached "
-                    "(only one keyboard source per process for v0.1)");
+        axl_debug("axl_input_attach_key: already attached "
+                  "(only one keyboard source per process for v0.1)");
         return 0;
     }
     key_state.cb       = cb;
@@ -1322,8 +1322,8 @@ axl_input_attach_touch(
         return 0;
     }
     if (touch_state_used) {
-        axl_warning("axl_input_attach_touch: already attached "
-                    "(only one touch source per process for v0.1)");
+        axl_debug("axl_input_attach_touch: already attached "
+                  "(only one touch source per process for v0.1)");
         return 0;
     }
 

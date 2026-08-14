@@ -438,7 +438,7 @@ AxlRegex *
 axl_regex_new_full(const char *pattern, uint32_t flags, AxlRegexError *err)
 {
     if (pattern == NULL) {
-        axl_warning("NULL pattern");
+        axl_debug("NULL pattern");
         return NULL;
     }
     Parser s = { 0 };
@@ -448,7 +448,7 @@ axl_regex_new_full(const char *pattern, uint32_t flags, AxlRegexError *err)
     if (!s.err && s.p != s.end) perr(&s, "unexpected character");
     if (s.err) {
         if (err != NULL) { err->offset = s.err_off; err->message = s.err_msg; }
-        axl_warning("bad pattern at %zu: %s", s.err_off, s.err_msg ? s.err_msg : "?");
+        axl_debug("bad pattern at %zu: %s", s.err_off, s.err_msg ? s.err_msg : "?");
         parser_free_nodes(&s);
         return NULL;
     }

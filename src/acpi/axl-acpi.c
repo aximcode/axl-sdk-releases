@@ -277,7 +277,7 @@ ensure_rsdp(
     /* Validate the RSDP "RSD PTR " signature (8 bytes, trailing space). */
     static const char rsdp_sig[8] = { 'R', 'S', 'D', ' ', 'P', 'T', 'R', ' ' };
     if (axl_memcmp(cached_rsdp->signature, rsdp_sig, 8) != 0) {
-        axl_warning("RSDP signature mismatch");
+        axl_debug("RSDP signature mismatch");
         rsdp_failed = true;
         return -1;
     }
@@ -316,7 +316,7 @@ ensure_init(
     front_load_fadt_children();
 
     if (catalog_count == 0) {
-        axl_warning("RSDP found but RSDT/XSDT contains no entries");
+        axl_debug("RSDP found but RSDT/XSDT contains no entries");
         catalog_failed = true;
         return -1;
     }

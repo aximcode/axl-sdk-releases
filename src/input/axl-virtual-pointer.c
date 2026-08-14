@@ -207,7 +207,7 @@ axl_virtual_pointer_install(AxlVirtualPointer **out,
     }
     *out = NULL;
     if (g_vp != NULL) {
-        axl_warning("virtual pointer already installed (singleton)");
+        axl_debug("virtual pointer already installed (singleton)");
         return AXL_ERR;
     }
 

@@ -48,7 +48,7 @@ axl_acpi_read_mcfg(
         return AXL_ERR;
     }
     if (!axl_acpi_checksum_ok(h)) {
-        axl_warning("MCFG checksum invalid");
+        axl_debug("MCFG checksum invalid");
         return AXL_ERR;
     }
 

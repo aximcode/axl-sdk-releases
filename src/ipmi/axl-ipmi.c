@@ -202,8 +202,8 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
         return -1;
     }
     if (hdr->Length < SMBIOS_TYPE38_MIN_LEN) {
-        axl_warning("SMBIOS Type 38 length too short: %u (need >= %u)",
-                    (unsigned)hdr->Length, SMBIOS_TYPE38_MIN_LEN);
+        axl_debug("SMBIOS Type 38 length too short: %u (need >= %u)",
+                  (unsigned)hdr->Length, SMBIOS_TYPE38_MIN_LEN);
         return -1;
     }
 
@@ -301,8 +301,8 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
             if (smbus != NULL) {
                 axl_smbus_free(smbus);
             }
-            axl_warning("SSIF: no controller answered IPMI Get Device ID "
-                        "- BMC unreachable");
+            axl_debug("SSIF: no controller answered IPMI Get Device ID "
+                      "- BMC unreachable");
             return -1;
         }
 
@@ -319,8 +319,8 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
         axl_debug("SMBIOS Type 38: SMIC interface - not supported");
         return -1;
     default:
-        axl_warning("SMBIOS Type 38: unknown interface type %u",
-                    (unsigned)iface);
+        axl_debug("SMBIOS Type 38: unknown interface type %u",
+                  (unsigned)iface);
         return -1;
     }
 }

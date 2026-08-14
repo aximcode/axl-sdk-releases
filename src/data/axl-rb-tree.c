@@ -426,31 +426,31 @@ rb_check(
     }
 
     if (depth > RB_MAX_DEPTH) {
-        axl_warning("depth exceeded %u -- tree is corrupt or degenerate",
-                    RB_MAX_DEPTH);
+        axl_debug("depth exceeded %u -- tree is corrupt or degenerate",
+                  RB_MAX_DEPTH);
         return -1;
     }
     if (*seen > RB_MAX_VISITS) {
-        axl_warning("visited more than %u nodes -- structure is not a tree",
-                    RB_MAX_VISITS);
+        axl_debug("visited more than %u nodes -- structure is not a tree",
+                  RB_MAX_VISITS);
         return -1;
     }
 
     (*seen)++;
 
     if (n->left != NULL && n->left->parent != n) {
-        axl_warning("left child does not point back to its parent");
+        axl_debug("left child does not point back to its parent");
         return -1;
     }
     if (n->right != NULL && n->right->parent != n) {
-        axl_warning("right child does not point back to its parent");
+        axl_debug("right child does not point back to its parent");
         return -1;
     }
 
     if (n->color == AXL_RB_RED) {
         if ((n->left != NULL && n->left->color == AXL_RB_RED) ||
             (n->right != NULL && n->right->color == AXL_RB_RED)) {
-            axl_warning("red node has a red child");
+            axl_debug("red node has a red child");
             return -1;
         }
     }
@@ -465,7 +465,7 @@ rb_check(
     }
 
     if (left_bh != right_bh) {
-        axl_warning("black height differs (%d vs %d)", left_bh, right_bh);
+        axl_debug("black height differs (%d vs %d)", left_bh, right_bh);
         return -1;
     }
     return left_bh + (n->color == AXL_RB_BLACK ? 1 : 0);
@@ -505,11 +505,11 @@ axl_rb_check_invariants(const AxlRBTree *t)
     }
 
     if (t->root->parent != NULL) {
-        axl_warning("root has a parent");
+        axl_debug("root has a parent");
         return false;
     }
     if (t->root->color != AXL_RB_BLACK) {
-        axl_warning("root is not black");
+        axl_debug("root is not black");
         return false;
     }
     if (rb_check(t->root, &seen, 0) < 0) {
@@ -518,8 +518,8 @@ axl_rb_check_invariants(const AxlRBTree *t)
 
     walked = rb_walk_count(t);
     if (walked != seen) {
-        axl_warning("in-order walk saw %zu nodes, structure has %zu",
-                    walked, seen);
+        axl_debug("in-order walk saw %zu nodes, structure has %zu",
+                  walked, seen);
         return false;
     }
     return true;

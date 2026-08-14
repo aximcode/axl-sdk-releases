@@ -372,7 +372,7 @@ ensure_connected(
             }
         }
         if (!hs_done) {
-            axl_warning("TLS handshake failed for %s:%u", host, port);
+            axl_debug("TLS handshake failed for %s:%u", host, port);
             client_tls_free(c->tls_ctx);
             c->tls_ctx = NULL;
             axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
@@ -748,7 +748,7 @@ do_streaming_request(
         for (;;) {
             size_t got = 0;
             if (streamer(stream_ctx, chunk, sizeof(chunk), &got) != AXL_OK) {
-                axl_warning("streaming request body: producer returned error");
+                axl_debug("streaming request body: producer returned error");
                 axl_url_free(parsed);
                 return -1;
             }
@@ -1070,16 +1070,16 @@ axl_http_request_stream_file(AxlHttpClient *c, const char *method,
         return AXL_ERR;
     }
     if (axl_file_info(path, &info) != AXL_OK) {
-        axl_warning("stream_file: cannot stat '%s'", path);
+        axl_debug("stream_file: cannot stat '%s'", path);
         return AXL_ERR;
     }
     if (axl_fs_entry_is_dir(&info)) {
-        axl_warning("stream_file: '%s' is a directory", path);
+        axl_debug("stream_file: '%s' is a directory", path);
         return AXL_ERR;
     }
     AxlStream *src = axl_fopen(path, "r");
     if (src == NULL) {
-        axl_warning("stream_file: cannot open '%s' for read", path);
+        axl_debug("stream_file: cannot open '%s' for read", path);
         return AXL_ERR;
     }
     /* Hand the stream off as the producer ctx — cleanup callback

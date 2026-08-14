@@ -291,8 +291,8 @@ piix4_imc_acquire(Piix4Ctx *p, uint8_t *save)
         }
         axl_msleep(PIIX4_IMC_RETRY_SLEEP_MS);
     }
-    axl_warning("piix4 IMC semaphore acquire timeout @ port 0x%x (last=0x%02x)",
-                (unsigned)p->base, cur);
+    axl_debug("piix4 IMC semaphore acquire timeout @ port 0x%x (last=0x%02x)",
+              (unsigned)p->base, cur);
     return -1;
 }
 
@@ -351,8 +351,8 @@ piix4_run(Piix4Ctx *p, uint8_t cmd_byte, uint8_t addr_rw, uint8_t cnt_kind)
             return -1;
         }
         if (pre != 0x00) {
-            axl_warning("piix4 pre-flight EBUSY status=0x%02x @ port 0x%x",
-                        pre, (unsigned)p->base);
+            axl_debug("piix4 pre-flight EBUSY status=0x%02x @ port 0x%x",
+                      pre, (unsigned)p->base);
             return -1;
         }
     }
@@ -366,7 +366,7 @@ piix4_run(Piix4Ctx *p, uint8_t cmd_byte, uint8_t addr_rw, uint8_t cnt_kind)
 
     uint8_t status;
     if (piix4_wait_complete(p, &status) != 0) {
-        axl_warning("piix4 timeout @ port 0x%x", (unsigned)p->base);
+        axl_debug("piix4 timeout @ port 0x%x", (unsigned)p->base);
         return -1;
     }
     if (status & (PIIX4_STS_DEV_ERR | PIIX4_STS_BUS_COLLI | PIIX4_STS_FAILED)) {

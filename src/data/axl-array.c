@@ -117,7 +117,7 @@ axl_array_sized_new(size_t element_size, size_t reserved)
 
     a = axl_calloc(1, sizeof (AxlArray));
     if (a == NULL) {
-        axl_warning("allocation failed");
+        axl_debug("allocation failed");
         return NULL;
     }
 
@@ -133,7 +133,7 @@ axl_array_sized_new(size_t element_size, size_t reserved)
        caller-controlled, so this is reachable in one call. */
     a->buffer = axl_calloc(cap, element_size);
     if (a->buffer == NULL) {
-        axl_warning("buffer allocation failed");
+        axl_debug("buffer allocation failed");
         axl_free(a);
         return NULL;
     }

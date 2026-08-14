@@ -268,8 +268,8 @@ axl_image_run_fv_file(
     axl_bs()->FreePool(dp);  /* axl-pool-direct: device path for LoadImage */
 
     if (EFI_ERROR(status) || image == NULL) {
-        axl_warning("image_run_fv_file: LoadImage failed: 0x%llx",
-                    (unsigned long long)status);
+        axl_debug("image_run_fv_file: LoadImage failed: 0x%llx",
+                  (unsigned long long)status);
         return AXL_ERR;
     }
 

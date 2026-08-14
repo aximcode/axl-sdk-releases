@@ -40,7 +40,7 @@ axl_device_path_new_vendor(
 
     VendorChain *chain = axl_malloc(sizeof(*chain));
     if (chain == NULL) {
-        axl_warning("alloc failed");
+        axl_debug("alloc failed");
         return AXL_ERR;
     }
 

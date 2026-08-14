@@ -153,8 +153,8 @@ ws_build_frame(uint8_t opcode, const void *payload, size_t payload_len,
     }
 
     if (out_size < header_len + payload_len) {
-        axl_warning("ws frame buffer too small: need %zu, have %zu",
-                    header_len + payload_len, out_size);
+        axl_debug("ws frame buffer too small: need %zu, have %zu",
+                  header_len + payload_len, out_size);
         return 0;
     }
 

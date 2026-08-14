@@ -202,7 +202,7 @@ axl_async_submit(
     }
 
     if (slot == NULL) {
-        axl_warning("async queue full (%zu pending)", async->pending_count);
+        axl_debug("async queue full (%zu pending)", async->pending_count);
         return AXL_ASYNC_INVALID;
     }
 

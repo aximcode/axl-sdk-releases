@@ -38,7 +38,7 @@ buf_write(void *ctx, const void *data, size_t count)
         }
         char *new_data = (char *)axl_realloc(b->data, new_alloc);
         if (new_data == NULL) {
-            axl_warning("buffer grow failed");
+            axl_debug("buffer grow failed");
             return -1;
         }
         b->data  = new_data;
@@ -98,7 +98,7 @@ buf_pwrite(void *ctx, const void *data, size_t count, size_t offset)
         }
         char *new_data = (char *)axl_realloc(b->data, new_alloc);
         if (new_data == NULL) {
-            axl_warning("buffer grow failed");
+            axl_debug("buffer grow failed");
             return -1;
         }
         b->data  = new_data;
@@ -185,13 +185,13 @@ axl_bufopen(void)
 
     b = axl_new(BufCtx);
     if (b == NULL) {
-        axl_warning("allocation failed");
+        axl_debug("allocation failed");
         return NULL;
     }
 
     b->data = (char *)axl_malloc(BUF_INITIAL);
     if (b->data == NULL) {
-        axl_warning("buffer allocation failed");
+        axl_debug("buffer allocation failed");
         axl_free(b);
         return NULL;
     }
@@ -204,7 +204,7 @@ axl_bufopen(void)
     if (s == NULL) {
         /* A refused open never calls `close`, so releasing the context is
            still ours to do -- the same contract a consumer gets. */
-        axl_warning("allocation failed");
+        axl_debug("allocation failed");
         axl_free(b->data);
         axl_free(b);
         return NULL;

@@ -53,16 +53,16 @@ axl_checksum_new(AxlChecksumType type)
     AxlChecksum *cs;
 
     if (axl_checksum_type_get_length(type) == 0) {
-        axl_warning("invalid checksum type: %d", (int)type);
+        axl_debug("invalid checksum type: %d", (int)type);
         return NULL;
     }
 
     cs = axl_calloc(1, sizeof(*cs));
     if (cs == NULL) {
-        axl_warning(
-            "axl_checksum_new: OOM allocating AxlChecksum (%zu bytes)",
-            sizeof(*cs)
-            );
+        axl_debug(
+          "axl_checksum_new: OOM allocating AxlChecksum (%zu bytes)",
+          sizeof(*cs)
+          );
         return NULL;
     }
 

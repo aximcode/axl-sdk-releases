@@ -206,7 +206,7 @@ axl_http_server_set(AxlHttpServer *s, const char *key, const char *value)
 
     /* Guard: can't change max.connections after listener started */
     if (axl_streql(key, "max.connections") && s->conns != NULL) {
-        axl_warning("cannot change max.connections after server started");
+        axl_debug("cannot change max.connections after server started");
         return AXL_ERR;
     }
 
@@ -331,7 +331,7 @@ axl_http_server_use_tls(
     }
 
     if (!axl_tls_available()) {
-        axl_warning("TLS not available (build with AXL_TLS=1)");
+        axl_debug("TLS not available (build with AXL_TLS=1)");
         return AXL_ERR;
     }
 
@@ -583,7 +583,7 @@ on_tls_handshake_data(
     if (rc == AXL_TLS_WANT_MORE) {
         return true;    /* need more handshake data — re-arm this recv */
     }
-    axl_warning("TLS handshake failed for %s", conn->client_addr);
+    axl_debug("TLS handshake failed for %s", conn->client_addr);
 
 fail:
     /* Same teardown as a request-phase failure: reset_connection frees

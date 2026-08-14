@@ -695,8 +695,8 @@ driver_load_buffer_apply(
         &drv_handle);
 
     if (EFI_ERROR(st) || drv_handle == NULL) {
-        axl_warning("driver load_buffer: LoadImage(%zu bytes) failed: 0x%llx",
-                    len, (unsigned long long)st);
+        axl_debug("driver load_buffer: LoadImage(%zu bytes) failed: 0x%llx",
+                  len, (unsigned long long)st);
         *out_handle = NULL;
         return AXL_ERR;
     }
@@ -767,8 +767,8 @@ axl_driver_load(
     axl_free(buf);
 
     if (EFI_ERROR(status)) {
-        axl_warning("driver load: LoadImage failed for '%s': 0x%llx",
-                   path, (unsigned long long)status);
+        axl_debug("driver load: LoadImage failed for '%s': 0x%llx",
+                 path, (unsigned long long)status);
         return AXL_ERR;
     }
 
@@ -800,8 +800,8 @@ axl_driver_start(
         NULL);
 
     if (EFI_ERROR(status)) {
-        axl_warning("driver start failed: 0x%llx",
-                   (unsigned long long)status);
+        axl_debug("driver start failed: 0x%llx",
+                 (unsigned long long)status);
         return AXL_ERR;
     }
 
@@ -1002,7 +1002,7 @@ axl_driver_set_load_options(
         (void **)&img);
 
     if (EFI_ERROR(status) || img == NULL) {
-        axl_warning("driver set_load_options: HandleProtocol failed");
+        axl_debug("driver set_load_options: HandleProtocol failed");
         return AXL_ERR;
     }
 
@@ -1460,8 +1460,8 @@ driver_start_and_verify(
     if (load_options != NULL && load_options_size > 0) {
         if (axl_driver_set_load_options(drv, load_options,
                                         load_options_size) != AXL_OK) {
-            axl_warning("driver ensure: set_load_options failed for '%s'",
-                        source_label);
+            axl_debug("driver ensure: set_load_options failed for '%s'",
+                      source_label);
             axl_driver_unload(drv);
             return AXL_ERR;
         }
@@ -1472,8 +1472,8 @@ driver_start_and_verify(
         (EFI_HANDLE)drv, &exit_data_size, NULL);
 
     if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
-        axl_warning("driver ensure: StartImage failed for '%s': 0x%llx",
-                    source_label, (unsigned long long)st);
+        axl_debug("driver ensure: StartImage failed for '%s': 0x%llx",
+                  source_label, (unsigned long long)st);
         axl_driver_unload(drv);
         return AXL_ERR;
     }
@@ -1506,8 +1506,8 @@ driver_start_and_verify(
 
     /* Driver started but didn't register the expected protocol.
      * Unload to keep system state clean. */
-    axl_warning("driver ensure: '%s' did not register protocol; unloading",
-                source_label);
+    axl_debug("driver ensure: '%s' did not register protocol; unloading",
+              source_label);
     axl_driver_unload(drv);
     return AXL_ERR;
 }
@@ -1813,10 +1813,10 @@ _axl_driver_ensure_with_embedded_info(
         }
     }
 
-    axl_warning("driver ensure: '%s' not found in %zu candidate path%s%s",
-                search_name, n_cand, n_cand == 1 ? "" : "s",
-                (override_name == NULL && embedded_buf != NULL)
-                    ? " (embedded fallback also failed)" : "");
+    axl_debug("driver ensure: '%s' not found in %zu candidate path%s%s",
+              search_name, n_cand, n_cand == 1 ? "" : "s",
+              (override_name == NULL && embedded_buf != NULL)
+                  ? " (embedded fallback also failed)" : "");
     return AXL_NOT_FOUND;
 }
 
@@ -1860,8 +1860,8 @@ axl_driver_ensure_from_path(
 
     AxlDriverHandle drv = NULL;
     if (axl_driver_load(driver_path, &drv) != AXL_OK || drv == NULL) {
-        axl_warning("driver ensure_from_path: cannot load pinned driver '%s'",
-                    driver_path);
+        axl_debug("driver ensure_from_path: cannot load pinned driver '%s'",
+                  driver_path);
         return AXL_NOT_FOUND;
     }
 
@@ -1905,8 +1905,8 @@ axl_driver_ensure_embedded_only(
     if (driver_load_embedded(protocol_guid, embedded_buf, embedded_len,
                              load_options, load_options_size,
                              /* info */ NULL, driver_name) != AXL_OK) {
-        axl_warning("driver ensure_embedded_only: embedded driver (%zu bytes) "
-                    "failed to load or register", embedded_len);
+        axl_debug("driver ensure_embedded_only: embedded driver (%zu bytes) "
+                  "failed to load or register", embedded_len);
         return AXL_NOT_FOUND;
     }
     return AXL_OK;

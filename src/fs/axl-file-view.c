@@ -73,8 +73,8 @@ fv_fill(size_t page_index, void *dst, size_t cap, void *user)
     }
     axl_ssize_t got = axl_pread(v->stream, dst, want, base);
     if (got < 0 || (size_t)got != want) {
-        axl_warning("file_view: pread page %zu (base %zu, want %zu) got %lld",
-                    page_index, base, want, (long long)got);
+        axl_debug("file_view: pread page %zu (base %zu, want %zu) got %lld",
+                  page_index, base, want, (long long)got);
         return -1;
     }
     return (int64_t)got;
@@ -96,7 +96,7 @@ fv_make(const char *path, AxlPageCache *cache, bool owns)
 
     AxlFsEntry entry;
     if (axl_file_info(path, &entry) != AXL_OK) {
-        axl_warning("file_view: cannot stat '%s'", path);
+        axl_debug("file_view: cannot stat '%s'", path);
         if (owns) {
             axl_page_cache_free(cache);
         }
@@ -122,7 +122,7 @@ fv_make(const char *path, AxlPageCache *cache, bool owns)
 
     v->stream = axl_fopen(path, "r");
     if (v->stream == NULL) {
-        axl_warning("file_view: cannot open '%s'", path);
+        axl_debug("file_view: cannot open '%s'", path);
         axl_free(v->path);
         axl_free(v);
         if (owns) {
@@ -227,7 +227,7 @@ axl_file_view_open_cached(const char *path, AxlPageCache *cache)
     /* The view's offset->page math needs a power-of-two page size. */
     size_t ps = axl_page_cache_page_size(cache);
     if (ps == 0 || (ps & (ps - 1)) != 0) {
-        axl_warning("file_view: shared cache page size %zu is not a power of two", ps);
+        axl_debug("file_view: shared cache page size %zu is not a power of two", ps);
         return NULL;
     }
     return fv_make(path, cache, false);

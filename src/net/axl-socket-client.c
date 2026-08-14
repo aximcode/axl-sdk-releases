@@ -94,7 +94,7 @@ axl_socket_client_connect_to_host(AxlSocketClient *client, const char *host,
 
     /* Resolve hostname (or parse dotted-decimal) */
     if (axl_net_resolve(host, &ipv4) != AXL_OK) {
-        axl_warning("socket_client: DNS resolve failed for '%s'", host);
+        axl_debug("socket_client: DNS resolve failed for '%s'", host);
         return AXL_ERR;
     }
 

@@ -90,7 +90,7 @@ axl_ipmi_edkii_open(AxlIpmiTransportOps *ops)
         return AXL_ERR;
     }
     if (ipmi->IpmiSubmitCommand == NULL) {
-        axl_warning("EDKII IPMI_PROTOCOL found but IpmiSubmitCommand is NULL");
+        axl_debug("EDKII IPMI_PROTOCOL found but IpmiSubmitCommand is NULL");
         return AXL_ERR;
     }
 
