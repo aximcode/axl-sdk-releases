@@ -125,6 +125,150 @@ test_check(bool cond, const char *name)
     }
 }
 
+/* --------------------------------------------------------------------------
+   Green-path log-quiet detector.
+
+   A consumer running at AXL_LOG_INFO must see nothing from AXL on a healthy
+   run. The library reports a condition to its caller through the return
+   value, and only the caller has the context to judge whether a failed open
+   is a fault or an expected probe -- so anything AXL emits above debug for a
+   condition the caller can already test is a duplicate, and anything it emits
+   at all on a success path is noise.
+
+   The dispatcher applies the level filter BEFORE handler dispatch
+   (axl_log_full returns early when level > the effective level), and the
+   handler carries its own INFO cap on top, so the window fires for exactly
+   the lines a consumer at INFO would have seen on its console.
+
+   Usage -- the argument names the domain whose silence is being asserted:
+
+       test_log_quiet_begin("fs");
+       (void)axl_file_get_contents("fs0:\\nope.bin", &buf, &len);
+       test_log_quiet_end("fs: failed open is quiet at INFO");
+
+   Two things this deliberately does NOT do.
+
+   It never touches the global level: the cap lives on the handler, so a run
+   started at debug still measures ERROR/WARN/INFO and nothing downstream of
+   the window is left reconfigured.
+
+   It never trusts its own silence unverified. The handler table holds 8, and
+   a level can be pinned per domain (AXL_LOG_LEVEL="fs:error"); either would
+   make an unarmed window report a confident PASS over the exact regression it
+   guards. So begin() emits one probe line in @a probe_domain and requires to
+   see it, and a window that failed to arm FAILS -- a gate that cannot see is
+   worse than no gate.
+   -------------------------------------------------------------------------- */
+
+static unsigned int test_log_quiet_hits         = 0;
+static bool         test_log_quiet_armed        = false;
+static int          test_log_quiet_first_level  = -1;
+static char         test_log_quiet_first_domain[32];
+static char         test_log_quiet_first_msg[160];
+
+static inline void
+test_log_quiet_copy(char *dst, size_t cap, const char *src)
+{
+    size_t i = 0;
+
+    if (src != NULL) {
+        for (; src[i] != '\0' && i + 1 < cap; i++) {
+            dst[i] = src[i];
+        }
+    }
+    dst[i] = '\0';
+}
+
+/* Records only; the dispatcher is not re-entrant, so this must not allocate
+   or call anything that can itself log. A hand-rolled copy keeps it to
+   stores. */
+static inline void
+test_log_quiet_handler(
+    int                level,
+    const char        *domain,
+    const char        *message,
+    const AxlRealtime *stamp,
+    void              *data
+    ) AXL_CB_NOEXCEPT
+{
+    (void)stamp; (void)data;
+
+    if (test_log_quiet_hits == 0) {
+        test_log_quiet_first_level = level;
+        test_log_quiet_copy(test_log_quiet_first_domain,
+                            sizeof(test_log_quiet_first_domain), domain);
+        test_log_quiet_copy(test_log_quiet_first_msg,
+                            sizeof(test_log_quiet_first_msg), message);
+    }
+    test_log_quiet_hits++;
+}
+
+static inline void
+test_log_quiet_reset(void)
+{
+    test_log_quiet_hits            = 0;
+    test_log_quiet_first_level     = -1;
+    test_log_quiet_first_domain[0] = '\0';
+    test_log_quiet_first_msg[0]    = '\0';
+}
+
+static inline void
+test_log_quiet_begin(const char *probe_domain)
+{
+    test_log_quiet_reset();
+    test_log_quiet_armed = false;
+
+    /* The INFO cap rides on the HANDLER, not on the global level: there is no
+       axl_log_get_level to restore from, so a window that set the global one
+       could only "restore" it by guessing, and would silently reconfigure
+       everything downstream of it in a run started at debug. */
+    if (axl_log_add_domain_handler(NULL, AXL_LOG_INFO,
+                                   test_log_quiet_handler, NULL) != AXL_OK) {
+        return;   /* table full -- end() reports it rather than passing */
+    }
+
+    /* Arm check: emit one line the window MUST see. Without this, a full
+       handler table or a domain pinned below INFO (AXL_LOG_LEVEL="fs:error")
+       reports a confident PASS over the very regression being guarded. */
+    axl_log_full(AXL_LOG_INFO, probe_domain, NULL, 0,
+                 "log-quiet detector probe (expected)");
+    test_log_quiet_armed = (test_log_quiet_hits == 1);
+    test_log_quiet_reset();
+}
+
+static inline void
+test_log_quiet_end(const char *name)
+{
+    axl_log_remove_handler(test_log_quiet_handler);
+
+    if (!test_log_quiet_armed) {
+        axl_printf("      detector never saw its own probe -- handler table "
+                   "full, or this domain is pinned below INFO\n");
+        test_fail(name);
+        return;
+    }
+
+    /* Name the offender. "expected 0, got 1" tells a future reader nothing
+       about WHICH line regrew, and the console copy scrolls past in a run
+       with 2400 assertions. */
+    if (test_log_quiet_hits != 0) {
+        axl_printf("      offender: level=%d domain=%s msg=%s\n",
+                   test_log_quiet_first_level,
+                   test_log_quiet_first_domain,
+                   test_log_quiet_first_msg);
+    }
+    test_check(test_log_quiet_hits == 0, name);
+}
+
+/* Unwind a window WITHOUT asserting -- for a topology-gated caller that
+   discovered mid-window it is on the path this release does not cover, and
+   must balance with test_skip_n() instead. */
+static inline void
+test_log_quiet_abort(void)
+{
+    axl_log_remove_handler(test_log_quiet_handler);
+}
+
 static inline void
 test_print_header(const char *suite_name)
 {

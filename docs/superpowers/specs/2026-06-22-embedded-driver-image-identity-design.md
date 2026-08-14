@@ -151,6 +151,12 @@ Replace `[INFO] driver ensure: loaded '<embedded>'` with a single INFO line:
 Path text via `axl_device_path_to_text`. If synthesis was skipped (failure
 path), the line still prints name/handle/guid/base/size with `path=<none>`.
 
+> **Superseded in 3.2.1 — the line is `debug`, not `INFO`.** Its content is
+> unchanged; only the level moved. A driver that loaded is the outcome the
+> caller asked for, so announcing it above debug put a line on every healthy
+> boot of any consumer running at `AXL_LOG_INFO`. It is still there under
+> `-v`. See the 3.2.1 CHANGELOG entry.
+
 ## Testing (test-first; bug-fix bucket D + new-API bucket A)
 
 **Unit (`test/unit/axl-test-driver.c`), safe negatives + exact strings:**

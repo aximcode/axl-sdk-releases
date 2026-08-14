@@ -4946,6 +4946,57 @@ test_fread_fwrite_zero_sized_requests(void)
 }
 
 // ---------------------------------------------------------------------------
+// A failed open is reported to the caller through the return value, so the
+// library must not ALSO announce it above debug -- only the caller knows
+// whether a missing file is a fault or an expected probe.
+//
+// Regression guard: these three sites logged axl_warning, which every
+// consumer running at AXL_LOG_INFO saw on a run where nothing was wrong. The
+// same event was already axl_debug in all three backends one layer down, so
+// the split verdict was visible inside the library itself.
+// ---------------------------------------------------------------------------
+
+static void
+test_failed_open_is_quiet_at_info(void)
+{
+    void   *contents = NULL;
+    size_t  len      = 0;
+    int     rc;
+
+    /* src/fs/axl-fs.c -- axl_file_get_contents, open for read. */
+    test_log_quiet_begin("fs");
+    rc = axl_file_get_contents("fs0:\\axl-quiet-nonexistent.bin",
+                               &contents, &len);
+    test_log_quiet_end("quiet: get_contents open failure logs nothing at INFO");
+    test_check(rc == AXL_ERR,
+               "quiet: get_contents on a missing file returns AXL_ERR");
+    /* Only reachable if the premise broke and the file EXISTS. Release it
+       anyway, so that shows up as the FAIL above rather than as a leak-gate
+       failure in a different part of the run. */
+    axl_free(contents);
+    contents = NULL;
+
+    /* src/fs/axl-fs.c -- axl_file_set_contents, open for create. An unmapped
+       volume fails the open itself, which is the site under test; a bad
+       filename would fail later, in the write. */
+    test_log_quiet_begin("fs");
+    rc = axl_file_set_contents("fs99:\\axl-quiet-nonexistent.bin", "x", 1);
+    test_log_quiet_end("quiet: set_contents open failure logs nothing at INFO");
+    test_check(rc == AXL_ERR,
+               "quiet: set_contents to an unmapped volume returns AXL_ERR");
+
+    /* src/stream/axl-stream-file.c -- axl_fopen. Same event as the two
+       above; leaving this one loud would recreate the split verdict. */
+    test_log_quiet_begin("stream");
+    AxlStream *s = axl_fopen("fs99:\\axl-quiet-nonexistent.bin", "r");
+    test_log_quiet_end("quiet: fopen open failure logs nothing at INFO");
+    test_check(s == NULL, "quiet: fopen on an unmapped volume returns NULL");
+    if (s != NULL) {
+        axl_fclose(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -5038,6 +5089,7 @@ test_io_main(int argc, char **argv)
     test_stream_init_resets_the_static_streams();
     test_fclose_frees_a_heap_stream();
     test_fclose_leaves_the_static_streams_usable();
+    test_failed_open_is_quiet_at_info();
 
     return test_print_results();
 }

@@ -264,7 +264,7 @@ axl_fopen(const char *path, const char *mode)
     axl_free(wide_path);
 
     if (rc != 0) {
-        axl_warning("open failed: %s", path);
+        axl_debug("open failed: %s", path);
         return NULL;
     }
 

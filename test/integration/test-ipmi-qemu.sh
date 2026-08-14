@@ -61,4 +61,30 @@ test_add_network
 test_add_ipmi_bmc_sim_kcs
 test_run_foreground 40
 
+# --- src/ipmi/axl-ipmi-kcs.c "IPMI KCS transport ready" stays at debug -------
+#
+# This is the run that REACHES that line: the BMC sim answers, so kcs_open
+# succeeds and its success line executes. AxlTestIpmi's own quiet window
+# deliberately skips this branch — SMBIOS Type 38 speaks at INFO here, and
+# that is follow-on-sweep material, not something 3.2.1 fixed — so without
+# this check the site has no guard at all, and a sabotage back to axl_info
+# goes undetected.
+#
+# Both halves are load-bearing. The absence grep alone would pass vacuously on
+# a run where no transport opened, so the reach marker is what makes it a
+# measurement rather than a tautology.
+test_clean_log
+if grep -qa 'real_hw: transport=1' "$TEST_CLEAN_LOG"; then
+    test_host_pass "kcs: the run opened a KCS transport (the ready line ran)"
+    if grep -qa 'KCS transport ready' "$TEST_CLEAN_LOG"; then
+        test_host_fail "kcs: 'transport ready' is a success line, not INFO"
+        grep -a 'KCS transport ready' "$TEST_CLEAN_LOG" | sed 's/^/    /'
+    else
+        test_host_pass "kcs: 'transport ready' is a success line, not INFO"
+    fi
+else
+    test_host_fail "kcs: no KCS transport opened — the BMC sim did not answer"
+fi
+test_host_summary "ipmi KCS log-level checks ($TEST_ARCH)"
+
 test_count_results

@@ -425,7 +425,7 @@ axl_ipmi_session_new_with_transport(AxlIpmiTransport hint)
     }
 
     if (rc != 0) {
-        axl_warning("No IPMI transport available (hint=%d)", (int)hint);
+        axl_debug("No IPMI transport available (hint=%d)", (int)hint);
         return NULL;
     }
     return axl_steal_pointer(&s);

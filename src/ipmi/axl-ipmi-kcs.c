@@ -427,7 +427,7 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
     ops->close    = kcs_close;
     ops->ctx      = k;
 
-    axl_info("IPMI KCS transport ready (data=0x%x, cmd=0x%x)",
-             (unsigned)data_port, (unsigned)cmd_port);
+    axl_debug("IPMI KCS transport ready (data=0x%x, cmd=0x%x)",
+              (unsigned)data_port, (unsigned)cmd_port);
     return AXL_OK;
 }

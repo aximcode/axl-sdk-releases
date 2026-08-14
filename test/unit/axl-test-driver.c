@@ -984,6 +984,39 @@ test_handle_enum(void)
     probe_net_stack_location();
 }
 
+// ---------------------------------------------------------------------------
+// A driver that cannot be read is reported through the return value.
+//
+// axl_driver_load on an unmapped volume walks the whole failure path: the
+// DevicePath load is skipped (no volume handle to build one from), the buffer
+// fallback's read fails, and AXL_ERR comes back. That read failure used to
+// announce itself twice at warning -- once from axl-fs.c, once from
+// axl-driver.c -- to a caller that was already checking the status.
+//
+// Ten lines above the axl-driver.c site, the LoadImage failure it falls back
+// FROM was already axl_debug, so the file contradicted itself inside a single
+// function.
+// ---------------------------------------------------------------------------
+
+static void
+test_failed_driver_load_is_quiet_at_info(void)
+{
+    AxlDriverHandle h = NULL;
+
+    /* "driver" rather than "fs": both domains speak on this path, and the
+       axl-driver.c site is the one with no other coverage. */
+    test_log_quiet_begin("driver");
+    int rc = axl_driver_load("fs99:\\axl-quiet-nonexistent.efi", &h);
+    test_log_quiet_end("quiet: driver load read failure logs nothing at INFO");
+    test_check(rc == AXL_ERR,
+               "quiet: driver load from an unmapped volume returns AXL_ERR");
+    test_check(h == NULL, "quiet: driver load failure leaves the handle NULL");
+    /* Premise-broke path: unload rather than leak the image. */
+    if (h != NULL) {
+        axl_driver_unload(h);
+    }
+}
+
 int
 test_driver_main(int argc, char **argv)
 {
@@ -1007,6 +1040,7 @@ test_driver_main(int argc, char **argv)
     test_deps_walk_diamond();
     test_deps_walk_missing_dep();
     test_deps_parse_errors();
+    test_failed_driver_load_is_quiet_at_info();
 
     return test_print_results();
 }

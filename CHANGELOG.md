@@ -3,6 +3,49 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 3.2.1 — 2026-08-14
+
+### Fixed
+
+- **The library announced at `warning`/`info` what it had already reported to
+  its caller through the return value.** A consumer that moved its default
+  level to `AXL_LOG_INFO` — under the ordinary rule that a real failure should
+  be visible without `-v`, and nothing should be logged on the green path —
+  saw nine AXL lines on a fully passing 209-assertion run. Its only recourse
+  was to pin AXL's domains to `ERROR` from the outside, which a consumer
+  should never have to do.
+
+  Eight sites drop to `debug`. Only the caller knows whether a missing file is
+  a fault or an expected probe, and the status it is already checking says the
+  same thing the log line did:
+
+  | Site | Was |
+  |---|---|
+  | `axl_file_get_contents` open failure (`src/fs/axl-fs.c`) | `warning` |
+  | `axl_file_set_contents` open failure (`src/fs/axl-fs.c`) | `warning` |
+  | `axl_fopen` open failure (`src/stream/axl-stream-file.c`) | `warning` |
+  | `axl_driver_load` read failure (`src/util/axl-driver.c`) | `warning` |
+  | "No IPMI transport available" (`src/ipmi/axl-ipmi.c`) | `warning` |
+  | "IPMI KCS transport ready" (`src/ipmi/axl-ipmi-kcs.c`) | `info` |
+  | "driver ensure: loaded …" (`src/util/axl-driver.c`) | `info` |
+  | "loaded driver: …" (`src/util/axl-driver.c`) | `info` |
+
+  The last three are success lines: a machine with no BMC is a configuration,
+  not a fault, and a driver that loaded is the outcome the caller asked for.
+  The two `driver` ones cost a line per driver on a healthy boot for any
+  consumer at INFO that loads through those paths.
+
+  The split verdict was already visible inside the library: `"open failed"`
+  was `debug` in all three backends and `warning` in the two wrappers one
+  layer above them, and `axl-driver.c` contradicted itself inside a single
+  function — a `LoadImage` failure at `debug`, the read failure ten lines
+  later at `warning`.
+
+  **No API or ABI change**, and nothing is lost: every demoted line is still
+  there at `-v`. Warnings that are a `void`-returning helper's *only* channel
+  are deliberately untouched — four in `axl-driver.c`'s image-identity path
+  stay at `warning`, because the caller has no return value to inspect.
+
 ## 3.2.0 — 2026-08-12
 
 ### Breaking

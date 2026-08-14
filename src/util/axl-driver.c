@@ -755,7 +755,7 @@ axl_driver_load(
     void *buf = NULL;
     size_t buf_size = 0;
     if (axl_file_get_contents(path, &buf, &buf_size) != AXL_OK || buf == NULL) {
-        axl_warning("driver load: cannot read '%s'", path);
+        axl_debug("driver load: cannot read '%s'", path);
         return AXL_ERR;
     }
 
@@ -1491,16 +1491,16 @@ driver_start_and_verify(
         AXL_AUTO_FREE char *dptext =
             (dp != NULL) ? axl_device_path_to_text(dp) : NULL;
         const AxlGuid *g = protocol_guid;
-        axl_info("driver ensure: loaded '%s' handle=0x%llx "
-                 "guid=%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x "
-                 "base=0x%llx size=0x%llx path=%s",
-                 source_label, (unsigned long long)(uintptr_t)drv,
-                 g->data1, g->data2, g->data3,
-                 g->data4[0], g->data4[1], g->data4[2], g->data4[3],
-                 g->data4[4], g->data4[5], g->data4[6], g->data4[7],
-                 (li != NULL) ? (unsigned long long)(uintptr_t)li->ImageBase : 0ULL,
-                 (li != NULL) ? (unsigned long long)li->ImageSize : 0ULL,
-                 (dptext != NULL) ? dptext : "<none>");
+        axl_debug("driver ensure: loaded '%s' handle=0x%llx "
+                  "guid=%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x "
+                  "base=0x%llx size=0x%llx path=%s",
+                  source_label, (unsigned long long)(uintptr_t)drv,
+                  g->data1, g->data2, g->data3,
+                  g->data4[0], g->data4[1], g->data4[2], g->data4[3],
+                  g->data4[4], g->data4[5], g->data4[6], g->data4[7],
+                  (li != NULL) ? (unsigned long long)(uintptr_t)li->ImageBase : 0ULL,
+                  (li != NULL) ? (unsigned long long)li->ImageSize : 0ULL,
+                  (dptext != NULL) ? dptext : "<none>");
         return AXL_OK;
     }
 
@@ -1950,7 +1950,7 @@ driver_load_cb(const char *full_path, const AxlFsEntry *entry, void *user)
         if (axl_driver_start(drv) == 0) {
             axl_driver_connect(drv);
             c->loaded++;
-            axl_info("loaded driver: %s", entry->name);
+            axl_debug("loaded driver: %s", entry->name);
         } else {
             axl_driver_unload(drv);
             axl_warning("failed to start: %s", entry->name);
