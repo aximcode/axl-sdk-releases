@@ -344,7 +344,7 @@ axl_http_server_use_tls(
     }
 
     s->tls_enabled = true;
-    axl_info("TLS enabled on port %u", (unsigned)s->port);
+    axl_debug("TLS enabled on port %u", (unsigned)s->port);
     return AXL_OK;
 }
 

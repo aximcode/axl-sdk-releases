@@ -439,7 +439,7 @@ axl_task_pool_new(void)
 
     pool->mp_ctx = axl_backend_mp_init(&ap_count);
     if (pool->mp_ctx == NULL) {
-        axl_info("MP Services not available -- single-core fallback");
+        axl_debug("MP Services not available -- single-core fallback");
         pool->single_core = true;
         return pool;
     }
@@ -516,7 +516,7 @@ axl_task_pool_new(void)
            through also registers the quiesce hook below — a dispatched AP
            that has not arrived YET is exactly the one that must not still
            be spinning at OS handoff. */
-        axl_info("no APs reached their worker loop -- single-core fallback");
+        axl_debug("no APs reached their worker loop -- single-core fallback");
         pool->single_core = true;
     }
 
@@ -531,7 +531,7 @@ axl_task_pool_new(void)
         pool->pre_ebs = NULL;
     }
 
-    axl_info("%llu AP workers running", (unsigned long long)pool->worker_count);
+    axl_debug("%llu AP workers running", (unsigned long long)pool->worker_count);
     return pool;
 }
 

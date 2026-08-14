@@ -339,9 +339,9 @@ dhcp4_sb_bringup(void)
         axl_memcpy(g_fallback_lease.subnet,  &mode.SubnetMask, 4);
         axl_memcpy(g_fallback_lease.router,  &mode.RouterAddress, 4);
         g_have_fallback_lease = true;
-        axl_info("dhcp4_sb: leased %u.%u.%u.%u (no IP4Config2)",
-                 g_fallback_lease.address[0], g_fallback_lease.address[1],
-                 g_fallback_lease.address[2], g_fallback_lease.address[3]);
+        axl_debug("dhcp4_sb: leased %u.%u.%u.%u (no IP4Config2)",
+                  g_fallback_lease.address[0], g_fallback_lease.address[1],
+                  g_fallback_lease.address[2], g_fallback_lease.address[3]);
         rc = AXL_OK;
         /* Intentionally NOT DestroyChild — keep the lease active. */
     }
@@ -410,9 +410,9 @@ pxe_bc_dhcp(void)
         axl_memcpy(g_fallback_lease.address, &pxe->Mode->StationIp, 4);
         axl_memcpy(g_fallback_lease.subnet,  &pxe->Mode->SubnetMask, 4);
         g_have_fallback_lease = true;
-        axl_info("pxe_bc: leased %u.%u.%u.%u (no IP4Config2/Dhcp4-SB)",
-                 g_fallback_lease.address[0], g_fallback_lease.address[1],
-                 g_fallback_lease.address[2], g_fallback_lease.address[3]);
+        axl_debug("pxe_bc: leased %u.%u.%u.%u (no IP4Config2/Dhcp4-SB)",
+                  g_fallback_lease.address[0], g_fallback_lease.address[1],
+                  g_fallback_lease.address[2], g_fallback_lease.address[3]);
         rc = AXL_OK;
         /* Leave PXE started — keep the address active. */
     }
@@ -1058,7 +1058,7 @@ load_driver_list(
             continue;
         }
 
-        axl_info("ensure_drivers: loaded '%s'", path);
+        axl_debug("ensure_drivers: loaded '%s'", path);
         loaded++;
     }
     return loaded;
@@ -1068,8 +1068,8 @@ AxlNetDriversStatus
 axl_net_ensure_drivers(void)
 {
     size_t snp_before = net_count_snp();
-    axl_info("ensure_drivers: starting (%zu SNP handles already present)",
-             snp_before);
+    axl_debug("ensure_drivers: starting (%zu SNP handles already present)",
+              snp_before);
 
     /* Short-circuit if SNP is already registered. This makes the call
      * idempotent — safe for tools to invoke unconditionally before any
@@ -1101,14 +1101,14 @@ axl_net_ensure_drivers(void)
      * unnecessary avoids both side-effects. See net_drivers_ipxe[]
      * comment for the empirical evidence captured during development. */
     if (snp_after_core == 0) {
-        axl_info(
+        axl_debug(
             "ensure_drivers: no SNP after core drivers - falling back to iPXE");
         loaded_count += load_driver_list(
             net_drivers_ipxe,
             sizeof(net_drivers_ipxe) / sizeof(net_drivers_ipxe[0]));
         axl_driver_connect(NULL);
     } else {
-        axl_info(
+        axl_debug(
             "ensure_drivers: SNP came up via core drivers (%zu handles) - skipping iPXE",
             snp_after_core);
     }
@@ -1126,8 +1126,8 @@ axl_net_ensure_drivers(void)
     axl_watchdog_disarm();
 
     size_t snp_after = net_count_snp();
-    axl_info("ensure_drivers: %zu drivers loaded, SNP handles %zu->%zu",
-             loaded_count, snp_before, snp_after);
+    axl_debug("ensure_drivers: %zu drivers loaded, SNP handles %zu->%zu",
+              loaded_count, snp_before, snp_after);
 
     if (snp_after > 0) {
         return AXL_NET_DRIVERS_OK;
@@ -1359,7 +1359,7 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
         if (cfg_handles != NULL) {
             axl_free(cfg_handles);
         }
-        axl_info("no IP4Config2 - trying IP4Config2-free DHCP fallback");
+        axl_debug("no IP4Config2 - trying IP4Config2-free DHCP fallback");
         /* Both ladder rungs keep have=false: they never touch IP4Config2, so
            there is no registry NIC to report. Their lease is cached in
            _axl_net_fallback_lease, which axl_net_get_ip_address surfaces. */
@@ -1449,7 +1449,7 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
 
     if (wait_rc == AXL_OK) {
         g_config_method = AXL_NET_CONFIG_IP4CONFIG2;
-        axl_info("network ready");
+        axl_debug("network ready");
         /* The exit this out-param exists for: ip4cfg_for_ex already recorded
            the NIC we drove DHCP on, so there is nothing to set here. */
         return AXL_OK;
@@ -2105,7 +2105,7 @@ axl_net_takeover_if_no_snp(void)
     axl_net_ensure_drivers();
     _axl_net_connect_snp_handles();
     if (net_count_snp() > 0) {
-        axl_info("takeover: SNP came up via staged drivers (no disconnect)");
+        axl_debug("takeover: SNP came up via staged drivers (no disconnect)");
         return AXL_OK;
     }
 
@@ -2116,7 +2116,7 @@ axl_net_takeover_if_no_snp(void)
     _axl_net_connect_snp_handles();
 
     size_t snp_after = net_count_snp();
-    axl_info("takeover: re-drove %zu NIC(s), SNP handles now %zu",
-             taken, snp_after);
+    axl_debug("takeover: re-drove %zu NIC(s), SNP handles now %zu",
+              taken, snp_after);
     return (snp_after > 0) ? AXL_OK : AXL_ERR;
 }

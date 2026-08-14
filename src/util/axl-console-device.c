@@ -1256,8 +1256,8 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
     d->installing = false;
 
     *out = d;
-    axl_info("console device installed (%ux%u, %u evicted)",
-             d->cols, d->rows, d->evicted_count);
+    axl_debug("console device installed (%ux%u, %u evicted)",
+              d->cols, d->rows, d->evicted_count);
     return AXL_OK;
 }
 
@@ -1333,7 +1333,7 @@ axl_console_device_uninstall(AxlConsoleDevice *d)
     }
     g_dev = NULL;
     axl_free(d);
-    axl_info("console device uninstalled");
+    axl_debug("console device uninstalled");
 }
 
 // --- Input relay injection (functional only when take_input=true) ------------

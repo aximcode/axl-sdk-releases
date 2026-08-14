@@ -610,7 +610,7 @@ axl_console_tap_install(AxlConsoleTap **out, const AxlConsoleOps *ops, void *use
        live. */
     axl_console_emit_report_cell_rule(&m->emit);
 
-    axl_info("console tap installed (%ux%u)", m->cols, m->rows);
+    axl_debug("console tap installed (%ux%u)", m->cols, m->rows);
     return AXL_OK;
 }
 
@@ -648,7 +648,7 @@ axl_console_tap_uninstall(AxlConsoleTap *m)
 
     g_tap = NULL;
     axl_free(m);
-    axl_info("console tap uninstalled");
+    axl_debug("console tap uninstalled");
 }
 
 int

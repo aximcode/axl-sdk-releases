@@ -33,6 +33,12 @@ cat << 'NSHEOF' | test_set_startup
 fs0:
 cd \
 
+# The reclaim verdict this test greps for is an axl_debug line: the service
+# framework reports the outcome to its caller, so announcing it at INFO put a
+# line on every healthy reload. This run opts INTO seeing it, which is the
+# right way round -- the library is quiet by default and the test asks.
+set AXL_LOG_LEVEL debug
+
 echo Connecting drivers...
 connect -r
 stall 1000000

@@ -695,7 +695,7 @@ axl_9p_server_listen(
         return AXL_ERR;
     }
 
-    axl_info("9p: server listening on port %u", (unsigned)p);
+    axl_debug("9p: server listening on port %u", (unsigned)p);
     return AXL_OK;
 }
 

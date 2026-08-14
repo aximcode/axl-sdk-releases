@@ -198,6 +198,7 @@ run_fbcon_serial_scenario() {
     OVMF_CODE="$DBG_CODE" OVMF_VARS="$DBG_VARS" SHOT_WAIT=22 \
         timeout 160 "$RUN_QEMU" --arch X64 \
             --screenshot "$shot" --debugcon "$dbg" --serial-log "$ser" \
+            --setvar AXL_LOG_LEVEL=debug \
             --sendkey "$keys" \
             "$FBCON_DRIVER" >/dev/null 2>&1 || true
 
@@ -377,6 +378,7 @@ echo "=== fbcon-reload ==="
 OVMF_CODE="$DBG_CODE" OVMF_VARS="$DBG_VARS" SHOT_WAIT=30 \
     timeout 160 "$RUN_QEMU" --arch X64 \
         --screenshot "$FBCON_RELOAD_SHOT" --debugcon "$FBCON_RELOAD_DBG" --serial-log "$FBCON_RELOAD_SER" \
+        --setvar AXL_LOG_LEVEL=debug \
         --sendkey "ctrl-backslash f b c o n dot e f i ret" \
         "$FBCON_DRIVER" >/dev/null 2>&1 || true
 if [[ -f "$FBCON_RELOAD_DBG" ]] && grep -aqE 'ASSERT|Pool\.c\(721\)|Bad Signature|CpuDeadLoop|DeadLoop' "$FBCON_RELOAD_DBG"; then

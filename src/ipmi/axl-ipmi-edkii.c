@@ -128,7 +128,7 @@ axl_ipmi_edkii_open(AxlIpmiTransportOps *ops)
     ops->close    = edkii_close;
     ops->ctx      = ipmi;
 
-    axl_info("IPMI EDKII transport ready (IPMI_PROTOCOL @ %p)",
-             (void *)ipmi);
+    axl_debug("IPMI EDKII transport ready (IPMI_PROTOCOL @ %p)",
+              (void *)ipmi);
     return AXL_OK;
 }

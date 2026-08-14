@@ -41,8 +41,8 @@ axl_smbus_new(void)
     }
     s->ops = ops;
 
-    axl_info("SMBus: %s transport ready",
-             axl_smbus_transport_string(ops.kind));
+    axl_debug("SMBus: %s transport ready",
+              axl_smbus_transport_string(ops.kind));
     return s;
 }
 
@@ -133,7 +133,7 @@ axl_smbus_new_with_probe(AxlSmbusProbeFn probe, void *user)
     AxlSmbus *s = try_each_handle(&gEfiSmbusHcProtocolGuid,
                                   axl_smbus_hc_open_handle, probe, user);
     if (s != NULL) {
-        axl_info("SMBus: HC transport ready (probe-selected)");
+        axl_debug("SMBus: HC transport ready (probe-selected)");
         return s;
     }
 
@@ -141,7 +141,7 @@ axl_smbus_new_with_probe(AxlSmbusProbeFn probe, void *user)
     s = try_each_handle(&i2c_guid,
                         axl_smbus_i2c_open_handle, probe, user);
     if (s != NULL) {
-        axl_info("SMBus: I2C transport ready (probe-selected)");
+        axl_debug("SMBus: I2C transport ready (probe-selected)");
         return s;
     }
 
@@ -150,7 +150,7 @@ axl_smbus_new_with_probe(AxlSmbusProbeFn probe, void *user)
      * EFI_SMBUS_HC_PROTOCOL pointing at a different controller. */
     s = try_piix4_ports(probe, user);
     if (s != NULL) {
-        axl_info("SMBus: PIIX4 transport ready (probe-selected)");
+        axl_debug("SMBus: PIIX4 transport ready (probe-selected)");
         return s;
     }
 

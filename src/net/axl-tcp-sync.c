@@ -410,7 +410,7 @@ axl_tcp_listen_via(uint16_t port, const AxlIPv4Address *source_ip,
     sock->listener_id = g_next_listener_id++;   /* unique; children inherit it */
 
     *out_listener = sock;
-    axl_info("listening on port %u", port);
+    axl_debug("listening on port %u", port);
     return AXL_OK;
 }
 

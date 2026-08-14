@@ -46,6 +46,7 @@
 #                         H may be `auto` to have a verified-free host port
 #                         claimed for you and reported as HOSTFWD_<G>=<port>.
 #   --extra FILE          Stage additional .efi file on disk (repeatable)
+#   --setvar NAME=VALUE    `set` a shell variable before the app (repeatable)
 #   --sendkey "K K ..."   With --screenshot: inject QEMU monitor key tokens
 #                         (e.g. "h i spc t h e r e", "ctrl-s", "ret") once
 #                         the app is up, then capture — for "screenshot the
@@ -137,6 +138,12 @@ CPU_SPEC=""         # --cpu SPEC (HF4: replay a captured CPU model, e.g. qemu64,
 HOSTFWDS=()
 HOSTFWD_CHOSEN=()   # HOSTFWD_<guest>=<host> for each --hostfwd auto:<guest>
 EXTRA_FILES=()
+# Shell variables to `set` before the app runs, as NAME=VALUE. Exists so a test
+# can opt INTO verbosity instead of the library shouting by default: AXL reads
+# AXL_LOG_LEVEL through the Shell protocol, so `--setvar AXL_LOG_LEVEL=debug`
+# makes debug-level lines observable in the serial log for the one run that
+# needs them. Repeatable.
+SETVARS=()
 # --qemu-arg STRING: one literal QEMU command-line token, appended
 # verbatim (NOT word-split). Repeatable — pass one --qemu-arg per token,
 # e.g. `--qemu-arg -device --qemu-arg virtio-foo,bar=1`. Appending
@@ -231,6 +238,11 @@ while [[ $# -gt 0 ]]; do
         --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
+        --setvar)
+            # NAME=VALUE, checked here rather than silently emitting `set FOO
+            # FOO` for a bare `--setvar FOO`.
+            [[ "$2" == *=* ]] || { echo "ERROR: --setvar wants NAME=VALUE, got '$2'" >&2; exit 1; }
+            SETVARS+=("$2"); shift 2 ;;
         --sendkey)    SENDKEY_SEQ+=" $2"; shift 2 ;;
         --sendkey-after) SENDKEY_AFTER="$2"; shift 2 ;;
         --sendkey-settle) SENDKEY_SETTLE_MS="$2"; shift 2 ;;
@@ -365,6 +377,8 @@ Options:
                            "the guest has no network" rather than as a
                            bind error.
   --extra FILE             Stage additional .efi on disk (repeatable)
+  --setvar NAME=VALUE      `set` a shell variable before the app (repeatable).
+                           e.g. --setvar AXL_LOG_LEVEL=debug to see debug lines
   --sendkey "K K ..."      With --screenshot: inject QEMU monitor key
                            tokens (space-separated; e.g.
                            "h i spc t h e r e", "ctrl-s", "ret") after the
@@ -901,6 +915,29 @@ if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
     done
 fi
 
+# Emit the caller's `--setvar NAME=VALUE` pairs as shell `set` commands. One
+# definition used by both startup-script branches, so a --setvar cannot work in
+# one and silently do nothing in the other.
+emit_setvars() {
+    local sv
+    for sv in "${SETVARS[@]}"; do
+        echo "set ${sv%%=*} ${sv#*=}"
+    done
+}
+
+# There is no startup script to carry them in these modes, so a --setvar would
+# be silently ignored -- say so instead.
+if [[ ${#SETVARS[@]} -gt 0 ]]; then
+    if [[ "$BOOT_TARGET" == "true" ]]; then
+        echo "ERROR: --setvar needs the shell, but --boot-target bypasses it" >&2
+        exit 1
+    fi
+    if [[ -z "$EFI_FILE" ]]; then
+        echo "ERROR: --setvar needs an application to run before" >&2
+        exit 1
+    fi
+fi
+
 # Startup script
 if [[ -n "$CUSTOM_NSH" ]]; then
     if [[ ! -f "$CUSTOM_NSH" ]]; then
@@ -909,7 +946,9 @@ if [[ -n "$CUSTOM_NSH" ]]; then
     fi
     # Prepend the app-output sentinel so the non-raw filter can find where the
     # script's output begins (the launcher removes the old countdown anchor).
-    { echo "echo $APP_OUTPUT_SENTINEL"; cat "$CUSTOM_NSH"; } > "$STAGING/startup.nsh"
+    # The `set`s go BEFORE the sentinel so their echo stays out of the region
+    # the filter treats as application output.
+    { emit_setvars; echo "echo $APP_OUTPUT_SENTINEL"; cat "$CUSTOM_NSH"; } > "$STAGING/startup.nsh"
     # Power off when a non-interactive custom nsh finishes, so the run doesn't
     # idle at the shell prompt until --timeout (the auto-generated app launch
     # gets a `reset -s` for the same reason). Skipped for background /
@@ -988,6 +1027,10 @@ else
             : # bare-shell mode, or --boot-target (BdsDxe launches the app as
               # \EFI\BOOT\BOOTx64.EFI directly; this startup.nsh is never run).
         else
+            # Shell variables the caller asked for, before the app so it can
+            # read them on its first log emission (AXL_LOG_LEVEL is applied
+            # lazily, on the first line emitted).
+            emit_setvars
             # Marker delimiting where the app's output begins, so the non-raw
             # filter can strip the shell banner + mapping table above it (the
             # launcher removes the old "...to continue." countdown anchor).

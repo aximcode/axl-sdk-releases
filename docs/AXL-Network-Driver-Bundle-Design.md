@@ -121,7 +121,9 @@ Guest output (key lines):
 ```
 Image 'fs0:\drivers\x64\ipxe-intel.efi' loaded at 1DE90000 - Success
 Connect - Handle [B4] Result Success.
-[INFO]  net: network ready after 5 seconds      ← DHCP succeeded
+[DEBUG] net: network ready after 5 seconds      ← DHCP succeeded (run with
+                                                  AXL_LOG_LEVEL=debug to see
+                                                  it; success is not INFO)
 > GET http://10.0.2.2:18080/test.txt
 < HTTP 200
 < server: SimpleHTTP/0.6 Python/3.12.12

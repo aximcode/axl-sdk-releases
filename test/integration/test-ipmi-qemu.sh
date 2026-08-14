@@ -64,11 +64,11 @@ test_run_foreground 40
 # --- src/ipmi/axl-ipmi-kcs.c "IPMI KCS transport ready" stays at debug -------
 #
 # This is the run that REACHES that line: the BMC sim answers, so kcs_open
-# succeeds and its success line executes. AxlTestIpmi's own quiet window
-# deliberately skips this branch — SMBIOS Type 38 speaks at INFO here, and
-# that is follow-on-sweep material, not something 3.2.1 fixed — so without
-# this check the site has no guard at all, and a sabotage back to axl_info
-# goes undetected.
+# succeeds and its success line executes. AxlTestIpmi's own quiet window now
+# asserts on this branch too (3.2.2 demoted the SMBIOS Type 38 discovery lines
+# that had forced it to skip), so the two overlap deliberately: this one names
+# the specific string, and pairs it with a reach marker, so a regression says
+# WHICH line came back rather than only that something did.
 #
 # Both halves are load-bearing. The absence grep alone would pass vacuously on
 # a run where no transport opened, so the reach marker is what makes it a

@@ -720,6 +720,12 @@ dump_leaks(
     size_t           idx;
 
     if (mAllocList == NULL) {
+        /* log-level: this function returns void and its whole PURPOSE is to
+           report -- the line IS the return value, not commentary on an
+           operation that already returned a status. A caller has no other way
+           to learn the verdict, and the QEMU harness's leak gate greps for
+           this exact string to prove a binary reported at all, so demoting it
+           would not quieten the tree, it would blind the gate. */
         axl_info("no leaks detected");
         return;
     }

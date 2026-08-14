@@ -241,9 +241,9 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
         const uint8_t  primary_idx     = spec_modifier & 0x03;
 
         decode_kcs_ports(base, spec_modifier, &data_port, &cmd_port);
-        axl_info("SMBIOS Type 38: KCS @ 0x%x/0x%x (modifier=0x%02x)",
-                 (unsigned)data_port, (unsigned)cmd_port,
-                 (unsigned)spec_modifier);
+        axl_debug("SMBIOS Type 38: KCS @ 0x%x/0x%x (modifier=0x%02x)",
+                  (unsigned)data_port, (unsigned)cmd_port,
+                  (unsigned)spec_modifier);
         if (axl_ipmi_kcs_open(ops, data_port, cmd_port) == 0) {
             return 0;
         }
@@ -254,10 +254,10 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
             uint8_t spacing = spec_spacings[i];
             uint16_t alt_data = (uint16_t)(base & ~1ULL);
             uint16_t alt_cmd  = (uint16_t)(alt_data + spacing);
-            axl_info("SMBIOS Type 38: KCS retry @ 0x%x/0x%x "
-                     "(spacing=%u, modifier mismatch fallback)",
-                     (unsigned)alt_data, (unsigned)alt_cmd,
-                     (unsigned)spacing);
+            axl_debug("SMBIOS Type 38: KCS retry @ 0x%x/0x%x "
+                      "(spacing=%u, modifier mismatch fallback)",
+                      (unsigned)alt_data, (unsigned)alt_cmd,
+                      (unsigned)spacing);
             if (axl_ipmi_kcs_open(ops, alt_data, alt_cmd) == 0) {
                 return 0;
             }
@@ -272,10 +272,10 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
             uint8_t spacing = spec_spacings[i];
             uint16_t alt_cmd  = (uint16_t)(base & ~1ULL);
             uint16_t alt_data = (uint16_t)(alt_cmd + spacing);
-            axl_info("SMBIOS Type 38: KCS swapped retry @ 0x%x/0x%x "
-                     "(spacing=%u, base-is-cmd fallback)",
-                     (unsigned)alt_data, (unsigned)alt_cmd,
-                     (unsigned)spacing);
+            axl_debug("SMBIOS Type 38: KCS swapped retry @ 0x%x/0x%x "
+                      "(spacing=%u, base-is-cmd fallback)",
+                      (unsigned)alt_data, (unsigned)alt_cmd,
+                      (unsigned)spacing);
             if (axl_ipmi_kcs_open(ops, alt_data, alt_cmd) == 0) {
                 return 0;
             }
@@ -293,8 +293,8 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
         // (raw >> 1) address reaches the wrong device on such hardware.
         //
         SsifProbeState st = { .raw6 = raw[6], .found_addr = 0, .found = false };
-        axl_info("SMBIOS Type 38: SSIF (I2CSlaveAddress raw=0x%02x) - probing "
-                 "controllers", (unsigned)raw[6]);
+        axl_debug("SMBIOS Type 38: SSIF (I2CSlaveAddress raw=0x%02x) - probing "
+                  "controllers", (unsigned)raw[6]);
 
         AxlSmbus *smbus = axl_smbus_new_with_probe(ssif_bmc_probe, &st);
         if (smbus == NULL || !st.found) {
@@ -313,10 +313,10 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
         return rc;
     }
     case IPMI_SMBIOS_IFACE_BT:
-        axl_info("SMBIOS Type 38: BT interface - not supported");
+        axl_debug("SMBIOS Type 38: BT interface - not supported");
         return -1;
     case IPMI_SMBIOS_IFACE_SMIC:
-        axl_info("SMBIOS Type 38: SMIC interface - not supported");
+        axl_debug("SMBIOS Type 38: SMIC interface - not supported");
         return -1;
     default:
         axl_warning("SMBIOS Type 38: unknown interface type %u",

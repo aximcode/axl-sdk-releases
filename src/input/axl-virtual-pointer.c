@@ -330,8 +330,8 @@ axl_virtual_pointer_install(AxlVirtualPointer **out,
     vp->atexit_handle = axl_atexit(vp_atexit, vp);
 
     *out = vp;
-    axl_info("virtual pointer installed (%ux%u%s)", w, h,
-             vp->has_simple ? " +simple" : "");
+    axl_debug("virtual pointer installed (%ux%u%s)", w, h,
+              vp->has_simple ? " +simple" : "");
     return AXL_OK;
 }
 
@@ -365,7 +365,7 @@ axl_virtual_pointer_uninstall(AxlVirtualPointer *vp)
 
     g_vp = NULL;
     vp_free(vp);
-    axl_info("virtual pointer uninstalled");
+    axl_debug("virtual pointer uninstalled");
 }
 
 static void

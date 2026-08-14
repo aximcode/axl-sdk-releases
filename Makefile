@@ -793,7 +793,8 @@ endif
 LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-cxx-entry check-nul check-test-registered check-tautology \
     check-fuzz-link check-examples check-json-dialect check-flag-parity \
-    check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope
+    check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
+    check-log-levels
 
 print-lint-gates:
 	@echo $(LINT_GATES)
@@ -903,7 +904,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-examples check-json-dialect driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest
+.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-examples check-json-dialect check-log-levels driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1066,6 +1067,18 @@ check-test-registered:
 # demoting the administrator account. See scripts/check-json-dialect.py.
 check-json-dialect:
 	@python3 scripts/check-json-dialect.py
+
+# axl_info in library code must justify itself with a /* log-level: */ marker.
+#
+# A library announcing "transport ready" / "listening" / "network ready" tells
+# a caller what its own return value already said, on a run where nothing is
+# wrong. This shipped twice: v3.2.1 demoted the eight sites a consumer had
+# OBSERVED, the consumer removed its workaround, re-measured, and still saw six
+# lines -- because the list came from output rather than from a census. A rule
+# that lives only in a document is re-broken by the next author to not read it.
+# See scripts/check-log-levels.py and docs/AXL-Coding-Style.md.
+check-log-levels:
+	@python3 scripts/check-log-levels.py
 
 # Verify every sdk/examples/* source still COMPILES against the current public
 # headers.

@@ -133,7 +133,7 @@ axl_ipmi_dell_open(AxlIpmiTransportOps *ops)
     ops->close    = dell_close;
     ops->ctx      = dell;
 
-    axl_info("IPMI Dell transport ready (revision=%llu)",
-             (unsigned long long)dell->Revision);
+    axl_debug("IPMI Dell transport ready (revision=%llu)",
+              (unsigned long long)dell->Revision);
     return AXL_OK;
 }

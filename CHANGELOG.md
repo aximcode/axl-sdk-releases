@@ -3,6 +3,69 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 3.2.2 — 2026-08-14
+
+### Fixed
+
+- **`axl_info` no longer announces success.** 3.2.1 demoted the eight sites a
+  consumer had *observed*. It adopted that release, deleted its domain-pinning
+  workaround, re-measured a healthy run at `AXL_LOG_INFO` — and still saw six
+  lines:
+
+  ```
+  6x  [INFO]  ipmi: SMBIOS Type 38: KCS @ 0xca2/0xca3 (modifier=0x01)
+  ```
+
+  That is a *discovery success*. The list had been assembled from output rather
+  than from a census, so it could only ever contain what someone had already
+  watched scroll past. `src/ipmi/axl-ipmi.c` even contradicted itself inside one
+  function, exactly as the backends had: `:331` was already `axl_debug` for the
+  equivalent step ("Type 38 absent; trying default KCS") while `:244`, `:257`
+  and `:275` were `axl_info`.
+
+  This release censuses instead. All 42 `axl_info` calls under `src/` were
+  classified; **41 are now `axl_debug`** — every "transport ready",
+  "installed", "listening", "network ready", "loaded", "AP workers running",
+  "no IP4Config2", "certificate loaded". A caller learns each of those from a
+  non-NULL handle or an `AXL_OK`.
+
+  **This matters more on real hardware than in emulation.** The consumer's QEMU
+  gates only reach the KCS path; on a PowerEdge it is `ipmi-dell.c` or
+  `ipmi-edkii.c` that fires, and on ARM64 Grace it is `ipmi-ssif.c` — the
+  shipped SSIF path. None of those are reachable by any downstream test, so
+  they are fixed here despite nobody having reported them.
+
+- **One `axl_info` survives, deliberately.** `axl_mem_dump_leaks()` returns
+  `void` and exists *to* report: the line is its return value, not commentary
+  on an operation that already returned a status. The QEMU harness's leak gate
+  greps for that exact string to prove a binary reported at all, so demoting it
+  would not have quietened the tree — it would have blinded the gate. Verified
+  by sabotage: demoting it fails the whole run.
+
+### Added
+
+- **`make check-log-levels`** — every `axl_info` under `src/` must carry a
+  `/* log-level: <why> */` marker. The rule had been written down twice and
+  broken twice; a keyword scan for `ready|installed|listening` would pass the
+  next phrasing nobody thought of, so INFO is now a level you opt into and
+  defend. Wired into `LINT_GATES`, so `verify.sh` runs it.
+
+- **The rule itself, in `docs/AXL-Coding-Style.md`** ("Log Levels in Library
+  Code"). The style guide said where to put `AXL_LOG_DOMAIN` and never said
+  when to use which level, which is how one event acquired two verdicts. It
+  records the discriminator — *can the caller observe this any other way?* —
+  the `void`-helper exception that keeps four `axl-driver.c` warnings, and the
+  distinction between reporting and announcing.
+
+- **`run-qemu.sh --setvar NAME=VALUE`** — `set`s a shell variable before the
+  app runs. Two integration suites asserted on library INFO lines as a proxy
+  for "the operation happened" (`console device installed/uninstalled`,
+  `reload reclaimed old image`), so quietening the library broke them. They now
+  pass `--setvar AXL_LOG_LEVEL=debug` (or `set` it in their own startup script)
+  and assert on the same lines at debug — the library is quiet by default and
+  the run that wants detail asks for it, which is the right way round. No
+  assertion was weakened to accommodate the change.
+
 ## 3.2.1 — 2026-08-14
 
 ### Fixed

@@ -548,6 +548,62 @@ If a `(void)` cast on a call does not silence a real `nodiscard`
 warning, it does not belong. (Unused-*parameter* casts —
 `(void)argc;` — are a different, valid idiom and stay.)
 
+## Log Levels in Library Code
+
+A library must not log above `debug` for a condition it reports to its
+caller through a return value — the caller has the context to judge
+severity and the library does not. Use `warning` only for something the
+caller *cannot* discover from the return value: a `void`-returning
+helper that skipped its work, silent truncation, a degraded fallback the
+return does not describe, a resource leak. Use `error` only for a
+condition the library could not report at all. Never log above `debug`
+on a success path, and never use `axl_info` for a success, a readiness
+announcement, or the completion of a step that returns a status.
+
+**The discriminator is "can the caller observe this any other way?"** —
+not "how bad does this feel". Apply it per site; a blanket sweep gets it
+wrong in both directions.
+
+```c
+/* no — the caller is already checking the status this duplicates */
+if (rc != AXL_OK) {
+    axl_warning("open failed: %s", path);
+    return AXL_ERR;
+}
+
+/* yes — the log is the only channel a void helper has */
+static void
+apply_image_identity(EFI_HANDLE h)
+{
+    if (... != EFI_SUCCESS) {
+        axl_warning("cannot read LoadedImage to set identity");
+        return;
+    }
+```
+
+Enforced by `make check-log-levels`, which requires every `axl_info`
+under `src/` to carry a justification marker:
+
+```c
+/* log-level: <why this is not a success announcement> */
+axl_info("...");
+```
+
+**Reporting is not announcing.** The one marked call in the tree is
+`axl_mem_dump_leaks`, which returns `void` and exists *to* report — its
+output is its return value, not commentary on an operation that already
+returned a status. That is the line: a function whose contract is "tell
+me the state" is not logging a success when it does so. A function that
+did some work and says it went fine is.
+
+Why this is gated rather than trusted to review: it shipped wrong twice.
+v3.2.1 demoted the eight sites a consumer had *observed*; the consumer
+removed its workaround, re-measured a healthy run, and still saw six
+lines, because the list was assembled from output instead of from a
+census. Sites nobody's test reaches — a vendor IPMI transport that only
+exists on a real PowerEdge — are exactly the ones a list misses and a
+gate does not.
+
 ## Event Loop Callback Convention
 
 Callback return values control the **source**, not the loop:

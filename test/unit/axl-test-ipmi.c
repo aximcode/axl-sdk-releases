@@ -1010,16 +1010,20 @@ test_dell_transport_dispatch(void)
 // it can act on -- so announcing it at warning told a caller that was already
 // checking the pointer.
 //
-// TOPOLOGY-GATED, and the gate is narrower than it looks. When a transport
-// DOES answer, the probe reaches SMBIOS Type 38 first, whose "Type 38: KCS @
-// 0x.../0x..." success line is still INFO -- one of the ~362 sites the
-// follow-on sweep covers, not one this release touches. Asserting silence on
-// that branch would be asserting a fix that has not shipped.
+// NO LONGER TOPOLOGY-GATED, and that is the point of 3.2.2. In 3.2.1 the
+// BMC-answered branch had to be skipped: the probe reaches SMBIOS Type 38
+// first, and its "Type 38: KCS @ 0x.../0x..." DISCOVERY SUCCESS was still
+// INFO, so asserting silence there would have asserted a fix that had not
+// shipped. That skip is exactly what let the consumer adopt 3.2.1, delete its
+// workaround, and still measure six lines on a healthy run -- the suite was
+// declining to look at the branch its hardware takes.
 //
-// The success branch's own Part A site -- "IPMI KCS transport ready", which
-// the consumer saw six times on a passing run -- is guarded from the harness
-// side instead: test-ipmi-qemu.sh attaches isa-ipmi-kcs + ipmi-bmc-sim, so it
-// is the run that REACHES that line, and it greps its own serial log for it.
+// Both branches are now assertions, so whichever way the probe lands is
+// measured:
+//
+//   test-axl.sh        no KCS device -> every transport fails -> NULL.
+//   test-ipmi-qemu.sh  isa-ipmi-kcs + ipmi-bmc-sim -> Type 38 answers, the
+//                      KCS transport opens, and the whole path must be silent.
 // ---------------------------------------------------------------------------
 
 static void
@@ -1027,15 +1031,11 @@ test_bmc_probe_is_quiet_at_info(void)
 {
     test_log_quiet_begin("ipmi");
     AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new();
-
-    if (s == NULL) {
-        test_log_quiet_end("quiet: a BMC probe that finds nothing "
-                           "logs nothing at INFO");
-    } else {
-        test_log_quiet_abort();
-        test_skip_n(1, "quiet: a BMC answered — the Type 38 INFO line on "
-                       "that branch is follow-on sweep material");
-    }
+    test_log_quiet_end("quiet: a BMC probe logs nothing at INFO, "
+                       "whichever way it lands");
+    /* Deliberately no assertion on `s`: which branch ran depends on the
+       harness, and what is under test is that BOTH are silent. */
+    (void)s;
 }
 
 // ---------------------------------------------------------------------------

@@ -183,9 +183,9 @@ axl_ipmi_ssif_probe_get_device_id(AxlSmbus *smbus, uint8_t addr)
                                  buf, &cap) == AXL_OK && cap >= 3) {
             // buf = [NetFn echo][Cmd echo][CompletionCode][data...].
             bool ok = (buf[2] == 0x00);
-            axl_info("SSIF probe: %s @ 0x%02x (cc=0x%02x)",
-                     ok ? "BMC answered Get Device ID" : "non-IPMI response",
-                     (unsigned)addr, (unsigned)buf[2]);
+            axl_debug("SSIF probe: %s @ 0x%02x (cc=0x%02x)",
+                      ok ? "BMC answered Get Device ID" : "non-IPMI response",
+                      (unsigned)addr, (unsigned)buf[2]);
             return ok;
         }
         delay *= 2;
@@ -431,8 +431,8 @@ axl_ipmi_ssif_open(AxlIpmiTransportOps *ops,
     ops->close    = ssif_close;
     ops->ctx      = s;
 
-    axl_info("IPMI SSIF transport ready (slave=0x%02x, via %s)",
-             (unsigned)slave_addr,
-             axl_smbus_transport_string(axl_smbus_transport(smbus)));
+    axl_debug("IPMI SSIF transport ready (slave=0x%02x, via %s)",
+              (unsigned)slave_addr,
+              axl_smbus_transport_string(axl_smbus_transport(smbus)));
     return AXL_OK;
 }

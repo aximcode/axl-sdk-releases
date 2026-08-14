@@ -230,7 +230,7 @@ axl_tls_init(void)
 
     g_initialized = true;
     axl_atexit(axl_tls_cleanup_thunk, NULL);
-    axl_info("initialized (mbedTLS)");
+    axl_debug("initialized (mbedTLS)");
     return AXL_OK;
 }
 
@@ -460,7 +460,7 @@ axl_tls_generate_self_signed(
     mbedtls_x509write_crt_free(&crt);
     mbedtls_pk_free(&pk);
 
-    axl_info("generated self-signed cert: %s (%zu bytes)", subject, *cert_len);
+    axl_debug("generated self-signed cert: %s (%zu bytes)", subject, *cert_len);
     return AXL_OK;
 
 cert_fail:
@@ -519,7 +519,7 @@ axl_tls_server_set_cert(
         return AXL_ERR;
     }
 
-    axl_info("server certificate loaded");
+    axl_debug("server certificate loaded");
     return AXL_OK;
 }
 

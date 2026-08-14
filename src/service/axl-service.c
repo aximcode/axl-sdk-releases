@@ -240,8 +240,19 @@ service_reload_unload_old(void *data)
     if (m_drv_reload_old != NULL) {
         EFI_STATUS st = axl_efi_call(axl_bs()->UnloadImage, 1,
                                      (EFI_HANDLE)m_drv_reload_old);
-        axl_info("reload reclaimed old image rc=0x%llx",
-                 (unsigned long long)st);
+        /* Split by outcome rather than logging one line at one level. Nothing
+           returns `st` to anyone -- this is a loop callback whose bool means
+           "run again", not a status -- so on failure the old image stays
+           RESIDENT and no caller can discover it. That is the rule's
+           resource-leak case, which is what warning is for; the success half
+           is an ordinary completion and belongs at debug. */
+        if (EFI_ERROR(st)) {
+            axl_warning("reload could not reclaim the old image (rc=0x%llx); "
+                        "it stays resident", (unsigned long long)st);
+        } else {
+            axl_debug("reload reclaimed old image rc=0x%llx",
+                      (unsigned long long)st);
+        }
         m_drv_reload_old = NULL;
     }
     if (m_drv_reload_evt != NULL) {
