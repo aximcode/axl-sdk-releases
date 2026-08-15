@@ -672,17 +672,7 @@ It is still a crash, and `axl::result`'s docstring says so: `value_or`,
 `has_value` or `operator*` after a check are what belongs on a path that can
 actually fail.
 
-### 6a. Freestanding vs hosted — RETIRED (T3), kept as the measurement
-
-> **There is one C++ mode as of T3, and no user-facing flag.** This section is
-> what the two modes WERE and why, kept because the header table below is the
-> measurement that justified retiring them rather than an argument for keeping
-> them. `axl-c++ --hosted` is REJECTED with a message naming its removal, and
-> the CMake package's `HOSTED` keyword raises `FATAL_ERROR`. The rule of thumb
-> at the end is superseded: include what you need.
->
-> C stays freestanding, so the end state is one mode PER LANGUAGE — see the
-> end of §6a-PLAN for why that is not a compromise.
+### 6a. Freestanding vs hosted — why both exist, and which you need
 
 Two compile modes, and the difference is **which libstdc++ headers you may
 include**, not which libc you link.
@@ -718,8 +708,8 @@ hosted TU using `vector` + `string` + `map` + `unordered_map` is `memcpy`,
 `memmove`, `memset`, `memcmp` and `strlen`, all of which `libaxl.a` already
 defines — which is why `--hosted` needs no `libstdc++.a`.
 
-Rule of thumb, as it stood: **default (freestanding) unless you want std
-containers.** Superseded by T3 — there is nothing to choose.
+Rule of thumb: **default (freestanding) unless you want std containers.**
+`axl-c++ --hosted` when you do.
 
 ### 6a-PLAN. Retiring the two modes — measured, and blocked on x64
 
@@ -736,10 +726,10 @@ flags is acceptable; depending on a packaged archive is not.
 | task | arch | state |
 |---|---|---|
 | T1. Drop `-ffreestanding` + `-Iinclude/compat` for C++ TUs | aa64 | **PROVEN 7/7** — containers, `<stdexcept>`, `vector::at` throwing through libstdc++ frames, destructor during unwind |
-| T2. Move x64 C++ to AXL's own `x86_64-elf-g++` | x64 | **DONE** — see 6a-T2 below. Not the flag drop this row used to describe: the flags were already right, the COMPILER was the host's |
-| T3. Delete the `--hosted` flag from `axl-cc` / `axl-c++`, `CXXFLAGS_HOSTED*` from the Makefile, and the `--hosted` prose from README/§6a | both | **DONE** — see 6a-T3 below. Both spellings hard-error; only a diagnostic arm remains |
-| T4. Retire `include/compat/` for C++ (C keeps it) | both | **MOOT** — `include/compat/` was deleted outright when C moved to the bare-metal cross (`AXL-Libc-Substrate-Design.md` §4.1b), so there was nothing left to retire for C++. The row outlived its subject |
-| T5. Update `AXL-Cxx-Stdlib-Surface.md`, which is organised around the freestanding/hosted split | both | **DONE** — restructured around one mode, and its central "not supported" entry (the unwinder) flipped to done in the same pass |
+| T2. Same, x64 | x64 | **UNBLOCKED, PROVEN 7/7** — the toolchain landed; see below |
+| T3. Delete the `--hosted` flag from `axl-cc` / `axl-c++`, `CXXFLAGS_HOSTED*` from the Makefile, and the `--hosted` prose from README/§6a | both | after T1+T2 |
+| T4. Retire `include/compat/` for C++ (C keeps it) | both | after T2 |
+| T5. Update `AXL-Cxx-Stdlib-Surface.md`, which is organised around the freestanding/hosted split | both | after T3 |
 
 **C stays freestanding, and that is not a compromise.** Dropping
 `-ffreestanding` for C would pull glibc's `<stdio.h>` with its real `FILE`,
@@ -774,123 +764,16 @@ destructor running during the unwind — with no `-ffreestanding` and no
 `include/compat`. Details and the four build traps are in
 `AXL-Cxx-Toolchain-Handoff.md`.
 
-What remained at that point was not a blocker but wiring: `axl-cc`/`axl-c++`
-and the Makefile still selected the host g++ for x64, so T3–T5 waited on that
-rather than on any unanswered question. **That wiring is 6a-T2 below, and it is
-done** — T3–T5 are now unblocked. The distribution commitment is still real — the
+What remains is not a blocker but wiring: `axl-cc`/`axl-c++` and the Makefile
+still select the host g++ for x64, so T3–T5 wait on that rather than on any
+unanswered question. The distribution commitment is still real — the
 toolchain should install to `/opt` via a script mirroring
 `install-arm-toolchain.sh`, because SDK consumers who install from the `.deb`
 or `.rpm` have no source tree for a `toolchain/`-relative path to resolve
 against. (Done: `scripts/install-toolchain.sh`, paths in
 `scripts/axl-toolchains.conf`.)
 
-#### 6a-T2. What T2 turned out to be — the compiler, and one silent defect
-
-**DONE.** `axl-cc`, the Makefile and the generated CMake package all select
-`AXL_X64_GXX_DEFAULT` now, so C++ compiles bare-metal on both arches exactly as
-C already did. That was the last host input the SDK had
-(`AXL-Libc-Substrate-Design.md` §4.1d), and the `.deb`/`.rpm` `--depends` list
-is empty as a result.
-
-**The two paragraphs below this one predicted the wrong work.** They are kept
-because the prediction was reasonable and the measurement that overturned it is
-the expensive part to rediscover — see *What the link actually does* after
-them. Both were written from a hand-linked spike, and a spike's link is not
-`axl-cc`'s.
-
-##### The real blocker: `.ctors`, and nothing else
-
-GCC's `x86_64-*-elf` target ships `HAVE_INITFINI_ARRAY_SUPPORT 0`, so the
-compiler emits global constructors into the legacy `.ctors`. AXL's crt0 walks
-`.init_array` and only that (`src/runtime/axl-cxxabi.c`), and the linker
-scripts' `__CTOR_LIST__`/`__CTOR_END__` are read by nothing. So **every global
-constructor silently did not run** — the consumer's, and the 26 objects' worth
-inside the toolchain's own `libstdc++.a` (`libsupc++`'s emergency exception
-pool among them). No diagnostic anywhere; the ctor fixture in
-`test-cxx-hosted-qemu.sh` is what caught it.
-
-aa64 never showed this because the aarch64 port forces `.init_array` at the
-target level — its `auto-host.h` carries the same `0`, so the value is not the
-discriminator and reading it off aa64 would mislead.
-
-Fixed at the source, in the toolchain: `--enable-initfini-array`, published as
-`14.3.0-axl2`. The alternative — teaching AXL to walk `.ctors` backward — was
-weighed and rejected: it doubles the init path permanently to accommodate a
-setting the toolchain can simply have. `build-toolchain.sh` now asserts both
-halves (the compiler's output AND the shipped `libstdc++.a`), because a flag
-that is silently dropped reproduces the identical silent failure.
-
-##### What the link actually does — measured, not inferred
-
-The paragraphs below say `libaxl-cxx.a` becomes a multiple-definition error
-against `libstdc++.a`. **In `axl-cc`'s link it does not**, and the reason is
-archive selection: `libaxl-cxx.a` is named FIRST, and an archive member is
-pulled only for a symbol still undefined when the linker reaches it. So the 51
-colliding definitions in `libstdc++.a` are never selected at all.
-
-Measured on the one path that names both archives, `-frtti --hosted`
-(`ld -y`):
-
-    _Znwm           <- libaxl-cxx.a(axl-cxxabi-ops.o)
-    __dynamic_cast  <- libstdc++.a(dyncast.o)
-
-Both archives contribute to one link, no collision, and the image runs
-(`test-cxx-hosted-qemu.sh` asserts `typeid` and `dynamic_cast` under QEMU).
-The spike hit the error because it named the toolchain libs FIRST; that is a
-property of that command line, not of the two archives.
-
-So T2 changed no link, and the default link still names no toolchain library —
-which is what keeps the SDK self-contained, and is the §8 constraint that made
-`axl-cxx-rbtree.cpp`/`axl-cxx-hash.cpp` worth writing. `libaxl-cxxrt.a` (the
-newlib glue described below — it exists, in `src/cxxrt/`) belongs to the
-EXCEPTIONS build, `AXL-Cxx-Unwinder-Design.md` §U2/§U3, and is still unlinked
-by anything.
-
-#### 6a-T3. One C++ mode — what the flag's removal actually touched
-
-**DONE.** `-ffreestanding` is off the C++ compile line in all three build paths
-(`axl-cc`, the Makefile, the generated CMake package), so the containers need
-no flag. C keeps it, so the end state is one mode PER LANGUAGE.
-
-**Both spellings are REJECTED, not tolerated.** An earlier revision of this
-task made them warned no-ops on compatibility grounds; Mike's call was that he
-owns every consumer and updating them is trivial, so a flag that selects
-nothing should fail rather than linger in build scripts for years. `--hosted`
-exits 1 with a message naming the removal — an arm kept purely to DIAGNOSE,
-since deleting it outright would leave the generic "unknown option" that says
-nothing about why. CMake's `HOSTED` stays in the `cmake_parse_arguments` list
-for the same reason and raises `FATAL_ERROR`: an unrecognised keyword there is
-silently appended to the SOURCE list, so deleting it would produce "cannot
-find source file HOSTED", which names neither the keyword nor the cause.
-
-**Two things the flag was carrying that had nothing to do with compile mode**,
-and both are now derived from the objects instead:
-
-- **Which archive the link needs.** `--hosted` implied `libaxl-cxx.a` even with
-  zero `.cpp` on the command line, because the staged build (`axl-c++ -c
-  a.cpp` then `axl-c++ a.o -o app.efi`) reaches the link with only an object.
-  That now comes from an `nm -u` scan for Itanium-mangled / `__cxa_*` undefined
-  symbols, sharing one pass with the pre-existing RTTI detection. This CLOSES a
-  gap rather than replacing one: the same staged flow *without* `--hosted` was
-  already broken, and failed on an undefined `operator new` naming no flag.
-- **`-frtti`'s libstdc++.** It was gated on `--hosted && RTTI_LINK`; it is now
-  gated on `RTTI_LINK` alone, which is what it always meant.
-
-**`deps/lzma` comes off the C++ include path unconditionally.** It was filtered
-only for the five TUs compiled hosted. `deps/lzma/errno.h` shadows the real
-one, and the shadowing is stealthy — nothing includes it directly, but
-`#include <string>` reaches `ext/string_conversions.h`, which needs `errno` and
-would get a vendored stub with no `ERANGE`. Every C++ TU can reach `<string>`
-now, so the narrow filter would have been a trap waiting for the next
-`#include`.
-
-**One question this opens and does not answer:** `axl::string` exists because
-`<string>` was unavailable freestanding. It is always available now, so
-`axl::string` is a size choice rather than a necessity. That belongs to T5
-(`AXL-Cxx-Stdlib-Surface.md`, which is organised around the split this task
-removed) and is deliberately not decided here.
-
-#### (superseded) T2 is bigger than "drop two flags": `libaxl-cxx.a` is superseded
+#### T2 is bigger than "drop two flags": `libaxl-cxx.a` is superseded
 
 Measured against the x64 bare-metal toolchain, `libaxl-cxx.a` exports **54**
 symbols and **51 of them are already defined by `libstdc++.a`/`libsupc++.a`** —

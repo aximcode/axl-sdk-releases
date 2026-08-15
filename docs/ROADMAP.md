@@ -106,16 +106,8 @@ Library / SDK foundations:
   ARM. Everything that failed did so because x64 was borrowing the
   host's glibc-targeted g++, whose libsupc++ keeps `__cxa_eh_globals` in
   `__thread` storage and reads a stack canary from `%fs:0x28` — neither
-  of which UEFI provides. **WIRED IN 2026-08-13 (task T2)** — `axl-cc`, the
-  Makefile and the generated CMake package all select our own
-  `x86_64-elf-g++`, so C++ compiles bare-metal on both arches and the
-  `.deb`/`.rpm` depend on nothing from the host. That surfaced one silent
-  defect the spike's hand-link had hidden: GCC's `x86_64-*-elf` target emits
-  global constructors into `.ctors`, which AXL's crt0 does not walk, so NONE
-  of them ran. Fixed in the toolchain (`--enable-initfini-array`, published as
-  `14.3.0-axl2`); see `AXL-Cxx-Design.md` §6a-T2. Exceptions themselves are
-  still NOT wired — that is U2/U3 in `AXL-Cxx-Unwinder-Design.md`, and the
-  7/7 demo remains hand-linked
+  of which UEFI provides. **Nothing is wired into the build yet**, and
+  `AXL-Cxx-Design.md` §6a-PLAN's "T2 BLOCKED" is now stale
 
 - [AXL-Newlib-Investigation.md](AXL-Newlib-Investigation.md) — **the
   MEASUREMENTS behind the direction above; its "NOT SCHEDULED" status and its
@@ -146,39 +138,8 @@ Library / SDK foundations:
   firmware's memory map stays accurate, and the leak gate keeps working. It
   also makes third-party allocations (mbedtls, lzma, stb, newlib) tracked for
   the first time. `src/cxxrt/` is already the first working instance.
-  **§4.1 ANSWERED 2026-08-13 — the substrate stops short of stdio.** Newlib's
-  printf DOES reintroduce the cycle: even its INTEGER-ONLY `vsniprintf` arrives
-  with `mallocr`/`freer`/`reallocr`, the FILE machinery and `_impure_ptr`, at
-  21.5 KB against `AxlFormat`'s 6.7 KB (the general `vsnprintf` is 53.8 KB
-  across 47 archive members). `AxlFormat` stays permanently, as the second
-  entry in the "AXL implements it because AXL's is better here" list after the
-  allocator. Newlib remains the answer for `string`/`math`/`stdlib`.
-  **§4.1b DONE 2026-08-13 — C compiles bare-metal on BOTH arches and
-  `include/compat/` is deleted.** aa64 moved off the glibc-targeted Linux cross
-  too; the compiler comes from `axl-toolchains.conf` with no host fallback, all
-  four consumer entry points moved, and `test-axl-cc-hosted-headers.sh` now
-  asserts a consumer's `<string.h>` resolves inside the toolchain with nothing
-  under `/usr/include`. verify.sh ALL GREEN both arches (10393).
-  **§4.1c DONE — the toolchain is published.** `toolchain-x86_64-elf-14.3.0`
-  on `axl-sdk-releases`: 55 MB stripped tarball (1.5 GB as built, 235 MB
-  stripped), its three upstream source archives for GPL §6(d), and SHA256SUMS.
-  `install-toolchain.sh x64` is download-and-verify now, so CI and consumers
-  pay a download instead of a 40-minute build.
-  **§4b OPEN (not scheduled): alternatives to newlib, and where the seam
-  belongs.** The tree uses newlib's HEADERS only — `-nostdlib`, and AXL defines
-  all twelve standard-named symbols itself. picolibc and llvm-libc are the
-  candidates worth measuring; musl is the wrong shape; edk2-libc is abandoned.
-  Measure picolibc's printf against AxlFormat's 6,708 bytes before recommending
-  anything.
-  Original spike measurement follows. The
-  whole tree builds with `CC=x86_64-elf-gcc` (271/271 objects, 0 errors) WITH
-  or WITHOUT `include/compat` on the path, a compat-free `AxlTestLog.efi` runs
-  67/67 with no leaks under QEMU, and the entire cost of retiring
-  `include/compat/` for C is TWO fixes: `__assert_func` (15 refs from
-  `deps/sdefl` via newlib's real `<assert.h>`) and the `time()` signature clash
-  in `axl-mbedtls-platform.c`. AXL's own code never used compat at all — it
-  includes only `stddef`/`stdint`/`stdbool`/`stdarg` — so compat is entirely a
-  third-party shim. NOT yet measured: aa64, the C++ hosted path
+  **OPEN:** does newlib's `printf` reintroduce the Log -> Data cycle AxlFormat
+  exists to break? That measurement decides how deep the substrate goes
 - [AXL-Cxx-Unwinder-Design.md](AXL-Cxx-Unwinder-Design.md) — **U0 DONE 2026-08-09.**
   Tier 2 (the unwinder) reframed by measurement: our own `-fno-exceptions`
   objects reference **zero** `_Unwind_*` symbols, so three of the four things
@@ -294,16 +255,6 @@ Subsystems:
   [AXL-PieceTree-Design.md](AXL-PieceTree-Design.md) · [AXL-RBTree-Design.md](AXL-RBTree-Design.md) · [AXL-Config-Design.md](AXL-Config-Design.md)
 - Networking: [2026-07-19-axl-9p-design.md](superpowers/specs/2026-07-19-axl-9p-design.md) — Axl9p 9P2000.L client + server + `fsN:` mount bridge
 - Hardware fixtures / test: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md) · [HW-Testing-Workflow.md](HW-Testing-Workflow.md)
-- CI / release cost: [AXL-CI-Release-Speed-Design.md](AXL-CI-Release-Speed-Design.md)
-  — **ACCEPTED 2026-08-13, not yet implemented.** A release costs 75 billable
-  minutes and ~60 minutes of waiting, 46 of them in ONE serial job: CI's QEMU
-  runner picks `nproc-2` workers and a hosted runner has 2 cores, so the
-  `--shard`/`est=` machinery already in `run-integration.sh` goes unused. Plan:
-  a `plan` job choosing self-hosted (free, ~9 min) with a sharded hosted
-  fallback, a gate policy that reserves full CI for `X.0.0`, and reuse of a CI
-  run already green on the release commit's parent. Target ~90 min/month
-  against an org-wide ~2,000 allowance that BOTH repos have already breached
-  (axl-sdk April, agt June)
 
 Active sub-projects (pre-code planning — see "Active sub-projects" below):
 - [AXL-Dashboard-Server-Design.md](AXL-Dashboard-Server-Design.md) — native-SPA dashboard HTTP server
@@ -427,62 +378,6 @@ firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
 
 Grouped, terse; **detail lives in the linked design doc or
 [ROADMAP-Archive.md](ROADMAP-Archive.md)**. Most are opportunistic / low-priority.
-
-- **Is `axl-cc` still needed now the SDK ships its own toolchain?** Asked
-  2026-08-13. Measured answer: **yes, but not for the reason the question
-  assumes** — the toolchain never did this job. `axl-cc hello.c -o hello.efi`
-  expands to FOUR commands and 75 arguments: `gcc` with 16 baked-in flags
-  (`-ffreestanding -fshort-wchar -fno-builtin -fpic -mno-red-zone
-  -mstack-protector-guard=global ...`), `ld -shared -Bsymbolic --no-undefined
-  --gc-sections` against a per-arch linker script AND a version script,
-  `objcopy` with a 12-entry `-j` list plus `--subsystem`, then `pe-set-debug`.
-  None of that follows from having a compiler.
-
-  Two escape routes were considered and both fail on measurement:
-
-  - **Link PE directly, dropping `objcopy`.** Our x64 binutils does carry
-    `i386pep`, so x64 could. **aa64 cannot** — ARM's `aarch64-none-elf-ld`
-    lists no PE emulation at all (`aarch64elf`, `armelf`, `aarch64linux`).
-    That would mean two different pipelines to save one step on one arch.
-    LLVM's `lld` does emit arm64 PE (it is how Windows-on-ARM links), but
-    adopting it means a second toolchain, against §4.1d's whole direction.
-  - **A GCC specs file** (`-specs=axl-app.specs`), which is the GCC analogue
-    of the target triple Rust's `x86_64-unknown-uefi` uses to carry exactly
-    this policy. It can inject the flags, the linker script and the startfiles
-    — but GCC has **no post-link hook**, so `objcopy` and `pe-set-debug` still
-    need a wrapper. It would split the policy across two files instead of
-    removing one, which makes `check-flag-parity` harder, not easier.
-
-  **The sharper finding is next door.** The generated `axl-config.cmake` does
-  not CALL `axl-cc` — it re-implements the entire pipeline in CMake (its own
-  compile, `ld`, `objcopy`, `pe-set-debug`). That is the third build path
-  `check-flag-parity` exists to police, and it is duplication by choice rather
-  than necessity. Having the CMake package shell out to `axl-cc` would take
-  three paths to two for a small change, and is worth doing whether or not the
-  entry below ever happens.
-
-- **CMake as THE build system, replacing the Makefile.** Mike's stated
-  direction (2026-08-13), not scheduled. Today CMake is a CONSUMER-facing path
-  only: `scripts/install.sh` generates an `axl-config.cmake` that wraps
-  `axl-cc`-equivalent commands, while the library itself, all 43 test images,
-  every tool and every gate are a ~2,000-line Makefile. Moving the LIBRARY
-  build means porting: the build-state signature that wipes objects when
-  `CC`/`CXX`/`CROSS`/`CFLAGS` change (CMake re-configures instead, which is
-  the same idea done properly), the 19 `LINT_GATES` and `NONCLEAN_GOALS`
-  machinery, the per-image `.efi` link + `objcopy` + `pe-set-debug` chain, the
-  `AXL_TLS` source-set toggle, and `check-flag-parity`, whose whole job is to
-  keep three build paths agreeing — a CMake port would reduce that to two, or
-  arguably one, which is the strongest argument FOR it. Sequencing note: this
-  overlaps the entry below and the `axl-cc` question above it; deciding those
-  three together is cheaper than deciding them one at a time.
-
-  **The duplication is now load-bearing, not just untidy.** `axl-c++
-  -fexceptions` works on both arches, and the CMake package CANNOT do it: its
-  re-implementation has no `_eh` linker script, no glue objects and no
-  toolchain libraries, so a CMake consumer asking for exceptions gets an image
-  that compiles, links, and dies at the first throw. `check-flag-parity` cannot
-  see it — the `-j` lists agree. Having the package shell out to `axl-cc` fixes
-  it by construction; writing the logic a third time is the alternative.
 
 - **Distribution & consumption model** — [AXL-Distribution-Design.md](AXL-Distribution-Design.md).
   Package, install, discover and version-pin the SDK the way a real

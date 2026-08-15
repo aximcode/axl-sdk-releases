@@ -112,31 +112,19 @@ note "on main, clean tree, $TAG is free, gh authenticated"
 # --------------------------------------------------------------------------
 wait_for_ci() {
     local sha="$1" i line
-    # 150 * 30s = 75 min. The old ceiling was 30 min, chosen when CI's QEMU job
-    # ran a handful of suites; it now runs the WHOLE integration set (145 tests,
-    # each in its own QEMU) on a 2-core runner, which measured ~50 min on the
-    # v3.2.0 cut — so the gate timed out on a run that went on to pass, and the
-    # release had to be finished with --resume. Size the ceiling to the job.
-    say "Waiting for CI to pass on $sha (the release gate; up to 75 min)"
-    for i in $(seq 1 150); do
+    say "Waiting for CI to pass on $sha (the release gate)"
+    for i in $(seq 1 90); do          # 90 * 20s = 30 min ceiling
         line="$(gh run list --commit "$sha" --workflow CI \
                   --json status,conclusion \
                   --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || true)"
         case "$line" in
             completed:success) note "CI: SUCCESS"; return 0 ;;
             completed:*)       note "CI: ${line#completed:}"; return 1 ;;
-            *)
-                # One line per 5 min, not per poll: 150 identical
-                # "in_progress" lines bury the outcome they precede.
-                if (( i == 1 || i % 10 == 0 )); then
-                    note "[$(( (i * 30) / 60 )) min] CI: ${line:-no run yet}"
-                fi
-                ;;
+            *)                 note "[poll $i] CI: ${line:-no run yet}" ;;
         esac
-        sleep 30
+        sleep 20
     done
-    note "timed out waiting for CI after 75 min (the run may still be going —"
-    note "check 'gh run list --workflow CI', then use --resume)"
+    note "timed out waiting for CI"
     return 1
 }
 

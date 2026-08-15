@@ -26,24 +26,6 @@
 
 #include "axl-compress-internal.h"
 
-/* sdefl and sinfl assert() their internal invariants. Those assertions have
-   been DEAD for the whole life of this file — include/compat/assert.h defines
-   `assert(expr)` as `((void)0)` — and NDEBUG keeps them dead once the real
-   <assert.h> is on the path, which is what a bare-metal/newlib toolchain build
-   puts there. Without it the link fails on 15 undefined `__assert_func`
-   references (docs/AXL-Libc-Substrate-Design.md §4.1b).
-
-   Deliberately preserving today's behaviour rather than switching assertions
-   ON in a shipped compression path as a side effect of a toolchain change.
-   Enabling them is a separate decision that needs its own testing: sdefl's
-   asserts are not all cheap, and a firing assert in firmware is a panic. */
-/* `#define NDEBUG 1`, guarded: a bare `#define NDEBUG` is NOT the same token
-   sequence as the -DNDEBUG that RELEASE builds pass, and gcc warns on the
-   non-identical redefinition -- on every install.sh run and every distro
-   package. */
-#ifndef NDEBUG
-#define NDEBUG 1
-#endif
 #define SDEFL_IMPLEMENTATION
 #include "../../deps/sdefl/sdefl.h"
 

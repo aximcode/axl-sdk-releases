@@ -2,29 +2,16 @@
 # test-meta: arch=both needs= est=110 local-only=0
 # test-cxx-hosted-qemu.sh — the standard containers under UEFI, end to end.
 #
-# THE NAME IS HISTORICAL. There is no hosted MODE any more: task T3 dropped
-# -ffreestanding from the C++ line in all three build paths, so
-# <vector>/<string>/<map>/<unordered_map> compile with no flag and
-# `axl-c++ --hosted` is an accepted no-op. Kept as the filename because this is
-# still the containers-under-UEFI suite and renaming it would break the
-# ratchet's per-test history for no gain.
+# axl-c++ --hosted compiles a translation unit as HOSTED (dropping
+# -ffreestanding and the compat header shims) so libstdc++ stops refusing
+# <vector>/<string>/<map>/<unordered_map> at bits/requires_hosted.h, and links
+# the libstdc++.a members those containers need out-of-line.
 #
 # What this asserts, and why each one is here rather than implied:
 #
-#   1. The containers compile with NO FLAG, and --hosted is now REJECTED
-#      with a message naming its removal. This assertion is inverted from what it was
-#      ("without --hosted the containers are refused"), which was the honest
-#      test while two modes existed. What can regress now is -ffreestanding
-#      creeping back onto the C++ line, and that shows up here as a refusal at
-#      bits/requires_hosted.h -- the same failure, now the failing case.
-#
-#      SCOPE, because "three build paths" would be a false claim: this drives
-#      axl-cc only. The Makefile path is self-covering (axl-cxx-rehash.cpp
-#      includes <unordered_map>, so the library simply fails to build). The
-#      GENERATED CMAKE PACKAGE is covered by nothing at all -- no test and no
-#      CI step ever configures find_package(axl) -- and check-flag-parity is a
-#      whole-file substring test that the C flag set already satisfies. That
-#      gap predates T3 and is worth closing on its own.
+#   1. WITHOUT --hosted the same source must FAIL to compile. Otherwise a
+#      passing hosted build proves nothing about the flag -- the containers
+#      might have been reachable all along.
 #   2. libaxl-cxx.a defines the five std::__throw_* symbols. Under
 #      -fno-exceptions the container headers still CALL them; if libstdc++.a
 #      satisfies them instead, its functexcept.o arrives compiled WITH
@@ -43,10 +30,6 @@
 #      session that led to this test.
 #   6. The __throw_* stubs actually halt, with a diagnosable message, rather
 #      than falling through into code the optimizer proved unreachable.
-#   7. A DEFAULT C++ link names no libstdc++.a, read off the link line rather
-#      than inferred. -frtti is the sole exception and is opt-in. That is the
-#      AXL-Cxx-Design.md §8 constraint: redistributing the GCC runtime is the
-#      one act the Runtime Library Exception does not cover.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
 # Requires a staged SDK: scripts/install.sh --arch all --cpp
@@ -197,45 +180,13 @@ run_one() {
     [[ -s "$WORK/stage.diff" ]] && sed 's/^/      /' "$WORK/stage.diff" | head -5
 
     # ---------------------------------------------------------------
-    # 1. The containers compile with NO FLAG AT ALL.
-    #
-    # This assertion is INVERTED from what it was, and the inversion IS task
-    # T3 (AXL-Cxx-Design.md §6a-PLAN). It used to read "without --hosted the
-    # containers are refused", which was the honest test while two compile
-    # modes existed: a passing hosted build proved nothing about the flag
-    # unless the flag was load-bearing.
-    #
-    # There is one mode now, so the discriminating question changed. What
-    # could regress is -ffreestanding creeping back onto the C++ line in any
-    # of the three build paths, and that shows up here as a refusal at
-    # bits/requires_hosted.h -- the same failure, now the failing case.
+    # 1. Freestanding must REFUSE the containers.
     # ---------------------------------------------------------------
     "$AXL_CXX" --arch "$cc_arch" -c "$SRC" -o "$WORK/free.o" \
         >"$WORK/free.log" 2>&1
     rc=$?
-    check "$rc" "$arch: the containers compile with no flag (rc=$rc)"
-    [[ "$rc" -ne 0 ]] && grep -i "freestanding\|requires_hosted" "$WORK/free.log" \
-        | head -3 | sed 's/^/      /'
-
-    # ---------------------------------------------------------------
-    # 1b. --hosted is REJECTED, and the message says why.
-    #
-    # A flag that selects nothing should not be quietly tolerated: the
-    # failure mode of tolerating it is a build script that keeps passing a
-    # meaningless option for years. Asserting the MESSAGE too, not just the
-    # exit status -- axl-cc already rejects every unknown --option, so a
-    # status-only check would pass if this arm were deleted outright and
-    # would prove nothing about the caller being told what happened.
-    # ---------------------------------------------------------------
-    "$AXL_CXX" --arch "$cc_arch" --hosted -c "$SRC" -o "$WORK/hosted.o" \
-        >"$WORK/hosted.log" 2>&1
-    rc=$?
-    [[ "$rc" -ne 0 ]] && grep -q "was removed" "$WORK/hosted.log"
-    check "$?" "$arch: --hosted is rejected, naming the removal (rc=$rc)"
-
-    # It must not have produced output on the way to failing.
-    [[ ! -f "$WORK/hosted.o" ]]
-    check "$?" "$arch: the rejected --hosted build wrote no object"
+    [[ "$rc" -ne 0 ]] && grep -qi "freestanding" "$WORK/free.log"
+    check "$?" "$arch: without --hosted the containers are refused (rc=$rc)"
 
     # ---------------------------------------------------------------
     # 2. libaxl-cxx.a carries the five __throw_* definitions.
@@ -269,11 +220,11 @@ run_one() {
     for sym in "${THROW_SYMS[0]}" _ZSt20__throw_length_errorPKc "${REHASH_SYMS[@]}"; do
         trace+=("-Wl,-y,$sym")
     done
-    "$AXL_CXX" --arch "$cc_arch" --release "${trace[@]}" \
+    "$AXL_CXX" --arch "$cc_arch" --hosted --release "${trace[@]}" \
         "$SRC" -o "$efi" >"$WORK/build.log" 2>&1
     rc=$?
     [[ "$rc" -eq 0 && -f "$efi" ]]
-    check "$?" "$arch: builds the container fixture (rc=$rc)"
+    check "$?" "$arch: --hosted builds the container fixture (rc=$rc)"
     if [[ ! -f "$efi" ]]; then
         sed 's/^/      /' "$WORK/build.log" | tail -25
         return
@@ -303,7 +254,7 @@ run_one() {
     # than on the image, because an archive contributing zero members leaves
     # no trace in the output -- which is exactly the state that regressed
     # silently before, when tree.o was the only member still being pulled.
-    "$AXL_CXX" --arch "$cc_arch" --release -Wl,-t "$SRC" \
+    "$AXL_CXX" --arch "$cc_arch" --hosted --release -Wl,-t "$SRC" \
         -o "$WORK/tracelink-$cc_arch.efi" >"$WORK/tracelink.log" 2>&1
     trace_rc=$?
 
@@ -345,75 +296,45 @@ run_one() {
     done
 
     # ---------------------------------------------------------------
-    # 5b. Every new/delete form LINKS.
+    # 5b. Every new/delete form LINKS, freestanding as well as hosted.
     # ---------------------------------------------------------------
-    # These operators live in libaxl-cxx.a, so a consumer writing plain C++
-    # hits them without opting into anything. Two of them had no definition at
-    # all until this fixture existed, and both failed only at LINK:
-    # `new (std::nothrow) T` needs the std::nothrow OBJECT (libsupc++, which
-    # firmware does not link), and an over-aligned `new` calls a different
-    # operator entirely.
-    #
-    # This ran TWICE, once per mode, until T3 removed the modes. Kept as one
-    # run rather than two identical ones: a second PASS line for a distinction
-    # that no longer exists is a phantom assertion, and the ratchet counts it.
-    "$AXL_CXX" --arch "$cc_arch" --release \
-        "$NEWFORMS_SRC" -o "$WORK/newforms.efi" \
-        >"$WORK/newforms.log" 2>&1
-    rc=$?
-    check "$rc" "$arch: every new/delete form links"
-    [[ "$rc" -eq 0 ]] || grep -E "undefined reference" "$WORK/newforms.log" \
-        | sed 's/^/      /' | head -4
+    # These operators live in libaxl-cxx.a, which both modes link, so a
+    # consumer writing plain C++ hits them without opting into anything.
+    # Two of them had no definition at all until this fixture existed, and
+    # both failed only at LINK: `new (std::nothrow) T` needs the
+    # std::nothrow OBJECT (libsupc++, which firmware does not link), and an
+    # over-aligned `new` calls a different operator entirely.
+    local mode
+    for mode in freestanding hosted; do
+        local hosted_arg=()
+        [[ "$mode" == "hosted" ]] && hosted_arg=(--hosted)
+        "$AXL_CXX" --arch "$cc_arch" --release ${hosted_arg[@]+"${hosted_arg[@]}"} \
+            "$NEWFORMS_SRC" -o "$WORK/newforms-$mode.efi" \
+            >"$WORK/newforms-$mode.log" 2>&1
+        rc=$?
+        check "$rc" "$arch: every new/delete form links ($mode)"
+        [[ "$rc" -eq 0 ]] || grep -E "undefined reference" "$WORK/newforms-$mode.log" \
+            | sed 's/^/      /' | head -4
+    done
 
     # ---------------------------------------------------------------
-    # 5c. -frtti links with no mode flag, and is the ONLY thing that
-    #     puts libstdc++.a on the link line.
+    # 5c. -frtti works in hosted mode, and honestly fails freestanding.
     # ---------------------------------------------------------------
-    # libstdc++.a carries the __cxxabiv1 type_info vtables and __dynamic_cast,
-    # so -frtti needs nothing from us beyond __stack_chk_fail.
-    #
-    # This pair used to read "works hosted, honestly fails freestanding" --
-    # the freestanding half is gone with T3, since there is no mode to fail
-    # in. What replaces it is the property that actually mattered underneath:
-    # RTTI is OPT-IN, and the DEFAULT link names no GCC runtime library at
-    # all. That is the AXL-Cxx-Design.md §8 constraint -- redistributing the
-    # runtime is the one act the Runtime Library Exception does not cover --
-    # so a default build silently acquiring libstdc++.a is the regression
-    # worth catching, not a mode that no longer exists.
-    "$AXL_CXX" --arch "$cc_arch" --release -frtti \
+    # libstdc++.a carries the __cxxabiv1 type_info vtables and
+    # __dynamic_cast, so hosted RTTI needs nothing from us beyond
+    # __stack_chk_fail. Freestanding cannot: those live in libsupc++, which a
+    # firmware image does not link. Asserting the FAILURE too, so "RTTI works"
+    # never quietly comes to mean "in whichever mode you happened to try".
+    "$AXL_CXX" --arch "$cc_arch" --hosted --release -frtti \
         "$RTTI_SRC" -o "$WORK/rtti-$cc_arch.efi" >"$WORK/rtti.log" 2>&1
-    check "$?" "$arch: -frtti links with no mode flag"
+    check "$?" "$arch: -frtti links with --hosted"
     [[ -s "$WORK/rtti.log" ]] && grep -oP "undefined reference to .\K[^']+" \
         "$WORK/rtti.log" | head -3 | sed 's/^/      /'
 
-    # The negative, read off the LINK LINE rather than inferred from success:
-    # --verbose prints the ld invocation, and libstdc++.a must appear on the
-    # -frtti one and on no other.
-    #
-    # BOTH halves need a positive control, and for DIFFERENT reasons -- an
-    # absence proves nothing if the link never ran, and a presence proves
-    # nothing if the string came from an error message rather than a command
-    # line. axl-cc's own "-frtti needs libstdc++.a" diagnostic contains the
-    # literal string, so the grep below would pass on the exact failure it is
-    # meant to catch.
-    "$AXL_CXX" --arch "$cc_arch" --release --verbose -frtti \
-        "$RTTI_SRC" -o "$WORK/rtti-v.efi" >"$WORK/rtti-v.log" 2>&1
-    rc=$?
-    [[ "$rc" -eq 0 && -f "$WORK/rtti-v.efi" ]] \
-        && grep -q -- "-frtti.*libstdc++\.a\|libstdc++\.a" "$WORK/rtti-v.log" \
-        && grep -q "libaxl-cxx\.a" "$WORK/rtti-v.log"
-    check "$?" "$arch: -frtti DOES name libstdc++.a on a link that succeeded (rc=$rc)"
-
-    "$AXL_CXX" --arch "$cc_arch" --release --verbose \
-        "$SRC" -o "$WORK/nortti-v.efi" >"$WORK/nortti-v.log" 2>&1
-    rc=$?
-    # The control: libaxl-cxx.a must BE on this line. Without it, a link that
-    # died before ld ran -- or a --verbose that printed nothing -- reads as
-    # "no libstdc++.a" and passes.
-    [[ "$rc" -eq 0 && -f "$WORK/nortti-v.efi" ]] \
-        && grep -q "libaxl-cxx\.a" "$WORK/nortti-v.log" \
-        && ! grep -q "libstdc++\.a" "$WORK/nortti-v.log"
-    check "$?" "$arch: a default C++ link names NO libstdc++.a (self-contained, rc=$rc)"
+    "$AXL_CXX" --arch "$cc_arch" --release -frtti \
+        "$RTTI_SRC" -o "$WORK/rtti-free.efi" >"$WORK/rttifree.log" 2>&1
+    [[ "$?" -ne 0 ]] && grep -q "type_info\|__dynamic_cast\|typeinfo" "$WORK/rttifree.log"
+    check "$?" "$arch: -frtti freestanding fails on libsupc++ symbols, as documented"
 
     # Run-asserted on BOTH arches. It was x64-only until the aa64 linker
     # script was fixed: an RTTI link there produced a linker-synthesized
@@ -505,11 +426,11 @@ halt_fixture() {
     local reached="$5" marker="$6" unreachable="$7"
     local efi="$WORK/cxx-$name-$cc_arch.efi" rc
 
-    "$AXL_CXX" --arch "$cc_arch" --release "$src" -o "$efi" \
+    "$AXL_CXX" --arch "$cc_arch" --hosted --release "$src" -o "$efi" \
         >"$WORK/$name-build.log" 2>&1
     rc=$?
     [[ "$rc" -eq 0 && -f "$efi" ]]
-    check "$?" "$arch: builds the $name fixture (rc=$rc)"
+    check "$?" "$arch: --hosted builds the $name fixture (rc=$rc)"
     [[ -f "$efi" ]] || return
 
     timeout 120s "$PROJECT_DIR/scripts/run-qemu.sh" \

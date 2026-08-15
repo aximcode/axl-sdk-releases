@@ -32,24 +32,12 @@ LIB="out/native-$ARCH/lib/libaxl.a"
 LDS="scripts/elf_x86_64_efi.lds"
 CRT0="$B/axl-crt0-gcc-x86_64.o"
 
-# The probe links against a cross-built libaxl.a, so it must be compiled by the
-# SAME compiler -- host gcc would resolve <string.h> to /usr/include and mix a
-# host object into a bare-metal link. Read the path from the one manifest that
-# holds it (scripts/axl-toolchains.conf), exactly as the Makefile and axl-cc do.
-# shellcheck source=/dev/null
-source "$PROJECT_DIR/scripts/axl-toolchains.conf"
-AXL_CC_BIN="${AXL_X64_GCC:-$AXL_X64_GCC_DEFAULT}"
-if [[ ! -x "$AXL_CC_BIN" ]] && ! command -v "$AXL_CC_BIN" &>/dev/null; then
-    echo "SKIP: x64 bare-metal gcc not found at $AXL_CC_BIN" >&2
-    exit 0
-fi
-
 make ARCH="$ARCH" 2>&1 | tail -1
 
 CFLAGS=(-std=gnu2x -ffreestanding -fshort-wchar -fno-stack-protector
         -fno-builtin -fpic -mno-red-zone -march=x86-64
         -ffunction-sections -fdata-sections -DAXL_BACKEND_NATIVE
-        -Iinclude -Isrc/backend)
+        -Iinclude -Iinclude/compat -Isrc/backend)
 LDFLAGS=(-nostdlib -shared -Bsymbolic --no-warn-rwx-segments
          --no-undefined --gc-sections -T "$LDS")
 
@@ -66,7 +54,7 @@ gray_count() {
     printf '%s\n' "#include <axl.h>" \
         "static int m(int a,char**v){(void)a;(void)v;$body return 0;}" \
         "AXL_APP(m)" > "$WORK/$name.c"
-    "$AXL_CC_BIN" "${CFLAGS[@]}" -c "$WORK/$name.c" -o "$WORK/$name.o"
+    gcc "${CFLAGS[@]}" -c "$WORK/$name.c" -o "$WORK/$name.o"
     ld "${LDFLAGS[@]}" -o "$WORK/$name.so" "$CRT0" \
         "$B/axl-reloc.o" "$B/axl-debug-info.o" "$WORK/$name.o" "$LIB"
     nm "$WORK/$name.so" 2>/dev/null | grep -icE 'gray_|ft_grays' || true

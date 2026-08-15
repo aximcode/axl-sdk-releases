@@ -71,55 +71,6 @@ follows [Semantic Versioning](https://semver.org/).
   duplicate rather than toward flagging a success path: an unflagged duplicate
   is noise, a wrongly-flagged success path is lost signal.
 
-### Breaking
-
-- **`axl-cc --depfile` is removed.** Pass gcc's own `-MD -MP -MF <path>`
-  instead; `axl-cc` forwards them like any other compile flag.
-
-  It existed to post-process the dependency file so every path was absolute,
-  because a *relative* source makes gcc emit compile-cwd-relative
-  prerequisites that CMake's `DEPFILE` resolved against the wrong directory.
-  Pass an absolute source — which the generated CMake package now does — and
-  gcc's output is already absolute.
-
-  **This also fixes a staleness bug.** `--depfile` used `-MMD` internally,
-  which omits `-isystem` headers by definition; the SDK arrives that way, so
-  it tracked no SDK header at all and editing one did not rebuild a
-  consumer's object. `-MD` lists them.
-
-- **`axl-c++ --hosted` and the CMake `HOSTED` keyword are removed.** Both now
-  fail with a message naming the removal. C++ is compiled hosted
-  unconditionally, so `std::vector`, `std::string`, `std::map` and
-  `std::unordered_map` work with no flag at all — the flag only ever switched
-  off a freestanding C++ mode that no longer exists, and removing it from a
-  build produces byte-identical output.
-
-  ```console
-  # before
-  $ axl-c++ --hosted containers.cpp -o app.efi
-  # after
-  $ axl-c++ containers.cpp -o app.efi
-  ```
-
-  ```cmake
-  # before
-  axl_add_app(myapp myapp.cpp HOSTED)
-  # after
-  axl_add_app(myapp myapp.cpp)
-  ```
-
-  C sources are unaffected and still compile `-ffreestanding`; a mixed C/C++
-  image links exactly as before.
-
-### Changed
-
-- **x64 C++ compiles with AXL's own `x86_64-elf-g++`**, not the host's. The
-  SDK now takes no compiler, assembler or linker from the distro on either
-  arch, and the `.deb`/`.rpm` depend only on `curl` and `xz-utils` (to fetch
-  the toolchains). Install with `axl-install-toolchain all`.
-- **A staged C++ build no longer needs a flag to link.** `axl-c++ -c a.cpp`
-  followed by `axl-c++ a.o -o app.efi` previously failed on an undefined
-  `operator delete`; the C++ runtime archive is now selected from the objects.
 
 ## 3.2.2 — 2026-08-14
 

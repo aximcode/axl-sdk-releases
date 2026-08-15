@@ -50,28 +50,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-
-def cross_libc_include() -> str:
-    """The cross toolchain's libc include directory, from the Makefile.
-
-    This gate REPLAYS the compile database with a different driver, and the
-    libc headers are IMPLICIT in the recorded compiler binary -- nothing on the
-    command line names <toolchain>/x86_64-elf/include. Left alone, clang
-    resolves <string.h> to the HOST's /usr/include, so this measured a
-    glibc-flavoured version of a freestanding program: clean on a
-    non-multiarch distro, and wrong everywhere. clang-tidy hit the same rock
-    and died outright in CI; this one stayed quiet, which is worse.
-
-    The Makefile owns the value (it asks $(CC), so a toolchain override moves
-    it too) and fails rather than printing an empty string.
-    """
-    proc = subprocess.run(["make", "-s", "print-cc-libc-include"],
-                          cwd=ROOT, capture_output=True, text=True)
-    if proc.returncode != 0 or not proc.stdout.strip():
-        sys.exit("check-clang-warnings: cannot resolve the cross libc include "
-                 f"directory:\n{proc.stderr.strip()}")
-    return proc.stdout.strip()
-
 # Added on top of the recorded build flags.
 EXTRA_FLAGS = [
     "-fsyntax-only",
@@ -100,7 +78,7 @@ def excluded(path: str) -> bool:
     )
 
 
-def clang_command(entry: dict[str, object], libc_include: str) -> list[str] | None:
+def clang_command(entry: dict[str, object]) -> list[str] | None:
     args = entry.get("arguments")
     if not isinstance(args, list):
         return None
@@ -116,25 +94,8 @@ def clang_command(entry: dict[str, object], libc_include: str) -> list[str] | No
         if arg in DROP_EXACT:
             continue
         out.append(str(arg))
-    # A cross-compiled TU records a compiler whose NAME is the only place the
-    # target appears (x86_64-elf-gcc / aarch64-none-elf-gcc) -- replacing
-    # argv[0] with plain `clang` silently retargeted it at the host. Name the
-    # triple, then supply the libc that goes with it: compiler headers first
-    # (-nostdlibinc keeps clang's builtins and drops /usr/include), the cross
-    # libc after, which is the order the real build searches.
-    #
-    # NOT every entry is cross-compiled: scripts/pe-set-debug.c is a HOST tool
-    # built with plain `gcc`, and host headers are correct for it. Retargeting
-    # it broke the gate outright ("unknown target triple 'gcc'"), which is the
-    # good failure -- silently handing it a freestanding libc would not have
-    # announced itself.
-    name = os.path.basename(out[0])
-    triple = name[: -len("-gcc")] if name.endswith("-gcc") and name != "gcc" else ""
     out[0] = os.environ.get("CLANG", "clang")
-    cross: list[str] = []
-    if triple:
-        cross = [f"--target={triple}", "-nostdlibinc", f"-idirafter{libc_include}"]
-    return out + cross + EXTRA_FLAGS
+    return out + EXTRA_FLAGS
 
 
 def run_one(cmd: list[str], cwd: Path) -> str:
@@ -162,7 +123,6 @@ def main() -> int:
         return 2
 
     entries = json.loads(db_path.read_text())
-    libc_include = cross_libc_include()
     jobs: list[tuple[str, list[str], Path]] = []
     seen: set[str] = set()
     for entry in entries:
@@ -170,22 +130,9 @@ def main() -> int:
         if path in seen or excluded(path):
             continue
         seen.add(path)
-        cmd = clang_command(entry, libc_include)
+        cmd = clang_command(entry)
         if cmd is None:
             continue
-        # The database is single-arch (one `make` invocation produced it) while
-        # the libc directory above came from make's DEFAULT arch. Linting an
-        # ARCH=aa64 database would otherwise analyze aarch64 TUs against x64
-        # newlib headers and report something meaningless about neither.
-        for arg in cmd:
-            if arg.startswith("--target=") and arg[len("--target="):] not in libc_include:
-                sys.exit(
-                    f"check-clang-warnings: {path} targets "
-                    f"{arg[len('--target='):]}, but the libc headers reported "
-                    f"by make are {libc_include}.\n  Regenerate "
-                    "compile_commands.json for the arch you are linting, or "
-                    "run make with the matching ARCH."
-                )
         jobs.append((path, cmd, Path(str(entry.get("directory", ROOT)))))
 
     if not jobs:

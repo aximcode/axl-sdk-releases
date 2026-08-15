@@ -26,7 +26,7 @@ gate is the full suite run locally**, which is fast in parallel:
 
 ```sh
 make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
-./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 145/145 must pass
+./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 79/79 must pass
 scripts/lint.sh                                        # clang-tidy exactly as CI runs it
 ```
 
@@ -172,21 +172,6 @@ a comment explaining its trigger).
   new version needs a newer base) and `scripts/lint.sh`'s `CT_VERSION` together.
   Either way, the §4b CI-on-`main` run remains the authoritative gate.
 
-- **Doxygen has the same version-skew trap, with no pin available.**
-  `docs.yml` installs whatever doxygen `ubuntu-latest`'s apt ships (1.9.8 at
-  writing); a dev box is usually far newer, and reference resolution differs —
-  1.13 resolved two link targets 1.9.8 could not, so `scripts/build-docs.sh`
-  called the zero-warning gate clean while the v3.2.0 Docs run failed on both.
-  Docs is best-effort for the release itself (artifacts come from Release), but
-  the published site does not update until it is fixed. Before a release that
-  touches public headers, reproduce CI's version:
-
-  ```sh
-  podman run --rm -v "$PWD":/src:z -w /src ubuntu:24.04 bash -c \
-    'apt-get update -qq && apt-get install -y -qq doxygen && \
-     cd docs/sphinx && doxygen Doxyfile'
-  ```
-
   **Run clang-tidy one file per process (`-n1`).** Passing many
   TUs to a single `clang-tidy` invocation makes the path-sensitive
   `clang-analyzer-*` checks (notably `security.ArrayBound`)
@@ -313,7 +298,7 @@ release.yml workflow can race and check out the wrong commit.
 > **local** suite — run it before you cut:
 >
 > ```sh
-> ./test/integration/run-integration.sh -j"$(nproc)"   # 145/145 must pass
+> ./test/integration/run-integration.sh -j"$(nproc)"   # 79/79 must pass
 > scripts/lint.sh                                       # clang-tidy as CI runs it
 > ```
 
@@ -363,21 +348,14 @@ The tag push triggers three workflows on the same commit:
 - **Docs** (`.github/workflows/docs.yml`) — Doxygen + Sphinx
   build + Cloudflare Pages deploy.
 
-**Realistic timing.** The TAG's own workflows are fast —
-**~4–5 minutes wall-clock** for Release + Docs, which run in
-parallel. Verified on v0.9.0: Release 2m57s, Docs 1m44s.
-Release's Build-tools-aa64 (~3 min) is the longest of them,
-slower than x64 because cross-tool execution goes through QEMU
-user-mode emulation.
-
-**The CI backstop is the slow one, and it is a separate wait.**
-`--ci-gate` dispatches ci.yml on the release commit before
-tagging, and its QEMU job runs the WHOLE integration suite — 145
-tests, each in its own QEMU, on a 2-core runner. Measured **~50
-minutes** on the v3.2.0 cut; the other three jobs finished in
-under 6. `wait_for_ci` allows 75 minutes. If it ever times out on
-a run that is still going, the tag was NOT created — wait for CI
-yourself and finish with `--resume`, rather than re-cutting.
+**Realistic timing.** On healthy GitHub-runner infrastructure
+the whole flow is **~4–5 minutes wall-clock** (parallel across
+the three workflows). Verified on v0.9.0's successful retry:
+Release 2m57s, Docs 1m44s, CI 4m10s. The longest individual
+jobs are CI's QEMU integration tests (~4 min) and Release's
+Build-tools-aa64 (~3 min, slower than x64 due to QEMU user-mode
+emulation of cross-tool execution). All other jobs finish in
+under 2 minutes.
 
 **Pathological case — bad-DNS days.** When GitHub Actions runner
 DNS is flaky (azure.archive.ubuntu.com mirrors), `apt-get
@@ -505,10 +483,9 @@ Should show the release page with `axl-sdk.deb`, `axl-sdk.rpm`,
 `axl-sdk-host-tools.{tar.gz,deb}`, and `SHA256SUMS` attached.
 
 The `.deb` / `.rpm` packages include the full C and C++ surface
-when CI builds with BOTH bare-metal toolchains cached
-(`scripts/install-toolchain.sh all` — C and C++ compile
-bare-metal on both arches, so neither is optional any more).
-Specifically, each package contains:
+when CI builds with the ARM bare-metal toolchain cached
+(`scripts/install-arm-toolchain.sh`).  Specifically, each
+package contains:
 
 - C bits (always): `axl-cc` driver, `libaxl.a` per arch,
   `axl.h` + `axl/*.h` headers, CRT0 objects, linker scripts,
@@ -521,13 +498,10 @@ Specifically, each package contains:
   libstdc++ so there's no runtime-dependency escalation on the
   package — pure-C consumers can ignore the extra files.
 
-CI cache invalidation: both toolchain tarballs are keyed on
-`hashFiles('scripts/axl-toolchains.conf')`, so ANY edit to that
-manifest forces a re-fetch of both — which is also why a
-toolchain version bump must be PUBLISHED before the commit that
-bumps it lands, or every CI job downloads a URL that 404s.
-Verify both packages contain `libaxl-cxx.a` after a release
-build:
+CI cache invalidation: the ARM toolchain tarball is keyed on
+its pinned version (`14.3.rel1` at writing).  Bump the pin in
+`scripts/install-arm-toolchain.sh` to force a re-fetch.  Verify
+both packages contain `libaxl-cxx.a` after a release build:
 
 ```sh
 dpkg-deb -c axl-sdk_*_amd64.deb | grep libaxl-cxx
@@ -535,7 +509,7 @@ rpm -qpl axl-sdk-*.x86_64.rpm | grep libaxl-cxx
 ```
 
 If `libaxl-cxx.a` is missing, the build host either didn't have
-the bare-metal toolchains available or `install.sh`'s
+the ARM bare-metal toolchain available or `install.sh`'s
 auto-detect failed.  See
 [`AXL-SDK-Design.md` §"C++ support"](AXL-SDK-Design.md) for the
 toolchain story.

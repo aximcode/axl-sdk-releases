@@ -57,18 +57,6 @@ static bool mRegistered;
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-/* axl_atexit takes a void(void *); the lifecycle API takes no argument
-   because nothing needs one. One trampoline is cheaper than widening the
-   public shape of axl_cxxrt_fini to suit one caller. */
-static void
-cxxrt_fini_trampoline(
-    void *unused
-    )
-{
-    (void)unused;
-    axl_cxxrt_fini();
-}
-
 void
 axl_cxxrt_init(
     void
@@ -79,19 +67,6 @@ axl_cxxrt_init(
     }
     __register_frame(__eh_frame_start);
     mRegistered = true;
-
-    /* REGISTERING TEARDOWN HERE IS WHAT MAKES IT HAPPEN AT ALL. Nothing else
-       calls axl_cxxrt_fini: it is reachable from no other symbol, so
-       --gc-sections collects it and the frame table, libgcc's registration
-       object and the 13912-byte sorted FDE table it builds on the first
-       unwind, and libsupc++'s emergency pool all survive to teardown. That is
-       the leak this file's docstring measured down to zero -- and an
-       AXL_MEM_DEBUG build fails the leak gate on it.
-       atexit is LIFO, so registering FIRST means running LAST, which is the
-       ordering axl_cxxrt_fini documents: after every other atexit handler (a
-       destructor may throw, which needs the table still registered) and
-       before the leak report. */
-    (void)axl_atexit(cxxrt_fini_trampoline, NULL);
 }
 
 /**

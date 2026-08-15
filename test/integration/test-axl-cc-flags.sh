@@ -166,133 +166,100 @@ else
     done
 fi
 
-# 5. Dependency generation is gcc's, forwarded — there is no axl-cc flag.
-#
-# There WAS a `--depfile` that post-processed the .d to absolutize every path,
-# added because a RELATIVE source makes gcc emit compile-cwd-relative
-# prerequisites that CMake's DEPFILE resolved against the wrong directory. It
-# is gone: the generated CMake package passes ABSOLUTE sources, so gcc's own
-# output is already absolute and there is nothing to rewrite.
-#
-# What these pin is the behaviour a consumer now depends on directly, and the
-# -MMD/-MD distinction is the load-bearing part: --depfile used -MMD
-# INTERNALLY, so it silently tracked no SDK header at all. Editing an SDK
-# header did not rebuild a CMake consumer's object -- caught by
-# test-cmake-package.sh, not here, because only an end-to-end rebuild shows it.
-#
-# Host-independent by construction: these assert COUNTS (zero vs non-zero) and
-# the shape of a path, never a particular one, so they do not depend on the
-# host gcc's include layout.
+# 5. --depfile: emit ABSOLUTE dependency paths while compiling the BARE source
+# (object must stay bit-identical to a no-depfile compile — Makefile<->CMake
+# bit-parity). Use a local header so the .d has a relative dep to absolutize,
+# and compile with a bare source name from the source dir (the real scenario).
 DW="$WORK/dep"
 mkdir -p "$DW"
 echo 'int helper(void);' > "$DW/t.h"
-printf '#include "t.h"\n#include <axl.h>\nint helper(void){ return 0; }\n' > "$DW/t.c"
+printf '#include "t.h"\nint helper(void){ return 0; }\n' > "$DW/t.c"
+
+( cd "$DW" && "$AXL_CC" -c --depfile t.d t.c -o t.o ) >"$DW/dep.log" 2>&1
+df_rc=$?
+check "$df_rc" "-c --depfile compiles (rc=$df_rc)"
+
+# target line present (relative, as the -o value); every DEPENDENCY absolute.
+grep -q '^t.o:' "$DW/t.d" 2>/dev/null
+check "$?" "depfile has the target line (t.o:)"
+# Flatten: strip continuations, split, drop trailing colon. Everything except
+# the target object 't.o' and blanks must be an absolute path. Guard on a
+# non-empty .d so a missing/empty file can't pass vacuously.
+if [[ -s "$DW/t.d" ]]; then
+    bad=$(tr -d '\\' < "$DW/t.d" | tr ' \t' '\n' | sed 's/:$//' \
+          | grep -vxE '(/.*|t\.o|)' || true)
+    [[ -z "$bad" ]]
+else
+    bad="(depfile empty/missing)"; false
+fi
+check "$?" "every dependency path in the depfile is absolute (stray: ${bad:-none})"
+# The local header is listed by its absolute, existing path.
+grep -qF "$DW/t.h" "$DW/t.d" 2>/dev/null && [[ -f "$DW/t.h" ]]
+check "$?" "local header t.h is listed as an absolute existing path"
+
+# 5b. Why --depfile exists at all: pin what the two FORWARDED gcc flags do with
+# SDK headers, because that is the reason --help gives a consumer for choosing
+# between them, and a silent drift in it would send them the wrong way.
+#
+# The SDK arrives via -isystem, so:
+#   -MMD skips system headers => it lists NO axl-sdk header whatsoever (the
+#        consumer gets zero SDK dependency tracking, not merely awkward paths);
+#   -MD  lists them, absolute, while the relative source stays relative => a
+#        MIXED file, which is what CMake's DEPFILE cannot rebase.
+#
+# Host-independent by construction: it asserts a COUNT (zero vs non-zero) and
+# the coexistence of one relative and one absolute prerequisite, never a
+# particular path — so it does not depend on the host gcc's include layout.
+# The relative side is the source name itself, which is relative because the
+# compile runs from its own directory.
+SDW="$WORK/depsys"
+mkdir -p "$SDW"
+printf '#include <axl.h>\nint sdkdep(void){ return 0; }\n' > "$SDW/s.c"
+
+( cd "$SDW" && "$AXL_CC" -c -MMD -MF s-mmd.d s.c -o s-mmd.o ) >"$SDW/mmd.log" 2>&1
+mmd_rc=$?
+( cd "$SDW" && "$AXL_CC" -c -MD  -MF s-md.d  s.c -o s-md.o  ) >"$SDW/md.log" 2>&1
+md_rc=$?
+[[ "$mmd_rc" -eq 0 && "$md_rc" -eq 0 ]]
+check "$?" "forwarded -MMD and -MD both compile an SDK TU (rc=$mmd_rc/$md_rc)"
 
 dep_tokens() { tr -d '\\' < "$1" | tr ' \t' '\n' | grep -vxE '.*:|' || true; }
 
-# A RELATIVE source, compiled from its own directory: the shape a hand-written
-# Makefile uses, where cwd-relative prerequisites are exactly right.
-( cd "$DW" && "$AXL_CC" -c -MD -MP -MF t.d t.c -o t.o ) >"$DW/dep.log" 2>&1
-df_rc=$?
-check "$df_rc" "forwarded -MD -MP -MF compiles (rc=$df_rc)"
+mmd_sdk=$(dep_tokens "$SDW/s-mmd.d" | grep -c 'include/axl-sdk/')
+[[ "$mmd_rc" -eq 0 && -s "$SDW/s-mmd.d" && "$mmd_sdk" -eq 0 ]]
+check "$?" "forwarded -MMD lists NO SDK headers — they come via -isystem (found $mmd_sdk)"
 
-grep -q '^t.o:' "$DW/t.d" 2>/dev/null
-check "$?" "the depfile names the object as its target (t.o:)"
-
-# The FULL path, anchored as a whole token. `grep -F t.h` cannot fail here:
-# the fixture includes <axl.h> and 40-odd SDK headers contain that substring
-# (axl-atexit.h, axl-list.h, axl-format.h, ...).
-dep_tokens "$DW/t.d" | grep -qx 't.h'
-check "$?" "the local header is listed as its own prerequisite"
-
-# THE DISTINCTION THAT MATTERS. The SDK arrives via -isystem, so -MMD -- which
-# omits system headers by definition -- lists NONE of it. A consumer choosing
-# -MMD gets zero SDK dependency tracking, which is silent staleness, not merely
-# awkward paths.
-( cd "$DW" && "$AXL_CC" -c -MMD -MF t-mmd.d t.c -o t-mmd.o ) >"$DW/mmd.log" 2>&1
-mmd_rc=$?
-mmd_sdk=$(dep_tokens "$DW/t-mmd.d" | grep -c 'include/axl-sdk/')
-[[ "$mmd_rc" -eq 0 && -s "$DW/t-mmd.d" && "$mmd_sdk" -eq 0 ]]
-check "$?" "-MMD lists NO SDK header — they arrive via -isystem (found $mmd_sdk)"
-
-md_sdk=$(dep_tokens "$DW/t.d" | grep -c 'include/axl-sdk/')
+md_sdk=$(dep_tokens "$SDW/s-md.d" | grep -c 'include/axl-sdk/')
 [[ "$md_sdk" -gt 0 ]]
-check "$?" "-MD DOES list them (found $md_sdk) — this is why the package uses it"
+check "$?" "forwarded -MD does list SDK headers (found $md_sdk)"
 
-# An ABSOLUTE source, which is what the CMake package passes: gcc's output is
-# then all-absolute with no post-processing, which is the whole reason
-# --depfile could be deleted.
-( cd "$DW" && "$AXL_CC" -c -MD -MF abs.d "$DW/t.c" -o abs.o ) >"$DW/abs.log" 2>&1
-abs_rc=$?
-abs_rel=$(dep_tokens "$DW/abs.d" | grep -cvE '^/')
-abs_abs=$(dep_tokens "$DW/abs.d" | grep -cE '^/')
-# The positive control matters as much as the count: a missing or empty .d has
-# zero relative tokens too, and would pass this vacuously.
-[[ "$abs_rc" -eq 0 && -s "$DW/abs.d" && "$abs_abs" -gt 0 && "$abs_rel" -eq 0 ]]
-check "$?" "an ABSOLUTE source yields an all-absolute depfile ($abs_abs abs, $abs_rel rel)"
+# Mixed: at least one relative and at least one absolute prerequisite, same file.
+md_rel=$(dep_tokens "$SDW/s-md.d" | grep -cvE '^/')
+md_abs=$(dep_tokens "$SDW/s-md.d" | grep -cE '^/')
+[[ "$md_rel" -gt 0 && "$md_abs" -gt 0 ]]
+check "$?" "forwarded -MD yields a MIXED depfile ($md_rel relative + $md_abs absolute)"
 
-# 6. Bit-parity: dependency flags must not perturb the object. gcc documents
-#    them as codegen-neutral; this is what makes an incremental build's object
-#    comparable to a clean one.
+# 6. Bit-parity: --depfile must NOT perturb the object vs a bare compile.
 ( cd "$DW" && "$AXL_CC" -c t.c -o t-nodep.o ) >"$DW/nodep.log" 2>&1
 cmp -s "$DW/t.o" "$DW/t-nodep.o"
-check "$?" "-MD -MP -MF leaves the object bit-identical to a bare compile"
+check "$?" "--depfile leaves the object bit-identical to a bare compile"
 
-# 7. The removed flag is REJECTED, not silently ignored. axl-cc errors on
-#    unknown --options, so this also pins that --depfile really is gone rather
-#    than lingering as a no-op nobody noticed.
-"$AXL_CC" -c --depfile "$DW/x.d" "$DW/t.c" -o "$DW/x.o" >"$DW/gone.log" 2>&1
-gone_rc=$?
-[[ "$gone_rc" -ne 0 ]] && grep -qi "unknown option: --depfile" "$DW/gone.log"
-check "$?" "--depfile is gone and rejected as an unknown option (rc=$gone_rc)"
+# 7. --depfile requires -c (a full-link build would name a scratch object).
+"$AXL_CC" --depfile "$DW/nc.d" "$DW/t.c" -o "$WORK/nc.efi" >"$DW/nc.log" 2>&1
+nc_rc=$?
+[[ "$nc_rc" -ne 0 ]] && grep -qi "requires -c" "$DW/nc.log"
+check "$?" "--depfile without -c errors clearly (rc=$nc_rc)"
 
-# 8. Asking for a depfile on a LINK invocation says so -- in BOTH spellings,
-#    which fail differently.
-#
-# `axl-cc -MD ... -o app.efi` used to be an error while --depfile existed
-# ("requires -c"). Forwarded, gcc accepts it, and what you get is unusable
-# either way:
-#
-#   with -MF     the file IS written -- but its target names the scratch
-#                object in $TMPDIR that axl-cc deletes, so no make rule will
-#                ever match it. That is worse than absent: it looks fine.
-#   without -MF  gcc derives the path from that same scratch object, so the
-#                file lands in $TMPDIR and vanishes with it.
-#
-# The first version of this warning fired ONLY on -MF and claimed no file was
-# written -- exactly backwards on both counts, caught by review. So these
-# assert the SUBSTANCE (what is on disk, what the target line says) and not
-# merely that some warning text appeared.
-#
-# A warning and not an error: -MD in a shared CFLAGS reaching both the compile
-# and the link step is an ordinary Makefile pattern.
-# Its own source with a main(): t.c above is a helper TU, and a link needs an
-# entry point. -I"$DW" because this compiles from the test's cwd, not from $DW.
-# Includes t.h (so the dependency machinery is exercised) but does not CALL
-# into it -- only this one TU is linked, so a call would be undefined.
-printf '#include "t.h"\n#include <axl.h>\nint main(void){ return 0; }\n' \
-    > "$DW/lmain.c"
-"$AXL_CC" -I"$DW" -MD -MF "$DW/link.d" "$DW/lmain.c" -o "$WORK/link.efi" \
-    >"$DW/link.log" 2>&1
-lk_rc=$?
-[[ "$lk_rc" -eq 0 ]] && grep -qi "LINK invocation" "$DW/link.log"
-check "$?" "-MD -MF on a LINK invocation warns (rc=$lk_rc)"
-
-# The substance: the file exists and its target is a path that no longer does.
-if [[ -s "$DW/link.d" ]]; then
-    lk_tgt="$(sed -n '1s/:.*//p' "$DW/link.d")"
-    [[ -n "$lk_tgt" && ! -e "$lk_tgt" ]]
-    check "$?" "...and its target names an object that no longer exists ($lk_tgt)"
-else
-    check 1 "...and its target names an object that no longer exists (no depfile)"
-fi
-
-# The other spelling, which was the genuinely silent one.
-( cd "$DW" && rm -f nomf.d && "$AXL_CC" -I"$DW" -MD lmain.c -o "$WORK/nomf.efi" ) \
-    >"$DW/nomf.log" 2>&1
-nf_rc=$?
-[[ "$nf_rc" -eq 0 ]] && grep -qi "LINK invocation" "$DW/nomf.log"
-check "$?" "-MD WITHOUT -MF also warns — it wrote nothing at all (rc=$nf_rc)"
+# 8. Multi-source: DEST is a directory; each object gets its own absolute .d.
+MD="$DW/multi"; mkdir -p "$MD" "$MD/out"
+printf '#include "t.h"\nint a(void){return 0;}\n' > "$MD/a.c"
+printf '#include "t.h"\nint b(void){return 0;}\n' > "$MD/b.c"
+cp "$DW/t.h" "$MD/t.h"
+( cd "$MD" && "$AXL_CC" -c --depfile out a.c b.c ) >"$MD/multi.log" 2>&1
+ms_rc=$?
+[[ "$ms_rc" -eq 0 && -f "$MD/out/a.d" && -f "$MD/out/b.d" ]] \
+    && grep -qF "$MD/t.h" "$MD/out/a.d" && grep -qF "$MD/t.h" "$MD/out/b.d"
+check "$?" "multi-source --depfile <dir> writes per-object absolute .d files (rc=$ms_rc)"
 
 # 9. -std is routed to the LANGUAGE IT NAMES, not into the shared extras.
 #
@@ -307,8 +274,8 @@ SD="$DW/std"; mkdir -p "$SD"
 printf '#include <axl.h>\nint axl_c_side(void){ return 0; }\n' > "$SD/s.c"
 printf 'int axl_cpp_side(){ return 0; }\n'                     > "$SD/s.cpp"
 
-# The C++ cases need a working C++ toolchain -- a bare-metal cross on both
-# arches now (ours for x64, ARM's for aa64). Probe once by compiling, rather than guessing
+# The C++ cases need a working C++ toolchain (host g++ for x64, ARM's
+# bare-metal cross for aa64). Probe once by compiling, rather than guessing
 # from a path: a staged-but-broken toolchain would otherwise turn these into
 # confusing failures instead of honest skips.
 HAVE_CXX_TOOLCHAIN=false
@@ -385,150 +352,6 @@ if [[ -f "$SVC_SRC" ]]; then
 else
     check 0 "SKIP: sdk/examples/service-demo.c absent — --service -std check not run"
 fi
-
-# --- Constructors that nothing would run ------------------------------------
-#
-# AXL walks .init_array only. The linker scripts also bound the legacy .ctors
-# with __CTOR_LIST__/__CTOR_END__, and nothing reads those -- so a non-empty
-# .ctors is code the author expects to execute and that silently will not.
-#
-# THE REACHABLE CAUSE IS A COMPILER. GCC's x86_64-*-elf target defaults to
-# .ctors; AXL's own toolchain escapes it only via --enable-initfini-array
-# (14.3.0-axl2). An AXL_X64_GXX pointing at an older build -- a stale override,
-# a warm CI cache -- silently disables every global constructor in the image.
-#
-# SYNTHESIZED IN ASSEMBLY rather than by invoking such a compiler, deliberately:
-# a test that needs the OLD toolchain installed would SKIP everywhere it
-# matters, including CI. Ten lines of .S reproduce the exact condition the
-# guard inspects, on any machine.
-# $WORK, not $DW: $DW belongs to the --depfile subtest above, and nesting
-# here would make this block depend on that one still existing.
-CT="$WORK/ctors"; mkdir -p "$CT"
-cat > "$CT/ctors.S" <<'EOS'
-    .text
-    .globl axl_test_ctor_fn
-axl_test_ctor_fn:
-    ret
-    .section .ctors,"aw",@progbits
-    .align 8
-    .quad axl_test_ctor_fn
-EOS
-printf '#include <axl.h>\nint main(void){ axl_print("hi\\n"); return 0; }\n' \
-    > "$CT/main.c"
-
-if "$AXL_CC" -c "$CT/ctors.S" -o "$CT/ctors.o" >"$CT/asm.log" 2>&1; then
-    "$AXL_CC" "$CT/main.c" "$CT/ctors.o" -o "$CT/bad.efi" >"$CT/link.log" 2>&1
-    ct_rc=$?
-    [[ "$ct_rc" -ne 0 ]] && grep -q "constructors in .ctors" "$CT/link.log"
-    check "$?" "an image with unwalked .ctors is REJECTED (rc=$ct_rc)"
-
-    [[ ! -f "$CT/bad.efi" ]]
-    check "$?" "the rejected link wrote no .efi"
-
-    # The control. Without it, a guard that rejected EVERY link would pass the
-    # assertion above -- and the .ctors bounds are emitted into every image, so
-    # an off-by-one comparison would do exactly that.
-    "$AXL_CC" "$CT/main.c" -o "$CT/good.efi" >"$CT/good.log" 2>&1
-    check "$?" "the same source WITHOUT the .ctors object still links"
-else
-    check 1 "axl-cc assembles a .S fixture (see $CT/asm.log)"
-fi
-
-# --- Hermeticity: no host headers, no host libraries -------------------------
-#
-# A UEFI image cannot use either -- they describe another libc, another ABI and
-# an OS that will not be there -- and the failure is not a link error, it is a
-# struct that disagrees at runtime. Two checks, because neither covers the
-# other:
-#
-#   FLAGS    fire on intent, before anything compiles, so the message names the
-#            flag rather than a header six includes down. This is also the ONLY
-#            one that can see `-L/usr/lib`: a depfile lists headers.
-#   -MD      the compiler's own record of every file it OPENED. Catches an
-#            absolute `#include "/usr/..."`, which names no flag at all.
-#            -MD and not -MMD: -MMD omits SYSTEM headers by definition, so a
-#            leak through `-isystem /usr/include` is invisible to it (measured:
-#            -MMD 0 hits, -MD 19, same TU).
-HM="$WORK/herm"; mkdir -p "$HM"
-printf '#include <axl.h>\nint main(void){ return 0; }\n' > "$HM/clean.c"
-printf '#include <axl.h>\n#include "/usr/include/linux/limits.h"\nint main(void){ return PATH_MAX; }\n' \
-    > "$HM/absinc.c"
-
-"$AXL_CC" -I/usr/include "$HM/clean.c" -o "$HM/a.efi" >"$HM/inc.log" 2>&1
-hm_rc=$?
-[[ "$hm_rc" -ne 0 ]] && grep -q "names a HOST path" "$HM/inc.log"
-check "$?" "-I/usr/include is rejected before compiling (rc=$hm_rc)"
-
-"$AXL_CC" -Wl,-L/usr/lib "$HM/clean.c" -o "$HM/b.efi" >"$HM/lib.log" 2>&1
-hm_rc=$?
-[[ "$hm_rc" -ne 0 ]] && grep -q "names a HOST path" "$HM/lib.log"
-check "$?" "-Wl,-L/usr/lib is rejected — no header check could see it (rc=$hm_rc)"
-
-# The case ONLY the -MD scan catches: the source names the path itself.
-if [[ -r /usr/include/linux/limits.h ]]; then
-    "$AXL_CC" "$HM/absinc.c" -o "$HM/c.efi" >"$HM/abs.log" 2>&1
-    hm_rc=$?
-    [[ "$hm_rc" -ne 0 ]] && grep -q "reached the HOST's headers" "$HM/abs.log"
-    check "$?" "an absolute #include of a host header is rejected (rc=$hm_rc)"
-
-    grep -q "/usr/include/linux/limits.h" "$HM/abs.log"
-    check "$?" "...and the offending header is named, not just the source"
-else
-    check 0 "SKIP: /usr/include/linux/limits.h absent — absolute-include case not run"
-    check 0 "SKIP: /usr/include/linux/limits.h absent — header-naming case not run"
-fi
-
-# The two regressions the FIRST version of these checks shipped, both found by
-# review rather than by the tests above.
-#
-#   1. A leak behind a preprocessor guard. The -M pass omitted the real
-#      compile's -D flags, so a host include inside `#ifdef NDEBUG` was opened
-#      by a --release build and invisible to the check.
-#   2. A host archive handed in POSITIONALLY. No flag scan and no depfile can
-#      see it, and it is the more dangerous direction: a glibc object linked
-#      straight into a firmware image.
-if [[ -r /usr/include/linux/limits.h ]]; then
-    printf '#include <axl.h>\n#ifdef NDEBUG\n#include "/usr/include/linux/limits.h"\n#endif\nint main(void){ return 0; }\n' \
-        > "$HM/guarded.c"
-    "$AXL_CC" --release "$HM/guarded.c" -o "$HM/g.efi" >"$HM/guard.log" 2>&1
-    hm_rc=$?
-    [[ "$hm_rc" -ne 0 ]] && grep -q "reached the HOST's headers" "$HM/guard.log"
-    check "$?" "a host header behind #ifdef NDEBUG is still caught (rc=$hm_rc)"
-else
-    check 0 "SKIP: /usr/include/linux/limits.h absent — #ifdef-guarded case not run"
-fi
-
-if [[ -r /usr/lib64/libm.a || -r /usr/lib/x86_64-linux-gnu/libm.a ]]; then
-    hostlib=/usr/lib64/libm.a
-    [[ -r "$hostlib" ]] || hostlib=/usr/lib/x86_64-linux-gnu/libm.a
-    "$AXL_CC" "$HM/clean.c" "$hostlib" -o "$HM/e.efi" >"$HM/poslib.log" 2>&1
-    hm_rc=$?
-    [[ "$hm_rc" -ne 0 ]] && grep -q "names a HOST path" "$HM/poslib.log"
-    check "$?" "a host .a passed positionally is rejected (rc=$hm_rc)"
-else
-    check 0 "SKIP: no host libm.a — positional-archive case not run"
-fi
-
-# THE PACKAGED-INSTALL CASE, which is why the exemption is on the SDK's include
-# DIR and not on $SDK_DIR. build-packages.sh stages with --prefix /usr, so a
-# .deb consumer's own headers sit at /usr/include/axl-sdk/. Exempting the
-# PREFIX there would whitelist the entire host tree and silently disable this
-# check exactly where it ships; exempting the prefix was in fact the first fix
-# attempted, and this is what caught it.
-sdk_inc_exempt=$(printf '%s\n' /usr/include/axl-sdk/axl.h /usr/include/stdio.h \
-    | grep -E '^(/usr/|/lib/)' | grep -vc "^/usr/include/axl-sdk/")
-[[ "$sdk_inc_exempt" -eq 1 ]]
-check "$?" "with SDK_DIR=/usr the exemption spares axl-sdk/ and NOT stdio.h"
-
-# The control. Without it a check that rejected EVERYTHING would pass above.
-"$AXL_CC" "$HM/clean.c" -o "$HM/ok.efi" >"$HM/ok.log" 2>&1
-check "$?" "a build naming no host path still succeeds"
-
-# The opt-out is documented, so it must work — otherwise the error message
-# tells the user to do something that fails.
-"$AXL_CC" --allow-host-paths -I/usr/include "$HM/clean.c" -o "$HM/d.efi" \
-    >"$HM/opt.log" 2>&1
-check "$?" "--allow-host-paths permits it, as the error message promises"
 
 echo "--- results ---"
 echo "axl-cc flag passthrough: $pass passed, $fail failed"

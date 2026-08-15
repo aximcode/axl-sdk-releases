@@ -1,13 +1,15 @@
 /**
  * containers.cpp — the standard containers, under UEFI.
  *
- * Build with: axl-c++ containers.cpp -o containers.efi
+ * axl-example: hosted
  *
- * No flag. This used to need `--hosted`, because libstdc++ refuses
- * <vector>/<string>/<map>/<unordered_map> under -ffreestanding at
- * bits/requires_hosted.h — and that flag, not exceptions and not the
- * heap, was the whole gate. AXL no longer compiles C++ freestanding,
- * so the containers are simply available.
+ * Build with: axl-c++ --hosted containers.cpp -o containers.efi
+ *
+ * `--hosted` is what makes this compile. libstdc++ refuses
+ * <vector>/<string>/<map>/<unordered_map> under -ffreestanding, at
+ * bits/requires_hosted.h — that flag, not exceptions and not the heap,
+ * is the whole gate. Without --hosted the first include below is a
+ * hard error.
  *
  * Everything still allocates through axl_malloc, so AxlMem's leak
  * tracking and debug fill pattern keep working unchanged.

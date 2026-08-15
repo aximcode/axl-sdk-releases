@@ -67,11 +67,3 @@ WARN_AS_ERROR          = FAIL_ON_WARNINGS
 SORT_MEMBER_DOCS       = NO
 SHOW_INCLUDE_FILES     = NO
 FULL_PATH_NAMES        = NO
-
-# Graphs are for the HTML output, which is OFF here (GENERATE_XML only) — but
-# doxygen still evaluates the graph limits and reports an ERROR when a header's
-# included-by graph exceeds DOT_GRAPH_MAX_NODES. axl-macros.h is included by
-# 126 headers, well past the default 50, so the CI docs build failed on a graph
-# nothing renders. Raise the ceiling rather than chase the count: this is a
-# generated artefact of an umbrella-style public API, not a defect.
-DOT_GRAPH_MAX_NODES    = 500

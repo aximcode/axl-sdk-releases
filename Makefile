@@ -44,12 +44,7 @@ AXL_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 # ===================================================================
 
 ifeq ($(ARCH),aa64)
-  # OUR toolchain's binutils, not apt's aarch64-linux-gnu-*. ARM's ships
-  # pei-aarch64-little, so the .so -> .efi objcopy works with it; the hermetic
-  # direction (AXL-Libc-Substrate-Design.md §4.1d) says nothing comes from the
-  # host. x64 still cannot follow: its binutils has no PE backend until the
-  # toolchain is rebuilt with --enable-targets=x86_64-pep.
-  CROSS      = $(or $(AXL_AA64_BINUTILS_PREFIX),$(AXL_AA64_BINUTILS_PREFIX_DEFAULT))
+  CROSS      = aarch64-linux-gnu-
   # -mno-outline-atomics: keep atomic ops inline (avoids unresolved
   # __aarch64_ldadd* helper-function references in freestanding builds).
   # -ffixed-x18: UEFI AArch64 binding (UEFI 2.11 §2) reserves x18 as
@@ -61,46 +56,21 @@ ifeq ($(ARCH),aa64)
   EFI_LDS    = scripts/elf_aarch64_efi.lds
   PE_TARGET  = pei-aarch64-little
 else
-  # OURS now (the -axl toolchain adds the PE target objcopy needs); see the
-  # aa64 branch above and AXL-Libc-Substrate-Design.md §4.1d.
-  CROSS      = $(or $(AXL_X64_BINUTILS_PREFIX),$(AXL_X64_BINUTILS_PREFIX_DEFAULT))
+  CROSS      =
   GCC_ARCH   = -mno-red-zone -march=x86-64
   EFI_LDS    = scripts/elf_x86_64_efi.lds
   PE_TARGET  = pei-x86-64
 endif
 
-# C compiles with the BARE-METAL cross for both arches, not with host gcc
-# (x64) or the Linux cross (aa64). Both of those resolve <string.h> and friends
-# to a hosted libc's headers -- /usr/include on x64, the glibc-targeted cross's
-# on aa64 -- and this build uses no host headers or libraries. That is what
-# retired include/compat: the third-party code in deps/ is the only thing that
-# ever asked for those headers, and newlib supplies the genuine article.
-# docs/AXL-Libc-Substrate-Design.md §4.1b.
-#
-# Binutils stay as they were ($(CROSS)ld / ar / objcopy). They consume objects,
-# not headers, so they are not part of the hermetic question -- and the flip was
-# measured with exactly this pairing: 271/271 objects and 43 images per arch,
-# AxlTestData 2078/0 on both.
-ifeq ($(ARCH),aa64)
-  CC       = $(or $(AXL_AA64_GCC),$(AXL_AA64_GCC_DEFAULT))
-else
-  CC       = $(or $(AXL_X64_GCC),$(AXL_X64_GCC_DEFAULT))
-endif
+CC         = $(CROSS)gcc
 LD_ELF     = $(CROSS)ld
 AR         = $(CROSS)ar
 OBJCOPY    = $(CROSS)objcopy
 
-# C++ toolchain.  Bare-metal on BOTH arches now, matching $(CC) above.
-# AArch64 uses ARM's "none-elf" cross because the Linux-ABI cross's libstdc++
-# headers pull hosted typedefs from <bits/c++config.h> (see docs/ROADMAP.md
-# axlmm spec).  X64 uses AXL's own x86_64-elf toolchain, which nobody
-# publishes -- toolchain/x86_64-elf/build-toolchain.sh builds it.
-#
-# X64 used to be the HOST g++, and dropping that was the last host input the
-# SDK had (AXL-Libc-Substrate-Design.md §4.1d).  It is not only a hermeticity
-# argument: the host compiler is glibc-targeted, so its libsupc++ reads the
-# exception globals and the stack canary through %fs, which UEFI never sets
-# up.  See AXL-Cxx-Design.md §6a-PLAN task T2.
+# C++ toolchain.  AArch64 uses ARM's bare-metal "none-elf" cross because the
+# Linux-ABI cross's libstdc++ headers pull hosted typedefs from
+# <bits/c++config.h> (see docs/ROADMAP.md axlmm spec).  X64 uses host g++ (same
+# convention as axl-cc's host gcc).
 #
 # CXX and the C++ flags are set UNCONDITIONALLY, not under `ifdef AXL_CPP`.
 # They used to be guarded, and the consequence was not that the C++ gates were
@@ -116,10 +86,8 @@ OBJCOPY    = $(CROSS)objcopy
 # is asked for and the toolchain is missing.
 # Toolchain locations live in ONE file, shared verbatim with scripts/axl-cc
 # and the generated axl-config.cmake -- see scripts/axl-toolchains.conf for why
-# its KEY=VALUE subset is both valid make and valid sh. `-include` rather than
-# `include` so the lint gates and `make clean` still work in a tree without it;
-# a real build without it now fails at the CC guard below, since C has no host
-# fallback to land on.
+# its KEY=VALUE subset is both valid make and valid sh. `-include` so a tree
+# missing it still builds C.
 -include $(dir $(lastword $(MAKEFILE_LIST)))scripts/axl-toolchains.conf
 
 ifeq ($(ARCH),aa64)
@@ -133,7 +101,7 @@ ifeq ($(ARCH),aa64)
     CXX = $(or $(AXL_AA64_GXX),$(AXL_AA64_GXX_DEFAULT))
   endif
 else
-  CXX = $(or $(AXL_X64_GXX),$(AXL_X64_GXX_DEFAULT))
+  CXX = $(or $(AXL_X64_GXX),g++)
 endif
 
 ifdef AXL_CPP
@@ -142,14 +110,13 @@ ifdef AXL_CPP
       $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-toolchain.sh aa64)
     endif
   else
-    # Check $(CXX), NOT g++. The default is a bare-metal toolchain path now, so
-    # testing for host g++ would pass on a box that has one and lacks the other
-    # -- and the build then dies deep in a recipe with a bare "No such file or
-    # directory" instead of here, which is the guard's only job. `command -v`
-    # still covers an AXL_X64_GXX override spelled as a bare name on PATH;
-    # wildcard covers a path.
+    # Check $(CXX), NOT g++. Once AXL_X64_GXX can point at a bare-metal
+    # toolchain, testing for host g++ passes on a box that has one and lacks
+    # the other -- and the build then dies deep in a recipe with a bare
+    # "No such file or directory" instead of here, which is the guard's only
+    # job. `command -v` covers a bare name on PATH; wildcard covers a path.
     ifeq ($(or $(wildcard $(CXX)),$(shell command -v $(CXX) 2>/dev/null)),)
-      $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-toolchain.sh x64)
+      $(error AXL_CPP=1 needs $(CXX) — not found on PATH or at that path)
     endif
   endif
 endif
@@ -233,15 +200,8 @@ endif
 # check-examples / check-cxx-entry gates.  Matches the hard defaults baked into
 # axl-cc's C++ path — no exceptions, no RTTI, no thread-safe statics, C++23.
 # Unconditional: see the CXX comment above for what guarding it cost.
-#
-# NO -ffreestanding, and that is task T3 (AXL-Cxx-Design.md §6a-PLAN). It sets
-# __STDC_HOSTED__ to 0, which libstdc++ consults in bits/requires_hosted.h to
-# refuse <vector>/<string>/<map> -- so it was the whole of what `--hosted`
-# turned off, and there is one C++ mode now. C KEEPS it (see CFLAGS_BASE):
-# dropping it there would pull a real <stdio.h> with a FILE and locale
-# machinery AXL does not implement. One mode PER LANGUAGE, no user-facing flag.
 CXXFLAGS_BASE = -std=c++23 \
-                -fshort-wchar \
+                -ffreestanding -fshort-wchar \
                 -fno-builtin \
                 -fno-omit-frame-pointer \
                 -fno-exceptions -fno-rtti -fno-threadsafe-statics \
@@ -259,17 +219,21 @@ CXXFLAGS_BASE = -std=c++23 \
 # scatter .d files outside $(BUILDDIR).
 CXXFLAGS      = $(CXXFLAGS_BASE) $(CFLAGS_BUILD) -MD -MP
 
-# NO separate C++ include path. There was an INCLUDES_HOSTED that filtered
-# -Ideps/lzma out for the five hosted TUs, and it FILTERED NOTHING: -Ideps/lzma
-# is not in $(INCLUDES) at all (see the comment on it above) -- it reaches only
-# the two lzma TUs, per-rule. The protection that comment described is real and
-# comes from somewhere else, so the filter was a no-op that read like a guard.
-# Removed rather than carried forward: every C++ TU can reach <string> now, and
-# a no-op guard standing in front of a live hazard is worse than none.
+# The same set as axl-c++ --hosted gives a consumer translation unit: drop
+# -ffreestanding so libstdc++ stops refusing the containers, drop the header
+# directories that SHADOW a real libc header, and KEEP $(GCC_ARCH) -- dropping
+# that is how a hosted spike picked up AVX from this host's -march=x86-64-v3
+# default and #UD'd under UEFI.
 #
-# include/compat used to be filtered too, for its `typedef void FILE` against
-# the real <stdio.h>. It is gone: C now compiles with a bare-metal cross whose
-# newlib supplies the genuine headers.
+# TWO directories shadow, not one. include/compat's `typedef void FILE` against
+# the real <stdio.h> is the known one. deps/lzma/errno.h is the other, and it
+# is stealthier: nothing includes it directly, but `#include <string>` reaches
+# ext/string_conversions.h, which needs errno -- and gets a vendored stub with
+# no ERANGE in it. A consumer never sees this, because the staged SDK include
+# tree contains neither directory; only an in-tree hosted compile does.
+CXXFLAGS_HOSTED_BASE = $(filter-out -ffreestanding,$(CXXFLAGS_BASE))
+CXXFLAGS_HOSTED      = $(filter-out -ffreestanding,$(CXXFLAGS))
+INCLUDES_HOSTED      = $(filter-out -Iinclude/compat -Ideps/lzma,$(INCLUDES))
 
 ifeq ($(ARCH),aa64)
   GCC_CRT0 = $(BUILDDIR)/axl-crt0-gcc-aarch64.o
@@ -283,17 +247,8 @@ LINK_CRT0   = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ)
 # Tests/AXL_APP: asm CRT0 → _AxlEntry(from AXL_APP macro)
 LINK_CRT0_T = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ)
 
-# .eh_frame / .gcc_except_table are here on EVERY link and cost a non-exceptions
-# image nothing -- measured byte-identical with `cmp`, because --gc-sections has
-# already collected them when the linker script keeps nothing. objcopy takes
-# EXACT section names and silently drops what it is not given, so omitting them
-# would produce an exceptions image whose unwind tables were linked and then
-# thrown away: a failure that appears only at the first throw. What must stay
-# conditional is the KEEP() in the linker script (elf_*_efi_eh.lds), which is
-# what actually costs a C image +16.8%.
 OBJCOPY_SECTIONS = -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
-                   -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir \
-                   -j .eh_frame -j .gcc_except_table
+                   -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir
 
 # Host tool: patches PE debug data directory after objcopy
 PE_SET_DEBUG = $(BUILDDIR)/pe-set-debug
@@ -372,17 +327,7 @@ endef
 # ===================================================================
 
 CFLAGS     = $(CFLAGS_BASE) $(CFLAGS_BUILD) -MD -MP
-# -Ideps/lzma is NOT here, deliberately. It carries a vendored errno.h that
-# SHADOWS the toolchain's real one -- harmless while there was no real one, and
-# a live trap now that C compiles against newlib (a TU including <errno.h>
-# would get a stub with no ERANGE in it). It is added per-rule to the lzma TUs
-# that need it, the same way -Ideps/libvterm is, so the shadow reaches only the
-# vendored code that expects it.
-#
-# This is what keeps C++ safe too, and more sharply since T3: every C++ TU can
-# now reach <string>, which includes ext/string_conversions.h, which needs
-# ERANGE. Adding -Ideps/lzma to this line would break all of them at once.
-INCLUDES   = -Iinclude -Isrc/backend \
+INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend -Ideps/lzma \
              -Ideps/libvterm/include
 
 # ===================================================================
@@ -392,7 +337,7 @@ INCLUDES   = -Iinclude -Isrc/backend \
 ifdef AXL_TLS
 CFLAGS += -DAXL_HAVE_TLS -Ideps/mbedtls/include \
           -DMBEDTLS_CONFIG_FILE='<axl-mbedtls-config.h>' \
-          -Isrc/net -Wno-redundant-decls \
+          -Isrc/net -Iinclude/compat -Wno-redundant-decls \
           -U_WIN32 -U_WIN64
 endif
 
@@ -734,12 +679,12 @@ LIB_OBJS   = $(patsubst %.c,$(BUILDDIR)/%.o,$(notdir $(LIB_SOURCES)))
 # (those go in axl-cxxabi.c → libaxl.a).
 #
 # axl-cxx-libm.cpp, axl-cxx-rehash.cpp, axl-cxx-rbtree.cpp and
-# axl-cxx-hash.cpp exist for consumers who USE the standard containers. A C++
-# program that touches none of them pulls none of these: an archive member
-# only arrives when some symbol in it is still undefined.
+# axl-cxx-hash.cpp exist for `axl-c++ --hosted` consumers. None is referenced
+# by a freestanding C++ build, so none is pulled from the archive by one -- an
+# archive member only arrives when some symbol in it is still undefined.
 #
-# rbtree + hash are what let the containers drop libstdc++.a ENTIRELY:
-# measured, they were the only two members still being pulled (tree.o and
+# rbtree + hash are what let --hosted drop libstdc++.a ENTIRELY: measured,
+# they were the only two members still being pulled (tree.o and
 # hash_bytes.o). See AXL-Cxx-Design.md section 8 -- redistributing the runtime
 # library is the one act the GCC Runtime Library Exception does not cover.
 LIB_CXX_SOURCES = src/runtime/axl-cxxabi-ops.cpp \
@@ -781,11 +726,9 @@ ifeq ($(ARCH),aa64)
     AXL_CXXRT_CC = $(or $(AXL_AA64_GXX),$(AXL_AA64_GXX_DEFAULT))
   endif
 else
-  # Resolves identically to $(CXX) now that T2 has landed. Kept spelled out
-  # rather than written as $(CXX), because the two answer different questions:
-  # $(CXX) is whatever compiles AXL's C++, while this archive is glue for a
-  # SPECIFIC libstdc++ and is meaningless built by anything else. Collapsing
-  # them would make a future $(CXX) override silently retarget the glue.
+  # The manifest DEFAULT, not $(CXX): x64's CXX still falls back to host g++
+  # (flipping that is T2's remaining half), but this archive is glue for the
+  # bare-metal libstdc++ and is meaningless built by anything else.
   AXL_CXXRT_CC = $(or $(AXL_X64_GXX),$(AXL_X64_GXX_DEFAULT))
 endif
 AXL_CXXRT_CC := $(patsubst %g++,%gcc,$(AXL_CXXRT_CC))
@@ -856,89 +799,6 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
 print-lint-gates:
 	@echo $(LINT_GATES)
 
-# $(CC)'s libc include directory, reported for TOOLS THAT REPLAY THE COMPILE
-# DATABASE WITH A DIFFERENT DRIVER -- clang-tidy above all.
-#
-# bear records commands whose compiler is $(CC), and the libc headers are
-# IMPLICIT in that binary: nothing on the command line names
-# <toolchain>/x86_64-elf/include. clang-tidy reads such a command, infers the
-# target x86_64-elf from the compiler's NAME, and -- knowing no cross libc --
-# falls back to the HOST's /usr/include. That is glibc, for a freestanding
-# target.
-#
-# It resolves on a non-multiarch distro (EL/Fedora keep bits/ directly in
-# /usr/include) and FAILS on Debian/Ubuntu, where bits/ lives in the multiarch
-# subdirectory clang only adds for a linux-gnu target. So the local gate was
-# green while CI's ubuntu:26.04 lint job died on
-# `features-time64.h: 'bits/wordsize.h' file not found` (run 31672194387) --
-# the same local-vs-CI skew class as the doxygen version skew, and worse than
-# an outright failure, because every TU that DID analyze was analyzed against
-# the wrong libc.
-#
-# REPORTED, not appended to $(INCLUDES): `-isystem` on this directory would
-# move it AHEAD of the gcc-internal headers in the REAL build, changing which
-# limits.h / stdint.h / stdatomic.h / tgmath.h 200+ objects compile against
-# (those four exist in both directories). The replay reaches the same order
-# WITHOUT that risk, because it can also say -nostdlibinc: compiler headers
-# first, this directory after, nothing from the host at all. So the consumers
-# pass `-nostdlibinc -idirafter $(CC_LIBC_INCLUDE)` and NOT -isystem, which
-# would put the libc first and is how the first version of this got it wrong.
-#
-# Asked of $(CC) rather than assembled from axl-toolchains.conf's
-# *_TOOLCHAIN_DIR, so an AXL_X64_GCC / AXL_AA64_GCC override that repoints the
-# compiler cannot leave the lint reading a different toolchain's headers.
-# Lazy (`=`), so no make invocation on a toolchain-less box pays for the probe.
-CC_LIBC_INCLUDE = $(realpath $(lastword \
-    $(shell $(CC) -E -Wp,-v -xc /dev/null 2>&1 | sed -n 's|^ \(/.*\)|\1|p')))
-
-.PHONY: print-cc-libc-include
-print-cc-libc-include:
-	@dir='$(CC_LIBC_INCLUDE)'; \
-	if [ -z "$$dir" ] || [ ! -r "$$dir/string.h" ]; then \
-	    echo "print-cc-libc-include: cannot resolve $(CC)'s libc include dir" >&2; \
-	    echo "  (resolved to '$$dir'; expected a directory holding string.h)" >&2; \
-	    echo "  Refusing to report nothing: a lint that silently loses this" >&2; \
-	    echo "  analyzes against the HOST libc -- green here, broken on a" >&2; \
-	    echo "  multiarch distro, and wrong in both places." >&2; \
-	    exit 1; \
-	fi; \
-	echo "$$dir"
-
-# The C++ counterpart, and the same replay problem one library up. The C++ lint
-# pass used to read the HOST libstdc++ by accident: the compile database named
-# host `g++`, so clang inferred a linux-gnu target and found /usr/include/c++.
-# T2 moved x64 C++ to the bare-metal cross, and the accident stopped working --
-# `#include <string>` became "file not found", which is the better failure but
-# still a failure. The fix is to name the cross toolchain's C++ directories.
-#
-# Only the `/c++/` entries. $(CXX)'s search list also carries the gcc-internal
-# and libc directories, which the C rules above already handle correctly, and
-# passing them here as -isystem would reintroduce exactly the ordering bug
-# CC_LIBC_INCLUDE's comment describes.
-#
-# Three directories, not one, and all three are needed: the generic headers,
-# the TARGET subdirectory (<bits/c++config.h> lives there and everything
-# includes it), and `backward`. Asked of $(CXX) for the same reason
-# CC_LIBC_INCLUDE is asked of $(CC) -- an AXL_X64_GXX / AXL_AA64_GXX override
-# must move the lint with it.
-CXX_INCLUDE_DIRS = $(realpath $(shell $(CXX) -E -Wp,-v -xc++ /dev/null 2>&1 \
-    | sed -n 's|^ \(/.*/c++/.*\)|\1|p'))
-
-.PHONY: print-cxx-include-dirs
-print-cxx-include-dirs:
-	@dirs='$(CXX_INCLUDE_DIRS)'; \
-	found=0; \
-	for d in $$dirs; do [ -r "$$d/vector" ] && found=1; done; \
-	if [ -z "$$dirs" ] || [ "$$found" != "1" ]; then \
-	    echo "print-cxx-include-dirs: cannot resolve $(CXX)'s libstdc++ dirs" >&2; \
-	    echo "  (resolved to '$$dirs'; expected one of them to hold <vector>)" >&2; \
-	    echo "  Refusing to report nothing: the C++ lint pass would fall back" >&2; \
-	    echo "  to the HOST libstdc++, which is a different library from the" >&2; \
-	    echo "  one these objects compile against." >&2; \
-	    exit 1; \
-	fi; \
-	echo $$dirs
-
 # `print-%`, not the two names individually: check-dep-tracking's probe
 # includes this Makefile and asks it to expand a flag variable, so its
 # MAKECMDGOALS is print-CFLAGS etc. Naming only print-prefix and
@@ -960,12 +820,6 @@ NONCLEAN_GOALS := $(filter-out clean clean-all clean-tools help check-version \
 #            Makefile, so editing CFLAGS_BASE rebuilds NOTHING. `make` prints
 #            the new flags on the one file it happens to recompile and leaves
 #            the other 200 objects built the old way.
-#   CROSS    changes WHICH LINKER, ar and objcopy consume them. It was left
-#            out while binutils were whatever apt supplied and therefore not a
-#            variable at all; they are a toolchain INPUT now
-#            (AXL_AA64_BINUTILS_PREFIX, x64 to follow), so swapping them
-#            silently reused .efi images linked by the other one -- the exact
-#            shape of the CC/CXX miss below, one tool along.
 #   CC/CXX   changes WHICH COMPILER emits them. AXL_X64_GXX, AXL_AA64_GXX and
 #            ARM_TOOLCHAIN all repoint $(CXX), and the bare-metal toolchain
 #            compiles against newlib's headers where the host g++ uses
@@ -987,19 +841,6 @@ NONCLEAN_GOALS := $(filter-out clean clean-all clean-tools help check-version \
 # Hashed rather than stored whole: the flag string is ~300 characters and the
 # point is only whether it CHANGED.
 ifneq ($(NONCLEAN_GOALS),)
-
-# The C cross must exist before any of those goals can compile a thing. Say so
-# HERE, once, naming the installer -- otherwise the first recipe dies with a
-# bare "No such file or directory" on a path the reader has no reason to
-# recognise, which is the exact complaint that produced the AXL_CPP guard
-# above. Gated on NONCLEAN_GOALS so `make clean`, `make help` and every lint
-# gate still work on a box without a toolchain.
-ifeq ($(or $(wildcard $(CC)),$(shell command -v $(CC) 2>/dev/null)),)
-  $(error C compiler $(CC) not found — run ./scripts/install-toolchain.sh $(ARCH). \
-    C is built with the bare-metal cross on both arches so the tree uses no host \
-    headers; see docs/AXL-Libc-Substrate-Design.md §4.1b)
-endif
-
 #
 # Written with $(file ...) and hashed from disk rather than piped through a
 # shell, because the flags are not shell-safe: AXL_TLS=1 adds
@@ -1026,7 +867,7 @@ endif
 # override in this tree works. Hashing `$(CC) -dumpversion` would close the
 # rest at the price of a machine-dependent .axl-flags.
 $(shell mkdir -p $(BUILDDIR))
-$(file >$(BUILDDIR)/.axl-flags,$(CC) $(CXX) $(AXL_CXXRT_CC) $(CROSS) $(CFLAGS) $(CXXFLAGS) $(INCLUDES))
+$(file >$(BUILDDIR)/.axl-flags,$(CC) $(CXX) $(AXL_CXXRT_CC) $(CFLAGS) $(CXXFLAGS) $(INCLUDES))
 BUILD_FLAG_SIG := $(shell sha256sum $(BUILDDIR)/.axl-flags | cut -c1-12)
 TLS_STATE := tls=$(if $(AXL_TLS),on,off) flags=$(BUILD_FLAG_SIG)
 TLS_STATE_FILE := $(BUILDDIR)/.axl-build-state
@@ -1092,7 +933,7 @@ check-ascii:
 # thing guarding the AXL_ENTRY_LINKAGE `extern "C"` wrap. Host g++, .o only.
 check-cxx-entry:
 	@obj=$$(mktemp --suffix=.o); \
-	$(CXX) $(CXXFLAGS_BASE) -Iinclude -c test/cxx-entry-linkage.cpp -o $$obj || \
+	$(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat -c test/cxx-entry-linkage.cpp -o $$obj || \
 	  { echo "check-cxx-entry: FAIL — C++ fixture did not compile"; rm -f $$obj; exit 1; }; \
 	fail=0; \
 	for sym in _AxlEntry DriverEntry; do \
@@ -1192,13 +1033,13 @@ check-dep-tracking:
 .PHONY: check-cb-noexcept
 check-cb-noexcept:
 	@obj=$$(mktemp --suffix=.o); \
-	$(CXX) $(CXXFLAGS_BASE) -Iinclude \
+	$(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat \
 	    -c test/cb-noexcept-fixture.cpp -o $$obj 2>/dev/null || \
 	  { echo "check-cb-noexcept: FAIL -- a noexcept callback was REJECTED"; \
-	    $(CXX) $(CXXFLAGS_BASE) -Iinclude \
+	    $(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat \
 	        -c test/cb-noexcept-fixture.cpp -o $$obj 2>&1 | head -5 | sed 's/^/    /'; \
 	    rm -f $$obj; exit 1; }; \
-	if $(CXX) $(CXXFLAGS_BASE) -Iinclude -DEXPECT_REJECT \
+	if $(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat -DEXPECT_REJECT \
 	    -c test/cb-noexcept-fixture.cpp -o $$obj 2>/dev/null; then \
 	  echo "check-cb-noexcept: FAIL -- a THROWING callback was ACCEPTED;"; \
 	  echo "    AXL_CB_NOEXCEPT is not reaching the typedefs (missing"; \
@@ -1257,11 +1098,11 @@ check-log-levels:
 # CHECK_EX_SRCDIR is overridable so the "found nothing" arm below is reachable
 # from a test rather than merely asserted:
 #   make check-examples CHECK_EX_SRCDIR=/tmp/empty   # must FAIL
-# The `axl-example: hosted` marker is GONE with T3. It selected a second flag
-# set for a .cpp example that includes a libstdc++ header; there is one C++
-# mode now, so every example gets the same flags a consumer's `axl-c++` uses
-# and the marker would select nothing. Its absence is not a loosening: the
-# examples that carried it are still compiled, by the same rule as the rest.
+# A `.cpp` example carrying the marker `axl-example: hosted` in a comment is
+# compiled the way `axl-c++ --hosted` would compile it (no -ffreestanding, no
+# compat shims, $(GCC_ARCH) kept) instead of freestanding. Without the marker
+# a hosted example fails at bits/requires_hosted.h, which is the correct
+# answer for one that is NOT meant to be hosted.
 CHECK_EX_SRCDIR = sdk/examples
 CHECK_EX_DIR    = out/check-examples
 CHECK_EX_MIN    = 20
@@ -1277,6 +1118,7 @@ CHECK_EX_MIN    = 20
 # currently protecting anything.
 CFLAGS_EXAMPLE          = $(filter-out -DAXL_ALLOW_UEFI,$(CFLAGS_BASE))
 CXXFLAGS_EXAMPLE        = $(filter-out -DAXL_ALLOW_UEFI,$(CXXFLAGS_BASE))
+CXXFLAGS_HOSTED_EXAMPLE = $(filter-out -DAXL_ALLOW_UEFI,$(CXXFLAGS_HOSTED_BASE))
 
 check-examples:
 	@mkdir -p $(CHECK_EX_DIR); \
@@ -1292,7 +1134,10 @@ check-examples:
 	for src in $$srcs; do \
 	  inc="$(INCLUDES)"; \
 	  case $$src in \
-	    *.cpp) cc="$(CXX) $(CXXFLAGS_EXAMPLE)" ;; \
+	    *.cpp) cc="$(CXX) $(CXXFLAGS_EXAMPLE)"; \
+	           if grep -q 'axl-example: hosted' $$src; then \
+	             cc="$(CXX) $(CXXFLAGS_HOSTED_EXAMPLE)"; inc="$(INCLUDES_HOSTED)"; \
+	           fi ;; \
 	    *)     cc="$(CC) $(CFLAGS_EXAMPLE)" ;; \
 	  esac; \
 	  if grep -q 'axl-example: allow-uefi' $$src; then \
@@ -1467,65 +1312,6 @@ check-reloc-coverage: $(PREFIX)/cpu-topology-selftest.efi
 check-flag-parity:
 	@python3 scripts/check-flag-parity.py
 
-# check-ctors -- global constructors that NOTHING WILL RUN.
-#
-# AXL walks .init_array only (src/runtime/axl-cxxabi.c). The linker scripts
-# also bound the legacy .ctors with __CTOR_LIST__/__CTOR_END__ and nothing
-# reads those, so a non-empty .ctors is code the author expects to execute and
-# that silently does not.
-#
-# axl-cc checks this per link, and the generated CMake package inherits that
-# by calling axl-cc. THE MAKEFILE DOES NOT -- it runs its own ld+objcopy for
-# every test image and tool, which is the third-build-path drift
-# check-flag-parity exists over. Rather than a fourth copy of the check, this
-# scans what the Makefile PRODUCED: one pass over $(PREFIX), covering every
-# image at once.
-#
-# The reachable cause is a compiler, not a source edit: GCC's x86_64-*-elf
-# target defaults to .ctors and AXL's own toolchain escapes it only via
-# --enable-initfini-array (14.3.0-axl2), so a stale AXL_X64_GXX/GCC silently
-# disables every constructor in every image the Makefile builds.
-#
-# NOT in LINT_GATES, deliberately, and this is the same reasoning
-# check-no-avx and check-reloc-coverage already follow. Those gates run
-# CONCURRENTLY with both arch builds under verify.sh, and a gate that globs
-# $(PREFIX)/*.so would read images mid-write -- or find none at all on a clean
-# tree and hard-fail. So it declares what it scans as prerequisites and runs
-# from CI beside its siblings. `make ARCH=aa64 check-ctors` covers the other
-# arch, which matters more: aa64's compiler is ARM's third-party release.
-.PHONY: check-ctors
-check-ctors: $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/hello.efi
-	@n=0; bad=0; \
-	for so in $(PREFIX)/*.so $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.so; do \
-	    [ -f "$$so" ] || continue; \
-	    if ! syms=$$($(CROSS)nm "$$so" 2>&1); then \
-	        echo "check-ctors: FAIL -- $(CROSS)nm could not read $$so."; \
-	        echo "  A gate that cannot see reports clean forever."; \
-	        echo "  $$syms"; \
-	        exit 1; \
-	    fi; \
-	    lo=$$(printf '%s\n' "$$syms" | awk '$$3 == "__CTOR_LIST__" { print $$1 }'); \
-	    hi=$$(printf '%s\n' "$$syms" | awk '$$3 == "__CTOR_END__" { print $$1 }'); \
-	    if [ -z "$$lo" ] || [ -z "$$hi" ]; then continue; fi; \
-	    n=$$((n+1)); \
-	    if [ "$$lo" != "$$hi" ]; then \
-	        echo "check-ctors: FAIL -- $$so has constructors in .ctors that"; \
-	        echo "  nothing runs (__CTOR_LIST__=$$lo __CTOR_END__=$$hi)."; \
-	        bad=$$((bad+1)); \
-	    fi; \
-	done; \
-	if [ "$$bad" -ne 0 ]; then \
-	    echo "  Cause: a compiler without --enable-initfini-array. AXL's own"; \
-	    echo "  toolchain has it from 14.3.0-axl2; check AXL_$(shell echo $(ARCH) | tr a-z A-Z)_GXX / _GCC."; \
-	    exit 1; \
-	fi; \
-	if [ "$$n" -eq 0 ]; then \
-	    echo "check-ctors: no .so images under $(PREFIX) -- run 'make tools tests' first."; \
-	    echo "  A gate that scans nothing reports clean forever."; \
-	    exit 1; \
-	fi; \
-	echo "check-ctors: clean -- $$n image(s), none with unwalked .ctors."
-
 # check-toolchain-conf -- the same anti-drift argument as check-flag-parity,
 # applied to WHERE the C++ cross compilers live rather than which flags they
 # get. The AArch64 path was spelled out in five places (this Makefile,
@@ -1691,30 +1477,56 @@ $(BUILDDIR)/%.o: src/vterm/%.c | $(BUILDDIR)
 
 # C++ pattern for src/runtime/*.cpp.  Only reachable when AXL_CPP=1
 # (every .cpp source in libaxl-cxx.a lives here).
-# ONE rule for every C++ TU. Five of them (axl-cxx-rehash, -rbtree, -hash,
-# -string-inst, -list) used to need a second, hosted flag set because each
-# includes a libstdc++ header that bits/requires_hosted.h refuses under
-# -ffreestanding; T3 removed that flag from the C++ line entirely, so the split
-# and its target-specific-variable machinery are gone with it.
-#
-# $(GCC_ARCH) is NOT droppable here. Dropping it is exactly how a spike picked
-# up AVX from this host's -march=x86-64-v3 default and #UD'd under firmware
-# that runs with CR4.OSXSAVE clear -- the fault this file exists to prevent.
-# `make check-no-avx` covers the result.
-#
-# Worth keeping from what stood here: the split was ONCE written as several
-# target lines sharing one recipe --
-#
-#     $(BUILDDIR)/a.o: src/runtime/a.cpp | $(BUILDDIR)
-#     $(BUILDDIR)/b.o: src/runtime/b.cpp | $(BUILDDIR)
-#     	$(CXX) ... -c $< -o $@
-#
-# which make reads as TWO rules of which only the LAST has a recipe. It looked
-# fine because the objects were already up to date; only a build into a
-# throwaway prefix, where every TU compiles fresh, exposed it.
 ifdef AXL_CPP
 $(BUILDDIR)/%.o: src/runtime/%.cpp | $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# axl-cxx-rehash.cpp defines two members of a libstdc++ class, so it has to
+# include <unordered_map> -- which the freestanding rule above cannot do. It
+# gets the same treatment axl-c++ --hosted gives a consumer TU, and for the
+# same two reasons: -ffreestanding makes bits/requires_hosted.h refuse the
+# header, and include/compat's `typedef void FILE` collides with the real
+# <stdio.h> that hosted libstdc++ pulls in.
+#
+# $(GCC_ARCH) is NOT dropped. Dropping it is exactly how a spike picked up AVX
+# from this host's -march=x86-64-v3 default and #UD'd under firmware that runs
+# with CR4.OSXSAVE clear -- the fault this file exists to prevent. `make
+# check-no-avx` covers the result.
+#
+# An explicit rule, so it wins over the pattern rule above. CXXFLAGS_HOSTED /
+# INCLUDES_HOSTED are defined beside CXXFLAGS_BASE, so this rule and the
+# check-examples gate cannot drift apart.
+# The hosted-flags group. Each of these includes a libstdc++ header that
+# bits/requires_hosted.h refuses under -ffreestanding, so each needs the same
+# treatment axl-c++ --hosted gives a consumer TU: -ffreestanding dropped, and
+# include/compat off the include path because its `typedef void FILE`
+# collides with the real <stdio.h> behind those headers.
+#
+# Done with TARGET-SPECIFIC VARIABLES over the pattern rule above, not by
+# repeating a recipe five times. The obvious-looking alternative is WRONG and
+# was briefly committed here:
+#
+#     $(BUILDDIR)/a.o: src/runtime/a.cpp | $(BUILDDIR)
+#     $(BUILDDIR)/b.o: src/runtime/b.cpp | $(BUILDDIR)
+#     	$(CXX) $(CXXFLAGS_HOSTED) ... -c $< -o $@
+#
+# make reads that as TWO rules of which only the LAST has a recipe; the others
+# fall back to the freestanding pattern rule and fail to compile. It looked
+# fine because the objects were already up to date -- only lint.sh's build
+# into a throwaway prefix, which forces every TU to compile fresh, exposed it.
+#
+# $(GCC_ARCH) is retained through CXXFLAGS_HOSTED. Dropping it is how a spike
+# picked up AVX from this host's -march=x86-64-v3 default and #UD'd under
+# firmware running with CR4.OSXSAVE clear. CXXFLAGS_HOSTED also inherits
+# -MD -MP through its filter-out, so these do not dodge check-dep-tracking.
+HOSTED_CXX_OBJS = $(BUILDDIR)/axl-cxx-rehash.o \
+                  $(BUILDDIR)/axl-cxx-rbtree.o \
+                  $(BUILDDIR)/axl-cxx-hash.o \
+                  $(BUILDDIR)/axl-cxx-string-inst.o \
+                  $(BUILDDIR)/axl-cxx-list.o
+
+$(HOSTED_CXX_OBJS): CXXFLAGS := $(CXXFLAGS_HOSTED)
+$(HOSTED_CXX_OBJS): INCLUDES := $(INCLUDES_HOSTED)
 endif
 
 $(BUILDDIR)/%.o: src/crt0/%.c | $(BUILDDIR)
@@ -1724,11 +1536,7 @@ $(BUILDDIR)/%.o: src/crt0/%.S | $(BUILDDIR)
 	$(CC) $(CFLAGS_BASE) -c $< -o $@
 
 $(BUILDDIR)/%.o: deps/lzma/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -Ideps/lzma -DZ7_ST -c $< -o $@
-
-# The one AXL source that includes the vendored lzma headers gets the same
-# path, target-scoped rather than global -- see the INCLUDES comment.
-$(BUILDDIR)/axl-compress-lzma.o: INCLUDES += -Ideps/lzma
+	$(CC) $(CFLAGS) $(INCLUDES) -DZ7_ST -c $< -o $@
 
 # Vendored libvterm (Layer 2 only). -Ideps/libvterm resolves the AXL compat
 # shim that vterm_internal.h pulls in; -Ideps/libvterm/src resolves the
@@ -1801,24 +1609,14 @@ ifneq ($(LIBAXL_CXXRT_TARGET),)
 $(BUILDDIR)/axl-cxxrt-%.o: src/cxxrt/axl-cxxrt-%.c | $(BUILDDIR)
 	$(AXL_CXXRT_CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-# THREE members, each its own object, because archive members are
-# all-or-nothing and one of them carries a reference only the exceptions
-# linker script can satisfy. Merged, any link taking the allocator bridge
-# (every C++ link does -- operator new calls malloc) would also drag
-# axl-cxxrt-eh.o's reference to __eh_frame_start, and --no-undefined would
-# reject it before --gc-sections could collect the unreferenced function
-# holding it. Split, the bridge is usable without opting into the eh
-# machinery.
-#
-# NOTE the archive itself is consumed by nothing: axl-cc names the three
-# OBJECTS individually on an -fexceptions link, because axl-cxxrt-alloc.o has
-# to OVERRIDE newlib's malloc, and a definition inside an archive does not win
-# -- libc.a's malloc.o gets pulled for its other symbols and multiply-defines
-# them. Kept as an archive so `make` has one target to name and so the objects
-# have a single build rule.
+# TWO members, not one: every C++ link pulls the allocator half (operator new
+# calls malloc), and archive members are all-or-nothing. Merged, that link
+# would also drag axl-cxxrt-eh.o's reference to __eh_frame_start -- which only
+# the exceptions linker script defines -- and --no-undefined would reject it
+# before --gc-sections could collect the unreferenced function holding it.
+# Split, the bridge is usable without opting into the eh machinery.
 $(PREFIX)/lib/libaxl-cxxrt.a: $(BUILDDIR)/axl-cxxrt-alloc.o \
-                              $(BUILDDIR)/axl-cxxrt-eh.o \
-                              $(BUILDDIR)/axl-cxxrt-stubs.o | $(PREFIX)/lib
+                              $(BUILDDIR)/axl-cxxrt-eh.o | $(PREFIX)/lib
 	@rm -f $@
 	$(AR) rcs $@ $^
 endif
@@ -2027,12 +1825,9 @@ $(BUILDDIR)/fs-path-selftest.o: test/integration/fs-path-selftest.c | $(BUILDDIR
 # that cannot see is worse than none. The test ALSO builds this same source
 # with the staged axl-c++, which is what proves the consumer toolchain path.
 #
-# CXXFLAGS_BASE no longer carries -ffreestanding (T3), so this builds exactly
-# as a consumer's C++ does. It used to say "freestanding, the configuration the
-# stream layer exists for" -- that rationale is gone with the mode, and whether
-# axl::string still earns its place beside an always-available std::string is
-# an open T5 question. Needs AXL_CPP=1 for libaxl-cxx.a (operator new/delete
-# and the std:: halt stubs).
+# Freestanding: CXXFLAGS_BASE keeps -ffreestanding, so this is the
+# configuration the stream layer exists for. Needs AXL_CPP=1 for
+# libaxl-cxx.a (operator new/delete and the std:: halt stubs).
 cxx-streams-selftest: $(PREFIX)/cxx-streams-selftest.efi
 	@echo "  Built: $(PREFIX)/cxx-streams-selftest.efi"
 

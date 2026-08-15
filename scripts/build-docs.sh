@@ -45,26 +45,6 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# Doxygen VERSION SKEW — local-clean does not imply CI-clean
-#
-# docs.yml installs whatever doxygen `ubuntu-latest`'s apt ships (1.9.8 at
-# writing); a dev box is usually far newer. Reference resolution differs
-# between them, and NOT in the direction you would hope: 1.13 resolved two
-# \ref / explicit-link targets that 1.9.8 could not, so this gate reported
-# clean locally while the v3.2.0 Docs run failed on both.
-#
-# There is no pin to add here — the docs job takes the distro's package. When a
-# docs change matters, reproduce CI's exact version instead of trusting a newer
-# local one:
-#
-#   podman run --rm -v "$PWD":/src:z -w /src ubuntu:24.04 bash -c \
-#     'apt-get update -qq && apt-get install -y -qq doxygen && \
-#      cd docs/sphinx && doxygen Doxyfile'
-#
-# Same shape as the clang-tidy container in docs/RELEASING.md, same reason.
-# --------------------------------------------------------------------------
-
-# --------------------------------------------------------------------------
 # Step 1: Doxygen → XML
 # --------------------------------------------------------------------------
 
@@ -96,17 +76,10 @@ fi
 #
 # The usual cause is a backslash escape written in a doc comment: Doxygen reads
 # `\v` as a command even inside a markdown code span, so it has to be `\\v`.
-#
-# NOT every error carries a file:line. A config-level one ("Included by graph
-# for 'axl-macros.h' not generated, too many nodes") starts at column 0, and the
-# file:line-anchored pattern this check used to have could not see it — so the
-# v3.2.0 Docs run failed on an error class this gate reported clean. Match both
-# shapes.
-DOXY_ERR_RE='^([^ ]+:[0-9]+: )?error:'
-if grep -qE "$DOXY_ERR_RE" "$DOXY_LOG"; then
+if grep -qE '^[^ ]+:[0-9]+: error:' "$DOXY_LOG"; then
     log_error "Doxygen reported ERRORS (below). These do not trip"
     log_error "WARN_AS_ERROR=FAIL_ON_WARNINGS, so they are checked separately."
-    grep -E "$DOXY_ERR_RE" "$DOXY_LOG" | head -20 >&2
+    grep -E '^[^ ]+:[0-9]+: error:' "$DOXY_LOG" | head -20 >&2
     exit 1
 fi
 
