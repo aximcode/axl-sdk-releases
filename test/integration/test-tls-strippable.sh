@@ -31,12 +31,12 @@ echo "=== TLS strippability test (AXL_TLS=1) ==="
 # Build (AXL_TLS=1 throughout — no toggle): the full lib + the plain-HTTP
 # fixture + an https-capable consumer (fetch calls axl_tls_init for https).
 if ! make ARCH="$ARCH" AXL_TLS=1 all http-plain-selftest \
-        "out/native-$ARCH/tools/fetch.efi" > /tmp/tls-strip-build.log 2>&1; then
+        "$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/fetch.efi" > /tmp/tls-strip-build.log 2>&1; then
     echo "FAIL: build failed"; tail -20 /tmp/tls-strip-build.log; exit 1
 fi
 
-PLAIN="out/native-$ARCH/http-plain-selftest.efi"
-FETCH="out/native-$ARCH/tools/fetch.efi"
+PLAIN="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/http-plain-selftest.efi"
+FETCH="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/fetch.efi"
 
 mbedtls_strings() { strings "$1" 2>/dev/null | grep -c -i mbedtls; }
 

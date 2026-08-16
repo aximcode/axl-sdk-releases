@@ -191,12 +191,31 @@ axl_pci_get_vid_did(
  * `(base << 16) | (sub << 8) | prog_if` form — same shape consumed
  * by axl_pci_find_by_class.
  *
- * @return AXL_OK on success, AXL_ERR on bus error.
+ * **This does NOT precheck that the function is present**, unlike
+ * @ref axl_pci_get_vid_did and @ref axl_pci_get_header_type, which both fold
+ * "absent" into `AXL_ERR`. An absent function's config space reads all-ones,
+ * so this returns **`AXL_OK` with `0xFFFFFF`** — a plausible-looking value,
+ * not an error. Gate on @ref axl_pci_get_vid_did first if presence matters;
+ * enumeration helpers such as @ref axl_pci_find_by_class already do.
+ *
+ * **The value is 24 bits.** The absent/unknown reading is `0xFFFFFF`, *not*
+ * `0xFFFFFFFF` — a 32-bit comparison silently never matches, which turns a
+ * phantom-function skip into dead code. `0xFFFFFF` is also what a present but
+ * class-less function reads as (base class 0xFF, "does not fit any defined
+ * class"), so it is not by itself proof of absence.
+ *
+ * @note The asymmetry with the two sibling accessors is known and may be
+ *     reconciled in a future release. Do not rely on `AXL_OK` being returned
+ *     for an absent function; treat `0xFFFFFF` as "no usable class" either
+ *     way.
+ *
+ * @return AXL_OK on success — including for an absent function, see above —
+ *     AXL_ERR on bus error or if @p class_code is NULL.
  */
 AXL_WARN_UNUSED int
 axl_pci_get_class_code(
     AxlPciAddr   addr,    ///< target function
-    uint32_t    *class_code  ///< [out] 24-bit class code
+    uint32_t    *class_code  ///< [out] 24-bit class code; 0xFFFFFF if absent
 );
 
 /// PCI configuration-space header type, decoded from the low 7 bits
@@ -227,7 +246,13 @@ typedef enum {
  * enum — callers can compare against the named constants and treat
  * unknown values as opaque. Bus error returns -1.
  *
- * @return AXL_OK on success, AXL_ERR on bus error.
+ * Like @ref axl_pci_get_vid_did, the "function absent" sentinel is folded
+ * into the return code, so a caller never has to disambiguate "header type
+ * 0x7F, multi-function" from "nothing is there".
+ * (@ref axl_pci_get_class_code deliberately does not do this — see its note.)
+ *
+ * @return AXL_OK on success, AXL_ERR if the function is absent or on bus
+ *     error.
  */
 AXL_WARN_UNUSED int
 axl_pci_get_header_type(

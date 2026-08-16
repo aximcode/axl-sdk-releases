@@ -19,7 +19,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
-TEST_BUILD_DIR="$PROJECT_DIR/out/native-$_native_arch"
+TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
 # Startup: init network, run UDP echo test to host gateway (10.0.2.2)

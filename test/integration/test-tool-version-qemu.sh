@@ -35,7 +35,7 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TOOLS="$PROJECT_DIR/out/native-$NATIVE/tools"
+TOOLS="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
 make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true

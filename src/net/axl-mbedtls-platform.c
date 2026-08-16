@@ -95,10 +95,17 @@ mbedtls_platform_fprintf(void *stream, const char *fmt, ...)
 // Unix-seconds Gregorian conversion in the codebase.
 // ---------------------------------------------------------------------------
 
-long long
-time(long long *timer)
+/* Spelled with `time_t` rather than `long long` so the definition matches
+   whichever <time.h> is on the path. They are the same width today but not
+   the same TYPE: include/compat's shim typedefs `time_t` as `long long`,
+   while newlib's is `long` (`_TIME_T_` in sys/_types.h) — and a bare-metal
+   toolchain build against newlib's real header therefore rejected this with
+   "conflicting types for 'time'". `time_t` is correct under both.
+   docs/AXL-Libc-Substrate-Design.md §4.1b. */
+time_t
+time(time_t *timer)
 {
-    long long   result = 0;
+    time_t      result = 0;
     AxlTimespec ts;
 
     if (axl_clock_gettime(AXL_CLOCK_REALTIME, &ts) == AXL_OK
@@ -112,7 +119,7 @@ time(long long *timer)
            tz_minutes offset is subtracted — but the difference is
            a fraction of a day on the epoch boundary, harmless for
            certificate validity windows that span years. */
-        result = (long long)ts.tv_sec;
+        result = (time_t)ts.tv_sec;
     }
 
     if (timer != NULL) {

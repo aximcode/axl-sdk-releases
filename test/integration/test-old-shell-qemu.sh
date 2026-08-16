@@ -55,7 +55,7 @@ if [[ ! -f "$OLD_SHELL" ]]; then
 fi
 
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-NATIVE_DIR="$PROJECT_DIR/out/native-x64"
+NATIVE_DIR="$(test_build_dir)"
 
 # Build the fixtures: the sibling-locate probe + driver, mkrd, the file-layer
 # path-resolution selftest, and the resident-driver file-read + setenv fixture.

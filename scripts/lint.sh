@@ -64,15 +64,91 @@ echo "==> clang -Wall -Wextra over every TU (compiler diagnostics, not tidy)"
 # the scope measurement and the single deliberate suppression.
 python3 scripts/check-clang-warnings.py
 
+# Where the CROSS toolchain keeps its libc headers. clang-tidy replays the
+# compile database with clang, infers the freestanding target from the recorded
+# compiler's NAME (x86_64-elf-gcc), and then has no cross libc to go with it --
+# so <string.h> resolves to the HOST's /usr/include. That is glibc, and it is
+# clean on this box only because EL/Fedora keep bits/ directly in /usr/include;
+# CI's ubuntu:26.04 puts it in the multiarch subdirectory clang adds only for a
+# linux-gnu target, and the job died there. Passing the directory explicitly
+# makes tidy read the same headers the objects were compiled against.
+#
+# The Makefile owns the value (asked of $(CC), so a toolchain override moves it
+# too) and this reads it back, rather than keeping a second copy -- the same
+# arrangement as LINT_GATES above. It fails rather than reporting an empty
+# string, so this cannot silently revert to analyzing the host libc.
+#
+# -nostdlibinc + -idirafter, NOT -isystem. -isystem puts the libc AHEAD of
+# clang's own builtin headers, where the build searches the COMPILER's headers
+# first and the libc after -- measured: it flips which limits.h / stdint.h /
+# stdatomic.h / tgmath.h is read, and defines PATH_MAX where the gcc build
+# leaves it undefined. -nostdlibinc drops /usr/include entirely, so a missing
+# cross header is now a loud error instead of a silent fall-back to glibc.
+# (What remains is clang's builtin headers standing in for gcc's, which is
+# inherent to linting a gcc build with clang and predates this.)
+CT_LIBC=(--extra-arg=-nostdlibinc
+         "--extra-arg=-idirafter$(make -s print-cc-libc-include)")
+
+# --------------------------------------------------------------------------
+# clang-tidy result cache
+#
+# The tidy passes below are the largest item in a warm verify.sh (~45s), and
+# almost all of it re-analyses bytes that did not change. A TU's result is a
+# pure function of its text, its headers' text, its flags and the checker, so
+# scripts/lint-cache.py keys on exactly that and skips what cannot differ.
+#
+# The SALT is everything that is not a source file: the tidy binary's version,
+# the shared config, and a hash of the whole compile database (so any flag
+# change anywhere invalidates the lot rather than being invisible). Each pass
+# adds its own check-set, since the same TU under different checks is a
+# different question.
+#
+# LINT_NO_CACHE=1 forces a full run. CI has no cache directory, so it always
+# does one.
+# --------------------------------------------------------------------------
+LINT_CACHE="$(pwd)/out/.lint-cache"
+LINT_SALT="$(mktemp)"
+{
+    "$CT" --version
+    cat .clang-tidy 2>/dev/null
+    printf '%s\n' "${CT_LIBC[@]}"
+    sha256sum compile_commands.json 2>/dev/null | cut -d' ' -f1
+} > "$LINT_SALT"
+trap 'rm -f "$LINT_SALT"' EXIT
+
+# $1 label, $2 cache subdir, $3 extra checks arg (may be empty), rest: TUs
+lint_cached() {
+    local label="$1" sub="$2" checks="$3"; shift 3
+    local dir="$LINT_CACHE/$sub"
+    local salt="$LINT_SALT.$sub"
+    { cat "$LINT_SALT"; printf '%s\n' "$checks"; } > "$salt"
+
+    local need
+    need="$(python3 scripts/lint-cache.py filter "$dir" "$salt" "$@")"
+    local total=$#
+    if [[ -z "$need" ]]; then
+        echo "    $label: 0 of $total TUs need linting (cached)"
+        rm -f "$salt"; return 0
+    fi
+    local n; n=$(printf '%s\n' "$need" | grep -c .)
+    echo "    $label: $n of $total TUs need linting"
+    # shellcheck disable=SC2086
+    printf '%s\n' "$need" \
+      | xargs -n1 -P"$(nproc)" "$CT" -p . -quiet "${CT_LIBC[@]}" ${checks:+"$checks"}
+    # Only a clean pass records: any finding fails the batch, and the next run
+    # must re-lint all of it rather than trust a partial result.
+    python3 scripts/lint-cache.py record "$dir" "$salt" $need
+    rm -f "$salt"
+}
+
 echo "==> clang-tidy ($CT) over src/ (-n1, parallel)"
 # Mirror ci.yml exactly: per-file (-n1) so path-sensitive analyzer checks are
 # deterministic; exclude the backend + the mbedtls platform shim (compile DB
 # has no AXL_TLS=1). .clang-tidy's WarningsAsErrors makes any finding non-zero.
-find src -name '*.c' \
+mapfile -t _src_tus < <(find src -name '*.c' \
     -not -path '*/backend/*' \
-    -not -name 'axl-mbedtls-platform.c' \
-    -print0 \
-  | xargs -0 -n1 -P"$(nproc)" "$CT" -p . -quiet
+    -not -name 'axl-mbedtls-platform.c' | sort)
+lint_cached "src/" src "" "${_src_tus[@]}"
 
 echo "==> clang-tidy ($CT) over test/unit/ and tools/ (bugprone-* only)"
 # Test sources are where "passes for the wrong reason" lives, and nothing linted
@@ -104,8 +180,8 @@ echo "==> clang-tidy ($CT) over test/unit/ and tools/ (bugprone-* only)"
 # (`make tests tools` does not build them), so clang-tidy would fall back to
 # default flags and emit nonsense "file not found" errors rather than real
 # analysis. See docs/RELEASING.md for the scope table.
-find test/unit tools -name '*.c' -print0 \
-  | xargs -0 -n1 -P"$(nproc)" "$CT" -p . -quiet --checks='-clang-analyzer-*'
+mapfile -t _tt_tus < <(find test/unit tools -name '*.c' | sort)
+lint_cached "test+tools" bugprone "--checks=-clang-analyzer-*" "${_tt_tus[@]}"
 
 echo "==> clang-tidy ($CT) over C++ translation units"
 # The C++ layer. Nothing linted C++ before this: the compile database was
@@ -132,8 +208,42 @@ if [[ "$CXX_COUNT" -lt 1 ]]; then
     echo "       Check the AXL_CPP=1 on the bear line above." >&2
     exit 1
 fi
+#
+# The CROSS libstdc++, matching $CT_LIBC's cross libc one library down. This
+# pass used to read the HOST libstdc++ and said so at this comment: the compile
+# database named host `g++`, clang inferred a linux-gnu target from that name
+# and found /usr/include/c++. T2 moved x64 C++ to the bare-metal cross, the
+# accident stopped working, and every C++ TU failed with `'string' file not
+# found` -- the better failure, but still one. So the deferred half landed here.
+#
+# THREE flags, and each is load-bearing:
+#   -nostdinc++     drops clang's own C++ search (libc++ on some boxes), so a
+#                   missing cross header is a loud error rather than a silent
+#                   fall-back to a different standard library.
+#   -isystem <dirs> the cross toolchain's three C++ directories. -isystem, NOT
+#                   -idirafter: unlike the libc case these MUST come first --
+#                   there is nothing of clang's they could displace, and
+#                   -idirafter would leave them behind the (now empty) default
+#                   search and find nothing.
+#   $CT_LIBC        <string> includes <cstring> includes <string.h>, so the C++
+#                   pass needs the cross LIBC too. It was omitted here on the
+#                   grounds that it "mixes two libcs", which was true only
+#                   while the C++ headers came from the host.
+#
+# Captured into a variable FIRST, then iterated. `for _d in $(make ...)` would
+# swallow the target's exit 1 -- a command substitution in a `for` word list is
+# not a command, so `set -e` never sees it -- and the Makefile guard's
+# "Refusing to report nothing" would never reach the operator. The pass would
+# instead fail every C++ TU on `'string' file not found`, which names the
+# symptom three layers below the cause. $CT_LIBC's plain assignment above is
+# correct for the same reason, and this used to differ from it.
+CXX_INCS=$(make -s print-cxx-include-dirs)
+CT_CXX=(--extra-arg=-nostdinc++)
+for _d in $CXX_INCS; do
+    CT_CXX+=("--extra-arg=-isystem$_d")
+done
 printf '%s\n' "$CXX_TUS" \
-  | xargs -n1 -P"$(nproc)" "$CT" -p . -quiet
+  | xargs -n1 -P"$(nproc)" "$CT" -p . -quiet "${CT_LIBC[@]}" "${CT_CXX[@]}"
 
 # One summary line, so verify.sh's table can quote it without counting steps
 # (a hardcoded step count in the caller goes stale the moment a pass is added).

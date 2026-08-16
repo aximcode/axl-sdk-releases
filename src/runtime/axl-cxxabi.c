@@ -19,6 +19,8 @@
     callbacks share LIFO ordering during `_axl_cleanup`.
 **/
 
+#include <stddef.h>
+
 #include <axl/axl-atexit.h>
 
 #include "axl-cxxabi-internal.h"
@@ -55,9 +57,33 @@ __cxa_atexit(
 extern void (*__init_array_start[])(void);
 extern void (*__init_array_end[])(void);
 
+/* The exceptions build's frame-table registration (src/cxxrt/axl-cxxrt-eh.c).
+ *
+ * WEAK, and called from HERE rather than from _axl_init, for two reasons that
+ * both come down to what a link pulls in:
+ *
+ *   - A pure-C image never references any symbol in this object, so libaxl.a's
+ *     archive selection skips it entirely -- which means the call below costs
+ *     such an image nothing at all, not even a null check. Putting it in
+ *     _axl_init would put it in EVERY image. That is the §U2 byte-identity
+ *     constraint: a C image must be unchanged whether or not the SDK supports
+ *     exceptions.
+ *   - A C++ image WITHOUT exceptions links no libaxl-cxxrt.a, so the weak
+ *     reference resolves to 0 and is skipped. Only an exceptions link defines
+ *     it. `ld --no-undefined` permits an undefined WEAK reference, which is
+ *     what makes the same object serve both.
+ *
+ * Ordering is not incidental: it must run BEFORE the constructors below,
+ * because a global constructor may throw and the unwinder needs the table.
+ */
+extern void axl_cxxrt_init(void) __attribute__((weak));
+
 void
 _axl_cxxabi_run_init_array(void)
 {
+    if (axl_cxxrt_init != NULL) {
+        axl_cxxrt_init();
+    }
     for (void (**fn)(void) = __init_array_start; fn < __init_array_end; ++fn) {
         (*fn)();
     }

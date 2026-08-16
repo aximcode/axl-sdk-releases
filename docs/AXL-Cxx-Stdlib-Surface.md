@@ -1,17 +1,24 @@
 # What the C++ standard library gives us under UEFI
 
 > **Measured 2026-08-06, not recalled.** Every row below was produced by
-> compiling AND LINKING a real *use* of the facility with `axl-c++`, in both
-> modes, and the freestanding column was additionally run under QEMU. A
-> header-include check would have been wrong: several headers compile happily
-> and fail at link, which is how this project reached three wrong conclusions
-> in a row (see `AXL-Cxx-Design.md` §3).
+> compiling AND LINKING a real *use* of the facility with `axl-c++`, and run
+> under QEMU. A header-include check would have been wrong: several headers
+> compile happily and fail at link, which is how this project reached three
+> wrong conclusions in a row (see `AXL-Cxx-Design.md` §3).
+>
+> **Restructured 2026-08-13 (tasks T3 and U2/U3), and the two changes point in
+> opposite directions.** This document was organised around a
+> freestanding/hosted split that no longer exists — `--hosted` is removed and
+> passing it is an error, so §1 and §2 are one list now. And its central "not
+> supported" entry, the unwinder, is DONE: `axl-c++ -fexceptions` gives real
+> `try`/`catch` on both arches. The measurements are unchanged and kept; the
+> headings and the conclusions they led to are what moved.
 >
 > Regenerate with the probe harness described in §5.
 
 ---
 
-## 1. Free — freestanding, no flag
+## 1. Free — no flag, always available
 
 Verified **running** in a 45 KB image, values checked:
 
@@ -24,7 +31,12 @@ Verified **running** in a 45 KB image, values checked:
 NOT. `make_unique` is outside the C++23 freestanding subset. The error names
 `make_unique`, so this one at least diagnoses itself.
 
-## 2. Free — with `axl-c++ --hosted`
+## 2. Free — the containers, also no flag
+
+These needed `axl-c++ --hosted` until T3 retired the freestanding C++ mode.
+They cost nothing extra now and the flag is gone; §1 and §2 are separate lists
+only because §1's are additionally in the C++23 *freestanding subset*, which
+matters if you ever compile a TU outside AXL.
 
 Containers verified **running** on both arches (`test-cxx-hosted-qemu.sh`);
 the rest are link-verified:
@@ -34,18 +46,20 @@ variants) `<unordered_map>` / `<unordered_set>` `<stack>` `<queue>`
 `<priority_queue>` `<valarray>` `std::make_unique` `std::function`
 `<chrono>` `<complex>` `<random>` `<charconv>`
 
-Opt-in per translation unit. `libaxl.a` stays freestanding and a mixed image
-links; see `AXL-Cxx-Design.md` §2b.1 for what the link needs.
+`libaxl.a` stays freestanding — C keeps `-ffreestanding`, C++ does not — and a
+mixed image links; see `AXL-Cxx-Design.md` §2b.1 for what the link needs.
 
-## 3. Opt-in — `-frtti`, hosted only
+## 3. Opt-in — `-frtti`
 
-`typeid` and `dynamic_cast` work with `axl-c++ --hosted -frtti`, verified
-running under UEFI (positive AND negative cast). `libstdc++.a` supplies the
-`__cxxabiv1::__class_type_info` vtables and `__dynamic_cast`.
+`typeid` and `dynamic_cast` work with `axl-c++ -frtti`, verified running under
+UEFI (positive AND negative cast). `libstdc++.a` supplies the
+`__cxxabiv1::__class_type_info` vtables and `__dynamic_cast`, and this is the
+ONE thing that puts a GCC runtime library on the link line — the default link
+names none, which is the `AXL-Cxx-Design.md` §8 constraint. The suite reads
+that off the link line rather than inferring it from success.
 
-Freestanding `-frtti` compiles but does not link — those vtables live in
-`libsupc++`, which a firmware image does not carry. The harness asserts that
-failure too, so "RTTI works" cannot come to mean "in whichever mode you tried".
+This section used to say "hosted only", and asserted that a freestanding
+`-frtti` link FAILS. There is no freestanding mode to fail in since T3.
 
 Off by default because `type_info` objects cost image size for every
 polymorphic class, whether or not anything asks for them.
@@ -67,7 +81,7 @@ output section `.rela.dyn` so ld absorbs its own internal section.
 survives `objcopy` — whose `-j` takes exact names, which is the other half of
 the same trap.
 
-## 3b. What `--hosted` still cannot link (2026-08-08)
+## 3b. What the containers still cannot link (2026-08-08)
 
 `libstdc++.a` is no longer on the link line at all — `libaxl-cxx.a` supplies
 the `_Rb_tree_*` helpers, `_Hash_bytes`, `_M_replace_cold` and the
@@ -109,9 +123,38 @@ stack-smashing detection and RTTI. Some prebuilt `libstdc++.a` members
 reference `__stack_chk_fail` regardless of how we compile, so a hosted C++
 link needs it even with the protector off.
 
-### Tier 2 — the unwinder (~13 `_Unwind_*` symbols)
+### Tier 2 — the unwinder — **DONE 2026-08-13, and it is opt-in**
 
-Blocks real `try`/`catch`, and nothing else.
+`axl-c++ -fexceptions` gives real `try`/`catch` on BOTH arches. Committed
+test: `test-cxx-exceptions-qemu.sh`, 36 assertions — catch by exact type
+across three frames, every destructor on the unwind path running exactly once,
+rethrow preserving the exception object, `catch(...)`, a non-matching handler
+declining, container elements destructing mid-unwind, and a global constructor
+that throws and catches BEFORE `main`.
+
+This entry is preserved below because its ANALYSIS was right and only its
+verdict moved. The three things it says are needed were exactly the three that
+had to be built:
+
+| it said | what happened |
+|---|---|
+| a freestanding unwinder | each bare-metal toolchain's own `libgcc.a` already had one — 30 defined `_Unwind_*` on x64, 21 on aa64. Nothing was vendored or written |
+| `.eh_frame` / `.gcc_except_table` into the PE | added to `objcopy -j`, UNCONDITIONALLY: measured byte-identical for an image that has none, because `--gc-sections` already collected them |
+| register the FDE table at startup | `__register_frame`, called from `_axl_cxxabi_run_init_array` through a WEAK reference, so a pure-C image pulls nothing |
+
+**What it cost a C image: nothing.** The `KEEP(*(.eh_frame))` that would have
+cost +16.8% lives in a separate linker script (`elf_*_efi_eh.lds`) selected
+only by `-fexceptions`. Asserted, not assumed.
+
+**Still `-fno-exceptions` by DEFAULT**, and that is not inertia: exceptions
+must never cross the C boundary (`AXL-Cxx-Design.md` §6b — AXL invokes
+consumer callbacks from C frames that carry no landing pads, so an exception
+unwinding through them runs no cleanup at all). Every public callback typedef
+is `noexcept` and `make check-cb-noexcept` holds the line.
+
+The original entry, as it stood:
+
+> Blocks real `try`/`catch`, and nothing else.
 
 **This entry used to also name `std::list::sort`, `shared_ptr` and
 `<stdexcept>`, and that was wrong.** Measured 2026-08-09: a translation unit
@@ -125,19 +168,24 @@ an unwinder too -- you simply cannot `throw` them under `-fno-exceptions`,
 which is a different limitation. Full account and the remaining plan in
 `AXL-Cxx-Unwinder-Design.md`.
 
-These libstdc++ members need the unwinder because *they* were compiled with
-exceptions — not because of how we compile. Reaching them needs three things,
-and none is a flag:
+> These libstdc++ members need the unwinder because *they* were compiled with
+> exceptions — not because of how we compile. Reaching them needs three things,
+> and none is a flag:
+>
+> 1. A freestanding unwinder. x86-64's `libgcc_eh.a` is the **Linux** build:
+>    `mmap`, `munmap`, `_dl_find_object`, `getpagesize`, pthread TLS. The ARM
+>    bare-metal toolchain ships **no** `libgcc_eh.a` at all.
+> 2. `.eh_frame` and `.gcc_except_table` carried into the PE image. `axl-cc`'s
+>    `objcopy -j` list has neither, so unwind tables never reach the `.efi`
+>    today.
+> 3. Registering the FDE table at startup.
+>
+> A real project, but a scoped one — not an impossibility.
 
-1. A freestanding unwinder. x86-64's `libgcc_eh.a` is the **Linux** build:
-   `mmap`, `munmap`, `_dl_find_object`, `getpagesize`, pthread TLS. The ARM
-   bare-metal toolchain ships **no** `libgcc_eh.a` at all.
-2. `.eh_frame` and `.gcc_except_table` carried into the PE image. `axl-cc`'s
-   `objcopy -j` list has neither, so unwind tables never reach the `.efi`
-   today.
-3. Registering the FDE table at startup.
-
-A real project, but a scoped one — not an impossibility.
+Point 1 is the one worth reading twice: it was answered not by building an
+unwinder but by building a TOOLCHAIN. `libgcc_eh.a` being the Linux build was
+a fact about the HOST compiler, and it stopped mattering once x64 got its own
+`x86_64-elf` cross (`AXL-Cxx-Design.md` §6a-T2).
 
 ### Tier 3 — glibc's locale subsystem (~60 symbols)
 
@@ -177,12 +225,14 @@ ABI.
 Each probe writes a TU that USES the facility, then:
 
 ```sh
-out/bin/axl-c++ --arch x64 --release           probe.cpp -o probe.efi   # freestanding
-out/bin/axl-c++ --arch x64 --release --hosted  probe.cpp -o probe.efi   # hosted
+out/bin/axl-c++ --arch x64 --release               probe.cpp -o probe.efi
+out/bin/axl-c++ --arch x64 --release -fexceptions  probe.cpp -o probe.efi
 ```
 
-and classifies the failure by whether the log says `requires_hosted`
-(freestanding gate), `undefined reference` (link), or neither (compile). To
+There used to be a second line here passing `--hosted`, and the harness
+classified a failure by whether the log said `requires_hosted`. Both are gone
+with the mode: a failure is now `undefined reference` (link) or neither
+(compile). To
 measure how *deep* a "no" is, link against a shim defining
 `malloc`/`free`/`fputc`/`fputs`/`fprintf`/`__assert_fail`/`__stack_chk_fail`
 and re-read the residual undefined set — that is what separates tier 2 from
@@ -192,6 +242,14 @@ tier 3, and it is the step that turns "can't" into a number.
 
 Asked directly, and worth recording because the answer is *not* the locale
 cascade and two intermediate guesses were wrong.
+
+**Read the `_Unwind_*` row below as historical.** 11 of the 23 symbols were
+the unwinder, which the toolchain now supplies (tier 2) — so the count that
+matters today is the 12 plain-libc ones, all of which AXL has equivalents for.
+Nobody has re-run this probe since; the number is from 2026-08-06. AXL ships
+`axl::cout`/`cin`/`cerr` (`axl-ostream.hpp`, `axl-istream.hpp`,
+`test-cxx-streams-qemu.sh`, 78 assertions), which is why re-running it has not
+been worth anyone's afternoon.
 
 | Step | Result |
 |---|---|

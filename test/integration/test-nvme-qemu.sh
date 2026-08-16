@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
-EFI="$PROJECT_DIR/out/native-x64/tools/nvme.efi"
+EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/nvme.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: nvme.efi not built"; exit 1; }
 
 WORK="$(mktemp -d)"

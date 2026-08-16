@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-MKFIXTURE="$PROJECT_DIR/out/native-x64/tools/mkfixture.efi"
+MKFIXTURE="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/mkfixture.efi"
 # This test drives run-qemu.sh directly (no common-test.sh), so it resolves its
 # own host port rather than via the test_port helper. An explicit
 # TEST_PORT_BASE still wins; otherwise claim one that is verified free now and

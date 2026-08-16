@@ -25,7 +25,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 export TEST_SKIP_RATCHET=1
 
-EFI="$PROJECT_DIR/out/native-x64/AxlTestPlatform.efi"
+EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/AxlTestPlatform.efi"
 make -C "$PROJECT_DIR" ARCH=x64 tests 2>&1 | tail -1
 
 SWTPM="${SWTPM:-$(command -v swtpm || true)}"

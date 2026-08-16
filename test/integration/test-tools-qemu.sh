@@ -40,7 +40,7 @@ done
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 _arch_lc=$(echo "$TEST_ARCH" | tr 'A-Z' 'a-z')
 [[ "$_arch_lc" == "aarch64" ]] && _arch_lc="aa64"
-NATIVE_DIR="$PROJECT_DIR/out/native-$_arch_lc"
+NATIVE_DIR="$(test_build_dir)"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 
 make -C "$PROJECT_DIR" ARCH="$_arch_lc" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \

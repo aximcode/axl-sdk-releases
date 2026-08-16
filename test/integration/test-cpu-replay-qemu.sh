@@ -21,8 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 AXL_EMULATE="$PROJECT_DIR/scripts/axl-emulate"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-SYSINFO_X64="$PROJECT_DIR/out/native-x64/tools/sysinfo.efi"
-SYSINFO_AA64="$PROJECT_DIR/out/native-aa64/tools/sysinfo.efi"
+SYSINFO_X64="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/sysinfo.efi"
+SYSINFO_AA64="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)/tools/sysinfo.efi"
 
 export TEST_SKIP_RATCHET=1
 PASS=0

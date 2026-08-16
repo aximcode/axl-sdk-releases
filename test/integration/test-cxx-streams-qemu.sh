@@ -11,9 +11,14 @@
 #
 # What each case pins, and why it is here rather than implied:
 #
-#   1. FREESTANDING. Built with no --hosted, so this is the configuration the
-#      whole layer exists for -- if these needed --hosted, std::string would
-#      have been the right answer and axl::string should not exist.
+#   1. Builds with NO FLAG. This used to read "FREESTANDING -- if these needed
+#      --hosted, std::string would have been the right answer and axl::string
+#      should not exist", and that reasoning no longer applies: T3 retired the
+#      freestanding C++ mode, so <string> is always available and this case
+#      can no longer speak to whether axl::string earns its place. That is now
+#      an open question for T5 (AXL-Cxx-Stdlib-Surface.md), not something this
+#      assertion answers. What it still pins is that the fixture builds the
+#      way a consumer builds anything -- which is what cases 2+ run against.
 #   2. The globals are CONSTANT-INITIALISED. axl::cout / cerr / cin must emit
 #      no .init_array entry: a dynamic initialiser would reintroduce the
 #      static-init-order question, and .init_array was being eaten by
@@ -53,7 +58,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 AXL_CXX="$PROJECT_DIR/out/bin/axl-c++"
 SRC="$PROJECT_DIR/test/integration/cxx-streams-selftest.cpp"
 LIB_DIR="$PROJECT_DIR/out/lib/axl/$_native_arch"
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 
 WORK="$TEST_TMPDIR/cxx-streams"
 mkdir -p "$WORK"
@@ -113,7 +118,7 @@ test_add_efi "$EFI"
 # Checked on the .o, not the .efi: objcopy's -j list does not carry
 # .init_array through to the PE image, so its absence there proves nothing.
 # ---------------------------------------------------------------------------
-FIXTURE_OBJ="$PROJECT_DIR/out/native-$_native_arch/build/cxx-streams-selftest.o"
+FIXTURE_OBJ="$(test_build_dir "$_native_arch")/build/cxx-streams-selftest.o"
 READELF=readelf
 NM_BIN=nm
 if [[ "$TEST_ARCH" == "AARCH64" ]]; then
@@ -153,7 +158,7 @@ if [[ -x "$AXL_CXX" && -f "$LIB_DIR/libaxl-cxx.a" ]]; then
     check "staged headers match include/axl (else: install.sh --arch all --cpp)" \
         diff -rq "$PROJECT_DIR/include/axl" "$PROJECT_DIR/out/include/axl-sdk/axl"
 
-    check "axl-c++ builds the fixture freestanding (no --hosted)" \
+    check "axl-c++ builds the fixture with no mode flag" \
         "$AXL_CXX" --arch "$_native_arch" --release "$SRC" -o "$WORK/consumer.efi"
 else
     echo "  NOTE: no staged C++ SDK at $LIB_DIR/libaxl-cxx.a;"

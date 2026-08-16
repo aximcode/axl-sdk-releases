@@ -31,7 +31,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     all axlk-reqlog-server 2>&1 | tail -3
 
-TEST_BUILD_DIR="$PROJECT_DIR/out/native-$_native_arch"
+TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/axlk-reqlog-server.efi"
 
 cat << 'NSHEOF' | test_set_startup

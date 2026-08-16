@@ -22,7 +22,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tools 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 TOOLS_DIR="$NATIVE_DIR/tools"
 
 # Add tool EFIs to image

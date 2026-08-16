@@ -18,16 +18,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# run-qemu.sh takes the uppercase arch (X64/AARCH64); the Makefile takes the
-# lowercase one (x64/aa64) and builds into out/native-<lower>.
-case "$ARCH" in
-    X64)     OUT="out/native-x64";  MAKE_ARCH="x64" ;;
-    AARCH64) OUT="out/native-aa64"; MAKE_ARCH="aa64" ;;
-    *) echo "unknown arch $ARCH"; exit 1 ;;
-esac
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# run-qemu.sh takes the uppercase arch (X64/AARCH64); the Makefile takes the
+# lowercase one (x64/aa64). Ask for the prefix rather than composing it -- and
+# note this must come AFTER PROJECT_DIR, which it did not when the path was a
+# literal and ordering did not matter.
+case "$ARCH" in
+    X64)     OUT="$("$PROJECT_DIR/scripts/build-prefix.sh" x64)";  MAKE_ARCH="x64" ;;
+    AARCH64) OUT="$("$PROJECT_DIR/scripts/build-prefix.sh" aa64)"; MAKE_ARCH="aa64" ;;
+    *) echo "unknown arch $ARCH"; exit 1 ;;
+esac
 cd "$PROJECT_DIR"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 APP="$OUT/exit-status-selftest.efi"

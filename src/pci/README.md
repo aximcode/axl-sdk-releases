@@ -94,6 +94,16 @@ return covers "function not present" alongside the type-specific
 rejection cases. `class_code` matches the shape consumed by
 `axl_pci_find_by_class`.
 
+**`axl_pci_get_class_code` is the exception: it does not precheck
+presence.** An absent function's config space reads all-ones, so it
+returns `AXL_OK` with `0xFFFFFF` rather than -1. Gate on
+`axl_pci_get_vid_did` first if that distinction matters. Note the width
+while you are here — the sentinel is the 24-bit `0xFFFFFF`, and
+comparing against a 32-bit `0xFFFFFFFF` is a skip that silently never
+fires. `0xFFFFFF` is also a legitimate reading for a present but
+class-less function (base class 0xFF), so it means "no usable class",
+not "nothing there".
+
 `axl_pci_class_string` decodes the 24-bit class triplet into a
 human-readable form per the PCI Code and ID Assignment Spec:
 

@@ -32,7 +32,7 @@ PLAIN_PORT=$(test_port 1)   # plain-http redirector -> the https server (cross-s
 
 make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     all tools 2>&1 | tail -3
-TOOLS_DIR="$PROJECT_DIR/out/native-x64/tools"
+TOOLS_DIR="$(test_build_dir x64)/tools"
 test_add_efi "$TOOLS_DIR/fetch.efi"
 
 # Self-signed cert for the host https server. fetch defaults to insecure

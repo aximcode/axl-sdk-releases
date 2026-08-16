@@ -25,7 +25,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tools 2>&1 | tail -3
 
-test_add_efi "$PROJECT_DIR/out/native-$_native_arch/tools/sed.efi"
+test_add_efi "$(test_build_dir "$_native_arch")/tools/sed.efi"
 
 # Fixtures (LF-only; the harness FAT image preserves them verbatim).
 printf '1\n2\n3\n4\n'                             > "$TEST_STAGING/nums.txt"

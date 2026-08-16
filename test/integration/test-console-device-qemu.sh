@@ -88,7 +88,7 @@ if ! python3 -c 'import PIL' >/dev/null 2>&1; then
 fi
 
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-DRV_DIR="$PROJECT_DIR/out/native-x64/drivers"
+DRV_DIR="$(test_build_dir x64)/drivers"
 DRIVER="$DRV_DIR/console-device-smoke.efi"
 RESTORE_DRIVER="$DRV_DIR/console-device-restore-smoke.efi"
 PASSTHRU_DRIVER="$DRV_DIR/console-device-passthrough-smoke.efi"
@@ -98,7 +98,7 @@ INPUT_RESTORE_DRIVER="$DRV_DIR/console-device-input-restore-smoke.efi"
 WIDE_RESTORE_DRIVER="$DRV_DIR/console-device-wide-restore-smoke.efi"
 CYCLE_DRIVER="$DRV_DIR/console-device-cycle-smoke.efi"
 # fbcon is the productized tool (a driver in tools/, not a smoke fixture in drivers/).
-FBCON_DRIVER="$PROJECT_DIR/out/native-x64/tools/fbcon.efi"
+FBCON_DRIVER="$(test_build_dir x64)/tools/fbcon.efi"
 ANALYZER="$TESTS_DIR/analyze-console-device-shot.py"
 
 # Build the three smoke drivers (take-over + restore + wide-geometry). A build

@@ -3,9 +3,9 @@
  *
  * Build with: axl-c++ cxx-errors.cpp -o cxx-errors.efi
  *
- * Freestanding: this needs no --hosted. `axl::result` is
- * `std::expected`, which is in the C++23 freestanding subset, so the
- * error model works in the smallest possible image.
+ * `axl::result` is `std::expected`, which is in the C++23 freestanding
+ * subset -- so the error model costs nothing beyond the language itself
+ * and works in the smallest possible image.
  *
  * Two things every C++ consumer of AXL has to know, and nothing else
  * in the examples showed either:

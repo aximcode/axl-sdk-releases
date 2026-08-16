@@ -20,7 +20,19 @@
 # Usage:
 #   ./scripts/verify.sh              # everything
 #   ./scripts/verify.sh --no-docs    # skip the Sphinx build (slowest to rebuild)
+#   ./scripts/verify.sh --only=docs  # run ONLY these jobs (comma-separated)
 #   AXL_VERIFY_KEEP=1 ./scripts/verify.sh   # keep the per-job logs on success
+#
+# --only exists because the jobs are not equally able to SEE a given change.
+# A markdown-only edit is invisible to x64/aa64/lint/make, so running them
+# costs two arch builds plus a full AXL_CPP=1 lint build for no information --
+# and build-docs.sh runs INSIDE this script, so calling it separately first
+# pays for Sphinx twice. `--only=docs` is the whole gate for a prose change.
+#
+# A filtered run NEVER prints a bare "ALL GREEN": it names what did not run.
+# Otherwise a --only run and a full run are indistinguishable in a log, which
+# is the failure mode this tree keeps meeting -- a gate that cannot see the
+# change reporting the same green as one that can.
 #
 # Exit non-zero if any job fails or the arches disagree.
 set -uo pipefail
@@ -29,17 +41,42 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$SCRIPT_DIR")" || exit 1
 
 WANT_DOCS=1
+ONLY=""
+ALL_JOBS=(x64 aa64 lint make docs)
 for a in "$@"; do
     case "$a" in
         --no-docs) WANT_DOCS=0 ;;
-        -h|--help) sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+        --only=*)  ONLY="${a#--only=}" ;;
+        -h|--help) sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
         *) echo "verify.sh: unknown option $a" >&2; exit 2 ;;
     esac
 done
 
 OUT=$(mktemp -d -t axl-verify.XXXXXX)
-JOBS=(x64 aa64 lint make)
-[[ $WANT_DOCS -eq 1 ]] && JOBS+=(docs)
+SKIPPED=()
+if [[ -n "$ONLY" ]]; then
+    IFS=',' read -r -a JOBS <<< "$ONLY"
+    # A typo must FAIL, not quietly select nothing and report ALL GREEN.
+    for j in "${JOBS[@]}"; do
+        case " ${ALL_JOBS[*]} " in
+            *" $j "*) ;;
+            *) echo "verify.sh: --only names unknown job '$j'" \
+                    "(known: ${ALL_JOBS[*]})" >&2; exit 2 ;;
+        esac
+    done
+    for j in "${ALL_JOBS[@]}"; do
+        case " ${JOBS[*]} " in *" $j "*) ;; *) SKIPPED+=("$j") ;; esac
+    done
+else
+    JOBS=(x64 aa64 lint make)
+    [[ $WANT_DOCS -eq 1 ]] && JOBS+=(docs) || SKIPPED+=(docs)
+fi
+
+want() {
+    local j
+    for j in "${JOBS[@]}"; do [[ "$j" == "$1" ]] && return 0; done
+    return 1
+}
 
 # The pure-lint make gates: each reports "... clean" and builds no libaxl.a,
 # so none of them can leave a binary stale against a changed ABI. That is what
@@ -54,8 +91,11 @@ JOBS=(x64 aa64 lint make)
 # x64 and aa64 jobs below are mid-build. Deriving it makes that unrepresentable
 # instead of merely documented. The DETAIL column stays count-agnostic (see the
 # `make)` case), so a gate added in the Makefile needs no edit here at all.
+MAKE_CHECKS=()
+if want make; then
 mapfile -t MAKE_CHECKS < <(make -s print-lint-gates | tr ' ' '\n' | grep -v '^$')
-if (( ${#MAKE_CHECKS[@]} < 5 )); then
+fi
+if want make && (( ${#MAKE_CHECKS[@]} < 5 )); then
     echo "verify.sh: refusing to run -- 'make print-lint-gates' named only" \
          "${#MAKE_CHECKS[@]} gate(s). A gate runner that runs nothing reports" \
          "ALL GREEN forever." >&2
@@ -64,11 +104,11 @@ fi
 
 run() { local name="$1"; shift; ( "$@" ) >"$OUT/$name.log" 2>&1; echo $? >"$OUT/$name.rc"; }
 
-run x64  env timeout 900 ./test/integration/test-axl.sh &
-run aa64 env TEST_SKIP_RATCHET=1 timeout 900 ./test/integration/test-axl.sh --arch AARCH64 &
-run lint ./scripts/lint.sh &
-run make make "${MAKE_CHECKS[@]}" &
-[[ $WANT_DOCS -eq 1 ]] && run docs ./scripts/build-docs.sh &
+want x64  && run x64  env timeout 900 ./test/integration/test-axl.sh &
+want aa64 && run aa64 env TEST_SKIP_RATCHET=1 timeout 900 ./test/integration/test-axl.sh --arch AARCH64 &
+want lint && run lint ./scripts/lint.sh &
+want make && run make make "${MAKE_CHECKS[@]}" &
+want docs && run docs ./scripts/build-docs.sh &
 wait
 
 fail=0
@@ -116,20 +156,35 @@ _arch_total() {                 # Results: N passed, ... SKIPPED (M assertions) 
     [[ -n "$n_pass" ]] || return 1
     echo $(( n_pass + ${n_skip:-0} ))
 }
+# Only meaningful when BOTH arches ran; otherwise there is nothing to compare
+# and reporting a mismatch would be an artifact of the filter.
+if ! (want x64 && want aa64); then
+    x=""; a=""
+else
 x=$(_arch_total "$OUT/x64.log")  || x=""
 a=$(_arch_total "$OUT/aa64.log") || a=""
-if [[ -n "$x" && "$x" == "$a" ]]; then
+fi
+if ! (want x64 && want aa64); then
+    echo "cross-arch: not compared (both arches were not run)"
+elif [[ -n "$x" && "$x" == "$a" ]]; then
     echo "cross-arch: both $x  OK"
 else
     echo "cross-arch: MISMATCH x64=${x:-?} aa64=${a:-?}"
     fail=1
 fi
 
+# A filtered run must never be mistakable for a full one in a log. Naming what
+# did NOT run is the whole safety property of --only.
+green="ALL GREEN"
+if (( ${#SKIPPED[@]} )); then
+    green="ALL GREEN (partial run -- NOT RUN: ${SKIPPED[*]})"
+fi
+
 if [[ $fail -eq 0 && "${AXL_VERIFY_KEEP:-0}" != "1" ]]; then
     rm -rf "$OUT"
-    echo "ALL GREEN"
+    echo "$green"
 else
     echo "logs: $OUT"
-    [[ $fail -eq 0 ]] && echo "ALL GREEN" || echo "SOMETHING FAILED"
+    [[ $fail -eq 0 ]] && echo "$green" || echo "SOMETHING FAILED"
 fi
 exit $fail

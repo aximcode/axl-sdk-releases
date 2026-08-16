@@ -70,7 +70,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     stdio-bridge-fix stdio-bridge-self stdio-bridge-leak 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 LAUNCHER="$NATIVE_DIR/stdio-bridge-fix.efi"
 SELF_LAUNCHER="$NATIVE_DIR/stdio-bridge-self.efi"
 LEAK_LAUNCHER="$NATIVE_DIR/stdio-bridge-leak.efi"

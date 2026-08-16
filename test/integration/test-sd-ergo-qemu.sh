@@ -40,7 +40,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     sd-ergo 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 LAUNCHER="$NATIVE_DIR/sd-ergo-launcher.efi"
 
 # Skip-and-warn if the fixture could not be built/staged on this box

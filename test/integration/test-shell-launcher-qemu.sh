@@ -44,7 +44,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 # confusing boot-time fallback.
 make -C "$PROJECT_DIR" ARCH="$_native_arch" hello shell-launcher 2>&1 | tail -2
 
-EFI="$PROJECT_DIR/out/native-$_native_arch/hello.efi"
+EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$_native_arch")/hello.efi"
 
 nsh="$(mktemp)"
 stdout="$(mktemp)"   # non-raw filtered output (what integration tests grep)

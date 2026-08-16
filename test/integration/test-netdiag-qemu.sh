@@ -33,7 +33,7 @@ declare -A _NATIVE=([X64]=x64 [AARCH64]=aa64)
 NATIVE="${_NATIVE[$ARCH]:-x64}"
 
 make -C "$PROJECT_DIR" ARCH="$NATIVE" tests 2>&1 | tail -1
-EFI="$PROJECT_DIR/out/native-$NATIVE/AxlTestNet.efi"
+EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/AxlTestNet.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: AxlTestNet.efi not built ($EFI)"; exit 1; }
 
 WORK="$(mktemp -d)"

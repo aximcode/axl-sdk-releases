@@ -28,7 +28,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 export TEST_SKIP_RATCHET=1
 
-EFI="$PROJECT_DIR/out/native-x64/cpu-topology-selftest.efi"
+EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/cpu-topology-selftest.efi"
 make -C "$PROJECT_DIR" ARCH=x64 cpu-topology-selftest 2>&1 | tail -2
 
 overall_fail=0

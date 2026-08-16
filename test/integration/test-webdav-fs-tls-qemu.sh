@@ -30,7 +30,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
-test_add_efi "$PROJECT_DIR/out/native-$_native_arch/AxlTestNet.efi"
+test_add_efi "$(test_build_dir "$_native_arch")/AxlTestNet.efi"
 
 cat << 'NSHEOF' | test_set_startup
 @echo -off

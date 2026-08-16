@@ -30,10 +30,10 @@ export TEST_SKIP_RATCHET=1
 # Build the AXL_TLS=1 variant into a segregated prefix (see the rationale
 # in test-pk-verify-qemu.sh: toggling AXL_TLS changes per-TU CFLAGS but not
 # .c timestamps, so a dedicated prefix keeps the ratcheted suite clean).
-TLS_PREFIX="out/native-x64-tls"
+TLS_PREFIX="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" x64)"
 EFI="$PROJECT_DIR/$TLS_PREFIX/AxlTestJose.efi"
 rm -f "$EFI"
-make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 PREFIX="$TLS_PREFIX" all tests 2>&1 | tail -1
+make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 all tests 2>&1 | tail -1
 [[ -f "$EFI" ]] || { echo "FAIL: AXL_TLS build did not produce $EFI"; exit 1; }
 
 LOG="$(mktemp)"

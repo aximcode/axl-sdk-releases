@@ -34,7 +34,7 @@ PY_EXTRACT="$PROJECT_DIR/scripts/extract-fv-shell.py"
 # The host fwtool lives under the X64 build dir (the binary is arch-neutral —
 # it parses bytes, not the running arch). Build it via the Makefile so the
 # exact host build recipe under test is the one CI uses.
-FWTOOL_HOST="$PROJECT_DIR/out/native-x64/build/fwtool-host"
+FWTOOL_HOST="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/build/fwtool-host"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

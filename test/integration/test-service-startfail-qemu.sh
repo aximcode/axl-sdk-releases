@@ -43,7 +43,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     svc-startfail 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 # Stage ONLY the launcher. Deliberately NOT the -dxe: its absence makes the
 # 4-path disk search miss so the launcher buffer-loads the embedded blob (the
 # path that synthesizes a device path and hit the double-free).

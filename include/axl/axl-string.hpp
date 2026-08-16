@@ -219,8 +219,9 @@ public:
      *
      * `explicit`, as `std::string`'s `string_view` constructor is. Without
      * that, `some_view == "literal"` becomes ambiguous inside namespace
-     * `axl`: the view would convert to a #axl::string and pick up
-     * #axl::operator==(const string &, const char *) as a second candidate.
+     * `axl`: the view would convert to a #axl::string and pick up the
+     * `operator==(const string &, const char *)` overload below as a second
+     * candidate.
      */
     explicit string(std::string_view v) : string()
     {

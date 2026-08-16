@@ -23,8 +23,8 @@ done
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 _arch_lc=$(echo "$TEST_ARCH" | tr 'A-Z' 'a-z'); [[ "$_arch_lc" == "aarch64" ]] && _arch_lc="aa64"
-DRV="$PROJECT_DIR/out/native-$_arch_lc/tools/kbtune-drv.efi"
-APP="$PROJECT_DIR/out/native-$_arch_lc/kbtune-drv-test.efi"
+DRV="$(test_build_dir "$_arch_lc")/tools/kbtune-drv.efi"
+APP="$(test_build_dir "$_arch_lc")/kbtune-drv-test.efi"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 
 make -C "$PROJECT_DIR" ARCH="$_arch_lc" kbtune-drv kbtune-drv-test >/dev/null 2>&1

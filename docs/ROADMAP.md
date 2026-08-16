@@ -17,6 +17,11 @@ Legend: `[x]` done · `[-]` in progress · `[ ]` pending.
 Library / SDK foundations:
 - [AXL-Design.md](AXL-Design.md) — library design (phases, API spec, style)
 - [AXL-SDK-Design.md](AXL-SDK-Design.md) — SDK (toolchain, packaging)
+- [AXL-Build-System-Design.md](AXL-Build-System-Design.md) — **PROPOSED
+  2026-08-15.** Replace the 3,579-line Makefile with CMake for 4.0.0; we
+  stop shipping Makefiles. Decision (CMake over Meson) and the measured
+  port surface — the `.efi` pipeline, the ARCH x BUILD x AXL_TLS prefix
+  rule, 17 gates, and why `axl-cc` is NOT part of the port.
 - [AXL-Cxx-Stdlib-Handoff.md](AXL-Cxx-Stdlib-Handoff.md) — **DONE 2026-08-06.**
   `axl-c++ --hosted` ships, and `std::vector` / `std::string` / `std::map` /
   `std::unordered_map` run under UEFI on both arches
@@ -106,8 +111,16 @@ Library / SDK foundations:
   ARM. Everything that failed did so because x64 was borrowing the
   host's glibc-targeted g++, whose libsupc++ keeps `__cxa_eh_globals` in
   `__thread` storage and reads a stack canary from `%fs:0x28` — neither
-  of which UEFI provides. **Nothing is wired into the build yet**, and
-  `AXL-Cxx-Design.md` §6a-PLAN's "T2 BLOCKED" is now stale
+  of which UEFI provides. **WIRED IN 2026-08-13 (task T2)** — `axl-cc`, the
+  Makefile and the generated CMake package all select our own
+  `x86_64-elf-g++`, so C++ compiles bare-metal on both arches and the
+  `.deb`/`.rpm` depend on nothing from the host. That surfaced one silent
+  defect the spike's hand-link had hidden: GCC's `x86_64-*-elf` target emits
+  global constructors into `.ctors`, which AXL's crt0 does not walk, so NONE
+  of them ran. Fixed in the toolchain (`--enable-initfini-array`, published as
+  `14.3.0-axl2`); see `AXL-Cxx-Design.md` §6a-T2. Exceptions themselves are
+  still NOT wired — that is U2/U3 in `AXL-Cxx-Unwinder-Design.md`, and the
+  7/7 demo remains hand-linked
 
 - [AXL-Newlib-Investigation.md](AXL-Newlib-Investigation.md) — **the
   MEASUREMENTS behind the direction above; its "NOT SCHEDULED" status and its
@@ -138,8 +151,39 @@ Library / SDK foundations:
   firmware's memory map stays accurate, and the leak gate keeps working. It
   also makes third-party allocations (mbedtls, lzma, stb, newlib) tracked for
   the first time. `src/cxxrt/` is already the first working instance.
-  **OPEN:** does newlib's `printf` reintroduce the Log -> Data cycle AxlFormat
-  exists to break? That measurement decides how deep the substrate goes
+  **§4.1 ANSWERED 2026-08-13 — the substrate stops short of stdio.** Newlib's
+  printf DOES reintroduce the cycle: even its INTEGER-ONLY `vsniprintf` arrives
+  with `mallocr`/`freer`/`reallocr`, the FILE machinery and `_impure_ptr`, at
+  21.5 KB against `AxlFormat`'s 6.7 KB (the general `vsnprintf` is 53.8 KB
+  across 47 archive members). `AxlFormat` stays permanently, as the second
+  entry in the "AXL implements it because AXL's is better here" list after the
+  allocator. Newlib remains the answer for `string`/`math`/`stdlib`.
+  **§4.1b DONE 2026-08-13 — C compiles bare-metal on BOTH arches and
+  `include/compat/` is deleted.** aa64 moved off the glibc-targeted Linux cross
+  too; the compiler comes from `axl-toolchains.conf` with no host fallback, all
+  four consumer entry points moved, and `test-axl-cc-hosted-headers.sh` now
+  asserts a consumer's `<string.h>` resolves inside the toolchain with nothing
+  under `/usr/include`. verify.sh ALL GREEN both arches (10393).
+  **§4.1c DONE — the toolchain is published.** `toolchain-x86_64-elf-14.3.0`
+  on `axl-sdk-releases`: 55 MB stripped tarball (1.5 GB as built, 235 MB
+  stripped), its three upstream source archives for GPL §6(d), and SHA256SUMS.
+  `install-toolchain.sh x64` is download-and-verify now, so CI and consumers
+  pay a download instead of a 40-minute build.
+  **§4b OPEN (not scheduled): alternatives to newlib, and where the seam
+  belongs.** The tree uses newlib's HEADERS only — `-nostdlib`, and AXL defines
+  all twelve standard-named symbols itself. picolibc and llvm-libc are the
+  candidates worth measuring; musl is the wrong shape; edk2-libc is abandoned.
+  Measure picolibc's printf against AxlFormat's 6,708 bytes before recommending
+  anything.
+  Original spike measurement follows. The
+  whole tree builds with `CC=x86_64-elf-gcc` (271/271 objects, 0 errors) WITH
+  or WITHOUT `include/compat` on the path, a compat-free `AxlTestLog.efi` runs
+  67/67 with no leaks under QEMU, and the entire cost of retiring
+  `include/compat/` for C is TWO fixes: `__assert_func` (15 refs from
+  `deps/sdefl` via newlib's real `<assert.h>`) and the `time()` signature clash
+  in `axl-mbedtls-platform.c`. AXL's own code never used compat at all — it
+  includes only `stddef`/`stdint`/`stdbool`/`stdarg` — so compat is entirely a
+  third-party shim. NOT yet measured: aa64, the C++ hosted path
 - [AXL-Cxx-Unwinder-Design.md](AXL-Cxx-Unwinder-Design.md) — **U0 DONE 2026-08-09.**
   Tier 2 (the unwinder) reframed by measurement: our own `-fno-exceptions`
   objects reference **zero** `_Unwind_*` symbols, so three of the four things
@@ -155,10 +199,22 @@ Library / SDK foundations:
   levels, matching what aa64 already had from ARM, and real `try`/`catch` plus
   `std::vector`/`string`/`map` now run **7/7 under QEMU on both arches**.
   `deps/libunwind`, `src/cxxabi/` and `check-cxxabi-oracle` were removed as
-  the level-2 track they served is cancelled. **PENDING:** none of it is wired
-  into `axl-cc`/`axl-c++` or the Makefile — the runs were hand-linked — and a
-  libstdc++ emergency-pool leak must be cleared before it can ship, because
-  the leak gate is a hard gate. See
+  the level-2 track they served is cancelled.
+  **U2/U3 DONE 2026-08-13 — `axl-c++ -fexceptions` ships.** Both things this
+  entry listed as pending are closed: the runs are not hand-linked any more
+  (`axl-cc` derives the exceptions-capable link from `-fexceptions` itself, or
+  from an input object referencing `__gxx_personality_v0`), and the libstdc++
+  emergency-pool leak that blocked the hard leak gate is cleared. The committed
+  fixture is `test-cxx-exceptions-qemu.sh`, whose first assertion is a global
+  constructor that throws and catches BEFORE `main` — so it fails if frame
+  registration does not precede the `.init_array` walk, rather than assuming
+  the ordering. **Measured cost, both arches:** a container-using image goes
+  ~61 KB to ~279 KB on x64 (~69 KB to ~274 KB on aa64) with `-fexceptions`, of
+  which only ~22 KB is the unwinder — roughly half is libstdc++'s verbose
+  terminate handler pulling the C++ demangler and newlib `stdio`. Preempting
+  that handler with one small object takes the same image to 167 KB / 153 KB,
+  measured and booted; shipping it on the `-fexceptions` link path is an
+  obvious follow-up and is NOT done. See
   [AXL-Cxx-Toolchain-Handoff.md](AXL-Cxx-Toolchain-Handoff.md)
 - [AXL-Cxx-Stdlib-Surface.md](AXL-Cxx-Stdlib-Surface.md) — **measured**
   table of which STL facilities work freestanding, which need
@@ -255,6 +311,16 @@ Subsystems:
   [AXL-PieceTree-Design.md](AXL-PieceTree-Design.md) · [AXL-RBTree-Design.md](AXL-RBTree-Design.md) · [AXL-Config-Design.md](AXL-Config-Design.md)
 - Networking: [2026-07-19-axl-9p-design.md](superpowers/specs/2026-07-19-axl-9p-design.md) — Axl9p 9P2000.L client + server + `fsN:` mount bridge
 - Hardware fixtures / test: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md) · [HW-Testing-Workflow.md](HW-Testing-Workflow.md)
+- CI / release cost: [AXL-CI-Release-Speed-Design.md](AXL-CI-Release-Speed-Design.md)
+  — **ACCEPTED 2026-08-13, not yet implemented.** A release costs 75 billable
+  minutes and ~60 minutes of waiting, 46 of them in ONE serial job: CI's QEMU
+  runner picks `nproc-2` workers and a hosted runner has 2 cores, so the
+  `--shard`/`est=` machinery already in `run-integration.sh` goes unused. Plan:
+  a `plan` job choosing self-hosted (free, ~9 min) with a sharded hosted
+  fallback, a gate policy that reserves full CI for `X.0.0`, and reuse of a CI
+  run already green on the release commit's parent. Target ~90 min/month
+  against an org-wide ~2,000 allowance that BOTH repos have already breached
+  (axl-sdk April, agt June)
 
 Active sub-projects (pre-code planning — see "Active sub-projects" below):
 - [AXL-Dashboard-Server-Design.md](AXL-Dashboard-Server-Design.md) — native-SPA dashboard HTTP server
@@ -266,8 +332,22 @@ Active sub-projects (pre-code planning — see "Active sub-projects" below):
 ## Shipped — milestone summary
 
 [CHANGELOG.md](../CHANGELOG.md) is authoritative; this is the skim. Current:
-**v1.7.1**, **6319 unit tests** both arches (X64 + AArch64), native backend
-only (gcc + ld + objcopy). `scripts/cut-release.sh` automates the cut.
+**v3.2.3**, **10405 unit tests** both arches (X64 + AArch64), built with AXL's
+own bare-metal crosses on both arches (nothing from the host — see
+[AXL-Libc-Substrate-Design.md](AXL-Libc-Substrate-Design.md) §4.1d, inventory
+empty). `scripts/cut-release.sh` automates a cut from `main`; a release that
+must NOT carry everything on `main` is cut from the previous tag on a release
+branch, which is how 3.2.1, 3.2.2 and 3.2.3 shipped — see
+[RELEASING.md](RELEASING.md) "Which flow".
+
+> **`git describe` on `main` reports v3.2.0, not v3.2.3.** Those three tags
+> live on release branches whose content reached `main` by cherry-pick, so they
+> are not ancestors of it. Consequence worth knowing before the next cut:
+> `cut-release.sh` prints "commits since v3.2.0" and lists 61 of them. Reachable
+> ancestry could be restored with `git merge -s ours <tag>` per tag (the content
+> is already present, so it records the ancestry without changing a byte) — not
+> done here because it alters `main`'s graph and is worth deciding
+> deliberately.
 
 **Foundations (DONE):**
 - **Library core** — AxlMem, AxlString/AxlStrBuf, AxlStream (console/file/buffer
@@ -378,6 +458,71 @@ firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
 
 Grouped, terse; **detail lives in the linked design doc or
 [ROADMAP-Archive.md](ROADMAP-Archive.md)**. Most are opportunistic / low-priority.
+
+- **Is `axl-cc` still needed now the SDK ships its own toolchain?** Asked
+  2026-08-13. Measured answer: **yes, but not for the reason the question
+  assumes** — the toolchain never did this job. `axl-cc hello.c -o hello.efi`
+  expands to FOUR commands and 75 arguments: `gcc` with 16 baked-in flags
+  (`-ffreestanding -fshort-wchar -fno-builtin -fpic -mno-red-zone
+  -mstack-protector-guard=global ...`), `ld -shared -Bsymbolic --no-undefined
+  --gc-sections` against a per-arch linker script AND a version script,
+  `objcopy` with a 12-entry `-j` list plus `--subsystem`, then `pe-set-debug`.
+  None of that follows from having a compiler.
+
+  Two escape routes were considered and both fail on measurement:
+
+  - **Link PE directly, dropping `objcopy`.** Our x64 binutils does carry
+    `i386pep`, so x64 could. **aa64 cannot** — ARM's `aarch64-none-elf-ld`
+    lists no PE emulation at all (`aarch64elf`, `armelf`, `aarch64linux`).
+    That would mean two different pipelines to save one step on one arch.
+    LLVM's `lld` does emit arm64 PE (it is how Windows-on-ARM links), but
+    adopting it means a second toolchain, against §4.1d's whole direction.
+  - **A GCC specs file** (`-specs=axl-app.specs`), which is the GCC analogue
+    of the target triple Rust's `x86_64-unknown-uefi` uses to carry exactly
+    this policy. It can inject the flags, the linker script and the startfiles
+    — but GCC has **no post-link hook**, so `objcopy` and `pe-set-debug` still
+    need a wrapper. It would split the policy across two files instead of
+    removing one, which makes `check-flag-parity` harder, not easier.
+
+  **The sharper finding is next door.** The generated `axl-config.cmake` does
+  not CALL `axl-cc` — it re-implements the entire pipeline in CMake (its own
+  compile, `ld`, `objcopy`, `pe-set-debug`). That is the third build path
+  `check-flag-parity` exists to police, and it is duplication by choice rather
+  than necessity. Having the CMake package shell out to `axl-cc` would take
+  three paths to two for a small change, and is worth doing whether or not the
+  entry below ever happens.
+
+- **CMake as THE build system, replacing the Makefile** —
+  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)**, PROPOSED
+  2026-08-15. Mike's direction, targeted at 4.0.0, with the constraint stated
+  explicitly: **we will no longer ship Makefiles** — replaced, not
+  supplemented. Today CMake is a CONSUMER-facing path only
+  (`scripts/install.sh` generates `axl-config.cmake`), while the library, 42
+  test images, every tool and every gate are a **3,579-line** Makefile.
+
+  Three numbers in this entry were wrong until 2026-08-15 and are corrected in
+  the design doc: the Makefile is 3,579 lines not ~2,000, there are **17**
+  `LINT_GATES` not 19, and `check-flag-parity` guards **two** build paths not
+  three — `2229abc0` made the generated CMake package CALL `axl-cc` instead of
+  reimplementing it. That last correction matters, because "three paths → one"
+  was this entry's strongest argument FOR the port and the honest version is
+  "two → one" — and only if the port also swallows `axl-cc`, which §3 of the
+  design doc argues it must not (direct-PE linking has no aa64 emulation;
+  specs files have no post-link hook). The strongest argument is instead that
+  the hand-rolled build-state signature IS a re-configure, done by us because
+  make cannot express "flags are an input".
+
+  Sequencing: the design doc recommends shipping 4.0.0 FIRST and porting
+  after, since 4.0.0's content is finished and green while the port is
+  unbounded until it starts.
+
+  **The duplication is now load-bearing, not just untidy.** `axl-c++
+  -fexceptions` works on both arches, and the CMake package CANNOT do it: its
+  re-implementation has no `_eh` linker script, no glue objects and no
+  toolchain libraries, so a CMake consumer asking for exceptions gets an image
+  that compiles, links, and dies at the first throw. `check-flag-parity` cannot
+  see it — the `-j` lists agree. Having the package shell out to `axl-cc` fixes
+  it by construction; writing the logic a third time is the alternative.
 
 - **Distribution & consumption model** — [AXL-Distribution-Design.md](AXL-Distribution-Design.md).
   Package, install, discover and version-pin the SDK the way a real
@@ -508,6 +653,45 @@ Grouped, terse; **detail lives in the linked design doc or
 ---
 
 ## Done / decided (one-liners, full detail in Archive)
+
+- **Library log levels: the rule, the gate, and the sweep** (2026-08-14/15,
+  shipped as v3.2.1 → v3.2.3) — a consumer moving its default to
+  `AXL_LOG_INFO` saw AXL output on a healthy run. Three releases: the eight
+  observed sites, then a census of all 42 `axl_info` (41 demoted, one kept
+  because `axl_mem_dump_leaks` returns void and the QEMU leak gate greps it),
+  then 213 of 358 `axl_warning`. Census 138/358/1/169 → 138/145/1/382. The
+  durable half is the rule in [AXL-Coding-Style.md](AXL-Coding-Style.md) "Log
+  Levels in Library Code" plus `make check-log-levels`, which requires a
+  `/* log-level: */` marker rather than guessing from vocabulary. The
+  discriminator is *can the caller observe this any other way?* — and it is one
+  frame deeper than it looks, since a status can be checked by the immediate
+  caller and discarded by its caller.
+
+- **`AXL_TLS` gets its own build tree** (2026-08-15) — `PREFIX` now carries a
+  `-tls` suffix. `AXL_TLS` is in the build-state signature, and `test-axl.sh`
+  builds it off while `run-integration.sh` exports it on, so one shared prefix
+  wiped and rebuilt ~300 objects on every alternation (measured 321 one way,
+  270 back; now 0). The Makefile change is one line; the work was the **98
+  hand-composed `out/native-$arch` paths across 66 scripts** that had to start
+  asking `scripts/build-prefix.sh` instead.
+
+- **`cut-release.sh` refuses a breaking change under a non-major**
+  (2026-08-15) — `## Unreleased` is branch-wide state and a release is a commit
+  range; they agree only when the release is everything since the last tag.
+  A v3.2.3 cut from `main` dated 43 unrelated commits, two of them
+  `### Breaking`, into a patch and published before anyone read the version
+  against the content. `scripts/check-release-semver.sh` now refuses that
+  shape, with `--allow-breaking` as the deliberate exception. **It fires today**
+  on `main`, whose `## Unreleased` carries the toolchain rework's breaking
+  entries — so the next release from `main` must be a major.
+
+- **Gate wall-clock: 115s → 74s** (2026-08-15) — `verify.sh` runs its jobs
+  concurrently, so the wall clock is the slowest one. Docs was 115s and is now
+  7s warm (HTML and man built together, `sphinx -j auto`); clang-tidy was ~45s
+  and is now ~7s (`scripts/lint-cache.py` keys each TU on its own text, its
+  headers' text, the flags and the checker, and skips what cannot differ).
+  Both keep their teeth — verified by injecting a dangling `:ref:` and a
+  `bugprone-branch-clone` and confirming each still fails the gate.
 
 - **`AxlXml` flags adopted the `AxlJsonFlags` shape** (2026-08-04) —
   `AxlXmlWriterFlags` + `AXL_XML_WRITER_DEFAULT/PRETTY` + `uint32_t flags`

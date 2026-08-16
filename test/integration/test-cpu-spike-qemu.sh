@@ -37,7 +37,7 @@ test_setup
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
-TEST_BUILD_DIR="$PROJECT_DIR/out/native-$_native_arch"
+TEST_BUILD_DIR="$(test_build_dir)"
 
 # The spin fixture (test/integration/cpu-spin-fixture.c + its `cpu-spin-fixture`
 # make target) is shared with the CPU-burn investigation and is owned by that

@@ -54,7 +54,7 @@ fi
 tail -3 "$BUILD_LOG"
 rm -f "$BUILD_LOG"
 
-TEST_BUILD_DIR="$PROJECT_DIR/out/native-$_native_arch"
+TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/tcp-echo-server.efi"
 
 # Startup: connect drivers, DHCP, run server.

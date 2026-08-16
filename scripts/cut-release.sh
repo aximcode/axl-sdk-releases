@@ -10,6 +10,8 @@
 #   scripts/cut-release.sh X.Y.Z            # cut a release
 #   scripts/cut-release.sh X.Y.Z --dry-run  # show what it would do, change nothing
 #   scripts/cut-release.sh X.Y.Z --yes      # skip the confirmation prompt
+#   scripts/cut-release.sh X.Y.Z --allow-breaking  # cut a documented breaking
+#                                           #   change under a non-major version
 #   scripts/cut-release.sh X.Y.Z --resume   # recovery: main already has the
 #                                           #   release commit + green CI — just
 #                                           #   tag, push, watch, confirm
@@ -44,6 +46,9 @@ CI_GATE=false   # CI runs only via workflow_dispatch (NOT on push, NOT on
                 # docs/RELEASING.md §4b). --ci-gate makes this script dispatch
                 # ci.yml on main and wait for it green before it tags.
 RELEASES_REPO="aximcode/axl-sdk-releases"
+# Deliberate exception to the semver refusal below: a release that really is
+# meant to carry a documented breaking change under a non-major version.
+ALLOW_BREAKING=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -51,6 +56,7 @@ for arg in "$@"; do
         --yes|-y)  ASSUME_YES=true ;;
         --resume)  RESUME=true ;;
         --ci-gate) CI_GATE=true ;;
+        --allow-breaking) ALLOW_BREAKING=1 ;;
         -*)        echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
         *)
             if [[ -n "$VERSION" ]]; then
@@ -62,7 +68,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$VERSION" ]]; then
-    echo "usage: $0 X.Y.Z [--dry-run] [--yes] [--resume]" >&2
+    echo "usage: $0 X.Y.Z [--dry-run] [--yes] [--resume] [--allow-breaking]" >&2
     exit 2
 fi
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -112,19 +118,31 @@ note "on main, clean tree, $TAG is free, gh authenticated"
 # --------------------------------------------------------------------------
 wait_for_ci() {
     local sha="$1" i line
-    say "Waiting for CI to pass on $sha (the release gate)"
-    for i in $(seq 1 90); do          # 90 * 20s = 30 min ceiling
+    # 150 * 30s = 75 min. The old ceiling was 30 min, chosen when CI's QEMU job
+    # ran a handful of suites; it now runs the WHOLE integration set (145 tests,
+    # each in its own QEMU) on a 2-core runner, which measured ~50 min on the
+    # v3.2.0 cut — so the gate timed out on a run that went on to pass, and the
+    # release had to be finished with --resume. Size the ceiling to the job.
+    say "Waiting for CI to pass on $sha (the release gate; up to 75 min)"
+    for i in $(seq 1 150); do
         line="$(gh run list --commit "$sha" --workflow CI \
                   --json status,conclusion \
                   --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || true)"
         case "$line" in
             completed:success) note "CI: SUCCESS"; return 0 ;;
             completed:*)       note "CI: ${line#completed:}"; return 1 ;;
-            *)                 note "[poll $i] CI: ${line:-no run yet}" ;;
+            *)
+                # One line per 5 min, not per poll: 150 identical
+                # "in_progress" lines bury the outcome they precede.
+                if (( i == 1 || i % 10 == 0 )); then
+                    note "[$(( (i * 30) / 60 )) min] CI: ${line:-no run yet}"
+                fi
+                ;;
         esac
-        sleep 20
+        sleep 30
     done
-    note "timed out waiting for CI"
+    note "timed out waiting for CI after 75 min (the run may still be going —"
+    note "check 'gh run list --workflow CI', then use --resume)"
     return 1
 }
 
@@ -203,6 +221,16 @@ fi
 # --------------------------------------------------------------------------
 grep -q '^## Unreleased' CHANGELOG.md \
     || die "CHANGELOG.md has no '## Unreleased' section — add release notes first"
+
+# ...and that the section is consistent with the version being cut. The check
+# above only asks whether the heading EXISTS; step 3 then dates it over
+# whatever sits beneath. That is how v3.2.3 first shipped 43 commits of
+# in-progress work, two of them "### Breaking", as a PATCH. The commit range is
+# already printed below and it did not help -- and --yes skips the prompt
+# entirely -- so this is a refusal rather than more output.
+scripts/check-release-semver.sh "$VERSION" \
+    ${ALLOW_BREAKING:+--allow-breaking} \
+    || die "release content does not match the version being cut"
 
 PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
 say "Will release $TAG — commits since ${PREV_TAG:-the beginning}"

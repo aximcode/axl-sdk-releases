@@ -240,7 +240,7 @@ Test runner has ratchet check (fails if count drops below baseline).
 | AxlService | src/service/ | axl/axl-service.h, axl-embed.h (lifecycle wrapper over AxlLoop; composes axl-loop + axl-config + axl-driver; AXL_SERVICE_DRIVER macro in axl.h) |
 | AxlSharedDriver | src/util/axl-shared-driver.c | axl/axl-shared-driver.h (thin wrappers over axl-driver + axl-protocol for the synchronous-RPC "thin launcher + resident driver" pattern; no event loop; see docs/AXL-Shared-Driver-Recipe.md + sdk/examples/shared-driver-demo/) |
 | AxlTask | src/task/ | axl/axl-task.h, axl-buf-pool.h, axl-async.h |
-| C++ layer | src/runtime/*.cpp | axl/axl-cxx.hpp (`axl::result`), axl-arena-allocator.hpp (`axl::arena_allocator`). The standard containers are the default -- `axl-c++ --hosted` makes `std::vector`/`string`/`map`/`unordered_map` work on both arches; `libaxl-cxx.a` supplies `operator new`/`delete`, the five `std::__throw_*`, `ceil`, and AXL's own `_Prime_rehash_policy`. See docs/AXL-Cxx-Design.md |
+| C++ layer | src/runtime/*.cpp | axl/axl-cxx.hpp (`axl::result`), axl-arena-allocator.hpp (`axl::arena_allocator`). The standard containers are the default and need no flag -- `std::vector`/`string`/`map`/`unordered_map` work on both arches (`--hosted` is removed; passing it is an error); `libaxl-cxx.a` supplies `operator new`/`delete`, the five `std::__throw_*`, `ceil`, and AXL's own `_Prime_rehash_policy`. See docs/AXL-Cxx-Design.md |
 | AxlNet | src/net/ | axl/axl-tcp.h, axl-udp.h, axl-url.h, axl-http-server.h, axl-http-client.h, axl-inet-address.h, axl-socket.h, axl-socket-client.h, axl-net.h (umbrella) |
 | AxlTls | src/net/ | axl/axl-tls.h (optional: AXL_TLS=1) |
 | AxlCrypto | src/net/ | axl/axl-crypto.h (PK sign/verify, AEAD, ECDH, AES-CTR; AXL_TLS=1) |

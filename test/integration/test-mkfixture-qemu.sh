@@ -22,8 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 AXL_EMULATE="$PROJECT_DIR/scripts/axl-emulate"
-MKFIXTURE="$PROJECT_DIR/out/native-x64/tools/mkfixture.efi"
-SYSINFO="$PROJECT_DIR/out/native-x64/tools/sysinfo.efi"
+MKFIXTURE="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/mkfixture.efi"
+SYSINFO="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/sysinfo.efi"
 
 # Auxiliary; don't clobber test-axl.sh's pass-count baseline.
 export TEST_SKIP_RATCHET=1

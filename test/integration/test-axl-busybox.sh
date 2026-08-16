@@ -25,7 +25,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     axl-busybox 2>&1 | tail -5
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/axl.efi"
 
 # Test data — same shape as test-tools.sh's cat / grep coverage. Stage

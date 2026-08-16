@@ -65,7 +65,7 @@ esac
 # Build. If the tool EFI is already there we skip — this script is
 # typically invoked in a loop while iterating on the AxlIpmi code.
 #
-IPMI_EFI="$PROJECT_DIR/out/native-$_native_arch/tools/ipmi.efi"
+IPMI_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$_native_arch")/tools/ipmi.efi"
 if [[ ! -f "$IPMI_EFI" ]]; then
     log_info "Building ipmi.efi ($ARCH)..."
     make -C "$PROJECT_DIR" ARCH="$_native_arch" tools 2>&1 | tail -3

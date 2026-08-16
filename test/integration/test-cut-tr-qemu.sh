@@ -67,16 +67,16 @@ overall_fail=0
 run_one() {
     local arch="$1" native_arch out cutefi trefi log nsh pass fail
     case "$arch" in
-        X64)     native_arch="x64";  out="$PROJECT_DIR/out/native-x64" ;;
-        AARCH64) native_arch="aa64"; out="$PROJECT_DIR/out/native-aa64" ;;
+        X64)     native_arch="x64";  out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)" ;;
+        AARCH64) native_arch="aa64"; out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)" ;;
     esac
     cutefi="$out/tools/cut.efi"
     trefi="$out/tools/tr.efi"
 
     echo "=== cut/tr ($arch) ==="
     make -C "$PROJECT_DIR" ARCH="$native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
-        "out/native-$native_arch/tools/cut.efi" \
-        "out/native-$native_arch/tools/tr.efi" 2>&1 | tail -1
+        "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/cut.efi" \
+        "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/tr.efi" 2>&1 | tail -1
 
     # Build the nsh: each case wrapped in unique sentinels.
     nsh="$(mktemp)"

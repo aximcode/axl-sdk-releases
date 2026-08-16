@@ -43,8 +43,8 @@ overall_fail=0
 run_one() {
     local arch="$1" native_arch out efi log nsh pass fail
     case "$arch" in
-        X64)     native_arch="x64";  out="$PROJECT_DIR/out/native-x64" ;;
-        AARCH64) native_arch="aa64"; out="$PROJECT_DIR/out/native-aa64" ;;
+        X64)     native_arch="x64";  out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)" ;;
+        AARCH64) native_arch="aa64"; out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)" ;;
     esac
     efi="$out/tools/lsproto.efi"
 
@@ -53,7 +53,7 @@ run_one() {
     # (an absolute path is a different target and only "works" when the file
     # already happens to exist).
     make -C "$PROJECT_DIR" ARCH="$native_arch" \
-        ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} "out/native-$native_arch/tools/lsproto.efi" 2>&1 | tail -1
+        ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/lsproto.efi" 2>&1 | tail -1
 
     nsh="$(mktemp)"
     cat > "$nsh" <<'NSH'

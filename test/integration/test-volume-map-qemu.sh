@@ -32,7 +32,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     volume-map-test 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 
 # A host directory mounted as an extra filesystem is what makes the
 # LocateHandle order diverge from the shell's fsN numbering.

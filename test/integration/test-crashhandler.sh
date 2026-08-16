@@ -29,8 +29,8 @@ export TEST_SKIP_RATCHET=1
 test_parse_args "$@"
 
 ARCH_LC=$(arch_dir "$TEST_ARCH")
-CRASH_HANDLER="$PROJECT_DIR/out/native-$ARCH_LC/drivers/crashhandler.efi"
-CRASH_TEST="$PROJECT_DIR/out/native-$ARCH_LC/tools/crashtest.efi"
+CRASH_HANDLER="$(test_build_dir "$ARCH_LC")/drivers/crashhandler.efi"
+CRASH_TEST="$(test_build_dir "$ARCH_LC")/tools/crashtest.efi"
 
 # Build if missing (warm tree: <2s).
 if [[ ! -f "$CRASH_HANDLER" || ! -f "$CRASH_TEST" ]]; then

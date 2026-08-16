@@ -46,7 +46,7 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-MKRD="$PROJECT_DIR/out/native-$NATIVE/tools/mkrd.efi"
+MKRD="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools/mkrd.efi"
 
 make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 [[ -f "$MKRD" ]] || { echo "ERROR: $MKRD not built"; exit 1; }

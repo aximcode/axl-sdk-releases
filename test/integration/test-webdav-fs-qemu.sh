@@ -25,7 +25,7 @@ GUEST_PORT=8080
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
-test_add_efi "$PROJECT_DIR/out/native-$_native_arch/AxlTestNet.efi"
+test_add_efi "$(test_build_dir "$_native_arch")/AxlTestNet.efi"
 
 cat << 'NSHEOF' | test_set_startup
 @echo -off

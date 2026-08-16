@@ -35,7 +35,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     driver-parent-leak-test 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/driver-parent-leak-test.efi"
 # Launcher ONLY — the driver is intentionally NOT staged on disk, so the
 # launcher falls back to its embedded blob (a buffer load), which is the path

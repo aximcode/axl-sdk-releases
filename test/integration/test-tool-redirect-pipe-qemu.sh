@@ -44,7 +44,7 @@ ARCH="X64"
 while [[ $# -gt 0 ]]; do case "$1" in --arch) ARCH="$2"; shift 2;; *) shift;; esac; done
 declare -A _M=([X64]=x64 [AARCH64]=aa64); NATIVE="${_M[$ARCH]:-x64}"
 
-TOOLS="$PROJECT_DIR/out/native-$NATIVE/tools"
+TOOLS="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
 make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true

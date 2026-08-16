@@ -50,7 +50,7 @@ if [[ "$TEST_ARCH" != "X64" ]]; then
 fi
 
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-KBPROBE="$PROJECT_DIR/out/native-x64/kbprobe.efi"
+KBPROBE="$(test_build_dir x64)/kbprobe.efi"
 
 # Build the reader. A build failure is a real FAIL (it's the test's own fixture).
 if ! make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} kbprobe 2>&1 | tail -5; then

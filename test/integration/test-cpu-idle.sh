@@ -35,7 +35,7 @@ esac
 
 THRESHOLD="${CPU_IDLE_THRESHOLD:-0.60}"
 RUNS="${CPU_IDLE_RUNS:-3}"
-TEST_EFI="$PROJECT_DIR/out/native-$ARCH_SUFFIX/AxlTestCpuIdle.efi"
+TEST_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$ARCH_SUFFIX")/AxlTestCpuIdle.efi"
 
 if [ ! -f "$TEST_EFI" ]; then
     echo "error: $TEST_EFI not found"

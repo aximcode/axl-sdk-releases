@@ -40,9 +40,9 @@ overall_fail=0
 run_one() {
     local arch="$1" native_arch out efi log sz objdump_bin bss_flags
     case "$arch" in
-        X64)     native_arch="x64";  out="$PROJECT_DIR/out/native-x64"
+        X64)     native_arch="x64";  out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)"
                  objdump_bin="objdump" ;;
-        AARCH64) native_arch="aa64"; out="$PROJECT_DIR/out/native-aa64"
+        AARCH64) native_arch="aa64"; out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)"
                  objdump_bin="aarch64-linux-gnu-objdump" ;;
     esac
     efi="$out/bss-probe.efi"

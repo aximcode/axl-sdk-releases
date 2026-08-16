@@ -54,8 +54,8 @@ run_case() {
     local out efi log verdict kindline pathline
 
     case "$arch" in
-        X64)     out="$PROJECT_DIR/out/native-x64" ;;
-        AARCH64) out="$PROJECT_DIR/out/native-aa64" ;;
+        X64)     out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)" ;;
+        AARCH64) out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)" ;;
     esac
     efi="$out/boot-path-selftest.efi"
 

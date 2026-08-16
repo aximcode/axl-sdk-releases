@@ -20,7 +20,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 export TEST_SKIP_RATCHET=1
 
-EFI="$PROJECT_DIR/out/native-x64/time-settime-selftest.efi"
+EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/time-settime-selftest.efi"
 make -C "$PROJECT_DIR" ARCH=x64 time-settime-selftest 2>&1 | tail -2
 
 log="$(mktemp)"

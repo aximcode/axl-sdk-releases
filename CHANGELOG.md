@@ -3,6 +3,262 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.0.0 — 2026-08-15
+### Breaking
+
+- **`axl-c++ --hosted` and the CMake `HOSTED` keyword are removed.** Both now
+  fail with a message naming the removal. C++ is compiled hosted
+  unconditionally, so `std::vector`, `std::string`, `std::map` and
+  `std::unordered_map` work with no flag at all — the flag only ever switched
+  off a freestanding C++ mode that no longer exists, and removing it from a
+  build produces byte-identical output.
+
+  ```console
+  # before
+  $ axl-c++ --hosted containers.cpp -o app.efi
+  # after
+  $ axl-c++ containers.cpp -o app.efi
+  ```
+
+  ```cmake
+  # before
+  axl_add_app(myapp myapp.cpp HOSTED)
+  # after
+  axl_add_app(myapp myapp.cpp)
+  ```
+
+  C sources are unaffected and still compile `-ffreestanding`; a mixed C/C++
+  image links exactly as before.
+
+  **What the containers cost, measured** (`-Os`, both arches, every image
+  booted rather than merely linked). A C++ image that uses no container is the
+  same size as the C one to the byte, so the cost below is the containers and
+  nothing else:
+
+  | added to a hello image | x64 | aa64 |
+  |---|---|---|
+  | `<vector>` + `<algorithm>` | +1,782 | +1,962 |
+  | `<string>`, real use (`+=` / `append` / `insert`) | +1,863 | +2,115 |
+  | `<map>` keyed by `std::string` | +5,415 | +6,395 |
+  | `<unordered_map>` | +5,871 | +5,261 |
+  | **all four in one image** | **+14,245** | **+14,597** |
+
+  The four together cost less than the sum because they share the string
+  machinery. Reach for them.
+
+- **`axl-cc` rejects host headers and host libraries.** A UEFI image cannot
+  use them — they describe another libc, another ABI, and an OS that will not
+  be there — and the failure mode is a struct that disagrees at runtime rather
+  than a link error that names the cause.
+
+  Two checks, because neither covers the other. The **flags** are inspected
+  before anything compiles, which is the only point that can see
+  `-Wl,-L/usr/lib` or a host `.a` handed in positionally. A separate **`-M`
+  pass** after each compile reads the compiler's own record of every file it
+  opened, which catches an absolute `#include "/usr/..."` naming no flag at
+  all. `-M` and not `-MM`: `-MM` omits system headers by definition, so a leak
+  through `-isystem /usr/include` is invisible to it — measured on one
+  translation unit at 0 hits against 19. The pass is isolated rather than
+  bolted onto the real compile, so it cannot perturb a consumer's own
+  dependency flags; it costs ~14 ms against a ~27 ms compile.
+
+  ```sh
+  axl-cc --allow-host-paths myapp.c -o myapp.efi
+  ```
+
+  `--allow-host-paths` is the opt-out, off by default, for the same reason
+  `--allow-uefi` is: when a consumer genuinely needs it, that intent belongs on
+  the build line where a reviewer sees it. The SDK's own headers and the
+  toolchain's are never affected, wherever they are installed.
+
+- **`include/compat/` is gone, and C compiles with the bare-metal cross on both
+  arches.** The seven hand-written libc shims existed only because x64
+  compiled with the host's gcc and aa64 with a glibc-targeted Linux cross.
+  Both arches now use a bare-metal cross whose newlib supplies the genuine
+  headers, so the shims stand in front of nothing.
+
+  AXL's own code never used them — across `src/` and `include/` it includes
+  only `stddef`, `stdint`, `stdbool` and `stdarg` — so `compat/` was always
+  there for third-party sources, and `deps/` gets the real headers now.
+  Consumers who let `axl-cc` or the CMake package own the include path need no
+  change, and `install.sh` deletes a `compat/` left behind by an older install
+  into the same prefix. A build that named `<sdk>/include/compat` itself must
+  drop it.
+
+  There is **no host fallback anywhere**: a missing cross is an error naming
+  the installer, in the Makefile and in `axl-cc` alike. Falling back would
+  defeat the point and re-create the bug the build-state signature exists to
+  catch, where a suite run silently measured the host toolchain.
+
+- **`axl-cc --depfile` is removed.** Pass gcc's own `-MD -MP -MF <path>`
+  instead; `axl-cc` forwards them like any other compile flag.
+
+  It existed to post-process the dependency file so every path was absolute,
+  because a *relative* source makes gcc emit compile-cwd-relative
+  prerequisites that CMake's `DEPFILE` resolved against the wrong directory.
+  Pass an absolute source — which the generated CMake package now does — and
+  gcc's output is already absolute.
+
+  **This also fixes a staleness bug.** `--depfile` used `-MMD` internally,
+  which omits `-isystem` headers by definition; the SDK arrives that way, so
+  it tracked no SDK header at all and editing one did not rebuild a
+  consumer's object. `-MD` lists them.
+
+### Added
+
+- **Real `try` / `catch` under UEFI, on both arches.** `axl-c++ -fexceptions`
+  now produces a working exceptions image: throw, catch by type, nested throw,
+  rethrow preserving the exception object, and a global constructor that throws
+  and catches **before `main`**.
+
+  ```console
+  $ axl-c++ -fexceptions app.cpp -o app.efi
+  ```
+
+  **There is no `--exceptions` flag, deliberately.** `-fexceptions` is a real
+  gcc flag the caller already has to pass for landing pads to be emitted, so
+  `axl-cc` detects that — on the command line, or via an input object
+  referencing `__gxx_personality_v0`, so the staged `-c`-then-link flow works
+  too. A second AXL-specific spelling would only be a way for the two to get
+  out of step. Same shape as the existing `-frtti` detection, sharing its
+  single `nm -u` pass.
+
+  The flag selects a linker script that `KEEP`s `.eh_frame` and links the
+  toolchain's `libstdc++` / `libsupc++` / `libc` / `libm` / `libgcc` in place
+  of `libaxl-cxx.a` — that archive exists to supply what a firmware image
+  otherwise lacks, and libstdc++ defines all of it properly, with real throws
+  instead of halts. **A C image pays nothing**: the `KEEP` is what would cost
+  it +16.8% for tables it can never use, so it lives in a separate script, and
+  frame registration hangs off a weak reference that a pure-C link never
+  resolves.
+
+  Exceptions are **off by default and cost real bytes when on** — an image
+  using all four containers goes 61 KB to 279 KB on x64 (69 KB to 274 KB on
+  aa64). Roughly half of that is libstdc++'s verbose terminate handler
+  dragging in the C++ demangler and newlib's `stdio`, not the unwinder, which
+  is ~22 KB. Budget for it before switching a whole codebase over.
+
+  Callbacks that AXL invokes from its own C frames must still not throw, and
+  `AXL_CB_NOEXCEPT` (3.2.0) makes that a compile error rather than a
+  convention — AXL's C frames carry no landing pads, so an exception unwinding
+  through one runs no cleanup at all.
+
+- **The x86_64-elf toolchain is a published release artifact.** A bare-metal
+  x64 cross is now mandatory and no upstream ships one, which left every
+  machine facing a ~40-minute source build. `axl-install-toolchain x64` is a
+  55 MB download-and-verify, with the source build as fallback — the shape
+  aa64 has always had. A checksum mismatch is fatal rather than a silent
+  fallback to building, because it means the manifest and the published
+  artifact disagree.
+
+- **`axl-cc` refuses an image whose global constructors would never run.**
+  AXL walks `.init_array` only, and GCC's `x86_64-*-elf` target defaults to
+  emitting constructors into the legacy `.ctors` — so a toolchain built
+  without `--enable-initfini-array` produces an image that links clean while
+  every global constructor, including the 26 objects' worth inside libstdc++,
+  silently does not run. One `nm` over the `.so` already produced, 6 ms per
+  link; `make check-ctors` covers what the Makefile builds. Both fail closed,
+  and the diagnostic names the toolchain rather than guessing at a cause.
+
+### Changed
+
+- **x64 C++ compiles with AXL's own `x86_64-elf-g++`**, not the host's. The
+  SDK now takes no compiler, assembler or linker from the distro on either
+  arch, and the `.deb`/`.rpm` depend only on `curl` and `xz-utils` (to fetch
+  the toolchains). Install with `axl-install-toolchain all`.
+- **A staged C++ build no longer needs a flag to link.** `axl-c++ -c a.cpp`
+  followed by `axl-c++ a.o -o app.efi` previously failed on an undefined
+  `operator delete`; the C++ runtime archive is now selected from the objects.
+- **The generated CMake package calls `axl-cc` instead of reimplementing it.**
+  `axl-config.cmake` carried its own compile line, `ld`, `objcopy` and
+  `pe-set-debug` — about 200 lines mirroring the script, now 110 that delegate.
+  Three build paths become two.
+
+  This fixes two consumer-visible defects. `axl_add_app` produces a custom
+  target, so `target_compile_options()` errored with "non-compilable target
+  type" — the package had **no way to pass a compile flag at all**, which made
+  `-fexceptions` not merely unwired but unreachable. And the previous
+  implementation tracked no header dependencies (its `DEPENDS` named only the
+  source), so editing an SDK or project header rebuilt nothing.
+
+  ```cmake
+  axl_add_app(myapp myapp.cpp OPTIONS -fexceptions -O2)
+  ```
+
+### Fixed
+
+- **A packaged install could not compile the example its own post-install
+  message recommends.** `axl-cc`'s host-path check grepped the `-M` output for
+  `^/usr/` without excluding the translation unit itself, and
+  `build-packages.sh` stages the examples to `/usr/share/doc/axl-sdk/examples/`
+  — so a source that merely *lived* under `/usr` was reported as the host
+  header it had supposedly opened, naming itself in the error. Every packaged
+  install failed on the first command the package tells the user to run.
+- **`time()` was declared in a shape no genuine `<time.h>` accepts.** It was
+  defined as `time(long long *)`, matching only the retired `compat` shim;
+  newlib declares `time_t time(time_t *)` with `time_t` as `long`, so any real
+  header rejected it outright. The widths already agreed — only the spelling
+  was wrong.
+- **`sdefl` / `sinfl` referenced an `assert()` nothing resolves.** The 15
+  assertions had been dead for the file's whole life because `compat`'s
+  `assert.h` defined `assert` as `((void)0)`; against a real `<assert.h>` they
+  become `__assert_func` references. `NDEBUG` keeps them dead, preserving
+  today's behaviour exactly — switching assertions *on* in a shipped
+  compression path is a separate decision, since a firing assert in firmware is
+  a panic rather than a message.
+- **Three Doxygen errors that failed the v3.2.0 Docs run.**
+
+### Build
+
+Contributor-facing; none of this changes a consumer's build.
+
+- **An `AXL_TLS=1` build gets its own output tree** (`out/native-<arch>-tls`).
+  `AXL_TLS` is in the build-state signature, so toggling it wipes the objects,
+  both archives and every `.efi` under the prefix — and the toggle is constant
+  in practice, since `test-axl.sh` builds TLS-off while `run-integration.sh`
+  exports `AXL_TLS=1`. Sharing one prefix rebuilt ~300 objects on every
+  alternation and made running the two concurrently corrupt both.
+
+  **Ask `scripts/build-prefix.sh` for the path rather than composing it.** A
+  hand-written `out/native-$arch` is the rule frozen at one input, and PREFIX
+  is now a function of three. `common-test.sh` offers memoized
+  `test_build_prefix` / `test_build_dir` wrappers; the script exists as a
+  script because 51 of the callers source nothing at all.
+- **`clang-tidy` skips translation units that cannot have changed**, keyed on
+  the TU and every header in its `.d` list by content, plus a salt covering
+  the tidy version, `.clang-tidy`, the check set and the whole compile
+  database. `scripts/lint.sh` 71s to 32s warm. `LINT_NO_CACHE=1` forces a full
+  run, and a TU with no dependency record is always linted — unknown means
+  unsafe. Nothing is recorded unless the batch passed.
+- **`scripts/build-docs.sh` builds HTML and man concurrently** and gives Sphinx
+  the cores: 115s to 39s cold, 8s warm. `-W` still fails the build under `-j`,
+  which was verified rather than assumed.
+- **`cut-release.sh` refuses to date a `### Breaking` section into a non-major
+  bump** (`scripts/check-release-semver.sh`, `--allow-breaking` to override).
+  It reads only the section being dated, so it does not fire on every past
+  release. This is the check that made the present release a major.
+
+### Documentation
+
+- **`axl_pci_get_class_code` does not precheck function presence — the header
+  now says so.** It is the only one of the three standard-header accessors
+  without that precheck: an absent function's config space reads all-ones, so
+  it returns `AXL_OK` with `0xFFFFFF`, which looks like an answer. The
+  sentinel is 24 bits and **not** `0xFFFFFFFF`, and `0xFFFFFF` is also a
+  legitimate reading for a present but class-less function — so it means "no
+  usable class", not "nothing there". Behaviour is unchanged and the asymmetry
+  is pinned by test; making it consistent is an API change that wants
+  coordinating with a consumer bump.
+
+### Legal
+
+- **The SDK now distributes GPL binaries**, so the corresponding source for
+  all three toolchain components is attached to the same release, per GPLv3
+  6(d). The recipe is in git, builds unmodified upstream sources with no
+  patches, and the release notes carry a three-year written offer. **A
+  consumer's own compiled output is unaffected** — that is the GCC Runtime
+  Library Exception.
+
 ## 3.2.3 — 2026-08-14
 
 ### Changed
@@ -70,7 +326,6 @@ follows [Semantic Versioning](https://semver.org/).
   no longer treated as a sentinel at all. The gate now errs toward missing a
   duplicate rather than toward flagging a success path: an unflagged duplicate
   is noise, a wrongly-flagged success path is lost signal.
-
 
 ## 3.2.2 — 2026-08-14
 

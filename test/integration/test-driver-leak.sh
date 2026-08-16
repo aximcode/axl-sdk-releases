@@ -37,7 +37,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     driver driver-leak-test 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/driver.efi"
 test_add_efi "$NATIVE_DIR/driver-leak-test.efi"
 

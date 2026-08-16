@@ -45,14 +45,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-case "$ARCH" in
-    X64)     OUT="out/native-x64";  MAKE_ARCH="x64" ;;
-    AARCH64) OUT="out/native-aa64"; MAKE_ARCH="aa64" ;;
-    *) echo "unknown arch $ARCH"; exit 1 ;;
-esac
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# After PROJECT_DIR: asking for the prefix needs it, where the old literal
+# did not, so this block had to move up.
+case "$ARCH" in
+    X64)     OUT="$("$PROJECT_DIR/scripts/build-prefix.sh" x64)";  MAKE_ARCH="x64" ;;
+    AARCH64) OUT="$("$PROJECT_DIR/scripts/build-prefix.sh" aa64)"; MAKE_ARCH="aa64" ;;
+    *) echo "unknown arch $ARCH"; exit 1 ;;
+esac
 cd "$PROJECT_DIR"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 DRV="$OUT/flushfail-fs-driver.efi"

@@ -31,10 +31,10 @@ export TEST_SKIP_RATCHET=1
 # sharing the default out/native-x64 cache would leave AXL_HAVE_TLS .o's
 # behind for a later non-TLS test-axl.sh run (the cache hazard install.sh
 # segregates against). A dedicated prefix keeps the ratcheted suite clean.
-TLS_PREFIX="out/native-x64-tls"
+TLS_PREFIX="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" x64)"
 EFI="$PROJECT_DIR/$TLS_PREFIX/AxlTestCrypto.efi"
 rm -f "$EFI"
-make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 PREFIX="$TLS_PREFIX" all tests 2>&1 | tail -1
+make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 all tests 2>&1 | tail -1
 [[ -f "$EFI" ]] || { echo "FAIL: AXL_TLS build did not produce $EFI"; exit 1; }
 
 LOG="$(mktemp)"

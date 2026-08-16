@@ -60,7 +60,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     sd-sibling 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 PROBE="$NATIVE_DIR/sd-sibling-probe.efi"
 DRIVER_A="$NATIVE_DIR/sd-sibling-driver-a.efi"
 DRIVER_B="$NATIVE_DIR/sd-sibling-driver-b.efi"

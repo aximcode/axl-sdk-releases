@@ -296,7 +296,7 @@ axl_9p_server_listen(
  *
  * The teardown is ABORTIVE and port-releasing, with no mode to choose:
  * freeing the server has no "keep serving" variant, and its callers go on to
- * free the @ref AxlLoop it was built on. The listener and every live
+ * free the `AxlLoop` it was built on. The listener and every live
  * connection are closed with a TCP RST and finalized **synchronously and
  * loop-free** — including the firmware accept backlog and any already-deferred
  * closes of connections accepted from this listener — so the listen port is

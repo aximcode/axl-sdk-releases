@@ -53,9 +53,9 @@ check() {
 run_one() {
     local arch="$1" cc_arch out objdump_bin efi lib
     case "$arch" in
-        X64)     cc_arch="x64";  out="$PROJECT_DIR/out/native-x64"
+        X64)     cc_arch="x64";  out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)"
                  objdump_bin="objdump" ;;
-        AARCH64) cc_arch="aa64"; out="$PROJECT_DIR/out/native-aa64"
+        AARCH64) cc_arch="aa64"; out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)"
                  objdump_bin="aarch64-linux-gnu-objdump" ;;
     esac
     lib="$out/lib/libaxl.a"

@@ -15,7 +15,7 @@ MOCK_PORT=$(test_port 0)
 # Determine build output directory
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
-TEST_BUILD_DIR="$PROJECT_DIR/out/native-$_native_arch"
+TEST_BUILD_DIR="$(test_build_dir)"
 
 # Stage rfbrowse.efi
 test_add_efi "$TEST_BUILD_DIR/tools/rfbrowse.efi"

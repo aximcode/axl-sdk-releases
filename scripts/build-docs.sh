@@ -45,6 +45,26 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
 fi
 
 # --------------------------------------------------------------------------
+# Doxygen VERSION SKEW — local-clean does not imply CI-clean
+#
+# docs.yml installs whatever doxygen `ubuntu-latest`'s apt ships (1.9.8 at
+# writing); a dev box is usually far newer. Reference resolution differs
+# between them, and NOT in the direction you would hope: 1.13 resolved two
+# \ref / explicit-link targets that 1.9.8 could not, so this gate reported
+# clean locally while the v3.2.0 Docs run failed on both.
+#
+# There is no pin to add here — the docs job takes the distro's package. When a
+# docs change matters, reproduce CI's exact version instead of trusting a newer
+# local one:
+#
+#   podman run --rm -v "$PWD":/src:z -w /src ubuntu:24.04 bash -c \
+#     'apt-get update -qq && apt-get install -y -qq doxygen && \
+#      cd docs/sphinx && doxygen Doxyfile'
+#
+# Same shape as the clang-tidy container in docs/RELEASING.md, same reason.
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
 # Step 1: Doxygen → XML
 # --------------------------------------------------------------------------
 
@@ -76,10 +96,17 @@ fi
 #
 # The usual cause is a backslash escape written in a doc comment: Doxygen reads
 # `\v` as a command even inside a markdown code span, so it has to be `\\v`.
-if grep -qE '^[^ ]+:[0-9]+: error:' "$DOXY_LOG"; then
+#
+# NOT every error carries a file:line. A config-level one ("Included by graph
+# for 'axl-macros.h' not generated, too many nodes") starts at column 0, and the
+# file:line-anchored pattern this check used to have could not see it — so the
+# v3.2.0 Docs run failed on an error class this gate reported clean. Match both
+# shapes.
+DOXY_ERR_RE='^([^ ]+:[0-9]+: )?error:'
+if grep -qE "$DOXY_ERR_RE" "$DOXY_LOG"; then
     log_error "Doxygen reported ERRORS (below). These do not trip"
     log_error "WARN_AS_ERROR=FAIL_ON_WARNINGS, so they are checked separately."
-    grep -E '^[^ ]+:[0-9]+: error:' "$DOXY_LOG" | head -20 >&2
+    grep -E "$DOXY_ERR_RE" "$DOXY_LOG" | head -20 >&2
     exit 1
 fi
 
@@ -112,19 +139,47 @@ fi
 log_success "Doxygen XML → $OUT_DIR/doxygen-xml/"
 
 # --------------------------------------------------------------------------
-# Step 2: Sphinx → HTML
+# Steps 2 and 3: Sphinx → HTML and man, together
+#
+# The two builders read the same sources and write different trees, so they
+# have no reason to be sequential; and `-j auto` parallelises the reader phase
+# within each. Measured on 8 cores: html 71s -> 28s, man 40s -> 12s, and run
+# concurrently the pair costs what html alone costs. That takes this script,
+# which is the SLOWEST job in verify.sh and therefore its wall-clock, from
+# ~115s to ~30s.
+#
+# -W (warnings are errors) still bites under -j: verified by appending a
+# dangling :ref: to index.rst and confirming the parallel build reports it and
+# exits 1. A faster gate that stopped seeing would be a bad trade.
+#
+# Failures are collected rather than `set -e`'d one at a time, so a broken man
+# build is still reported when html also fails — the point of the gate is to
+# show every warning in one run, not the first.
 # --------------------------------------------------------------------------
 
-log_info "Building HTML (ReadTheDocs theme) ..."
-sphinx-build -b html -q -W "$SPHINX_DIR" "$OUT_DIR/html"
+log_info "Building HTML (ReadTheDocs theme) + man pages ..."
+SPHINX_RC=0
+
+sphinx-build -b html -q -W -j auto "$SPHINX_DIR" "$OUT_DIR/html" \
+    > "$OUT_DIR/sphinx-html.log" 2>&1 &
+_html_pid=$!
+sphinx-build -b man  -q -W -j auto "$SPHINX_DIR" "$OUT_DIR/man" \
+    > "$OUT_DIR/sphinx-man.log" 2>&1 &
+_man_pid=$!
+
+wait $_html_pid || SPHINX_RC=1
+wait $_man_pid  || SPHINX_RC=1
+
+# Always surface the output: -q means these are empty on success, so anything
+# here is a diagnostic worth reading.
+cat "$OUT_DIR/sphinx-html.log" "$OUT_DIR/sphinx-man.log" >&2
+
+if [[ $SPHINX_RC -ne 0 ]]; then
+    log_error "Sphinx reported warnings (treated as errors by -W)."
+    exit 1
+fi
+
 log_success "HTML → $OUT_DIR/html/"
-
-# --------------------------------------------------------------------------
-# Step 3: Sphinx → man pages
-# --------------------------------------------------------------------------
-
-log_info "Building man pages ..."
-sphinx-build -b man -q -W "$SPHINX_DIR" "$OUT_DIR/man"
 log_success "Man pages → $OUT_DIR/man/"
 
 # --------------------------------------------------------------------------

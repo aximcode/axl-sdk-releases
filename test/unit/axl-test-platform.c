@@ -486,6 +486,50 @@ test_pci_get_vid_did_class_code(void)
     /* NULL guards */
     test_check(axl_pci_get_vid_did(root, NULL, &did) == AXL_ERR, "pci get_vid_did: NULL vid");
     test_check(axl_pci_get_class_code(root, NULL) == AXL_ERR,       "pci get_class_code: NULL out");
+
+    /* The three standard-header accessors do NOT agree about an absent
+       function, and that asymmetry is deliberate-but-surprising enough to pin
+       here rather than leave for a consumer to rediscover.
+       axl_pci_get_vid_did and axl_pci_get_header_type fold "absent" into
+       AXL_ERR; axl_pci_get_class_code does not, and hands back 0xFFFFFF with
+       AXL_OK -- a plausible-looking 24-bit value.
+       Wanted: a MAPPED but absent function. The bus=0xFF address above is
+       unmapped, so its reads fail outright and the all-ones path never runs;
+       bus 0 is mapped by MCFG, so an empty function there reads all-ones. */
+    AxlPciAddr mapped_absent = { 0 };
+    bool       found_absent  = false;
+    for (uint8_t dev = 0; dev < 32 && !found_absent; dev++) {
+        for (uint8_t fn = 0; fn < 8; fn++) {
+            AxlPciAddr a = { .seg = 0, .bus = 0, .dev = dev, .func = fn };
+            uint16_t   probe;
+            uint16_t   v2, d2;
+            if (axl_pci_read_config_16(a, 0x00, &probe) == AXL_OK &&
+                probe == 0xFFFF &&
+                axl_pci_get_vid_did(a, &v2, &d2) == AXL_ERR)
+            {
+                mapped_absent = a;
+                found_absent  = true;
+                break;
+            }
+        }
+    }
+
+    if (found_absent) {
+        uint32_t          absent_cc = 0;
+        AxlPciHeaderType  absent_ht;
+        bool              absent_mf;
+        test_check(axl_pci_get_class_code(mapped_absent, &absent_cc) == AXL_OK
+                   && absent_cc == 0xFFFFFFu,
+                   "pci get_class_code: absent function reads 0xFFFFFF as AXL_OK "
+                   "(no presence precheck -- see axl-pci.h)");
+        test_check(axl_pci_get_header_type(mapped_absent, &absent_ht, &absent_mf)
+                   == AXL_ERR,
+                   "pci get_header_type: same absent function returns AXL_ERR "
+                   "(it DOES precheck) -- the documented asymmetry");
+    } else {
+        test_skip_n(2, "pci absent-function asymmetry (no mapped-but-absent "
+                       "function on bus 0 in this image)");
+    }
 }
 
 // ---------------------------------------------------------------------------

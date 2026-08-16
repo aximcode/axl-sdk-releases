@@ -66,7 +66,7 @@ case "$ARCH" in
     *) echo "error: unsupported ARCH=$ARCH" >&2; exit 2 ;;
 esac
 
-TEST_EFI="$PROJECT_DIR/out/native-$ARCH_SUFFIX/AxlTestJsonCorpus.efi"
+TEST_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$ARCH_SUFFIX")/AxlTestJsonCorpus.efi"
 
 # --- preflight: fail with guidance, never with a mystery -------------------
 if [[ ! -f "$TEST_EFI" ]]; then

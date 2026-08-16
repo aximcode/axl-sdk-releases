@@ -15,6 +15,12 @@ scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
 CHANGELOG, commits + pushes `main`, tags, and watches Release/Docs to the
 published release. By default it does **not** wait on CI (see the gate below).
 
+**But first decide WHERE you are cutting from.** `cut-release.sh` releases the
+tip of `main` and everything under `## Unreleased`. If `main` carries work that
+does not belong in this release, that is the wrong flow and the script cannot
+do the right one — see [Which flow](#which-flow-from-main-or-from-a-tag)
+immediately below. Three of the last three releases used the other one.
+
 ### The gate is LOCAL — run the suite before you cut
 
 **CI is no longer a per-push gate, and release tags do NOT trigger it.** `ci.yml`
@@ -26,7 +32,7 @@ gate is the full suite run locally**, which is fast in parallel:
 
 ```sh
 make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
-./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 79/79 must pass
+./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 145/145 must pass
 scripts/lint.sh                                        # clang-tidy exactly as CI runs it
 ```
 
@@ -78,8 +84,12 @@ a comment explaining its trigger).
 
 ## Prerequisites
 
-- You're on `main`, working tree clean, `git log origin/main..HEAD`
-  shows the commits to ship.
+- You've picked the flow — see
+  [Which flow](#which-flow-from-main-or-from-a-tag). On the `main` flow:
+  you're on `main`, working tree clean, and `git log origin/main..HEAD`
+  shows the commits to ship. On the tag flow: you're on the release
+  branch and `git log vPREV..HEAD` shows them — **read that range**, it
+  is what the release will contain.
 - The integration suite passes locally. The quick smoke set:
 
   ```sh
@@ -172,6 +182,21 @@ a comment explaining its trigger).
   new version needs a newer base) and `scripts/lint.sh`'s `CT_VERSION` together.
   Either way, the §4b CI-on-`main` run remains the authoritative gate.
 
+- **Doxygen has the same version-skew trap, with no pin available.**
+  `docs.yml` installs whatever doxygen `ubuntu-latest`'s apt ships (1.9.8 at
+  writing); a dev box is usually far newer, and reference resolution differs —
+  1.13 resolved two link targets 1.9.8 could not, so `scripts/build-docs.sh`
+  called the zero-warning gate clean while the v3.2.0 Docs run failed on both.
+  Docs is best-effort for the release itself (artifacts come from Release), but
+  the published site does not update until it is fixed. Before a release that
+  touches public headers, reproduce CI's version:
+
+  ```sh
+  podman run --rm -v "$PWD":/src:z -w /src ubuntu:24.04 bash -c \
+    'apt-get update -qq && apt-get install -y -qq doxygen && \
+     cd docs/sphinx && doxygen Doxyfile'
+  ```
+
   **Run clang-tidy one file per process (`-n1`).** Passing many
   TUs to a single `clang-tidy` invocation makes the path-sensitive
   `clang-analyzer-*` checks (notably `security.ArrayBound`)
@@ -235,6 +260,77 @@ a comment explaining its trigger).
     default flags and emits nonsense `'foo.h' file not found` errors rather
     than real analysis. Getting them into the DB is the prerequisite.
 
+## Which flow: from `main`, or from a tag?
+
+Two flows, and picking the wrong one is the most expensive mistake in this
+document. Ask one question:
+
+> **Does `main` contain anything that should NOT go out in this release?**
+
+**No — release the tip of `main`.** Use `scripts/cut-release.sh X.Y.Z`. This is
+the flow the script was written for and the rest of this document describes.
+
+**Yes — cut from the previous TAG on a release branch.** The script cannot do
+this: it hard-requires `main` (`git branch --show-current == main`) and
+hardcodes `git push origin main`, so running it from a release branch would
+push that branch's commits onto `main`. Follow "Cut the release" below by hand,
+with the differences in the next section.
+
+This is not an exotic case. **v3.2.1, v3.2.2 and v3.2.3 were all cut from tags**
+— every release since v3.2.0 — because `main` was accumulating a toolchain and
+C++ rework that had no business in a patch. The script models
+"release = tip of `main`", and this project frequently does not work that way.
+
+### Why this matters more than it looks
+
+`## Unreleased` is **branch-wide state**; a release is a **commit range**. They
+agree only when the release is "everything on this branch since the last tag".
+`cut-release.sh` dates whatever sits under `## Unreleased` — so on a branch
+where those two have diverged, it will happily stamp unrelated work into the
+release notes and the tag.
+
+That is not hypothetical. v3.2.3 was first cut from `main` and dated **43
+commits** of in-progress work into a patch release, two of them under a
+`### Breaking` heading, publishing eight assets before anyone read the version
+number against the content. It was deleted (zero downloads) and re-cut from the
+`v3.2.2` tag.
+
+`scripts/check-release-semver.sh` now refuses that specific shape — a
+`### Breaking` section under a non-major bump — from inside `cut-release.sh`.
+It is a backstop, not a substitute for picking the right flow: it catches a
+mislabelled *version*, not unrelated work that happens to be non-breaking.
+
+### Cutting from a tag — what differs
+
+Steps 1, 2, 3, 5, 6 and 7 below are **identical**. Only the branch handling
+changes:
+
+```sh
+# instead of working on main:
+git worktree add ~/axl-sdk-X.Y.Z -b release-X.Y.Z vPREV   # e.g. v3.2.2
+cd ~/axl-sdk-X.Y.Z
+
+# cherry-pick or apply ONLY the change this release is for, then
+# steps 1-3: bump-version.sh, date the CHANGELOG, commit "release: vX.Y.Z"
+
+# step 4 becomes: push the RELEASE BRANCH, not main
+git push -u origin release-X.Y.Z
+
+# steps 5-7 unchanged: tag, push the tag, watch, confirm
+```
+
+Two things to get right:
+
+- **The `## Unreleased` section on the release branch is yours to write.** The
+  tag's CHANGELOG will not have one (it was dated at that release), so add a
+  heading carrying *only* this release's entries. Do not copy `main`'s
+  accumulator across; that is the mistake this whole section exists to prevent.
+- **Land it on `main` afterwards.** The release branch is not a long-lived
+  fork. Cherry-pick the change onto `main` as one squashed commit with the
+  version appended to the subject — the pattern `e98a4f6a` (v3.2.1) and
+  `d64e15d1` (v3.2.2) set. Expect `CHANGELOG.md` to be the only conflict: keep
+  `main`'s `## Unreleased` intact and place the newly-dated section beneath it.
+
 ## Cut the release
 
 ### 1. Bump the version
@@ -280,15 +376,18 @@ Keep this commit small. The release-cut commit is the canonical
 "what changed in this release" reference; if it's noisy with code
 changes, the diff-against-previous-tag becomes harder to read.
 
-### 4. Push `main` first
+### 4. Push the release branch first
 
 ```sh
-git push origin main
+git push origin main                 # main flow
+git push -u origin release-X.Y.Z     # tag flow
 ```
 
-`main` must contain the release-metadata commit *before* the tag
+The branch must contain the release-metadata commit *before* the tag
 points at it; if you tag first and then push the branch, the
 release.yml workflow can race and check out the wrong commit.
+`release.yml` triggers on any `v*` tag regardless of which branch
+carries it, so the tag flow publishes exactly the same way.
 
 ### 4b. The gate is the LOCAL suite — CI no longer auto-runs on a push
 
@@ -298,7 +397,7 @@ release.yml workflow can race and check out the wrong commit.
 > **local** suite — run it before you cut:
 >
 > ```sh
-> ./test/integration/run-integration.sh -j"$(nproc)"   # 79/79 must pass
+> ./test/integration/run-integration.sh -j"$(nproc)"   # 145/145 must pass
 > scripts/lint.sh                                       # clang-tidy as CI runs it
 > ```
 
@@ -348,14 +447,21 @@ The tag push triggers three workflows on the same commit:
 - **Docs** (`.github/workflows/docs.yml`) — Doxygen + Sphinx
   build + Cloudflare Pages deploy.
 
-**Realistic timing.** On healthy GitHub-runner infrastructure
-the whole flow is **~4–5 minutes wall-clock** (parallel across
-the three workflows). Verified on v0.9.0's successful retry:
-Release 2m57s, Docs 1m44s, CI 4m10s. The longest individual
-jobs are CI's QEMU integration tests (~4 min) and Release's
-Build-tools-aa64 (~3 min, slower than x64 due to QEMU user-mode
-emulation of cross-tool execution). All other jobs finish in
-under 2 minutes.
+**Realistic timing.** The TAG's own workflows are fast —
+**~4–5 minutes wall-clock** for Release + Docs, which run in
+parallel. Verified on v0.9.0: Release 2m57s, Docs 1m44s.
+Release's Build-tools-aa64 (~3 min) is the longest of them,
+slower than x64 because cross-tool execution goes through QEMU
+user-mode emulation.
+
+**The CI backstop is the slow one, and it is a separate wait.**
+`--ci-gate` dispatches ci.yml on the release commit before
+tagging, and its QEMU job runs the WHOLE integration suite — 145
+tests, each in its own QEMU, on a 2-core runner. Measured **~50
+minutes** on the v3.2.0 cut; the other three jobs finished in
+under 6. `wait_for_ci` allows 75 minutes. If it ever times out on
+a run that is still going, the tag was NOT created — wait for CI
+yourself and finish with `--resume`, rather than re-cutting.
 
 **Pathological case — bad-DNS days.** When GitHub Actions runner
 DNS is flaky (azure.archive.ubuntu.com mirrors), `apt-get
@@ -483,9 +589,10 @@ Should show the release page with `axl-sdk.deb`, `axl-sdk.rpm`,
 `axl-sdk-host-tools.{tar.gz,deb}`, and `SHA256SUMS` attached.
 
 The `.deb` / `.rpm` packages include the full C and C++ surface
-when CI builds with the ARM bare-metal toolchain cached
-(`scripts/install-arm-toolchain.sh`).  Specifically, each
-package contains:
+when CI builds with BOTH bare-metal toolchains cached
+(`scripts/install-toolchain.sh all` — C and C++ compile
+bare-metal on both arches, so neither is optional any more).
+Specifically, each package contains:
 
 - C bits (always): `axl-cc` driver, `libaxl.a` per arch,
   `axl.h` + `axl/*.h` headers, CRT0 objects, linker scripts,
@@ -498,10 +605,13 @@ package contains:
   libstdc++ so there's no runtime-dependency escalation on the
   package — pure-C consumers can ignore the extra files.
 
-CI cache invalidation: the ARM toolchain tarball is keyed on
-its pinned version (`14.3.rel1` at writing).  Bump the pin in
-`scripts/install-arm-toolchain.sh` to force a re-fetch.  Verify
-both packages contain `libaxl-cxx.a` after a release build:
+CI cache invalidation: both toolchain tarballs are keyed on
+`hashFiles('scripts/axl-toolchains.conf')`, so ANY edit to that
+manifest forces a re-fetch of both — which is also why a
+toolchain version bump must be PUBLISHED before the commit that
+bumps it lands, or every CI job downloads a URL that 404s.
+Verify both packages contain `libaxl-cxx.a` after a release
+build:
 
 ```sh
 dpkg-deb -c axl-sdk_*_amd64.deb | grep libaxl-cxx
@@ -509,7 +619,7 @@ rpm -qpl axl-sdk-*.x86_64.rpm | grep libaxl-cxx
 ```
 
 If `libaxl-cxx.a` is missing, the build host either didn't have
-the ARM bare-metal toolchain available or `install.sh`'s
+the bare-metal toolchains available or `install.sh`'s
 auto-detect failed.  See
 [`AXL-SDK-Design.md` §"C++ support"](AXL-SDK-Design.md) for the
 toolchain story.

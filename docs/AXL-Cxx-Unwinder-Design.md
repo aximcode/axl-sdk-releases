@@ -382,6 +382,56 @@ is why the Linux-only symbols in that path only have to *link*, not work.
 Both halves were prototyped and ran 7/7, but neither is committed: the linker
 script and the registration call still have to land in the build.
 
+### U2/U3-RESULT — wired, both arches, 2026-08-13
+
+**DONE.** `axl-c++ -fexceptions` produces a working exceptions image on x64 and
+aa64; `test-cxx-exceptions-qemu.sh` is the committed test (36 assertions), and
+the 7/7 demo is no longer hand-linked.
+
+What landed, and the shape of each decision:
+
+- **No `--exceptions` flag.** `-fexceptions` is a real gcc flag the caller
+  already has to pass to get landing pads emitted, so axl-cc detects THAT --
+  on the command line, or via an input object referencing
+  `__gxx_personality_v0`, so a staged `-c`-then-link build works. A second
+  AXL-specific spelling would only be a way for the two to get out of step.
+  Same shape as the pre-existing `-frtti` detection, sharing one `nm -u` pass.
+- **`elf_*_efi_eh.lds`**, selected by that flag: `KEEP(*(.eh_frame))` plus
+  `__eh_frame_start`. Separate files exactly as §U2 requires — the KEEP is what
+  costs a C image +16.8%.
+- **The `objcopy -j` entries are UNCONDITIONAL**, which §U2 did not anticipate.
+  Measured with `cmp`: adding `.eh_frame`/`.gcc_except_table` to a C image's
+  `-j` list is byte-identical, because `--gc-sections` already collected them
+  when nothing keeps them. Gating them was the first shape and
+  `check-flag-parity` correctly rejected it — the Makefile and the CMake
+  package would each have needed the same conditional. The byte-identity
+  constraint is about IMAGE bytes and is met by the linker-script split alone.
+- **`__register_frame` runs from `_axl_cxxabi_run_init_array`**, via a WEAK
+  reference, not from `_axl_init`. A pure-C image never pulls that object at
+  all, so the hook costs it nothing — not even a null check. A C++ image
+  without exceptions resolves the weak reference to 0 and skips it. The
+  fixture's first assertion is a global constructor that throws and catches
+  BEFORE `main`, which is what proves the ordering rather than assuming it.
+- **AXL owns the newlib syscall stubs** (`src/cxxrt/axl-cxxrt-stubs.c`) rather
+  than linking `libnosys.a`. Functionally identical; libnosys's objects carry
+  `.gnu.warning.<sym>` sections, so a SUCCEEDING link emitted ten "not
+  implemented and will always fail" lines. Both spellings are defined
+  (`close` and `_close`, …) because the two toolchains disagree — the same
+  trap `sbrk`/`_sbrk` already documents, one family along, and defining one
+  covers exactly one arch.
+- **`_exit` routes to `axl_exit`.** It is reached from newlib's `abort()`,
+  i.e. from `std::terminate`. A halt loop wedges the machine; `axl_exit`
+  returns to the shell with a status.
+
+**STILL OPEN — the CMake package cannot build an exceptions image.** It
+re-implements axl-cc's pipeline rather than calling it, and that
+re-implementation has no `-fexceptions` handling: no `_eh` linker script, no
+glue objects, no toolchain libraries. `check-flag-parity` no longer catches
+this, because the `-j` lists now agree. A CMake consumer passing
+`-fexceptions` gets an image that compiles, links, and fails at the first
+throw. Closing it means either teaching the package the same logic or — better,
+and recorded in ROADMAP — having it shell out to `axl-cc`.
+
 ### U4. Tests
 
 A throw across three frames with destructors, caught by type; a rethrow; a

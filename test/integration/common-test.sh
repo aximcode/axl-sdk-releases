@@ -19,6 +19,49 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$TESTS_DIR")")"
 source "$PROJECT_DIR/scripts/axl-common.sh"
 
+# The build tree for this run's arch — ASKED OF MAKE, never composed here.
+#
+# 71 scripts used to spell out "$PROJECT_DIR/out/native-$arch" themselves,
+# which is correct only while PREFIX depends on nothing but ARCH. It already
+# depends on BUILD, and folding AXL_TLS into it — so a TLS run stops wiping the
+# non-TLS objects and vice versa — would have silently pointed every one of
+# those scripts at a tree nothing had built. The Makefile owns the answer;
+# this asks it. `make -s print-prefix` honours ARCH, BUILD and AXL_TLS
+# together, so this stays right through any future split.
+#
+# Memoized per arch: 71 scripts times several calls times a make fork is
+# measurable, and the answer cannot change inside one run.
+# $1 (optional) names the arch when it is NOT this run's TEST_ARCH — a script
+# that deliberately builds the other one, or that has already mapped TEST_ARCH
+# to a Makefile arch of its own. Accepts either spelling (X64/x64,
+# AARCH64/aa64) because the scripts use both.
+test_build_prefix() {
+    local arch="${1:-${TEST_ARCH:-X64}}"
+    case "$arch" in
+        AARCH64|aarch64|aa64) arch=aa64 ;;
+        *)                    arch=x64  ;;
+    esac
+    # Key the memo on the TLS state too, not just the arch: a caller may ask
+    # for the TLS prefix (AXL_TLS=1 test_build_prefix x64) in a run whose
+    # default is non-TLS, and an arch-only key would hand back the cached
+    # non-TLS answer -- the exact class of bug this helper exists to prevent.
+    local var="_TEST_BUILD_PREFIX_${arch}_${AXL_TLS:+tls}"
+    if [[ -z "${!var:-}" ]]; then
+        # Delegates rather than re-asking make itself: scripts/build-prefix.sh
+        # is the one definition, since 51 integration scripts source nothing
+        # and can only call it as a command. This adds the memo on top.
+        printf -v "$var" '%s' "$("$PROJECT_DIR/scripts/build-prefix.sh" "$arch")"
+    fi
+    printf '%s\n' "${!var}"
+}
+
+# Absolute form. The relative one above is what a make TARGET wants (targets
+# are relative to PROJECT_DIR); this one is what a file test or a QEMU
+# staging path wants. Both come from the same answer.
+test_build_dir() {
+    printf '%s/%s\n' "$PROJECT_DIR" "$(test_build_prefix "$@")"
+}
+
 # AXL_TLS: warn only when a toggle is actually imminent.
 #
 # run-integration.sh exports AXL_TLS=1 for the whole suite. A test run BY HAND
@@ -46,7 +89,7 @@ source "$PROJECT_DIR/scripts/axl-common.sh"
 if [[ -z "${AXL_TLS:-}" ]]; then
     _axl_tls_arch=x64
     [[ "${1:-}" == *AARCH64* || "${*:-}" == *AARCH64* ]] && _axl_tls_arch=aa64
-    _axl_tls_state="$PROJECT_DIR/out/native-$_axl_tls_arch/build/.axl-tls-state"
+    _axl_tls_state="$(test_build_dir "$_axl_tls_arch")/build/.axl-tls-state"
     if [[ -r "$_axl_tls_state" && "$(cat "$_axl_tls_state" 2>/dev/null)" == "on" ]]; then
         echo "note: the build tree was last built with AXL_TLS=1 and this run has" >&2
         echo "      it unset, so make will WIPE and rebuild it (watch for 'cannot" >&2

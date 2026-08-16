@@ -40,7 +40,7 @@ PROJECT_DIR="$(dirname "$PROJECT_DIR")"
 _native_arch="x64"
 make -C "$PROJECT_DIR" ARCH="$_native_arch" all tests smbus-hc-shim 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/AxlTestIpmi.efi"
 test_add_efi "$NATIVE_DIR/SmbusHcShim.efi"
 

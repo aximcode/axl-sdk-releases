@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-TAR="$PROJECT_DIR/out/native-x64/tools/tar.efi"
+TAR="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/tar.efi"
 
 export TEST_SKIP_RATCHET=1
 PASS=0

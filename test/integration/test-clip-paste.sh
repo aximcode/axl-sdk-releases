@@ -24,7 +24,7 @@ test_setup
 
 make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
 
-NATIVE_DIR="$PROJECT_DIR/out/native-x64"
+NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/tools/clip.efi"
 test_add_efi "$NATIVE_DIR/tools/paste.efi"
 

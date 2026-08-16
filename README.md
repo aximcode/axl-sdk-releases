@@ -86,28 +86,32 @@ $ axl-c++ hello.cpp -o hello.efi
 Compile-time hard defaults: `-std=c++23 -fno-exceptions -fno-rtti
 -fno-threadsafe-statics`.
 
-**Freestanding (default) vs `--hosted`.** The difference is which
-libstdc++ headers you may include, not which libc you link.
-Freestanding gives you the C++23 freestanding subset — `<array>`,
-`<span>`, `<string_view>`, `<type_traits>`, `<utility>`, `<optional>`,
-`<variant>`, `<expected>`, and the language-support headers
-`<exception>`, `<typeinfo>`, `<new>`. `axl-c++ --hosted` additionally
-makes `std::vector`, `std::string`, `std::map` and
-`std::unordered_map` work, on both arches:
+**One C++ mode, no flag.** The whole standard library you would
+expect is available — `std::vector`, `std::string`, `std::map`,
+`std::unordered_map` alongside `<array>`, `<span>`, `<string_view>`,
+`<optional>`, `<variant>`, `<expected>` — on both arches:
 
 ```console
-$ axl-c++ --hosted containers.cpp -o app.efi
+$ axl-c++ containers.cpp -o app.efi
 ```
 
-Either way the SDK links **no `libstdc++.a`** — AXL supplies the
-eleven functions that used to require it, so nothing of GCC's runtime
-library is redistributed. `--hosted` costs only `memcpy`, `memmove`,
-`memset`, `memcmp` and `strlen`, which `libaxl.a` already defines.
-Full rationale and the measured header table:
-[`AXL-Cxx-Design.md` §6a](docs/AXL-Cxx-Design.md).
+There used to be a `--hosted` flag for the containers, because C++
+compiled `-ffreestanding` and libstdc++ refuses them under it at
+`bits/requires_hosted.h`. It is removed — passing it is an error that
+says so. C sources stay freestanding, and a mixed image links.
 
-AArch64 needs the ARM bare-metal `aarch64-none-elf-g++` toolchain —
-`scripts/install-arm-toolchain.sh` fetches it.
+The SDK links **no `libstdc++.a`** — AXL supplies the eleven functions
+that would otherwise require it, so nothing of GCC's runtime library
+is redistributed. The whole libc footprint is `memcpy`, `memmove`,
+`memset`, `memcmp` and `strlen`, which `libaxl.a` already defines.
+(`-frtti` is the one opt-in exception; it needs the type_info vtables
+from your own installed libstdc++.) Full rationale and the measured
+header table: [`AXL-Cxx-Design.md` §6a](docs/AXL-Cxx-Design.md).
+
+C++ needs a bare-metal cross on BOTH arches — ARM's
+`aarch64-none-elf-g++`, and AXL's own `x86_64-elf-g++` (nobody
+publishes one, so AXL builds and hosts it).
+`scripts/install-toolchain.sh all` fetches both.
 
 See [`AXL-SDK-Design.md` §"C++ support"](docs/AXL-SDK-Design.md) +
 [`AXLMM-Design.md` §"Toolchain & constraints"](docs/AXLMM-Design.md)
@@ -154,9 +158,13 @@ C++ consumer.
 
 ### Requirements
 
-- **GCC** + **binutils** for the host toolchain, plus
-  `gcc-aarch64-linux-gnu` + `binutils-aarch64-linux-gnu` if you want
-  to cross-build aa64 UEFI binaries.
+- **Nothing from the distro's toolchain.** `axl-cc` compiles and
+  links with bare-metal crosses that `scripts/install-toolchain.sh`
+  fetches to `/opt` — ARM's `aarch64-none-elf` and AXL's own
+  `x86_64-elf` — so the `.deb` and `.rpm` need no compiler, assembler
+  or linker from the distro (only `curl` and `xz`, to fetch those
+  toolchains). A host GCC is needed only to build axl-sdk itself from
+  source.
 - No EDK2, no gnu-efi, no external UEFI SDK.
 
 ### Install the SDK

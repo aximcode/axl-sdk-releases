@@ -11,7 +11,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Sourced up here (not at first use further down) because the host-port
 # allocator is needed by the mid-file netdev fixtures too.
 source "$DIR/scripts/axl-common.sh"
-TOOLS="$DIR/out/native-$NAT/tools"
+TOOLS="$("$DIR/scripts/build-prefix.sh" --abs "$NAT")/tools"
 make -C "$DIR" ARCH="$NAT" tools >/dev/null 2>&1 || true
 [[ -x "$TOOLS/netload.efi" ]] || { echo "ERROR: netload.efi not built"; exit 1; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT

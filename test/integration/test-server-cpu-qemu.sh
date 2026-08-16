@@ -41,7 +41,7 @@ SAMPLE_SECS=12       # post-traffic steady-state sampling window
 # ~0.01-0.05 cores; a spin pegs ~1.0. 0.50 separates them with wide margin.
 CPU_BUDGET_CORES="0.50"
 
-TEST_BUILD_DIR="$PROJECT_DIR/out/native-x64"
+TEST_BUILD_DIR="$(test_build_dir)"
 make -C "$PROJECT_DIR" \
     ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests echo-server-sync 2>&1 | tail -3
 

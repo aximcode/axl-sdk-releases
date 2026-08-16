@@ -15,11 +15,10 @@ axl_add_app(cancellable-demo cancellable-demo.c)
 axl_add_app(event-demo event-demo.c)
 axl_add_app(runtime-demo runtime-demo.c)
 
-# C++ examples. hello.cpp, cxx-errors.cpp and cxx-streams.cpp are
-# freestanding; containers.cpp needs HOSTED, which is what makes
-# std::vector / std::string / std::map available (libstdc++ refuses them
-# under -ffreestanding).
+# C++ examples. All four build identically -- containers.cpp used to need a
+# HOSTED keyword for std::vector / std::string / std::map, and there is one
+# C++ mode now, so the keyword was removed and passing it is an error.
 axl_add_app(hello-cxx hello.cpp)
 axl_add_app(cxx-errors cxx-errors.cpp)
 axl_add_app(cxx-streams cxx-streams.cpp)
-axl_add_app(containers containers.cpp HOSTED)
+axl_add_app(containers containers.cpp)

@@ -7,9 +7,9 @@ export TEST_SKIP_RATCHET=1
 while [[ $# -gt 0 ]]; do case "$1" in --arch) TEST_ARCH="$2"; shift 2;; *) exit 1;; esac; done
 test_setup
 declare -A _M=([X64]=x64 [AARCH64]=aa64); _a="${_M[$TEST_ARCH]:-x64}"
-make -C "$PROJECT_DIR" ARCH="$_a" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} io-streams "out/native-$_a/tools/hexdump.efi" 2>&1 | tail -2
-EFI="$PROJECT_DIR/out/native-$_a/io-streams.efi"
-HEXDUMP="$PROJECT_DIR/out/native-$_a/tools/hexdump.efi"
+make -C "$PROJECT_DIR" ARCH="$_a" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} io-streams "$(test_build_prefix "$_a")/tools/hexdump.efi" 2>&1 | tail -2
+EFI="$(test_build_dir "$_a")/io-streams.efi"
+HEXDUMP="$(test_build_dir "$_a")/tools/hexdump.efi"
 if [[ ! -f "$EFI" ]]; then echo "WARN: io-streams.efi not built; skipping."; echo "IO redirect test: SKIP"; exit 0; fi
 test_add_efi "$EFI"
 test_add_efi "$HEXDUMP"

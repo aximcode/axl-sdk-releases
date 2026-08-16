@@ -38,8 +38,8 @@ run_one() {
     local native_arch out efi log
 
     case "$arch" in
-        X64)     native_arch="x64";  out="$PROJECT_DIR/out/native-x64"  ;;
-        AARCH64) native_arch="aa64"; out="$PROJECT_DIR/out/native-aa64" ;;
+        X64)     native_arch="x64";  out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)"  ;;
+        AARCH64) native_arch="aa64"; out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)" ;;
     esac
     efi="$out/console-text-mode-selftest.efi"
 

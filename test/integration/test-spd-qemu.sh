@@ -37,7 +37,7 @@ test_setup
 _native_arch="x64"
 make -C "$PROJECT_DIR" ARCH="$_native_arch" tools tests smbus-hc-shim 2>&1 | tail -3
 
-NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
+NATIVE_DIR="$(test_build_dir)"
 SPD_BLOB="$PROJECT_DIR/test/data/spd-ddr4-micron-8gb.bin"
 JEDEC_FILE="$PROJECT_DIR/share/jedec.json5"
 
