@@ -62,6 +62,25 @@ test_build_dir() {
     printf '%s/%s\n' "$PROJECT_DIR" "$(test_build_prefix "$@")"
 }
 
+# The STAGED SDK -- a different question from test_build_dir, with different
+# inputs, which is why it is a separate helper rather than a mode of that one.
+#
+#   test_build_dir   out/native-<arch>[-release][-tls]   objects and images,
+#                    varies with ARCH x BUILD x AXL_TLS
+#   test_sdk_dir     out/{bin,lib,include,share}         what install.sh
+#                    produces and a consumer consumes; varies with nothing
+#
+# Both live under out/ and both were called "the prefix", which is how
+# AXL-Distribution-Design.md's P2 (separate the two) came to look like the same
+# 149-file sweep as the CMake port's slice 3. Measured, the real overlap is
+# seven files; P2's own surface is the handful of callers that ask this.
+#
+# No memo: scripts/sdk-prefix.sh forks no `make` -- it reads one environment
+# variable -- so the cost test_build_prefix memoizes away does not exist here.
+test_sdk_dir() {
+    "$PROJECT_DIR/scripts/sdk-prefix.sh" --abs
+}
+
 # AXL_TLS: warn only when a toggle is actually imminent.
 #
 # run-integration.sh exports AXL_TLS=1 for the whole suite. A test run BY HAND

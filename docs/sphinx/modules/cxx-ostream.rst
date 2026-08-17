@@ -3,7 +3,7 @@ axl::cout / axl::cerr
 
 Formatted output for freestanding C++, over ``axl_printf`` / ``axl_printerr``.
 Costs roughly 700 bytes over an equivalent ``axl_printf`` program (x64
-``--release``) and needs no ``--hosted``. That is a selective-link delta,
+``--release``), with no flag of any kind. That is a selective-link delta,
 not a fixed size — it moves with the library.
 
 ``axl::endl`` writes ``"\n"``, not ``"\r\n"``: the console stream translates LF

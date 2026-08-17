@@ -11,11 +11,13 @@
     regression through, which is the whole reason the strings are
     fixed rather than descriptive.
 
-    This TU is compiled by `axl-c++ --hosted`. Without that flag
-    libstdc++ refuses the containers outright at
-    `bits/requires_hosted.h`, and test-cxx-hosted-qemu.sh asserts that
-    refusal too — the flag has to be what lifts the gate, not a
-    coincidence of include paths.
+    This TU is compiled with NO mode flag. libstdc++ used to refuse
+    the containers at `bits/requires_hosted.h` under `-ffreestanding`,
+    and `axl-c++ --hosted` was what lifted it; T3 dropped that flag
+    from the C++ line, so the containers are simply available and the
+    `--hosted` spelling now hard-errors. test-cxx-hosted-qemu.sh
+    asserts both halves — that this builds bare, and that `--hosted`
+    is rejected by name.
 
     The `unordered_map` half is not decoration. Its load-factor math
     is the one place libstdc++ does floating point, so on a host whose

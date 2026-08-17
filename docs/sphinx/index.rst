@@ -26,6 +26,7 @@ AXL SDK
 
    modules/cxx
    modules/arena-allocator
+   modules/cxx-handle
    modules/cxx-string
    modules/cxx-ostream
    modules/cxx-istream

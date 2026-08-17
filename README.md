@@ -202,31 +202,62 @@ the resulting `.efi` is a real PE32+ that boots on any UEFI
 system. This is the path we recommend — no separate packaging,
 no parallel toolchain to maintain.
 
-**Windows (native MSYS2 / MinGW-w64):** no binary package yet.
-Build from source under an MSYS2 UCRT64 shell with
-`pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils`
-installed, then `make` as on Linux. Cross-aa64 needs an
-aarch64 ELF cross-toolchain (e.g. an `aarch64-*-gcc` from
-MSYS2 or from Arm's GNU toolchain archives); point at it with
-`make ARCH=aa64 CROSS=<prefix>-`.
+**macOS and native Windows (MSYS2 / MinGW-w64): not supported
+today.** Building AXL needs a **bare-metal** GNU cross-toolchain
+(`x86_64-elf` / `aarch64-none-elf`), and we publish those for
+Linux x86-64 hosts only — `axl-install-toolchain` has nothing to
+fetch on a Mac or under MSYS2. **Use WSL on Windows** (above);
+on macOS, run the Linux package in a container or VM.
 
-**macOS:** no binary package yet. Install cross-toolchains via
-the [messense tap](https://github.com/messense/homebrew-macos-cross-toolchains):
+Earlier revisions of this file documented a Homebrew
+`x86_64-unknown-linux-gnu` cross plus `make CROSS=<prefix>-`.
+**That does not work, and cannot.** Two independent reasons, both
+measured:
+
+- `CROSS=` selects **binutils only**. It stopped selecting the
+  compiler when C moved to the bare-metal cross on both arches;
+  `CC` comes from `AXL_X64_GCC` / `AXL_AA64_GCC`, so the
+  documented command left the compiler pointing at a toolchain
+  that does not exist on those hosts.
+- A **glibc-targeted** cross cannot build the tree at all. The
+  `linux-gnu` triple was fine when `include/compat/` shimmed the
+  libc headers; that is gone, and `deps/` now needs genuine
+  bare-metal newlib headers. It fails on the first `<stdlib.h>`.
+
+Native Apple Clang cannot produce the ELF intermediates AXL needs
+either (`gcc → ld -T linker.lds → objcopy --target pei-*`).
+
+If you have a bare-metal cross for your host, you can point AXL
+at it — see **Using your own toolchain** below. Supporting these
+hosts properly means publishing bare-metal toolchains for them,
+which is a standing build-and-host commitment (Zephyr maintains a
+whole `sdk-ng` repo to do it) rather than a flag.
+
+### Using your own toolchain
+
+`AXL_TOOLCHAIN` selects **which** toolchain supplies the compiler
+and binutils; the `AXL_*` variables say **where** it is:
 
 ```bash
-brew tap messense/macos-cross-toolchains
-brew install x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-git clone https://github.com/aximcode/axl-sdk-releases.git
-cd axl-sdk-releases
-make            CROSS=x86_64-unknown-linux-gnu-              # x64
-make ARCH=aa64  CROSS=aarch64-unknown-linux-gnu-             # aa64
+# the default: whatever axl-install-toolchain put in /opt
+make
+
+# your own bare-metal cross -- the defaults are not consulted
+export AXL_TOOLCHAIN=cross
+export AXL_X64_GCC=/path/to/x86_64-elf-gcc
+export AXL_X64_GXX=/path/to/x86_64-elf-g++
+export AXL_X64_BINUTILS_PREFIX=/path/to/x86_64-elf-
+make
 ```
 
-Native Apple Clang can't produce the ELF intermediates AXL
-needs (we run `gcc → ld -T linker.lds → objcopy --target pei-*`);
-a GNU cross-toolchain is required. The `linux-gnu` triple is
-fine — `libaxl.a` is built `-ffreestanding -nostdlib`, so none
-of the glibc baggage gets linked into your `.efi`.
+`axl-cc` honours the same variables, so a consumer build picks up
+the choice without changing its own build files. The toolchain
+must target **bare metal**, not `*-linux-gnu`.
+
+Leaving a variable unset under `cross` is refused by name rather
+than falling back — a silent fallback is what made the old
+`CROSS=` path fail deep in a recipe instead of at the point you
+stated your intent.
 
 **Pin a specific version:** use the versioned URL pattern
 `https://github.com/aximcode/axl-sdk-releases/releases/download/v<version>/<file>`.

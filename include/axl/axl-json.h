@@ -610,6 +610,17 @@ axl_json_free(
     AxlJsonReader *r  ///< reader to free (NULL-safe)
 );
 
+/* Note the argument: a reader is a caller-owned struct, normally a local,
+   and this releases what it HOLDS rather than the struct itself. That is
+   why there is no AXL_DEFINE_AUTOPTR_CLEANUP here — there is no heap
+   object for a cleanup attribute to free — and why a C++ owning handle
+   over one would leak the struct on every destruction. Declare a reader
+   by value and call axl_json_free on the way out. */
+AXL_DEFINE_NO_HANDLE(AxlJsonReader,
+    "AxlJsonReader is a value type, not a handle -- axl_json_free releases "
+    "what the reader holds and does not free the struct itself. Declare one "
+    "by value and call axl_json_free(&r).")
+
 /**
  * @brief Why the last parse into @a r failed, and where.
  *

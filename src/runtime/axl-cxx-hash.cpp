@@ -7,7 +7,7 @@
 
     Together with `axl-cxx-rbtree.cpp` these were the last two things a
     hosted C++ image took from `libstdc++.a` (`hash_bytes.o` and
-    `tree.o`).  Supplying both lets `axl-c++ --hosted` drop the archive
+    `tree.o`).  Supplying both lets a C++ image drop the archive
     entirely.  See `AXL-Cxx-Design.md` section 8 for why that matters:
     redistributing the runtime library is the one act the GCC Runtime
     Library Exception does not cover.

@@ -30,6 +30,42 @@ for _axl_conf in "$SCRIPT_DIR/axl-toolchains.conf" \
     fi
 done
 
+# AXL_TOOLCHAIN -- WHICH toolchain supplies the compiler and binutils. Same
+# variant the Makefile takes, same two values, deliberately the same spelling:
+# a variant one build path understands and the other ignores is precisely the
+# drift `make check-flag-parity` exists to catch, one layer up. Every known
+# consumer enters through this script rather than the Makefile, so this is the
+# copy that actually faces users.
+#
+#   axl    (default) the toolchains axl-toolchains.conf names.
+#   cross  one you supply, via AXL_<ARCH>_GCC / _GXX / _BINUTILS_PREFIX; the
+#          conf defaults are NOT consulted, so an unset locator resolves empty
+#          and the existing "compiler not found" diagnostic fires by name.
+#
+# See the Makefile's block for why the pairing exists (Zephyr, EDK2 and the
+# Linux kernel all pair a variant with a locator) and why `llvm` is absent
+# rather than a silent no-op.
+AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-axl}"
+case "$AXL_TOOLCHAIN" in
+    axl) ;;
+    cross)
+        AXL_X64_GCC_DEFAULT=""
+        AXL_X64_GXX_DEFAULT=""
+        AXL_X64_BINUTILS_PREFIX_DEFAULT=""
+        AXL_AA64_GCC_DEFAULT=""
+        AXL_AA64_GXX_DEFAULT=""
+        AXL_AA64_BINUTILS_PREFIX_DEFAULT=""
+        ;;
+    *)
+        echo "ERROR: AXL_TOOLCHAIN=$AXL_TOOLCHAIN is not a toolchain variant." >&2
+        echo "       Use 'axl' (the default: the toolchains" >&2
+        echo "       axl-install-toolchain installs), or 'cross' (one you" >&2
+        echo "       supply, named by AXL_X64_GCC / AXL_AA64_GCC and the" >&2
+        echo "       matching _GXX and _BINUTILS_PREFIX)." >&2
+        exit 1
+        ;;
+esac
+
 # The name to print in --help / --version / diagnostics. axl-c++ `exec`s this
 # script, and exec leaves $0 as the SCRIPT's path (a #! interpreter takes argv
 # from the kernel, so `exec -a` cannot rename it) — so the alias passes its own
@@ -188,6 +224,22 @@ C++ compilation requires the bare-metal toolchain on BOTH arches
 Set AXL_AA64_GXX / AXL_X64_GXX to override either.  @PROG@
 auto-appends libaxl-cxx.a to the link line when any C++ source
 is compiled; pure-C builds skip this.
+
+Toolchain selection (environment, not flags -- the Makefile takes
+the same ones, so a consumer build and an SDK build agree):
+
+  AXL_TOOLCHAIN=axl     Default. The toolchain axl-install-toolchain
+                        installs, as named by axl-toolchains.conf.
+  AXL_TOOLCHAIN=cross   One you supply. The defaults are NOT
+                        consulted, so an unset locator is refused by
+                        name instead of silently falling back.
+  AXL_<ARCH>_GCC        Where it is: the C compiler,
+  AXL_<ARCH>_GXX        the C++ compiler, and
+  AXL_<ARCH>_BINUTILS_PREFIX   the ld/ar/objcopy prefix.
+                        <ARCH> is X64 or AA64.
+
+The toolchain must target BARE METAL. A *-linux-gnu cross resolves
+<string.h> to a hosted libc, which no longer has shims to land on.
 
 Options:
   --arch x64|aa64       Target architecture (default: x64)
@@ -714,6 +766,17 @@ fi
 # ~40-minute source build when the download fails AND the source tree is here.
 axl_cc_name_toolchain_installer() {
     local arch="$1"
+    # Under AXL_TOOLCHAIN=cross the caller has declared they supply the
+    # toolchain, so naming our installer would answer a question they did not
+    # ask -- and would read as "you are holding it wrong" when the actual
+    # remedy is one unset variable. Say what IS true for this variant.
+    if [[ "$AXL_TOOLCHAIN" == "cross" ]]; then
+        echo "       AXL_TOOLCHAIN=cross does not consult the" >&2
+        echo "       axl-toolchains.conf defaults, by design -- name the" >&2
+        echo "       toolchain yourself, or unset AXL_TOOLCHAIN to use the" >&2
+        echo "       one the SDK installs." >&2
+        return
+    fi
     if [[ -x "$SDK_DIR/bin/axl-install-toolchain" ]]; then
         echo "       Install the bare-metal toolchain via:" >&2
         echo "         axl-install-toolchain $arch" >&2

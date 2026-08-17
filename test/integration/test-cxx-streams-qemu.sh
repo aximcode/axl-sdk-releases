@@ -15,10 +15,11 @@
 #      --hosted, std::string would have been the right answer and axl::string
 #      should not exist", and that reasoning no longer applies: T3 retired the
 #      freestanding C++ mode, so <string> is always available and this case
-#      can no longer speak to whether axl::string earns its place. That is now
-#      an open question for T5 (AXL-Cxx-Stdlib-Surface.md), not something this
-#      assertion answers. What it still pins is that the fixture builds the
-#      way a consumer builds anything -- which is what cases 2+ run against.
+#      cannot speak to whether axl::string earns its place. It earns it on
+#      recoverable OOM instead -- settled 2026-08-16, AXL-Cxx-Design.md 9c --
+#      which case 5 below is what actually pins. What this case still pins is
+#      that the fixture builds the way a consumer builds anything, which is
+#      what cases 2+ run against.
 #   2. The globals are CONSTANT-INITIALISED. axl::cout / cerr / cin must emit
 #      no .init_array entry: a dynamic initialiser would reintroduce the
 #      static-init-order question, and .init_array was being eaten by
@@ -55,9 +56,9 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-AXL_CXX="$PROJECT_DIR/out/bin/axl-c++"
+AXL_CXX="$(test_sdk_dir)/bin/axl-c++"
 SRC="$PROJECT_DIR/test/integration/cxx-streams-selftest.cpp"
-LIB_DIR="$PROJECT_DIR/out/lib/axl/$_native_arch"
+LIB_DIR="$(test_sdk_dir)/lib/axl/$_native_arch"
 NATIVE_DIR="$(test_build_dir)"
 
 WORK="$TEST_TMPDIR/cxx-streams"
@@ -156,7 +157,7 @@ if [[ -x "$AXL_CXX" && -f "$LIB_DIR/libaxl-cxx.a" ]]; then
     # exercises the PREVIOUS build. Compared by content -- install.sh
     # deliberately avoids mtime churn, so an mtime test reports false drift.
     check "staged headers match include/axl (else: install.sh --arch all --cpp)" \
-        diff -rq "$PROJECT_DIR/include/axl" "$PROJECT_DIR/out/include/axl-sdk/axl"
+        diff -rq "$PROJECT_DIR/include/axl" "$(test_sdk_dir)/include/axl-sdk/axl"
 
     check "axl-c++ builds the fixture with no mode flag" \
         "$AXL_CXX" --arch "$_native_arch" --release "$SRC" -o "$WORK/consumer.efi"

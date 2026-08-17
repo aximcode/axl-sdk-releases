@@ -23,8 +23,8 @@
     `ceil`, `_Prime_rehash_policy`.  Measured on this tree, the ONLY
     remaining pulls from `libstdc++.a` were two archive members --
     `tree.o` (these nine functions) and `hash_bytes.o` (see
-    `axl-cxx-hash.cpp`).  Supplying both means `axl-c++ --hosted` stops
-    naming `libstdc++.a` on the link line, which makes the SDK
+    `axl-cxx-hash.cpp`).  Supplying both means a C++ link stops
+    naming `libstdc++.a`, which makes the SDK
     self-contained AND removes the one act the GCC Runtime Library
     Exception does not cover: redistributing the runtime library itself.
     See `AXL-Cxx-Design.md` section 8.

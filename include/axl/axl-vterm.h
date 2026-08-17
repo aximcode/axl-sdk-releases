@@ -113,6 +113,8 @@ axl_vterm_free(
     AxlVterm *v  ///< handle (NULL-safe)
 );
 
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlVterm, axl_vterm_free)
+
 /**
  * @brief Feed a run of terminal bytes, driving the bound ops.
  *

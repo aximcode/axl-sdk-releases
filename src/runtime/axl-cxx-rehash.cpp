@@ -60,9 +60,10 @@
     is embedded by value in every `unordered_map`, which puts it inside
     the libstdc++ ABI that has been stable since GCC 5.
 
-    Compiled `-fhosted` (see the Makefile's explicit rule) because
-    `<unordered_map>` is unavailable otherwise — the very restriction
-    `axl-c++ --hosted` exists to lift.
+    Built by the ordinary C++ rule with the rest of `libaxl-cxx.a`. It
+    needed an explicit `-fhosted` rule while `-ffreestanding` was on the
+    C++ line, because `<unordered_map>` is unavailable under it; T3
+    dropped that flag, so the special case went with it.
 **/
 
 #include <stddef.h>

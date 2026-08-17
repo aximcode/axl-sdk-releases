@@ -20,8 +20,8 @@
 #     a garbage pointer before it ever reaches the unwinder.
 #   - 18 further %fs:0x28 accesses across 11 objects are glibc's STACK
 #     CANARY, which UEFI likewise never sets up.
-#   - libstdc++'s headers are configured for glibc, so `--hosted` is a
-#     workaround for borrowing them rather than a feature.
+#   - libstdc++'s headers are configured for glibc, so the removed
+#     `--hosted` flag was a workaround for borrowing them, not a feature.
 #
 # A --with-newlib --disable-threads --disable-tls build has none of
 # those: the ARM toolchain's libsupc++ measures 0 TLS symbols and 0

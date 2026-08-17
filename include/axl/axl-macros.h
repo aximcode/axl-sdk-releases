@@ -72,19 +72,106 @@ typedef enum {
 
 #define AXL_HAVE_AUTOPTR 1
 
+/**
+ * The C++ half of an ownership binding.
+ *
+ * Every AXL_DEFINE_AUTOPTR_CLEANUP below emits, in C++ only, a
+ * `axl::handle_traits<Type>` specialization naming the same destroy
+ * function the C cleanup attribute uses. #axl::unique_handle (in
+ * <axl/axl-handle.hpp>) resolves its deleter through that trait, so a
+ * type acquires a C++ owning handle by the same one line that gives C
+ * its `AXL_AUTOPTR`, and the two cannot drift: they are the same macro
+ * invocation on the same line of the same header.
+ *
+ * The primary template is DECLARED and never defined, which is what
+ * makes the handle opt-in. A type no header binds has no trait, so
+ * `axl::unique_handle<T>` over it is a compile error rather than a
+ * plausible-looking double free. Where the reason is worth stating —
+ * a value type, or one owned by a parent — use #AXL_DEFINE_NO_HANDLE
+ * to replace that error with the ownership rule.
+ *
+ * The `extern "C++"` is load-bearing, not decoration. These macros are
+ * invoked inside the headers' own `extern "C"` blocks, and a template
+ * declared there is `error: template with C linkage` — which would
+ * break every C++ consumer of every header carrying a binding.
+ */
+#if defined(__cplusplus)
+
+extern "C++" {
+namespace axl {
+
+template <class T>
+struct handle_traits;
+
+namespace detail {
+/* Always false, but DEPENDENT, so a static_assert over it fires only
+   where the enclosing template is instantiated. */
+template <class>
+inline constexpr bool handle_excluded = false;
+}
+
+}
+}
+
+/* Internal: emit the trait. @a destroy_call must consume the pointer
+   parameter, which is named `p_`. */
+#define AXL_HANDLE_TRAITS_(Type, destroy_call)                          \
+    extern "C++" {                                                      \
+    namespace axl {                                                     \
+        template <> struct handle_traits<Type> {                        \
+            static void destroy(Type *p_) noexcept { destroy_call; }    \
+        };                                                              \
+    }                                                                   \
+    }
+
+/**
+ * Declare that @a Type must never be held by #axl::unique_handle, and
+ * say why at the point someone tries.
+ *
+ * Without this the attempt still fails — an unbound type has no trait —
+ * but it fails as `incomplete type axl::handle_traits<T>`, which reads
+ * like a missing header and sends the consumer looking for one. This
+ * replaces that with @a reason, a string literal stating the ownership
+ * rule.
+ *
+ * `destroy` is a member TEMPLATE so its body is instantiated at the
+ * point of use. A plain member would be compiled where the
+ * specialization is DEFINED, firing the assertion in every C++
+ * translation unit that merely includes the header.
+ */
+#  define AXL_DEFINE_NO_HANDLE(Type, reason)                            \
+    extern "C++" {                                                      \
+    namespace axl {                                                     \
+        template <> struct handle_traits<Type> {                        \
+            template <class U_ = Type>                                  \
+            static void destroy(U_ *) noexcept {                        \
+                static_assert(detail::handle_excluded<U_>, reason);     \
+            }                                                           \
+        };                                                              \
+    }                                                                   \
+    }
+
+#else
+#  define AXL_HANDLE_TRAITS_(Type, destroy_call)
+#  define AXL_DEFINE_NO_HANDLE(Type, reason)
+#endif
+
 #define AXL_DEFINE_AUTOPTR_CLEANUP(Type, free_func)                     \
     static inline void _axl_autoptr_cleanup_##Type(Type **p) {          \
         if (*p) { free_func(*p); }                                      \
-    }
+    }                                                                   \
+    AXL_HANDLE_TRAITS_(Type, free_func(p_))
 
 /* Like AXL_DEFINE_AUTOPTR_CLEANUP but for a destructor that takes a fixed
  * second argument — e.g. a teardown-mode enum. Scope-exit cleanup always
  * passes @p arg (destruction is graceful; a caller that wants a different
- * mode calls the destructor explicitly). */
+ * mode calls the destructor explicitly). The C++ handle inherits that same
+ * choice, for the same reason. */
 #define AXL_DEFINE_AUTOPTR_CLEANUP_ARG(Type, free_func, arg)            \
     static inline void _axl_autoptr_cleanup_##Type(Type **p) {          \
         if (*p) { free_func(*p, (arg)); }                              \
-    }
+    }                                                                   \
+    AXL_HANDLE_TRAITS_(Type, free_func(p_, (arg)))
 
 #define AXL_AUTOPTR(Type)  __attribute__((cleanup(_axl_autoptr_cleanup_##Type))) Type *
 

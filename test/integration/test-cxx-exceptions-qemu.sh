@@ -51,8 +51,8 @@ case "$WHICH" in
     *) echo "usage: $0 [X64|AARCH64|both]" >&2; exit 2 ;;
 esac
 
-AXL_CXX="$PROJECT_DIR/out/bin/axl-c++"
-AXL_CC="$PROJECT_DIR/out/bin/axl-cc"
+AXL_CXX="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-c++"
+AXL_CC="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-cc"
 SRC="$SCRIPT_DIR/cxx-exceptions-selftest.cpp"
 C_SRC="$PROJECT_DIR/sdk/examples/hello.c"
 WORK="$(mktemp -d -t axl-cxx-eh.XXXXXX)"
@@ -113,7 +113,7 @@ run_one() {
     esac
 
     echo "=== cxx-exceptions ($arch) ==="
-    if [[ ! -x "$AXL_CXX" || ! -f "$PROJECT_DIR/out/lib/axl/$cc_arch/axl-cxxrt-eh.o" ]]; then
+    if [[ ! -x "$AXL_CXX" || ! -f "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/lib/axl/$cc_arch/axl-cxxrt-eh.o" ]]; then
         echo "  SKIP ($arch): no staged C++ SDK with the exceptions glue"
         echo "        run: scripts/install.sh --arch $cc_arch --cpp"
         skipped=$((skipped + 1))

@@ -86,6 +86,8 @@ axl_compositor_free(
     AxlCompositor  *c   ///< compositor (NULL-safe)
 );
 
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlCompositor, axl_compositor_free)
+
 /**
  * @brief The root surface — the tree anchor at (0, 0). Create top-level
  *        surfaces as its children. It has no buffer and is never drawn.
@@ -246,6 +248,19 @@ void
 axl_surface_free(
     AxlSurface  *s   ///< surface (NULL-safe)
 );
+
+/* A surface is a NODE in a tree the compositor owns, not something the
+   caller owns: axl_surface_new returns a borrowed pointer, and
+   axl_compositor_free above destroys every surface in the tree. So there
+   is deliberately no AXL_DEFINE_AUTOPTR_CLEANUP here and no C++ handle —
+   a scope guard or a class member holding one turns correct teardown into
+   a question of which declaration comes last. Destroy a subtree by
+   calling axl_surface_free explicitly, at the point you mean it. */
+AXL_DEFINE_NO_HANDLE(AxlSurface,
+    "AxlSurface is owned by the compositor surface tree, not by the caller "
+    "-- axl_surface_new returns a borrowed node and axl_compositor_free "
+    "destroys every surface in the tree. Hold the compositor and call "
+    "axl_surface_free explicitly.")
 
 /**
  * @brief The surface's back-buffer — its draw target. Owned by the

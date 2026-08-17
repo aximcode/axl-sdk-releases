@@ -752,6 +752,15 @@ atexit entry needed for those.
 `axl_atexit` is specifically for **long-lived resources** that
 outlive function scope and would leak at process exit.
 
+In C++ there is a third option between the two, and it is usually the
+right one for a resource that outlives a function but not the process:
+`axl::unique_handle<T>` (`<axl/axl-handle.hpp>`) is the same ownership
+as `AXL_AUTOPTR` for the cases a `cleanup` attribute cannot express —
+a class member, a moved value, a factory's return. A resource owned
+that way is released when its owner is destroyed, so it needs no
+atexit entry either. `axl_atexit` remains the answer for a genuinely
+process-lifetime resource, and for all C code.
+
 ## 5. Nested loops
 
 > *"What happens when a user embeds an Axl main loop within the

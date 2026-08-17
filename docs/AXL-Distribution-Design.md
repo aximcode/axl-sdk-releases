@@ -124,7 +124,43 @@ stage/                   default local install prefix, if we keep a default
 
 Open question O1 (below): keep a default `--prefix` at all, or require it?
 
----
+### 4.1 The accessor landed 2026-08-16 — P2 is no longer a sweep
+
+**`scripts/sdk-prefix.sh` answers "where is the staged SDK", as
+`scripts/build-prefix.sh` already answers "where is the build directory".**
+Callers ask instead of composing, so relocating the staged SDK is now one
+environment variable (`AXL_SDK_PREFIX`) rather than an edit to every caller.
+Verified end to end: staged to a scratch directory, the suite follows it, and
+pointing it at an empty directory makes a test fail with "staged SDK missing"
+— the control, without which "it followed" proves nothing.
+
+Two helpers exist for the two questions, deliberately not one with a mode
+flag: `test_build_dir` varies with ARCH x BUILD x AXL_TLS, `test_sdk_dir`
+varies with nothing.
+
+**This also retires a premise BOTH design docs carried.** They agreed that P2
+and the CMake port's slice 3 sweep the same ~149 make callers, so running them
+apart pays for one wide sweep twice —
+`AXL-Build-System-Design.md` §8.2 says so from the other side. Measured with
+comments stripped (the same pollution that made 149 read as 157):
+
+| | files |
+|---|---|
+| invoke `make` | 155 |
+| …already ask `build-prefix.sh` | 139 |
+| reference an `out/` path at all | 23 |
+| **both — the real overlap** | **7** |
+
+The overlap is **seven files**, not 149: `Makefile`, `scripts/axl-common.sh`,
+`build.sh`, `install.sh`, `lint.sh`, and two integration tests. The wide sweep
+the docs feared was already paid for by `d8ab47ee` (the `AXL_TLS` prefix
+split), which pushed 139 callers through `build-prefix.sh` for a different
+reason. What remained was not a caller sweep at all — it was that the staged
+SDK had no accessor, so ~12 tests hand-composed it.
+
+**Consequence for sequencing:** P2 and the port no longer need to be run
+together, and neither blocks the other. The argument for pairing them was
+entirely the shared surface, and the surface is gone.
 
 ## 5. Artifact matrix
 
@@ -370,9 +406,18 @@ consumer code, no design risk.
 - `axl-cc --print-prefix` / `--print-version`.
 - Correct `AXL-SDK-Design.md` + README.
 
-**P2 — Separate build dir from install prefix.** Touches every doc, test path,
-and CI reference to `out/`. Mechanical but wide; do it in one sweep, not
-piecemeal.
+**P2 — Separate build dir from install prefix.** **Half done 2026-08-16, and
+it was never wide** — see §4.1. `scripts/sdk-prefix.sh` + `test_sdk_dir` exist,
+the ~12 hand-composed callers are converted, and `AXL_SDK_PREFIX` relocates
+the staged SDK (verified with a control). The measured overlap with the CMake
+port's slice 3 is **7 files, not 149**, so this no longer has to be paired
+with the port or done in one sweep.
+
+What remains is the part that IS a decision rather than a mechanism: whether
+the default moves from `out/` to `stage/` (and `out/native-*` to
+`build/<arch>-<mode>/`) — that is O1, and it breaks every existing invocation
+and doc line, which is why the accessor deliberately kept `out` as its
+default. The accessor makes that change one edit whenever you want it.
 
 **P3 — CMake toolchain file.** Its own design pass, per §6.1's open questions.
 Success criterion: axl-utils can delete `AXL_UTILS_INTELLISENSE`, the phantom

@@ -886,9 +886,15 @@ now, so the narrow filter would have been a trap waiting for the next
 
 **One question this opens and does not answer:** `axl::string` exists because
 `<string>` was unavailable freestanding. It is always available now, so
-`axl::string` is a size choice rather than a necessity. That belongs to T5
-(`AXL-Cxx-Stdlib-Surface.md`, which is organised around the split this task
-removed) and is deliberately not decided here.
+`axl::string` is a size choice rather than a necessity.
+
+**ANSWERED 2026-08-16 — see §9c.** Kept, on a re-founded justification
+(recoverable OOM), and the size premise turned out to be backwards. Note this
+paragraph originally deferred the question to T5, whose actual scope was
+"update `AXL-Cxx-Stdlib-Surface.md`". T5 was completed on that scope and the
+parked question went out with it, undecided and tracked nowhere, while five
+places went on citing an "open T5 question" that had been closed. Park a
+question on a task only when the task's own definition covers it.
 
 #### (superseded) T2 is bigger than "drop two flags": `libaxl-cxx.a` is superseded
 
@@ -1090,6 +1096,96 @@ first, because it would otherwise set every convention unilaterally.
 | **C4** | `std::map` / `std::unordered_map` — **DONE**, running on both arches. The `AxlTree` / `AxlHashTable` skins are not needed |
 | **C5** | Domain wrappers: `AxlNTree`, `AxlRadixTree`, AGT's draw-context guard migrates |
 | **C6** | C++ JSON API — RAII container scopes, templated `add`, range-for over the reader. Four faces, so `w.splice(r["items"])` falls out of `axl_json_write_token` |
+| **C7** | **DONE 2026-08-16.** `axl::unique_handle<T>` in `axl-handle.hpp` — the "owning pointer" the §1 table asks for, and the direct answer to its 84-call first row. Landed out of order because AGT asked for it while adopting v4.0.0; see §9b |
+
+### 9b. `axl::unique_handle` — generated, not listed
+
+The request was a two-parameter `unique_handle<T, Free>` plus a hand-written
+alias per type. What shipped is a **single**-parameter `unique_handle<T>` whose
+deleter resolves through `axl::handle_traits<T>`, emitted by the existing
+`AXL_DEFINE_AUTOPTR_CLEANUP` macro. Three reasons, all measured in this tree:
+
+- **The family is 61 types, not the 13 asked for** (58 plain bindings + 3
+  `_ARG`). A hand-written list covers the ones someone thought of.
+- **`template <auto Free>` cannot express the `_ARG` variant at all.**
+  `AxlSocket`, `AxlTcp` and `AxlHttpServer` destroy through
+  `void axl_X_close(AxlX *, AxlTeardown)` — arity 2. Generated from the macro,
+  they inherit the same `AXL_TEARDOWN_GRACEFUL` the C cleanup passes.
+- **The binding cannot drift from the destroy function**, because they are the
+  same macro invocation on the same line of the same header — rather than two
+  places kept in sync by discipline.
+
+Being opt-in per type is what makes the exclusions structural rather than
+documented. A type no header binds has no trait, so `unique_handle<T>` over it
+is a compile error. Two types state their reason with `AXL_DEFINE_NO_HANDLE`:
+`AxlSurface` (a borrowed node in a tree `axl_compositor_free` destroys whole —
+owning it makes teardown depend on member declaration order) and
+`AxlJsonReader` (a caller-owned value struct whose free releases contents, not
+the struct).
+
+Two mechanism details are load-bearing and were each verified against the
+compiler rather than reasoned about, having been wrong the first time:
+
+- The macros are invoked **inside the headers' own `extern "C"` blocks**, where
+  a template is `error: template with C linkage`. The emission wraps itself in
+  `extern "C++"`; without it every C++ consumer of every header with a binding
+  fails to compile.
+- `AXL_DEFINE_NO_HANDLE`'s `destroy` is a **member template**. As a plain
+  member its body compiles where the specialization is *defined*, firing the
+  `static_assert` in every translation unit that merely includes the header.
+
+`make check-handle-exclusions` compiles one fixture three ways and matches the
+poison **text**, not just the exit status — a fixture typo fails to compile
+exactly like a working exclusion does.
+
+### 9c. Does `axl::string` still earn its place? — DECIDED 2026-08-16: yes
+
+The original justification died with T3: `<string>` was gated by
+`bits/requires_hosted.h`, and there is no freestanding C++ mode any more. Kept
+anyway, on three findings that replace it.
+
+**1. `std::string` cannot report an OOM, and this can.** Under
+`-fno-exceptions` an allocation failure halts the image, and `operator new` may
+not soften it by returning NULL — libstdc++ passes the result to the container
+unchecked, so NULL buys a `#PF` near address 0 (an earlier revision of
+`axl-cxxabi-ops.cpp` did exactly that and was reverted; `cxx-hosted-badalloc`
+pins the halt today). `axl::string` sets a sticky `bad()` and leaves the
+contents untouched — the same contract `axl_mem_fail_next_alloc()` and the
+suite's OOM assertions rest on.
+
+**2. It is structural, not stylistic.** `axl::istream::finish()` reads
+`acc.bad()` to turn an accumulation OOM into `AXL_NO_RESOURCES`. Delete the
+class and `axl::cin >> s` cannot report exhaustion at all, because the halt
+happens below the stream. The string and the stream layer stand or fall
+together.
+
+**3. The size premise was backwards.** "A size choice rather than a necessity"
+implied `axl::string` was the expensive option. Measured on x64 `--release`,
+an equivalent construct-append-grow program: baseline 47,247 B; with
+`axl::string` 47,811 B (**+564**); with `std::string` 48,292 B (**+1045**). It
+is half the cost of the thing it was suspected of losing to.
+
+**Wrapping is not available as a way out of the duplication.** `axl::string`
+cannot wrap `std::string` and keep `bad()` — the failure halts inside
+`append()`/`reserve()`, below any wrapper, with no return path on which to set
+a flag. A custom allocator does not rescue it either: it can only halt or
+pre-check, and pre-checking changes the type (`basic_string<char, traits, A>`
+is not `std::string`), forfeiting the interop that motivated the idea. The
+delegation that IS possible is already done — the whole search/compare family
+forwards to `std::string_view` — libstdc++'s own algorithms reading our bytes,
+via an implicit `operator std::string_view()` — and only the storage-and-OOM
+core is ours.
+
+**Guidance:** prefer `std::string` wherever a path can pre-size or may
+legitimately halt — with #axl::arena_allocator when it needs a pre-checked
+capacity. Reach for `axl::string` when a path must SURVIVE exhaustion without
+knowing the size up front.
+
+**Known weakness, recorded rather than hidden:** in-tree consumers are one SDK
+example and the streams selftest, and AGT is migrating to `std::string`. That
+is not treated as disqualifying for a public SDK, but if the stream layer is
+ever dropped, this decision should be re-opened — the string's strongest
+argument is that it serves `axl::cin`.
 
 **Acceptance test for C1–C3: AGT shrinks.** If those 84 `axl_free` calls, 12
 owning `char *` members and 4 `AxlArray *` members do not go away, the

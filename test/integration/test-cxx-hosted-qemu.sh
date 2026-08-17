@@ -5,7 +5,7 @@
 # THE NAME IS HISTORICAL. There is no hosted MODE any more: task T3 dropped
 # -ffreestanding from the C++ line in all three build paths, so
 # <vector>/<string>/<map>/<unordered_map> compile with no flag and
-# `axl-c++ --hosted` is an accepted no-op. Kept as the filename because this is
+# `axl-c++ --hosted` hard-errors (asserted below). Kept as the filename because this is
 # still the containers-under-UEFI suite and renaming it would break the
 # ratchet's per-test history for no gain.
 #
@@ -68,7 +68,7 @@ case "$WHICH" in
     *) echo "usage: $0 [X64|AARCH64|both]" >&2; exit 2 ;;
 esac
 
-AXL_CXX="$PROJECT_DIR/out/bin/axl-c++"
+AXL_CXX="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-c++"
 SRC="$SCRIPT_DIR/cxx-hosted-selftest.cpp"
 THROW_SRC="$SCRIPT_DIR/cxx-hosted-throw.cpp"
 BADALLOC_SRC="$SCRIPT_DIR/cxx-hosted-badalloc.cpp"
@@ -81,6 +81,7 @@ NEWFORMS_SRC="$SCRIPT_DIR/cxx-new-forms.cpp"
 ERRORS_SRC="$PROJECT_DIR/sdk/examples/cxx-errors.cpp"
 CTOR_SRC="$SCRIPT_DIR/cxx-ctor-selftest.cpp"
 RTTI_SRC="$SCRIPT_DIR/cxx-rtti-selftest.cpp"
+HANDLE_SRC="$SCRIPT_DIR/cxx-handle-selftest.cpp"
 WORK="$(mktemp -d -t axl-cxx-hosted.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -170,7 +171,7 @@ run_one() {
         X64)     cc_arch="x64";  out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)" ;;
         AARCH64) cc_arch="aa64"; out="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs aa64)" ;;
     esac
-    lib_dir="$PROJECT_DIR/out/lib/axl/$cc_arch"
+    lib_dir="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/lib/axl/$cc_arch"
 
     echo "=== cxx-hosted ($arch) ==="
     if [[ ! -x "$AXL_CXX" || ! -f "$lib_dir/libaxl-cxx.a" ]]; then
@@ -192,7 +193,7 @@ run_one() {
     # Compared by content, not mtime -- install.sh deliberately avoids mtime
     # churn (install -C), so an mtime test would report drift that isn't there.
     diff -rq "$PROJECT_DIR/include/axl" \
-             "$PROJECT_DIR/out/include/axl-sdk/axl" >"$WORK/stage.diff" 2>&1
+             "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/include/axl-sdk/axl" >"$WORK/stage.diff" 2>&1
     check "$?" "$arch: staged headers match include/axl (else: install.sh --cpp)"
     [[ -s "$WORK/stage.diff" ]] && sed 's/^/      /' "$WORK/stage.diff" | head -5
 
@@ -479,6 +480,41 @@ run_one() {
                      'ctor: magic=0x1BCD order=1,2 count=2' 'ctor: done'; do
             grep -Fxq "$cline" "$WORK/ctorrun.clean"
             check "$?" "$arch: global ctor — $cline"
+        done
+    fi
+
+    # ---------------------------------------------------------------
+    # 5f. axl::unique_handle owns a REAL object and gives the memory back.
+    # ---------------------------------------------------------------
+    # `make check-handle-exclusions` covers the compile-time contract —
+    # which types get a handle, which are refused, and what the refusal
+    # says. What it cannot see is whether the deleter reaches the destroy
+    # function the header named, so this runs the four cases AXL_AUTOPTR
+    # cannot express (scope, move, class member, factory return) against
+    # live allocation counts.
+    #
+    # Each case asserts `alive=1` BEFORE `freed=1`. Without that half,
+    # `freed=1` would hold trivially on a build with no allocation
+    # accounting — including this one, which is --release — and the whole
+    # fixture would be unable to fail. The counter has to be seen moving.
+    "$AXL_CXX" --arch "$cc_arch" --release "$HANDLE_SRC" \
+        -o "$WORK/handle-$cc_arch.efi" >"$WORK/handle.log" 2>&1
+    check "$?" "$arch: the unique_handle fixture builds"
+    if [[ -f "$WORK/handle-$cc_arch.efi" ]]; then
+        timeout 120s "$PROJECT_DIR/scripts/run-qemu.sh" \
+            --arch "$arch" --timeout 45 "$WORK/handle-$cc_arch.efi" \
+            >"$WORK/handlerun.log" 2>&1
+        tr -d '\r' < "$WORK/handlerun.log" > "$WORK/handlerun.clean"
+        local hline
+        for hline in 'handle: scope alive=1'      'handle: scope freed=1' \
+                     'handle: move alive=1'       'handle: move src-empty=1' \
+                     'handle: move freed=1' \
+                     'handle: member alive=1'     'handle: member usable=1' \
+                     'handle: member freed=1' \
+                     'handle: release disarmed=1' 'handle: release freed=1' \
+                     'handle: empty null=1'       'handle: done'; do
+            grep -Fxq "$hline" "$WORK/handlerun.clean"
+            check "$?" "$arch: unique_handle — $hline"
         done
     fi
 

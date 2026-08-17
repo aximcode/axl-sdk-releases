@@ -26,8 +26,27 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 # (non-TLS) out/ SDK other axl-cc tests rely on.
 SDK_PREFIX="$PROJECT_DIR/out/sdk-tls"
 echo "+ AXL_TLS=1 install.sh --arch x64 --prefix $SDK_PREFIX"
-AXL_TLS=1 "$PROJECT_DIR/scripts/install.sh" --arch x64 --prefix "$SDK_PREFIX" \
-    2>&1 | tail -1
+# Capture to a file and print the tail, rather than `| tail -1`: a pipeline's
+# exit status is the LAST command's, so `install.sh | tail` reports tail's
+# success and a failed install sails past `set -e`.
+#
+# That is not theoretical. Under -j8 this install lost a race with another
+# test's concurrent install.sh (both build into the shared TLS build tree),
+# failed, and was swallowed -- so the test carried on against a THREE-WEEK-OLD
+# staged prefix and died ten lines later on `undefined reference to
+# axl_crypto_rng`, which reads as a library defect rather than a staging
+# failure. Diagnosing that cost more than the fix.
+_inst_log="$(mktemp)"
+if ! AXL_TLS=1 "$PROJECT_DIR/scripts/install.sh" --arch x64 \
+        --prefix "$SDK_PREFIX" >"$_inst_log" 2>&1; then
+    echo "FAIL: install.sh failed to stage the TLS SDK at $SDK_PREFIX" >&2
+    echo "      (everything below would have run against a STALE prefix)" >&2
+    tail -15 "$_inst_log" | sed 's/^/      /' >&2
+    rm -f "$_inst_log"
+    exit 1
+fi
+tail -1 "$_inst_log"
+rm -f "$_inst_log"
 
 AXL_CC="$SDK_PREFIX/bin/axl-cc"
 [[ -x "$AXL_CC" ]] || { echo "FAIL: staged axl-cc missing at $AXL_CC"; exit 1; }

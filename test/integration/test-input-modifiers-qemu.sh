@@ -78,7 +78,7 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-AXL_CC="$PROJECT_DIR/out/bin/axl-cc"
+AXL_CC="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-cc"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 DEMO_C="$SCRIPT_DIR/input-modifiers-selftest.c"
 

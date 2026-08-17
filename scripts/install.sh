@@ -131,6 +131,38 @@ fi
 # shellcheck source=/dev/null
 . "$TOOLCHAIN_CONF"
 
+# AXL_TOOLCHAIN -- the same variant the Makefile and axl-cc take. This is the
+# THIRD build path, and it resolves the compiler independently in order to bake
+# a real path into the generated axl-config.cmake, so a variant the other two
+# honour and this one ignores is exactly the drift `make check-flag-parity`
+# exists over. The failure was the quiet kind: under `cross` with a locator
+# left unset, the ${:-} fallbacks below would stamp the /opt default into a
+# consumer's CMake package, and the detection a few lines down would announce
+# "C++ toolchain detected" about a toolchain the caller never named.
+#
+# It also has to happen HERE, before detection: make catches an unknown variant
+# eventually, but only after this script has logged two reassuring lines and
+# started a build.
+AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-axl}"
+case "$AXL_TOOLCHAIN" in
+    axl) ;;
+    cross)
+        AXL_X64_GCC_DEFAULT=""
+        AXL_X64_GXX_DEFAULT=""
+        AXL_X64_BINUTILS_PREFIX_DEFAULT=""
+        AXL_AA64_GCC_DEFAULT=""
+        AXL_AA64_GXX_DEFAULT=""
+        AXL_AA64_BINUTILS_PREFIX_DEFAULT=""
+        ;;
+    *)
+        log_error "AXL_TOOLCHAIN=$AXL_TOOLCHAIN is not a toolchain variant."
+        log_error "Use 'axl' (the default) or 'cross' (one you supply, named"
+        log_error "by AXL_X64_GCC / AXL_AA64_GCC and the matching _GXX and"
+        log_error "_BINUTILS_PREFIX)."
+        exit 1
+        ;;
+esac
+
 ARM_GXX="${AXL_AA64_GXX:-$AXL_AA64_GXX_DEFAULT}"
 # C++ compiles bare-metal on BOTH arches now (AXL-Cxx-Design.md §6a-PLAN task
 # T2). This was the host g++ -- the SDK's last host input -- and dropping it is
@@ -171,6 +203,30 @@ wants_arch() {  # <arch>
     done
     return 1
 }
+
+# Under `cross` the C compiler is mandatory and nobody else will say so early.
+# make does refuse, but only after this script logs "Building (x64, ...)" and
+# hands off -- so the reader sees a build start and then a Makefile error, when
+# the actual fault was an unset variable known before any of that. C++ stays
+# optional here exactly as it is under `axl`; this is only about C, which every
+# build needs.
+if [[ "$AXL_TOOLCHAIN" == "cross" ]]; then
+    for _a in "${ARCHES[@]}"; do
+        case "$_a" in
+            x64)  _cc="$X64_GCC"; _var="AXL_X64_GCC" ;;
+            aa64) _cc="$ARM_GCC"; _var="AXL_AA64_GCC" ;;
+            *)    continue ;;
+        esac
+        if [[ -z "$_cc" ]]; then
+            log_error "AXL_TOOLCHAIN=cross needs $_var set to your own"
+            log_error "bare-metal C compiler for $_a. The axl-toolchains.conf"
+            log_error "defaults are deliberately not consulted under this"
+            log_error "variant -- set it, or unset AXL_TOOLCHAIN to use the"
+            log_error "toolchain the SDK installs."
+            exit 1
+        fi
+    done
+fi
 
 if [[ "$CPP_MODE" != "skip" ]]; then
     cpp_missing=""

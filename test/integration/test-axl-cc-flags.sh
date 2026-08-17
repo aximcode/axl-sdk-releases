@@ -30,8 +30,8 @@ test_setup
 # captures each rc, so disable errexit for the body.
 set +e
 
-AXL_CC="$PROJECT_DIR/out/bin/axl-cc"
-LIB_DIR="$PROJECT_DIR/out/lib/axl/x64"
+AXL_CC="$(test_sdk_dir)/bin/axl-cc"
+LIB_DIR="$(test_sdk_dir)/lib/axl/x64"
 if [[ ! -x "$AXL_CC" || ! -d "$LIB_DIR" ]]; then
     echo "ERROR: staged SDK missing — run 'scripts/install.sh --arch x64' first" >&2
     exit 2
@@ -98,7 +98,7 @@ check "$?" "-Wl, reached ld (a non-empty link map was produced)"
 
 # 3b. Same passthrough on the C++ driver (axl-c++ = axl-cc -x c++): a C++ TU
 # emits a .d and honours a forwarded compile flag.
-AXL_CXX="$PROJECT_DIR/out/bin/axl-c++"
+AXL_CXX="$(test_sdk_dir)/bin/axl-c++"
 CXX_SRC="$PROJECT_DIR/sdk/examples/hello.cpp"
 if [[ -x "$AXL_CXX" && -f "$CXX_SRC" ]]; then
     rm -f "$WORK/hpp.o" "$WORK/hpp.d"

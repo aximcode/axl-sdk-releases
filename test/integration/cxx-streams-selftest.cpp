@@ -3,7 +3,7 @@
 
 /** @file cxx-streams-selftest.cpp
     Fixture for test-cxx-streams-qemu.sh: axl::cout / axl::cin / axl::cerr
-    and axl::string, built FREESTANDING (no --hosted) and run under QEMU.
+    and axl::string, built with no mode flag and run under QEMU.
 
     Driven by a verb so startup.nsh can point different stdin at it:
 

@@ -26,8 +26,9 @@
  * the opposite — that `std::vector`, `std::string` and `std::map` "require
  * exceptions and the heap, and are permanently excluded from freestanding".
  * Measurement disagreed on every clause. They do not require exceptions; the
- * gate is `-ffreestanding` itself, enforced by `bits/requires_hosted.h`, and
- * `axl-c++ --hosted` lifts it per translation unit. `std::map<std::string,int>`
+ * gate was `-ffreestanding` itself, enforced by `bits/requires_hosted.h`, and
+ * the SDK no longer passes that flag at all — so the containers are simply
+ * available, with nothing to opt into. `std::map<std::string,int>`
  * and a 200-entry `std::unordered_map` were then verified running under UEFI on
  * both arches in a 119 KB image. What the link needs from `libstdc++.a` is two
  * archive members with zero undefined symbols between them — no locale, no

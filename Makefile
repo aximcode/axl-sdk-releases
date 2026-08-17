@@ -146,6 +146,77 @@ OBJCOPY    = $(CROSS)objcopy
 # fallback to land on.
 -include $(dir $(lastword $(MAKEFILE_LIST)))scripts/axl-toolchains.conf
 
+# AXL_TOOLCHAIN -- WHICH toolchain supplies the compiler and binutils.
+#
+#   axl    (default) the ones scripts/axl-toolchains.conf names and
+#          scripts/install-toolchain.sh installs.
+#   cross  one you supply, named by AXL_<ARCH>_GCC / _GXX / _BINUTILS_PREFIX.
+#          The conf defaults are NOT consulted.
+#
+# A VARIANT beside the LOCATORS, because a locator alone cannot express which
+# toolchain you meant. That is the convention everywhere this problem is
+# solved: Zephyr pairs ZEPHYR_TOOLCHAIN_VARIANT with ZEPHYR_SDK_INSTALL_DIR /
+# CROSS_COMPILE, EDK2 pairs TOOL_CHAIN_TAG with GCC_AARCH64_PREFIX, the Linux
+# kernel pairs LLVM=1 with CROSS_COMPILE. None selects a toolchain by bare
+# prefix alone.
+#
+# The bug it closes is ours: `make CROSS=<prefix>-` was documented as the macOS
+# and native-Windows build, and has selected only BINUTILS since 0bf6ed51
+# replaced `CC = $(CROSS)gcc` with an AXL_*_GCC lookup. The compiler stayed
+# pointed at /opt, so the command could not work on a host with no /opt
+# toolchain -- and it died in a recipe rather than where the intent was stated.
+#
+# `cross` deliberately does NOT fall back to the defaults. Falling back is what
+# makes the failure late; refusing with the variable names is the feature.
+#
+# `llvm` is deliberately ABSENT rather than accepted-and-ignored. It is the
+# obvious next value, and it is not a stub: clang is one binary carrying every
+# backend, so it is selected by --target= rather than by a prefix -- which is
+# why the kernel's LLVM=1 reinterprets CROSS_COMPILE as a triple instead of a
+# binary prefix. A variant that silently did nothing would be worse than one
+# that refuses.
+AXL_TOOLCHAIN ?= axl
+
+# The arch's spelling in the variable names, for diagnostics that can name the
+# exact variable to set rather than a pattern the reader has to instantiate.
+ifeq ($(ARCH),aa64)
+  TC_ARCH := AA64
+else
+  TC_ARCH := X64
+endif
+
+ifeq ($(filter $(AXL_TOOLCHAIN),axl cross),)
+  $(error AXL_TOOLCHAIN=$(AXL_TOOLCHAIN) is not a toolchain variant. Use `axl` \
+    (the default: the toolchains scripts/install-toolchain.sh installs) or \
+    `cross` (one you supply, named by AXL_$(TC_ARCH)_GCC, AXL_$(TC_ARCH)_GXX \
+    and AXL_$(TC_ARCH)_BINUTILS_PREFIX))
+endif
+
+# `cross` means YOU name it, so the defaults stop existing. Clearing them here
+# rather than editing the six $(or ...) sites keeps one definition of the
+# fallback rule -- and means a locator left unset resolves EMPTY and is caught
+# by the CC guard below, which is where the diagnostic lives.
+ifeq ($(AXL_TOOLCHAIN),cross)
+  # `override`, on every one of these, because a plain assignment CANNOT clear
+  # a variable set on the make command line -- `make AXL_TOOLCHAIN=cross
+  # ARM_TOOLCHAIN=/opt/...` would silently keep the fallback, which is the very
+  # case this block exists to stop. (The same precedence rule made a sabotage
+  # of this block read as undetected until it was written with `override`.)
+  override AXL_X64_GCC_DEFAULT :=
+  override AXL_X64_GXX_DEFAULT :=
+  override AXL_X64_BINUTILS_PREFIX_DEFAULT :=
+  override AXL_AA64_GCC_DEFAULT :=
+  override AXL_AA64_GXX_DEFAULT :=
+  override AXL_AA64_BINUTILS_PREFIX_DEFAULT :=
+  # ARM_TOOLCHAIN is a DEFAULT by another name: the older override spelling
+  # supplies the aa64 C++ compiler as `$(ARM_TOOLCHAIN)/bin/...-g++` when
+  # AXL_AA64_GXX is unset. Leaving it live would let a stale environment
+  # variable quietly provide a compiler under the one variant whose entire
+  # promise is that nothing arrives implicitly -- so it is cleared too, and
+  # `ifdef` reads an empty value as undefined.
+  override ARM_TOOLCHAIN :=
+endif
+
 ifeq ($(ARCH),aa64)
   # ARM_TOOLCHAIN stays supported as the older override spelling; AXL_AA64_GXX
   # is the one axl-cc and install.sh honour, so both resolve here.
@@ -161,19 +232,26 @@ else
 endif
 
 ifdef AXL_CPP
-  ifeq ($(ARCH),aa64)
-    ifeq ($(wildcard $(CXX)),)
-      $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-toolchain.sh aa64)
-    endif
-  else
-    # Check $(CXX), NOT g++. The default is a bare-metal toolchain path now, so
-    # testing for host g++ would pass on a box that has one and lacks the other
-    # -- and the build then dies deep in a recipe with a bare "No such file or
-    # directory" instead of here, which is the guard's only job. `command -v`
-    # still covers an AXL_X64_GXX override spelled as a bare name on PATH;
-    # wildcard covers a path.
-    ifeq ($(or $(wildcard $(CXX)),$(shell command -v $(CXX) 2>/dev/null)),)
-      $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-toolchain.sh x64)
+  # Check $(CXX), NOT g++. The default is a bare-metal toolchain path now, so
+  # testing for host g++ would pass on a box that has one and lacks the other
+  # -- and the build then dies deep in a recipe with a bare "No such file or
+  # directory" instead of here, which is the guard's only job. `command -v`
+  # still covers an AXL_*_GXX override spelled as a bare name on PATH;
+  # wildcard covers a path.
+  ifeq ($(or $(wildcard $(CXX)),$(shell command -v $(CXX) 2>/dev/null)),)
+    # Same two-message split as the C guard below, and for the same reason. It
+    # also fixes a message that read "needs " with NOTHING after it: under
+    # `cross` with the locator unset, $(CXX) is empty, so the old text named no
+    # compiler at all and then recommended an installer the caller had already
+    # declined by choosing this variant.
+    ifeq ($(AXL_TOOLCHAIN),cross)
+      $(error AXL_CPP=1 with AXL_TOOLCHAIN=cross needs AXL_$(TC_ARCH)_GXX set \
+        to your own bare-metal C++ compiler$(if $(CXX), (it resolved to \
+        "$(CXX)"), (it is unset)). The axl-toolchains.conf defaults are \
+        deliberately not consulted under this variant)
+    else
+      $(error AXL_CPP=1 needs $(if $(CXX),$(CXX),a C++ compiler) — run \
+        ./scripts/install-toolchain.sh $(ARCH))
     endif
   endif
 endif
@@ -875,7 +953,7 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-cxx-entry check-nul check-test-registered check-tautology \
     check-fuzz-link check-examples check-json-dialect check-flag-parity \
     check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
-    check-log-levels
+    check-log-levels check-handle-exclusions
 
 print-lint-gates:
 	@echo $(LINT_GATES)
@@ -1019,9 +1097,23 @@ ifneq ($(NONCLEAN_GOALS),)
 # above. Gated on NONCLEAN_GOALS so `make clean`, `make help` and every lint
 # gate still work on a box without a toolchain.
 ifeq ($(or $(wildcard $(CC)),$(shell command -v $(CC) 2>/dev/null)),)
-  $(error C compiler $(CC) not found — run ./scripts/install-toolchain.sh $(ARCH). \
-    C is built with the bare-metal cross on both arches so the tree uses no host \
-    headers; see docs/AXL-Libc-Substrate-Design.md §4.1b)
+  # Two messages, because the right remedy depends on which variant asked.
+  # Telling a `cross` user to run the installer would be actively wrong: they
+  # have just declared they are supplying the toolchain themselves, so the
+  # thing they need is the name of the variable they left unset.
+  ifeq ($(AXL_TOOLCHAIN),cross)
+    $(error AXL_TOOLCHAIN=cross needs AXL_$(TC_ARCH)_GCC set to your own \
+      bare-metal C compiler$(if $(CC), (it resolved to "$(CC)"), (it is unset)). \
+      Set AXL_$(TC_ARCH)_GXX and AXL_$(TC_ARCH)_BINUTILS_PREFIX too; the \
+      axl-toolchains.conf defaults are deliberately not consulted under this \
+      variant. It must target bare metal -- a glibc-targeted cross resolves \
+      <string.h> to a hosted libc, which include/compat used to paper over and \
+      no longer exists; see docs/AXL-Libc-Substrate-Design.md §4.1b)
+  else
+    $(error C compiler $(CC) not found — run ./scripts/install-toolchain.sh $(ARCH). \
+      C is built with the bare-metal cross on both arches so the tree uses no host \
+      headers; see docs/AXL-Libc-Substrate-Design.md §4.1b)
+  endif
 endif
 
 #
@@ -1231,6 +1323,59 @@ check-cb-noexcept:
 	fi; \
 	rm -f $$obj; \
 	python3 scripts/check-cb-noexcept.py include/axl
+
+# check-handle-exclusions -- axl::unique_handle is opt-in PER TYPE, and the
+# types left out are left out because owning them is a bug.
+#
+# The mechanism is that the deleter resolves through axl::handle_traits<T>,
+# which exists only where a header invoked AXL_DEFINE_AUTOPTR_CLEANUP. So the
+# exclusion needs no separate enforcement -- it is the default, and a type
+# earns a handle by being bound. What needs guarding is that this stays true
+# in BOTH directions, which is why the fixture is compiled three ways.
+#
+# The ACCEPTING build is not a formality. Without it the gate passes just as
+# well for a header where handle_traits was never specialized for anything:
+# every type would "correctly" reject, and the feature would be absent rather
+# than working.
+#
+# The REJECTING builds match the static_assert TEXT, not merely the exit
+# status. A fixture typo fails to compile exactly like a working exclusion
+# does, so an exit-status-only assertion would be green while measuring
+# nothing -- and the message is the deliverable here anyway: the consumer who
+# reaches for the wrong type gets told the ownership rule at the point of the
+# mistake instead of hunting for a header that was never missing.
+.PHONY: check-handle-exclusions
+check-handle-exclusions:
+	@obj=$$(mktemp --suffix=.o); \
+	$(CXX) $(CXXFLAGS_BASE) -Iinclude \
+	    -c test/handle-exclusion-fixture.cpp -o $$obj 2>/dev/null || \
+	  { echo "check-handle-exclusions: FAIL -- a BOUND type was REJECTED;"; \
+	    echo "    axl::unique_handle must compile for every type whose header"; \
+	    echo "    invokes AXL_DEFINE_AUTOPTR_CLEANUP (or _ARG)."; \
+	    $(CXX) $(CXXFLAGS_BASE) -Iinclude \
+	        -c test/handle-exclusion-fixture.cpp -o $$obj 2>&1 | head -8 | sed 's/^/    /'; \
+	    rm -f $$obj; exit 1; }; \
+	for spec in "SURFACE:owned by the compositor surface tree" \
+	            "JSON:value type, not a handle"; do \
+	    name=$${spec%%:*}; want=$${spec#*:}; \
+	    err=$$($(CXX) $(CXXFLAGS_BASE) -Iinclude -DEXPECT_REJECT_$$name \
+	        -c test/handle-exclusion-fixture.cpp -o $$obj 2>&1); \
+	    if [ $$? -eq 0 ]; then \
+	      echo "check-handle-exclusions: FAIL -- EXPECT_REJECT_$$name COMPILED;"; \
+	      echo "    that type must not be ownable by axl::unique_handle."; \
+	      rm -f $$obj; exit 1; \
+	    fi; \
+	    case "$$err" in \
+	      *"$$want"*) ;; \
+	      *) echo "check-handle-exclusions: FAIL -- EXPECT_REJECT_$$name failed,"; \
+	         echo "    but not with its poison message. Expected to find:"; \
+	         echo "        $$want"; \
+	         echo "    A fixture typo fails identically; the message IS the test."; \
+	         echo "$$err" | head -8 | sed 's/^/    /'; \
+	         rm -f $$obj; exit 1 ;; \
+	    esac; \
+	done; \
+	rm -f $$obj
 
 # Verify every `test_*` function defined in test/unit/*.c is actually reached.
 # An unregistered test compiles, prints nothing, and cannot move the pass-count
@@ -2053,10 +2198,11 @@ $(BUILDDIR)/fs-path-selftest.o: test/integration/fs-path-selftest.c | $(BUILDDIR
 #
 # CXXFLAGS_BASE no longer carries -ffreestanding (T3), so this builds exactly
 # as a consumer's C++ does. It used to say "freestanding, the configuration the
-# stream layer exists for" -- that rationale is gone with the mode, and whether
-# axl::string still earns its place beside an always-available std::string is
-# an open T5 question. Needs AXL_CPP=1 for libaxl-cxx.a (operator new/delete
-# and the std:: halt stubs).
+# stream layer exists for" -- that rationale went with the mode. The layer is
+# kept on a different one, settled 2026-08-16 (AXL-Cxx-Design.md 9c): OOM is a
+# value, so axl::string sets bad() where std::string halts, and axl::cin reads
+# that to report AXL_NO_RESOURCES. Needs AXL_CPP=1 for libaxl-cxx.a (operator
+# new/delete and the std:: halt stubs).
 cxx-streams-selftest: $(PREFIX)/cxx-streams-selftest.efi
 	@echo "  Built: $(PREFIX)/cxx-streams-selftest.efi"
 

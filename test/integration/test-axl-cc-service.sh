@@ -34,8 +34,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-AXL_CC="$PROJECT_DIR/out/bin/axl-cc"
-LIB_DIR="$PROJECT_DIR/out/lib/axl/$_native_arch"
+AXL_CC="$(test_sdk_dir)/bin/axl-cc"
+LIB_DIR="$(test_sdk_dir)/lib/axl/$_native_arch"
 
 if [[ ! -x "$AXL_CC" || ! -d "$LIB_DIR" ]]; then
     echo "ERROR: staged SDK missing for $_native_arch — run 'scripts/install.sh --arch $_native_arch' first" >&2

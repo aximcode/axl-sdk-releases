@@ -92,9 +92,9 @@ namespace axl {
  * `clear()`.
  *
  * Spelled as a requirement rather than a list of overloads so the SAME
- * `operator>>` serves #axl::string freestanding AND `std::string` under
- * `axl-c++ --hosted`, without this header including `<string>` (which is
- * hosted-only and would make the header unusable freestanding).
+ * `operator>>` serves #axl::string and `std::string` alike, without this
+ * header including `<string>` — a dependency every consumer would then pay
+ * whether or not they ever name a `std::string`.
  */
 template <class S>
 concept byte_sink = requires(S &s, const char *p, size_t n) {

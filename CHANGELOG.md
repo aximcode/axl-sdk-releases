@@ -3,6 +3,87 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.1.0 — 2026-08-16
+### Added
+
+- **`axl::unique_handle<T>` — unique ownership of an AXL C handle, for C++.**
+  `AXL_AUTOPTR` stays exactly as it is for C; what it cannot be is a class
+  member, moved, or returned from a factory, so the long-lived cases fell back
+  to a raw pointer and a hand-written destructor. This is the same ownership
+  idea where the language can express all three.
+
+  ```cpp
+  #include <axl/axl-handle.hpp>
+  #include <axl/axl-loop.h>          // AND the header declaring your type
+
+  axl::unique_handle<AxlLoop> loop{axl_loop_new()};
+  axl_loop_run(loop.get());          // the C API, unchanged
+  ```
+
+  **Include both headers.** `axl-handle.hpp` pulls in `<memory>` and
+  `<axl/axl-macros.h>` and nothing else; the trait for a type is emitted where
+  that *type* is declared. Making `unique_handle<T>` always resolve would mean
+  dragging every subsystem header in, and a consumer who tried that shape
+  measured its public-header include weight growing ~13x. Missing it is a
+  compile error (`'AxlVterm' was not declared in this scope`), not a silent
+  failure.
+
+  **Opt-in per type, because owning some of them is a bug.** The deleter
+  resolves through `axl::handle_traits<T>`, emitted by the existing
+  `AXL_DEFINE_AUTOPTR_CLEANUP` — so ~61 types get a handle in the same line
+  that gives C its cleanup attribute, and it cannot drift from the destroy
+  function it names. Two types state their reason via `AXL_DEFINE_NO_HANDLE`
+  instead of leaving a bare `incomplete type`: `AxlSurface` (a borrowed node in
+  a tree `axl_compositor_free` destroys whole) and `AxlJsonReader` (a
+  caller-owned value struct). Gated by `make check-handle-exclusions`.
+
+  `sizeof(axl::unique_handle<T>) == sizeof(T *)`, the deleter is stateless, and
+  the destroy call inlines to what a hand-written destructor would emit. A
+  consumer migrating every `AXL_AUTOPTR` in its tree measured +628 B (+0.10%)
+  on its largest image.
+
+- **`AXL_TOOLCHAIN` selects which toolchain supplies the compiler and
+  binutils.** `axl` (default, what `axl-install-toolchain` installs) or `cross`
+  (one you supply, named by `AXL_<ARCH>_GCC` / `_GXX` / `_BINUTILS_PREFIX`).
+  Under `cross` the defaults are not consulted, so a locator left unset is
+  refused **by name** rather than silently falling back. Honoured by the
+  Makefile, `axl-cc` and `install.sh` alike.
+
+  A variant beside the locators is the convention everywhere this is solved —
+  Zephyr's `ZEPHYR_TOOLCHAIN_VARIANT`, EDK2's `TOOL_CHAIN_TAG`, the kernel's
+  `LLVM=1` — and AXL had only the locators. See **Removed** below for what
+  that cost.
+
+- **`scripts/sdk-prefix.sh` + `AXL_SDK_PREFIX`** answer "where is the staged
+  SDK", as `scripts/build-prefix.sh` already answers "where is the build
+  directory". Two things lived under `out/` and both were called "the prefix";
+  they are now separately addressable. The default is unchanged (`out`), so
+  nothing moves unless asked.
+
+### Removed
+
+- **The README's macOS / native-Windows build instructions.** They told you to
+  install a Homebrew `x86_64-unknown-linux-gnu` cross and run
+  `make CROSS=<prefix>-`. That could not work, for two independent reasons,
+  both measured: `CROSS=` has selected **binutils only** since C moved to the
+  bare-metal cross (the compiler comes from `AXL_<ARCH>_GCC`), and a
+  glibc-targeted cross cannot build the tree at all now that `include/compat/`
+  is gone — `deps/` needs genuine newlib headers and dies on the first
+  `<stdlib.h>`.
+
+  Building AXL needs a **bare-metal** cross (`x86_64-elf` /
+  `aarch64-none-elf`), and those are published for Linux x86-64 hosts only.
+  Use WSL on Windows; on macOS, a container or VM. If you have a bare-metal
+  cross for your host, point `AXL_TOOLCHAIN=cross` at it.
+
+### Fixed
+
+- **`test-jose-cc-qemu.sh` could report a library defect when staging had
+  failed.** It ran `install.sh … | tail -1`, and a pipeline's exit status is
+  the last command's — so a failed install reported success, the test carried
+  on against a stale staged prefix, and died ten lines later on an undefined
+  reference. It now checks the status and says which of the two happened.
+
 ## 4.0.0 — 2026-08-15
 ### Breaking
 

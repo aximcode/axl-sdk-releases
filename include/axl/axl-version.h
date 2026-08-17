@@ -27,9 +27,9 @@
 #include <stdbool.h>
 
 #define AXL_VERSION_MAJOR   4
-#define AXL_VERSION_MINOR   0
+#define AXL_VERSION_MINOR   1
 #define AXL_VERSION_PATCH   0
-#define AXL_VERSION_STRING  "4.0.0"
+#define AXL_VERSION_STRING  "4.1.0"
 
 /* Encoded as 0xMMmmpp (major, minor, patch) for simple comparisons. */
 #define AXL_VERSION_NUMBER \

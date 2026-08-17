@@ -9,8 +9,8 @@
  *
  * @par The problem it solves
  *
- * `axl-c++ --hosted` makes `std::vector`, `std::string` and `std::map`
- * available, and they are the right default. What they cannot do is
+ * `std::vector`, `std::string` and `std::map` are available unconditionally,
+ * and they are the right default. What they cannot do is
  * participate in AXL's C error model. AXL treats out-of-memory as a value:
  * `axl_mem_fail_next_alloc()` is in a public header, the suite carries dozens
  * of OOM assertions, and some of them are degradation contracts rather than
@@ -102,8 +102,9 @@
  *     arena" is a claim about the arena it holds NOW. Swapping between arenas
  *     with different lifetimes is where this bites.
  *
- * Requires `axl-c++ --hosted` only if you instantiate a standard container
- * with it. The allocator itself is freestanding.
+ * Needs no flag. The standard containers are available unconditionally since
+ * T3 retired the freestanding C++ mode, and the allocator itself pulls in
+ * nothing beyond `<memory>` and `<type_traits>`.
  */
 
 #ifndef AXL_ARENA_ALLOCATOR_HPP

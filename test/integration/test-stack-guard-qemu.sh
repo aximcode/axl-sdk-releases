@@ -96,8 +96,8 @@ run_one() {
     # 4. It fires. Build the fixture through axl-cc, exactly as a consumer
     #    would get it, and require the halt.
     efi="$WORK/stack-guard-$cc_arch.efi"
-    if [[ -x "$PROJECT_DIR/out/bin/axl-cc" ]]; then
-        "$PROJECT_DIR/out/bin/axl-cc" --arch "$cc_arch" --release "$SRC" -o "$efi" \
+    if [[ -x "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-cc" ]]; then
+        "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-cc" --arch "$cc_arch" --release "$SRC" -o "$efi" \
             >"$WORK/build.log" 2>&1
         check "$?" "$arch: fixture builds through axl-cc"
     else

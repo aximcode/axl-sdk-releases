@@ -8,18 +8,35 @@
  *
  * @par Why this exists when axl-cxx.hpp says it should not
  *
- * That file argues there is no `axl::string` because `std::string` works, and
- * it is right — on `axl-c++ --hosted`. `<string>` is gated by
- * `bits/requires_hosted.h`, so a plain freestanding translation unit has no
- * owning string at all. That is the configuration #axl::cout and #axl::cin
- * are built for (about 700 bytes for #axl::cout, and roughly 7 KB once
- * #axl::cin and this class come too -- no `--hosted` either way), and
- * `axl::cin >> some_name` needs somewhere to put the token.
+ * That file argues there is no `axl::string` because `std::string` works.
+ * This class was originally written because that held only conditionally:
+ * `<string>` was gated by `bits/requires_hosted.h`, so a freestanding
+ * translation unit had no owning string at all. **That reason is gone** — T3
+ * retired the freestanding C++ mode, and `std::string` is now available
+ * everywhere.
  *
- * So the rule stands where it was measured and this fills the hole beside it.
- * On `--hosted`, prefer `std::string` anyway — it is the one every other C++
- * programmer already knows, and this exists for the configuration that cannot
- * have it.
+ * It is kept for a different reason, and the right one: **out-of-memory is a
+ * value here.** `std::string` has nowhere to put an allocation failure. Under
+ * `-fno-exceptions` it halts the image, and `operator new` may not soften that
+ * by returning NULL because libstdc++ hands the result to the container
+ * unchecked. This class sets a sticky #axl::string::bad() and leaves the
+ * contents untouched, which is the same contract `axl_mem_fail_next_alloc()`
+ * and the suite's OOM assertions are built on.
+ *
+ * That is not a preference — #axl::istream depends on it. `axl::cin >> s`
+ * reports an accumulation OOM as `AXL_NO_RESOURCES` by reading
+ * #axl::string::bad() off its accumulator; with `std::string` the halt would
+ * happen below the stream, with no value left to report.
+ *
+ * It is also the cheaper of the two: measured on x64 `--release`, an
+ * equivalent construct-append-grow program costs **564 bytes** with this
+ * class and **1045 bytes** with `std::string`.
+ *
+ * **So: prefer `std::string`** on any path that can pre-size or that may
+ * legitimately halt — it is the one every other C++ programmer knows, and
+ * #axl::arena_allocator gives it a pre-checked capacity where that fits.
+ * Reach for this class when a path must SURVIVE exhaustion and cannot know
+ * the size up front, which is exactly the case `axl::cin >> s` presents.
  *
  * @par Why it is NOT a skin over AxlString
  *

@@ -26,7 +26,7 @@
  *
  * So `std::` costs the unwinder plus `--allow-multiple-definition` and buys
  * only the spelling. This costs roughly 700 bytes over an equivalent
- * `axl_printf` program (x64 `--release`) and needs no `--hosted`. Treat that
+ * `axl_printf` program (x64 `--release`), with no flag of any kind. Treat that
  * as an order of magnitude, not a constant: `libaxl.a` is selectively
  * linked, so the figure is the difference between two DIFFERENT sets of
  * pulled objects and it drifts whenever the library does. Measured at 1227

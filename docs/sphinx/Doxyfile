@@ -34,11 +34,18 @@ EXPAND_ONLY_PREDEF     = NO
 # typedef to Sphinx's C domain, which cannot parse a trailing token after
 # the parameter list and emits "Invalid C declaration" for every callback
 # that carries it. The contract is documented in prose on the macro itself.
+# AXL_DEFINE_NO_HANDLE and the trait emitter are stripped for the same reason:
+# left in place Doxygen treats the invocation as part of the declaration that
+# FOLLOWS it, so `axl_json_reader_error` and `axl_gfx_buffer_new` arrived at
+# Sphinx with a macro call glued to the front and failed to parse. The C++
+# ownership rules they express are documented in prose on modules/cxx-handle.
 PREDEFINED             = EFIAPI= \
                          __attribute__(x)= \
                          AXL_WARN_UNUSED= \
                          AXL_NORETURN= \
-                         AXL_CB_NOEXCEPT=
+                         AXL_CB_NOEXCEPT= \
+                         AXL_DEFINE_NO_HANDLE(x,y)= \
+                         AXL_HANDLE_TRAITS_(x,y)=
 
 # Output — XML only (Breathe consumes this)
 GENERATE_XML           = YES

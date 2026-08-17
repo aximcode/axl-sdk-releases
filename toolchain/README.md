@@ -27,8 +27,8 @@ root of three separate problems rather than a stylistic preference:
   code with `-mstack-protector-guard=global` for exactly this reason; the
   distro archive was not built that way.
 - **libstdc++'s headers are configured for glibc**, which is why
-  `axl-c++ --hosted` exists at all. It is a workaround for borrowing
-  them, not a feature.
+  `axl-c++ --hosted` existed at all — a workaround for borrowing them,
+  never a feature. T3 removed it; the flag now hard-errors.
 
 A `--with-newlib --disable-threads --disable-tls` build has none of
 those. The ARM toolchain's `libsupc++` measures **0 TLS symbols and 0
