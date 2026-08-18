@@ -5458,6 +5458,51 @@ test_image_enumerate(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_image_watch_loads / axl_image_unwatch_loads
+//
+// Only SAFE negatives and a single register/release round-trip. The watch
+// FIRING is not asserted here: making it fire means loading an image, and
+// the end-to-end proof already exists in test-crashhandler.sh, whose report
+// can only name the faulting image if the watch refreshed the table.
+// ---------------------------------------------------------------------------
+
+static void
+image_watch_count(void *ctx)
+{
+    int *fired = (int *)ctx;
+    if (fired != NULL) {
+        (*fired)++;
+    }
+}
+
+static void
+test_image_watch(void)
+{
+    int fired = 0;
+
+    test_check(axl_image_watch_loads(NULL, &fired) == NULL,
+               "image_watch_loads: NULL callback -> NULL");
+
+    /* Round-trip. The teardown leak report is the other half of this
+       assertion: the watch owns a heap-allocated bridging context, so one
+       that failed to release would fail the run rather than pass quietly. */
+    AxlImageWatch *w = axl_image_watch_loads(image_watch_count, &fired);
+    test_check(w != NULL,
+               "image_watch_loads: returns a handle");
+    axl_image_unwatch_loads(w);
+
+    /* NULL is documented as a no-op. Asserted by REGISTERING AGAIN after
+       it, rather than by calling it and claiming survival -- a call that
+       corrupted the backend's notify table would show up as the second
+       registration failing. */
+    axl_image_unwatch_loads(NULL);
+    AxlImageWatch *w2 = axl_image_watch_loads(image_watch_count, &fired);
+    test_check(w2 != NULL,
+               "image_unwatch_loads: NULL leaves registration working");
+    axl_image_unwatch_loads(w2);
+}
+
+// ---------------------------------------------------------------------------
 // axl_cpu_register_exception (validation paths — no live trigger)
 // ---------------------------------------------------------------------------
 
@@ -11383,6 +11428,7 @@ test_util_main(int argc, char **argv)
     test_boot();
     test_app_boot_path();
     test_image_enumerate();
+    test_image_watch();
     test_cpu_register_exception();
     test_cpu_features();
     test_cpu_simd_tier();

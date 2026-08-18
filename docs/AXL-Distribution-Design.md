@@ -9,6 +9,18 @@ How axl-sdk is packaged, installed, discovered, version-pinned, and consumed
 Companion to `AXL-SDK-Design.md` (which covers what the SDK *contains*); this
 doc covers how it *reaches and is used by* a consumer.
 
+## Where this doc sits — three docs, one subject, different questions
+
+| doc | answers | owns |
+|---|---|---|
+| [AXL-SDK-Design.md](AXL-SDK-Design.md) | what the SDK CONTAINS | toolchain requirement, C++ support, shipped layout |
+| [AXL-Distribution-Design.md](AXL-Distribution-Design.md) | how it REACHES and is USED by a consumer | packaging, `find_package` discovery, version pinning, `out/` vs `stage/` (§4), P1–P4 |
+| [AXL-Build-System-Design.md](AXL-Build-System-Design.md) | how WE build it | the CMake port, port-surface measurements (§8.2a), why `axl-cc` is excluded, `axl-config.cmake` extraction (§8.4) |
+
+**One owner per shared fact, everyone else links** — see AXL-SDK-Design.md for
+why that rule exists (two docs asserted the same stale premise for months
+because each was internally consistent).
+
 ---
 
 ## 1. The target experience
@@ -138,25 +150,16 @@ Two helpers exist for the two questions, deliberately not one with a mode
 flag: `test_build_dir` varies with ARCH x BUILD x AXL_TLS, `test_sdk_dir`
 varies with nothing.
 
-**This also retires a premise BOTH design docs carried.** They agreed that P2
-and the CMake port's slice 3 sweep the same ~149 make callers, so running them
-apart pays for one wide sweep twice —
-`AXL-Build-System-Design.md` §8.2 says so from the other side. Measured with
-comments stripped (the same pollution that made 149 read as 157):
+**This also retires a premise BOTH design docs carried** — that P2 and the
+CMake port's slice 3 sweep the same ~149 make callers, so running them apart
+pays for one wide sweep twice. Measured, the real overlap is **seven files**.
 
-| | files |
-|---|---|
-| invoke `make` | 155 |
-| …already ask `build-prefix.sh` | 139 |
-| reference an `out/` path at all | 23 |
-| **both — the real overlap** | **7** |
+> **The measurement is owned by `AXL-Build-System-Design.md` §8.2a** — the
+> per-category counts, the method, and why the earlier figure was wrong live
+> there and are not repeated here. This doc states only what follows for P2.
 
-The overlap is **seven files**, not 149: `Makefile`, `scripts/axl-common.sh`,
-`build.sh`, `install.sh`, `lint.sh`, and two integration tests. The wide sweep
-the docs feared was already paid for by `d8ab47ee` (the `AXL_TLS` prefix
-split), which pushed 139 callers through `build-prefix.sh` for a different
-reason. What remained was not a caller sweep at all — it was that the staged
-SDK had no accessor, so ~12 tests hand-composed it.
+What remained on this side was not a caller sweep at all: the staged SDK had
+no accessor, so ~12 tests hand-composed it. That is what §4.1 above fixes.
 
 **Consequence for sequencing:** P2 and the port no longer need to be run
 together, and neither blocks the other. The argument for pairing them was
@@ -419,6 +422,13 @@ the default moves from `out/` to `stage/` (and `out/native-*` to
 and doc line, which is why the accessor deliberately kept `out` as its
 default. The accessor makes that change one edit whenever you want it.
 
+**P1's `axl-config-version.cmake` is folded into the CMake PORT** (decided
+2026-08-16), because the package it belongs to is generated from a 334-line
+heredoc inside `install.sh`, and extracting that to `cmake/*.cmake.in` is
+port scope — see `AXL-Build-System-Design.md` §8.4. Until it exists,
+`find_package(axl 4.1 REQUIRED)` cannot enforce a version, which is the call
+§1 of this doc advertises.
+
 **P3 — CMake toolchain file.** Its own design pass, per §6.1's open questions.
 Success criterion: axl-utils can delete `AXL_UTILS_INTELLISENSE`, the phantom
 `-ide` targets, `project(LANGUAGES NONE)`, and the VS-generator rejection —
@@ -429,6 +439,24 @@ while keeping Make/CMake bit-parity.
 **Deliberately out of scope:** switching axl-sdk's own build from GNU Make to
 Meson/ninja. It is a legitimate question, but it would not fix a single item in
 §2 — those are all consumer-facing. Decide it separately, on its own merits.
+
+> **Decided separately, and it is CMake** —
+> [AXL-Build-System-Design.md](AXL-Build-System-Design.md), in progress since
+> 2026-08-15. That doc reaches this paragraph's conclusion from the other
+> direction and cites it: the in-tree build system is invisible to consumers,
+> so the port must justify itself on internal grounds alone (it does — the
+> hand-rolled build-state signature IS a re-configure) and it needs no major
+> version. **Two items here interact with it and are NOT independent:**
+>
+> - **P2 touches the same surface.** 157 files invoke `make`, 50 of the
+>   integration scripts among them sourcing nothing shared — the same
+>   `out/`-path sweep this phase describes as "wide; do it in one sweep".
+>   Running P2 and the port separately pays for that sweep twice, so the port
+>   proposes absorbing P2 (its §8.2). Open; scope call not yet taken.
+> - **P3 does not come free with it.** The in-tree build drives the bare-metal
+>   crosses directly and never puts `axl-cc` in a compiler slot, which is the
+>   entire difficulty of §6.1. An in-tree `compile_commands.json` is not
+>   evidence a *consumer* can get one. Its §8.3 spells this out.
 
 ---
 

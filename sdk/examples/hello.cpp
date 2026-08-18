@@ -1,9 +1,9 @@
 /**
  * hello.cpp — minimal AXL SDK C++ example.
  *
- * Exercises the C++ runtime that ships in libaxl-cxx.a: heap
- * allocation (operator new/delete), a virtual call, and a static
- * initializer that runs before main() via the .init_array walker.
+ * Exercises the C++ runtime a firmware link gets: heap allocation
+ * (operator new/delete), a virtual call, and a static initializer
+ * that runs before main() via the .init_array walker.
  * The AXL public API is plain C and is called directly.
  *
  * Build with: axl-c++ hello.cpp -o hello.efi

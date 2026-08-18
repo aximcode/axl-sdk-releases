@@ -40,6 +40,13 @@ VERSION=""
 DRY_RUN=false
 ASSUME_YES=false
 RESUME=false
+FORCE_CI=false  # --force-ci: dispatch CI even when the local stamp
+                # already covers the release commit.
+# The stamp helper is shared with run-integration.sh so the two cannot
+# drift on the format. Sourced, not re-implemented.
+# shellcheck source=../test/integration/lib/release-gate.sh
+source "$(dirname "$0")/../test/integration/lib/release-gate.sh"
+
 CI_GATE=false   # CI runs only via workflow_dispatch (NOT on push, NOT on
                 # release tags), so the release gate is the LOCAL suite plus a
                 # manual CI dispatch on main watched green before tagging (see
@@ -56,6 +63,7 @@ for arg in "$@"; do
         --yes|-y)  ASSUME_YES=true ;;
         --resume)  RESUME=true ;;
         --ci-gate) CI_GATE=true ;;
+        --force-ci) CI_GATE=true; FORCE_CI=true ;;
         --allow-breaking) ALLOW_BREAKING=1 ;;
         -*)        echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
         *)
@@ -285,7 +293,20 @@ git push origin main
 REL_SHA="$(git rev-parse HEAD)"
 note "pushed release commit $REL_SHA"
 
-if $CI_GATE; then
+if $CI_GATE && ! $FORCE_CI && release_gate_covers "$REL_SHA" >/dev/null 2>&1; then
+    # ALREADY GREEN — skip the dispatch entirely. The local suite is the
+    # authoritative gate (RELEASING.md), and it stamped this tree; dispatching
+    # CI would run the same tests on the same code for an answer we hold.
+    # That is the one move that improves turnaround AND cost at once, since a
+    # run never dispatched costs nothing and takes no time
+    # (AXL-CI-Release-Speed-Design.md §10.3/§10.4).
+    #
+    # It reads the stamp against the RELEASE commit, not HEAD-before-the-bump:
+    # release_gate_covers accepts a descendant whose whole diff is VERSION,
+    # axl-version.h and CHANGELOG.md, which is exactly what the bump touches.
+    say "CI gate satisfied locally — $(release_gate_covers "$REL_SHA")"
+    note "skipping the CI dispatch (pass --force-ci to run it anyway)"
+elif $CI_GATE; then
     # CI no longer auto-runs on a push, so trigger it on the release commit and
     # wait for it before tagging.
     say "Triggering CI on main (--ci-gate)"

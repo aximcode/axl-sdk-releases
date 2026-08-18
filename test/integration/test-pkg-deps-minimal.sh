@@ -64,12 +64,15 @@ AA64_TC="${AXL_AA64_TOOLCHAIN_DIR}"
 for d in "$X64_TC" "$AA64_TC"; do
     [[ -d "$d" ]] || { echo "SKIP: toolchain not installed: $d"; exit 0; }
 done
-[[ -x out/bin/axl-cc ]] || { echo "SKIP: SDK not staged (run ./scripts/install.sh --arch all --cpp)"; exit 0; }
+# --abs: this path is both tested here and MOUNTED into the container
+# below, so a repo-relative answer would depend on the caller's cwd.
+STAGE="$("$DIR/scripts/sdk-prefix.sh" --abs)"
+[[ -x "$STAGE/bin/axl-cc" ]] || { echo "SKIP: SDK not staged (run ./scripts/install.sh --arch all --cpp)"; exit 0; }
 
 OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 
 podman run --rm \
-    -v "$DIR/out:/opt/axl-sdk:ro" \
+    -v "$STAGE:/opt/axl-sdk:ro" \
     -v "$X64_TC:$X64_TC:ro" \
     -v "$AA64_TC:$AA64_TC:ro" \
     -v "$DIR/sdk/examples:/ex:ro" \

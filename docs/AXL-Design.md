@@ -3,7 +3,7 @@
 A C library — with first-class C++ support — that makes UEFI
 application development look and feel like writing Linux C or C++ code.
 Applications use snake_case `axl_` functions with standard C types
-(the C-shaped API is fully usable from C++ via `libaxl-cxx.a` and the
+(the C-shaped API is fully usable from C++ via the
 `axl-c++` driver). No external dependencies.
 
 **Name:** AXL = AximCode Library. Pronounced "axle."

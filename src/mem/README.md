@@ -7,6 +7,30 @@ reporting.
 
 Header: `<axl/axl-mem.h>`
 
+## `axl_malloc` vs `malloc`
+
+Both work. They are **separate allocators**, deliberately
+(`docs/AXL-Libc-Substrate-Design.md` §2-DECISION): `axl_malloc` is a thin
+wrapper over the firmware's `AllocatePool`, while `malloc` is newlib's
+dlmalloc running on a region AXL hands it through `sbrk`. Their pointers
+are not interchangeable — never `free()` an `axl_malloc` block or
+`axl_free()` a `malloc` one.
+
+Measured on `sdk/examples/hello.c`, x64 `--release`: switching one
+allocation from `axl_malloc` to `malloc` takes the image from 47,247 to
+60,760 bytes, **+13,513** — of which only ~7 KB is content. The rest is
+relocations: dlmalloc's bin array is 128 pointer pairs, and a `-fpic`
+UEFI image needs a `.rela` entry per pointer, so `.rela` grows +6,240
+against `.text`'s +3,952. `axl_malloc` adds ~0, because `AllocatePool`
+and the backend are already linked into every image.
+
+`axl_malloc` is also the only one AXL can instrument: fences, fill
+patterns, the leak report and the free quarantine are AXL's, and newlib's
+allocator has no debugging of any kind compiled in. See
+`src/format/README.md` for the same comparison across `printf` and the
+string functions.
+
+
 ## Overview
 
 AXL provides its own allocator on top of UEFI's pool memory. All allocated

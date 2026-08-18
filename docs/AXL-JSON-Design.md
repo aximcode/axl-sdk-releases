@@ -2303,6 +2303,68 @@ Test oracle: `canada.json` through the corpus runner, with jq supplying expected
 values over the differential path that already exists. That is the whole reason
 the bulk suites were worth wiring up.
 
+## The C++ face (C6, 2026-08-17)
+
+`<axl/axl-json.hpp>` gives each of the four faces above a C++ form. It lives in
+`docs/AXL-Cxx-Design.md` §9/§9e as a C++-layer phase; recorded here because it
+is what finally exercised the four-face shape end to end, and because it
+required four additions to THIS API.
+
+| face | C | C++ |
+|---|---|---|
+| streaming in | `AxlJsonScanner` | `axl::json_scanner`, a range of events |
+| whole-document in | `AxlJsonReader` | `axl::json_document` / `axl::json_value` |
+| streaming out | `AxlJsonWriter` | `axl::json_writer`, containers as RAII scopes |
+| document into writer | `axl_json_write_token` | `json_writer::splice()` |
+
+**The bridge needed no C change.** A sub-reader is REBASED, so token 0 of
+`doc["items"]` is that array — `axl_json_write_token(w, sub, 0)` splices it.
+That is the property the "two engines, four faces" section predicted would make
+the DOM serializer not a second writer, and it held.
+
+### Four additions, and why the obvious shortcut was wrong
+
+**`axl_json_get_string_len` / `axl_json_value_string_len` /
+`axl_json_object_peek_key_len`.** Nothing could size a decoded string:
+`get_string` truncates silently and returns true, and object iteration reports
+a truncated key only after the pair is consumed. A `std::string` return was
+impossible on any of the three.
+
+The shortcut — expose the raw source span, let the caller size `len * 3 / 2 + 1`
+and decode with the already-public `axl_json_decode_string()` — is wrong, and
+the reason is worth keeping: **that helper takes no UTF-8 mode.** A caller
+decoding through it would get a different string from the one the reader hands
+back, which is exactly the "one document, two answers" contradiction
+`token_equals` and the iterator's decoded keys were both written to remove. So
+the queries go through the reader.
+
+The peek exists rather than a length-of-the-pair-just-yielded because the
+question a caller has is "how big a buffer do I need", and only a
+before-the-fact answer can prevent the truncation rather than report it.
+
+Measuring runs the REAL decoder into a scratch buffer. A count-only pass would
+duplicate the escape, surrogate and split-tail logic and could then drift from
+the thing it claims to predict — and `repair_decoded_utf8` decides it anyway,
+since REPAIR rewrites in place and needs the bytes.
+
+**`axl_json_double` / `axl_json_kv_double`** complete the scalar mirror the
+`get_double` entry above opened: the reader has read doubles since P14 and the
+writer could not emit one without formatting it by hand and splicing through
+`axl_json_raw` — which puts JSON validity on the caller for the one type where
+it is genuinely hard.
+
+Emitted `%.17g`, which on AXL's engine is the SHORTEST round-trippable spelling
+rather than the 17 digits it looks like: `axl_dtoa` (Grisu2) produces at most 17
+shortest digits, so the significant-digit rounding is a no-op and `%g` picks the
+shorter of fixed/exponential and trims. `0.1` emits as `0.1`. Verified by
+round-trip: every value written reads back bit-identical.
+
+Non-finite values follow the DIALECT rather than the formatter. RFC 8259 has no
+NaN and no Infinity, so a strict writer latches its sticky error and emits
+nothing; `AXL_JSON_ALLOW_NAN_INF` — the same bit the READER accepts them under —
+emits `NaN` / `Infinity` / `-Infinity`. One flag, both directions, which is what
+the shared flag space is for.
+
 ## Implementation phases
 
 Each phase is independently green (both arches) and independently

@@ -30,7 +30,10 @@
  * - **axl_array_get() is a function**, not GLib's typed @c g_array_index
  *   macro, and **axl_array_len() is a function**, not a public @c ->len field.
  *   Both deliberate: the struct stays opaque and there is no macro
- *   type-punning.
+ *   type-punning. axl_array_data() does hand out the base pointer — the same
+ *   thing @c g_array_index reaches through, and what @c std::vector::data()
+ *   is — but it is `void *` and reading it as a typed array is the caller's
+ *   explicit cast against axl_array_element_size(), not a macro's silent one.
  * - **One element at a time.** There is no bulk @c append_vals /
  *   @c insert_vals / @c prepend_vals; no caller has needed them.
  */
@@ -238,6 +241,79 @@ axl_array_get(
  */
 size_t
 axl_array_len(
+    AxlArray *a  ///< array
+);
+
+/**
+ * @brief The contiguous element buffer, for reading a whole array at once.
+ *
+ * Elements are stored back to back with no padding between them, so the
+ * element at @a i begins at `(uint8_t *)axl_array_data(a) + i *
+ * axl_array_element_size(a)` — exactly what axl_array_get() returns, without
+ * the per-element call.
+ *
+ * @par Why this exists when axl_array_get() already does
+ *
+ * A caller that reads EVERY element pays an out-of-line call and a bounds
+ * check per element through axl_array_get(). Measured over a C++ view in
+ * AXL-Cxx-Design.md §4.1: indexed traversal ran 4.2x slower and a sort 19.4x
+ * slower than the same loop over a base pointer, and adding this accessor
+ * recovered ALL of both for 87 bytes of code.
+ *
+ * That section's §7 item 3 said this was worth adding only if an
+ * `AxlArray`-backed C++ CONTAINER were ever wanted, which §5 rejected — the
+ * inference being that no other caller had the same need. A borrowed VIEW has
+ * exactly the same need and is the shape §4.4 recommended, so the conclusion
+ * did not survive the case that motivated it.
+ *
+ * @par This does not reopen the type
+ *
+ * The struct stays opaque and there is still no typed indexing macro; this is
+ * a read-side base pointer, the same thing `std::vector::data()` is, and it
+ * carries `std::vector::data()`'s invalidation rule (below). Appending still
+ * copies through axl_array_append()'s memcpy, so §4.1's soundness verdict —
+ * a C++ skin over this type never runs `T`'s copy constructor — is untouched.
+ *
+ * @warning The pointer is INVALIDATED by anything that can grow or move the
+ *     buffer: axl_array_append(), axl_array_append_ptr(), axl_array_insert(),
+ *     axl_array_insert_ptr(), axl_array_prepend(), axl_array_prepend_ptr(),
+ *     axl_array_set_size() and axl_array_steal(). Treat it as a borrow that
+ *     lives until the next mutation, and re-fetch after one.
+ *
+ *     Two more do not move the BUFFER but do move the ELEMENTS, so a pointer
+ *     to a particular slot stops meaning what it meant: the removal calls,
+ *     and axl_array_sort() / axl_array_sort_with_data(), which permute in
+ *     place.
+ *
+ * @return base of the element buffer, or NULL if @a a is NULL or owns no
+ *     buffer (a fresh array always owns one; axl_array_steal() hands it away
+ *     and leaves the array empty-but-usable). NULL is always paired with an
+ *     axl_array_len() of 0, so a `(pointer, length)` pair from these two is
+ *     safe to iterate without a separate NULL test.
+ */
+void *
+axl_array_data(
+    AxlArray *a  ///< array
+);
+
+/**
+ * @brief The per-element stride in bytes, as passed to axl_array_new().
+ *
+ * The companion axl_array_data() needs to compute an element address, and
+ * the check a typed reader must make before casting that buffer to `T *`:
+ * a stride that disagrees with `sizeof(T)` means the array holds something
+ * else, and reading it as `T` is a wrong answer at best and an out-of-bounds
+ * read when `sizeof(T)` is the larger.
+ *
+ * For a pointer-mode array this is `sizeof(void *)`, which is what
+ * axl_array_set_ptr_free_func() already refuses a mismatch on.
+ *
+ * @return element size in bytes, or 0 if @a a is NULL. Never 0 for a live
+ *     array — axl_array_sized_new() refuses a zero @a element_size — so 0 is
+ *     unambiguously the NULL case.
+ */
+size_t
+axl_array_element_size(
     AxlArray *a  ///< array
 );
 

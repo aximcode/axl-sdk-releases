@@ -19,19 +19,33 @@ refuse them under ``-ffreestanding`` at ``bits/requires_hosted.h`` — that flag
 not exceptions and not the heap, was the whole gate — and the SDK no longer
 passes it, so there is nothing to opt into. (The ``axl-c++ --hosted`` flag that
 once lifted it per translation unit is removed and now hard-errors; delete it
-from any build that still passes it.) ``libaxl-cxx.a`` supplies what the link
-needs: ``operator new`` / ``delete`` over ``axl_malloc`` — every form,
-including nothrow (with the
-``std::nothrow`` object) and over-aligned — the five ``std::__throw_*`` entry points that
-``-fno-exceptions`` calls instead of throwing, ``ceil``, and AXL's own
-``_Prime_rehash_policy`` so ``std::unordered_map`` links without dragging in an
-archive member that may carry AVX above the SDK's ``-march=x86-64`` baseline.
+from any build that still passes it.) Every C++ link carries the toolchain's
+own ``libstdc++`` / ``libsupc++``, so ``operator new``, the
+``std::__throw_*`` entry points and the container internals are the real ones
+rather than substitutes. AXL supplies only the four glue objects a firmware
+image needs underneath them — the ``sbrk`` newlib's allocator grows into, the
+POSIX porting layer over ``AxlStream``, the unwind frame-table registration,
+and a terminate handler that reports through the UEFI console instead of a
+``stderr`` nothing wires up.
 
-Allocation failure HALTS. That is deliberate — ``operator new`` may not return
-NULL, because libstdc++ never checks it — but it means a standard container
-cannot participate in AXL's recoverable-OOM contracts. See
-:doc:`arena-allocator` for the paths where that matters, and for containers
-that have to run on an application processor.
+Streams and files
+-----------------
+
+``<iostream>``, ``<sstream>`` and ``<fstream>`` all work — ``std::cout``
+reaches the UEFI console, and ``std::ofstream`` writes to the ESP. They are
+**expensive**: measured on x64 ``--release``, an image using all three carries
+734,512 bytes of ``.text``, against 80,912 for one using only the containers.
+``axl::cout`` (``axl-ostream.hpp``) costs roughly 700 bytes over an equivalent
+``axl_printf`` program and is the right default for a serial console; reach
+for ``std::`` when you want the whole standard library and can afford it.
+
+Allocation failure TERMINATES. That is deliberate — ``operator new`` may not
+return NULL, because libstdc++ never checks it — so an exhausted heap throws
+``std::bad_alloc``, finds no handler in ``-fno-exceptions`` code, and reaches
+AXL's terminate handler, which prints the exception type and ``what()`` before
+exiting. It means a standard container cannot participate in AXL's
+recoverable-OOM contracts. See :doc:`arena-allocator` for the paths where that
+matters, and for containers that have to run on an application processor.
 
 .. doxygenfile:: axl-cxx.hpp
    :project: axl

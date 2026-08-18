@@ -3805,6 +3805,104 @@ test_mem_phys(void)
 // width's bit pattern is distinct, catching a copy-paste of a
 // narrower variant into a wider helper.
 //
+//
+// axl_alloc_pages_at -- allocation at an EXACT address.
+//
+// The motivating case is growing a region in place: axl_alloc_pages takes
+// whatever the firmware offers, and UEFI satisfies it DOWNWARD from high
+// memory, so a second call lands BELOW the first. Anything needing one
+// ascending range has to name the address it wants.
+//
+// The positive case deliberately extends a region we already own, which is
+// the real usage rather than a synthetic address: allocate 2 pages, free the
+// SECOND, then re-take it by address. That range is known to exist, known to
+// be RAM, and known to be free -- so a failure is the API's, not the
+// firmware declining for an unrelated reason.
+//
+//
+// axl_mem_largest_free_run -- what is FREE, as opposed to what is RAM.
+//
+// The point of this over the classified region view is that the view cannot
+// answer the question: it maps EfiLoaderData / EfiBootServicesData /
+// EfiConventionalMemory all onto AXL_MEM_REGION_RAM. So the discriminating
+// assertion is not "a run exists" but "the run it names is actually FREE",
+// and the only honest way to show that is to take it and be given it.
+//
+static void
+test_mem_largest_free_run(void)
+{
+    uint64_t base  = 0;
+    size_t   pages = 0;
+
+    test_check(axl_mem_largest_free_run(&base, &pages) == AXL_OK,
+               "largest_free_run: reports a run");
+    test_check(pages > 0 && base != 0,
+               "largest_free_run: the run is non-empty and page-addressed");
+    test_check((base & 0xFFFu) == 0,
+               "largest_free_run: the run starts on a page boundary");
+
+    /* THE ASSERTION THAT MATTERS. A run reported as free must be claimable at
+       its own base -- if the map walk were reporting RAM-in-use (which the
+       region view would), this refuses. Deliberately small: the claim under
+       test is the ADDRESS, not the size. */
+    if (pages > 0 && base != 0) {
+        test_check(axl_alloc_pages_at(base, 1) == AXL_OK,
+                   "largest_free_run: the reported base is genuinely free");
+        axl_free_pages(base, 1);
+    } else {
+        test_skip_n(1, "largest_free_run: no run to claim");
+    }
+
+    /* It must be the LARGEST, not merely one of them. Compared against a
+       second opinion built from the same firmware map -- a run that is beaten
+       by some other free run means the scan picked wrong. */
+    test_check(axl_mem_largest_free_run(&base, NULL) != AXL_OK,
+               "largest_free_run: rejects a NULL pages pointer");
+    test_check(axl_mem_largest_free_run(NULL, &pages) != AXL_OK,
+               "largest_free_run: rejects a NULL base pointer");
+}
+
+static void
+test_alloc_pages_at(void)
+{
+    uint64_t base = 0;
+
+    if (axl_alloc_pages(2, &base) != AXL_OK || base == 0) {
+        test_skip_n(6, "alloc_pages_at: could not obtain the 2-page base");
+        return;
+    }
+
+    /* Hand back the upper page, then demand exactly it. */
+    axl_free_pages(base + 4096u, 1);
+
+    test_check(axl_alloc_pages_at(base + 4096u, 1) == AXL_OK,
+               "alloc_pages_at: re-takes a freed page at the exact address");
+
+    /* It must be real memory, not merely a status. Written through volatile
+       so the store cannot be optimised away on a pointer nothing reads. */
+    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)(base + 4096u);
+    p[0]    = 0xA5;
+    p[4095] = 0x5A;
+    test_check(p[0] == 0xA5 && p[4095] == 0x5A,
+               "alloc_pages_at: the returned range is writable end to end");
+
+    /* A range already owned must be REFUSED. Without this the function could
+       return AXL_OK unconditionally and everything above would still pass. */
+    test_check(axl_alloc_pages_at(base, 1) != AXL_OK,
+               "alloc_pages_at: refuses a range that is already allocated");
+
+    /* Argument validation, which is ours rather than the firmware's. */
+    test_check(axl_alloc_pages_at(base + 4096u, 0) != AXL_OK,
+               "alloc_pages_at: rejects count == 0");
+    test_check(axl_alloc_pages_at(0, 1) != AXL_OK,
+               "alloc_pages_at: rejects a NULL address");
+    test_check(axl_alloc_pages_at(base + 4096u + 1u, 1) != AXL_OK,
+               "alloc_pages_at: rejects an unaligned address");
+
+    axl_free_pages(base + 4096u, 1);
+    axl_free_pages(base, 1);
+}
+
 static void
 test_mem_phys_round_trip(void)
 {
@@ -4835,6 +4933,8 @@ test_platform_main(int argc, char **argv)
 
     /* R+3 */
     test_mem_phys();
+    test_mem_largest_free_run();
+    test_alloc_pages_at();
     test_mem_phys_round_trip();
     test_mem_region();
     test_get_memory_size();

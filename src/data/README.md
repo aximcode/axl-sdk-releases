@@ -161,6 +161,29 @@ axl_array_set_size(a, 10);           // grow (zero-initialized)
 Pointer mode stores `void *` instead of copies — `axl_array_append_ptr`,
 `axl_array_get_ptr`, and friends.
 
+**Read the whole array at once** with `axl_array_data()` and
+`axl_array_element_size()`. `axl_array_get()` costs an out-of-line call and a
+bounds check per element, which is invisible on one lookup and dominant on a
+traversal — measured over a C++ view, indexed reads ran 4.2x and a sort 19.4x
+slower than the same loop over a base pointer:
+
+```c
+size_t     n    = axl_array_len(a);
+const int *base = axl_array_data(a);
+for (size_t i = 0; i < n; i++) { total += base[i]; }
+```
+
+The struct stays opaque and there is still no typed indexing macro: this is a
+`void *` you cast explicitly against `axl_array_element_size()`, not
+`g_array_index`'s silent pun. The pointer is **invalidated** by anything that
+can move the buffer — `append`, `insert`, `prepend`, `set_size`, `steal` — so
+treat it as a borrow that lives until the next mutation. A NULL return is
+always paired with a length of 0, so `(pointer, length)` is safe to iterate
+with no separate NULL test.
+
+From C++, `axl::array_span<T>()` (`<axl/axl-array.hpp>`) wraps exactly this
+pair and checks the stride for you.
+
 **Reserve capacity** when the size is roughly known, so the append loop
 pays no grow-and-copy:
 
@@ -2282,6 +2305,53 @@ a large out-of-core document, read the range out once and search the
 buffer). The `axl_text_buffer_find_regex` / `axl_piece_tree_find_regex`
 wrappers run a compiled regex over those sources.
 
+### Sizing a decoded string
+
+`axl_json_get_string` TRUNCATES a value too long for the buffer and still
+returns true — the right default for a caller filling a fixed field, and the
+wrong one for a caller that must not lose bytes. `axl_json_get_string_len` and
+`axl_json_value_string_len` report the size that cannot truncate:
+
+```c
+size_t n;
+if (axl_json_get_string_len(&r, "name", &n)) {
+    char *buf = axl_malloc(n + 1);
+    axl_json_get_string(&r, "name", buf, n + 1);   /* cannot truncate */
+}
+```
+
+The answer is the length AFTER escape decoding and after the reader's UTF-8
+mode applies, which is why it cannot be computed from the source span: `\uXXXX`
+shrinks six bytes to between one and four, a surrogate pair shrinks twelve to
+four, and JSON5's `\0` GROWS two to the three of U+FFFD. It costs a decode
+pass, which is why the truncating form stays the default.
+
+For object keys the query is a PEEK — `axl_json_object_peek_key_len` reports
+the key the next `axl_json_object_next` will yield, without consuming it,
+because that call truncates and reports it only after the pair is gone:
+
+```c
+size_t klen;
+while (axl_json_object_peek_key_len(&it, &klen)) {
+    char *key = axl_malloc(klen + 1);
+    axl_json_object_next(&it, key, klen + 1, &value);   /* whole, always */
+    ...
+}
+```
+
+### Writing a double
+
+`axl_json_double` and `axl_json_kv_double` complete the scalar mirror — the
+reader has had `axl_json_get_double` since P14. Values are emitted in the
+SHORTEST round-trippable spelling (`0.1`, not `0.10000000000000001`), and
+non-finite values follow the dialect: refused by a strict writer, emitted as
+`NaN` / `Infinity` under `AXL_JSON_ALLOW_NAN_INF` — the same bit the reader
+accepts them under.
+
+From C++, `<axl/axl-json.hpp>` wraps all of this: `axl::json_document`,
+chaining `operator[]`, range-for over arrays and objects, and an
+`axl::json_writer` whose containers close themselves.
+
 ## AxlRadixTree — Radix Tree
 
 Compact prefix tree (radix tree) with string keys. Supports exact
@@ -2290,6 +2360,18 @@ remove with node collapse, and depth-first iteration. Lookup is O(k)
 where k is the key length, independent of the number of entries.
 
 Header: `<axl/axl-radix-tree.h>`
+
+**A NULL value is a value, not an absence.** A key's presence is tracked on
+its node rather than inferred from `value != NULL`, so `axl_radix_tree_insert(t,
+k, NULL)` is counted once by `axl_radix_tree_size`, visited by
+`axl_radix_tree_foreach`, and removable by `axl_radix_tree_remove` like any
+other entry; `value_free` is not called for it. Only `axl_radix_tree_lookup`
+cannot tell it from an absent key, because its `void *` return has no spare
+value to say so — use `axl_radix_tree_foreach` when the difference matters.
+
+Inferring presence from the value was a real defect, fixed 2026-08-17: a
+NULL-valued key was counted by `size` and reachable by nothing, so it could
+never be removed, and re-inserting it counted it again every time.
 
 ### Overview
 

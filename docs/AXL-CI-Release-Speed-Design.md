@@ -1,6 +1,7 @@
 # AXL-CI-Release-Speed-Design — cutting release wall time and Actions spend
 
-Status: ACCEPTED 2026-08-13, not yet implemented.
+Status: ACCEPTED 2026-08-13. Revised 2026-08-18 after measuring the mechanism
+— see §10, which narrows the scope and DROPS §4.2.
 Companion: `docs/AGT-CI-Cost-Handoff.md` in `aximcode/agt` — see §8.
 
 Every number here was measured on the v3.2.0 cut (2026-08-13) or read from the
@@ -192,6 +193,80 @@ The self-hosted runner in §4.1 serves both repos — the org already has a
 
 Details, measurements and a step-by-step for that repo:
 **`docs/AGT-CI-Cost-Handoff.md` in `aximcode/agt`** (commit `0d43f34`).
+
+## 10. REVISION 2026-08-18 — measured, and the scope narrows
+
+Re-read against the goal as stated: **turnaround AND cost**, both. Three
+findings change what is worth building.
+
+### 10.1 The serialisation is not a repo defect — it is `nproc`
+
+`run-integration.sh` already picks its own worker count:
+
+```sh
+_ncpu=$(nproc); if [[ "$_ncpu" -ge 3 ]]; then JOBS=$(( _ncpu - 2 )); else JOBS=1; fi
+```
+
+`ci.yml` passes no `-j`, so it takes that path. `JOBS=1` is what a 2-vCPU
+hosted runner *evaluates to*, not something CI does wrong. On an 8-core box
+the same unchanged line gives **`JOBS=6`**. §3's "the parallelism is built,
+gated, and unused" resolves itself the moment the job runs somewhere with
+cores — no workflow change, no shard matrix, no `plan` job.
+
+### 10.2 §4.2 (hosted sharding) is DROPPED, because it trades cost for wall
+
+§4.2's own table: the hosted 4-way shard is ~14 min wall at **~56 billable**,
+against ~42 billable today. That is a wall-time win bought with MORE spend —
+correct if wall time is the only goal, a regression once cost is a goal too.
+Each shard re-pays checkout, toolchain install and the staged build.
+
+Keep it only as an explicit opt-in for "this release is urgent and the box is
+down". Do not make it the default fallback.
+
+### 10.3 §4.3 and §4.4 are COMPLEMENTARY, and neither works alone
+
+This is the pair that serves both goals at once, because the cheapest and
+fastest run is the one never dispatched. They are easy to mistake for
+alternatives; they are not:
+
+- **§4.3's stamp** records that a SHA went green locally.
+- **The release commit is a DIFFERENT SHA.** `cut-release.sh` bumps `VERSION`,
+  `include/axl/axl-version.h` and `CHANGELOG.md`, so a naive stamp check fails
+  at precisely the moment it is needed.
+- **§4.4 is the bridge**: if `git diff --name-only parent..release` is a subset
+  of those three files, the parent's green carries to the release commit.
+
+Build them together or neither.
+
+### 10.4 Revised priority
+
+| step | turnaround | cost | verdict |
+|---|---|---|---|
+| §4.3 stamp + §4.4 parent reuse | skips the run entirely | 0 | **first** — no infrastructure |
+| self-hosted runner | 42 min -> ~9 | 42 billable -> 0 | **second** |
+| §4.1 plan job / fallback | prevents an indefinite block | ~1 billable/run | optional insurance |
+| §4.2 hosted sharding | -28 min wall | **+14 billable** | **dropped** (see 10.2) |
+
+§7's rollout order was right for this goal and this revision restores it. An
+earlier reading of this document reordered registration to first; that
+optimises wall time alone and is wrong once cost is a goal.
+
+### 10.5 What a self-hosted switch still requires
+
+Not obsolete, and small — but the first item is load-bearing:
+
+1. The QEMU job's `Install dependencies (apt)` and `Enable /dev/kvm access`
+   steps must become `if: runner.environment == 'github-hosted'`. Without the
+   guard, CI runs `apt-get` against a workstation.
+2. `concurrency: group: axl-qemu-${{ github.ref }}` so two dispatches cannot
+   contend for one machine.
+3. Availability: without §4.1's fallback, a release waits on the box being
+   awake. That is the real trade, and it is a choice rather than a defect.
+
+**Not written down anywhere: how to register the runner.** §7 step 4 names the
+action; no procedure exists in this repo for installing the Actions runner,
+labelling it `axl-qemu`, or running it as a service. That gap is the reason
+this step "cannot be validated from the repo alone".
 
 ## 9. Open questions
 

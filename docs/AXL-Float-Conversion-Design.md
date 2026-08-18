@@ -32,6 +32,14 @@ conversion list is enumerated and contains no `%f`/`%e`/`%g`;
 `grep -rln "strtod\|parse_double\|to_double\|atof" src/` returns nothing;
 and `axl-json.h` has `get_int`/`get_uint`/`get_bool` but no `get_double`.
 
+> **Historical, as of 2026-08-17.** All three confirmations were true when this
+> was written and the third no longer is: `axl_json_get_double` /
+> `axl_json_value_double` shipped with JSON P14 on top of the primitive this
+> document delivered, and `axl_json_double` / `axl_json_kv_double` completed the
+> mirror on the WRITE side with the C++ JSON API (AXL-Cxx-Design.md §9e). Kept
+> as the evidence that motivated the work rather than edited into a claim about
+> today.
+
 `docs/AXL-JSON-Design.md` §4 records the consequence as a deliberate current
 position: *"AXL is freestanding with no libm and has no double accessor …
 `NaN`/`Infinity` are retrievable only as text via `axl_json_get_number_str`."*

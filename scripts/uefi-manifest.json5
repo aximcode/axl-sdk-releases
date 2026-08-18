@@ -552,6 +552,13 @@
     {"name": "EXCEPT_AARCH64_FIQ",                  "kind": "define"},
     {"name": "EXCEPT_AARCH64_SERROR",               "kind": "define"},
     {"name": "MAX_AARCH64_EXCEPTION",               "kind": "define"},
+    // MUST precede EFI_SYSTEM_CONTEXT_X64: it is an INLINE 512-byte member of
+    // it, not a pointer. Without an entry here the generator substituted
+    // `void *FxSaveState`, which put every later field -- Rip, Rsp, Rbp and
+    // every GPR -- 504 bytes early, so axl_cpu_register_exception() handed
+    // consumers a garbage instruction pointer, zeroed registers and a zero
+    // frame pointer that yielded NO backtrace at all.
+    {"name": "EFI_FX_SAVE_STATE_X64",              "kind": "struct"},
     {"name": "EFI_SYSTEM_CONTEXT_X64",              "kind": "struct"},
     {"name": "EFI_SYSTEM_CONTEXT_AARCH64",          "kind": "struct"},
     {"name": "EFI_SYSTEM_CONTEXT",                  "kind": "union"},

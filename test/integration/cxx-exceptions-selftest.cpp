@@ -8,7 +8,9 @@
  * the whole opt-in: axl-cc sees the flag, selects the exceptions linker script
  * (which KEEPs .eh_frame and defines __eh_frame_start), adds -j .eh_frame -j
  * .gcc_except_table to objcopy, and links the toolchain's libstdc++/libsupc++/
- * libgcc plus AXL's glue objects instead of libaxl-cxx.a.
+ * libgcc plus AXL's glue objects -- which is what every C++ link carries
+ * since P4. What -fexceptions adds is landing pads in this file's own
+ * frames, so a throw here is CAUGHT instead of reaching std::terminate.
  *
  * NOTHING HERE CALLS axl_cxxrt_init(). That is deliberate and is half of what
  * this fixture proves: the frame table has to be registered before any throw,

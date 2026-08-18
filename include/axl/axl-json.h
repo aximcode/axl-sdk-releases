@@ -883,6 +883,51 @@ axl_json_get_string(
 );
 
 /**
+ * @brief How many bytes axl_json_get_string() would need for @a key's value.
+ *
+ * The DECODED length, excluding the NUL terminator — so a buffer of
+ * `*out_len + 1` is exactly enough and truncation becomes impossible.
+ *
+ * @par Why this exists
+ *
+ * axl_json_get_string() TRUNCATES and still returns true, which is the right
+ * default for a caller filling a fixed field and the wrong one for a caller
+ * that must not lose bytes. Without this there was no way to ask: a short
+ * answer is a perfectly good string and cannot be recognised as short from its
+ * own contents. A C caller wanting an exact allocation had to guess, and a C++
+ * caller could not return a `std::string` at all.
+ *
+ * @par It decodes, and that is the point
+ *
+ * The answer is the length AFTER escape decoding and after the reader's
+ * #AXL_JSON_UTF8_REPAIR / RAW mode is applied, because that is what
+ * axl_json_get_string() will write. It cannot be computed from the source
+ * span: `\uXXXX` shrinks six bytes to between one and four, a surrogate PAIR
+ * shrinks twelve to four, and JSON5's `\0` GROWS two bytes to the three of
+ * U+FFFD. Deriving it from axl_json_decode_string()'s documented `len * 3 / 2
+ * + 1` worst case is safe but not exact, and — the part that matters — that
+ * helper does not know the reader's UTF-8 mode, so a caller sizing from it and
+ * decoding with it would produce a DIFFERENT string from the one this reader
+ * hands back. One document must not have two answers to what a string says.
+ *
+ * The cost is a decode pass that measures instead of storing. Pair it with
+ * axl_json_get_string() and the string is decoded twice; that is the price of
+ * an exact size, and it is why the truncating call remains the default rather
+ * than being replaced.
+ *
+ * @return true if @a key exists and is a string, with @a out_len set; false
+ *     otherwise (missing key, not a string, or a NULL argument), leaving
+ *     @a out_len untouched. Accepts exactly what axl_json_get_string()
+ *     accepts.
+ */
+bool
+axl_json_get_string_len(
+    const AxlJsonReader *r,        ///< reader (object context)
+    const char          *key,      ///< key to look up
+    size_t              *out_len   ///< [out] decoded length, excluding the NUL
+);
+
+/**
  * @brief Extract an integer value from a parsed JSON object.
  *
  * Accepts the whole int64_t range, INT64_MIN included. A literal whose
@@ -1134,6 +1179,27 @@ axl_json_value_string(
 );
 
 /**
+ * @brief How many bytes axl_json_value_string() would need for this value.
+ *
+ * The own-value twin of axl_json_get_string_len(), and it keeps the mirror
+ * this family documents: each `value_X` accepts exactly what the matching
+ * `get_X` accepts, and `get_X` is axl_json_get_value() followed by the
+ * `value_X` below it. Read axl_json_get_string_len() for why the answer must
+ * be decoded rather than derived from the source span.
+ *
+ * This is the form an ARRAY ELEMENT needs — axl_json_array_next() hands back a
+ * sub-reader whose own value is the string.
+ *
+ * @return true if the reader's value is a string, with @a out_len set; false
+ *     otherwise, leaving @a out_len untouched.
+ */
+bool
+axl_json_value_string_len(
+    const AxlJsonReader *r,        ///< reader scoped to a value
+    size_t              *out_len   ///< [out] decoded length, excluding the NUL
+);
+
+/**
  * @brief Descend to any value by key, whatever its type.
  *
  * The by-key form of the sub-reader axl_json_get_object() and
@@ -1379,6 +1445,38 @@ axl_json_object_next(
     char              *key_buf,   ///< [out] DECODED key, or NULL to skip it
     size_t             key_size,  ///< size of @a key_buf, 0 when it is NULL
     AxlJsonReader     *value      ///< [out] borrowed reader for the value
+);
+
+/**
+ * @brief How many bytes the NEXT pair's key will need, without consuming it.
+ *
+ * A PEEK: it reports the key that the next axl_json_object_next() will yield,
+ * and advances nothing. So the sequence is size, allocate, then take —
+ * `axl_json_object_next()` with a buffer of `*out_len + 1` cannot truncate.
+ *
+ * @par Why a peek rather than a length on the pair just yielded
+ *
+ * axl_json_object_next() truncates a key that does not fit and still yields
+ * the pair, reporting it through axl_json_object_iter_error() — after the fact,
+ * with the pair already consumed and no way to re-read it. A caller who wants
+ * every key WHOLE therefore has to know the size BEFORE asking, which a
+ * report-afterwards accessor cannot provide and this can. It also needs no
+ * second decode of a key already delivered, and no new iterator state.
+ *
+ * Truncation stays the default and stays supported: a caller comparing keys
+ * against known short names should keep using a fixed buffer and check
+ * axl_json_object_iter_error(), which is cheaper than a peek per pair.
+ *
+ * @return true if a pair remains, with @a out_len set to its key's DECODED
+ *     length excluding the NUL; false at the end of the object, or on a NULL
+ *     argument, leaving @a out_len untouched. A false return is exactly the
+ *     condition that ends the `while (axl_json_object_next(...))` loop, so the
+ *     two agree about when the walk is over.
+ */
+bool
+axl_json_object_peek_key_len(
+    const AxlJsonObjectIter *iter,     ///< iterator, not advanced
+    size_t                  *out_len   ///< [out] decoded key length, no NUL
 );
 
 /**
@@ -3099,6 +3197,40 @@ axl_json_uint(
     uint64_t       v    ///< value
 );
 
+/**
+ * @brief Emit a number atom from a `double`.
+ *
+ * Completes the scalar mirror: the reader has had axl_json_get_double() and
+ * axl_json_value_double() since P14, and this was the one type a writer could
+ * not emit without formatting it by hand and splicing through axl_json_raw()
+ * — which puts JSON validity on the caller for the one type where it is
+ * genuinely hard.
+ *
+ * @par The shortest round-trippable spelling
+ *
+ * Formatted as `%.17g`, which on AXL's engine is exactly the shortest form
+ * that reads back identical — not the 17 digits it looks like. axl_dtoa()
+ * (Grisu2) produces the shortest digit string, at most 17 of them; asking for
+ * 17 significant digits therefore rounds NOTHING (the engine's `round_to_sig`
+ * returns immediately when the requested count is not fewer than it already
+ * has), and `%g` then picks the shorter of fixed/exponential and trims
+ * trailing zeros. So `0.1` emits as `0.1`, not `0.10000000000000001`.
+ * RapidJSON and yyjson emit shortest-round-trip for the same reason.
+ *
+ * @par Non-finite values follow the DIALECT
+ *
+ * RFC 8259 has no NaN and no Infinity, so under a strict writer they are a
+ * structural error: the sticky flag is set and nothing is emitted, rather than
+ * a token no conforming reader would accept. With #AXL_JSON_ALLOW_NAN_INF they
+ * emit as `NaN`, `Infinity` and `-Infinity` — which is what the READER accepts
+ * under the same bit, one flag honored in both directions.
+ */
+void
+axl_json_double(
+    AxlJsonWriter *w,   ///< writer
+    double         v    ///< value; non-finite needs #AXL_JSON_ALLOW_NAN_INF
+);
+
 /// Emit a boolean atom.
 void
 axl_json_bool(
@@ -3193,6 +3325,15 @@ axl_json_kv_uint(
     AxlJsonWriter *w,
     const char    *key,
     uint64_t       value
+);
+
+/// `"key":1.5` — double. See axl_json_double() for the spelling and the
+/// non-finite rule.
+void
+axl_json_kv_double(
+    AxlJsonWriter *w,     ///< writer
+    const char    *key,   ///< object key
+    double         value  ///< value
 );
 
 /// `"key":true|false` — boolean.

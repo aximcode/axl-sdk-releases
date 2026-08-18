@@ -31,6 +31,16 @@ typedef struct RadixNode {
     char              *edge;
     size_t             edge_len;
     void              *value;
+    /* Whether this node TERMINATES a stored key, as opposed to being an
+       interior node on the way to one.
+
+       Tracked explicitly because it used to be inferred from `value != NULL`,
+       and NULL is a value a caller may legitimately store. Under the old rule
+       `axl_radix_tree_insert(t, k, NULL)` was counted by the size but
+       reachable by nothing: lookup reported it absent, remove refused it, and
+       foreach skipped it — so the key could never be removed while size()
+       went on counting it, and inserting it twice counted it twice. */
+    bool               has_value;
     struct RadixNode **children;
     size_t             child_count;
     size_t             child_cap;
@@ -99,7 +109,10 @@ radix_node_free(
         radix_node_free(node->children[i], value_free);
     }
 
-    if (value_free != NULL && node->value != NULL) {
+    /* has_value AND non-NULL: a stored NULL is a real entry, but handing it
+       to a destructor written for real values is not what the caller asked
+       for. Every other presence test in this file is has_value alone. */
+    if (value_free != NULL && node->has_value && node->value != NULL) {
         value_free(node->value);
     }
 
@@ -249,6 +262,7 @@ axl_radix_tree_insert(
             }
 
             leaf->value = value;
+            leaf->has_value = true;
             if (radix_node_add_child(node, leaf) != 0) {
                 radix_node_free(leaf, NULL);
                 return AXL_ERR;
@@ -354,6 +368,7 @@ axl_radix_tree_insert(
         if (pos + match_len == key_len) {
             /* Key ends at the split point — split gets the value */
             split->value = value;
+            split->has_value = true;
             tree->size++;
             return AXL_OK;
         }
@@ -367,6 +382,7 @@ axl_radix_tree_insert(
         }
 
         leaf->value = value;
+        leaf->has_value = true;
         if (radix_node_add_child(split, leaf) != 0) {
             radix_node_free(leaf, NULL);
             return AXL_ERR;
@@ -376,9 +392,13 @@ axl_radix_tree_insert(
         return AXL_OK;
     }
 
-    /* Key fully consumed at current node — set/replace value */
-    if (node->value != NULL) {
-        if (tree->value_free != NULL) {
+    /* Key fully consumed at current node — set/replace value.
+
+       has_value, not `value != NULL`: the old test counted a re-inserted
+       NULL as a brand new entry every time, and skipped the destructor for a
+       replaced one. */
+    if (node->has_value) {
+        if (tree->value_free != NULL && node->value != NULL) {
             tree->value_free(node->value);
         }
     } else {
@@ -386,6 +406,7 @@ axl_radix_tree_insert(
     }
 
     node->value = value;
+    node->has_value = true;
     return AXL_OK;
 }
 
@@ -425,7 +446,9 @@ axl_radix_tree_lookup(
         node = child;
     }
 
-    return node->value;
+    /* An interior node is not a hit even though its value is NULL either way:
+       stated through has_value so the intent survives a future change. */
+    return node->has_value ? node->value : NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,11 +472,16 @@ axl_radix_tree_lookup_prefix(
 
     void *last_value = NULL;
     size_t last_pos = 0;
+    /* Tracked apart from last_value, which cannot distinguish "matched a key
+       whose value is NULL" from "matched nothing" -- the same reason
+       has_value exists on the node. */
+    bool   matched = false;
 
     /* Root value counts as a prefix match for any key */
-    if (node->value != NULL) {
+    if (node->has_value) {
         last_value = node->value;
         last_pos = 0;
+        matched = true;
     }
 
     while (pos < key_len) {
@@ -475,13 +503,17 @@ axl_radix_tree_lookup_prefix(
         pos += child->edge_len;
         node = child;
 
-        if (node->value != NULL) {
+        if (node->has_value) {
             last_value = node->value;
             last_pos = pos;
+            matched = true;
         }
     }
 
-    if (last_value != NULL && suffix != NULL) {
+    /* @a suffix is written whenever a key MATCHED, even if its value is NULL.
+       Keying this on last_value would leave the caller's suffix untouched on
+       a genuine match, which reads as no-match. */
+    if (matched && suffix != NULL) {
         *suffix = key + last_pos;
     }
 
@@ -534,16 +566,18 @@ axl_radix_tree_remove(
         }
     }
 
-    if (node->value == NULL) {
+    if (!node->has_value) {
         return false;
     }
 
-    /* Clear the value */
-    if (tree->value_free != NULL) {
+    /* Clear the value. Guarded on non-NULL as well: a stored NULL is a real
+       entry to remove, but not one to hand to a destructor. */
+    if (tree->value_free != NULL && node->value != NULL) {
         tree->value_free(node->value);
     }
 
     node->value = NULL;
+    node->has_value = false;
     tree->size--;
 
     /* Collapse from leaf upward (skip root at path[0]) */
@@ -551,7 +585,7 @@ axl_radix_tree_remove(
         RadixNode *cur = path[i - 1];
         RadixNode *parent = path[i - 2];
 
-        if (cur->value != NULL) {
+        if (cur->has_value) {
             break;
         }
 
@@ -667,7 +701,9 @@ foreach_walk(
 
     ctx->key_buf[ctx->key_len] = '\0';
 
-    if (node->value != NULL) {
+    /* has_value: a visit count that disagreed with axl_radix_tree_size()
+       was one of the symptoms of inferring presence from the value. */
+    if (node->has_value) {
         ctx->func(ctx->key_buf, node->value, ctx->data);
     }
 

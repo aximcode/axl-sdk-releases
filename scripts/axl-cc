@@ -81,6 +81,9 @@ RUNTIME="full"
 ENTRY=""
 OUTPUT=""
 VERBOSE=false
+# Drop the .eh_frame KEEP and replace __cxa_throw with a diagnose-and-exit.
+# ~18% of a C++ image. See the guard below and src/cxxrt/axl-cxxrt-nothrow.cpp.
+NO_EH_FRAME=false
 RUN=false
 RUN_ARGS=()
 SOURCES=()
@@ -167,6 +170,7 @@ while [[ $# -gt 0 ]]; do
                         RUN_ARGS+=("$1"); shift
                     done ;;
         -o)         OUTPUT="$2"; OUTPUT_USER_SET=true; shift 2 ;;
+        --no-eh-frame) NO_EH_FRAME=true; shift ;;
         --verbose|-v) VERBOSE=true; shift ;;
         # Linker passthrough (gcc convention). MUST precede -W* below, or
         # -Wl,... is swallowed as a compile flag. -Wl,a,b -> a b to the ld link.
@@ -222,8 +226,9 @@ for files with non-standard extensions.
 C++ compilation requires the bare-metal toolchain on BOTH arches
 (install via `axl-install-toolchain aa64` / `... x64`).
 Set AXL_AA64_GXX / AXL_X64_GXX to override either.  @PROG@
-auto-appends libaxl-cxx.a to the link line when any C++ source
-is compiled; pure-C builds skip this.
+auto-appends the toolchain's libstdc++/libsupc++ and AXL's C++
+runtime glue when any C++ reaches the link; pure-C builds skip
+both.
 
 Toolchain selection (environment, not flags -- the Makefile takes
 the same ones, so a consumer build and an SDK build agree):
@@ -311,13 +316,11 @@ Options:
                         compile error. Catch at your own boundary and
                         return a status.
   (C++ RTTI)            Pass -frtti to enable typeid and dynamic_cast.
-                        That is the one case where the toolchain's
-                        libstdc++.a is named on the link line, for the
-                        type_info vtables and __dynamic_cast, which live
-                        in libsupc++. Off by default: the type_info
-                        objects cost image size for every polymorphic
-                        class, and the default link stays self-contained
-                        without them.
+                        Off by default: the type_info objects cost image
+                        size for every polymorphic class. It needs no
+                        extra library since P4 -- every C++ link already
+                        carries libstdc++/libsupc++, where the type_info
+                        vtables and __dynamic_cast live.
   -x LANG               Force language for subsequent sources: 'c' or
                         'c++'. Default is per-file by extension.
   -c                    Compile only; skip the link / objcopy /
@@ -351,6 +354,25 @@ Options:
                         path from a scratch object axl-cc then deletes.
   -Wl,<opt>[,<opt>...]  Forward option(s) to the linker (ld)
   -Xlinker <opt>        Forward a single option to the linker (ld)
+  --no-eh-frame         Drop the unwind tables from a C++ link.
+                        Saving = .eh_frame + a constant ~13.5 KB (x64)
+                        / ~16.5 KB (aa64) of collected throw path.
+                        .eh_frame scales with YOUR code on x64 and is
+                        constant (~8.3 KB) on aa64, so expect ~13% at
+                        any size on x64 and ~25 KB FLAT on aa64.
+                        Measure rather than budget from a percentage.
+                        For a C++ image that uses neither exceptions
+                        nor iostreams and never needs to CATCH.
+                        A throw still halts diagnosably -- it prints
+                        the type and what() and exits -- because
+                        __cxa_throw is intercepted before the unwinder
+                        is entered. Without that interception, dropping
+                        the tables does not degrade the message, it
+                        takes a CPU fault and WEDGES the machine.
+                        REFUSED together with -fexceptions: no catch
+                        block could run, and an image whose handlers
+                        are silently dead is a correctness failure
+                        rather than the size trade this flag offers.
   -v, --verbose         Print compiler/linker commands
   --version             Show version and build info
   -h, --help            Show this help
@@ -426,6 +448,7 @@ if [[ -n "$SERVICE_NAME" ]]; then
     [[ "$BUILD"   == "debug" ]]   && fwd+=("--debug")
     [[ "$RUNTIME" == "minimal" ]] && fwd+=("--minimal-runtime")
     [[ "$VERBOSE" == "true" ]]    && fwd+=("--verbose")
+    [[ "$NO_EH_FRAME" == "true" ]] && fwd+=("--no-eh-frame")
     # --hosted must survive the re-invocation, or `--service NAME --hosted`
     # silently builds both passes freestanding and fails at
     # bits/requires_hosted.h with no mention of the flag the caller passed.
@@ -642,7 +665,7 @@ detect_lang() {
 }
 
 # Quick scan: which languages are in the source list?  HAS_CPP drives
-# toolchain validation + libaxl-cxx.a auto-link below; both drive the -std
+# toolchain validation and folds into CXX_LINK below; both drive the -std
 # reachability check that follows.  Cheap loop — sources are few.
 HAS_CPP=false
 HAS_C=false
@@ -823,8 +846,8 @@ fi
 # link"; the link-side prerequisite moved to CXX_LINK below, which is derived
 # from the objects and so is right for a staged build too.
 #
-# The one remaining link-time use of $GXX_BIN is `-print-file-name=libstdc++.a`
-# on the -frtti path, and RTTI_LINK is not known until after the compile step.
+# The link-time uses of $GXX_BIN are the `-print-file-name` lookups for
+# libstdc++/libsupc++, and CXX_LINK is not known until after the compile step.
 # That path reports a missing archive by name, which is the same information.
 if [[ "$HAS_CPP" == "true" ]]; then
     if [[ -z "$GXX_BIN" ]] || { [[ ! -x "$GXX_BIN" ]] && ! command -v "$GXX_BIN" &>/dev/null; }; then
@@ -1170,43 +1193,19 @@ SO_FILE="$TMPDIR/output.so"
 # missing-symbol bugs surface at build time rather than as
 # RIP-points-at-nonsense crashes in the field. The AXL library's own
 # build already uses this flag; consumer-facing axl-cc was missing it.
-# When any C++ source was compiled, prepend libaxl-cxx.a before
-# libaxl.a so its operator new/delete and __cxa_pure_virtual
-# definitions satisfy C++-emitted references; libaxl.a then satisfies
-# axl-cxxabi-ops.cpp's own undefined references (axl_malloc / axl_free
-# / axl_print / axl_exit).  Pure-C builds skip libaxl-cxx.a entirely.
-#
-# --hosted needs NO libstdc++.a. It used to name the toolchain's archive for
-# the handful of members the associative containers pull out of line, and
-# those were measured down to exactly two -- tree.o and hash_bytes.o.
-# src/runtime/axl-cxx-rbtree.cpp and axl-cxx-hash.cpp supply both, so the
-# archive is off the line entirely.
-#
-# That is not a size optimisation. Redistributing libstdc++ is the ONE act the
-# GCC Runtime Library Exception does not cover (shipping the produced .efi is
-# unambiguously fine; shipping the runtime library as a library is not), so
-# not linking it is what lets the SDK be self-contained without taking on
-# GPL-3 obligations. See AXL-Cxx-Design.md section 8.
-#
-# It also removes the --hosted prerequisite that a matching libstdc++-static
-# be installed, which was a real setup failure on both arches.
-#
-# The archive is selected from the OBJECTS, not from a flag. `--hosted` used to
-# carry this for the staged build -- `axl-c++ -c a.cpp` then `axl-c++ a.o -o
-# app.efi`, where the link half sees no .cpp source at all -- and T3 retires
-# the flag, so the job moves to the same nm scan RTTI_LINK already does one
-# symbol class along (CXX_LINK below).
-#
-# That is not merely a replacement, it CLOSES a gap: the staged flow without
-# --hosted was already broken, and failed on an undefined `operator new` that
-# named no flag. Over-eagerness is harmless here because this is an ARCHIVE --
-# a member arrives only for a symbol still undefined, so a C-only link that
-# somehow reached this branch would pull nothing and produce the same image.
+# When any C++ reaches the link, it also carries the toolchain's
+# libstdc++/libsupc++ and AXL's four cxxrt glue objects; a pure-C link takes
+# neither. See the P4 block below for what that swap replaced and why the
+# choice is made from the OBJECTS rather than from a flag.
 #
 # ONE nm pass over everything reaching the link -- freshly compiled objects and
-# any handed to us -- feeding both questions below. A failure to read them
-# leaves both false, which is the pre-existing behaviour: this can only ADD
-# detection, never remove it.
+# any handed to us. A failure to read them leaves the answer false, which is
+# the pre-existing behaviour: this can only ADD detection, never remove it.
+# The `--hosted` flag used to carry the same job for the staged build
+# (`axl-c++ -c a.cpp` then `axl-c++ a.o -o app.efi`, where the link half sees
+# no .cpp source at all); T3 retired the flag and the scan replaced it, which
+# also CLOSED a gap -- that staged flow was already broken, and failed on an
+# undefined `operator new` that named no flag.
 _link_objs=(${OBJS[@]+"${OBJS[@]}"} ${PREBUILT_OBJS[@]+"${PREBUILT_OBJS[@]}"})
 _link_undef=""
 if [[ ${#_link_objs[@]} -gt 0 ]]; then
@@ -1219,167 +1218,179 @@ CXX_LINK="false"
 if printf '%s\n' "$_link_undef" | grep -q "^ *U _Z\|^ *U __cxa_\| _Z\| __cxa_"; then
     CXX_LINK="true"
 fi
-
-# EXCEPTIONS. Derived the same way -frtti is, and for the same reason: the flag
-# only ever appears on the COMPILE line, so a staged build (`axl-c++ -c
-# -fexceptions a.cpp` then `axl-c++ a.o -o app.efi`) reaches the link with an
-# empty CFLAGS_EXTRA and would otherwise silently get the non-exceptions script
-# -- which fails at RUNTIME, on the first throw, not at link.
-#
-# There is no --exceptions flag on purpose. -fexceptions is a real gcc flag the
-# caller already has to pass to get landing pads emitted (the C++ default here
-# is -fno-exceptions, and consumer flags are appended last so it wins), so a
-# second AXL-specific spelling would be a way to get the two out of step.
-# __gxx_personality_v0 is the marker: gcc emits a reference to it from every
-# function with a landing pad, and from nothing else.
-#
-# Gated on there being C++ in the link at all. -fexceptions is meaningful to
-# gcc for C too (it emits landing pads so a C frame can be unwound THROUGH),
-# but AXL registers the frame table from the C++ ABI object, which a pure-C
-# link never pulls. Ungated, `axl-cc -fexceptions hello.c` grew the image 47 KB
-# -> 54 KB with a .eh_frame that NOTHING registers: cost with no capability.
-EH_LINK="false"
-if [[ "$HAS_CPP" == "true" || "$CXX_LINK" == "true" ]]; then
-    if printf '%s\n' ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} | grep -qx -- "-fexceptions"; then
-        EH_LINK="true"
-    elif printf '%s\n' "$_link_undef" | grep -q "__gxx_personality"; then
-        EH_LINK="true"
-    fi
+# A .cpp on THIS command line settles it without consulting nm. Folded in here
+# rather than tested alongside CXX_LINK at each use, so there is ONE answer to
+# "is this a C++ link" — the two were spelled `HAS_CPP || CXX_LINK` at three
+# separate sites, which is three chances to add a fourth and get it wrong.
+if [[ "$HAS_CPP" == "true" ]]; then
+    CXX_LINK="true"
 fi
 
+# ONE C++ LINK SHAPE (P4, AXL-Libc-Substrate-Design.md §4d).
+#
+# There used to be two, selected by whether the caller passed -fexceptions:
+# a DEFAULT link carrying libaxl-cxx.a and no libstdc++ at all, and an
+# EXCEPTIONS link carrying the toolchain's libstdc++/libsupc++ instead. They
+# were alternatives rather than companions -- 53 of libaxl-cxx.a's 56 symbols
+# collide with libstdc++ -- so the two could never appear together, and
+# picking the wrong one failed at RUNTIME on the first throw rather than at
+# link.
+#
+# P4 deletes libaxl-cxx.a and keeps the exceptions shape for every C++ link.
+# What that buys is <iostream>, <sstream> and <fstream>, which no set of
+# hand-written substitutes was ever going to reach; what it costs is measured
+# and accepted (+46,928 .text on sdk/examples/containers.cpp, x64). So
+# -fexceptions is now purely a COMPILE-side flag -- it decides whether the
+# caller's own frames get landing pads -- and no longer selects a link.
+#
+# The glue AXL still owes is OBJECTS, not an archive, and that is load-bearing
+# rather than stylistic. axl-cxxrt-terminate.o preempts libstdc++'s
+# vterminate.o, whose __gnu_cxx::__verbose_terminate_handler drags
+# __cxa_demangle and newlib's stdio in for ~112 KB and then prints NOTHING
+# under UEFI. From an archive that member could still be pulled; from an
+# object it cannot. Same reasoning as axl-cxxrt-alloc.o's sbrk. See
+# src/cxxrt/axl-cxxrt-terminate.cpp.
 CXX_LIB_ARGS=()
-if [[ "$HAS_CPP" == "true" || "$CXX_LINK" == "true" ]]; then
-    # libaxl-cxx.a must have been installed at SDK build time
-    # (./scripts/install.sh --cpp). Without it the link fails on unresolved
-    # operator new/delete. Checked HERE rather than beside the compiler check,
-    # because it is a LINK prerequisite: the staged flow reaches the link with
-    # no .cpp source at all, and used to get ld's raw undefined-symbol list.
-    if [[ "$EH_LINK" == "true" ]]; then
-        # THE EXCEPTIONS LINK, and it is the ALTERNATIVE to libaxl-cxx.a
-        # rather than an addition to it. That archive exists to supply what a
-        # firmware image otherwise lacks -- operator new/delete, the
-        # std::__throw_* halts, _Prime_rehash_policy -- and the toolchain's own
-        # libstdc++/libsupc++ define all of it properly, with real throws
-        # instead of halts. The two cannot both appear: 51 of libaxl-cxx.a's
-        # 61 symbols collide.
-        #
-        # The glue AXL still owes is two OBJECTS, not an archive, and that is
-        # load-bearing rather than stylistic. axl-cxxrt-alloc.o overrides
-        # newlib's malloc/free/realloc/calloc/memalign so every C++ allocation
-        # stays inside AXL's tracker -- and a definition in an ARCHIVE would
-        # not win, because libc.a's malloc.o gets pulled for its other symbols
-        # and multiply-defines them. A definition in an object keeps the
-        # matching libc member out of the link entirely. (Measured: linking
-        # them from libaxl-cxxrt.a fails with exactly that.)
-        for _ehobj in axl-cxxrt-alloc.o axl-cxxrt-eh.o axl-cxxrt-stubs.o; do
-            if [[ ! -f "$LIB_DIR/$_ehobj" ]]; then
-                echo "ERROR: -fexceptions needs $LIB_DIR/$_ehobj, which this" >&2
-                echo "       SDK was built without. Rebuild with C++ support:" >&2
-                echo "         ./scripts/install.sh --cpp" >&2
-                rm -rf "$TMPDIR"; exit 1
+# --no-eh-frame AND exceptions is a CORRECTNESS failure, not a size trade, so
+# it is refused rather than warned about. A handler in a --no-eh-frame image
+# can never run -- nothing unwinds to it -- and the throw would reach the
+# interceptor in axl-cxxrt-nothrow.o and exit, silently skipping every catch
+# block the source contains. That is the one outcome this flag must not be
+# able to produce.
+#
+# Two sources, because a staged build reaches the link with no source at all:
+# the flag on this command line, and a pre-built object referencing
+# __gxx_personality_v0 (which -fexceptions is what emits).
+if [[ "$NO_EH_FRAME" == "true" ]]; then
+    _eh_reason=""
+    for _f in ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"}; do
+        [[ "$_f" == "-fexceptions" ]] && _eh_reason="-fexceptions was passed"
+    done
+    if [[ -z "$_eh_reason" && ${#PREBUILT_OBJS[@]} -gt 0 ]]; then
+        for _o in "${PREBUILT_OBJS[@]}"; do
+            if "${CROSS}nm" -u "$_o" 2>/dev/null | grep -q '__gxx_personality_v0'; then
+                _eh_reason="$_o references __gxx_personality_v0"
+                break
             fi
-            CXX_LIB_ARGS+=("$LIB_DIR/$_ehobj")
         done
-    else
-        if [[ ! -f "$LIB_DIR/libaxl-cxx.a" ]]; then
-            echo "ERROR: this link contains C++ but $LIB_DIR/libaxl-cxx.a is missing." >&2
-            echo "       Rebuild the SDK with C++ support:" >&2
+    fi
+    if [[ -n "$_eh_reason" ]]; then
+        echo "ERROR: --no-eh-frame cannot be combined with exceptions" >&2
+        echo "       ($_eh_reason)." >&2
+        echo "" >&2
+        echo "  --no-eh-frame drops the unwind tables, so no catch block in" >&2
+        echo "  the image can ever run: a throw would print its type and exit" >&2
+        echo "  instead of reaching your handler. Refusing rather than" >&2
+        echo "  building an image whose exception handling is silently dead." >&2
+        echo "" >&2
+        echo "  Drop one of the two. Without -fexceptions a throw out of" >&2
+        echo "  libstdc++ still HALTS diagnosably; it just cannot be caught." >&2
+        rm -rf "${TMPDIR:-}" 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+if [[ "$CXX_LINK" == "true" ]]; then
+    # Checked HERE rather than beside the compiler check, because these are
+    # LINK prerequisites: the staged flow (`axl-c++ -c a.cpp` then `axl-c++
+    # a.o -o app.efi`) reaches the link with no .cpp source at all, and used
+    # to get ld's raw undefined-symbol list instead of a message naming the
+    # missing install step.
+    # --no-eh-frame swaps the frame-table registrar for the throw
+    # interceptor. They are mutually exclusive: axl-cxxrt-eh.o references
+    # __eh_frame_start, which only the exceptions script defines, so keeping
+    # it alongside the default script is a hard --no-undefined link error --
+    # which is why this is an object-set change and not only a script change.
+    _cxxrt_eh_obj=axl-cxxrt-eh.o
+    [[ "$NO_EH_FRAME" == "true" ]] && _cxxrt_eh_obj=axl-cxxrt-nothrow.o
+    for _ehobj in axl-cxxrt-alloc.o "$_cxxrt_eh_obj" axl-cxxrt-stubs.o \
+                  axl-cxxrt-terminate.o; do
+        if [[ ! -f "$LIB_DIR/$_ehobj" ]]; then
+            echo "ERROR: this link contains C++ and needs $LIB_DIR/$_ehobj," >&2
+            echo "       which this SDK was built without. Rebuild with C++" >&2
+            echo "       support:" >&2
             echo "         ./scripts/install.sh --cpp" >&2
-            rm -rf "$TMPDIR"
-            exit 1
+            rm -rf "$TMPDIR"; exit 1
         fi
-        CXX_LIB_ARGS+=("$LIB_DIR/libaxl-cxx.a")
-    fi
+        CXX_LIB_ARGS+=("$LIB_DIR/$_ehobj")
+    done
 fi
-# Normally empty: nothing from libstdc++.a is linked any more.
+# A C++ LINK NEEDS THE WHOLE MATCHED SET, not just libstdc++: the unwinder is
+# in libgcc.a, the ABI layer and the emergency pool in libsupc++.a, and
+# libstdc++ reaches libc/libm for memcpy, ceil and the syscall stubs libnosys
+# answers. All resolved through $GXX_BIN rather than assembled from a path, so
+# an AXL_*_GXX override moves the libraries with the compiler.
 #
-# The ONE exception is -frtti. typeid and dynamic_cast need
-# __cxxabiv1::__class_type_info's vtables and __dynamic_cast, which live in
-# libsupc++ inside libstdc++.a, and those are a much larger surface than the
-# eleven functions rbtree+hash replaced. RTTI is opt-in and off by default, so
-# the DEFAULT link stays self-contained; a consumer who asks for -frtti opts
-# into needing an installed libstdc++ on their own machine.
-#
-# That distinction is the whole point: what the GCC Runtime Library Exception
-# does not cover is US REDISTRIBUTING the runtime library. A consumer linking
-# their own installed copy is not that, and the .efi they produce is Target
-# Code, which RLE section 1 covers unambiguously.
-STDCXX_LIB=""
-# RTTI_LINK is true when -frtti is on THIS command line, or when any input
-# object carries an RTTI artefact. The flag only ever appears on the COMPILE
-# line, so the staged flow this script documents --
-#   axl-c++ -c -frtti a.cpp -o a.o
-#   axl-c++           a.o   -o app.efi
-# -- reaches the link with an empty CFLAGS_EXTRA and used to fail on mangled
-# __dynamic_cast / __class_type_info names that never mention the flag.
-RTTI_LINK="false"
-if printf '%s\n' ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} | grep -qx -- "-frtti"; then
-    RTTI_LINK="true"
-else
-    # Reuses the single nm pass above rather than running a second one.
-    if printf '%s\n' "$_link_undef" \
-         | grep -q "__class_type_info\|__dynamic_cast"; then
-        RTTI_LINK="true"
-    fi
-fi
-# The EXCEPTIONS link needs the whole matched set, not just libstdc++: the
-# unwinder is in libgcc.a, the ABI layer and the emergency pool in libsupc++.a,
-# and libstdc++ reaches libc/libm for memcpy, ceil and the syscall stubs
-# libnosys answers. All resolved through $GXX_BIN rather than assembled from a
-# path, so an AXL_*_GXX override moves the libraries with the compiler.
+# -frtti needs nothing extra now, and that IS the change. typeid and
+# dynamic_cast want __cxxabiv1::__class_type_info's vtables and
+# __dynamic_cast from libsupc++, which used to make -frtti the one flag that
+# put libstdc++.a on the line; every C++ link carries it since P4, so the
+# separate RTTI_LINK detection and its diagnostic are gone.
 #
 # NO libnosys.a, deliberately. It supplies exactly the syscall stubs newlib's
 # reentrant layer needs -- and every one of its objects carries a
 # `.gnu.warning.<sym>` section, so a SUCCEEDING link emits ten "not
 # implemented and will always fail" lines. axl-cxxrt-stubs.o answers the same
-# set quietly. axl-cxxrt-alloc.o's sbrk (returning -1) is what keeps newlib's
-# own heap from ever obtaining a byte, which is a MEMORY SAFETY invariant, not
-# tidiness: see that file.
+# set quietly.
+#
+# THE C LIBRARY IS ON EVERY LINK (P3, AXL-Libc-Substrate-Design.md §4d).
+#
+# It used to arrive only on the -fexceptions path, which is why `printf` and
+# `malloc` were unavailable to plain C: a C link was libaxl.a and nothing else.
+# libstdc++/libsupc++ stay C++-only -- those are the C++ runtime, and a C image
+# has no use for them.
+#
+# Resolved through the C driver for a C link and the C++ one for a C++ link,
+# because a C-only SDK need not have a C++ toolchain installed at all and
+# asking $GXX_BIN would fail for a consumer who never wanted one.
 EH_LIBS=()
-if [[ "$EH_LINK" == "true" ]]; then
-    for _ehlib in libstdc++.a libsupc++.a libc.a libm.a libgcc.a; do
-        _p="$("$GXX_BIN" -print-file-name="$_ehlib" 2>/dev/null || true)"
-        if [[ ! -f "$_p" ]]; then
-            echo "ERROR: -fexceptions needs $_ehlib from the bare-metal" >&2
-            echo "       toolchain; '${GXX_BIN:-<none configured>}' could not" >&2
-            echo "       locate it (got: '${_p:-<nothing>}')." >&2
-            echo "       Install it via 'axl-install-toolchain $ARCH'." >&2
-            rm -rf "$TMPDIR"; exit 1
-        fi
-        EH_LIBS+=("$_p")
-    done
+_libsrc="$GCC_BIN"
+_libwhy="the C library"
+_libfix="axl-install-toolchain $ARCH"
+_liblist=(libc.a libm.a libgcc.a)
+if [[ "$CXX_LINK" == "true" ]]; then
+    _libsrc="$GXX_BIN"
+    _libwhy="the C++ runtime"
+    _liblist=(libstdc++.a libsupc++.a libc.a libm.a libgcc.a)
 fi
-if [[ "$RTTI_LINK" == "true" && "$EH_LINK" != "true" ]]; then
-    STDCXX_LIB="$("$GXX_BIN" -print-file-name=libstdc++.a 2>/dev/null || true)"
-    if [[ ! -f "$STDCXX_LIB" ]]; then
-        # Names -frtti alone: this branch is gated on RTTI_LINK, which is
-        # nm-derived, so it also fires for a staged link whose OBJECT carries
-        # RTTI and whose command line mentions no flag at all.
-        echo "ERROR: this link needs libstdc++.a for the RTTI type_info" >&2
-        echo "       vtables and __dynamic_cast (-frtti, on this command line" >&2
-        echo "       or baked into an input object); could not locate it via" >&2
-        echo "       '${GXX_BIN:-<no C++ compiler configured>}'" >&2
-        echo "       (got: '${STDCXX_LIB:-<nothing>}')" >&2
-        if [[ "$ARCH" == "aa64" ]]; then
-            echo "       Install the ARM bare-metal toolchain via 'axl-install-toolchain aa64'" >&2
-        else
-            echo "       On Fedora/RHEL: dnf install libstdc++-static" >&2
-        fi
-        echo "       Without -frtti no libstdc++ is needed at all." >&2
+for _ehlib in "${_liblist[@]}"; do
+    _p="$("$_libsrc" -print-file-name="$_ehlib" 2>/dev/null || true)"
+    if [[ ! -f "$_p" ]]; then
+        echo "ERROR: $_libwhy needs $_ehlib from the bare-metal" >&2
+        echo "       toolchain; '${_libsrc:-<none configured>}' could not" >&2
+        echo "       locate it (got: '${_p:-<nothing>}')." >&2
+        echo "       Install it via '$_libfix'." >&2
         rm -rf "$TMPDIR"; exit 1
     fi
-    CXX_LIB_ARGS+=("$STDCXX_LIB")
-fi
-# The group costs a re-scan and is only needed when a third, mutually
-# dependent archive is present. With just libaxl-cxx.a and libaxl.a the order
-# below is already correct: libaxl-cxx.a references axl_malloc, libaxl.a
-# satisfies it.
-LIB_GROUP_OPEN=()
-LIB_GROUP_CLOSE=()
-if [[ -n "$STDCXX_LIB" || "$EH_LINK" == "true" ]]; then
-    LIB_GROUP_OPEN=(--start-group)
-    LIB_GROUP_CLOSE=(--end-group)
-fi
+    EH_LIBS+=("$_p")
+done
+
+# THE PORTING LAYER TRAVELS WITH THE C LIBRARY, and this is load-bearing rather
+# than tidy. newlib defines none of write/read/open/close/lseek/fstat, and
+# `malloc` reaches dlmalloc which grows through `sbrk` -- all of which live in
+# AXL's glue objects. Without them on a C link:
+#
+#   x64   an undefined reference, which is at least loud
+#   aa64  WORSE -- ARM's newlib ships its own sbrk/write/read that call the
+#         _r forms, which call back to these names. Two halves of a mutual
+#         recursion, i.e. a stack overflow at the first malloc rather than a
+#         link error.
+#
+# Named as OBJECTS, for the displacement reason documented below.
+for _pobj in axl-cxxrt-alloc.o axl-cxxrt-stubs.o; do
+    if [[ -f "$LIB_DIR/$_pobj" ]]; then
+        case " ${CXX_LIB_ARGS[*]-} " in
+            *" $LIB_DIR/$_pobj "*) ;;
+            *) CXX_LIB_ARGS+=("$LIB_DIR/$_pobj") ;;
+        esac
+    fi
+done
+# ALWAYS a group: libc.a is on every link (P3), and libaxl.a <-> libc.a is
+# genuinely mutually dependent -- libaxl's vendored code calls memcpy, while
+# newlib's stdio calls back into AXL's porting layer. One pass in either order
+# leaves something undefined.
+LIB_GROUP_OPEN=(--start-group)
+LIB_GROUP_CLOSE=(--end-group)
 
 # --version-script localizes every symbol but the entry point. `-shared`
 # otherwise exports all globals into the dynamic symbol table and treats them
@@ -1391,22 +1402,39 @@ VERSION_SCRIPT_ARGS=()
 EFI_VER="$SDK_DIR/lib/axl/efi-localize.ver"
 [[ -f "$EFI_VER" ]] && VERSION_SCRIPT_ARGS+=(--version-script "$EFI_VER")
 
-# The EXCEPTIONS script differs from the default in one place: it KEEPs
-# .eh_frame and defines __eh_frame_start. It is a separate file rather than a
-# KEEP() in the shared one because KEEP costs a C-only image +16.8% for tables
-# it can never use (AXL-Cxx-Unwinder-Design.md §U2, measured).
+# The C++ script differs from the default in one place: it KEEPs .eh_frame and
+# defines __eh_frame_start. It is a separate file rather than a KEEP() in the
+# shared one because KEEP costs a C-only image +16.8% for tables it can never
+# use (AXL-Cxx-Unwinder-Design.md §U2, measured).
+#
+# EVERY C++ LINK TAKES IT SINCE P4, not only an -fexceptions one. libstdc++ is
+# compiled WITH exceptions whatever the caller passed, so `vector::at` out of
+# range really throws now -- and without a registered frame table that throw
+# reaches std::terminate through _URC_FATAL_PHASE1_ERROR instead of the normal
+# path, losing the type name and what() that axl-cxxrt-terminate.cpp prints.
 LINK_LDS="$EFI_LDS"
-if [[ "$EH_LINK" == "true" ]]; then
-    if [[ ! -f "${EFI_LDS_EH:-}" ]]; then
-        echo "ERROR: -fexceptions needs ${EFI_LDS_EH:-the exceptions linker script}," >&2
-        echo "       which this SDK does not carry. Re-run scripts/install.sh." >&2
-        rm -rf "$TMPDIR"; exit 1
+NO_EH_LD_ARGS=()
+if [[ "$CXX_LINK" == "true" ]]; then
+    if [[ "$NO_EH_FRAME" == "true" ]]; then
+        # The DEFAULT script, and __cxa_throw redirected to the interceptor in
+        # axl-cxxrt-nothrow.o. --wrap rather than a plain definition because
+        # libsupc++'s eh_throw.o lands on the link regardless (the terminate
+        # handler needs other symbols from it) and a second definition is a
+        # `multiple definition` error.
+        NO_EH_LD_ARGS+=(--wrap=__cxa_throw)
+    else
+        if [[ ! -f "${EFI_LDS_EH:-}" ]]; then
+            echo "ERROR: a C++ link needs ${EFI_LDS_EH:-the exceptions linker script}," >&2
+            echo "       which this SDK does not carry. Re-run scripts/install.sh." >&2
+            rm -rf "$TMPDIR"; exit 1
+        fi
+        LINK_LDS="$EFI_LDS_EH"
     fi
-    LINK_LDS="$EFI_LDS_EH"
 fi
 
 run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
     --no-warn-rwx-segments --no-undefined --gc-sections \
+    ${NO_EH_LD_ARGS[@]+"${NO_EH_LD_ARGS[@]}"} \
     -T "$LINK_LDS" \
     ${VERSION_SCRIPT_ARGS[@]+"${VERSION_SCRIPT_ARGS[@]}"} \
     ${LDFLAGS_EXTRA[@]+"${LDFLAGS_EXTRA[@]}"} \
@@ -1476,7 +1504,7 @@ elif [[ "$_ctor_lo" != "$_ctor_hi" ]]; then
     # a pure-C image too -- __attribute__((constructor)) built by a stale
     # AXL_<ARCH>_GCC does it -- and telling that author to fix a C++ override
     # they never set points at the wrong knob.
-    if [[ "$HAS_CPP" == "true" || "$CXX_LINK" == "true" ]]; then
+    if [[ "$CXX_LINK" == "true" ]]; then
         _ctor_cc="$GXX_BIN"; _ctor_var="AXL_${ARCH^^}_GXX"
     else
         _ctor_cc="$GCC_BIN"; _ctor_var="AXL_${ARCH^^}_GCC"

@@ -8,6 +8,17 @@ toolchain end-to-end and shipped the C++ ABI runtime
 wrapper class library described here (CPP1.7 onward) is parked until
 AGT exists as a real consumer that can validate the API shape.
 
+> **`libaxl-cxx.a` NO LONGER EXISTS (P4, 2026-08-17).** Every mention
+> of it below is historical. Every C++ link now carries the toolchain's
+> own `libstdc++`/`libsupc++` — which supply `operator new`/`delete`,
+> `__cxa_pure_virtual` and the rest — plus four `axl-cxxrt-*.o` glue
+> objects for what a firmware image lacks underneath them.
+> `__cxa_atexit` and the `.init_array` walker are unaffected: they were
+> always in `libaxl.a` (`src/runtime/axl-cxxabi.c`). Nothing here needs
+> re-deciding, but a reader resuming this work should take the link
+> shape from `AXL-Libc-Substrate-Design.md` §4d rather than from the
+> paragraphs below.
+
 This doc captures every locked-in design decision so implementation
 can resume at any point without re-deriving them.
 

@@ -704,6 +704,266 @@ test_json_parse(void)
     test_check(!ok, "json parse: invalid returns false");
 }
 
+// The decoded-length queries. Every assertion is stated against what the
+// matching accessor actually WRITES, not against a literal: the contract is
+// "the buffer size that cannot truncate", so an agreement test is what pins
+// it. A literal would also silently encode the escape arithmetic twice.
+static void
+test_json_decoded_len(void)
+{
+    // Each of these decodes to a DIFFERENT length than its source span, and in
+    // both directions: \uXXXX shrinks 6 bytes to 1-3, a surrogate pair shrinks
+    // 12 to 4, and JSON5's \0 GROWS 2 to the 3 of U+FFFD. A length derived
+    // from the source span would pass for the plain case and fail for these.
+    const char *doc =
+        "{\"plain\":\"hello\","
+        " \"esc\":\"a\\u0041b\","          // 3 chars decoded
+        " \"wide\":\"\\u00e9\","            // 1 char, 2 UTF-8 bytes
+        " \"pair\":\"\\ud83d\\ude00\","     // 1 code point, 4 UTF-8 bytes
+        " \"empty\":\"\","
+        " \"num\":42,"
+        " \"arr\":[\"one\",\"a\\u0041b\"]}";
+    AxlJsonReader r;
+    test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_STRICT, &r),
+        "jsonlen: fixture parses");
+
+    size_t n = 0;
+
+    // The core agreement: n + 1 is exactly enough, and what lands is what the
+    // accessor writes with an oversized buffer.
+    struct { const char *key; const char *want; } cases[] = {
+        { "plain", "hello" },
+        { "esc",   "aAb"   },
+        { "wide",  "\xc3\xa9" },
+        { "pair",  "\xf0\x9f\x98\x80" },
+        { "empty", ""      },
+    };
+    bool all_agree = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t len = 0;
+        if (!axl_json_get_string_len(&r, cases[i].key, &len)) {
+            all_agree = false;
+            continue;
+        }
+        char exact[64];
+        axl_json_get_string(&r, cases[i].key, exact, len + 1);
+        if (axl_strlen(exact) != len || axl_strcmp(exact, cases[i].want) != 0) {
+            all_agree = false;
+        }
+    }
+    test_check(all_agree,
+        "jsonlen: len+1 holds the whole value, for 5 escape shapes");
+
+    // Named individually so a regression says WHICH shape broke.
+    axl_json_get_string_len(&r, "esc", &n);
+    test_check(n == 3, "jsonlen: \\u0041 counts decoded (3), not source (7)");
+    axl_json_get_string_len(&r, "wide", &n);
+    test_check(n == 2, "jsonlen: \\u00e9 is 2 UTF-8 bytes");
+    axl_json_get_string_len(&r, "pair", &n);
+    test_check(n == 4, "jsonlen: a surrogate pair is 4 UTF-8 bytes");
+    n = 999;
+    axl_json_get_string_len(&r, "empty", &n);
+    test_check(n == 0, "jsonlen: an empty string is 0");
+
+    // Refusals leave out_len untouched, matching axl_json_get_string's
+    // untouched-on-false rule.
+    n = 12345;
+    test_check(!axl_json_get_string_len(&r, "num", &n),
+        "jsonlen: a number is not a string");
+    test_check(n == 12345, "jsonlen: out_len untouched when not a string");
+    test_check(!axl_json_get_string_len(&r, "absent", &n),
+        "jsonlen: a missing key returns false");
+    test_check(!axl_json_get_string_len(NULL, "plain", &n),
+        "jsonlen: NULL reader returns false");
+    test_check(!axl_json_get_string_len(&r, "plain", NULL),
+        "jsonlen: NULL out_len returns false");
+
+    // The own-value form, which is what an ARRAY ELEMENT needs.
+    AxlJsonArrayIter it;
+    AxlJsonReader    elem;
+    test_check(axl_json_array_begin(&r, "arr", &it), "jsonlen: array begins");
+    bool elems_agree = true;
+    const char *want[] = { "one", "aAb" };
+    for (size_t i = 0; axl_json_array_next(&it, &elem); i++) {
+        size_t elen = 0;
+        if (!axl_json_value_string_len(&elem, &elen)) { elems_agree = false; break; }
+        char got[32];
+        axl_json_value_string(&elem, got, elen + 1);
+        if (i >= 2 || axl_strlen(got) != elen || axl_strcmp(got, want[i]) != 0) {
+            elems_agree = false;
+        }
+    }
+    test_check(elems_agree,
+        "jsonlen: value_string_len sizes array elements exactly");
+
+    n = 777;
+    AxlJsonReader numr;
+    test_check(axl_json_get_value(&r, "num", &numr), "jsonlen: descend to num");
+    test_check(!axl_json_value_string_len(&numr, &n),
+        "jsonlen: value_string_len refuses a number");
+    test_check(n == 777, "jsonlen: out_len untouched on refusal");
+
+    axl_json_free(&r);
+
+    // --- the object-key PEEK ------------------------------------------------
+    // A key long enough that no sane fixed buffer would hold it, and one
+    // carrying an escape, so a peek derived from the source span fails.
+    const char *odoc =
+        "{\"a-very-long-key-that-a-fixed-buffer-would-truncate\":1,"
+        " \"esc\\u0041key\":2}";
+    AxlJsonReader o;
+    test_check(axl_json_parse(odoc, axl_strlen(odoc), AXL_JSON_STRICT, &o),
+        "jsonlen: object fixture parses");
+
+    AxlJsonObjectIter oit;
+    test_check(axl_json_value_object_begin(&o, &oit), "jsonlen: object begins");
+
+    const char *want_keys[] = {
+        "a-very-long-key-that-a-fixed-buffer-would-truncate", "escAkey"
+    };
+    bool peek_ok = true;
+    size_t pairs = 0;
+    size_t klen = 0;
+    while (axl_json_object_peek_key_len(&oit, &klen)) {
+        char kbuf[128];
+        AxlJsonReader v;
+        if (klen + 1 > sizeof(kbuf)) { peek_ok = false; break; }
+        if (!axl_json_object_next(&oit, kbuf, klen + 1, &v)) { peek_ok = false; break; }
+        // The peek promised a size that cannot truncate, so the iterator's
+        // per-pair error must be OK -- that is the whole contract.
+        if (axl_json_object_iter_error(&oit)->code != AXL_JSON_OK) { peek_ok = false; }
+        if (axl_strlen(kbuf) != klen) { peek_ok = false; }
+        if (pairs < 2 && axl_strcmp(kbuf, want_keys[pairs]) != 0) { peek_ok = false; }
+        pairs++;
+    }
+    test_check(peek_ok && pairs == 2,
+        "jsonlen: peek sizes every key exactly, and none truncates");
+
+    // The peek and the walk must agree about when the object is over: a peek
+    // that stayed true past the last pair would spin forever in the loop
+    // above, and one that went false early would drop a pair.
+    test_check(!axl_json_object_peek_key_len(&oit, &klen),
+        "jsonlen: peek is false once the walk is done");
+
+    // It PEEKS -- calling it twice must not consume anything.
+    AxlJsonObjectIter oit2;
+    axl_json_value_object_begin(&o, &oit2);
+    size_t k1 = 0, k2 = 0;
+    axl_json_object_peek_key_len(&oit2, &k1);
+    axl_json_object_peek_key_len(&oit2, &k2);
+    test_check(k1 == k2 && k1 == axl_strlen(want_keys[0]),
+        "jsonlen: peeking twice reports the same pair (it does not advance)");
+    char after[128];
+    AxlJsonReader av;
+    axl_json_object_next(&oit2, after, sizeof(after), &av);
+    test_check(axl_strcmp(after, want_keys[0]) == 0,
+        "jsonlen: next() still yields the peeked pair");
+
+    test_check(!axl_json_object_peek_key_len(NULL, &klen),
+        "jsonlen: NULL iterator returns false");
+
+    axl_json_free(&o);
+}
+
+// The double atom. The load-bearing assertion is the SPELLING: `%.17g` is
+// claimed to be the shortest round-trippable form on this engine rather than
+// literally 17 digits, and that claim rests on axl_dtoa producing at most 17
+// shortest digits so the significant-digit rounding is a no-op. If that ever
+// stops holding, 0.1 emits as 0.10000000000000001 and these fail.
+static void
+test_json_write_double(void)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new("");
+    AxlJsonWriter w;
+
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_arr_begin(&w);
+    axl_json_double(&w, 0.1);
+    axl_json_double(&w, 1.5);
+    axl_json_double(&w, -2.25);
+    axl_json_double(&w, 0.0);
+    axl_json_double(&w, 1e300);
+    axl_json_double(&w, 3.0);
+    axl_json_arr_end(&w);
+    axl_json_writer_finish(&w);
+
+    test_check(axl_strcmp(axl_string_str(out),
+                          "[0.1,1.5,-2.25,0,1e+300,3]") == 0,
+        "jsondbl: shortest round-trip spelling, not 17 digits");
+    test_check(!axl_json_writer_error(&w), "jsondbl: no writer error");
+
+    // Round-trip through the READER: what was written must read back
+    // BIT-IDENTICAL, which is the property "%.17g" is there to buy and which
+    // an exact-string check alone does not prove.
+    AxlJsonReader r;
+    test_check(axl_json_parse(axl_string_str(out), axl_string_len(out),
+                              AXL_JSON_STRICT, &r), "jsondbl: output reparses");
+    const double want[] = { 0.1, 1.5, -2.25, 0.0, 1e300, 3.0 };
+    AxlJsonArrayIter it;
+    AxlJsonReader    elem;
+    bool round_trips = true;
+    size_t i = 0;
+    if (axl_json_value_array_begin(&r, &it)) {
+        while (axl_json_array_next(&it, &elem)) {
+            double got = 0;
+            if (i >= 6 || !axl_json_value_double(&elem, &got) || got != want[i]) {
+                round_trips = false;
+            }
+            i++;
+        }
+    } else {
+        round_trips = false;
+    }
+    test_check(round_trips && i == 6,
+        "jsondbl: every value reads back BIT-IDENTICAL");
+    axl_json_free(&r);
+
+    // Non-finite is a DIALECT question. Strict refuses and latches; nothing is
+    // emitted, because a `nan` token no reader accepts is worse than an error.
+    AXL_AUTOPTR(AxlString) sout = axl_string_new("");
+    AxlJsonWriter sw;
+    axl_json_writer_init(&sw, sout, AXL_JSON_STRICT);
+    axl_json_arr_begin(&sw);
+    axl_json_double(&sw, 1.0 / 0.0);
+    axl_json_arr_end(&sw);
+    axl_json_writer_finish(&sw);
+    test_check(axl_json_writer_error(&sw),
+        "jsondbl: strict REFUSES infinity");
+
+    // ...and the same bit that lets the READER accept them lets the writer
+    // emit them. One flag, both directions.
+    AXL_AUTOPTR(AxlString) nout = axl_string_new("");
+    AxlJsonWriter nw;
+    axl_json_writer_init(&nw, nout, AXL_JSON_ALLOW_NAN_INF);
+    axl_json_arr_begin(&nw);
+    axl_json_double(&nw, 1.0 / 0.0);
+    axl_json_double(&nw, -1.0 / 0.0);
+    axl_json_double(&nw, 0.0 / 0.0);
+    axl_json_arr_end(&nw);
+    axl_json_writer_finish(&nw);
+    test_check(!axl_json_writer_error(&nw), "jsondbl: NAN_INF accepts them");
+    test_check(axl_strcmp(axl_string_str(nout),
+                          "[Infinity,-Infinity,NaN]") == 0,
+        "jsondbl: JSON5 spelling, not the C library's nan/inf");
+
+    AxlJsonReader nr;
+    test_check(axl_json_parse(axl_string_str(nout), axl_string_len(nout),
+                              AXL_JSON_ALLOW_NAN_INF, &nr),
+        "jsondbl: AXL's own reader accepts what it wrote");
+    axl_json_free(&nr);
+
+    // kv form.
+    AXL_AUTOPTR(AxlString) kout = axl_string_new("");
+    AxlJsonWriter kw;
+    axl_json_writer_init(&kw, kout, AXL_JSON_STRICT);
+    axl_json_obj_begin(&kw);
+    axl_json_kv_double(&kw, "temp", 36.6);
+    axl_json_obj_end(&kw);
+    axl_json_writer_finish(&kw);
+    test_check(axl_strcmp(axl_string_str(kout), "{\"temp\":36.6}") == 0,
+        "jsondbl: kv_double emits key and value");
+}
+
 // ---------------------------------------------------------------------------
 // JSON Nested-Object Navigation Tests
 // ---------------------------------------------------------------------------
@@ -10261,6 +10521,86 @@ test_radix_tree_value_free(void)
     test_check(radix_free_count == 2, "radix_vfree: free calls free on remaining");
 }
 
+// A NULL value is a VALUE, not an absence. The tree used to infer a key's
+// presence from `node->value != NULL`, which made every one of the assertions
+// below wrong: the entry was counted but unremovable, re-inserting it counted
+// it again, and overwriting a live value with NULL stranded the key forever.
+//
+// Presence is now a flag on the node, so `size()` counts keys and `remove()`
+// can reach every key `size()` counts. Lookup still cannot distinguish a
+// stored NULL from an absent key — that is the return convention (`void *`,
+// NULL for miss) and is documented, not a defect.
+static void
+test_radix_tree_null_value(void)
+{
+    AxlRadixTree *t = axl_radix_tree_new();
+
+    // A fresh key with a NULL value: counted once, and REMOVABLE.
+    test_check(axl_radix_tree_insert(t, "/a", NULL) == AXL_OK,
+        "radix_null: insert of a NULL value succeeds");
+    test_check(axl_radix_tree_size(t) == 1, "radix_null: counted once");
+    test_check(axl_radix_tree_remove(t, "/a"),
+        "radix_null: a NULL-valued key can be removed");
+    test_check(axl_radix_tree_size(t) == 0, "radix_null: size back to 0");
+
+    // Re-inserting the SAME key must not count it twice. This is the exact
+    // double-count: both inserts took the `else { tree->size++; }` branch
+    // because `node->value` was NULL each time.
+    axl_radix_tree_insert(t, "/b", NULL);
+    axl_radix_tree_insert(t, "/b", NULL);
+    test_check(axl_radix_tree_size(t) == 1,
+        "radix_null: inserting the same key twice counts once");
+    test_check(axl_radix_tree_remove(t, "/b"), "radix_null: still removable");
+    test_check(axl_radix_tree_size(t) == 0, "radix_null: size 0 after remove");
+
+    // Overwriting a LIVE value with NULL. The key stays present and stays
+    // removable; previously it became permanently unreachable while still
+    // being counted.
+    axl_radix_tree_insert(t, "/c", (void *)0x1234);
+    axl_radix_tree_insert(t, "/c", NULL);
+    test_check(axl_radix_tree_size(t) == 1, "radix_null: overwrite keeps size 1");
+    test_check(axl_radix_tree_lookup(t, "/c") == NULL,
+        "radix_null: overwritten value reads back NULL");
+    test_check(axl_radix_tree_remove(t, "/c"),
+        "radix_null: a key overwritten with NULL is still removable");
+    test_check(axl_radix_tree_size(t) == 0, "radix_null: size 0 again");
+
+    // And the reverse: NULL then a real value.
+    axl_radix_tree_insert(t, "/d", NULL);
+    axl_radix_tree_insert(t, "/d", (void *)0x5678);
+    test_check(axl_radix_tree_size(t) == 1, "radix_null: NULL-then-value counts once");
+    test_check(axl_radix_tree_lookup(t, "/d") == (void *)0x5678,
+        "radix_null: the real value is readable");
+
+    // foreach must VISIT a NULL-valued entry: it is an entry, and a visit
+    // count that disagrees with size() is how the accounting bug would come
+    // back. Counting only visits would miss it, so the count is compared
+    // against size().
+    axl_radix_tree_insert(t, "/e", NULL);
+    radix_foreach_count = 0;
+    axl_radix_tree_foreach(t, radix_foreach_counter, NULL);
+    test_check(axl_radix_tree_size(t) == 2, "radix_null: two entries present");
+    test_check(radix_foreach_count == axl_radix_tree_size(t),
+        "radix_null: foreach visits every counted entry, NULL values included");
+
+    axl_radix_tree_free(t);
+
+    // An OWNING tree must not call the destructor for a NULL value, and must
+    // still count the entry. A destructor invoked on NULL is the obvious way
+    // to get this wrong in the other direction.
+    radix_free_count = 0;
+    AxlRadixTree *o = axl_radix_tree_new_full(radix_free_counter);
+    axl_radix_tree_insert(o, "/x", NULL);
+    axl_radix_tree_insert(o, "/y", (void *)1);
+    test_check(axl_radix_tree_size(o) == 2, "radix_null: owning tree counts both");
+    axl_radix_tree_remove(o, "/x");
+    test_check(radix_free_count == 0,
+        "radix_null: removing a NULL value does not call the destructor");
+    axl_radix_tree_free(o);
+    test_check(radix_free_count == 1,
+        "radix_null: teardown frees only the non-NULL value");
+}
+
 static void
 test_radix_tree_http_keys(void)
 {
@@ -13084,6 +13424,103 @@ test_array_insert_prepend(void)
     axl_array_free(g);
 }
 
+// The contiguous-buffer accessors. Every assertion here is stated against
+// axl_array_get()/axl_array_get_ptr(), which already work, rather than against
+// a literal — the contract is "the same bytes, without the per-element call",
+// so an agreement test is what actually pins it.
+static void
+test_array_data_and_element_size(void)
+{
+    // Deliberately not int: a stride the compiler would not have guessed, so
+    // an implementation returning sizeof(int) or sizeof(void *) by accident
+    // fails rather than coincidentally passing.
+    struct Rec { int32_t a; int64_t b; char c; };
+
+    test_check(axl_array_data(NULL) == NULL, "data: NULL array -> NULL");
+    test_check(axl_array_element_size(NULL) == 0, "elemsize: NULL array -> 0");
+
+    AxlArray *a = axl_array_new(sizeof(struct Rec));
+    test_check(axl_array_element_size(a) == sizeof(struct Rec),
+        "elemsize: reports the constructor's stride");
+    test_check(axl_array_data(a) != NULL, "data: fresh array owns a buffer");
+
+    for (int i = 0; i < 12; i++) {
+        struct Rec r = { .a = i, .b = (int64_t)i * 1000, .c = (char)('a' + i) };
+        axl_array_append(a, &r);
+    }
+
+    // The base pointer IS element 0, and the stride between elements is
+    // exactly element_size. These two together are the whole addressing
+    // contract a typed reader casts on.
+    test_check(axl_array_data(a) == axl_array_get(a, 0),
+        "data: base pointer is element 0");
+    test_check((size_t)((uint8_t *)axl_array_get(a, 1)
+                        - (uint8_t *)axl_array_data(a))
+               == axl_array_element_size(a),
+        "data: element 1 sits exactly element_size past the base");
+
+    // Reading the whole array through the base pointer agrees with reading it
+    // one axl_array_get() at a time, field by field. Comparing only `a` would
+    // pass for a stride that was wrong in a way the first field survives.
+    const struct Rec *base = (const struct Rec *)axl_array_data(a);
+    bool agrees = true;
+    for (size_t i = 0; i < axl_array_len(a); i++) {
+        const struct Rec *via_get = (const struct Rec *)axl_array_get(a, i);
+        if (base[i].a != via_get->a || base[i].b != via_get->b
+            || base[i].c != via_get->c) {
+            agrees = false;
+        }
+    }
+    test_check(agrees, "data: 12 elements read via base match axl_array_get");
+    test_check(base[11].a == 11 && base[11].b == 11000 && base[11].c == 'l',
+        "data: last element carries the values that were appended");
+
+    // The documented invalidation rule, observed rather than asserted away:
+    // growth past capacity moves the buffer. Recorded so a future change that
+    // makes the buffer stable does not quietly leave the warning wrong.
+    const void *before = axl_array_data(a);
+    for (int i = 0; i < 200; i++) {
+        struct Rec r = { .a = i, .b = 0, .c = 'x' };
+        axl_array_append(a, &r);
+    }
+    test_check(axl_array_len(a) == 212, "data: 212 elements after growth");
+    test_check(axl_array_data(a) != before,
+        "data: growth past capacity moved the buffer (the invalidation rule)");
+    test_check(axl_array_data(a) == axl_array_get(a, 0),
+        "data: base still tracks element 0 after a realloc");
+    axl_array_free(a);
+
+    // Pointer mode: the buffer holds the stored pointers themselves.
+    AxlArray *p = axl_array_new(sizeof(void *));
+    test_check(axl_array_element_size(p) == sizeof(void *),
+        "elemsize: pointer mode is sizeof(void *)");
+    axl_array_append_ptr(p, (void *)0xA1);
+    axl_array_append_ptr(p, (void *)0xB2);
+    axl_array_append_ptr(p, (void *)0xC3);
+    void *const *slots = (void *const *)axl_array_data(p);
+    test_check(slots[0] == (void *)0xA1 && slots[1] == (void *)0xB2
+               && slots[2] == (void *)0xC3,
+        "data: pointer mode holds the stored pointers");
+    test_check(slots[1] == axl_array_get_ptr(p, 1),
+        "data: pointer-mode slot agrees with axl_array_get_ptr");
+    axl_array_free(p);
+
+    // After a steal the array owns no buffer. NULL must be paired with a
+    // length of 0 — that pairing is what lets a (pointer, length) reader skip
+    // a separate NULL test, so it is asserted rather than assumed.
+    AxlArray *s = axl_array_new(sizeof(int));
+    for (int i = 0; i < 4; i++) { axl_array_append(s, &i); }
+    size_t stolen_len = 0;
+    void *stolen = axl_array_steal(s, &stolen_len);
+    test_check(stolen != NULL && stolen_len == 4, "data: steal handed over 4");
+    test_check(axl_array_data(s) == NULL, "data: stolen array reports NULL");
+    test_check(axl_array_len(s) == 0, "data: NULL base is paired with length 0");
+    test_check(axl_array_element_size(s) == sizeof(int),
+        "elemsize: survives a steal (the array stays usable)");
+    axl_free(stolen);
+    axl_array_free(s);
+}
+
 static void
 test_hash_add_owned_set(void)
 {
@@ -15021,6 +15458,7 @@ test_data_main(int argc, char **argv)
     test_array_extended();
     test_array_sized_steal_clear();
     test_array_insert_prepend();
+    test_array_data_and_element_size();
     test_hmac_rfc_vectors();
     test_hmac_edge_cases();
     test_hmac_incremental();
@@ -15032,6 +15470,8 @@ test_data_main(int argc, char **argv)
     test_string();
     test_string_ascii();
     test_json_parse();
+    test_json_decoded_len();
+    test_json_write_double();
     test_json_get_object();
     test_json5_parse();
     test_json_unicode_escapes();
@@ -15091,6 +15531,7 @@ test_data_main(int argc, char **argv)
     test_radix_tree_prefix();
     test_radix_tree_edge_split();
     test_radix_tree_foreach();
+    test_radix_tree_null_value();
     test_radix_tree_value_free();
     test_radix_tree_http_keys();
     test_ntree_build_navigate();

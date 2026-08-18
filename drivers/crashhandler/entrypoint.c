@@ -20,6 +20,7 @@ AxlGuid g_crash_handler_protocol_guid = AXL_CRASH_HANDLER_PROTOCOL_GUID;
 AxlHandle               g_image_handle = NULL;
 AxlCrashImageEntry         g_image_table[AXL_CRASH_MAX_IMAGES];
 uint32_t                g_image_count  = 0;
+AxlImageWatch          *g_image_watch  = NULL;
 
 /* Sentinel protocol instance (value doesn't matter -- existence is the signal) */
 static uint8_t sentinel = 0;
@@ -102,8 +103,22 @@ crash_handler_main(AxlHandle image, AxlSystemTable *st)
                    crash_count);
     }
 
-    /* 4. Snapshot loaded images (pre-allocate for crash handler) */
+    /* 4. Snapshot loaded images (pre-allocate for crash handler), and keep
+       that snapshot CURRENT. Taking it once here is not enough and used to
+       be all this did: the driver loads before the application that goes on
+       to fault, so the faulting image was never in the table, the report
+       carried no base to rebase against, and rsod-decode had nothing to
+       resolve. The watch fires at TPL_CALLBACK, where re-enumerating may
+       allocate; exception context, where it may not, only ever READS. */
     snapshot_loaded_images();
+    g_image_watch = axl_image_watch_loads(refresh_loaded_images, NULL);
+    if (g_image_watch == NULL) {
+        /* Not fatal -- a stale table still names the images present at load
+           time. Say so rather than degrade silently, since the symptom is a
+           report that looks complete and attributes nothing. */
+        axl_printf("CrashHandler: image-load watch unavailable; "
+                   "crash reports may not name the faulting image\n");
+    }
 
     /* 5. Register exception handlers via axl-sdk's typed CPU API.
        Each registration is independent — kinds that aren't
@@ -120,6 +135,12 @@ crash_handler_main(AxlHandle image, AxlSystemTable *st)
     }
     if (registered == 0) {
         axl_printf("CrashHandler: no exception kinds could be monitored\n");
+        /* Release the watch on the way out. A DriverEntry that returns an
+           error is torn down by the core WITHOUT the Unload handler running,
+           so leaving it registered points a live firmware notify at code
+           about to be freed -- it would fire on the next image load. */
+        axl_image_unwatch_loads(g_image_watch);
+        g_image_watch = NULL;
         return AXL_ERR;
     }
 
@@ -146,6 +167,12 @@ static int
 crash_handler_unload(AxlHandle image)
 {
     (void)image;
+    /* The image-load watch IS releasable, unlike the exception
+       registrations above, and must be released: its notify would
+       otherwise be invoked into unloaded code the next time any image
+       loads. */
+    axl_image_unwatch_loads(g_image_watch);
+    g_image_watch = NULL;
     return AXL_OK;
 }
 

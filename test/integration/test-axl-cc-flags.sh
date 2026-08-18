@@ -148,7 +148,7 @@ check "$?" "--help still says exceptions are off by default"
 #
 # Also pins that axl-c++ ships alongside axl-cc UNCONDITIONALLY: it is a
 # dependency-free wrapper, and withholding it on a C-only install replaces
-# axl-cc's precise "libaxl-cxx.a is missing, run ./scripts/install.sh --cpp"
+# axl-cc's precise "axl-cxxrt-alloc.o ... run ./scripts/install.sh --cpp"
 # with the shell's bare "command not found".
 CXX_DRV="$(dirname "$AXL_CC")/axl-c++"
 [[ -x "$CXX_DRV" ]]

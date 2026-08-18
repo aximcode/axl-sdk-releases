@@ -155,27 +155,76 @@ log_success "Doxygen XML → $OUT_DIR/doxygen-xml/"
 # Failures are collected rather than `set -e`'d one at a time, so a broken man
 # build is still reported when html also fails — the point of the gate is to
 # show every warning in one run, not the first.
+#
+# -E (never reuse the saved environment) IS LOAD-BEARING, for two reasons.
+#
+# THE CACHE GROWS WITHOUT BOUND. The `.. include:: ../../ROADMAP.md :parser:
+# myst_parser.sphinx_` documents accumulate on every incremental rebuild
+# instead of being replaced. Measured on this tree against a fresh build of the
+# same sources:
+#
+#     .doctrees total          3.5 GB   vs    66 MB
+#     environment.pickle      1712 MB   vs   9.9 MB     (173x)
+#     guides/roadmap.doctree   818 MB   vs   317 KB     (2640x)   from 56 KB of md
+#     guides/sdk.doctree       414 MB   vs   126 KB     (3360x)
+#
+# Each build then unpickles a bigger cache than the last, so it compounds: the
+# pair peaked at 28.2 GB RSS and the OOM killer took sphinx-build twice on a
+# 31 GB machine -- reported, before the attribution below was fixed, as
+# "Sphinx reported warnings". With -E the html build is 669 MB / 32 s.
+#
+# AND A GATE MUST NOT TRUST A CACHE. This is the zero-warning gate; a saved
+# environment that considers a file unchanged does not re-emit its warnings, so
+# an incremental run can be green where a clean one is not. That is the "gate
+# that cannot see" shape this tree keeps meeting, and -E is what closes it.
+# Cost: nothing worth having. The full build is ~32 s, and it was never the
+# incremental path that was fast.
 # --------------------------------------------------------------------------
 
 log_info "Building HTML (ReadTheDocs theme) + man pages ..."
 SPHINX_RC=0
 
-sphinx-build -b html -q -W -j auto "$SPHINX_DIR" "$OUT_DIR/html" \
+sphinx-build -b html -q -W -E -j auto "$SPHINX_DIR" "$OUT_DIR/html" \
     > "$OUT_DIR/sphinx-html.log" 2>&1 &
 _html_pid=$!
-sphinx-build -b man  -q -W -j auto "$SPHINX_DIR" "$OUT_DIR/man" \
+sphinx-build -b man  -q -W -E -j auto "$SPHINX_DIR" "$OUT_DIR/man" \
     > "$OUT_DIR/sphinx-man.log" 2>&1 &
 _man_pid=$!
 
-wait $_html_pid || SPHINX_RC=1
-wait $_man_pid  || SPHINX_RC=1
+# Keep the ACTUAL status of each, not a flattened 1. A shell reports a
+# signal death as 128+signum, and telling that apart from a -W warning is the
+# difference between "fix your docstring" and "this box ran out of memory" --
+# see the attribution below.
+_html_rc=0; _man_rc=0
+wait $_html_pid || _html_rc=$?
+wait $_man_pid  || _man_rc=$?
+[[ $_html_rc -ne 0 || $_man_rc -ne 0 ]] && SPHINX_RC=1
 
 # Always surface the output: -q means these are empty on success, so anything
 # here is a diagnostic worth reading.
 cat "$OUT_DIR/sphinx-html.log" "$OUT_DIR/sphinx-man.log" >&2
 
 if [[ $SPHINX_RC -ne 0 ]]; then
-    log_error "Sphinx reported warnings (treated as errors by -W)."
+    # A KILLED sphinx reported nothing at all, so blaming -W sends the reader
+    # hunting a docstring warning that does not exist. It happened: two
+    # `-j auto` builds run concurrently HERE, verify.sh runs this job
+    # concurrently with both arch suites and clang-tidy, and the html worker
+    # reached 17 GB anon-rss before the OOM killer took it -- reported as
+    # "Sphinx reported warnings", which is the one thing it had not done.
+    _signalled=""
+    for _rc in $_html_rc $_man_rc; do
+        [[ $_rc -gt 128 ]] && _signalled="$_signalled $((_rc - 128))"
+    done
+    if [[ -n "$_signalled" ]]; then
+        log_error "Sphinx was KILLED by signal(s):$_signalled -- it did not"
+        log_error "report anything. Signal 9 here is almost always the OOM"
+        log_error "killer: two -j auto builds run concurrently above, and"
+        log_error "verify.sh adds two QEMU suites and clang-tidy alongside."
+        log_error "Check 'dmesg | grep -i oom', then retry with"
+        log_error "'verify.sh --only=docs' to give it the machine."
+    else
+        log_error "Sphinx reported warnings (treated as errors by -W)."
+    fi
     exit 1
 fi
 

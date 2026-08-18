@@ -24,11 +24,11 @@
     under UEFI — verified by overflowing a buffer under QEMU and
     watching it halt here rather than return.
 
-    Lives in `libaxl.a` rather than `libaxl-cxx.a` because the symbols
-    are C-linkage and every C consumer needs them too. Some prebuilt
+    Lives in `libaxl.a`, not in the C++ glue, because the symbols are
+    C-linkage and every C consumer needs them too. Some prebuilt
     `libstdc++.a` members reference `__stack_chk_fail` regardless of
-    how we compile, so a hosted C++ link needs it even when the
-    protector is off.
+    how we compile, so a C++ link needs it even when the protector is
+    off.
 
     @par The canary is a fixed value, deliberately
 
@@ -53,8 +53,58 @@
 
 #include <axl.h>
 
+/* AXL_NORETURN on the DECLARATIONS, not only the definitions. Without it here,
+   __stack_chk_fail_local's call to __stack_chk_fail looks like it returns, and
+   clang reports the caller as "declared 'noreturn' should not return" -- which
+   is correct: the prototype is what a caller reasons from. */
+AXL_NORETURN void __stack_chk_fail(void);
+AXL_NORETURN void __stack_chk_fail_local(void);
+void __stack_chk_init(void);
+
 /* High byte NUL on purpose -- see the file docs. */
 uintptr_t __stack_chk_guard = 0x00a5b7c3d1e9f200ULL;
+
+/**
+ * @brief Seed the guard. A NO-OP, and deliberately so.
+ *
+ * Defined only to OWN newlib's `stack_protector.o` completely. That member
+ * defines four symbols -- `__stack_chk_fail`, `__stack_chk_fail_local`,
+ * `__stack_chk_guard` and this -- and AXL owned two of them. An archive member
+ * is pulled for ANY symbol it defines, so a single reference to either of the
+ * unowned two would have dragged newlib's version in and multiply-defined the
+ * other two against ours. Now that `libc.a` is on every link (P3) that stopped
+ * being theoretical.
+ *
+ * A no-op is also the CORRECT body, not merely a placeholder. newlib's seeds
+ * the guard when it reads zero; AXL's canary is a fixed compile-time value
+ * with a deliberate NUL byte (see the file docs), already correct before any
+ * code runs. Seeding it later is precisely the hazard those docs describe --
+ * every frame already on the stack captured the old value and would fail its
+ * check on return.
+ */
+void
+__stack_chk_init(
+    void
+    )
+{
+}
+
+/**
+ * @brief The `-fpic` entry point, identical in effect to `__stack_chk_fail`.
+ *
+ * gcc emits a call to THIS rather than `__stack_chk_fail` for position-
+ * independent code on some targets, to save a PLT indirection. Same
+ * requirement, same handler: a separate body would be a second place for the
+ * diagnostic to drift out of step.
+ */
+AXL_NORETURN
+__attribute__((no_stack_protector)) void
+__stack_chk_fail_local(
+    void
+    )
+{
+    __stack_chk_fail();
+}
 
 /**
  * @brief Canary mismatch: the stack was corrupted. Halts.

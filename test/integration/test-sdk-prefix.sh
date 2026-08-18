@@ -43,19 +43,33 @@ fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 [[ -x "$SDKP" ]] || { echo "  FAIL: scripts/sdk-prefix.sh is not executable"; echo; echo "sdk-prefix: 0 passed, 1 failed"; exit 1; }
 
-# 1. The default is today's staged location, so every existing caller and every
-#    consumer instruction keeps working unchanged. A separation that moved the
-#    default would be a breaking change wearing a refactor's clothes.
+# 1. The default is `stage`, NOT `out` (O1, decided 2026-08-16).
+#
+#    The accessor deliberately kept `out` when it landed, so the separation
+#    could be mechanical and reviewable on its own. This is the second half:
+#    `out/` now holds build trees and Sphinx output, `stage/` holds the staged
+#    SDK, and the two stop sharing a name as well as a parent.
+#
+#    It IS a break for anyone who typed `out/bin/axl-cc` — which is why it was
+#    a decision rather than a cleanup, and why every doc that teaches the path
+#    moves with it.
 got="$("$SDKP")"
-[[ "$got" == "out" ]] && pass "default is 'out' (unchanged from today)" \
-                      || fail "default was '$got', expected 'out'"
+[[ "$got" == "stage" ]] && pass "default is 'stage', not the build root" \
+                        || fail "default was '$got', expected 'stage'"
+
+# 1b. And it must not be the build tree's parent any more. Asserted separately
+#     because "the default changed" and "the two are no longer nested" are
+#     different properties, and only the second is the point of O1.
+bp_top="$("$PROJECT_DIR/scripts/build-prefix.sh" x64)"; bp_top="${bp_top%%/*}"
+[[ "$got" != "$bp_top" ]] && pass "staged SDK is not under the build root ($bp_top)" \
+                          || fail "staged SDK still shares the build root ($bp_top)"
 
 # 2. --abs resolves against the repo, matching build-prefix.sh's flag exactly.
 #    Same spelling on purpose: two accessors that disagree about their own flags
 #    are worse than one accessor and a hardcoded path.
 got="$("$SDKP" --abs)"
-[[ "$got" == "$PROJECT_DIR/out" ]] && pass "--abs is repo-rooted" \
-                                   || fail "--abs was '$got'"
+[[ "$got" == "$PROJECT_DIR/stage" ]] && pass "--abs is repo-rooted" \
+                                     || fail "--abs was '$got'"
 
 # 3. The point of the whole exercise: P2 becomes ONE variable, not a sweep.
 got="$(AXL_SDK_PREFIX=/opt/axl-sdk "$SDKP")"

@@ -32,7 +32,7 @@ gate is the full suite run locally**, which is fast in parallel:
 
 ```sh
 make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
-./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 145/145 must pass
+./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 0 failures required
 scripts/lint.sh                                        # clang-tidy exactly as CI runs it
 ```
 
@@ -43,8 +43,36 @@ its own QEMU. Green here is the release gate. Then:
 ```sh
 scripts/cut-release.sh X.Y.Z            # cut (no CI wait — local suite was the gate)
 scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
-scripts/cut-release.sh X.Y.Z --ci-gate  # opt back in: wait for a (manually-triggered) CI run
+scripts/cut-release.sh X.Y.Z --ci-gate  # want the CI backstop too (see the stamp, below)
+scripts/cut-release.sh X.Y.Z --force-ci # --ci-gate, and dispatch even if the stamp covers it
 ```
+
+**`--ci-gate` no longer always dispatches.** A clean, COMPLETE
+`run-integration.sh` writes `test/integration/.last-run-stamp` (gitignored —
+it describes one machine's run, not a property of the tree). If that stamp
+covers the release commit, `--ci-gate` is satisfied without dispatching
+anything, because it would be the same tests on the same code for an answer
+you already hold. A run never dispatched is the only thing that improves both
+turnaround and Actions spend — see `AXL-CI-Release-Speed-Design.md` §10.3.
+
+"Covers" is deliberately narrow, since a false positive here tags code no
+suite ever ran:
+
+| situation | gate |
+|---|---|
+| stamp's SHA == the release commit | satisfied |
+| stamp is the release commit's PARENT, and the only diff is `VERSION`, `include/axl/axl-version.h`, `CHANGELOG.md` | satisfied |
+| anything else changed since the stamp | **dispatches** |
+| stamp missing, malformed, or from a failing run | **dispatches** |
+| stamp came from a `--shard` (partial) run | **dispatches** — it never wrote one |
+
+The parent rule is not a convenience: `cut-release.sh` creates the version-bump
+commit itself, so the stamp is always one commit behind by construction and a
+bare SHA match could never fire at cut time.
+
+`--force-ci` dispatches regardless. Use it when you want the fresh-OS backstop
+specifically — a toolchain bump, a workflow change, anything where "it passed
+on my box" is the thing in question.
 
 Before any release, trigger CI by hand on `main` (Actions tab →
 `workflow_dispatch`, or `gh workflow run ci.yml --ref main`) and watch it green —
@@ -52,6 +80,75 @@ that commit IS the one you will tag, so this is the fresh-OS backstop. The tag n
 longer re-runs it. `--ci-gate` makes the cut dispatch CI on `main` and wait for it
 before tagging. The `--ci` flag on the runner excludes the `local-only` tests CI
 runners can't execute (patched-QEMU SMBus, usb-mouse pointer) — that's what CI runs.
+
+### Registering the self-hosted runner (optional, and why you would)
+
+Only relevant when you actually want CI to run — a major tag, a toolchain
+bump, or `--force-ci`. A normal cut skips CI entirely via the stamp above, so
+none of this is on the critical path for a release.
+
+**Why:** `run-integration.sh` picks `nproc - 2` workers. A GitHub-hosted runner
+has 2 cores, so that evaluates to **one** worker and the QEMU job takes ~50
+minutes. The same unchanged line gives **six** on an 8-core workstation, for
+~9 minutes and zero Actions minutes. Nothing in the repo needs to change to get
+that — only where the job runs. See `AXL-CI-Release-Speed-Design.md` §10.
+
+**Register it** (once per machine; the org's `Default` runner group has
+`visibility=all`, so one registration serves axl-sdk and its consumers):
+
+```sh
+# 1. Get a registration token (expires in an hour).
+gh api -X POST /orgs/aximcode/actions/runners/registration-token --jq .token
+
+# 2. Install the runner under a directory of its own.
+mkdir -p ~/actions-runner && cd ~/actions-runner
+curl -fsSLO https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
+tar xzf actions-runner-linux-x64.tar.gz
+
+# 3. Configure. The `axl-qemu` LABEL is what ci.yml selects on — the name is
+#    free, the label is not.
+./config.sh --url https://github.com/aximcode \
+            --token <TOKEN> \
+            --labels axl-qemu \
+            --unattended
+
+# 4. Run it as a service so it survives a logout.
+sudo ./svc.sh install && sudo ./svc.sh start && sudo ./svc.sh status
+```
+
+Confirm GitHub can see it — this is the check that distinguishes "registered"
+from "online", and a job targeting an offline runner queues rather than fails:
+
+```sh
+gh api /orgs/aximcode/actions/runners \
+  --jq '.runners[] | {name, status, labels: [.labels[].name]}'
+```
+
+**Then use it.** The QEMU job takes a `runner` input, defaulting to `hosted`:
+
+```sh
+gh workflow run ci.yml --ref main -f runner=self-hosted
+```
+
+Once you trust it, flip the input's `default:` in `ci.yml` from `hosted` to
+`self-hosted` — that one word is the whole switch.
+
+**Three things to know before you rely on it:**
+
+- **`apt-get` and the `/dev/kvm` chmod are guarded** with
+  `if: runner.environment == 'github-hosted'`. That guard is load-bearing: the
+  job installs packages, and without it CI would `apt-get` your workstation.
+  If you add a setup step, guard it the same way.
+- **A release now waits on the machine being awake.** There is no automatic
+  hosted fallback (the design's §4.1 plan job was not built, deliberately —
+  §4.2's sharded fallback costs MORE Actions minutes than the serial run it
+  replaces). If the box is down, dispatch with `-f runner=hosted`.
+- **`concurrency: axl-qemu-<ref>`** serialises dispatches so two cannot contend
+  for one QEMU host.
+
+Self-hosted on a PRIVATE repo carries none of the fork-PR risk that makes
+self-hosted runners dangerous on public ones: there are no untrusted
+contributors to run code as us.
 
 ### GitHub Actions trigger policy
 
@@ -397,7 +494,7 @@ carries it, so the tag flow publishes exactly the same way.
 > **local** suite — run it before you cut:
 >
 > ```sh
-> ./test/integration/run-integration.sh -j"$(nproc)"   # 145/145 must pass
+> ./test/integration/run-integration.sh -j"$(nproc)"   # 0 failures required
 > scripts/lint.sh                                       # clang-tidy as CI runs it
 > ```
 
@@ -436,10 +533,13 @@ in `gh release view vX.Y.Z`. Worth a few minutes of polish.
 
 ### 6. Watch the workflows
 
-The tag push triggers three workflows on the same commit:
+The tag push triggers **two** workflows (and on a minor/patch, one):
 
-- **CI** (`.github/workflows/ci.yml`) — full unit + integration
-  suite across both architectures.
+> **CI is NOT one of them**, despite what this section said until 2026-08-18.
+> `ci.yml` is `workflow_dispatch` only — see the trigger table above. A tag
+> re-running CI on a commit already validated on `main` was pure duplication,
+> and that trigger was removed. This paragraph outlived it.
+
 - **Release** (`.github/workflows/release.yml`) — builds .deb +
   .rpm via `fpm` (both x64 and aa64), pulls iPXE from upstream
   for the host-tools tarball, attaches everything to a GitHub
@@ -456,10 +556,17 @@ user-mode emulation.
 
 **The CI backstop is the slow one, and it is a separate wait.**
 `--ci-gate` dispatches ci.yml on the release commit before
-tagging, and its QEMU job runs the WHOLE integration suite — 145
-tests, each in its own QEMU, on a 2-core runner. Measured **~50
-minutes** on the v3.2.0 cut; the other three jobs finished in
-under 6. `wait_for_ci` allows 75 minutes. If it ever times out on
+tagging **unless the local stamp already covers it** (see above),
+and its QEMU job runs the WHOLE integration suite, each test in
+its own QEMU. Measured **~50 minutes** on the v3.2.0 cut; the
+other three jobs finished in under 6.
+
+That wall time is not a repo defect: `run-integration.sh` picks
+`nproc - 2` workers, and a hosted runner has 2 cores, so it
+evaluates to one worker. The same unchanged line gives six on an
+8-core box. `AXL-CI-Release-Speed-Design.md` §10 has the
+measurement and what to do about it; the stamp above is the part
+that is already built. `wait_for_ci` allows 75 minutes. If it ever times out on
 a run that is still going, the tag was NOT created — wait for CI
 yourself and finish with `--resume`, rather than re-cutting.
 
@@ -598,27 +705,30 @@ Specifically, each package contains:
   `axl.h` + `axl/*.h` headers, CRT0 objects, linker scripts,
   CMake config, pkg-config, JSON5 sidecars.  The `axl-c++` driver
   is here too — it is a dependency-free `exec axl-cc -x c++`
-  wrapper, so it ships unconditionally; without `libaxl-cxx.a` it
+  wrapper, so it ships unconditionally; without the C++ glue it
   simply reports which install step is missing.
-- C++ bits (when toolchain present at build time): `libaxl-cxx.a`
-  per arch.  `libaxl-cxx.a` doesn't link
-  libstdc++ so there's no runtime-dependency escalation on the
-  package — pure-C consumers can ignore the extra files.
+- C++ bits (when toolchain present at build time): the four
+  `axl-cxxrt-*.o` glue objects per arch, plus the C++ headers.
+  The package conveys no libstdc++ — `axl-cc` names the
+  consumer's installed copy — so there is no runtime-dependency
+  escalation; pure-C consumers can ignore the extra files.
 
 CI cache invalidation: both toolchain tarballs are keyed on
 `hashFiles('scripts/axl-toolchains.conf')`, so ANY edit to that
 manifest forces a re-fetch of both — which is also why a
 toolchain version bump must be PUBLISHED before the commit that
 bumps it lands, or every CI job downloads a URL that 404s.
-Verify both packages contain `libaxl-cxx.a` after a release
-build:
+Verify both packages contain the C++ glue after a release build.
+`axl-cxxrt-terminate.o` is the one to grep for: it is the only
+member that is C++-only, so its absence means exactly "no C++
+half".
 
 ```sh
-dpkg-deb -c axl-sdk_*_amd64.deb | grep libaxl-cxx
-rpm -qpl axl-sdk-*.x86_64.rpm | grep libaxl-cxx
+dpkg-deb -c axl-sdk_*_amd64.deb | grep axl-cxxrt
+rpm -qpl axl-sdk-*.x86_64.rpm | grep axl-cxxrt
 ```
 
-If `libaxl-cxx.a` is missing, the build host either didn't have
+If `axl-cxxrt-terminate.o` is missing, the build host either didn't have
 the bare-metal toolchains available or `install.sh`'s
 auto-detect failed.  See
 [`AXL-SDK-Design.md` §"C++ support"](AXL-SDK-Design.md) for the

@@ -31,7 +31,12 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 export TEST_SKIP_RATCHET=1
 
-STAGE="${AXL_STAGE_DIR:-$PROJECT_DIR/out}"
+# Via sdk-prefix.sh, not a hard-coded path. This read $PROJECT_DIR/out, which
+# stopped existing when the staged SDK moved to stage/ (v4.1.0, 2026-08-16)
+# -- so this ENTIRE suite skipped from that day on, silently and with a
+# green "PASS 0s" in the runner. The CMake package is the third build path
+# check-flag-parity exists for, and it was the one with no coverage at all.
+STAGE="${AXL_STAGE_DIR:-$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)}"
 
 pass=0
 fail=0
@@ -196,12 +201,12 @@ build_case multi 'axl_add_app(multiapp multimain.c second.c)' multiapp 8664
 # used to CONFIGURE and then die at the first throw, because the package
 # re-implemented axl-cc's pipeline without the _eh linker script, the glue
 # objects or the toolchain libraries.
-# The C++ cases need libaxl-cxx.a; a C-only SDK (install.sh --no-cpp) is a
-# legitimate configuration, and FAILING there would report a defect that is
-# really a missing optional component. The C, driver, embeds and multi cases
-# above run either way.
-if [[ ! -f "$STAGE/lib/axl/x64/libaxl-cxx.a" ]]; then
-    echo "  SKIP: no libaxl-cxx.a staged — C++ and exceptions cases not run"
+# The C++ cases need the staged cxxrt glue; a C-only SDK (install.sh
+# --no-cpp) is a legitimate configuration, and FAILING there would report a
+# defect that is really a missing optional component. The C, driver, embeds
+# and multi cases above run either way.
+if [[ ! -f "$STAGE/lib/axl/x64/axl-cxxrt-terminate.o" ]]; then
+    echo "  SKIP: no staged C++ glue — C++ and exceptions cases not run"
     echo "        (install.sh --cpp to include them)"
     echo ""
     echo "cmake-package: $pass passed, $fail failed"

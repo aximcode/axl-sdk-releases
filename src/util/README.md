@@ -626,6 +626,36 @@ The reusable primitive underneath the FV launchers is
 with `AxlConsoleMirror` (`<axl/axl-console-mirror.h>`) to mirror the
 launched app's console to a remote terminal.
 
+### Watching for image loads
+
+`axl_image_enumerate` gives you the images loaded *right now*. Anything
+that keeps a snapshot needs to know when that answer changes:
+
+```c
+static void on_load(void *ctx) { rebuild_my_table(); }
+
+AxlImageWatch *w = axl_image_watch_loads(on_load, NULL);
+/* ... */
+axl_image_unwatch_loads(w);
+```
+
+`axl_loop_add_protocol_notify` already covers a program that runs an
+`AxlLoop`. This one exists for the case that has none — a resident DXE
+driver returns from its entry point and iterates nothing, so an event it
+must poll is an event it never notices. Here the firmware invokes the
+callback directly, at `TPL_CALLBACK`.
+
+The callback may allocate (pool allocation is legal at that TPL) and may
+call `axl_image_enumerate`, but it must be short and must not block. It
+receives no image identity: UEFI coalesces the underlying protocol-install
+signals, so "one call per image" is not a promise. Treat it as *something
+changed* and re-read.
+
+The motivating case is a crash handler, which must have its loaded-image
+table built *before* a fault arrives, because rebuilding it in exception
+context would allocate. Snapshotting once at init is the trap — the image
+that eventually faults is normally loaded after the watcher is.
+
 ### Image Signature Inspection
 
 For "is this PE file signed and does its signature validate?"

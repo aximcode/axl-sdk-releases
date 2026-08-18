@@ -53,6 +53,12 @@ CFLAGS=(-std=gnu2x -ffreestanding -fshort-wchar -fno-stack-protector
 LDFLAGS=(-nostdlib -shared -Bsymbolic --no-warn-rwx-segments
          --no-undefined --gc-sections -T "$LDS")
 
+# The C library the probe now needs, asked of the same cross compiler that
+# builds it rather than guessed at a path.
+LIBC_A="$("$AXL_CC_BIN" -print-file-name=libc.a)"
+LIBM_A="$("$AXL_CC_BIN" -print-file-name=libm.a)"
+LIBGCC_A="$("$AXL_CC_BIN" -print-file-name=libgcc.a)"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -67,8 +73,15 @@ gray_count() {
         "static int m(int a,char**v){(void)a;(void)v;$body return 0;}" \
         "AXL_APP(m)" > "$WORK/$name.c"
     "$AXL_CC_BIN" "${CFLAGS[@]}" -c "$WORK/$name.c" -o "$WORK/$name.o"
+    # libc.a and the porting layer, because P3 deleted AXL's stand-in
+    # memcpy/memset/strlen and newlib owns those names now. Without them this
+    # probe fails to LINK, and the failure reads as "pulled 0 ftgrays" -- i.e.
+    # as the assertion passing for a broken reason. A group, matching every
+    # other AXL link. See docs/AXL-Libc-Substrate-Design.md §4d P3.
     ld "${LDFLAGS[@]}" -o "$WORK/$name.so" "$CRT0" \
-        "$B/axl-reloc.o" "$B/axl-debug-info.o" "$WORK/$name.o" "$LIB"
+        "$B/axl-reloc.o" "$B/axl-debug-info.o" "$WORK/$name.o" \
+        --start-group "$B/axl-cxxrt-alloc.o" "$B/axl-cxxrt-stubs.o" "$LIB" \
+        "$LIBC_A" "$LIBM_A" "$LIBGCC_A" --end-group
     nm "$WORK/$name.so" 2>/dev/null | grep -icE 'gray_|ft_grays' || true
 }
 

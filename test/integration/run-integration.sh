@@ -135,6 +135,33 @@ if [[ -z "${RUN_INTEGRATION_DIR:-}" && "${RUN_NO_BUILD:-0}" != "1" ]]; then
     fi
 fi
 
+# A STALE STAGED SDK is a precondition, not a test result.
+#
+# Several tests assert that the staged include/axl-sdk/axl matches include/axl,
+# because they exercise the STAGED copy and an unstaged header edit means they
+# silently report on the previous one. That assertion is right, but as a
+# per-test failure it is diagnosis-hostile: editing one public header surfaces
+# as two unrelated-looking C++ tests failing at the END of a seven-minute run,
+# and the reader has to open a log to learn the cause is one missing command.
+# It happened twice in one evening, and cost a re-run each time.
+#
+# So it is checked ONCE, here, before anything runs. Same condition, same
+# remedy, stated when it is cheap to act on. The per-test assertions stay --
+# they are what protects a test run from a stage that goes stale MID-run, which
+# this cannot see.
+if [[ -d "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/include/axl-sdk/axl" ]]; then
+    if ! diff -rq "$PROJECT_DIR/include/axl" \
+                  "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/include/axl-sdk/axl" >"$LOGDIR/_stage.diff" 2>&1; then
+        echo
+        echo "*** STAGED SDK IS STALE — run: ./scripts/install.sh --arch all --cpp"
+        echo "    include/axl and the staged copy differ, so any test that"
+        echo "    exercises the staged SDK would report on the PREVIOUS build."
+        sed 's/^/      /' "$LOGDIR/_stage.diff" | head -8
+        echo
+        exit 1
+    fi
+fi
+
 # Run one test under a timeout. Host ports are NOT assigned here: each test
 # claims its own from the shared allocator in scripts/axl-common.sh (see
 # common-test.sh's test_port), which verifies each port is free right now and
@@ -356,4 +383,16 @@ done
 echo ""
 echo "integration: $pass passed, $failc failed ($ARCH)"
 echo "logs: $LOGDIR"
+
+# Stamp a clean, COMPLETE run so a release can skip dispatching CI for an
+# answer this run already has (AXL-CI-Release-Speed-Design.md §10.3). Only a
+# full run counts: a --shard or a filtered run did not test everything, so it
+# must not be able to satisfy a release gate.
+if [[ $failc -eq 0 && -z "$SHARD" ]]; then
+    # shellcheck source=lib/release-gate.sh
+    source "$SCRIPT_DIR/lib/release-gate.sh"
+    release_gate_write "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" \
+                       "$ARCH" "$pass" "$failc"
+fi
+
 [[ $failc -eq 0 ]]

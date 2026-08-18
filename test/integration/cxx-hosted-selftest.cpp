@@ -721,21 +721,30 @@ main(void)
         axl_printf("cxx: new overaligned %s\r\n", ok ? "ok" : "BAD");
     }
 
-    /* The throwing operator new halts on failure (see
+    /* The throwing operator new terminates on failure (see
      * cxx-hosted-badalloc.cpp). `new (std::nothrow)` is the standard's
      * way to ask for a NULL instead, and it must still give one --
      * which needs the std::nothrow OBJECT, not just the overloads
-     * that take it. */
-    axl_mem_fail_next_alloc(1);
-    int *nt = new (std::nothrow) int[4];
+     * that take it.
+     *
+     * The failure is produced by asking for 128 TiB rather than by
+     * `axl_mem_fail_next_alloc(1)`, and that changed at P4 for the reason
+     * cxx-hosted-badalloc.cpp records at length: `operator new` is
+     * libstdc++'s now and reaches newlib's `malloc`, a different allocator
+     * from the one AxlMem injects into. The old call did not start failing
+     * -- it started being IGNORED, and this line printed ALLOCATED. */
+    volatile size_t ntWant = (size_t) 1 << 45;
+    int *nt = new (std::nothrow) int[(size_t) ntWant];
     axl_printf("cxx: nothrow %s\r\n", nt == nullptr ? "null" : "ALLOCATED");
     delete[] nt;
 
     /* The libm shim. x86-64 reaches `ceil` through the container
      * headers -- `_M_bkt_for_elements` rounds a load-factor quotient,
      * and rounding a double needs SSE4.1, above the -march=x86-64
-     * baseline -- so on that arch this exercises
-     * src/runtime/axl-cxx-libm.cpp. AArch64 folds it to `frintp` and
+     * baseline -- so on that arch this reaches newlib's libm, which is on
+     * every link since P3 (AXL's own `ceil` shim went with libaxl-cxx.a at
+     * P4, and had existed only because that link carried no libm at all).
+     * AArch64 folds it to `frintp` and
      * exercises the compiler instead; the values must agree either
      * way, which is the point.
      *

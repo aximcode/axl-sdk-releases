@@ -19,34 +19,51 @@
 #      bits/requires_hosted.h -- the same failure, now the failing case.
 #
 #      SCOPE, because "three build paths" would be a false claim: this drives
-#      axl-cc only. The Makefile path is self-covering (axl-cxx-rehash.cpp
-#      includes <unordered_map>, so the library simply fails to build). The
+#      axl-cc only. The Makefile path is covered by `make check-examples`,
+#      which compiles sdk/examples/containers.cpp with CXXFLAGS_EXAMPLE --
+#      derived from the Makefile's own CXXFLAGS_BASE by filter-out -- and that
+#      source includes <map>/<string>/<vector>, none of them in the C++23
+#      freestanding subset. (NOT cxx-streams-selftest, which an earlier
+#      version of this note named: everything it includes IS in the
+#      freestanding subset, so it compiles cleanly WITH -ffreestanding --
+#      verified -- and cannot catch the regression. The genuinely
+#      self-covering source used to be axl-cxx-rehash.cpp, deleted by P4.) The
 #      GENERATED CMAKE PACKAGE is covered by nothing at all -- no test and no
 #      CI step ever configures find_package(axl) -- and check-flag-parity is a
 #      whole-file substring test that the C flag set already satisfies. That
 #      gap predates T3 and is worth closing on its own.
-#   2. libaxl-cxx.a defines the five std::__throw_* symbols. Under
-#      -fno-exceptions the container headers still CALL them; if libstdc++.a
-#      satisfies them instead, its functexcept.o arrives compiled WITH
-#      exceptions and drags in the unwinder.
+#   2. libstdc++.a defines the hook symbols the container headers call, and
+#      the mangled spellings this file greps for still ARE those functions.
+#      INVERTED AT P4: these used to come from libaxl-cxx.a, which existed
+#      because functexcept.o arrives compiled WITH exceptions and drags in
+#      the unwinder. P4 accepts that cascade in exchange for iostreams, so
+#      the archive is gone and the toolchain is the provider.
 #   3. The link resolves __throw_length_error and _Prime_rehash_policy's two
-#      out-of-line members FROM libaxl-cxx.a, proven with ld -y rather than
+#      out-of-line members FROM libstdc++.a, proven with ld -y rather than
 #      inferred from "it linked". Both members or neither: they share
-#      _M_next_resize, so a build that takes one from each side links cleanly
-#      and then disagrees with itself about when to rehash.
+#      _M_next_resize, so a build that took one from each side would link
+#      cleanly and then disagree with itself about when to rehash.
 #   4. No ungated AVX in the produced image. UEFI boots with CR4.OSXSAVE
-#      clear, and this host's libstdc++ hashtable_c++0x.o carries 49 VEX
+#      clear, and the DISTRO libstdc++'s hashtable_c++0x.o carries 49 VEX
 #      instructions -- the #UD that gates x64 (docs/AXL-Cxx-Stdlib-Handoff.md
-#      section 3). This is the assertion that the member was not pulled.
+#      section 3). AXL's own substitutes used to be the answer; since P4 the
+#      answer is that the hermetic toolchain's libstdc++ is measured clean,
+#      and `make check-no-avx` scans that archive. This asserts the produced
+#      IMAGE, which is the claim that actually matters.
 #   5. The image RUNS and prints exact lines. Compile is not link; link is not
 #      run -- each of those three steps produced a wrong conclusion in the
 #      session that led to this test.
 #   6. The __throw_* stubs actually halt, with a diagnosable message, rather
 #      than falling through into code the optimizer proved unreachable.
-#   7. A DEFAULT C++ link names no libstdc++.a, read off the link line rather
-#      than inferred. -frtti is the sole exception and is opt-in. That is the
-#      AXL-Cxx-Design.md §8 constraint: redistributing the GCC runtime is the
-#      one act the Runtime Library Exception does not cover.
+#   7. EVERY C++ link names libstdc++.a, read off the link line rather than
+#      inferred, and -frtti is no longer special. INVERTED AT P4. The old
+#      assertion protected AXL-Cxx-Design.md §8 -- redistributing the GCC
+#      runtime is the one act the Runtime Library Exception does not cover --
+#      and that constraint is untouched, because the SDK still ships no
+#      libstdc++: axl-cc resolves the CONSUMER's installed copy through
+#      `$GXX_BIN -print-file-name`. Since P3 put libc/libm/libgcc on every
+#      link, that toolchain was already a hard prerequisite for any link at
+#      all, so P4 adds no install step.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
 # Requires a staged SDK: scripts/install.sh --arch all --cpp
@@ -174,8 +191,10 @@ run_one() {
     lib_dir="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/lib/axl/$cc_arch"
 
     echo "=== cxx-hosted ($arch) ==="
-    if [[ ! -x "$AXL_CXX" || ! -f "$lib_dir/libaxl-cxx.a" ]]; then
-        echo "  SKIP ($arch): no staged C++ SDK at $lib_dir/libaxl-cxx.a"
+    # Keyed on a cxxrt OBJECT: P4 deleted libaxl-cxx.a, so keying the skip on
+    # that would make this whole suite skip forever, silently.
+    if [[ ! -x "$AXL_CXX" || ! -f "$lib_dir/axl-cxxrt-terminate.o" ]]; then
+        echo "  SKIP ($arch): no staged C++ SDK at $lib_dir"
         echo "        run: scripts/install.sh --arch $cc_arch --cpp"
         skipped=$((skipped + 1))
         return
@@ -239,27 +258,50 @@ run_one() {
     check "$?" "$arch: the rejected --hosted build wrote no object"
 
     # ---------------------------------------------------------------
-    # 2. libaxl-cxx.a carries the five __throw_* definitions.
+    # 2. libstdc++.a carries the hook definitions (INVERTED AT P4).
     # ---------------------------------------------------------------
-    local nm_bin="nm"
+    # Read off the TOOLCHAIN's archive, located the same way axl-cc locates it
+    # so an AXL_*_GXX override moves both together. Before P4 this asserted
+    # libaxl-cxx.a; the symbols are the same, the provider is the opposite.
+    # The g++ comes from axl-toolchains.conf, resolved the way that file
+    # documents (`${AXL_<A>_GXX:-$AXL_<A>_GXX_DEFAULT}`) -- it is deliberately
+    # both valid sh and valid make so callers need not hard-code a path. A
+    # literal /opt path here would go stale the first time the pin moves, and
+    # would test a DIFFERENT libstdc++ from the one axl-cc links.
+    local nm_bin="nm" gxx_bin
     [[ "$arch" == "AARCH64" ]] && nm_bin="aarch64-linux-gnu-nm"
-    "$nm_bin" --defined-only "$lib_dir/libaxl-cxx.a" >"$WORK/cxxlib.nm" 2>/dev/null
-    local sym missing=""
-    for sym in "${THROW_SYMS[@]}" "${REHASH_SYMS[@]}" "${TREE_SYMS[@]}"; do
-        grep -q " $sym\$" "$WORK/cxxlib.nm" || missing="$missing $sym"
-    done
-    [[ -z "$missing" ]]
-    check "$?" "$arch: libaxl-cxx.a defines all $((${#THROW_SYMS[@]} + ${#REHASH_SYMS[@]} + ${#TREE_SYMS[@]})) libstdc++ hook symbols${missing:+ (missing:$missing)}"
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/scripts/axl-toolchains.conf"
+    if [[ "$cc_arch" == "aa64" ]]; then
+        gxx_bin="${AXL_AA64_GXX:-$AXL_AA64_GXX_DEFAULT}"
+    else
+        gxx_bin="${AXL_X64_GXX:-$AXL_X64_GXX_DEFAULT}"
+    fi
+    local stdcxx_a=""
+    [[ -x "$gxx_bin" ]] && stdcxx_a="$("$gxx_bin" -print-file-name=libstdc++.a 2>/dev/null)"
 
-    # The mangled names above must still BE these functions. Without this a
-    # renamed mangling turns every grep into a silent no-match.
-    #
-    # Via a file, not a pipe: `set -o pipefail` is on, and `grep -q` exits on
-    # the first match, SIGPIPEing nm -- so `nm | grep -q` reports FAILURE on
-    # the runs where it found what it was looking for.
-    "$nm_bin" -C --defined-only "$lib_dir/libaxl-cxx.a" >"$WORK/cxxlib.dm" 2>/dev/null
-    grep -qF "std::__throw_out_of_range_fmt(char const*, ...)" "$WORK/cxxlib.dm"
-    check "$?" "$arch: the mangled names still demangle to the std:: functions"
+    [[ -n "$stdcxx_a" && -f "$stdcxx_a" ]]
+    check "$?" "$arch: located the toolchain's libstdc++.a (${stdcxx_a:-<nothing>})"
+
+    if [[ -f "$stdcxx_a" ]]; then
+        "$nm_bin" --defined-only "$stdcxx_a" >"$WORK/cxxlib.nm" 2>/dev/null
+        local sym missing=""
+        for sym in "${THROW_SYMS[@]}" "${REHASH_SYMS[@]}" "${TREE_SYMS[@]}"; do
+            grep -q " $sym\$" "$WORK/cxxlib.nm" || missing="$missing $sym"
+        done
+        [[ -z "$missing" ]]
+        check "$?" "$arch: libstdc++.a defines all $((${#THROW_SYMS[@]} + ${#REHASH_SYMS[@]} + ${#TREE_SYMS[@]})) hook symbols${missing:+ (missing:$missing)}"
+
+        # The mangled names above must still BE these functions. Without this a
+        # renamed mangling turns every grep into a silent no-match.
+        #
+        # Via a file, not a pipe: `set -o pipefail` is on, and `grep -q` exits
+        # on the first match, SIGPIPEing nm -- so `nm | grep -q` reports
+        # FAILURE on the runs where it found what it was looking for.
+        "$nm_bin" -C --defined-only "$stdcxx_a" >"$WORK/cxxlib.dm" 2>/dev/null
+        grep -qF "std::__throw_out_of_range_fmt(char const*, ...)" "$WORK/cxxlib.dm"
+        check "$?" "$arch: the mangled names still demangle to the std:: functions"
+    fi
 
     # ---------------------------------------------------------------
     # 3. Hosted build, with ld -y proving WHO satisfied each symbol.
@@ -280,25 +322,30 @@ run_one() {
         return
     fi
 
-    # Every traced symbol must be DEFINED BY libaxl-cxx.a. ld prints
+    # Every traced symbol must be DEFINED BY libstdc++.a. ld prints
     # "<file>: definition of <sym>" for the archive member that supplied it.
-    local from_us=1
+    # INVERTED AT P4: the provider used to be libaxl-cxx.a. Still asserted
+    # positively rather than as "not us" -- an absence would also be satisfied
+    # by a symbol nothing defined at all, which --no-undefined would catch but
+    # this check would report as a pass.
+    local from_stdcxx=1
     for sym in "${REHASH_SYMS[@]}" _ZSt20__throw_length_errorPKc; do
-        if ! grep -E "libaxl-cxx\.a.*: definition of $sym\$" "$WORK/build.log" >/dev/null; then
-            from_us=0
+        if ! grep -E "libstdc\+\+\.a.*: definition of $sym\$" "$WORK/build.log" >/dev/null; then
+            from_stdcxx=0
             echo "      $sym came from: $(grep -E ": definition of $sym\$" "$WORK/build.log" | head -1 || echo '<nothing>')"
         fi
     done
-    [[ "$from_us" -eq 1 ]]
-    check "$?" "$arch: libaxl-cxx.a — not libstdc++.a — defined the hook symbols"
+    [[ "$from_stdcxx" -eq 1 ]]
+    check "$?" "$arch: libstdc++.a defined the hook symbols (P4 inversion)"
 
     # ---------------------------------------------------------------
-    # 3b. libstdc++.a is not linked AT ALL.
+    # 3b. libstdc++.a IS linked, and libaxl-cxx.a is gone (P4).
     # ---------------------------------------------------------------
-    # Not a size optimisation: redistributing libstdc++ is the one act the
-    # GCC Runtime Library Exception does not cover, so not linking it is what
-    # lets the SDK be self-contained without GPL-3 obligations. It also drops
-    # the --hosted prerequisite that a matching libstdc++-static be installed.
+    # The §8 constraint is unchanged and is NOT what this measures: the SDK
+    # still redistributes no libstdc++, because axl-cc names the consumer's
+    # installed copy via `-print-file-name`. What regressing here would mean
+    # now is a link that quietly went back to hand-written substitutes, i.e.
+    # a stale staged SDK making every case below measure the previous build.
     #
     # Asserted on the BUILD LOG (ld -t names every archive it opens) rather
     # than on the image, because an archive contributing zero members leaves
@@ -316,12 +363,17 @@ run_one() {
     [[ "$trace_rc" -eq 0 && -f "$WORK/tracelink-$cc_arch.efi" ]]
     check "$?" "$arch: the -Wl,-t probe link SUCCEEDED (rc=$trace_rc)"
 
-    ! grep -q "libstdc++\.a" "$WORK/tracelink.log"
-    check "$?" "$arch: the hosted link names no libstdc++.a"
+    grep -q "libstdc++\.a" "$WORK/tracelink.log"
+    check "$?" "$arch: the C++ link opens libstdc++.a"
+
+    ! grep -q "libaxl-cxx\.a" "$WORK/tracelink.log"
+    check "$?" "$arch: libaxl-cxx.a is gone from the link (P4)"
 
     # Positive control: -t must actually have produced a listing, or the
-    # absence above proves nothing.
-    grep -q "libaxl-cxx\.a" "$WORK/tracelink.log"
+    # ABSENCE above proves nothing. libaxl.a is the archive that is on every
+    # link whatever happens to the C++ side, so it is the right control now
+    # that libaxl-cxx.a is the thing being asserted absent.
+    grep -q "libaxl\.a" "$WORK/tracelink.log"
     check "$?" "$arch: ld -t listing is present (control for the check above)"
 
     # ---------------------------------------------------------------
@@ -348,12 +400,12 @@ run_one() {
     # ---------------------------------------------------------------
     # 5b. Every new/delete form LINKS.
     # ---------------------------------------------------------------
-    # These operators live in libaxl-cxx.a, so a consumer writing plain C++
-    # hits them without opting into anything. Two of them had no definition at
-    # all until this fixture existed, and both failed only at LINK:
-    # `new (std::nothrow) T` needs the std::nothrow OBJECT (libsupc++, which
-    # firmware does not link), and an over-aligned `new` calls a different
-    # operator entirely.
+    # A consumer writing plain C++ hits these without opting into anything.
+    # Two of them had no definition at all until this fixture existed, and
+    # both failed only at LINK: `new (std::nothrow) T` needs the std::nothrow
+    # OBJECT and an over-aligned `new` calls a different operator entirely.
+    # Both come from libsupc++ since P4 -- which firmware DOES link now, and
+    # that is the change this case silently depends on.
     #
     # This ran TWICE, once per mode, until T3 removed the modes. Kept as one
     # run rather than two identical ones: a second PASS line for a distinction
@@ -367,54 +419,50 @@ run_one() {
         | sed 's/^/      /' | head -4
 
     # ---------------------------------------------------------------
-    # 5c. -frtti links with no mode flag, and is the ONLY thing that
-    #     puts libstdc++.a on the link line.
+    # 5c. -frtti links with no mode flag and needs no extra library.
     # ---------------------------------------------------------------
-    # libstdc++.a carries the __cxxabiv1 type_info vtables and __dynamic_cast,
-    # so -frtti needs nothing from us beyond __stack_chk_fail.
+    # libsupc++ carries the __cxxabiv1 type_info vtables and __dynamic_cast.
+    # RTTI used to be the ONE thing that put libstdc++.a on the link line, and
+    # this pair asserted exactly that asymmetry; P4 puts it there for every
+    # C++ link, so the asymmetry is gone and what is left to pin is that
+    # -frtti needs no separate opt-in plumbing.
     #
-    # This pair used to read "works hosted, honestly fails freestanding" --
-    # the freestanding half is gone with T3, since there is no mode to fail
-    # in. What replaces it is the property that actually mattered underneath:
-    # RTTI is OPT-IN, and the DEFAULT link names no GCC runtime library at
-    # all. That is the AXL-Cxx-Design.md §8 constraint -- redistributing the
-    # runtime is the one act the Runtime Library Exception does not cover --
-    # so a default build silently acquiring libstdc++.a is the regression
-    # worth catching, not a mode that no longer exists.
+    # Still worth running rather than deleting: -frtti is the workload that
+    # first SPLIT the aa64 relocation table (see the run assertion below), and
+    # it remains the only fixture that exercises type_info at all.
     "$AXL_CXX" --arch "$cc_arch" --release -frtti \
         "$RTTI_SRC" -o "$WORK/rtti-$cc_arch.efi" >"$WORK/rtti.log" 2>&1
     check "$?" "$arch: -frtti links with no mode flag"
     [[ -s "$WORK/rtti.log" ]] && grep -oP "undefined reference to .\K[^']+" \
         "$WORK/rtti.log" | head -3 | sed 's/^/      /'
 
-    # The negative, read off the LINK LINE rather than inferred from success:
-    # --verbose prints the ld invocation, and libstdc++.a must appear on the
-    # -frtti one and on no other.
+    # Read off the LINK LINE rather than inferred from success: --verbose
+    # prints the ld invocation, and libstdc++.a must appear on BOTH the -frtti
+    # link and the plain one since P4.
     #
-    # BOTH halves need a positive control, and for DIFFERENT reasons -- an
-    # absence proves nothing if the link never ran, and a presence proves
+    # Each half still needs its exit status checked first. A presence proves
     # nothing if the string came from an error message rather than a command
-    # line. axl-cc's own "-frtti needs libstdc++.a" diagnostic contains the
-    # literal string, so the grep below would pass on the exact failure it is
-    # meant to catch.
+    # line -- axl-cc's old "-frtti needs libstdc++.a" diagnostic contained the
+    # literal string, so this grep would once have passed on the exact failure
+    # it is meant to catch.
     "$AXL_CXX" --arch "$cc_arch" --release --verbose -frtti \
         "$RTTI_SRC" -o "$WORK/rtti-v.efi" >"$WORK/rtti-v.log" 2>&1
     rc=$?
     [[ "$rc" -eq 0 && -f "$WORK/rtti-v.efi" ]] \
-        && grep -q -- "-frtti.*libstdc++\.a\|libstdc++\.a" "$WORK/rtti-v.log" \
-        && grep -q "libaxl-cxx\.a" "$WORK/rtti-v.log"
-    check "$?" "$arch: -frtti DOES name libstdc++.a on a link that succeeded (rc=$rc)"
+        && grep -q -- "libstdc++\.a" "$WORK/rtti-v.log" \
+        && grep -q "libaxl\.a" "$WORK/rtti-v.log"
+    check "$?" "$arch: -frtti names libstdc++.a on a link that succeeded (rc=$rc)"
 
     "$AXL_CXX" --arch "$cc_arch" --release --verbose \
         "$SRC" -o "$WORK/nortti-v.efi" >"$WORK/nortti-v.log" 2>&1
     rc=$?
-    # The control: libaxl-cxx.a must BE on this line. Without it, a link that
-    # died before ld ran -- or a --verbose that printed nothing -- reads as
-    # "no libstdc++.a" and passes.
+    # INVERTED AT P4. The control is libaxl.a, which is on every link whatever
+    # the C++ side does, so a --verbose that printed nothing cannot read as a
+    # pass.
     [[ "$rc" -eq 0 && -f "$WORK/nortti-v.efi" ]] \
-        && grep -q "libaxl-cxx\.a" "$WORK/nortti-v.log" \
-        && ! grep -q "libstdc++\.a" "$WORK/nortti-v.log"
-    check "$?" "$arch: a default C++ link names NO libstdc++.a (self-contained, rc=$rc)"
+        && grep -q "libaxl\.a" "$WORK/nortti-v.log" \
+        && grep -q "libstdc++\.a" "$WORK/nortti-v.log"
+    check "$?" "$arch: a DEFAULT C++ link also names libstdc++.a (rc=$rc)"
 
     # Run-asserted on BOTH arches. It was x64-only until the aa64 linker
     # script was fixed: an RTTI link there produced a linker-synthesized
@@ -523,22 +571,41 @@ run_one() {
     # ---------------------------------------------------------------
     halt_fixture "$arch" "$cc_arch" out-of-range "$THROW_SRC" \
         "cxx-throw: about to call vector::at(99) on a 3-element vector" \
-        "__throw_out_of_range_fmt" \
+        "terminate: uncaught exception of type St12out_of_range" \
+        "  what(): vector::_M_range_check" \
         "cxx-throw: UNREACHABLE"
     halt_fixture "$arch" "$cc_arch" bad-alloc "$BADALLOC_SRC" \
-        "cxx-badalloc: about to allocate with OOM injected" \
-        "__throw_bad_alloc" \
+        "cxx-badalloc: about to allocate more than any heap can serve" \
+        "terminate: uncaught exception of type St9bad_alloc" \
+        "  what(): std::bad_alloc" \
         "cxx-badalloc: UNREACHABLE"
 }
 
-# Build a fixture that is SUPPOSED to halt, run it, and assert three things
-# that are easy to conflate: it got as far as the call, the stub identified
-# itself rather than dying mutely, and it did not RETURN. The third is the one
-# that matters most -- gcc compiles the code after a throw site assuming it is
-# unreachable, so a stub that returns resumes in a state nothing modelled.
+# Build a fixture that is SUPPOSED to halt, run it, and assert four things
+# that are easy to conflate: it got as far as the call, the runtime NAMED what
+# went wrong, it said what() rather than only the type, and it did not RETURN.
+# The last is the one that matters most -- gcc compiles the code after a throw
+# site assuming it is unreachable, so a path that returns resumes in a state
+# nothing modelled.
+#
+# WHAT PRODUCES THE MESSAGE CHANGED AT P4, and the assertions moved with it.
+# These used to reach AXL's own std::__throw_* stubs in libaxl-cxx.a, which
+# printed "axl-cxxabi: __throw_out_of_range_fmt" and halted. They now reach
+# libstdc++'s real ones, which THROW; with no handler in a -fno-exceptions
+# consumer the unwinder calls std::terminate, and AXL's replacement handler
+# (src/cxxrt/axl-cxxrt-terminate.cpp) prints the type and what(). That is
+# strictly better diagnostics -- "vector::_M_range_check: __n (which is 99)"
+# instead of a function name -- and it is why every C++ link takes the
+# exceptions linker script now: without a registered frame table the throw
+# would reach terminate through _URC_FATAL_PHASE1_ERROR and print neither.
+#
+# The TYPE line is matched exactly (grep -Fxq) because it is AXL's own output.
+# The what() text is matched as a PREFIX: its tail is libstdc++'s wording, and
+# pinning a third-party string exactly would fail on a toolchain bump without
+# anything being wrong.
 halt_fixture() {
     local arch="$1" cc_arch="$2" name="$3" src="$4"
-    local reached="$5" marker="$6" unreachable="$7"
+    local reached="$5" type_line="$6" what_pat="$7" unreachable="$8"
     local efi="$WORK/cxx-$name-$cc_arch.efi" rc
 
     "$AXL_CXX" --arch "$cc_arch" --release "$src" -o "$efi" \
@@ -554,9 +621,10 @@ halt_fixture() {
 
     grep -Fxq "$reached" "$WORK/$name-run.clean"
     check "$?" "$arch: $name fixture reached the failing call"
-    grep -qF "axl-cxxabi" "$WORK/$name-run.clean" \
-        && grep -qF "$marker" "$WORK/$name-run.clean"
-    check "$?" "$arch: $name named itself ($marker) instead of halting mutely"
+    grep -Fxq "$type_line" "$WORK/$name-run.clean"
+    check "$?" "$arch: $name named the exception type instead of dying mutely"
+    grep -qF "$what_pat" "$WORK/$name-run.clean"
+    check "$?" "$arch: $name recovered what() ($what_pat...)"
     ! grep -qF "$unreachable" "$WORK/$name-run.clean"
     check "$?" "$arch: $name did not return into unreachable code"
 }

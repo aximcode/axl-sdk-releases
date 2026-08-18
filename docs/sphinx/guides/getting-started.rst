@@ -51,7 +51,7 @@ same FHS layout under a prefix of your choice::
     cd axl-sdk-releases
     git checkout v0.1.3   # or any tagged release
     ./scripts/install.sh --arch x64 --prefix "$PWD/out"
-    export PATH="$PWD/out/bin:$PATH"
+    export PATH="$PWD/stage/bin:$PATH"
 
 For a tarball instead of a clone, use the **Source code
 (tar.gz)** link on each

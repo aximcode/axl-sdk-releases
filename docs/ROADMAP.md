@@ -18,21 +18,44 @@ Library / SDK foundations:
 - [AXL-Design.md](AXL-Design.md) — library design (phases, API spec, style)
 - [AXL-SDK-Design.md](AXL-SDK-Design.md) — SDK (toolchain, packaging)
 - [AXL-Build-System-Design.md](AXL-Build-System-Design.md) — **PROPOSED
-  2026-08-15.** Replace the 3,579-line Makefile with CMake for 4.0.0; we
-  stop shipping Makefiles. Decision (CMake over Meson) and the measured
-  port surface — the `.efi` pipeline, the ARCH x BUILD x AXL_TLS prefix
-  rule, 17 gates, and why `axl-cc` is NOT part of the port.
+  2026-08-15; retargeted to 5.0.0 on 2026-08-16.** Replace the 3,579-line
+  Makefile with CMake. Decision (CMake over Meson) and the measured port
+  surface — the `.efi` pipeline (~180 images per arch), the
+  ARCH x BUILD x AXL_TLS prefix rule, 17 gates, 149 make callers, and why
+  `axl-cc` is NOT part of the port.
+
+  **NOT 4.0.0, and it is breaking.** The entry used to say "for 4.0.0; we stop
+  shipping Makefiles", on the premise that the Makefile was not in the shipped
+  surface. **That premise is retracted** (design doc §5.1): `release.yml`
+  publishes the whole tree via `git archive HEAD`, there is no `.gitattributes`
+  so nothing is `export-ignore`d, and `README.md` gives
+  `git clone axl-sdk-releases && make CROSS=<prefix>-` as the *only* documented
+  build for macOS and native Windows, which have no binary package. So the port
+  needs a `### Breaking` entry, a README rewrite, and a major of its own.
+  4.0.0 shipped 2026-08-15 without it.
+
+  **`CROSS=` ANSWERED 2026-08-16 (`00206e7a`): the README path is removed and
+  the port reproduces nothing.** It selected binutils only (since `0bf6ed51`),
+  and a glibc-targeted cross cannot build the tree at all now `include/compat`
+  is gone. `AXL_TOOLCHAIN` replaces it as a VARIANT beside the locators, the
+  pairing Zephyr / EDK2 / the kernel all use — so the port inherits no prefix
+  convention. **`AXL-Distribution-Design.md`'s P2 is also decoupled**: the
+  "shared 149-caller surface" both docs claimed measures at SEVEN files, and
+  P2's own half shipped in `52f5f369`. Still open is Distribution's O1 (does
+  the default move from `out/` to `stage/`), now one edit rather than a sweep.
 - [AXL-Cxx-Stdlib-Handoff.md](AXL-Cxx-Stdlib-Handoff.md) — **DONE 2026-08-06.**
   `axl-c++ --hosted` ships, and `std::vector` / `std::string` / `std::map` /
   `std::unordered_map` run under UEFI on both arches
   (`test/integration/test-cxx-hosted-qemu.sh`). **§8's distribution question
-  CLOSED 2026-08-08: the SDK is self-contained and links no `libstdc++.a` at
-  all.** `--hosted` was pulling exactly two members (`tree.o`,
-  `hash_bytes.o`); `src/runtime/axl-cxx-rbtree.cpp` and `axl-cxx-hash.cpp`
-  supply those eleven functions clean-room under Apache-2.0, so the one act
-  the GCC Runtime Library Exception does not cover — redistributing the
-  runtime library — simply does not arise. `-frtti` remains the exception and
-  links the consumer's own installed archive.
+  was CLOSED 2026-08-08 ("the SDK links no `libstdc++.a` at all") and
+  RESETTLED 2026-08-17 by P4: every C++ link carries the CONSUMER's installed
+  libstdc++, and the SDK still conveys none of it.** The RLE constraint is
+  untouched — what it forbids is us redistributing the runtime library, and
+  `axl-cc` resolves the consumer's copy via `-print-file-name`, as the
+  `-frtti` path already did. The five clean-room substitutes that made the old
+  answer possible went with `libaxl-cxx.a`; see
+  `AXL-Libc-Substrate-Design.md` P4-RESULT for why keeping them was worth
+  ~3 KB against a +47 KB budget.
 
   **Not the same as "everything links"**, and the first commit message said
   "eleven functions were the whole gap", which was wrong. `std::list` and
@@ -67,6 +90,75 @@ Library / SDK foundations:
   `AXL_DEFINE_NO_HANDLE`. Gated by `make check-handle-exclusions` (one fixture,
   three compiles, matches the poison text) and 12 run assertions per arch in
   `test-cxx-hosted-qemu.sh`. See AXL-Cxx-Design.md §9b.
+- **C++ seams over the C API — C2/C3/C5 DONE 2026-08-17.** Five headers, 67
+  assertions per arch in `test-cxx-seam-qemu.sh` plus 18 C-side unit
+  assertions, 11 sabotages verified.
+  - **C2** `axl::view` / `axl::adopt` (`axl-cstr.hpp`) — the ~20 public
+    functions returning an owned `char *` become one expression instead of
+    four leak-prone lines. The `AxlString *` half of the scoped seam was
+    DROPPED: zero C++ consumers reference the type, which is §4.4's measured
+    inversion applied to C2.
+  - **C3** `axl_array_data()` + `axl_array_element_size()` on the C side, and
+    `axl::array_span` / `axl::array_ptr_span` (`axl-array.hpp`). The scoped
+    `axl::c_array_ref` was **not written** — with a base pointer a borrowed
+    array is a `std::span` outright, with real `T *` iterators instead of a
+    proxy. This reverses §7 item 3, whose "only if a container is wanted"
+    clause missed that a VIEW has the same need. A stride mismatch HALTS
+    naming both sizes.
+  - **C5** four lazy allocation-free `AxlNTree` ranges (`axl-ntree.hpp`),
+    `axl::radix_tree<T>` (`axl-radix-tree.hpp`), `axl::gfx_target_scope`
+    (`axl-gfx-surface.hpp`, replacing AGT's hand-written `saved_target_`).
+    `level_order`/`in_order` are deliberately absent — they need a queue, and
+    a range that allocated silently would read like the four that do not.
+    The radix wrapper was built with **zero** C++ consumers, as an explicit
+    surface-completeness call rather than a measured one.
+  - **C6 DONE 2026-08-17** — `axl-json.hpp`: `axl::json_document`/`json_value`
+    with simdjson-style chaining navigation, array and object ranges,
+    `axl::json_writer` with RAII container scopes and templated `add`,
+    `splice()` (the reader->writer bridge, which needed no C change), and
+    `axl::json_scanner`. 52 assertions per arch. Required four C additions,
+    which serve C callers too: `axl_json_get_string_len`,
+    `axl_json_value_string_len`, `axl_json_object_peek_key_len` (a PEEK, since
+    object iteration reports a truncated key only after consuming the pair),
+    and `axl_json_double`/`axl_json_kv_double`, completing the scalar mirror
+    the reader opened at P14. See AXL-Cxx-Design.md §9d and §9e.
+  - **`axl-c++ --no-eh-frame` — DONE 2026-08-17**, on a measured request from
+    AGT (5.3 MB of fleet growth from P4's one-link-shape collapse). Drops the
+    unwind tables. AGT has since ADOPTED it on all four link sites: **x64 fleet
+    16.40 -> 14.12 MB across 34 binaries**, gate green (9650/0 both arches,
+    63/63 visual).
+
+    **Budget from the decomposition, not a percentage.** Saving = `.eh_frame` +
+    a constant ~13.5 KB (x64) / ~16.5 KB (aa64) of collected throw path, and
+    `.eh_frame` scales with program size on x64 while being CONSTANT (~8.3 KB)
+    on aa64 — because `-fasynchronous-unwind-tables` is a per-TARGET default,
+    on for `x86_64-elf` and off for `aarch64-none-elf`, so aa64 consumer code
+    emits no CFI under `-fno-exceptions`. (Not an architecture property:
+    `aarch64-linux-gnu` has it ON. An earlier revision of this line said
+    "psABI" and was wrong.) x64 lands ~13% at any tool size; aa64 is **~25 KB flat**, which AGT
+    measured as 3.1-4.4%. The -18%/-15% first quoted here came from one small
+    fixture and under-predicted aa64 by ~4x.
+
+    The request was "select the non-`_eh` linker script", and measurement said
+    that alone does two wrong things: it does not LINK (`axl-cxxrt-eh.o`
+    references `__eh_frame_start` under `--no-undefined`), and it does not
+    degrade the terminate message, it takes a CPU fault and **wedges the
+    machine**. So the flag also swaps in `axl-cxxrt-nothrow.o`, whose
+    `__cxa_throw` intercepts before the unwinder is entered and still prints
+    the type and `what()`. REFUSED with `-fexceptions`, because that
+    combination silently kills every catch block — a correctness failure, not
+    a size trade. `test-cxx-noeh-qemu.sh`, 19 assertions per arch. See
+    AXL-Cxx-Unwinder-Design.md §U5.
+  - **The C++ layer is now COMPLETE**: C0-C7 all shipped.
+
+    Read "complete" as "every phase the design doc scoped has landed and is
+    tested", not as "proven against real consumers". The honest caveat is the
+    one §9c already records for `axl::string`: for the C6 JSON API and the C5
+    radix wrapper, the only in-tree consumer is the fixture that tests them.
+    AGT exercises `unique_handle`, `std::string` and the `AxlArray` sites; the
+    rest is a public SDK surface waiting for its first outside caller, and
+    §9c's acceptance test ("AGT shrinks") is the measure that has NOT been
+    re-run since C2/C3/C5 landed.
 - [AXL-Cxx-Streams-Handoff.md](AXL-Cxx-Streams-Handoff.md) — **DONE 2026-08-07.**
   `axl::cout` / `axl::cin` / `axl::cerr` over `axl_printf` / `axl_readline`,
   plus **`axl::string`** — which the handoff did not anticipate. `std::`
@@ -154,8 +246,61 @@ Library / SDK foundations:
   than bridging to it — see the design doc — and newlib-minus-malloc is no
   longer merely "worth spiking": `src/cxxrt/` is a working instance of it
 
+- **Debug SDK variant — PROPOSED 2026-08-17, not scheduled.** SDK consumers
+  have **no instrumented allocator at all**: the staged `libaxl.a` is built
+  `-DNDEBUG`, so no fences, no `0xDA`/`0xDF` fills, no leak list, no
+  quarantine, no file/line — `axl_mem_dump_leaks()` exists and reports nothing.
+  `axl-cc --debug` does not change this; it sets the CONSUMER's compile flags,
+  while the staged library it links was built once at `BUILD=RELEASE`.
+  Closing it means staging a DEBUG variant of `libaxl.a` plus the glue objects
+  and having `axl-cc --debug` select it. Found while pricing
+  [AXL-Libc-Substrate-Design.md](AXL-Libc-Substrate-Design.md) §2-DECISION,
+  which is also what it would unblock: an `AXL_MEM_DEBUG` allocator bridge for
+  the C/C++ world is dead code until a debug SDK exists to compile it into.
 - [AXL-Libc-Substrate-Design.md](AXL-Libc-Substrate-Design.md) — **DIRECTION
-  AGREED 2026-08-11.** `axl_*` sits on newlib the way GLib sits on libc, with
+  AGREED 2026-08-11; PHASES COSTED 2026-08-17 (§4c).** The C half is free —
+  six real images linked with `libc.a` and the stand-ins deleted grew by
+  nothing and pulled no stdio, so `axl-str-compat.c` + `axl-intrinsics.c`
+  (195 lines) are deletable. **ALL FIVE PHASES DONE 2026-08-17.** The C++ half
+  (P4) cost **+46,928 `.text` (+138%)**, and **+100,339 on the `.efi`** (58,758 -> 159,097), on a `-fno-exceptions` image — not the
+  +126 KB costed here, which pre-dated the terminate-handler shrink — and
+  released `libaxl-cxx.a` ENTIRELY (7 files, 1,696 lines), buying real
+  stdio and working `<iostream>`/`<sstream>`/`<fstream>`. Sequencing is
+  forced: the `_r` allocator bridge comes FIRST
+  because stdio's `findfp.o`/`fvwrite.o` allocate through `_malloc_r`, so the
+  porting layer alone would not deliver stdio. **The P2 shape is settled
+  (§4c.1): newlib's stdio sits ON `AxlStream`, not the reverse.** newlib
+  defines 0 of the 18 porting-layer symbols, so those are AXL's in every
+  design; `AxlStreamBackend`'s vtable already has the
+  read/write/pread/pwrite/seek/close shape newlib wants, so the fd table is an
+  `AxlStream *` array rather than a subsystem. **`fopen`/`FILE` ARE
+  supported** — newlib's FILE machinery sits on those six entry points, so
+  third-party C that opens files needs no porting; what stays direct is
+  AXL's OWN file APIs, which do not route through `FILE`. And **`AxlFormat` is out of scope permanently** — two formatters on
+  purpose, per §4.1. **Phased in §4d (P1-P5), not started:** P1 the allocator
+  takes the standard names (plain AND `_r`, from `libaxl.a` itself), P2 the
+  porting layer over `AxlStream`, P3 `libc.a` everywhere + the 195-line
+  deletion, P4 the libstdc++ swap (+126 KB, accepted) for iostreams, P5
+  locale. **P5 MEASURED 2026-08-17 and there is nothing to do:**
+  `<sstream>` `<fstream>` `<format>` `<regex>` all compile, link and RUN
+  today — what they needed was a C library, not glibc's locale, so
+  P2/P3 delivered it as a side effect. `AXL-Cxx-Stdlib-Surface.md`'s
+  Tier 3 ("blocks all four") is RETRACTED. The wall is SIZE: ~1 MB each,
+  ~9x the 119,691-byte -fexceptions baseline. **P1 LANDED 2026-08-17** (`c991ccfc`,
+  `68caad05`): newlib's internals allocate through AXL, `strdup()` works
+  where it returned NULL, dlmalloc is absent from the image, and
+  `malloc_usable_size` is AXL's — newlib's returned 56 for a 64-byte
+  block, silently. **REPLACED SAME DAY by §2-DECISION: TWO allocators, split
+  by namespace; P3 LANDED, the 195 lines are deleted and the AXL/newlib
+  symbol overlap fell 14 -> 5** — newlib keeps its own dlmalloc on an AXL `sbrk` over
+  `axl_alloc_pages`, `axl_malloc` stays separate over `AllocatePool`, and
+  nothing crosses because the names are disjoint. Accepted cost: C++ and
+  third-party allocations leave AXL's leak gate. **P2 LANDED 2026-08-17** (`7cf04c31`): real `printf` and
+  `fopen` for third-party C, newlib's FILE running on `AxlStream`, 28/28
+  both arches. **The one ordering that is a trap is P3
+  before P1** — third-party `malloc` would reach newlib's dlmalloc and
+  return NULL silently rather than failing the link.
+  **DIRECTION AGREED 2026-08-11.** `axl_*` sits on newlib the way GLib sits on libc, with
   the ALLOCATOR inverted rather than replaced: AXL's allocator keeps its
   implementation and takes the STANDARD NAMES, so `malloc` is AXL's over
   `AllocatePool` and `axl_malloc` is the same allocator plus call-site
@@ -224,10 +369,16 @@ Library / SDK foundations:
   the ordering. **Measured cost, both arches:** a container-using image goes
   ~61 KB to ~279 KB on x64 (~69 KB to ~274 KB on aa64) with `-fexceptions`, of
   which only ~22 KB is the unwinder — roughly half is libstdc++'s verbose
-  terminate handler pulling the C++ demangler and newlib `stdio`. Preempting
-  that handler with one small object takes the same image to 167 KB / 153 KB,
-  measured and booted; shipping it on the `-fexceptions` link path is an
-  obvious follow-up and is NOT done. See
+  terminate handler pulling the C++ demangler and newlib `stdio`.
+  **U5 DONE — that handler is preempted and the image is ~43-46% smaller.**
+  `src/cxxrt/axl-cxxrt-terminate.cpp` is the fourth object `axl-cc` names on
+  the `-fexceptions` path: 264,185 → 150,920 on x64 and 259,933 → 139,651 on
+  aa64, measured with and without it. The stock handler printed **nothing**
+  under UEFI (its `stderr` is a newlib one nothing wires up), so the 112 KB
+  bought negative value; ours names the exception's type and `what()` for
+  +89 B / +655 B over a fixed string, and is asserted both ways —
+  `nm` for the absent demangler, a booted uncaught throw for the output. See
+  [AXL-Cxx-Unwinder-Design.md](AXL-Cxx-Unwinder-Design.md) §4a and
   [AXL-Cxx-Toolchain-Handoff.md](AXL-Cxx-Toolchain-Handoff.md)
 - [AXL-Cxx-Stdlib-Surface.md](AXL-Cxx-Stdlib-Surface.md) — **measured**
   table of which STL facilities work freestanding, which need
@@ -469,8 +620,90 @@ firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
 
 ## Open backlog
 
+- **The x64 and aa64 toolchains now MATCH (2026-08-17, `-axl3` published).**
+  newlib 4.4.0 -> 4.5.0 and ARM's six newlib flags adopted verbatim from the
+  manifest ARM ships inside its own toolchain
+  (`14.3.rel1-*-manifest.txt`). Two divergences closed: newlib 4.4.0's
+  `struct mallinfo` filled ten `int` into a struct its own `<malloc.h>`
+  declares as ten `size_t`, and `printf("%zu", (size_t)4096)` emitted the
+  literal text `zu` on x64 while working on aa64 (that is
+  `--enable-newlib-io-c99-formats`, not `io-long-long`).
+
+  **Not matchable, and recorded so nobody retries it:** ARM's `libc.a` defines
+  `open/read/write/lseek/sbrk/...` and ours does not, because newlib's
+  `configure.host` grants `syscall_dir=syscalls` to `aarch64*-*-*` and gives
+  `x86_64` no entry. Both builds pass `--disable-newlib-supplied-syscalls`;
+  verified by building x64 without it and observing no change. AXL's porting
+  layer handles it instead — underscore forms are the implementations, plain
+  names are weak aliases, so either winner is correct.
+
+  Leftover: the `AXL_NEWLIB_MALLINFO_INT` block in `axl-cxxrt-alloc.c` is now
+  dead (its build-time probe self-disabled) and can be deleted.
+
+
 Grouped, terse; **detail lives in the linked design doc or
 [ROADMAP-Archive.md](ROADMAP-Archive.md)**. Most are opportunistic / low-priority.
+
+- **Hardware crypto/hash instructions are DETECTED and used by NOTHING.**
+  Surveyed 2026-08-17. `AxlCpuFeatures` (`include/axl/axl-cpu.h`) already
+  reports the whole family on both arches — x86 `aes` / `pclmulqdq` / `sha`
+  (SHA-NI) / `vaes` / `vpclmulqdq` / `sse42` / `rdrand`, aarch64 `aes_a64` /
+  `pmull` / `sha1` / `sha2` / `sha512` / `sha3` / `crc32` — and
+  `src/util/axl-cpu.c` populates the aarch64 half by reading
+  `ID_AA64ISAR0_EL1` directly with `mrs`, no `getauxval` and no OS
+  dependency. **Grep says nothing in `src/` or `tools/` reads any of those
+  bits**: the only `AxlCpuFeatures` consumers are the gfx SIMD dispatchers.
+  So the detection layer is built, shipped and idle.
+
+  **SHA-256 is the target, not AES**, and the ranking is what makes this
+  worth scheduling at all:
+
+  | workload | why | aarch64 | x86-64 |
+  |---|---|---|---|
+  | `axl_pbkdf2_hmac_sha256` | *deliberately* iterated — thousands of SHA-256 rounds, the only pure CPU-bound hashing in the SDK with no I/O to hide behind | `SHA256H/H2/SU0/SU1` | SHA-NI |
+  | SCRAM auth (`src/net/axl-scram.c`) | calls PBKDF2 per authentication at a server-chosen count (4096+) — direct user-visible **latency**, not throughput | ″ | ″ |
+  | gzip/zlib CRC (`src/data/axl-compress.c`) | CRC-32 + Adler-32 over every byte of every payload | `CRC32B/H/W/X` | ⚠ below |
+  | JOSE (`src/net/axl-jose.c`) | HS256/RS256/ES256 all hash the payload | SHA2 | SHA-NI |
+  | AES-GCM / AES-CTR | **TLS only, and network-bound** — the least valuable of the set here | AESE + PMULL | AES-NI |
+
+  Load-bearing detail: the core hashing APIs are **not** `AXL_TLS`-gated.
+  `axl-digest.c`, `axl-digest-sha256.c`, `axl-digest-crc.c`, `axl-hmac.c` and
+  `axl-pbkdf2.c` are unconditional in `LIB_SOURCES`, and the SHA-256 round
+  constants live in `axl-digest-sha256.c` — this is AXL's own code, not
+  mbedTLS's, so mbedTLS config flags do not reach it. Every consumer gets
+  these with no TLS build.
+
+  **⚠ The CRC polynomials differ between arches and this is a real trap.**
+  ARM's `FEAT_CRC32` implements the *gzip/zlib/PNG* polynomial natively, so
+  `axl_crc32` maps straight onto `CRC32B/H/W/X`. x86's SSE4.2 `crc32`
+  instruction is **Castagnoli (CRC-32C)** — a DIFFERENT polynomial — and does
+  not accelerate `axl_crc32` at all; x86 needs `PCLMULQDQ` folding instead.
+  The `sse42` doc comment in `axl-cpu.h` says "also CRC32 instruction"
+  without that caveat, which is how a fast, confidently wrong x86
+  implementation gets written. Fix the comment when this is picked up.
+
+  **TASK, cheapest-first, and step 1 is the whole decision:**
+
+  1. **Measure `axl_pbkdf2_hmac_sha256`** at a realistic iteration count
+     (4096 and 10000) under QEMU on both arches. Note QEMU must expose the
+     features — `-cpu max` on aa64 — or the probe reports false and the
+     measurement is of the C path twice. Warm the heap first
+     (`feedback_warm_the_heap_before_benchmarking`).
+  2. If it pays (2-4x is the usual figure), add `sha256_block_sha2()` behind
+     `axl_cpu_features()->sha2` / `->sha`, following the existing dispatch
+     precedent — `blend_row_over_avx2` behind `axl_cpu_avx_usable()`, which
+     is allowlisted per SYMBOL in `check-no-avx` with a recorded
+     justification. A new dispatched kernel needs the same allowlist entry.
+  3. CRC-32 second, per-arch and NOT shared, for the polynomial reason above.
+  4. AES last, and only if something measures TLS as cipher-bound rather
+     than bound by the UEFI SNP driver. `aesni.c` (33 KB) and `aesce.c`
+     (20 KB) already sit unbuilt in `deps/mbedtls/library/`, so it is a
+     config change — but note `aesce.c` detects via `getauxval(AT_HWCAP)`,
+     which does not exist under UEFI, so it would need AXL's probe wired in
+     rather than being a pure flag flip.
+
+  Not scheduled. Recorded so it is decided on purpose rather than
+  rediscovered.
 
 - **Is `axl-cc` still needed now the SDK ships its own toolchain?** Asked
   2026-08-13. Measured answer: **yes, but not for the reason the question
@@ -506,8 +739,9 @@ Grouped, terse; **detail lives in the linked design doc or
   entry below ever happens.
 
 - **CMake as THE build system, replacing the Makefile** —
-  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)**, PROPOSED
-  2026-08-15. Mike's direction, targeted at 4.0.0, with the constraint stated
+  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)**, IN PROGRESS
+  2026-08-15 on branch `worktree-cmake-build-system`. Mike's direction, with
+  the constraint stated
   explicitly: **we will no longer ship Makefiles** — replaced, not
   supplemented. Today CMake is a CONSUMER-facing path only
   (`scripts/install.sh` generates `axl-config.cmake`), while the library, 42
@@ -525,9 +759,26 @@ Grouped, terse; **detail lives in the linked design doc or
   the hand-rolled build-state signature IS a re-configure, done by us because
   make cannot express "flags are an input".
 
-  Sequencing: the design doc recommends shipping 4.0.0 FIRST and porting
-  after, since 4.0.0's content is finished and green while the port is
-  unbounded until it starts.
+  **Sequencing DECIDED 2026-08-15: ship 4.0.0 first, port after, on a
+  branch.** 4.0.0's content is finished and green while the port is unbounded
+  until it starts. The branch is the mechanism, not a detail — `cut-release.sh`
+  dates whatever sits under `## Unreleased`, so port commits on `main` would
+  ship inside 4.0.0 and reproduce the v3.2.3 incident.
+
+  **The port is NOT consumer-breaking and needs no major** (design doc §5.1,
+  measured): `git ls-files` matches exactly two Makefiles (root +
+  `test/fuzz/`), `install.sh` ships neither, and `sdk/` ships only
+  `CMakeLists.txt`. We have never SHIPPED a Makefile — we use one. That kills
+  the only argument for porting before 4.0.0.
+  [AXL-Distribution-Design.md](AXL-Distribution-Design.md) §10 reached the same
+  conclusion independently, from the consumer side.
+
+  **The surface is bigger than the Makefile.** 3,579 lines is the thing being
+  replaced; **157 files invoke `make` (215 invocations)**, 129 of them
+  integration scripts, and **50 of those source nothing shared** — so the
+  indirection must be a script, like `build-prefix.sh`. For scale, the
+  `AXL_TLS` prefix split was 98 refs / 66 scripts and cost 48 failing suites.
+  Design doc §2.1.
 
   **The duplication is now load-bearing, not just untidy.** `axl-c++
   -fexceptions` works on both arches, and the CMake package CANNOT do it: its

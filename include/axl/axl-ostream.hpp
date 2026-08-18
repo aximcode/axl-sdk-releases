@@ -14,23 +14,34 @@
  * `std::ostream::sentry::sentry` with `CR2 = -24`: `std::cout` had never been
  * constructed, because `ios_base::Init` is absent from the image entirely.
  *
- * Two things that look like fixes are not. Supplying our own
- * `std::streambuf` makes it WORSE (65 symbols, not 23) because the cost is
- * above the sink: `std::ostream`'s constructor calls `basic_ios::init()`,
- * which constructs a `std::locale`. And `<iostream>` collides with
- * `libaxl-cxx.a` — it drags in `functexcept.o`, `new_opv.o` and
- * `new_handler.o`, which multiply-define our `operator new[]`, the five
- * `std::__throw_*` stubs and `std::nothrow`, so linking needs
- * `--allow-multiple-definition`, which silences exactly the error class that
- * caught this SDK's `.init_array` and `.rela.dyn` bugs.
+ * Supplying our own `std::streambuf` makes it WORSE (65 symbols, not 23),
+ * because the cost is above the sink: `std::ostream`'s constructor calls
+ * `basic_ios::init()`, which constructs a `std::locale`.
  *
- * So `std::` costs the unwinder plus `--allow-multiple-definition` and buys
- * only the spelling. This costs roughly 700 bytes over an equivalent
- * `axl_printf` program (x64 `--release`), with no flag of any kind. Treat that
- * as an order of magnitude, not a constant: `libaxl.a` is selectively
- * linked, so the figure is the difference between two DIFFERENT sets of
- * pulled objects and it drifts whenever the library does. Measured at 1227
- * and then 715 across one afternoon's changes to `axl-string.c` alone.
+ * @par What changed at P4, and what did not
+ *
+ * `std::cout` WORKS now. Every C++ link carries the toolchain's real
+ * libstdc++ (`docs/AXL-Libc-Substrate-Design.md` §4d), so `<iostream>`,
+ * `<sstream>` and `<fstream>` compile, link and run under UEFI —
+ * `test-cxx-iostreams-qemu.sh` boots all three on both arches. Two of the
+ * three objections above are therefore RETIRED: the multiply-definition
+ * collision with `libaxl-cxx.a` is gone with that archive, and nothing needs
+ * `--allow-multiple-definition` any more.
+ *
+ * The SIZE objection is the one that survives, and it got sharper rather than
+ * softer. Measured 2026-08-17, x64 `--release`: an image that uses
+ * `std::cout` / `std::ostringstream` / `std::ifstream` carries **734,512
+ * bytes** of `.text`. The equivalent through this header is roughly **700
+ * bytes** over a plain `axl_printf` program — three orders of magnitude, for
+ * the same output.
+ *
+ * So the choice is now a real one rather than a workaround: `std::` if you
+ * want the whole standard library and can afford it, `axl::` if you want a
+ * line of text on a serial console. Treat the 700 as an order of magnitude,
+ * not a constant — `libaxl.a` is selectively linked, so the figure is the
+ * difference between two DIFFERENT sets of pulled objects and it drifts
+ * whenever the library does. Measured at 1227 and then 715 across one
+ * afternoon's changes to `axl-string.c` alone.
  * See `docs/AXL-Cxx-Stdlib-Surface.md` section 6.
  *
  * @par Why `cout` and not `out`

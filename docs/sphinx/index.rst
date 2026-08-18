@@ -27,6 +27,12 @@ AXL SDK
    modules/cxx
    modules/arena-allocator
    modules/cxx-handle
+   modules/cxx-cstr
+   modules/cxx-array
+   modules/cxx-ntree-ranges
+   modules/cxx-radix-tree
+   modules/cxx-gfx-target
+   modules/cxx-json
    modules/cxx-string
    modules/cxx-ostream
    modules/cxx-istream

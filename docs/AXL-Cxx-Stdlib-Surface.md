@@ -81,9 +81,15 @@ output section `.rela.dyn` so ld absorbs its own internal section.
 survives `objcopy` — whose `-j` takes exact names, which is the other half of
 the same trap.
 
-## 3b. What the containers still cannot link (2026-08-08)
+## 3b. What the containers still cannot link (2026-08-08; SUPERSEDED 2026-08-17)
 
-`libstdc++.a` is no longer on the link line at all — `libaxl-cxx.a` supplies
+> **P4 inverted the premise of this section.** `libstdc++.a` is on EVERY C++
+> link now and `libaxl-cxx.a` is deleted, so "what the containers cannot
+> link" is answered by libstdc++ rather than by a list of symbols AXL still
+> owes. The table below has been empty since 2026-08-09 and stays empty for a
+> different reason. See `AXL-Libc-Substrate-Design.md` P4-RESULT.
+
+`libstdc++.a` was no longer on the link line at all — `libaxl-cxx.a` supplied
 the `_Rb_tree_*` helpers, `_Hash_bytes`, `_M_replace_cold` and the
 `std::__throw_*` family. That is NOT the same as "everything links", and an
 earlier commit message said "eleven functions were the whole gap", which was
@@ -189,7 +195,31 @@ a fact about the HOST compiler, and it stopped mattering once x64 got its own
 
 ### Tier 3 — glibc's locale subsystem (~60 symbols)
 
-Blocks `<sstream>` `<fstream>` `<format>` `<regex>`.
+> **RETRACTED 2026-08-17. This tier no longer blocks anything.** All four
+> headers below compile, link AND RUN under the current link shape, measured on
+> x64 `--release -fexceptions`, booted in QEMU:
+>
+> | header | proof it ran | `.efi` | over the `-fexceptions` baseline (119,691) |
+> |---|---|---|---|
+> | `<fstream>` | `read=[from fstream]` — wrote and read back a file on the ESP | 1,078,943 | **+959,252** |
+> | `<sstream>` | `n=42` from `std::ostringstream` | 1,090,906 | +971,215 |
+> | `<format>` | `n=42` from `std::format` | 1,146,441 | +1,026,750 |
+> | `<regex>` | `match=1 nomatch=0` | 1,194,294 | +1,074,603 |
+>
+> The tier was measured against the OLD link shape, where a C++ image linked
+> `libaxl-cxx.a` and no `libc.a`. Since P2/P3
+> (`AXL-Libc-Substrate-Design.md` §4d) newlib is on every link and its stdio
+> runs on `AxlStream`, so what these headers actually needed was a C library,
+> not glibc's locale.
+>
+> **The wall is real but it is SIZE, not capability: ~1 MB each, about 9x the
+> baseline image.** That is a budget question rather than a support question,
+> and for a UEFI image on an ESP it is often affordable. `<fstream>` working
+> also demonstrates the porting layer end to end from C++.
+>
+> The symbol analysis below stands as the record of what glibc's locale
+> machinery WOULD have cost, and of why reimplementing it was rejected. It is
+> no longer the reason these headers are unavailable, because they are not.
 
 **`<iostream>` is NOT in this tier — an earlier revision of this table put it
 here and was wrong.** Measured directly, `std::cout << 42` and `std::cin >> x`
@@ -276,10 +306,22 @@ Two dead ends worth not repeating:
   which constructs a `std::locale`. A custom streambuf + `std::ostream` needs
   **65** symbols — *worse* than `std::cout`, which at least reuses
   libstdc++'s pre-instantiated objects.
-- **`<iostream>` collides with `libaxl-cxx.a`.** It drags `functexcept.o`,
-  `new_opv.o` and `new_handler.o`, which multiply-define our `operator new[]`,
-  the `std::__throw_*` stubs and `std::nothrow`. Linking needs
-  `--allow-multiple-definition`, which silences a genuinely useful error.
+- ~~**`<iostream>` collides with `libaxl-cxx.a`.**~~ **RETIRED 2026-08-17
+  (P4).** It dragged `functexcept.o`, `new_opv.o` and `new_handler.o`, which
+  multiply-defined our `operator new[]`, the `std::__throw_*` stubs and
+  `std::nothrow`, so linking needed `--allow-multiple-definition`. That
+  archive is deleted and there is nothing left to collide with:
+  `<iostream>`, `<sstream>` and `<fstream>` compile, link and RUN on both
+  arches (`test-cxx-iostreams-qemu.sh`).
+
+  **The SIZE argument is the one that survives, and it grew.** Measured
+  2026-08-17, x64 `--release`: an image using `std::cout` +
+  `std::ostringstream` + `std::ifstream` carries **734,512 bytes** of
+  `.text`; aa64 is 702,576. Against the ~700 bytes the `axl::` stream costs
+  over a plain `axl_printf` program, that is three orders of magnitude for
+  the same line of output. So the choice is now a genuine one rather than a
+  workaround — which is exactly what §9c settled for `axl::string` on the
+  recoverable-OOM axis.
 
 ### The alternative, measured
 

@@ -250,6 +250,70 @@ axl_image_enumerate(
 );
 
 /**
+ * @brief Opaque handle for an image-load watch.
+ *
+ * Returned by `axl_image_watch_loads`, released by
+ * `axl_image_unwatch_loads`.
+ */
+typedef struct AxlImageWatch AxlImageWatch;
+
+/**
+ * @brief Callback fired after an image is loaded.
+ *
+ * Runs in firmware notify context, so it must be SHORT. It may
+ * allocate and it may call `axl_image_enumerate` — the notify runs
+ * below the TPL at which pool allocation becomes illegal — but it
+ * must not block, wait on an event, or re-enter `axl_image_watch_loads`.
+ *
+ * No image is named: the callback's job is to re-read whatever it
+ * needs. See `axl_image_watch_loads` for why.
+ */
+typedef void (*AxlImageLoadFn)(
+    void *ctx   ///< opaque data passed to `axl_image_watch_loads`
+) AXL_CB_NOEXCEPT;
+
+/**
+ * @brief Call @p cb whenever an image is loaded, with NO event loop.
+ *
+ * `axl_loop_add_protocol_notify` does the same job for a program that
+ * runs an `AxlLoop`. This one is for the case that has none: a resident
+ * DXE driver returns from its entry point and never iterates anything,
+ * so an event it must poll is an event it will never notice. Here the
+ * FIRMWARE invokes @p cb.
+ *
+ * The intended use is keeping a snapshot fresh. A crash handler, for
+ * instance, must have its loaded-image table already built when a fault
+ * arrives, because rebuilding it in exception context would allocate;
+ * watching loads lets it refresh at a safe moment instead. Snapshotting
+ * once at init is the bug this exists to prevent — the image that
+ * eventually faults is usually loaded *after* the watcher.
+ *
+ * @p cb receives no image identity on purpose. UEFI signals the
+ * underlying event when an `EFI_LOADED_IMAGE_PROTOCOL` instance is
+ * installed, and coalesces signals, so "one call per image" is not a
+ * promise the firmware makes. Treat the call as "something changed" and
+ * re-enumerate.
+ *
+ * @return the watch handle, or NULL on failure.
+ */
+AxlImageWatch *
+axl_image_watch_loads(
+    AxlImageLoadFn  cb,  ///< callback fired after an image loads
+    void           *ctx  ///< opaque data for @p cb
+);
+
+/**
+ * @brief Stop an image-load watch and release it. NULL-safe.
+ *
+ * After this returns, @p watch is invalid and @p cb will not be called
+ * again.
+ */
+void
+axl_image_unwatch_loads(
+    AxlImageWatch *watch  ///< handle from `axl_image_watch_loads`, or NULL
+);
+
+/**
  * @brief Get the base address and size of the currently-running image.
  *
  * Convenience over `axl_image_enumerate` when the caller only wants

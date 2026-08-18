@@ -864,6 +864,41 @@ axl_alloc_pages(
     return AXL_OK;
 }
 
+int
+axl_alloc_pages_at(
+    uint64_t  phys_addr,
+    size_t    count
+    )
+{
+    EFI_STATUS           status;
+    EFI_PHYSICAL_ADDRESS addr;
+
+    /* Rejected, not rounded. Rounding would hand back a region that does not
+       start where the caller asked, and the whole point of this entry point
+       is that the caller needs THAT address -- a sbrk-style break silently
+       moved by 4 KiB is worse than a clean failure. */
+    if (count == 0 || phys_addr == 0 || (phys_addr & 0xFFFu) != 0) {
+        return AXL_ERR;
+    }
+
+    /* AllocateAddress uses the parameter as an IN value; the firmware
+       succeeds only if it can give out that exact range. A copy is passed
+       because the call also writes to it. */
+    addr = (EFI_PHYSICAL_ADDRESS)phys_addr;
+
+    status = axl_bs()->AllocatePages(
+        AllocateAddress,
+        EfiBootServicesData,
+        (size_t)count,
+        &addr);
+
+    if (EFI_ERROR(status)) {
+        return AXL_ERR;
+    }
+
+    return AXL_OK;
+}
+
 void
 axl_free_pages(
     uint64_t  phys_addr,

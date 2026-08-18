@@ -2,6 +2,7 @@ Build/
 Conf/
 build/
 out/
+stage/
 # Stray SDK staging when install.sh is run with --prefix . (default is ./out).
 # Root-anchored so real source dirs (include/axl/, share/*.json5) are unaffected.
 /bin/
@@ -43,6 +44,10 @@ SCRATCH.md
 .envrc
 .env.*
 .claude/settings.local.json
+# Agent-created git worktrees live here. Each holds a full checkout with its
+# own .git file, so without this the parent tree reports `?? .claude/worktrees/`
+# and a careless `git add -A` sweeps in a nested repo as a gitlink.
+.claude/worktrees/
 # Hardware-fixture captures (HF1+) — machine-specific, often contain
 # identifying data (serials, MACs, OEM strings). Local-only by default;
 # sanitization + public corpus is HF10's scope.
@@ -79,3 +84,4 @@ test/fuzz/timeout-*
 toolchain/*/work/
 toolchain/*/out/
 toolchain/*/build.log
+test/integration/.last-run-stamp

@@ -369,6 +369,76 @@ axl_image_enumerate(
     return rc;
 }
 
+/* The watch owns its own bridging context because the backend notify
+   carries exactly ONE void*, and a watch needs two (the consumer's
+   callback and the consumer's data). Allocated rather than kept in a
+   fixed table: a watch is a long-lived registration, so an arbitrary
+   cap here would be a cap on how many independent snapshots a program
+   can keep fresh. */
+struct AxlImageWatch {
+    AxlImageLoadFn  cb;
+    void           *ctx;
+    AxlEventHandle  event;
+};
+
+static void
+image_watch_trampoline(void *ctx)
+{
+    AxlImageWatch *w = (AxlImageWatch *)ctx;
+    if (w != NULL && w->cb != NULL) {
+        w->cb(w->ctx);
+    }
+}
+
+AxlImageWatch *
+axl_image_watch_loads(
+    AxlImageLoadFn  cb,
+    void           *ctx)
+{
+    if (cb == NULL) {
+        return NULL;
+    }
+
+    AxlImageWatch *w = (AxlImageWatch *)axl_malloc(sizeof(*w));
+    if (w == NULL) {
+        return NULL;
+    }
+    w->cb    = cb;
+    w->ctx   = ctx;
+    w->event = NULL;
+
+    /* Address of the generated GUID object directly, not a stack copy.
+       RegisterProtocolNotify creates a REGISTRATION that outlives this call,
+       unlike LocateHandleBuffer's transient use of a GUID above, so the
+       pointer's lifetime is worth not having to think about. The generated
+       header declares these as file-scope `static EFI_GUID` objects, which
+       is why this needs no copy; axl_loop_add_protocol_notify's callers pass
+       them the same way. */
+    if (axl_backend_event_create_notify_protocol(&gEfiLoadedImageProtocolGuid,
+                                                 image_watch_trampoline,
+                                                 w, &w->event) != AXL_OK) {
+        axl_error("failed to register loaded-image notify");
+        axl_free(w);
+        return NULL;
+    }
+    return w;
+}
+
+void
+axl_image_unwatch_loads(
+    AxlImageWatch *watch)
+{
+    if (watch == NULL) {
+        return;
+    }
+    /* Close FIRST. gBS->CloseEvent drains an in-flight notify, so after it
+       returns the trampoline cannot still be running against the context we
+       are about to free. Freeing first would be a use-after-free with a
+       window exactly as wide as one pending signal. */
+    axl_backend_event_close(watch->event);
+    axl_free(watch);
+}
+
 int
 axl_image_self_get_range(
     void   **out_base,

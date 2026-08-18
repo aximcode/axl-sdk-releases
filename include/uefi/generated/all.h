@@ -14,7 +14,6 @@
 #  error "<uefi/...> is not available to applications. Use the axl_* API; build a driver with `axl-cc --type driver` (CMake: axl_add_driver), or pass `--allow-uefi` (CMake: ALLOW_UEFI) to opt in deliberately."
 #endif
 
-
 #include "calling.h"
 #include "types.h"
 #include "status.h"
@@ -134,6 +133,7 @@ typedef struct _EFI_SMBUS_HC_PROTOCOL EFI_SMBUS_HC_PROTOCOL;
 typedef struct _EFI_I2C_OPERATION EFI_I2C_OPERATION;
 typedef struct _EFI_I2C_REQUEST_PACKET EFI_I2C_REQUEST_PACKET;
 typedef struct _EFI_I2C_MASTER_PROTOCOL EFI_I2C_MASTER_PROTOCOL;
+typedef struct _EFI_FX_SAVE_STATE_X64 EFI_FX_SAVE_STATE_X64;
 typedef struct _EFI_SYSTEM_CONTEXT_X64 EFI_SYSTEM_CONTEXT_X64;
 typedef struct _EFI_SYSTEM_CONTEXT_AARCH64 EFI_SYSTEM_CONTEXT_AARCH64;
 typedef union _EFI_SYSTEM_CONTEXT EFI_SYSTEM_CONTEXT;

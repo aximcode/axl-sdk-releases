@@ -284,17 +284,19 @@ same FHS layout under `/opt/axl-sdk/`.
 
 `./scripts/install.sh` is the entry point even for an in-tree
 build: it compiles the library and stages a complete SDK under
-`./out` by default (`out/bin/axl-cc`, `out/lib/axl/<arch>/`,
-`out/include/`), so the driver to invoke is **`./out/bin/axl-cc`**.
+`./stage` by default (`stage/bin/axl-cc`, `stage/lib/axl/<arch>/`,
+`stage/include/`), so the driver to invoke is **`./stage/bin/axl-cc`**.
+`out/` holds build trees and Sphinx output only — a build directory is
+not an install prefix.
 `scripts/axl-cc` is not a standalone driver — run from a raw
 checkout it fails with `no SDK libraries ... lib/axl/<arch>`
 because it resolves its SDK root to the repo top, where nothing is
-staged yet. Stage first, then use `out/bin/axl-cc` (or add it to
+staged yet. Stage first, then use `stage/bin/axl-cc` (or add it to
 `PATH`):
 
 ```bash
 ./scripts/install.sh --arch x64        # stages ./out
-./out/bin/axl-cc hello.c -o hello.efi
+./stage/bin/axl-cc hello.c -o hello.efi
 ```
 
 ### Host-side QEMU testing tooling

@@ -54,8 +54,8 @@ BINUTILS_VER="${BINUTILS_VER:-2.43}"
 # until something silently misbehaves -- which is exactly what -axl2 marks
 # (the init-array enable below, whose absence made every global constructor
 # silently not run).
-AXL_REV="${AXL_REV:--axl2}"
-NEWLIB_VER="${NEWLIB_VER:-4.4.0.20231231}"
+AXL_REV="${AXL_REV:--axl3}"
+NEWLIB_VER="${NEWLIB_VER:-4.5.0.20241231}"
 
 TARGET="x86_64-elf"
 JOBS="${JOBS:-$(nproc)}"
@@ -185,9 +185,31 @@ fi
 if [ ! -f "$PREFIX/$TARGET/lib/libc.a" ]; then
     log "newlib $NEWLIB_VER"
     rm -rf "$BUILD/newlib"; mkdir -p "$BUILD/newlib"
+    # FLAGS MATCHED TO ARM'S aarch64-none-elf BUILD, read out of the manifest
+    # ARM ships in its own toolchain tree
+    # (14.3.rel1-x86_64-aarch64-none-elf-manifest.txt, `newlib_configure=`).
+    # Matching them is the point: a consumer should not find that printf takes
+    # a different set of conversions depending on which arch they targeted.
+    #
+    # MEASURED before this was changed -- `printf("%zu", (size_t)4096)` emitted
+    # the literal text `zu` on x64 and 4096 on aa64. That is io-c99-formats,
+    # and %zu on a size_t is the single most common thing a C program prints.
+    # It failed SILENTLY, which is what makes it worth a toolchain rebuild.
+    #
+    # --disable-newlib-supplied-syscalls is ARM's too, and is NOT what makes
+    # their libc.a carry open/read/write/sbrk while ours does not: newlib's
+    # configure.host grants `syscall_dir=syscalls` to aarch64*-*-* and gives
+    # x86_64 no entry at all. Verified by building without the flag and
+    # observing no change. It is upstream per-target policy, not a knob.
     ( cd "$BUILD/newlib" && "$SRC/newlib/configure" \
         --target="$TARGET" --prefix="$PREFIX" \
         --disable-newlib-supplied-syscalls \
+        --enable-newlib-retargetable-locking \
+        --enable-newlib-reent-check-verify \
+        --enable-newlib-io-long-long \
+        --enable-newlib-io-c99-formats \
+        --enable-newlib-register-fini \
+        --enable-newlib-mb \
         CFLAGS_FOR_TARGET="$TARGET_FLAGS" \
       && make -j"$JOBS" "${MAKEINFO_STUB[@]}" \
       && make install "${MAKEINFO_STUB[@]}" )

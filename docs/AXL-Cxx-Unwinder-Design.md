@@ -16,6 +16,142 @@
 
 ---
 
+## U5 — `--no-eh-frame`, and the crash a naive opt-out actually produces
+
+Added 2026-08-17, on a request from AGT: a C++ image that uses neither
+exceptions nor iostreams pays for a frame table it can never consult, and §U2
+measured that KEEP at +16.8% on a C image. AGT measured 11.6-11.8% of each of
+its own binaries, ~5.3 MB across 34 tools.
+
+**The request was to select the non-`_eh` script. That alone does not work, in
+two ways that only measurement surfaced.**
+
+**It does not LINK.** `axl-cxxrt-eh.o` — on every C++ link since P4 —
+references `__eh_frame_start`, which only the exceptions script defines, and
+every build path passes `--no-undefined`. So the change is an OBJECT-SET
+change, not a script change.
+
+**It does not degrade, it CRASHES.** The expectation, stated in the request and
+in this tree's own comments, was that a throw without a frame table reaches
+`std::terminate` through `_URC_FATAL_PHASE1_ERROR` and loses the type name and
+`what()`. Measured on x64: `vector::at(99)` in such an image takes an unhandled
+CPU fault, dumps registers, and WEDGES the machine — QEMU had to be killed by
+timeout after 34 s of spin. That is the failure mode `axl-cxxrt-stubs.c`'s
+`_exit` docstring says AXL routes `abort` through `axl_exit` specifically to
+avoid.
+
+An empty-but-valid `.eh_frame` — a lone CIE-list terminator, so
+`__register_frame` gets a well-formed table with no FDEs — was tried and faults
+identically. **The fault is inherent to unwinding a frame with no FDE**, not to
+the table being absent, which is why the fix cannot live in the linker script.
+
+### What shipped instead
+
+`axl-c++ --no-eh-frame` selects the default script AND swaps
+`axl-cxxrt-eh.o` for `axl-cxxrt-nothrow.o`, whose `__cxa_throw` intercepts
+**before the unwinder is entered**: it prints the type and `what()`, then
+`axl_exit`s. So the image keeps the diagnostic the frame table was being held
+for, and drops the table.
+
+Three mechanism details, each of which cost a wrong first attempt:
+
+- **`--wrap=__cxa_throw`, not a definition.** libsupc++'s `eh_throw.o` lands on
+  the link anyway — the terminate handler needs other symbols from it — so a
+  second definition is `multiple definition`. `--wrap` collides with nothing
+  and leaves `__real___cxa_throw` reachable.
+- **`what()` needs no unwinder.** `__cxa_throw` receives the `std::type_info *`,
+  and `typeid(std::exception).__do_catch(tinfo, &obj, 1)` answers "is this
+  catchable as `std::exception`" using `type_info`'s own virtual. The call goes
+  ON THE CATCH TYPE with the thrown type as argument; the reverse compiles,
+  returns false for everything, and silently costs the `what()` line —
+  confirmed by building it both ways and running both.
+- **The saving is bigger than dropping the KEEP.** With nothing calling the
+  real `__cxa_throw`, `--gc-sections` collects more of libsupc++'s throw path
+  too, so the flag reclaims more than the table it removes.
+
+### How much it saves, and why a percentage does not transfer
+
+**Do not budget from a percentage.** Measured on
+`test/integration/cxx-hosted-throw.cpp` — a SMALL fixture — this flag is -18%
+on x64 and -15% on aa64. AGT then measured its own 34-binary fleet and got
+**-12.5 to -13.9% on x64 and -3.1 to -4.4% on aa64**: x64 close, aa64 off by
+~4x. Their decomposition is the right way to state it, and it is quoted here
+because it travels where the percentage does not:
+
+    saving  =  .eh_frame  +  the gc'd throw path
+
+| term | x64 | aa64 |
+|---|---|---|
+| `.eh_frame` | **scales with the program** — 67 KB (kitchen-sink) to 93 KB (axedit) | **constant** — 8,264-8,328 B across four very different programs, a 64-byte spread |
+| gc'd throw path | ~13.5 KB, constant | ~16.5 KB, constant |
+
+**The mechanism is a per-target DEFAULT**, which is worth knowing because it
+lets a consumer predict their own number rather than copy someone else's.
+Measured with `gcc -Q --help=common`, and on an identical six-function C TU at
+`-O2`:
+
+| toolchain | `-fasynchronous-unwind-tables` | `.eh_frame` under `-fno-exceptions` |
+|---|---|--:|
+| `x86_64-elf` | enabled | 144 B |
+| `aarch64-none-elf` | disabled | **0 B** |
+
+So under `-fno-exceptions` x64 emits per-function CFI and aa64 emits none:
+on x64 the table grows with the consumer's own code, while on aa64 the consumer
+contributes none of it and what remains is fixed CIEs from the prebuilt
+libstdc++/libsupc++ objects.
+
+**It is NOT an architecture property, and an earlier revision of this section
+said it was.** That claim ("x86-64's psABI requires async unwind tables") is
+refuted by the same measurement one triple over:
+
+    aarch64-linux-gnu-gcc   -fasynchronous-unwind-tables [enabled]
+
+Same architecture, opposite default — so the split is bare-metal versus Linux
+on aarch64, not aarch64 versus x86-64. Nor is it a hard requirement on x64:
+`-fno-asynchronous-unwind-tables` takes that 144 B to 0 cleanly, which a
+mandate would not permit.
+
+What actually differs is **asynchronous** versus **on-demand** tables.
+aarch64-none-elf emits them when something asks — `-fexceptions` on the same TU
+produces 144 B, as does forcing `-fasynchronous-unwind-tables` — while x86-64
+additionally defaults the ASYNC form on, which exists for debuggers, profilers
+and async signals rather than for exceptions, and which x86-64 leans on because
+it omits frame pointers by default.
+
+The numbers and every conclusion below are unaffected; only the causal story
+was wrong. Recorded because a default is not a requirement and a target triple
+is not an architecture, and this document asserted both.
+
+Which gives the shape to budget against:
+
+- **x64** — table (grows with your code) + ~13.5 KB. Both terms grow, so the
+  percentage stays near 13% across tool sizes.
+- **aa64** — ~8.3 KB fixed table + ~16.5 KB = **~25 KB flat, whatever the
+  binary size**. The percentage is then purely a function of how big the binary
+  is, which is why AGT's ranged 3.1-4.4% across tools differing mainly in size.
+
+This is the same trap `axl-cc`'s accepted-cost note fell into from the other
+direction (+46,928 `.text` -- but **+100,339 on the `.efi`**, 58,758 -> 159,097 -- on `sdk/examples/containers.cpp`, which
+under-predicted a real linked tool by 3-4x). A figure from one fixture is a
+figure from one fixture: name the fixture, and prefer a decomposition the
+reader can apply to their own program.
+
+### The guard is what makes this a diagnostics trade
+
+`--no-eh-frame` with `-fexceptions` is REFUSED. Together they produce an image
+whose `catch` blocks can never run — a throw reaches the interceptor and exits,
+silently skipping every handler in the source. That is a correctness failure,
+not a size trade, and it is the one outcome the flag must not be able to
+produce. Detected from the flag on the command line and from a pre-built object
+referencing `__gxx_personality_v0`, because a staged `-c`-then-link build
+reaches the link with no source to inspect.
+
+Pinned by `test-cxx-noeh-qemu.sh`, 19 assertions per arch — including that a
+non-throwing image is behaviourally identical, that no CPU-fault dump appears,
+and that both guard paths refuse AND produce no output file.
+
+---
+
 ## 1. What the tier-2 entry says, and what measurement says
 
 The surface doc says tier 2 is ~13 `_Unwind_*` symbols and that it
@@ -423,14 +559,15 @@ What landed, and the shape of each decision:
   i.e. from `std::terminate`. A halt loop wedges the machine; `axl_exit`
   returns to the shell with a status.
 
-**STILL OPEN — the CMake package cannot build an exceptions image.** It
-re-implements axl-cc's pipeline rather than calling it, and that
-re-implementation has no `-fexceptions` handling: no `_eh` linker script, no
-glue objects, no toolchain libraries. `check-flag-parity` no longer catches
-this, because the `-j` lists now agree. A CMake consumer passing
-`-fexceptions` gets an image that compiles, links, and fails at the first
-throw. Closing it means either teaching the package the same logic or — better,
-and recorded in ROADMAP — having it shell out to `axl-cc`.
+**CLOSED — the CMake package builds an exceptions image.** It used to
+re-implement axl-cc's pipeline (its own compile line, `ld`, `objcopy`,
+`pe-set-debug`, ~200 lines) with no `-fexceptions` handling at all: no `_eh`
+linker script, no glue objects, no toolchain libraries, so a CMake consumer
+passing `-fexceptions` got an image that compiled, linked, and faulted at the
+first throw. It now shells out to `axl-cc` (`COMMAND ${AXL_CC}` in the
+generated `axl-config.cmake`), which is the option this section recommended.
+`check-flag-parity` guards the delegation itself rather than the spellings —
+reintroduce a hand-rolled compile or objcopy there and it fires again.
 
 ### U4. Tests
 
@@ -445,6 +582,90 @@ AArch64 uses DWARF CFI in `.eh_frame`, which is why one linker script shape
 served both arches in the spike. Test both anyway: the arches differ in
 toolchain provenance (ours vs ARM's) and in relocation handling, and
 `check-reloc-coverage` exists because aa64 diverged there before.
+
+## 4a. U5 — the terminate handler, and the 112 KB that printed nothing
+
+**DONE**, `src/cxxrt/axl-cxxrt-terminate.cpp`.
+
+U4 above lists "an uncaught throw reaching `std::terminate`" among the cases
+to test. Doing that revealed the case was not merely untested but *mute*:
+libstdc++'s `__gnu_cxx::__verbose_terminate_handler` writes to a newlib
+`stderr` that no UEFI image wires up, so an uncaught throw printed **nothing**
+— verified by booting one. It was not free silence. `eh_term_handler.o`
+initialises `__cxxabiv1::__terminate_handler` to that function, so every
+`-fexceptions` image linked `vterminate.o` and, behind it, `__cxa_demangle`
+and newlib's stdio.
+
+Measured on `cxx-exceptions-selftest.cpp`, `--release -fexceptions`, with and
+without AXL's replacement object:
+
+| arch | stock | ours | delta |
+|---|---|---|---|
+| x64 | 264,185 | 150,920 | **−113,265 (−42.9%)** |
+| aa64 | 259,933 | 139,651 | **−120,282 (−46.3%)** |
+
+Decisions, and why each is not the obvious one:
+
+- **An OBJECT on the link line, not an archive member.** This is preemption:
+  defining the symbol before `vterminate.o` is ever considered means that
+  member is never pulled, so its `__cxa_demangle` reference never arrives to
+  be satisfied. From an archive the link resolves either way and the demangler
+  can still come in. Same mechanism `axl-cxxrt-alloc.o` uses for `malloc`, and
+  the fourth object `axl-cc` names on the `-fexceptions` path. Safe because
+  `vterminate.o` defines nothing else — only the handler's `.cold` half and
+  its function-local static.
+- **The type name is KEPT, and the expected tradeoff did not exist.** The open
+  question was "lose the exception's identity, or keep the 112 KB demangler".
+  Neither: `abi::__cxa_current_exception_type()->name()` gives the *mangled*
+  name for free, and `try { throw; } catch (const std::exception &e)` recovers
+  `what()` from a real handler. Measured against a bare "terminate called"
+  variant, both together cost **+89 B** on x64 and **+655 B** on aa64. So the
+  output names the exception:
+
+      terminate: uncaught exception of type St13runtime_error
+        what(): a deliberate uncaught error
+
+  `St13runtime_error`, not `std::runtime_error` — demangling that string is
+  the whole 112 KB, and it is the trade taken deliberately.
+- **The one C++ TU compiled `-fexceptions`** (`CXXFLAGS_EH`, derived from
+  `CXXFLAGS` by subtraction so a future ABI flag reaches it too). The `throw;`
+  is not decoration: `what()` is virtual on `std::exception`, so reaching it
+  needs a reference of that static type, which only a handler can produce.
+  That is also why the file is `.cpp` where its three siblings are `.c`.
+- **It exposed a latent link defect, which is fixed rather than dodged.**
+  `libaxl.a` and newlib both define eleven libc names, and `axl-cc` links both
+  inside one `--start-group` — so which won was decided by whichever reference
+  happened to be outstanding when each archive was scanned. Adding this object
+  changed that, and an uncaught `throw 42;` stopped linking:
+
+      libstdc++(eh_alloc.o) -> getenv -> libc(getenv.o) -> getenv_r.o
+                                                        -> libc(strncmp.o)
+                                            -> impure.o -> findfp.o
+                                                        -> libc(memset.o)
+      libgcc(unwind-dw2-fde.o) -> memcpy -> libaxl(axl-intrinsics.o), which
+                                            also defines memset  -> collision
+
+  AXL's are now weak. That buys **coexistence, not precedence** — an archive
+  member is still extracted for a weak definition and `libaxl.a` is scanned
+  first, so which copy ships still depends on what drags each member in
+  (measured: `std::runtime_error` → newlib's `memcpy`/`strlen`; a bare `int` →
+  AXL's). What changes is that both members can be present without the link
+  failing. The line falls where the *runtime dependency* falls: leaf functions
+  have none, so either copy is correct; `__cxa_atexit` and the `__stack_chk_*`
+  pair only work if AXL's init/teardown ran, so they stay strong — newlib's are
+  inert under UEFI for the very same reason this section's handler was.
+  `make check-libc-overlap` enforces both directions. Making newlib's the ones
+  that actually RUN is a separate, larger change: put `libc.a` on the C link
+  line too and delete AXL's stand-ins.
+- **Tested two ways, because either alone is weak.** `test-cxx-exceptions-
+  qemu.sh` asserts the SIZE half (`nm` on the ELF `.so`: no `__cxa_demangle`,
+  no newlib stdio) and the SPEAKING half (an uncaught-throw fixture booted
+  under QEMU, exact lines). The size half alone would pass for a handler that
+  printed nothing; the speaking half alone would pass with 112 KB of dead
+  demangler alongside. The `nm` reads the `.so` because `objcopy` does not
+  carry `.symtab` into the PE — on the `.efi` every absence assertion would
+  pass while blind — and a readability control fires on an unreadable,
+  stripped or non-exceptions input rather than reporting a false zero.
 
 ---
 
@@ -481,3 +702,77 @@ ar x "$(g++ -print-file-name=libstdc++.a)" list.o && nm -u -C list.o
 # libgcc_eh.a is the Linux build
 nm -u "$(gcc -print-file-name=libgcc_eh.a)"
 ```
+
+
+## U6 — REFUTED: rebuilding libstdc++/libsupc++ would save nothing
+
+An earlier handoff proposed rebuilding the toolchain's `libstdc++`/`libsupc++`
+with `-fno-asynchronous-unwind-tables`, on the theory that they are what a
+default `_eh` image's residual `.eh_frame` is made of. **Measured 2026-08-17:
+the premise is wrong and the mechanism does not work.** Recorded so nobody
+re-opens it.
+
+### The residual is not what the hypothesis said it was
+
+`.eh_frame` in a default `_eh` C++ image (`cxx-json-selftest`, x64),
+attributed per input object from the linker map:
+
+| contributor | bytes | share |
+|---|--:|--:|
+| `libstdc++.a` | 4,624 | 42% |
+| `libgcc.a` | 2,812 | 25% |
+| **the consumer's own object** | **2,040** | **18%** |
+| `libc.a` (newlib) | 1,528 | 14% |
+| `axl-cxxrt-terminate.o` | 64 | <1% |
+| `libsupc++.a` | **0** | 0% |
+| total | 11,068 | |
+
+`libsupc++` — named in the hypothesis — contributes **nothing**. A quarter is
+`libgcc`, which a libstdc++ rebuild would not touch. And 18% is the
+CONSUMER's own object, which needs no toolchain work at all.
+
+### `-fexceptions` makes the flag a no-op, which is the whole answer
+
+Same TU, same toolchain, only the flag changing:
+
+| compile | `.eh_frame` |
+|---|--:|
+| `-fexceptions` | 2,152 |
+| `-fexceptions -fno-asynchronous-unwind-tables` | **2,152 — identical** |
+| `-fno-exceptions` | 1,992 |
+| `-fno-exceptions -fno-asynchronous-unwind-tables` | **0** |
+
+Confirmed on a second TU (1,112 → 1,112). The last row is the CONTROL and it
+moves, so the flag is reaching the compiler; `gcc -Q --help=common` confirms
+it flips both `-fasynchronous-unwind-tables` and `-funwind-tables` to
+`[disabled]`. The tables survive anyway because `-fexceptions` requires them:
+what the async form adds is CFI validity at every instruction rather than at
+call sites, and on x86-64 gcc emits the same table either way.
+
+`libstdc++.a` carries 35,612 bytes of `.gcc_except_table`, so it is
+unambiguously exception-enabled. **Therefore rebuilding it with
+`-fno-asynchronous-unwind-tables` saves exactly zero bytes.** Same for
+`libsupc++`.
+
+### What IS available, and why it is still not worth doing
+
+Only the exception-FREE libraries could shrink: `libc.a` (newlib, no
+`.gcc_except_table` at all) contributes 1,528 bytes, and `libgcc.a`'s 2,812
+some fraction — and `libgcc` is the unwinder, which is the last thing to
+strip unwind information from casually.
+
+So the realistic ceiling is ~1.5-4.3 KB per image, against: a full toolchain
+rebuild, a new pinned tarball and sha256, and every consumer re-running
+`axl-install-toolchain`. `TARGET_FLAGS` in `toolchain/x86_64-elf/build-
+toolchain.sh` is `-O2 -fPIC`, so x64 is ours to change — but aa64 uses ARM's
+prebuilt binaries (their manifest sets no target CFLAGS), so aa64 could not
+follow without abandoning ARM's toolchain, which was a deliberate choice.
+
+And on a `--no-eh-frame` image the saving is **zero regardless**, because
+`.eh_frame` is already absent.
+
+**Recommendation: do not.** The one free win here is the consumer's own 18%:
+a consumer on a default `_eh` link removes their own contribution by putting
+`-fno-asynchronous-unwind-tables` on their own compiles, no toolchain work
+required. That does nothing for a `--no-eh-frame` consumer, for the same
+reason everything else here does nothing for them.

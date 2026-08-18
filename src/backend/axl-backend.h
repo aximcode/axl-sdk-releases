@@ -978,6 +978,33 @@ axl_backend_event_create_before_exit_boot(
     );
 
 /**
+ * @brief Register a notify to run whenever a protocol is installed.
+ *
+ * Creates an `EVT_NOTIFY_SIGNAL` event at `TPL_CALLBACK` and hands it
+ * to `RegisterProtocolNotify`, so the firmware invokes @p notify(@p ctx)
+ * each time a new instance of @p guid appears. This is the LOOPLESS
+ * counterpart to `axl_loop_add_protocol_notify`, which creates a bare
+ * waitable event and relies on an `AxlLoop` to poll it — a resident DXE
+ * driver that returns from its entry point pumps no loop and cannot use
+ * that one.
+ *
+ * The notify runs at `TPL_CALLBACK`, so it MAY allocate (pool allocation
+ * is legal at or below `TPL_NOTIFY`) and must stay short, for the same
+ * reason `axl_backend_event_create_notify_timer` documents.
+ *
+ * Pair every successful call with `axl_backend_event_close`.
+ *
+ * @return AXL_OK on success, AXL_ERR on error or table-full.
+ */
+int
+axl_backend_event_create_notify_protocol(
+    const void *guid,               ///< protocol GUID to watch
+    void      (*notify)(void *ctx), ///< notify function (TPL_CALLBACK)
+    void       *ctx,                ///< opaque context passed to @p notify
+    AxlEventHandle *event           ///< (out) receives event handle
+    );
+
+/**
  * @brief Close an event. NULL-safe.
  *
  * DIAG-WRAPPED 2026-04-27: every call site routes through

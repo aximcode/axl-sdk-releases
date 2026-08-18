@@ -19,7 +19,7 @@
 # the header resolves INSIDE the toolchain and NOT under /usr/include.
 #
 # Requires a staged SDK (scripts/install.sh); point AXL_STAGE_DIR at it, or
-# default to out/. Exits 2 if the staged SDK is absent.
+# default to wherever sdk-prefix.sh says it is. Exits 2 if it is absent.
 
 source "$(dirname "$0")/common-test.sh"
 test_setup
@@ -27,7 +27,7 @@ test_setup
 # each rc, so disable errexit.
 set +e
 
-STAGE="${AXL_STAGE_DIR:-$PROJECT_DIR/out}"
+STAGE="${AXL_STAGE_DIR:-$(test_sdk_dir)}"
 AXL_CC="$STAGE/bin/axl-cc"
 SDK_INC="$STAGE/include/axl-sdk"
 if [[ ! -x "$AXL_CC" || ! -d "$SDK_INC" ]]; then

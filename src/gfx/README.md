@@ -338,6 +338,23 @@ it's the unconditional "swap" step. While a buffer target is active,
 the clip stack and alpha compositing apply against the buffer's pixel
 array using buffer-local coordinates.
 
+**`axl_gfx_target_buffer(NULL)` is not "no target" — it is the SCREEN.** That
+distinction only bites once anything nests, and then it bites silently: an
+inner render that finishes with `target_buffer(NULL)` redirects the rest of its
+*caller's* painting from that caller's back buffer onto the display. Read the
+outgoing target with `axl_gfx_get_current_target()` and restore *that*:
+
+```c
+AxlGfxBuffer *saved = axl_gfx_get_current_target();
+axl_gfx_target_buffer(buf);
+    ...
+axl_gfx_target_buffer(saved);                    // NOT NULL
+```
+
+The two-line pair above is what C++ consumers get as a scope guard —
+`axl::gfx_target_scope` in `<axl/axl-gfx-surface.hpp>`, which captures at
+construction and restores in its destructor.
+
 ### Raw fills vs. drawn fills
 
 Every *drawing* primitive composites source-over onto a destination

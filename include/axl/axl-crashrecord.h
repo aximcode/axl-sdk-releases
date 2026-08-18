@@ -50,6 +50,13 @@ typedef struct {
     uint16_t version;          /* AXL_CRASH_RECORD_VERSION */
     uint8_t  arch;             /* AXL_CRASH_ARCH_X64 or AXL_CRASH_ARCH_AARCH64 */
     uint8_t  reserved;
+    /* AxlCpuExceptionKind (axl-cpu.h), NOT an architectural vector
+       number. The two numberings agree nowhere -- kind 5 is #UD while
+       x86 vector 5 is #BR -- and this field going undocumented is how
+       the writer and the report reader came to disagree, naming every
+       captured x64 exception after its neighbour. Arch-neutral on
+       purpose: kinds 15/16 are the aa64 ones, so a reader does not
+       need `arch` to name the exception. */
     uint32_t exception_type;
     uint64_t timestamp;        /* EFI_TIME packed as minutes since 2000, or 0 */
     uint32_t image_count;      /* Number of AxlCrashImageEntry following registers */

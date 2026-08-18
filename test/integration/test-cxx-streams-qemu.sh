@@ -151,7 +151,7 @@ fi
 # This is what proves axl-c++ and the staged headers work for someone outside
 # the tree; it is a compile+link assertion, not the image that runs.
 # ---------------------------------------------------------------------------
-if [[ -x "$AXL_CXX" && -f "$LIB_DIR/libaxl-cxx.a" ]]; then
+if [[ -x "$AXL_CXX" && -f "$LIB_DIR/axl-cxxrt-terminate.o" ]]; then
     # The staged SDK is a SECOND TREE: axl-c++ compiles against
     # out/include/axl-sdk, so an un-restaged edit to include/axl means this
     # exercises the PREVIOUS build. Compared by content -- install.sh
@@ -162,7 +162,7 @@ if [[ -x "$AXL_CXX" && -f "$LIB_DIR/libaxl-cxx.a" ]]; then
     check "axl-c++ builds the fixture with no mode flag" \
         "$AXL_CXX" --arch "$_native_arch" --release "$SRC" -o "$WORK/consumer.efi"
 else
-    echo "  NOTE: no staged C++ SDK at $LIB_DIR/libaxl-cxx.a;"
+    echo "  NOTE: no staged C++ SDK at $LIB_DIR;"
     echo "        skipping the consumer-toolchain assertions only."
     echo "        run: scripts/install.sh --arch all --cpp"
 fi

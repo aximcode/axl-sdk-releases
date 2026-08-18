@@ -10,6 +10,7 @@
 **/
 
 #include <axl/axl-json.h>
+#include <axl/axl-math.h>
 #include <axl/axl-array.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -1008,6 +1009,43 @@ axl_json_uint(AxlJsonWriter *w, uint64_t v)
 }
 
 void
+axl_json_double(AxlJsonWriter *w, double v)
+{
+    char buf[40];
+
+    if (!check_atom_context(w)) return;
+
+    /* Non-finite is a DIALECT question, not a formatting one. `%.17g` would
+       happily print `nan`/`inf`, which no RFC 8259 reader accepts and which
+       AXL's own reader accepts only under AXL_JSON_ALLOW_NAN_INF -- so the
+       writer gates on the same bit rather than emitting a token the matching
+       reader would reject. Spelled `NaN` / `Infinity`, which is what the
+       lexer accepts; `nan` / `inf` are not JSON5 either. */
+    if (!axl_isfinite(v)) {
+        if (!(w->flags & AXL_JSON_ALLOW_NAN_INF)) {
+            wr_fail(w, AXL_JSON_ERR_INVALID_ARGUMENT);
+            return;
+        }
+        if (!begin_item(w)) return;
+        if (axl_isnan(v)) {
+            wr_str(w, "NaN");
+        } else {
+            wr_str(w, v < 0 ? "-Infinity" : "Infinity");
+        }
+        finish_value(w);
+        return;
+    }
+
+    if (!begin_item(w)) return;
+    /* .17g is the SHORTEST round-trippable form on this engine, not 17 digits
+       -- see the header. axl_dtoa yields at most 17 shortest digits, so the
+       significant-digit rounding is a no-op and %g then trims. */
+    axl_snprintf(buf, sizeof(buf), "%.17g", v);
+    wr_str(w, buf);
+    finish_value(w);
+}
+
+void
 axl_json_bool(AxlJsonWriter *w, bool v)
 {
     if (!check_atom_context(w)) return;
@@ -1218,6 +1256,13 @@ axl_json_kv_uint(AxlJsonWriter *w, const char *key, uint64_t value)
 {
     axl_json_key(w, key);
     axl_json_uint(w, value);
+}
+
+void
+axl_json_kv_double(AxlJsonWriter *w, const char *key, double value)
+{
+    axl_json_key(w, key);
+    axl_json_double(w, value);
 }
 
 void

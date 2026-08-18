@@ -142,7 +142,11 @@ BASELINE: dict[str, int] = {
     "src/ipmi/axl-ipmi-edkii.c": 3,
     "src/ipmi/axl-ipmi.c": 5,
     "src/log/axl-log.c": 1,
-    "src/mem/axl-mem.c": 2,
+    # 3, not 2, since axl_alloc_pages_at joined axl_alloc_pages/FreePages:
+    # it is the same page-allocator primitive one AllocateType along
+    # (AllocateAddress), and it is what lets a region be PLACED so it has
+    # room to grow -- see SBRK-RESULT in AXL-Libc-Substrate-Design.md.
+    "src/mem/axl-mem.c": 3,
     "src/net/axl-mbedtls-platform.c": 1,
     "src/net/axl-net-dhcp.c": 4,
     "src/net/axl-udp.c": 17,

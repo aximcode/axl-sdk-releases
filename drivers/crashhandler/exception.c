@@ -14,8 +14,8 @@
 
 #include "crashhandler.h"
 
-static const char *
-get_exception_name(AxlCpuExceptionKind kind)
+const char *
+crash_exception_name(AxlCpuExceptionKind kind)
 {
     switch (kind) {
     case AXL_CPU_EXCEPTION_DIVIDE_ERROR:    return "#DE (Divide Error)";
@@ -45,8 +45,16 @@ get_exception_name(AxlCpuExceptionKind kind)
 static void
 copy_basename(const char *utf8_path, char *out, size_t out_size)
 {
-    if (utf8_path == NULL || out_size == 0) {
-        if (out_size > 0) { out[0] = '\0'; }
+    if (out_size == 0) {
+        return;
+    }
+    if (utf8_path == NULL) {
+        /* "Unknown", matching the empty-basename case below rather than
+           writing an empty string. axl_image_enumerate documents path as
+           NULL for images whose firmware FilePath cannot be decoded, which
+           is MOST of them at DXE time -- so the empty-string branch left
+           every Name column in the report blank. */
+        axl_strlcpy(out, "Unknown", out_size);
         return;
     }
     const char *base = utf8_path;
@@ -62,15 +70,37 @@ static int
 collect_loaded_image(const AxlImageInfo *info, void *ctx)
 {
     (void)ctx;
-    if (g_image_count >= AXL_CRASH_MAX_IMAGES) {
-        return 1;  /* stop early — table full */
+    uint32_t slot;
+    bool     appending = (g_image_count < AXL_CRASH_MAX_IMAGES);
+
+    if (appending) {
+        /* Note the count is NOT bumped here. It is published below, after
+           the row is filled, so a reader can never see a count that
+           includes a half-written entry. */
+        slot = g_image_count;
+    } else {
+        /* Table full: DROP THE OLDEST and keep walking. Stopping here is
+           what made the report unusable. Measured on OVMF: the walk filled
+           all 32 slots and NONE of them contained the faulting RIP, so the
+           report listed 32 images, omitted the one that crashed, left the
+           "Image:" line off entirely, and gave rsod-decode no base to
+           rebase against. The application is enumerated after the
+           firmware's own images, so the entries worth keeping are the LAST
+           ones, not the first. Shifting 31 entries is a TPL_CALLBACK cost
+           paid on image load, never in exception context. */
+        for (uint32_t i = 1; i < AXL_CRASH_MAX_IMAGES; i++) {
+            g_image_table[i - 1] = g_image_table[i];
+        }
+        slot = AXL_CRASH_MAX_IMAGES - 1;
     }
-    g_image_table[g_image_count].base = (uint64_t)info->base;
-    g_image_table[g_image_count].size = info->size;
+    g_image_table[slot].base = (uint64_t)info->base;
+    g_image_table[slot].size = info->size;
     copy_basename(info->path,
-                  g_image_table[g_image_count].name,
+                  g_image_table[slot].name,
                   AXL_CRASH_IMAGE_NAME_LEN);
-    g_image_count++;
+    if (appending) {
+        g_image_count++;   /* publish the row only now that it is complete */
+    }
     return 0;
 }
 
@@ -81,8 +111,40 @@ collect_loaded_image(const AxlImageInfo *info, void *ctx)
 void
 snapshot_loaded_images(void)
 {
+    /* Keep the OLD table if the walk fails. This runs on every image load
+       now, not once at init, so a single failed enumeration would otherwise
+       leave the table EMPTY -- strictly worse than the stale table this
+       refresh replaced, because a crash would then be attributed to nothing
+       at all rather than to the wrong thing.
+       Restoring the count is exact rather than approximate:
+       axl_image_enumerate returns AXL_ERR only when LocateHandleBuffer
+       fails, which is BEFORE collect_loaded_image runs even once, so on
+       that path no row has been touched. */
+    uint32_t previous = g_image_count;
+
     g_image_count = 0;
-    (void)axl_image_enumerate(collect_loaded_image, NULL);
+    if (axl_image_enumerate(collect_loaded_image, NULL) != AXL_OK) {
+        g_image_count = previous;
+    }
+}
+
+void
+refresh_loaded_images(void *ctx)
+{
+    (void)ctx;
+    /* Runs at TPL_CALLBACK from the firmware's loaded-image notify, which
+       is why it may re-enumerate at all: axl_image_enumerate allocates.
+       It rebuilds the table IN PLACE, and does not double-buffer, so there
+       is a window in which g_image_count has been reset to 0 and the rows
+       are being refilled. That window is not closed, it is argued away:
+       UEFI Boot Services are single-threaded on the BSP, so a BSP fault
+       during this function would be a fault inside this function, and an
+       AP fault mid-refresh is out of scope for a handler that captures BSP
+       state. If AP capture is ever added, this needs a shadow table --
+       g_image_count going to zero first is the thing that would bite.
+       Within the window the count never OUTRUNS the data: collect_loaded_
+       image publishes g_image_count only after its row is fully written. */
+    snapshot_loaded_images();
 }
 
 /**
@@ -340,13 +402,13 @@ crash_exception_handler(
     /* --- Print crash summary (best effort) --- */
     if (fault_image_idx >= 0) {
         axl_printf("\n\n!!! CRASH: %s at 0x%lX (%s+0x%lX) !!!\n",
-                   get_exception_name(exc->kind),
+                   crash_exception_name(exc->kind),
                    (unsigned long)fault_addr,
                    g_image_table[fault_image_idx].name,
                    (unsigned long)(fault_addr - g_image_table[fault_image_idx].base));
     } else {
         axl_printf("\n\n!!! CRASH: %s at 0x%lX !!!\n",
-                   get_exception_name(exc->kind),
+                   crash_exception_name(exc->kind),
                    (unsigned long)fault_addr);
     }
     axl_printf("Crash record saved to NVRAM (slot %d). Reboot to see full report.\n\n",

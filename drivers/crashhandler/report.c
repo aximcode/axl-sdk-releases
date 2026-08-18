@@ -40,39 +40,6 @@ report_append(const char *str)
     do { axl_snprintf(fmt_buf, sizeof(fmt_buf), __VA_ARGS__); report_append(fmt_buf); } while (0)
 
 /**
- * Get the exception name as an ASCII string.
- */
-static const char *
-exception_name_ascii(uint8_t arch, uint32_t exception_type)
-{
-    if (arch == AXL_CRASH_ARCH_X64) {
-        switch (exception_type) {
-        case 0:  return "#DE (Divide Error)";
-        case 1:  return "#DB (Debug)";
-        case 4:  return "#OF (Overflow)";
-        case 5:  return "#BR (Bound Range)";
-        case 6:  return "#UD (Invalid Opcode)";
-        case 7:  return "#NM (Device Not Available)";
-        case 8:  return "#DF (Double Fault)";
-        case 11: return "#NP (Segment Not Present)";
-        case 12: return "#SS (Stack Fault)";
-        case 13: return "#GP (General Protection)";
-        case 14: return "#PF (Page Fault)";
-        case 16: return "#MF (FPU Error)";
-        case 17: return "#AC (Alignment Check)";
-        case 19: return "#XM (SIMD Exception)";
-        default: return "Unknown";
-        }
-    } else {
-        switch (exception_type) {
-        case 0: return "Synchronous";
-        case 3: return "SError";
-        default: return "Unknown";
-        }
-    }
-}
-
-/**
  * Append one crash record's worth of text into report_buf.
  * @return AXL_OK if the record was valid, AXL_ERR if it was malformed.
  */
@@ -97,6 +64,40 @@ append_single_crash_report(uint8_t *record, size_t record_size)
         return AXL_ERR;
     }
 
+    /* EVERY LENGTH BELOW COMES FROM NVRAM, so bound them against the record
+       we were actually handed before using any of them to walk. magic and
+       version say the record is OURS; they say nothing about a truncated
+       write, a flash bit-flip, or a slot half-overwritten by a crash during
+       the crash save -- and image_count/frame_count are used directly as
+       loop bounds over a 2560-byte stack buffer. Read hdr-> exactly once
+       here; everything below uses the CLAMPED locals. */
+    size_t regs_size = (hdr->arch == AXL_CRASH_ARCH_X64)
+                       ? sizeof(AxlCrashRegsX64)
+                       : sizeof(AxlCrashRegsAarch64);
+    size_t fixed = sizeof(AxlCrashRecordHeader) + regs_size;
+
+    /* At least one image entry: slot 0 is the faulting image and is read
+       unconditionally below, whatever image_count claims. */
+    if (record_size < fixed + sizeof(AxlCrashImageEntry)) {
+        return AXL_ERR;
+    }
+
+    uint32_t image_count = hdr->image_count;
+    uint32_t frame_count = hdr->frame_count;
+    if (image_count > AXL_CRASH_MAX_IMAGES) {
+        image_count = AXL_CRASH_MAX_IMAGES;
+    }
+    if (frame_count > AXL_CRASH_MAX_FRAMES) {
+        frame_count = AXL_CRASH_MAX_FRAMES;
+    }
+    if (image_count == 0) {
+        image_count = 1;   /* slot 0 always exists; see above */
+    }
+    if (fixed + (size_t)image_count * sizeof(AxlCrashImageEntry)
+              + (size_t)frame_count * sizeof(uint64_t) > record_size) {
+        return AXL_ERR;
+    }
+
     ptr = record + sizeof(AxlCrashRecordHeader);
 
     /* Get fault address from registers */
@@ -114,7 +115,7 @@ append_single_crash_report(uint8_t *record, size_t record_size)
     fault_image = (AxlCrashImageEntry *)ptr;
     fault_offset = (fault_image->base != 0) ? fault_addr - fault_image->base : 0;
     images = fault_image;  /* slot 0 = faulting image, rest = full table */
-    ptr += hdr->image_count * sizeof(AxlCrashImageEntry);
+    ptr += (size_t)image_count * sizeof(AxlCrashImageEntry);
 
     /* Stack frames */
     frames = (uint64_t *)ptr;
@@ -123,9 +124,19 @@ append_single_crash_report(uint8_t *record, size_t record_size)
     report_append("UEFI Crash Report\r\n");
     report_append("==================\r\n");
 
+    /* Range-check BEFORE the cast. magic + version above say the record is
+       ours, not that every field is in range, and converting an arbitrary
+       uint32_t to an enum is undefined -- a compiler may emit a jump table
+       with no default for a dense one. crash_exception_name happens to be
+       total; the caller should not depend on that. */
+    const char *exc_name = "Unknown";
+    if (hdr->exception_type > 0
+        && hdr->exception_type < (uint32_t)AXL_CPU_EXCEPTION_KIND_MAX) {
+        exc_name = crash_exception_name(
+            (AxlCpuExceptionKind)hdr->exception_type);
+    }
     REPORT_PRINT("Exception:    %s at 0x%016lX\r\n",
-        exception_name_ascii(hdr->arch, hdr->exception_type),
-        (unsigned long)fault_addr);
+        exc_name, (unsigned long)fault_addr);
 
     if (fault_image->base != 0) {
         REPORT_PRINT("Image:        %s (base 0x%lX, size 0x%lX)\r\n",
@@ -172,14 +183,14 @@ append_single_crash_report(uint8_t *record, size_t record_size)
     report_append("\r\n");
 
     /* --- Stack trace --- */
-    if (hdr->frame_count > 0) {
+    if (frame_count > 0) {
         report_append("Stack Trace:\r\n");
-        for (idx = 0; idx < hdr->frame_count; idx++) {
+        for (idx = 0; idx < frame_count; idx++) {
             uint64_t addr = frames[idx];
             uint32_t img_idx;
             bool found = false;
 
-            for (img_idx = 0; img_idx < hdr->image_count; img_idx++) {
+            for (img_idx = 0; img_idx < image_count; img_idx++) {
                 if (addr >= images[img_idx].base &&
                     addr < images[img_idx].base + images[img_idx].size) {
                     REPORT_PRINT("  0x%016lX  %s+0x%lX\r\n",
@@ -199,7 +210,7 @@ append_single_crash_report(uint8_t *record, size_t record_size)
     /* --- Loaded image table --- */
     report_append("Loaded Images:\r\n");
     REPORT_PRINT("  %-18s %-10s %s\r\n", "Base", "Size", "Name");
-    for (idx = 0; idx < hdr->image_count; idx++) {
+    for (idx = 0; idx < image_count; idx++) {
         if (images[idx].base == 0) {
             continue;
         }
@@ -210,7 +221,14 @@ append_single_crash_report(uint8_t *record, size_t record_size)
     }
 
     report_append("\r\nDecode with debug symbols:\r\n");
-    report_append("  rsod-decode.py --from-dump crash-report.txt --symbols <dir>\r\n");
+    if (fault_image->base != 0) {
+        REPORT_PRINT("  rsod-decode.py --image <build>/%s:0x%lX "
+                     "--file crash-report.txt\r\n",
+                     fault_image->name, (unsigned long)fault_image->base);
+    } else {
+        report_append("  rsod-decode.py --image <build>/<image>:<base> "
+                      "--file crash-report.txt\r\n");
+    }
     report_append("\r\n");
 
     return AXL_OK;

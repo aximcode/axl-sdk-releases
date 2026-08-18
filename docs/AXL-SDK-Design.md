@@ -3,6 +3,24 @@
 Part of the [AximCode](https://github.com/aximcode) project.
 AXL = AximCode Library. Pronounced "axle."
 
+## Where this doc sits — three docs, one subject, different questions
+
+This doc covers **what the SDK contains**. Two companions cover the other
+halves, and each fact below is owned by exactly one of them:
+
+| doc | answers | owns |
+|---|---|---|
+| **this one** | what is in the SDK | the toolchain requirement, C++ support, the layout of what ships |
+| [AXL-Distribution-Design.md](AXL-Distribution-Design.md) | how it REACHES and is USED by a consumer | packaging, `find_package` discovery, version pinning, the `out/` vs `stage/` split (§4), P1–P4 |
+| [AXL-Build-System-Design.md](AXL-Build-System-Design.md) | how WE build it | the CMake port, the port surface measurements (§8.2a), `axl-cc`'s exclusion from the port, `axl-config.cmake`'s extraction (§8.4) |
+
+**One owner per shared fact, everyone else links.** That rule exists because
+of a specific failure: the two companions independently asserted that
+Distribution's P2 and the port's slice 3 swept the same ~149 callers. A commit
+had invalidated that months earlier, and neither noticed — each was internally
+consistent, so nothing forced a re-read. Correcting it took two commits. A
+claim asserted in two places goes stale in two places.
+
 ## Audience
 
 Linux systems C developers — the glibc / GLib / systemd / libcurl
@@ -167,12 +185,21 @@ and `scripts/axl-cc`.  Two pieces live together:
    `axl-cc -c` for compile-only (build their own `.a` libraries)
    and pass pre-built `.o` / `.a` files to the linker.
 
-2. **C++ ABI runtime** (`libaxl-cxx.a`).  Provides the freestanding
-   pieces of the Itanium C++ ABI that the compiler emits
-   references to: operator `new` / `delete` (all forms, routing
-   through `axl_malloc` / `axl_free`) and `__cxa_pure_virtual`.
-   Companion symbols `__cxa_atexit` (routes through `axl_atexit`),
-   `__dso_handle`, and the `.init_array` walker live in `libaxl.a`
+2. **C++ runtime glue** (four objects under `lib/axl/<arch>/`).
+   Since P4 (`AXL-Libc-Substrate-Design.md` §4d) the Itanium C++
+   ABI itself comes from the toolchain's own
+   `libstdc++`/`libsupc++`, which every C++ link carries — that is
+   what makes `<iostream>`, `<sstream>` and `<fstream>` work.  AXL
+   supplies only what a firmware image lacks underneath them:
+   `axl-cxxrt-alloc.o` (the `sbrk` newlib's allocator grows into),
+   `axl-cxxrt-stubs.o` (the POSIX porting layer over `AxlStream`),
+   `axl-cxxrt-eh.o` (unwind frame-table registration) and
+   `axl-cxxrt-terminate.o` (a terminate handler that reports
+   through the UEFI console).  They ship as OBJECTS rather than an
+   archive because two of them work by PREEMPTION, which an
+   archive member cannot do.  Companion symbols `__cxa_atexit`
+   (routes through `axl_atexit`), `__dso_handle`, and the
+   `.init_array` walker live in `libaxl.a`
    (`src/runtime/axl-cxxabi.c`) so they're always present even
    for pure-C apps that incidentally link a C++ helper from a
    library.  See [`AXL-Lifecycle.md` §2.1.1](AXL-Lifecycle.md)
@@ -187,13 +214,17 @@ and builds C++ support when present (no `--cpp` opt-in required).
 The Linux-ABI cross (`aarch64-linux-gnu-g++`) is NOT viable —
 its libstdc++ headers pull hosted typedefs.
 
-**Single package.**  `libaxl-cxx.a` + `axl-c++` + axlmm headers
-ship in the regular `axl-sdk.deb` / `.rpm` (no `-cpp` subpackage).
-`libaxl-cxx.a` doesn't link libstdc++ (the freestanding subset we
-support is header-only), so there's no runtime dependency
-escalation; the size delta is ~80 KB against a multi-MB base.
-Pure-C consumers can ignore the extra files — they pay no runtime
-cost.
+**Single package.**  The C++ glue objects + `axl-c++` + the C++
+headers ship in the regular `axl-sdk.deb` / `.rpm` (no `-cpp`
+subpackage).  The package conveys NO libstdc++ — `axl-cc`
+resolves the consumer's own installed copy through
+`-print-file-name`, which is what keeps the GCC Runtime Library
+Exception's one restriction out of scope (see
+[`AXL-Cxx-Design.md` §8](AXL-Cxx-Design.md)).  That toolchain is
+already a hard prerequisite for ANY link since P3 put
+`libc.a`/`libm.a`/`libgcc.a` on every one, so C++ adds no install
+step.  Pure-C consumers can ignore the extra files — they pay no
+runtime cost.
 
 **Forbidden C++ features in axl-sdk-targeted code:** exceptions,
 RTTI (`typeid` / `dynamic_cast`), `<string>` / `<vector>` /

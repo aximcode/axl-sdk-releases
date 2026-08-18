@@ -154,6 +154,71 @@ fetch_efi_memory_map(
     return map;
 }
 
+/* The largest run of EfiConventionalMemory -- what is FREE, not what is RAM.
+ *
+ * Reuses fetch_efi_memory_map above rather than walking the firmware again:
+ * the dogfood gate counts raw firmware touchpoints, and a second copy would
+ * give the two walks separate chances to drift on slack or stride.
+ *
+ * NOT built on the classified region view next door, and that is the whole
+ * reason this function exists. That view coalesces EfiLoaderData,
+ * EfiBootServicesData and EfiConventionalMemory into AXL_MEM_REGION_RAM,
+ * which is right for "may I touch this span" and useless for "is this span
+ * free". Only the raw descriptor type distinguishes them.
+ *
+ * Descriptors are NOT coalesced here either. Two adjacent conventional runs
+ * would be a single usable region, but the firmware map already merges what
+ * it considers merge-able, and stitching neighbours would mean trusting our
+ * arithmetic over its bookkeeping for a caller that must re-check the
+ * allocation anyway.
+ */
+int
+axl_mem_largest_free_run(
+    uint64_t *base,
+    size_t   *pages
+    )
+{
+    size_t   map_size = 0;
+    size_t   desc_size = 0;
+    uint8_t *map;
+    uint64_t best_base = 0;
+    uint64_t best_pages = 0;
+
+    if (base == NULL || pages == NULL) {
+        return AXL_ERR;
+    }
+
+    map = fetch_efi_memory_map(&map_size, &desc_size);
+    if (map == NULL) {
+        return AXL_ERR;
+    }
+
+    for (size_t off = 0; off + desc_size <= map_size; off += desc_size) {
+        const EFI_MEMORY_DESCRIPTOR *d =
+            (const EFI_MEMORY_DESCRIPTOR *)(map + off);
+
+        if (d->Type != EfiConventionalMemory) {
+            continue;
+        }
+        if (d->NumberOfPages > best_pages) {
+            best_pages = d->NumberOfPages;
+            best_base  = d->PhysicalStart;
+        }
+    }
+
+    axl_free(map);
+
+    /* A machine with no free memory at all is a failure, not a zero-length
+       success: every caller of this is about to allocate. */
+    if (best_pages == 0) {
+        return AXL_ERR;
+    }
+
+    *base  = best_base;
+    *pages = (size_t)best_pages;
+    return AXL_OK;
+}
+
 static MemIv *
 collect_efi(size_t *out_n)
 {

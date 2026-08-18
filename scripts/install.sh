@@ -4,7 +4,7 @@
 # Usage: ./scripts/install.sh [OPTIONS]
 #
 # Options:
-#   --prefix DIR           Install location (default: ./out)
+#   --prefix DIR           Install location (default: ./stage)
 #   --arch ARCH            Build only this arch: x64, aa64, or all (default: all)
 #
 # Requires: gcc, ld, ar, objcopy (GCC toolchain)
@@ -15,13 +15,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SDK_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Defaults
-PREFIX="$SDK_DIR/out"
+PREFIX="$SDK_DIR/stage"
 LIBAXL_DIR="$SDK_DIR"
 BUILD_ARCHS="all"
 # C++ support mode: "auto" (default — build if toolchain present, skip
 # silently otherwise), "require" (--cpp: fail loud if missing), "skip"
 # (--no-cpp: don't build even if present).
 CPP_MODE="auto"
+PRINT_BUILD_LOCK=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,6 +30,12 @@ while [[ $# -gt 0 ]]; do
         --arch)        BUILD_ARCHS="$2"; shift 2 ;;
         --cpp)         CPP_MODE="require"; shift ;;
         --no-cpp)      CPP_MODE="skip"; shift ;;
+        # Print the lock this invocation would take around its build, then
+        # exit. Exists so a caller can reason about the serialisation without
+        # re-deriving the path -- a second spelling of the derivation is a
+        # thing that drifts, and the test for the lock would otherwise have to
+        # own one.
+        --print-build-lock) PRINT_BUILD_LOCK=1; shift ;;
         -h|--help)
             cat <<HELP
 Usage: $0 [--prefix DIR] [--arch x64|aa64|all] [--cpp|--no-cpp]
@@ -192,6 +199,23 @@ case "$BUILD_ARCHS" in
     *) echo "ERROR: unknown arch '$BUILD_ARCHS'" >&2; exit 1 ;;
 esac
 
+# --print-build-lock: report the lock path(s) the build below would take, then
+# exit before doing anything. It runs the same `make print-prefix` QUERY the
+# build runs, so a caller cannot end up reasoning about a path this script does
+# not take -- which is the whole reason it is reported rather than documented.
+if [[ "$PRINT_BUILD_LOCK" == "1" ]]; then
+    for arch in "${ARCHES[@]}"; do
+        # The SAME query the build uses. An earlier draft of this block spelled
+        # the prefix out and appended -tls by hand, and was already wrong by
+        # one suffix against the build ten lines down -- the exact drift this
+        # flag exists to make impossible.
+        _p="$(make -s -C "$LIBAXL_DIR" ARCH="$arch" BUILD=RELEASE \
+            ${AXL_TLS:+AXL_TLS=$AXL_TLS} print-prefix)"
+        printf '%s\n' "$LIBAXL_DIR/$_p.buildlock"
+    done
+    exit 0
+fi
+
 # Only an arch actually being built imposes a toolchain requirement. Checking
 # both unconditionally made `--arch x64 --cpp` hard-fail on a missing AArch64
 # bare-metal g++ that the run was never going to invoke -- which is precisely
@@ -238,7 +262,7 @@ if [[ "$CPP_MODE" != "skip" ]]; then
     fi
     if [[ -z "$cpp_missing" ]]; then
         BUILD_CPP=1
-        log_info "C++ toolchain detected — will build libaxl-cxx.a"
+        log_info "C++ toolchain detected — will build the C++ runtime glue"
     elif [[ "$CPP_MODE" == "require" ]]; then
         log_error "$cpp_missing"
         log_error "Run scripts/install-toolchain.sh first, or omit --cpp."
@@ -295,29 +319,80 @@ for arch in "${ARCHES[@]}"; do
     # a subsequent DEBUG build and the alloc-fill / fence machinery
     # would be missing — visible as the test_debug_features 0xDA
     # flake.
-    local_prefix="out/native-$arch-release"
+    # ASK for the prefix, never compose it. Passing PREFIX on make's command
+    # line OVERRIDES the Makefile's own rule, and this line used to hardcode
+    # "out/native-$arch-release" -- which silently defeated d8ab47ee, the split
+    # that gives an AXL_TLS build its own tree. A TLS install and a non-TLS
+    # install both landed here, and since AXL_TLS is in the build-state
+    # SIGNATURE, each alternation WIPED the other's objects (~300 of them,
+    # measured at the time) and rebuilt from scratch. Concurrently, it does not
+    # merely wipe: it corrupts, which is where "the input file ... is empty"
+    # and a stale staged prefix came from.
+    local_prefix="$(make -s -C "$LIBAXL_DIR" ARCH="$arch" BUILD=RELEASE \
+        ${AXL_TLS:+AXL_TLS=$AXL_TLS} print-prefix)"
     log_info "Building ($arch, gcc, RELEASE)..."
-    make -C "$LIBAXL_DIR" \
-        ARCH="$arch" PREFIX="$local_prefix" BUILD=RELEASE \
-        ${AXL_TLS:+AXL_TLS=$AXL_TLS} \
-        $( [[ "$BUILD_CPP" == "1" ]] && echo "AXL_CPP=1" ) \
-        -j "$(nproc)" 2>&1 | tail -3
+    # SERIALISED on the build tree, not on install.sh. --prefix says where to
+    # STAGE; the build always lands in local_prefix, so two install.sh runs
+    # with different prefixes still aim `make -j` at one target set. Under the
+    # integration suite that is routine rather than exotic: three tests invoke
+    # install.sh and run-integration.sh exports AXL_TLS=1 for all of them, so
+    # they collide on out/native-<arch>-release-tls. Observed symptoms were a
+    # partial archive and objcopy's "the input file ... is empty"; one such
+    # loss left a test linking against a three-week-old staged prefix and
+    # failing on a missing symbol, which reads as a library defect.
+    #
+    # d8ab47ee made the two CONFIGURATIONS independent by putting AXL_TLS in
+    # the prefix. This is the other half: two builds of the SAME configuration.
+    #
+    # The lock is keyed on the tree so unrelated configurations still run in
+    # parallel, and it is held only across the build -- staging into distinct
+    # prefixes is genuinely concurrent and stays that way.
+    _build_lock="$LIBAXL_DIR/$local_prefix.buildlock"
+    mkdir -p "$(dirname "$_build_lock")"
+    _do_build() {
+        make -C "$LIBAXL_DIR" \
+            ARCH="$arch" PREFIX="$local_prefix" BUILD=RELEASE \
+            ${AXL_TLS:+AXL_TLS=$AXL_TLS} \
+            $( [[ "$BUILD_CPP" == "1" ]] && echo "AXL_CPP=1" ) \
+            -j "$(nproc)" 2>&1 | tail -3
+    }
+    if command -v flock >/dev/null 2>&1; then
+        # fd 9, and the subshell scopes it so the lock is released even if the
+        # build fails under `set -e`. No timeout: waiting is the correct
+        # behaviour, and a bounded wait that gave up would reintroduce exactly
+        # the corruption this prevents.
+        ( flock 9 || exit 1; _do_build ) 9>"$_build_lock"
+    else
+        # No flock (a stripped container). Build unserialised rather than
+        # refusing -- a single install.sh is the common case and is unaffected
+        # -- but say so, because a silent downgrade of a correctness measure is
+        # how the original defect stayed invisible.
+        log_warning "flock not found: concurrent install.sh runs may corrupt $local_prefix"
+        _do_build
+    fi
 
     mkdir -p "$PREFIX/lib/axl/$arch"
     install -C -m 644 "$LIBAXL_DIR/$local_prefix/lib/libaxl.a"              "$PREFIX/lib/axl/$arch/"
     install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-native.o"   "$PREFIX/lib/axl/$arch/"
     install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-minimal.o"  "$PREFIX/lib/axl/$arch/"
     if [[ "$BUILD_CPP" == "1" ]]; then
-        install -C -m 644 "$LIBAXL_DIR/$local_prefix/lib/libaxl-cxx.a"      "$PREFIX/lib/axl/$arch/"
-        # The EXCEPTIONS glue, staged as OBJECTS rather than as
-        # libaxl-cxxrt.a. axl-cxxrt-alloc.o overrides newlib's malloc family
-        # so C++ allocations stay inside AXL's tracker, and that override only
-        # works from an object: from an archive, libc.a's malloc.o gets pulled
-        # for its other symbols and multiply-defines them (measured). They are
-        # named individually by axl-cc on an -fexceptions link and by nothing
-        # else -- axl-cxxrt-eh.o references __eh_frame_start, which only the
-        # exceptions linker script defines.
-        for _ehobj in axl-cxxrt-alloc.o axl-cxxrt-eh.o axl-cxxrt-stubs.o; do
+        # THE C++ RUNTIME GLUE, staged as OBJECTS rather than as
+        # libaxl-cxxrt.a, and the ONLY C++-specific thing the SDK ships now:
+        # P4 deleted libaxl-cxx.a and put the toolchain's real libstdc++ on
+        # every C++ link instead (AXL-Libc-Substrate-Design.md §4d).
+        #
+        # axl-cxxrt-alloc.o supplies the sbrk newlib's dlmalloc grows into,
+        # and axl-cxxrt-terminate.o preempts libstdc++'s verbose terminate
+        # handler (~112 KB of demangler and stdio that prints nothing under
+        # UEFI). Neither works from an archive: the member being displaced
+        # gets pulled for some other symbol and either multiply-defines or
+        # arrives with its dependencies intact. axl-cc names all four
+        # individually on every C++ link.
+        # axl-cxxrt-nothrow.o is the --no-eh-frame alternative to
+        # axl-cxxrt-eh.o: the two are mutually exclusive on a link, and
+        # axl-cc picks one. Both are staged so the choice is the consumer's.
+        for _ehobj in axl-cxxrt-alloc.o axl-cxxrt-eh.o axl-cxxrt-nothrow.o \
+                      axl-cxxrt-stubs.o axl-cxxrt-terminate.o; do
             if [[ -f "$LIBAXL_DIR/$local_prefix/build/$_ehobj" ]]; then
                 install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/$_ehobj" \
                     "$PREFIX/lib/axl/$arch/"
@@ -374,6 +449,25 @@ install -C -m 644 "$LIBAXL_DIR/include/axl/"*.h                   "$PREFIX/inclu
 install -C -m 644 "$LIBAXL_DIR/include/axl/"*.hpp                 "$PREFIX/include/axl-sdk/axl/"
 install -C -m 644 "$LIBAXL_DIR/include/uefi/"*.h                  "$PREFIX/include/axl-sdk/uefi/"
 install -C -m 644 "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/axl-sdk/uefi/generated/"
+# Point out a staged SDK left in the OLD default location (./out), which is
+# where --prefix defaulted before O1 moved it to ./stage. It is not stale
+# today -- it was correct when it was written -- but nothing refreshes it any
+# more, so the next edit to axl-cc or a public header leaves it serving the
+# previous build to anyone who still types out/bin/axl-cc from muscle memory
+# or an old script. That is the same trap the compat/ removal below exists
+# for, one directory up.
+#
+# WARNED, NOT DELETED, and the asymmetry is deliberate: compat/ sits inside
+# the prefix this run owns and is ours to clean, whereas ./out is a directory
+# this invocation was not asked to touch. Removing files outside your own
+# --prefix is a surprise nobody asked for.
+_old_default="$LIBAXL_DIR/out"
+if [[ "$PREFIX" != "$_old_default" && -x "$_old_default/bin/axl-cc" ]]; then
+    log_warning "a staged SDK remains at $_old_default (the pre-O1 default)."
+    log_warning "Nothing refreshes it now -- it will go stale silently."
+    log_warning "Remove it with: rm -rf $_old_default/{bin,lib,include,share}"
+fi
+
 # Remove a compat/ left behind by an OLDER install into this same prefix.
 # install.sh stopped CREATING it, which is not the same as removing it: an
 # in-place upgrade would keep serving the stale shims -- and their
@@ -649,8 +743,8 @@ function(_axl_build_efi TARGET TYPE)
     #     project header rebuilt nothing.
     #
     # The LINK step needs no COMPILE flags repeated to it. axl-cc derives what
-    # the link needs (the C++ runtime archive, -frtti's libstdc++, the
-    # exceptions linker script and glue) from the OBJECTS via `nm -u`,
+    # the link needs (libstdc++/libsupc++, the C++ linker script and the
+    # cxxrt glue objects) from the OBJECTS via `nm -u`,
     # precisely so a staged build works -- so re-passing -O2 or -D would be
     # noise, and forgetting to would be a silent defect. This is that design
     # paying off.
@@ -813,12 +907,12 @@ log_info "Installed axl-config.cmake"
 # install round-trip), and invisible to shellcheck. Extracting it
 # cost nothing and gained all those.
 install -C -m 755 "$LIBAXL_DIR/scripts/axl-cc" "$PREFIX/bin/axl-cc"
-# axl-c++ ships UNCONDITIONALLY, unlike libaxl-cxx.a. It is a 9-line `exec
+# axl-c++ ships UNCONDITIONALLY, unlike the C++ glue objects. It is a 9-line `exec
 # axl-cc -x c++` wrapper with no build step and no dependency on the C++
 # toolchain, so BUILD_CPP would not be saving anything — and gating it made the
 # failure WORSE. axl-cc already diagnoses both C++ failure modes precisely at
 # the moment of use ("g++ not found ... run axl-install-toolchain aa64",
-# "libaxl-cxx.a is missing ... run ./scripts/install.sh --cpp"). Withholding
+# "axl-cxxrt-alloc.o ... run ./scripts/install.sh --cpp"). Withholding
 # the wrapper replaces those with the shell's bare "axl-c++: command not
 # found", which names no remedy. It was also incoherent: `axl-cc hello.cpp`
 # reached the good diagnostic on a C-only install while `axl-c++ hello.cpp`

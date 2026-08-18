@@ -312,6 +312,56 @@ axl_backend_event_create_before_exit_boot(
     return AXL_OK;
 }
 
+int
+axl_backend_event_create_notify_protocol(
+    const void *guid,
+    void      (*notify)(void *ctx),
+    void       *ctx,
+    AxlEventHandle *event
+    )
+{
+    EFI_STATUS       status;
+    EFI_EVENT        ev = NULL;
+    NotifyTimerCtx  *nc;
+    size_t           slot;
+    void            *registration = NULL;
+
+    if (guid == NULL || notify == NULL || event == NULL) {
+        return AXL_ERR;
+    }
+
+    nc = notify_bridge_reserve(notify, ctx, &slot);
+    if (nc == NULL) {
+        return AXL_ERR;
+    }
+
+    /* EVT_NOTIFY_SIGNAL at TPL_CALLBACK, which is what makes this usable
+       from a driver with no event loop: the FIRMWARE calls the trampoline.
+       axl_loop_add_protocol_notify creates a bare event instead and needs
+       an AxlLoop iteration to notice it. */
+    status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                              notify_timer_trampoline, nc, &ev);
+    if (EFI_ERROR(status)) {
+        notify_bridge_abort(nc);
+        return AXL_ERR;
+    }
+
+    /* The registration token is discarded on purpose. It exists to feed
+       LocateHandle(ByRegisterNotify), which walks only the handles that
+       arrived since the last such call; this API's contract is "something
+       changed, go look", so the caller re-enumerates and needs no token.
+       Passing NULL is not an option -- the firmware rejects it. */
+    status = gBS->RegisterProtocolNotify((EFI_GUID *)guid, ev, &registration);
+    if (EFI_ERROR(status)) {
+        gBS->CloseEvent(ev);
+        notify_bridge_abort(nc);
+        return AXL_ERR;
+    }
+
+    notify_bridge_publish(slot, ev, nc, false, event);
+    return AXL_OK;
+}
+
 /* Look up and release a notify-timer's tracking slot. Returns true
    if the handle was a tracked notify-timer (caller has already
    closed the EFI event); the close path in event_close_dbg uses

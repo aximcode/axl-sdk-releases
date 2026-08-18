@@ -38,8 +38,53 @@
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>  /* axl_memset */
+#include <stddef.h>       /* offsetof */
 
 AXL_LOG_DOMAIN("cpu");
+
+/* THE OFFSETS ARE THE CONTRACT, and they failed silently once.
+ *
+ * EFI_SYSTEM_CONTEXT_X64 is generated from the spec HTML, and the generator
+ * substitutes `void *` for any member type it was not asked to extract. That
+ * is harmless for a member the spec declares as a pointer and fatal for one it
+ * declares BY VALUE: EFI_FX_SAVE_STATE_X64 is an inline 512-byte FXSAVE area,
+ * so a `void *` stand-in moved Rip, Rsp, Rbp and every GPR 504 bytes earlier
+ * than the firmware writes them. Nothing failed to compile and nothing failed
+ * to link; the handler simply reported RIP=0x4F307F9B6302D008 with every
+ * register zero, and a zero frame pointer yields no backtrace at all.
+ *
+ * These are the UEFI 2.11 (Table 18-x) layout, derived by summation:
+ *   ExceptionData  0..8      FxSaveState  8..520    Dr0-Dr7    520..568
+ *   Cr0-Cr8      568..616    Rflags     616..624    Ldtr,Tr    624..640
+ *   Gdtr,Idtr    640..672    Rip        672..680    Gs..Ss     680..728
+ *   Rdi..Rax     728..792    R8-R15     792..856
+ * Rip is asserted because it is the field the crash report is built around,
+ * and sizeof because it catches a member added or dropped anywhere else. */
+#if defined(__x86_64__)
+_Static_assert(sizeof(EFI_FX_SAVE_STATE_X64) == 512,
+               "EFI_FX_SAVE_STATE_X64 must be the 512-byte FXSAVE area; a "
+               "void* stand-in here silently shifts every later field");
+_Static_assert(offsetof(EFI_SYSTEM_CONTEXT_X64, FxSaveState) == 8,
+               "EFI_SYSTEM_CONTEXT_X64.FxSaveState must follow ExceptionData");
+_Static_assert(offsetof(EFI_SYSTEM_CONTEXT_X64, Rip) == 672,
+               "EFI_SYSTEM_CONTEXT_X64.Rip moved -- the firmware writes the "
+               "UEFI 2.11 layout, so a mismatch reads a neighbouring field");
+_Static_assert(sizeof(EFI_SYSTEM_CONTEXT_X64) == 856,
+               "EFI_SYSTEM_CONTEXT_X64 is not the UEFI 2.11 layout");
+#elif defined(__aarch64__)
+/* aa64 needs no such guard today -- EFI_SYSTEM_CONTEXT_AARCH64 has no
+ * aggregate members, so the generator substituted nothing in it -- but the
+ * two fields the crash report is built around are pinned for symmetry, so an
+ * aa64 regression fails at compile time rather than in a QEMU boot. */
+_Static_assert(offsetof(EFI_SYSTEM_CONTEXT_AARCH64, X0) == 0,
+               "EFI_SYSTEM_CONTEXT_AARCH64 must start at X0");
+_Static_assert(offsetof(EFI_SYSTEM_CONTEXT_AARCH64, FP) + 8
+               == offsetof(EFI_SYSTEM_CONTEXT_AARCH64, LR)
+               && offsetof(EFI_SYSTEM_CONTEXT_AARCH64, LR) + 8
+               == offsetof(EFI_SYSTEM_CONTEXT_AARCH64, SP),
+               "EFI_SYSTEM_CONTEXT_AARCH64 runs x29(FP), x30(LR), SP in that "
+               "order -- the crash path reads all three");
+#endif
 
 // ---------------------------------------------------------------------------
 // Per-kind slot table
@@ -412,7 +457,14 @@ static volatile uint32_t g_features_state = DETECT_NONE;
    down, is the other half of the same dispatch check and shares the guard. */
 static bool          g_simd_memo_valid   = false;
 static bool          g_avx_memo_valid    = false;
+#if defined(__x86_64__)
+/* x86-only, unlike its three neighbours. The sole reader is
+   axl_cpu_enable_avx, which lives inside the __x86_64__ block below; the
+   others are also touched by the reset at the end of the file, which is
+   compiled on every arch. Declared unconditionally this is an
+   unused-variable warning on aa64. */
 static bool          g_avx_memo_enabled  = false;
+#endif
 static volatile bool g_simd_memo_retired = false;
 
 static inline void

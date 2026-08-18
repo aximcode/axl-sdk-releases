@@ -75,7 +75,17 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlRadixTree, axl_radix_tree_free)
  * If the key already exists, the old value is freed via value_free
  * (if set) and replaced with the new value.
  *
- * @return AXL_OK on success, AXL_ERR on allocation failure.
+ * @a value may be NULL. A key's presence is tracked on the node rather than
+ * inferred from its value, so a NULL-valued key is counted once by
+ * axl_radix_tree_size(), visited by axl_radix_tree_foreach(), and removable
+ * by axl_radix_tree_remove() like any other. value_free is NOT called for it.
+ *
+ * The one thing that cannot distinguish it is axl_radix_tree_lookup(), which
+ * returns `void *` and has no spare value to mean "absent" — that is the
+ * return convention, not a gap in the tree. Use axl_radix_tree_foreach() when
+ * the difference matters.
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure or a NULL @p key.
  */
 int
 axl_radix_tree_insert(

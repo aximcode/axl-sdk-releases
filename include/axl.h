@@ -9,8 +9,8 @@
  * UEFI C library — with first-class C++ support — aimed at Linux
  * systems C and C++ developers (glibc / GLib / systemd / libcurl
  * audience) who don't want to learn EDK2 to ship a UEFI binary. The
- * C-shaped API is fully usable from C++ (libaxl-cxx.a, the axl-c++
- * driver, RAII via AXL_AUTOPTR). UTF-8 everywhere, standard C types, snake_case
+ * C-shaped API is fully usable from C++ (the axl-c++ driver, RAII via
+ * AXL_AUTOPTR). UTF-8 everywhere, standard C types, snake_case
  * functions, PascalCase types — the API shape carried over directly
  * from GLib (AxlLoop ~= GMainLoop, AxlHashTable ~= GHashTable, etc).
  * Public API never returns or accepts EFI_* types.

@@ -30,13 +30,13 @@
  * the SDK no longer passes that flag at all — so the containers are simply
  * available, with nothing to opt into. `std::map<std::string,int>`
  * and a 200-entry `std::unordered_map` were then verified running under UEFI on
- * both arches in a 119 KB image. What the link needs from `libstdc++.a` is two
- * archive members with zero undefined symbols between them — no locale, no
- * iostreams, no unwinder.
+ * both arches. Since P4 the link carries the toolchain's real `libstdc++.a`
+ * (`docs/AXL-Libc-Substrate-Design.md` §4d), which is also what makes
+ * `<iostream>`, `<sstream>` and `<fstream>` reachable.
  *
  * So there is no `axl::vector` and no `axl::string` either. What this layer
  * supplies is the parts the standard cannot: the error vocabulary below, the
- * runtime hooks in `libaxl-cxx.a` that make the link possible, and
+ * glue objects that make a firmware link work at all, and
  * #axl::arena_allocator for the one property the standard containers really
  * do cost us — see below.
  *
@@ -73,11 +73,23 @@
  *
  * @par Errors are values
  *
- * `-fno-exceptions` is not negotiable here, so a fallible operation returns
- * #axl::result. That matches what the C library already does — errors are
- * QUERIED, never thrown — and it is the standard's own vocabulary rather than
- * an invented one. ETL's answer to this question is no heap at all; EASTL's is
- * an allocator returning null. Ours is a value.
+ * A fallible operation returns #axl::result. That matches what the C library
+ * already does — errors are QUERIED, never thrown — and it is the standard's
+ * own vocabulary rather than an invented one. ETL's answer to this question is
+ * no heap at all; EASTL's is an allocator returning null. Ours is a value.
+ *
+ * **This used to read "`-fno-exceptions` is not negotiable here", and that is
+ * no longer true.** Exceptions work under UEFI: `axl-c++ -fexceptions` gives
+ * real `try`/`catch`, pinned by `test-cxx-exceptions-qemu.sh` — which catches
+ * a throw from a global constructor, before `main`.
+ * `docs/AXL-Cxx-Unwinder-Design.md` records the decision that reversed the
+ * invariant this sentence used to assert.
+ *
+ * The CONCLUSION is unchanged and the reason for it is now stronger.
+ * `-fexceptions` is a per-translation-unit opt-in and `-fno-exceptions` is
+ * still the default, so a header that threw would be unusable in the default
+ * mode. Errors as values is what works in BOTH, which is a firmer footing than
+ * "the language feature is unavailable" ever was.
  */
 
 #ifndef AXL_CXX_HPP
@@ -103,9 +115,10 @@ namespace axl {
  * distinguish the same outcomes and neither needs a translation table. Its
  * numeric values are part of the C contract and stay that way.
  *
- * @warning `.value()` on an errored result calls `abort()`. The SDK DEFINES
- *     `abort` (see `src/runtime/axl-cxxabi-ops.cpp`) so this is a diagnosable
- *     halt rather than a link failure — but it is still a crash, and
+ * @warning `.value()` on an errored result calls `abort()`. newlib defines
+ *     `abort`, and it is routed to AXL's own exit through `_exit` (see
+ *     `src/cxxrt/axl-cxxrt-stubs.c`), so this is a diagnosable halt rather
+ *     than a link failure or a wedged machine — but it is still a crash, and
  *     `value_or`, `has_value` or `operator*` after a check are what you want
  *     on any path that can actually fail. This is not specific to
  *     `std::expected`: under `-fno-exceptions` libstdc++ lowers every throw

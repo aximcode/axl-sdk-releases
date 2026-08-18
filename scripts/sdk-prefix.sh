@@ -56,11 +56,12 @@ for arg in "$@"; do
     esac
 done
 
-# Default matches install.sh's own default, so nothing moves unless asked. A
-# separation that relocated the staged SDK would be a breaking change wearing
-# a refactor's clothes -- every consumer instruction, every package recipe and
-# every test names this path today.
-PREFIX="${AXL_SDK_PREFIX:-out}"
+# Default matches install.sh's own default. It was `out` when this accessor
+# landed, deliberately, so the separation could be mechanical; O1 then decided
+# the move (2026-08-16). `out/` keeps the build trees and Sphinx output,
+# `stage/` holds the staged SDK -- the overloading AXL-Distribution-Design.md
+# §4 is named after is what made a build directory read as an install prefix.
+PREFIX="${AXL_SDK_PREFIX:-stage}"
 
 if $ABS; then
     case "$PREFIX" in

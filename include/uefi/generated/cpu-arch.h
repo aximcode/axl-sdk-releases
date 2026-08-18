@@ -58,13 +58,40 @@ typedef INTN EFI_EXCEPTION_TYPE;
 
 #define MAX_AARCH64_EXCEPTION EXCEPT_AARCH64_SERROR
 
+typedef struct _EFI_FX_SAVE_STATE_X64 {
+   UINT16                  Fcw;
+   UINT16                  Fsw;
+   UINT16                  Ftw;
+   UINT16                  Opcode;
+   UINT64                  Rip;
+   UINT64                  DataOffset;
+   UINT8                   Reserved1[8];
+   UINT8                   St0Mm0[10], Reserved2[6];
+   UINT8                   St1Mm1[10], Reserved3[6];
+   UINT8                   St2Mm2[10], Reserved4[6];
+   UINT8                   St3Mm3[10], Reserved5[6];
+   UINT8                   St4Mm4[10], Reserved6[6];
+   UINT8                   St5Mm5[10], Reserved7[6];
+   UINT8                   St6Mm6[10], Reserved8[6];
+   UINT8                   St7Mm7[10], Reserved9[6];
+   UINT8                   Xmm0[16];
+   UINT8                   Xmm1[16];
+   UINT8                   Xmm2[16];
+   UINT8                   Xmm3[16];
+   UINT8                   Xmm4[16];
+   UINT8                   Xmm5[16];
+   UINT8                   Xmm6[16];
+   UINT8                   Xmm7[16];
+   UINT8                   Reserved11[14 * 16];
+} EFI_FX_SAVE_STATE_X64;
+
 typedef struct _EFI_SYSTEM_CONTEXT_X64 {
    UINT64 ExceptionData;   // ExceptionData is
                            // additional data pushed
                            // on the stack by some
                            // types of x64 64-bit
                            // mode exceptions
-   void  *FxSaveState;
+   EFI_FX_SAVE_STATE_X64 FxSaveState;
    UINT64                  Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
    UINT64                  Cr0, Cr1 /* Reserved */, Cr2, Cr3, Cr4, Cr8;
    UINT64                  Rflags;

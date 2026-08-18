@@ -3,6 +3,275 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.2.0 — 2026-08-18
+### Added
+
+- **`axl-c++ --no-eh-frame`** — drop the unwind tables from a C++ link that
+  will never catch. Since P4 every C++ link takes the exceptions linker
+  script, so a program containing no `try`/`catch`/`throw` still carried the
+  frame tables and the throw path. This flag selects the plain script AND
+  swaps `axl-cxxrt-eh.o` for `axl-cxxrt-nothrow.o`, whose `__cxa_throw`
+  intercepts *before* the unwinder is entered: an unhandled `vector::at()`
+  range error still halts and still prints its type and `what()`. Simply
+  selecting the plain script does neither — it fails to link
+  (`__eh_frame_start` is undefined under `--no-undefined`) and, once forced,
+  **wedges the machine**: unwinding a frame with no FDE takes an unhandled
+  CPU fault. **Refused with `-fexceptions`**, and refused when an input object
+  references `__gxx_personality_v0`, because that combination would silently
+  kill every catch block.
+
+  Worth **−12.5% to −13.9% per binary on x64** and **−3.1% to −4.4% on aa64**
+  across a consumer fleet of 34 real tools (16.40 MB → 14.12 MB in total).
+  **Do not quote one percentage for both arches**: on x64 `.eh_frame` scales
+  with the program and dominates the saving; on aa64 it is roughly constant,
+  so most of the (smaller) saving there is the garbage-collected throw path.
+
+- **`axl::preorder_pruned(root, descend)`** — a pre-order walk whose predicate
+  governs the DESCENT, not the output. The rejected node is still visited and
+  only its subtree is skipped, which is what a collapsed tree view needs.
+  `preorder(n) | std::views::filter(pred)` cannot express it: `filter` drops a
+  node after the walk has already descended into it, so the hidden subtree is
+  still traversed. Allocation- and stack-free like the other ranges; yields an
+  `input_range`, since the predicate lives in the iterator and a capturing
+  lambda is not default-constructible.
+
+- **Six C++ seam headers over the C API**, completing the C++ layer (C0-C7).
+  `axl-cstr.hpp` (`axl::view` / `axl::adopt`), `axl-array.hpp` (`array_span`),
+  `axl-ntree.hpp` (four lazy, allocation-free ranges), `axl-radix-tree.hpp`,
+  `axl-gfx-surface.hpp` (`gfx_target_scope`) and `axl-json.hpp`
+  (`json_document` / `json_value` / `json_writer` / `json_scanner`, with a
+  chaining `operator[]`). All header-only; the layer compiles no `.cpp` beyond
+  the runtime glue, and every one is usable under both `-fno-exceptions` and
+  `-fexceptions`.
+
+- **`axl_array_data()` and `axl_array_element_size()`** — hand out the backing
+  buffer so a reader stops paying a call per element. This is what
+  `axl::array_span` is built on.
+
+- **JSON: three decoded-length queries and `axl_json_double`.** A caller can
+  now size a decoded string before allocating for it, and the writer can emit
+  a `double`.
+
+- **`axl_image_watch_loads`** — call a callback whenever an image is loaded,
+  with no event loop. `axl_loop_add_protocol_notify` already covered a program
+  that runs an `AxlLoop`; this is for the case that has none, where a resident
+  DXE driver returns from its entry point and iterates nothing, so the
+  firmware must do the calling. It exists because anything holding a snapshot
+  of the loaded-image set needs to know when that set changes — see the
+  CrashHandler fix below.
+
+- **`printf("%zu", …)` works on x64.** It previously emitted the literal text
+  `zu` — likewise `%zd`, `%ju` and `%td` — while working correctly on aa64.
+  `%zu` on a `size_t` is the most common conversion in C and it failed
+  *silently*, which made it a portability trap rather than a missing feature.
+  The x64 toolchain is rebuilt as **`14.3.0-axl3`** with
+  `--enable-newlib-io-c99-formats` and the rest of ARM's newlib flag set, taken
+  verbatim from the manifest ARM ships inside its own toolchain. Consumers pick
+  this up by re-running `axl-install-toolchain x64`; the pinned URL and sha256
+  in `scripts/axl-toolchains.conf` move with it.
+
+- **newlib 4.4.0 → 4.5.0 on x64**, matching ARM's version. This fixes newlib's
+  own `struct mallinfo`, which in 4.4.0 filled ten `int` fields into a struct
+  its `<malloc.h>` declares as ten `size_t` — callers read pairs of 32-bit
+  fields as single 64-bit ones followed by uninitialised stack.
+
+- **`<iostream>`, `<sstream>` and `<fstream>` work.** `std::cout` reaches the
+  UEFI console, `std::ofstream` writes to the ESP, and `std::ostringstream`
+  round-trips including `double` — booted on both arches. Before this a
+  default C++ link carried no libstdc++ at all, so every stream symbol was an
+  undefined reference; the compile always succeeded and the failure was at
+  LINK, which is why it read as "not supported" rather than "not linked".
+
+### Changed
+
+- **`libaxl.a` no longer carries ASYNCHRONOUS unwind tables on x64.** This is
+  a LIBRARY build flag and deliberately not a consumer one: `axl-cc` and the
+  generated CMake package are unchanged, so your own objects still compile
+  with whatever your gcc defaults to. What shrinks is the AXL code linked
+  into your image. `-fno-asynchronous-unwind-tables` joins x64's
+  `CFLAGS_BASE`, taking
+  `libaxl.a` from 158,976 bytes of `.eh_frame` to **0**, and a default-`_eh`
+  C++ consumer image from 207,509 to 195,733 bytes (**-5.7%**). Only the
+  asynchronous form goes — it serves debuggers and profilers by being valid at
+  every instruction, while exceptions consume the SYNCHRONOUS tables
+  `-fexceptions` implies, which are exact at call sites. All 7 cases of
+  `cxx-exceptions-selftest` still pass on both arches, including throw-and-
+  catch from a global constructor before `main`. C-only images and
+  `--no-eh-frame` images are byte-unaffected: `--gc-sections` had already
+  collected `.eh_frame` there. aa64 is untouched because `aarch64-none-elf`
+  already defaults the flag off — a per-TARGET default, not an architecture
+  property, since `aarch64-linux-gnu` defaults it on.
+
+- **There is ONE C++ link shape now, and it carries libstdc++.** `axl-cc` used
+  to pick between two: a default link with AXL's `libaxl-cxx.a` substituting
+  for libstdc++, and an `-fexceptions` link with the real thing. They could
+  never coexist — 53 of the archive's 56 symbols collided — so passing the
+  wrong flag failed at runtime on the first throw rather than at link. Every
+  C++ link now takes the toolchain's `libstdc++`/`libsupc++`, the four
+  `axl-cxxrt-*.o` glue objects and the exceptions linker script; `-fexceptions`
+  is a compile-side flag only.
+
+  **Cost, measured on `sdk/examples/containers.cpp`, x64 `--release`:**
+  `.text` 33,984 → 80,912 (+46,928, +138%); `.efi` 58,758 → 159,097. An image
+  that actually uses the streams is far larger — 734,512 bytes of `.text` on
+  x64, 702,576 on aa64 — which is why `axl::cout` (roughly 700 bytes over an
+  equivalent `axl_printf` program) remains the right default for a serial
+  console. `test-cxx-iostreams-qemu.sh` pins both the behaviour and a per-arch
+  size ceiling.
+
+  **A C image is untouched.** No libstdc++, no exceptions linker script, no
+  change in bytes.
+
+- **Diagnostics for an uncaught container failure got better.** `vector::at()`
+  out of range used to print `axl-cxxabi: __throw_out_of_range_fmt` from AXL's
+  stub. It now reaches libstdc++'s real `__throw_out_of_range_fmt`, unwinds to
+  AXL's terminate handler, and prints the exception type and `what()`:
+  `terminate: uncaught exception of type St12out_of_range` /
+  `what(): vector::_M_range_check: __n (which is 99) >= this->size() (which is 3)`.
+  This is why every C++ link takes the exceptions linker script: without a
+  registered frame table the throw arrives via `_URC_FATAL_PHASE1_ERROR` and
+  prints neither.
+
+- **`make check-no-avx` scans the toolchain's `libstdc++.a` and `libsupc++.a`.**
+  Its previous subject was `libaxl-cxx.a`, whose `axl-cxx-rehash.o` /
+  `axl-cxx-libm.o` existed precisely because a DISTRO libstdc++ carries AVX in
+  the container path — `#UD` under UEFI, which boots `CR4.OSXSAVE` clear. With
+  those deleted the exposure moved to the archive the SDK consumes, so that is
+  what the gate reads. Also closes a pre-existing gap: the `-fexceptions` path
+  has linked libstdc++ since long before this change and was never covered.
+
+- **An `-fexceptions` image is ~43-46% smaller, and an uncaught throw finally
+  says something.** libstdc++'s `__gnu_cxx::__verbose_terminate_handler` is the
+  default terminate handler, so every exceptions image linked it — and behind
+  it `__cxa_demangle` and newlib's `stdio`. Under UEFI it printed **nothing**:
+  its output goes to a newlib `stderr` no UEFI image wires up. So the cost
+  bought negative value.
+
+  AXL now preempts it with one object on the `-fexceptions` link path
+  (`src/cxxrt/axl-cxxrt-terminate.cpp`). Measured on
+  `cxx-exceptions-selftest.cpp`, `--release -fexceptions`:
+
+  | arch | before | after | delta |
+  |---|---|---|---|
+  | x64 | 264,185 | 150,920 | −113,265 (−42.9%) |
+  | aa64 | 259,933 | 139,651 | −120,282 (−46.3%) |
+
+  The replacement names the exception rather than printing a fixed string,
+  which costs +89 B on x64 / +655 B on aa64 — `__cxa_current_exception_type()`
+  gives the mangled name for free and a rethrow recovers `what()`:
+
+  ```
+  terminate: uncaught exception of type St13runtime_error
+    what(): a deliberate uncaught error
+  ```
+
+  The type name is **mangled** by design: demangling it is the whole 112 KB.
+  Nothing to do to get this — it applies to any `axl-c++ -fexceptions` build
+  through `axl-cc`, the Makefile, or the CMake package. **Restage first**
+  (`scripts/install.sh --arch all --cpp`): an existing staged SDK lacks the new
+  object, and `axl-cc` refuses the link by name rather than silently linking
+  the old handler.
+
+### Removed
+
+- **`libaxl-cxx.a` and its seven sources (1,696 lines).** `operator new` /
+  `delete` in every form, the five `std::__throw_*` halts, `std::terminate`,
+  `abort`, `ceil`, `_Prime_rehash_policy`, `std::_Rb_tree`, `_Hash_bytes`,
+  `_List_node_base` and the `basic_string` out-of-line members are all
+  libstdc++'s now.
+
+  The five that were not about iostreams were kept for two reasons that no
+  longer hold. **Size:** keeping them saves ~3 KB of `.text` against a
+  +47 KB budget. **AVX:** they were written against a distro libstdc++;
+  `scripts/check-no-avx.py` finds the hermetic toolchain's `libstdc++.a` and
+  `libsupc++.a` clean across all 189 members.
+
+  The SDK still conveys **no** libstdc++ — `axl-cc` resolves the consumer's
+  own installed copy via `-print-file-name`, so the GCC Runtime Library
+  Exception's one restriction stays out of scope. That toolchain has been a
+  hard prerequisite for every link since `libc.a`/`libm.a`/`libgcc.a` joined
+  them, so this adds no install step.
+
+### Fixed
+
+- **A NULL value in a radix tree was not counted as a value.** `axl_radix_tree`
+  treated a stored `NULL` as absence, so inserting one did not raise the count
+  and lookups reported a miss for a key that was genuinely present. A NULL
+  value is a value.
+
+- **x64 CPU exception handlers received garbage.** `EFI_SYSTEM_CONTEXT_X64` is
+  generated from the spec HTML, and the generator substitutes `void *` for any
+  member type not named in `scripts/uefi-manifest.json5`. That is harmless for
+  a member the spec declares as a pointer and fatal for one it declares BY
+  VALUE: `EFI_FX_SAVE_STATE_X64` is an inline 512-byte FXSAVE area, so the
+  `void *` stand-in put `Rip`, `Rsp`, `Rbp` and every GPR **504 bytes** earlier
+  than the firmware writes them. Nothing failed to compile and nothing failed
+  to link — `axl_cpu_register_exception` simply reported
+  `RIP=0x4F307F9B6302D008` with every register zero, and a zero frame pointer
+  yielded no backtrace at all. The type is in the manifest now, and
+  `src/util/axl-cpu.c` carries `_Static_assert`s on `sizeof` and
+  `offsetof(…, Rip)` so the same silent shift fails at COMPILE time.
+
+- **Every captured exception was reported under the wrong name.** CrashHandler
+  stored an `AxlCpuExceptionKind` in the crash record and decoded it as an x86
+  vector number — two numberings that agree nowhere, so a `#UD` came back from
+  NVRAM as `#BR (Bound Range)`, and on aa64 both kinds decoded to `Unknown`.
+  There is one decoder now, used by both the live print and the persisted
+  report, and `exception_type` is documented in `<axl/axl-crashrecord.h>`:
+  going undocumented is how the two sides drifted apart.
+
+- **Crash reports could not name the faulting image.** CrashHandler snapshotted
+  the loaded-image table once during driver init — before the application that
+  goes on to fault is loaded — so the report listed 32 firmware images, omitted
+  the one that crashed, printed no `Image:` line, and left `rsod-decode.py`
+  with no base to rebase against. The table is refreshed on every image load
+  now (via `axl_image_watch_loads`), and when it overflows it drops the OLDEST
+  entry instead of stopping: the application is enumerated after the
+  firmware's own images, so the entries worth keeping are the last ones.
+
+- **A NULL image path rendered as a blank Name column** rather than `Unknown`,
+  which is most images at DXE time.
+
+- **The crash report's own decode instruction named flags that do not exist.**
+  It printed `rsod-decode.py --from-dump crash-report.txt --symbols <dir>`;
+  the tool has neither option, so the one instruction the report gives a
+  reader failed outright. It now prints the invocation that works, filled in
+  with the faulting image and its base.
+
+- **`libaxl.a` no longer fights newlib over `memcpy`/`strlen`/…** Both archives
+  define eleven libc names, and `axl-cc` links both inside one
+  `--start-group`, so which one won was decided by whichever reference happened
+  to be outstanding when each archive was scanned. That is not a property
+  anyone controls, and it broke: `axl-c++ -fexceptions` on a program throwing a
+  non-`std::exception` failed with five `multiple definition` errors.
+
+  AXL's are now **weak** — a fallback for links that carry no libc (a C-only
+  link is `libaxl.a` and nothing else). Note this buys *coexistence, not
+  precedence*: an archive member is still extracted for a weak definition and
+  `libaxl.a` is still scanned first, so which copy an image ships still depends
+  on what drags each member in. Measured — an image throwing
+  `std::runtime_error` takes newlib's `memcpy`/`strlen`, one throwing a bare
+  `int` takes AXL's. What changes is that the second is a working link instead
+  of five errors.
+
+  Three symbols deliberately stay strong, because newlib's are structurally
+  inert under UEFI: `__cxa_atexit` (newlib registers into a table drained by
+  `exit()`, which nothing calls here — C++ static destructors would never run),
+  `__stack_chk_fail` (writes through `write()`, an AXL stub returning −1, so the
+  image would halt naming nothing) and `__stack_chk_guard` (BSS filled in by
+  `__stack_chk_init`, which nothing calls — the canary would stay 0).
+  `make check-libc-overlap` enforces both directions.
+
+  Verified behaviour-neutral: a C image and an already-working exceptions image
+  come out with byte-identical `.text`/`.rodata`/`.data`.
+
+- **`make BUILD=release` (lowercase) silently built DEBUG.** `CFLAGS_BUILD`
+  compares against `RELEASE` while `PREFIX` lowercases whatever it is given, so
+  debug objects landed in the directory named `release` — aliasing the real
+  release tree and wiping it on the next correct build. `BUILD` is now
+  case-normalised and any unrecognised value is refused by name, matching the
+  guard `ARCH` already had. Gated by `make check-build-mode`.
+
 ## 4.1.0 — 2026-08-16
 ### Added
 
@@ -586,7 +855,6 @@ Contributor-facing; none of this changes a consumer's build.
   The intent is that the opt-in is visible on the build line instead of buried
   in a source file. Prefer an `axl_*` API; a gap worth an escape hatch is worth
   reporting.
-
 
 - **`axl_json_parse` and `axl_json_load_file` take the dialect as a
   parameter**, and the `_flags` twins beside them are gone:
@@ -1314,7 +1582,6 @@ changes, which can compile silently. See `docs/AXL-API-Consistency-Audit.md`.
   It now prefers extracting the firmware's own Shell (native fwtool → python →
   uefiextract) and falls back to the distro package only when extraction is
   impossible.
-
 
 ## 2.9.0 — 2026-07-14
 

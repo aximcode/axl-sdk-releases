@@ -274,6 +274,29 @@ axl_array_len(AxlArray *a)
     return a->length;
 }
 
+void *
+axl_array_data(AxlArray *a)
+{
+    if (a == NULL) {
+        return NULL;
+    }
+
+    /* NULL is reachable only after axl_array_steal(), which also zeroes
+       length — so the (pointer, length) pair the header promises is safe to
+       iterate without a separate NULL test. */
+    return a->buffer;
+}
+
+size_t
+axl_array_element_size(AxlArray *a)
+{
+    if (a == NULL) {
+        return 0;
+    }
+
+    return a->element_size;
+}
+
 void
 axl_array_clear(AxlArray *a)
 {

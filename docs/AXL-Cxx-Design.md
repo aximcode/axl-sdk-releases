@@ -109,7 +109,7 @@ translation unit compiled with exceptions OFF needs only:
 | Symbol | Status |
 |---|---|
 | `memcpy` | AXL provides |
-| `operator new` / `delete` (3 forms) | `libaxl-cxx.a` provides |
+| `operator new` / `delete` (3 forms) | AXL provided; libstdc++'s own since P4 |
 | `std::__throw_bad_alloc()` | missing — a one-line stub |
 | `std::__throw_bad_array_new_length()` | missing — a one-line stub |
 | `std::__throw_length_error(char const*)` | missing — a one-line stub |
@@ -164,7 +164,27 @@ Verified running on **both** arches: `std::vector` + `std::sort`,
 change and an erase/rehash churn — with `load_factor() <= max_load_factor()`
 asserted, not just the values. `test/integration/test-cxx-hosted-qemu.sh`.
 
-### 2b.2 Why we define two libstdc++ internals ourselves
+### 2b.2 Why we define two libstdc++ internals ourselves — RETIRED 2026-08-17 (P4)
+
+> **The code this section describes is DELETED, and its central measurement
+> no longer holds.** `axl-cxx-rehash.cpp`, `axl-cxx-rbtree.cpp`,
+> `axl-cxx-hash.cpp`, `axl-cxx-libm.cpp` and `axl-cxx-string-inst.cpp` went
+> with `libaxl-cxx.a` at P4 (`AXL-Libc-Substrate-Design.md` §4d).
+>
+> The AVX hazard below is a property of the DISTRO's libstdc++, and the tree
+> stopped using one: since the hermetic-toolchain move (2026-08-13) both
+> arches build against AXL's own bare-metal GCC. Run
+> `scripts/check-no-avx.py` over that toolchain's `libstdc++.a` and
+> `libsupc++.a` and both are **clean, all 189 members** — `hashtable_c++0x.o`
+> included. Nobody had re-measured after the toolchain changed, so five files
+> were being maintained against a hazard that had already gone.
+>
+> `make check-no-avx` now scans those two archives directly, which is where
+> the exposure actually lives once every C++ link carries them.
+>
+> Kept as written because the reasoning is still the right reasoning if a
+> consumer ever points `AXL_X64_GXX` at a distro g++ — and because "the
+> premise expired quietly" is the transferable lesson.
 
 `hashtable_c++0x.o` is the only place libstdc++ does floating point in the
 container path. On a distribution whose gcc baseline is above plain `x86-64` —
@@ -202,15 +222,26 @@ still fails.
 ### 2b.3 `operator new` may not return NULL
 
 Making the containers reachable turned a documented quirk into a defect.
-`libaxl-cxx.a`'s `operator new` used to return NULL on exhaustion and ask
-callers to be defensive. `__new_allocator::allocate` does not check it — the
-standard guarantees the throwing form never returns NULL — so a container OOM
-became a `#PF` near address 0 inside a template, with nothing pointing at the
+AXL's own `operator new` used to return NULL on exhaustion and ask callers to
+be defensive. `__new_allocator::allocate` does not check it — the standard
+guarantees the throwing form never returns NULL — so a container OOM became a
+`#PF` near address 0 inside a template, with nothing pointing at the
 allocation.
 
-It now halts through `std::__throw_bad_alloc`. `new (std::nothrow)` is the
-supported way to get a NULL, and those overloads were added alongside. Nothing
-in-tree or in AGT null-checked `new`, so the old contract was buying nothing.
+**Since P4 the operator is libstdc++'s own**, so the contract is the standard
+one rather than ours to define: exhaustion THROWS `std::bad_alloc`, which in
+`-fno-exceptions` consumer code finds no handler and reaches AXL's terminate
+handler, printing the type and `what()` before exiting. `new (std::nothrow)`
+is still the supported way to get a NULL. Nothing in-tree or in AGT
+null-checked `new`, so the old contract was buying nothing.
+
+*How the failure is PRODUCED changed with it, and that broke two fixtures
+silently.* `axl_mem_fail_next_alloc()` injects into AxlMem, and `operator new`
+now reaches newlib's `malloc` — a different allocator (§2-DECISION of
+`AXL-Libc-Substrate-Design.md`). The injection did not start failing, it
+started being ignored: `cxx-hosted-badalloc.cpp` allocated successfully and
+printed its own `UNREACHABLE`. Both fixtures now request 2^45 `int`s, which
+no `sbrk` can serve.
 
 Writing that sentence exposed two forms that had never linked at all, in
 either mode, and neither looks unusual in source:
@@ -226,9 +257,11 @@ either mode, and neither looks unusual in source:
   aligns to `sizeof(size_t)`, so these over-allocate and stash the original
   pointer below the returned block.
 
-`test/integration/cxx-new-forms.cpp` is the standing guard, link-checked in
-BOTH modes because the freestanding half is where `std::nothrow` goes missing
-— hosted builds get it from `libstdc++.a` and hide the gap.
+`test/integration/cxx-new-forms.cpp` is the standing guard. It was
+link-checked in BOTH modes while two existed, because the freestanding half
+was where `std::nothrow` went missing; there is one mode now, and one link
+shape since P4, so it runs once. `std::nothrow` comes from libsupc++, which
+every C++ link carries.
 
 ### 2b.4 The two flags that were not actually forced
 
@@ -572,6 +605,14 @@ soundness. Interop is therefore a *seam*, not a base: `std::span` outward, and a
 small `axl::c_array_ref` adaptor for iterating an `AxlArray *` you were handed,
 which is AGT's actual direction of travel.
 
+> **Shipped 2026-08-17 as `std::span` alone.** The `c_array_ref` half of that
+> sentence was not needed: `axl_array_data()` makes the handed-in array a
+> `std::span` directly, so the "and" collapses into the first clause. §9d.
+>
+> This table's own method also caught C2 later: counted at implementation time,
+> `AxlString` has **zero** C++ consumers, so the `AxlString *` seam scoped for
+> C2 was dropped for the same reason `AxlTree`'s skin was.
+
 ## 5. Decision
 
 | Container | Built | Reason |
@@ -580,7 +621,7 @@ which is AGT's actual direction of travel.
 | `axl::unordered_map<K,V>` | **DON'T — use `std::unordered_map`** (§2b.1) | running on both arches. AXL supplies `_Prime_rehash_policy`'s two out-of-line members itself (§2b.2), so no AVX-carrying archive member is linked |
 | `axl::map<K,V>` | **DON'T — use `std::map`** (§2b.1) | running on both arches off `tree.o`, which has no undefined symbols. §4.3's 1.4× was measured against a hand-written AVL, which is no longer the alternative |
 | `axl::string` | **prefer `std::string`** (§2b), which already has SSO | §4.5's measurement stands as the reason not to skin `AxlString`; it is no longer a reason to WRITE one |
-| `AxlNTree`, `AxlRadixTree` | **skin** | domain wrappers, not STL analogs. `AxlNTree`'s links are **public**, so traversal inlines with no C change — the thing `AxlArray` would have needed `axl_array_data()` for |
+| `AxlNTree`, `AxlRadixTree` | **skin — SHIPPED 2026-08-17 (C5)** | domain wrappers, not STL analogs. `AxlNTree`'s links are **public**, so traversal inlines with no C change — the thing `AxlArray` would have needed `axl_array_data()` for, and which C3 has since added for it |
 
 All of them allocate through `axl_malloc`/`axl_free`, so leak tracking, the
 debug fill pattern that exposed §4.1's use-after-free, and the suite's leak gate
@@ -655,7 +696,18 @@ concepts.
 `std::expected<T, AxlStatus>` — standard, freestanding-available, and it matches
 the house convention that errors are **queried, not thrown** (JSON decision 16).
 It answers the question `-fno-exceptions` otherwise leaves open: what
-`push_back` does on OOM. ETL's answer is no heap at all; EASTL's is an allocator
+`push_back` does on OOM.
+
+> **The premise below shifted, and the conclusion got firmer.** This section
+> was written when exceptions did not work at all. They do now — `axl-c++
+> -fexceptions` gives real `try`/`catch` under UEFI, decided and built out in
+> `AXL-Cxx-Unwinder-Design.md`, which explicitly notes that it reverses the
+> invariant `axl-cxx.hpp` called "not negotiable". What has NOT changed is that
+> `-fexceptions` is a per-TU opt-in and `-fno-exceptions` is the default: a
+> header that throws is unusable in the default mode, so errors-as-values is
+> what serves both. Read the rest of this section as "errors are values because
+> the API must work in both compile modes", not "because there are no
+> exceptions". ETL's answer is no heap at all; EASTL's is an allocator
 returning null. Ours is a value.
 
 **`abort` is DEFINED**, in `libaxl-cxx.a` (`src/runtime/axl-cxxabi-ops.cpp`),
@@ -978,9 +1030,12 @@ Independent of the C++ work; each benefits every C consumer.
    `INITIAL_BUCKETS` is 64 and growth is `* 2`, so the count is *always* a power
    of two and the modulo is a hardware divide for nothing. Measured **−12%
    lookup at N=8k**, −6% at 50k, zero behaviour change.
-3. **`axl_array_data()`** — the only thing that would let a C++ skin inline
+3. ~~**`axl_array_data()`** — the only thing that would let a C++ skin inline
    element access (§4.1, third row). Worth it only if an `AxlArray`-backed
-   container is ever wanted; §5 says it is not.
+   container is ever wanted; §5 says it is not.~~ **SHIPPED 2026-08-17 with
+   C3**, alongside `axl_array_element_size()`. The "only if a container" clause
+   was wrong: a borrowed VIEW has the same inlining need, and it is the shape
+   §4.4 recommended in the same breath. See §9d.
 
 ## 8. Open questions
 
@@ -992,8 +1047,27 @@ Independent of the C++ work; each benefits every C consumer.
 - ~~Naming and namespace.~~ **CLOSED 2026-08-04 — see §6b.** `axl::` lowercase.
   The examples there name `axl::vector` / `axl::string` / `axl::map`; §2b.1
   since settled that those are `std::` types and the layer writes none of them.
-- **How `libstdc++.a` reaches an SDK consumer. CLOSED 2026-08-08 — it does
-  not reach them at all.** Mike's call was "make the SDK self-contained", and
+- **How `libstdc++.a` reaches an SDK consumer. CLOSED 2026-08-08, and
+  REOPENED-then-RESETTLED 2026-08-17 (P4).**
+
+  **The 2026-08-17 answer: it reaches them from their own installed
+  toolchain, on every C++ link, and the SDK still conveys none of it.** P4
+  deleted `libaxl-cxx.a` and put the real libstdc++ on the line, which is what
+  makes `<iostream>`/`<sstream>`/`<fstream>` work. The §1-RLE analysis below
+  is UNCHANGED and still governs — what it forbids is US redistributing the
+  runtime library, and `axl-cc` names the consumer's copy via
+  `-print-file-name`, exactly as the `-frtti` exception already did.
+
+  What did change is that the "self-contained" property this entry bought is
+  no longer distinguishing: P3 put `libc.a`/`libm.a`/`libgcc.a` on EVERY link,
+  so the bare-metal toolchain was already a hard prerequisite for building
+  anything at all. `libgcc.a` is under the same RLE. Adding libstdc++ for C++
+  links costs a consumer no extra install step.
+
+  The 2026-08-08 reasoning, which is what settled the licensing question and
+  is still the reference for it:
+
+  Mike's call was "make the SDK self-contained", and
   measurement made that free rather than costly: `--hosted` was pulling
   exactly TWO archive members, `tree.o` and `hash_bytes.o`, each with zero
   undefined symbols. `src/runtime/axl-cxx-rbtree.cpp` and `axl-cxx-hash.cpp`
@@ -1055,13 +1129,16 @@ Independent of the C++ work; each benefits every C consumer.
   in exchange for GPL-3 conveyance duties on every SDK tarball plus an ABI
   hazard when their libstdc++ differs from the one we vendored. The decision
   is Mike's; the legal uncertainty that made it hard is not there any more.
-- **Whether halt-on-OOM is now the SDK's contract. STILL OPEN — Mike's call.**
-  Shipping the `std::__throw_*` stubs in `libaxl-cxx.a` means every C++
-  consumer inherits them, and §2b.3 made `operator new` halt as well. That is
-  the correct behaviour for a standard container and it is a real narrowing
-  against AXL's C error model, where OOM is a value and some contracts are
-  *degradation* rather than propagation. `axl::arena_allocator` is the escape
-  hatch, not a general answer: it only helps where a bounded worst case can be
+- **Whether halt-on-OOM is now the SDK's contract. SETTLED BY P4, and not by
+  a decision — the stubs that encoded it are deleted.** A C++ consumer now
+  inherits libstdc++'s own behaviour: exhaustion throws `std::bad_alloc`,
+  which in `-fno-exceptions` code finds no handler and reaches AXL's terminate
+  handler, printing the type and `what()` before exiting. So it is still a
+  halt, and it is still a real narrowing against AXL's C error model where OOM
+  is a value and some contracts are *degradation* rather than propagation —
+  but it is the STANDARD's narrowing rather than a policy AXL chose, which is
+  the part that was open. `axl::arena_allocator` remains the escape hatch, and
+  remains a partial one: it only helps where a bounded worst case can be
   computed up front.
 - **Small-scalar specialization** for the map skins, so `unordered_map<int,int>`
   does not box. Only if something measures as hot.
@@ -1090,12 +1167,12 @@ first, because it would otherwise set every convention unilaterally.
 | Phase | Content |
 |---|---|
 | **C0** | **DONE 2026-08-04 (`b4795ed9`).** Gate surface (four places, §8), `axl::result<T>` = `std::expected<T, AxlStatus>` + `axl::err()` in `axl-cxx.hpp`, and `abort` defined in `libaxl-cxx.a` |
-| **C1** | **DONE.** `axl-c++ --hosted`, the five `std::__throw_*` stubs, the `ceil` shim and AXL's own `_Prime_rehash_policy` in `libaxl-cxx.a`, `operator new` halting instead of returning NULL, and `make check-no-avx`. Verified running on both arches (§2b.1). **Open: the distribution question — how `libstdc++.a` reaches an SDK consumer (§8)** |
-| **C2** | `std::string` — WORKS as-is. A seam to/from `const char *` and `AxlString *` is the only thing left to write |
-| **C3** | `std::vector` — WORKS as-is. `axl::arena_allocator` shipped with C1. Remaining: `axl::c_array_ref` for the 9 AGT sites holding an `AxlArray *` |
+| **C1** | **DONE, and half of it since RETIRED by P4.** `axl-c++ --hosted`, the five `std::__throw_*` stubs, the `ceil` shim and AXL's own `_Prime_rehash_policy` in `libaxl-cxx.a`, `operator new` halting instead of returning NULL, and `make check-no-avx`. Verified running on both arches (§2b.1). The substitutes are gone (`AXL-Libc-Substrate-Design.md` P4-RESULT) and libstdc++ supplies all of them; `check-no-avx` survives, repointed at that archive. The distribution question this row left open is answered in §8 |
+| **C2** | **DONE 2026-08-17.** `axl::view` / `axl::adopt` in `axl-cstr.hpp`. The `AxlString *` half was dropped on a count — see §9d |
+| **C3** | **DONE 2026-08-17.** `axl_array_data()` + `axl_array_element_size()` on the C side, `axl::array_span` / `axl::array_ptr_span` in `axl-array.hpp`. `axl::c_array_ref` was NOT written; §9d says why |
 | **C4** | `std::map` / `std::unordered_map` — **DONE**, running on both arches. The `AxlTree` / `AxlHashTable` skins are not needed |
-| **C5** | Domain wrappers: `AxlNTree`, `AxlRadixTree`, AGT's draw-context guard migrates |
-| **C6** | C++ JSON API — RAII container scopes, templated `add`, range-for over the reader. Four faces, so `w.splice(r["items"])` falls out of `axl_json_write_token` |
+| **C5** | **DONE 2026-08-17.** `axl-ntree.hpp` (four lazy ranges), `axl-radix-tree.hpp` (`axl::radix_tree<T>`), `axl-gfx-surface.hpp` (`axl::gfx_target_scope`) |
+| **C6** | **DONE 2026-08-17.** `axl-json.hpp` — `axl::json_document`/`json_value` with chaining navigation, array and object ranges, `axl::json_writer` with RAII scopes and templated `add`, `splice`, and `axl::json_scanner`. `w.splice(r["items"])` did fall out of `axl_json_write_token` with no C change. Four C additions were needed; see §9e |
 | **C7** | **DONE 2026-08-16.** `axl::unique_handle<T>` in `axl-handle.hpp` — the "owning pointer" the §1 table asks for, and the direct answer to its 84-call first row. Landed out of order because AGT asked for it while adopting v4.0.0; see §9b |
 
 ### 9b. `axl::unique_handle` — generated, not listed
@@ -1137,6 +1214,177 @@ compiler rather than reasoned about, having been wrong the first time:
 `make check-handle-exclusions` compiles one fixture three ways and matches the
 poison **text**, not just the exit status — a fixture typo fails to compile
 exactly like a working exclusion does.
+
+### 9d. What C2/C3/C5 turned into — three premises moved
+
+Shipped 2026-08-17. Each phase was scoped in this document more than a week
+before it was built, and the code corrected the scope in three places. Recorded
+here because the §9 table only has room to tick a row.
+
+**C2 lost half its scope, to §4.4's own inversion.** The seam was specified as
+"to/from `const char *` **and `AxlString *`**". Counted at implementation time,
+`AxlString` has **zero** references in AGT — the only C++ consumer — and zero in
+any other C++ tree built on this SDK. That is exactly what §4.4 measured for
+`AxlHashTable`: the interop that argues loudest for a bridge is the interop
+nobody is doing. What DOES have demand is different and was not in the scope at
+all: ~20 public functions return an owned `char *`, and in C++ that is four
+lines that leak on any early return. `axl::adopt()` is those four lines as an
+expression; the `AxlString` overload is not built.
+
+The demand count in §1's table has also decayed: "12 owning `char *` members"
+is now 8 `axl_strdup` sites, because AGT migrated to `std::string` on its own
+while this was pending. The acceptance test at the end of §9c should be read
+against that.
+
+**C3's deliverable was deleted by a C-side change of four lines.**
+`axl::c_array_ref` — a view whose iterator called `axl_array_get()` per
+dereference — is not here. `axl_array_data()` + `axl_array_element_size()` make
+a borrowed array a `std::span` outright: real `T *` iterators, no proxy, and
+`<algorithm>`/`<ranges>` for free per §2. §7 item 3 had dismissed
+`axl_array_data()` as "worth it only if an `AxlArray`-backed C++ CONTAINER is
+ever wanted", which §5 rejected — but a borrowed VIEW has the identical
+inlining need and is the shape §4.4 actually recommended, so the inference did
+not survive the case that motivated it. §4.1's third row had already measured
+the payoff: +87 bytes recovering 4.2× on reads and 19.4× on sort.
+
+`axl_array_data()` does NOT reopen the type. The struct stays opaque, there is
+still no typed indexing macro, and appending still memcpys — so §4.1's
+soundness verdict is untouched and this remains a read-side accessor, the same
+thing `std::vector::data()` is.
+
+**C5 is three unrelated things, and one of them was built without a consumer.**
+`AxlNTree` and the draw-context guard both have real callers; `AxlRadixTree`
+has zero C++ consumers by §4.4's own table and was built anyway, as a
+deliberate call for SDK surface completeness rather than because a count
+supported it. It is scoped to the three things §6b's corollary allows — RAII
+ownership, a typed payload, and a capturing `for_each` — and forwards for the
+rest.
+
+Two shape decisions inside C5 are worth keeping:
+
+- **Four lazy tree ranges, not `axl_ntree_traverse`'s four orders.**
+  `children`, `ancestors`, `preorder` and `postorder` all walk the public links
+  with no stack, so they allocate nothing. `level_order` and `in_order` are
+  deliberately absent: breadth-first needs a queue, and a range that allocated
+  silently inside a `for` loop reading like the other four is worse than
+  sending the caller to the C function.
+- **The gfx guard is concrete, not `scope_guard<T>`.** The whole public API has
+  exactly one save-and-restore-a-global pair, so a template would be an
+  abstraction with one caller — and a generic guard must be told the getter,
+  the setter and the value, which is longer at the call site than the thing it
+  abstracts.
+
+**One test defect the sabotage pass caught, kept because the shape recurs.**
+The fixture's pointer-mode element type was `struct { int; bool; }` — 8 bytes,
+which is exactly `sizeof(void *)` on both arches. So `array_ptr_span`'s stride
+check could have been written against `sizeof(T)` instead of `sizeof(void *)`
+and every assertion still passed. Eleven sabotages were run; that one came back
+NOT DETECTED, and the fix was to the test. A fixture type whose size
+coincidentally equals the size under test is a check that cannot fail.
+
+#### What the independent review changed, and the pattern in it
+
+Three reviewers ran against the first green version (91/91 today, 67/67 then).
+The defects clustered, and the cluster is the lesson: **every one of them was a
+case the single in-tree consumer did not happen to exercise.** A seam's whole
+job is to serve callers who are not the author, so "the fixture is green" is
+weaker evidence here than anywhere else in the tree.
+
+Four API shapes simply did not compile, and none was reachable from the
+fixture as written:
+
+| what | why it was invisible |
+|---|---|
+| `axl::children(nullptr)` — ambiguous across the const/non-const pair | the fixture had already written `static_cast<AxlNTree *>(nullptr)` around it, i.e. the author absorbed the symptom instead of reading it |
+| `array_span(const AxlArray *)` — absent, so a `const AxlArray *` member was unusable | the fixture held only mutable arrays |
+| `for_each(plain_function_name)` — `F` deduces to a function *reference*, so the cast was function-to-object | the fixture passed only lambdas |
+| `ranges::find_if(children(n), …)` → `std::ranges::dangling` | the fixture used range-`for` and `views::filter`, neither of which returns an iterator |
+
+Two were live memory hazards the type system could have refused and didn't:
+`adopt<std::string_view>` compiled and returned a view over the buffer `adopt`
+had just freed — the exact bug the header exists to remove — and `array_span<T>`
+checked stride while ignoring `alignof(T)`, so an over-aligned type matched at
+16 bytes on 8-aligned storage. Both are now `static_assert`s, verified to fire
+with the right message rather than assumed to.
+
+**The leak gate was set to `-ge 5` on a rationale that was measurably false.**
+The comment claimed the halting verb printed no teardown verdict; `abort()`
+reaches AXL's `_exit` → `axl_exit` → `_axl_cleanup`, which drains atexit and
+*then* dumps leaks, so all six verbs report. Two reviewers found it
+independently and the measurement settled it at six. A floor one below the
+truth lets any single verb lose its verdict and stay green — the "gate that
+cannot see" shape, in the gate written to prevent it.
+
+**Members of a class template are only instantiated on use, so an untested one
+has never been COMPILED.** `radix_tree`'s move-assignment, `release()`, `get()`
+and `operator bool`, and both iterators' post-increment, had no caller at all —
+a wrong body would have shipped without a diagnostic, not merely without a
+test. This is a sharper form of `feedback_uncompiled_code_is_a_bug_class`: for
+templates, coverage and compilation are the same question.
+
+Finally, `axl::string`'s OOM behaviour — the *only* documented difference
+between `adopt<std::string>` and `adopt<axl::string>`, and therefore the whole
+reason the template parameter exists — was untestable as written, because both
+adopted strings were shorter than the 23-byte inline buffer and so never
+allocated. `bad()` was false by construction.
+
+### 9e. C6 — what the C API could not do, and three bugs the fixture caught
+
+Shipped 2026-08-17, last by design: §9 put the JSON API after everything else
+so it would inherit the layer's conventions rather than set them. It did —
+`axl::result` for errors, `axl::` lowercase and flat, owner/borrower lifetimes
+copied from the C design's own rule — and the phase was mostly about what the
+C side could not answer.
+
+**The blocker was sizing a decoded string, and it appeared three times.**
+`axl_json_get_string()` truncates silently and returns `true`;
+`axl_json_value_string()` does the same; `axl_json_object_next()` truncates a
+key and reports it only *after* the pair is consumed. None of the three can
+back a `std::string` return.
+
+The tempting fix — expose the raw source span and let C++ decode with the
+already-public `axl_json_decode_string()` — is WRONG, and the reason is
+recorded in the C header: that helper takes no UTF-8 mode, so a C++ caller
+sizing and decoding through it would produce a **different string** from the
+one the reader hands back. One document must not have two answers to what a
+string says. So the queries go through the reader:
+`axl_json_get_string_len`, `axl_json_value_string_len`, and
+`axl_json_object_peek_key_len` — a peek, because a report-afterwards accessor
+cannot help a caller who needs the size *before* asking.
+
+Measuring reuses the real decoder into a scratch buffer rather than counting
+alongside it. A count-only pass would duplicate the escape, surrogate and
+split-tail logic and be free to drift from the thing it predicts — and
+`repair_decoded_utf8()` settles it anyway, since REPAIR rewrites the buffer in
+place and cannot run against a null destination.
+
+**A fourth addition completes a mirror rather than unblocking anything.** The
+writer had no `double` atom while the reader has had `get_double` since P14, so
+`w.add("scale", 1.5)` had nowhere to go. `axl_json_double` formats `%.17g`,
+which on AXL's engine is the SHORTEST round-trippable spelling and not 17
+digits: `axl_dtoa` yields at most 17 shortest digits, so the significant-digit
+rounding is a no-op and `%g` then trims. Non-finite values follow the dialect.
+
+**Three bugs, all caught by the first QEMU run, all in the C++ header:**
+
+1. **Every value was born errored.** `json_value(const AxlJsonReader &)` left
+   `m_err` to its default member initializer — `AXL_NOT_FOUND`, chosen so a
+   default-constructed value names a failure — so every value built from a real
+   reader inherited it. The API found nothing, and `parse()` still reported
+   success.
+2. **Every document leaked.** The move constructor did not carry `m_owns`, so
+   the default (`false`) won and the moved-TO document never freed. `parse()`
+   returns by value, so this leaked every document the API produced.
+3. **`parse_owning` dangled on short documents.** The bytes lived in a
+   `std::string` member; a document under the small-buffer threshold keeps them
+   INSIDE the object, so moving it relocated them and left the reader pointing
+   at the old address. Fixed by holding them behind a `unique_ptr`, which makes
+   the address survive every move.
+
+The first two are the same shape and worth naming: **a default member
+initializer chosen to make one case safe silently supplied the wrong value to
+another.** Both were invisible to the compiler and to every compile-time probe;
+only running the thing found them.
 
 ### 9c. Does `axl::string` still earn its place? — DECIDED 2026-08-16: yes
 
@@ -1191,6 +1439,83 @@ argument is that it serves `axl::cin`.
 owning `char *` members and 4 `AxlArray *` members do not go away, the
 foundation did not fit the real consumer. That is the measure, stated up front
 rather than discovered later.
+
+## 9f. A standard container cannot carry an OOM degradation contract
+
+Surfaced by a consumer building "degrade, do not die" contracts on top of
+`axl::arena_allocator`, and verified here before writing it down. It is a
+substrate-level consequence of two decisions that are each correct on their
+own, and it is not obvious from either.
+
+**If a code path must REPORT allocation failure rather than halt, the failing
+allocation cannot be a standard container's.**
+
+### Why — reason one: `-fno-exceptions` does not reach libstdc++
+
+`-fno-exceptions` governs the CONSUMER's translation units. The toolchain's
+prebuilt `libstdc++.a` is compiled WITH exceptions and still throws, and since
+P4 every C++ link carries it. `nm -C` on a default `-fno-exceptions` image
+shows `std::__throw_bad_alloc()` and `std::bad_alloc::what()` present.
+
+So a failing `push_back` throws for real. What happens next depends only on
+the link shape, and **both outcomes halt**:
+
+| link | the throw reaches | result |
+|---|---|---|
+| default `_eh` | the unwinder, then AXL's terminate handler | prints type + `what()`, halts |
+| `--no-eh-frame` | `__wrap___cxa_throw`, before the unwinder | prints type + `what()`, halts |
+
+Neither returns. There is no error for the caller to inspect, which is
+precisely what §9c already records for `std::string` versus `axl::string`;
+this generalises it to every container.
+
+### Why — reason two: the two heaps are disjoint
+
+`src/cxxrt/axl-cxxrt-alloc.c` calls this "the safety argument", and it is
+load-bearing here:
+
+    axl_malloc    -> gBS->AllocatePool(EfiBootServicesData)
+    operator new  -> newlib's dlmalloc, over AXL's private sbrk region
+
+Nothing crosses between them. Two consequences that catch people:
+
+- **Probing does not work.** A successful `axl_malloc` before a container push
+  says nothing about whether the push will succeed. They are different pools.
+- **The contract is not TESTABLE the usual way.** `axl_mem_fail_next_alloc()`
+  reaches `axl_malloc` and never `operator new`, so an injected-OOM fixture
+  cannot make a container push fail. (See the same note in CLAUDE.md: C++ OOM
+  fixtures must request an unsatisfiable size instead.)
+
+### The shape that works
+
+Put the container on the STRUCTURE and a checked `axl_malloc` on the ELEMENT:
+
+```cpp
+std::deque<axl::unique_handle<...>> lines;   // structure: may halt on OOM
+// element: axl_malloc, checked, degrades
+```
+
+This is what a consumer shipped after measuring, and it earns its keep twice:
+the element allocation is the one that scales with input, and because it goes
+through `axl_malloc` the contract becomes testable with
+`axl_mem_fail_next_alloc()` again.
+
+**Residual, and state it rather than imply it is zero:** the container's own
+node/spine allocations are still `operator new` and still unchecked. The
+pattern bounds the exposure to the container's overhead rather than to the
+data; it does not remove it.
+
+### And `arena_allocator` is not the fix either
+
+`axl-arena-allocator.hpp` already says `deallocate()` does nothing and to
+**size for the PEAK, not the total**. A ring buffer that frees its evicted
+element has a bounded LIVE SET and an unbounded TOTAL, so arena-backing it
+consumes space permanently, exhausts, and then halts — arriving later and less
+predictably than an honest failure. The distinction that matters is churn
+versus live set, and the header's warning is exactly what it is for.
+
+Nor is "one-shot" a property of a call site: an allocation made once per
+enter/leave cycle is not one-shot, because the cycle repeats.
 
 ## 10. Prior art consulted
 

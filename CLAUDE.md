@@ -2,8 +2,8 @@
 
 GLib-inspired C library — with first-class C++ support — and SDK for
 UEFI. Public API (`axl.h`) uses standard C types, snake_case naming,
-UTF-8 strings, and is fully usable from C++ (`libaxl-cxx.a`, the
-`axl-c++` driver, RAII via `AXL_AUTOPTR`). No EDK2 headers leak through
+UTF-8 strings, and is fully usable from C++ (the `axl-c++` driver,
+RAII via `AXL_AUTOPTR`). No EDK2 headers leak through
 the public API. The SDK packages the library for standalone UEFI app
 development (no EDK2 source tree needed).
 
@@ -172,6 +172,8 @@ it deletes them mid-build. `check-tautology` did exactly that.
 | `make check-no-avx` | an UNGATED AVX instruction in a produced image (UEFI boots `CR4.OSXSAVE` clear, so it is `#UD`). Dispatched kernels are allowlisted per SYMBOL with a recorded justification -- not per object, so a second function acquiring VEX by accident still fails |
 | `make check-bss-clear` | a crt0 that stopped zeroing .bss |
 | `make check-flag-parity` | the three build paths (Makefile, `axl-cc`, the CMake package `install.sh` generates) disagreeing on an ABI/safety flag or an `objcopy -j` section. Both drifted in one afternoon: the stack protector reached 2 of 3, and a renamed relocation section reached 2 of 3 `-j` lists |
+| `make check-libc-overlap` | a name BOTH `libaxl.a` and newlib define where AXL's is STRONG. Two strong providers inside `axl-cc`'s `--start-group` resolve by whichever reference happens to be outstanding when each archive is scanned — adding one object once turned an uncaught `throw 42;` into five `multiple definition` errors. The line falls where the RUNTIME DEPENDENCY falls: leaf functions (`memcpy`, `strlen`) are weak so newlib's better version wins; hooks that need AXL's own init/teardown (`__cxa_atexit`, `__stack_chk_fail`, `__stack_chk_guard`) stay strong because newlib's are inert under UEFI. Checks BOTH directions |
+| `make check-build-mode` | `BUILD=release` (lowercase) meaning DEBUG. `CFLAGS_BUILD` compares against `RELEASE` while `PREFIX` lowercases, so it built debug objects into the directory named `release` — ALIASING the real release tree and wiping it on the next correct build |
 | `make check-dep-tracking` | a C/C++ object compiled WITHOUT `-MD -MP`, so it has no header dependency and a header edit rebuilds nothing. `CXXFLAGS` lacked them for the whole life of the C++ layer, which made a sabotage of `axl-istream.hpp` read as UNDETECTED — the code was never recompiled. The `.axl-build-state` signature does NOT cover this: it hashes which FLAGS an object used, not which HEADERS it depends on. Assembly is exempt only while it `#include`s nothing, and the gate re-checks that rather than assuming it |
 | `test-cxx-hosted-qemu.sh` (ctor fixture) | `--gc-sections` eating `.init_array`. Nothing REFERENCES an `.init_array` entry, so without `KEEP()` in the linker scripts it is collected and NO C++ global constructor runs -- silently, for as long as the C++ layer existed |
 | `make check-reloc-coverage` | a `DT_RELA` relocation table SPLIT across two sections (the crt0 walks `DT_RELASZ` bytes and reads past the end), or dropped by `objcopy -j`, which takes EXACT section names. A latent aa64 bug for years; `-frtti` was the first workload to trigger it |
@@ -221,8 +223,9 @@ hang/`#GP`, not a clean `AXL_ERR`. See
 
 ## Current State (May 2026)
 
-All migration, cleanup, and style phases done. 2421 unit tests + 17 HTTP +
-12 Redfish integration tests, 0 failures. Native backend only (gcc + ld + objcopy).
+All migration, cleanup, and style phases done. **10485 unit assertions and 158
+integration tests, 0 failures (2026-08-17)** — `test/integration/.last-pass-count`
+is the authority, this line is a snapshot and dates fast. Native backend only (gcc + ld + objcopy).
 Test runner has ratchet check (fails if count drops below baseline).
 
 | Module | Directory | Header |
@@ -240,7 +243,7 @@ Test runner has ratchet check (fails if count drops below baseline).
 | AxlService | src/service/ | axl/axl-service.h, axl-embed.h (lifecycle wrapper over AxlLoop; composes axl-loop + axl-config + axl-driver; AXL_SERVICE_DRIVER macro in axl.h) |
 | AxlSharedDriver | src/util/axl-shared-driver.c | axl/axl-shared-driver.h (thin wrappers over axl-driver + axl-protocol for the synchronous-RPC "thin launcher + resident driver" pattern; no event loop; see docs/AXL-Shared-Driver-Recipe.md + sdk/examples/shared-driver-demo/) |
 | AxlTask | src/task/ | axl/axl-task.h, axl-buf-pool.h, axl-async.h |
-| C++ layer | src/runtime/*.cpp | axl/axl-cxx.hpp (`axl::result`), axl-arena-allocator.hpp (`axl::arena_allocator`), axl-handle.hpp (`axl::unique_handle`, opt-in per type via `AXL_DEFINE_AUTOPTR_CLEANUP`). The standard containers are the default and need no flag -- `std::vector`/`string`/`map`/`unordered_map` work on both arches (`--hosted` is removed; passing it is an error); `libaxl-cxx.a` supplies `operator new`/`delete`, the five `std::__throw_*`, `ceil`, and AXL's own `_Prime_rehash_policy`. **`axl::string` is KEPT** (decided 2026-08-16, design §9c): `std::string` HALTS on OOM under `-fno-exceptions` while `axl::string` sets `bad()`, which `axl::cin` reads to report `AXL_NO_RESOURCES` -- and it measures 564 B against `std::string`'s 1045 B. This was an "open T5 question" for a while; T5 was a doc-restructure task that closed 2026-08-14, so that phrasing was always wrong. See docs/AXL-Cxx-Design.md |
+| C++ layer | src/cxxrt/axl-cxxrt-terminate.cpp (the only .cpp left in src/) | axl/axl-cxx.hpp (`axl::result`), axl-arena-allocator.hpp (`axl::arena_allocator`), axl-handle.hpp (`axl::unique_handle`, opt-in per type via `AXL_DEFINE_AUTOPTR_CLEANUP`). **C0-C7 ALL SHIPPED as of 2026-08-17** — the seam headers are axl-cstr.hpp (`axl::view`/`adopt`), axl-array.hpp (`array_span` over the new `axl_array_data()`), axl-ntree.hpp (four lazy ranges), axl-radix-tree.hpp, axl-gfx-surface.hpp (`gfx_target_scope`), and axl-json.hpp (`json_document`/`json_writer`/`json_scanner`, chaining `operator[]`). Every one is HEADER-ONLY; the layer compiles no .cpp beyond the runtime glue. Exceptions WORK (`axl-c++ -fexceptions`), but are a per-TU opt-in with `-fno-exceptions` the default, so every header must be usable in both modes — which is why errors are `axl::result` and nothing throws. The standard containers are the default and need no flag -- `std::vector`/`string`/`map`/`unordered_map` work on both arches (`--hosted` is removed; passing it is an error). **ONE C++ LINK SHAPE since P4 (2026-08-17):** every C++ link carries the toolchain's `libstdc++`/`libsupc++`, the four `axl-cxxrt-*.o` glue objects and the EXCEPTIONS linker script -- `libaxl-cxx.a` and its 7 substitute sources are DELETED. That is what makes `<iostream>`/`<sstream>`/`<fstream>` work (booted both arches, `test-cxx-iostreams-qemu.sh`); it costs +46,928 `.text` on a containers image -- but quote the **`.efi`**, +100,339 (58,758 -> 159,097), and note a fixture UNDERSTATES it: a consumer measured **+153,886 to +178,118 (+28-36%)** on four real x64 tools. An iostreams image is ~734 KB of `.text`, which is why `axl::cout` (~700 B over `axl_printf`) stays the default. `axl_mem_fail_next_alloc()` NO LONGER reaches `operator new` -- that is libstdc++'s and calls newlib `malloc`, so C++ OOM fixtures must request an unsatisfiable size instead. **`axl::string` is KEPT** (decided 2026-08-16, design §9c): `std::string` HALTS on OOM under `-fno-exceptions` while `axl::string` sets `bad()`, which `axl::cin` reads to report `AXL_NO_RESOURCES` -- and it measures 564 B against `std::string`'s 1045 B. This was an "open T5 question" for a while; T5 was a doc-restructure task that closed 2026-08-14, so that phrasing was always wrong. See docs/AXL-Cxx-Design.md |
 | AxlNet | src/net/ | axl/axl-tcp.h, axl-udp.h, axl-url.h, axl-http-server.h, axl-http-client.h, axl-inet-address.h, axl-socket.h, axl-socket-client.h, axl-net.h (umbrella) |
 | AxlTls | src/net/ | axl/axl-tls.h (optional: AXL_TLS=1) |
 | AxlCrypto | src/net/ | axl/axl-crypto.h (PK sign/verify, AEAD, ECDH, AES-CTR; AXL_TLS=1) |
@@ -450,6 +453,18 @@ renamed-and-removed source file's stale .o can't survive across
 builds. (Earlier the `ar rcs` insert-or-replace behavior left
 stale members in place, requiring `make clean` after structural
 changes — fixed since.)
+
+**DELETING a source file is the case that still bites, and it looks
+like your edit did nothing.** `rm`ing a .c and dropping it from
+`LIB_SOURCES` shrinks `$(LIB_OBJS)` — and **removing a prerequisite
+does not make a target out of date**, so the libaxl.a recipe never
+runs, its `rm -f $@` never fires, and the deleted file's .o stays an
+archive member. `make` prints "AXL library built" and the symbol is
+still exported. Measured while deleting `axl-str-compat.c` /
+`axl-intrinsics.c`: `nm` still showed `memcpy` after a clean-looking
+build. The rename case above genuinely is safe (the new .o is a NEWER
+prerequisite, so the recipe fires). After deleting a source, remove
+its stale .o and the archive explicitly, or `make clean`.
 
 ## Documentation
 

@@ -193,6 +193,41 @@ axl_alloc_pages(
 );
 
 /**
+ * @brief Allocate pages at an EXACT physical address.
+ *
+ * Like #axl_alloc_pages, but the caller names the address instead of
+ * receiving one. Allocates @a count pages starting at @a phys_addr, and
+ * fails if any page in that range is already owned by someone else.
+ *
+ * @par What this is for
+ * Growing a region IN PLACE. #axl_alloc_pages takes whatever the firmware
+ * offers, and UEFI satisfies it DOWNWARD from high memory — so a second
+ * call typically lands *below* the first, and two regions obtained that way
+ * cannot be treated as one. Anything that must present a single ascending
+ * address range (a `sbrk`-style break is the motivating case, since a break
+ * that moves backwards is not a break) asks for the pages immediately after
+ * the ones it already owns, and gets a contiguous extension or a clean
+ * failure.
+ *
+ * The address must be page-aligned; an unaligned one is rejected rather than
+ * rounded, because rounding would hand back a region that does not start
+ * where the caller asked.
+ *
+ * @return AXL_OK on success, AXL_ERR if @a count is 0, @a phys_addr is 0 or
+ *     unaligned, or the firmware could not give out that exact range.
+ *     **A failure is ordinary**, not exceptional: the pages after yours may
+ *     simply belong to something else, and a caller that can fall back
+ *     should.
+ *
+ * Freed with #axl_free_pages, like any other page allocation.
+ */
+int
+axl_alloc_pages_at(
+    uint64_t  phys_addr,  ///< exact page-aligned physical address to allocate at
+    size_t    count       ///< number of 4KB pages to allocate
+);
+
+/**
  * @brief Free page-aligned memory allocated by axl_alloc_pages.
  */
 void

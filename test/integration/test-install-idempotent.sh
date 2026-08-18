@@ -241,7 +241,9 @@ else
     AXL_AA64_GXX="$NOARM" "$PROJECT_DIR/scripts/install.sh" \
         --arch x64 --cpp --prefix "$CPPW/x64" > "$CPPW/x64.log" 2>&1
     rc=$?
-    [[ "$rc" -eq 0 && -f "$CPPW/x64/lib/axl/x64/libaxl-cxx.a" ]]
+    # Keyed on a cxxrt OBJECT: P4 deleted libaxl-cxx.a, and keying a
+    # PRESENCE check on a file that no longer exists would fail forever.
+    [[ "$rc" -eq 0 && -f "$CPPW/x64/lib/axl/x64/axl-cxxrt-terminate.o" ]]
     check "$?" "--arch x64 --cpp succeeds without the AArch64 toolchain (rc=$rc)"
 fi
 

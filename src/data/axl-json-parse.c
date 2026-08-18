@@ -1218,6 +1218,85 @@ axl_json_value_string(const AxlJsonReader *r, char *value, size_t value_size)
                               value, value_size, NULL, r->utf8_mode);
 }
 
+/* Decoded byte length of a string token, excluding the NUL.
+
+   Runs the REAL decoder into a scratch buffer rather than counting alongside
+   it. A count-only pass would have to duplicate the escape, surrogate and
+   split-tail logic, and would then be free to drift from the thing it claims
+   to predict -- for a query whose entire contract is "this size cannot
+   truncate", a second implementation is the one thing that must not exist.
+   repair_decoded_utf8() also settles it on its own: REPAIR rewrites the buffer
+   IN PLACE, so it needs the bytes and cannot run against a null destination.
+
+   The scratch is 3x the source. A raw ill-formed byte becomes U+FFFD under
+   AXL_JSON_UTF8_REPAIR -- one byte in, three out -- which beats every ESCAPE
+   ratio; axl_json_decode_string()'s documented `len * 3 / 2 + 1` covers the
+   escape set only, and sizing from it would under-allocate a document with
+   raw bad bytes. */
+static bool
+measure_decoded(const char *src, size_t src_len, AxlJsonFlags utf8_mode,
+                size_t *out_len)
+{
+    char   *scratch;
+    size_t  cap;
+    bool    truncated = true;
+
+    /* +2: one for the NUL, one so a zero-length token still allocates. */
+    if (src_len > (SIZE_MAX - 2) / 3) {
+        return false;   /* not reachable from a parsed document; guard anyway */
+    }
+    cap = src_len * 3 + 2;
+
+    scratch = axl_malloc(cap);
+    if (scratch == NULL) {
+        return false;
+    }
+
+    if (!decode_json_string(src, src_len, scratch, cap, &truncated, utf8_mode)) {
+        axl_free(scratch);
+        return false;
+    }
+    /* The bound above is a worst case, so a truncation here means the bound is
+       wrong rather than the caller's -- refuse instead of returning a length
+       that would silently under-size the caller's buffer. */
+    if (truncated) {
+        axl_error("json: measure_decoded truncated at %zu bytes for a %zu-byte "
+                  "token -- the 3x bound is wrong", cap, src_len);
+        axl_free(scratch);
+        return false;
+    }
+
+    *out_len = axl_strlen(scratch);
+    axl_free(scratch);
+    return true;
+}
+
+bool
+axl_json_value_string_len(const AxlJsonReader *r, size_t *out_len)
+{
+    const AxlJsonTok *tok = own_tok(r);
+
+    if (tok == NULL || out_len == NULL || tok->type != AXL_JSON_TOK_STRING) {
+        return false;
+    }
+
+    return measure_decoded(r->json + tok->start,
+                           (size_t)(tok->end - tok->start),
+                           r->utf8_mode, out_len);
+}
+
+bool
+axl_json_get_string_len(const AxlJsonReader *ctx, const char *key,
+                        size_t *out_len)
+{
+    AxlJsonReader sub;
+
+    /* get_X is get_value + value_X, exactly as the header's own-value family
+       documents -- so the acceptance rules are stated once. */
+    return axl_json_get_value(ctx, key, &sub)
+           && axl_json_value_string_len(&sub, out_len);
+}
+
 bool
 axl_json_get_int(const AxlJsonReader *ctx, const char *key, int64_t *value)
 {
@@ -1518,6 +1597,34 @@ axl_json_object_begin(const AxlJsonReader *r, const char *key,
 
     return axl_json_get_value(r, key, &sub)
            && axl_json_value_object_begin(&sub, iter);
+}
+
+bool
+axl_json_object_peek_key_len(const AxlJsonObjectIter *iter, size_t *out_len)
+{
+    const AxlJsonTok *tokens;
+    const AxlJsonTok *ktok;
+
+    /* The SAME exhaustion test axl_json_object_next() applies, deliberately
+       duplicated in condition rather than shared through a helper: the two
+       must agree about when the walk is over, or a `while (peek) { next(); }`
+       loop either spins past the end or drops the last pair. Kept adjacent so
+       a change to one is visibly a change to both. */
+    if (iter == NULL || out_len == NULL || iter->remaining <= 0) {
+        return false;
+    }
+    if (iter->pos + 1 >= iter->token_count) {
+        return false;
+    }
+
+    tokens = (const AxlJsonTok *)iter->tokens;
+    ktok   = &tokens[iter->pos];
+
+    /* iter->pos is the index of the NEXT key token and nothing here writes to
+       the iterator, which is what makes this a peek. */
+    return measure_decoded(iter->json + ktok->start,
+                           (size_t)(ktok->end - ktok->start),
+                           iter->utf8_mode, out_len);
 }
 
 bool

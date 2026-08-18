@@ -93,6 +93,49 @@ axl_mem_phys_region_at(
 );
 
 /**
+ * @brief Find the largest run of memory the firmware has not handed out.
+ *
+ * Reports the longest single range of `EfiConventionalMemory` in the UEFI
+ * memory map -- memory that exists, is ordinary RAM, and is owned by nobody.
+ *
+ * @par Why this is not axl_mem_phys_region_get
+ * The classified region view deliberately reports `EfiLoaderData`,
+ * `EfiBootServicesData` and `EfiConventionalMemory` all as
+ * @ref AXL_MEM_REGION_RAM, because for fault-safe access what matters is that
+ * a span *is* RAM. That is the wrong question here: this one asks what is
+ * FREE, which that view cannot answer.
+ *
+ * @par What it is for -- PLACING an allocation rather than accepting one
+ * `AllocatePages` offers no bottom-up search: every implementation satisfies
+ * `AllocateAnyPages` downward from high memory, which lands the caller in the
+ * middle of the firmware's own allocations with nothing free above. A caller
+ * that needs room to grow upward finds the big run with this, takes its LOW
+ * end with #axl_alloc_pages_at, and extends into the rest.
+ *
+ * Measured on OVMF: a 423 MiB free run on x64 and 326 MiB on aa64, both
+ * entirely unused, while `AllocateAnyPages` was returning pages from a
+ * congested stripe at the top of memory riddled with 4 KiB gaps.
+ *
+ * @par The result is a SNAPSHOT
+ * It is true when read and can be falsified by the next allocation --
+ * including the caller's own. Treat it as a hint for placement and check the
+ * #axl_alloc_pages_at that follows; do not cache it.
+ *
+ * PI's GCD (`AllocateMemorySpace` with `EfiGcdAllocateAnySearchBottomUp`)
+ * looks like it should do this and cannot: the DXE Core claims all of
+ * SystemMemory for itself at init, so GCD reports ZERO unallocated
+ * SystemMemory on both arches and the call returns `EFI_NOT_FOUND`.
+ *
+ * @return AXL_OK on success; AXL_ERR on a NULL pointer, a firmware-query
+ *     failure, or when no free run exists at all.
+ */
+int
+axl_mem_largest_free_run(
+    uint64_t *base,   ///< [out] physical start of the run (non-NULL)
+    size_t   *pages   ///< [out] length of the run in 4 KiB pages (non-NULL)
+);
+
+/**
  * @brief Number of regions in the (cached) physical region map.
  *
  * Regions are ordered by ascending base, non-overlapping, and adjacent
