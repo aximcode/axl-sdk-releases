@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=none needs= est=6 local-only=0
+# test-meta: arch=none needs= est=48 local-only=0
 # test-install-concurrent.sh — two install.sh runs do not build into one tree
 # at the same time.
 #

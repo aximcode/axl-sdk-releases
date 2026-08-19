@@ -904,11 +904,11 @@ axl_json_get_string(
  * axl_json_get_string() will write. It cannot be computed from the source
  * span: `\uXXXX` shrinks six bytes to between one and four, a surrogate PAIR
  * shrinks twelve to four, and JSON5's `\0` GROWS two bytes to the three of
- * U+FFFD. Deriving it from axl_json_decode_string()'s documented `len * 3 / 2
- * + 1` worst case is safe but not exact, and — the part that matters — that
- * helper does not know the reader's UTF-8 mode, so a caller sizing from it and
- * decoding with it would produce a DIFFERENT string from the one this reader
- * hands back. One document must not have two answers to what a string says.
+ * U+FFFD. Deriving it from the `len * 3 / 2 + 1` worst case that
+ * axl_json_decode_string() documents is safe but not exact, and — the part
+ * that matters — that helper does not know the reader's UTF-8 mode, so a
+ * caller sizing from it and decoding with it would produce a DIFFERENT string
+ * from the one this reader hands back. One document must not have two answers to what a string says.
  *
  * The cost is a decode pass that measures instead of storing. Pair it with
  * axl_json_get_string() and the string is decoded twice; that is the price of

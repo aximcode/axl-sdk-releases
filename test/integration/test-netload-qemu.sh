@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=130 local-only=0
+# test-meta: arch=both needs= est=93 local-only=0
 # test-netload-qemu.sh — netload tool: scaffold, NVRAM state machine, driver
 # discovery, and the crash-recovery quarantine flow. Real driver-load/link/DHCP
 # is HW-validated, not covered here (no NIC drivers in QEMU).

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=25 local-only=0
+# test-meta: arch=both needs= est=20 local-only=0
 # test-no-gpu-qemu.sh — run-qemu.sh --no-gpu gives the guest NO graphics
 # adapter, so OVMF exposes no GOP and axl_gfx_available() is false.
 #

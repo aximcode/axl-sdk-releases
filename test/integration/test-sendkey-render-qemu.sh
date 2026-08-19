@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=gpu est=90 local-only=1
+# test-meta: arch=x64 needs=gpu est=21 local-only=1
 # test-sendkey-render-qemu.sh — the CAPTURE must reflect every injected key.
 #
 # The sibling test (test-sendkey-load-qemu.sh) asks "did the key arrive". This

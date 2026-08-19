@@ -41,6 +41,103 @@ log_warning() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 # --------------------------------------------------------------------------
+# axl_warn_stale_sdk_prefix — report a staged SDK that nothing refreshes
+#
+#   axl_warn_stale_sdk_prefix <installed-prefix> <sdk-source-root>
+#
+# A staged SDK left at a location that is no longer anyone's --prefix does not
+# go away and does not get updated; it just keeps serving whatever build it was
+# when it was written. Two such locations exist, both historical defaults:
+#
+#   <root>/out   the pre-O1 default, before O1 moved it to ./stage
+#   <root>       `install.sh --prefix .`, from before ./out was the default
+#
+# The second is the dangerous one, because scripts/axl-cc resolves SDK_DIR to
+# the repo root: leftovers there make the source script behave like a staged
+# driver and answer for the version it was installed at. Reported from a
+# consumer build against the dev tip, where `scripts/axl-cc --version` said
+# 2.8.7 (2026-07-08) inside a checkout that had just staged 4.2.0 -- and the
+# four leftover paths are gitignored by name, so `git status` showed clean
+# throughout. That corrupts a MEASUREMENT rather than a build: it compiles,
+# links, boots and passes, against a library six weeks old.
+#
+# WARNED, NOT DELETED, and the asymmetry with the compat/ removal in install.sh
+# is deliberate: compat/ sits inside the prefix that run owns and is its to
+# clean, whereas both of these are directories the invocation was not asked to
+# touch. Removing files outside your own --prefix is a surprise nobody asked
+# for.
+#
+# The removal advice differs per candidate and that is load-bearing. At the
+# source root, `share/` and `include/` hold TRACKED SOURCES (share/*.json5,
+# include/axl/*.h), so the ./out message's `{bin,lib,include,share}` brace
+# expansion would delete the tree it is trying to protect.
+# --------------------------------------------------------------------------
+
+# _axl_abs_path — canonical form, so two spellings of one directory compare
+# equal. `install.sh --prefix .` is a deliberate in-tree install and must not
+# be warned about, but PREFIX arrives from the command line verbatim and is
+# never normalised, so a literal `!=` compares "." against an absolute path.
+_axl_abs_path() {
+    if [[ -d "$1" ]]; then
+        ( cd -P "$1" 2>/dev/null && pwd -P ) || printf '%s\n' "${1%/}"
+    else
+        printf '%s\n' "${1%/}"
+    fi
+}
+
+# _axl_staged_sdk_version — the version a staged SDK at <dir> would serve, or
+# rc 1 if <dir> does not look like one.
+#
+# Three signals, any one of which is enough, because a HALF-cleaned prefix
+# still lies. The reported failure came through scripts/axl-cc, which reads
+# share/axl/version and links against lib/axl/<arch> and never looks at
+# bin/axl-cc -- so keying on the driver alone (as the original ./out check did)
+# misses a tree that has lost its bin/ and kept its answer.
+_axl_staged_sdk_version() {
+    local d="$1"
+    [[ -f "$d/share/axl/version" || -d "$d/lib/axl" || -x "$d/bin/axl-cc" ]] \
+        || return 1
+    local v
+    v="$(cat "$d/share/axl/version" 2>/dev/null)" || v=""
+    printf '%s\n' "${v:-unknown}"
+}
+
+axl_warn_stale_sdk_prefix() {
+    local prefix_abs root_abs old_abs ver
+    prefix_abs="$(_axl_abs_path "$1")"
+    root_abs="$(_axl_abs_path "$2")"
+    old_abs="$root_abs/out"
+
+    if [[ "$prefix_abs" != "$root_abs" ]] && ver="$(_axl_staged_sdk_version "$root_abs")"; then
+        log_warning "a staged SDK (version $ver) is sitting IN THE SOURCE TREE at $root_abs."
+        log_warning "Nothing refreshes it now, and scripts/axl-cc resolves its SDK root"
+        log_warning "there -- so it answers for that build, not for this checkout."
+        # -e, not -d: in a git WORKTREE .git is a file, and this tree uses
+        # worktrees. Testing for a directory sends worktree users down the
+        # tarball branch -- still correct advice, just not the tidier one.
+        if [[ -e "$root_abs/.git" ]]; then
+            # Those four paths are gitignored by name, so -X removes exactly
+            # them; nothing tracked is reachable by this command. Carries its
+            # own cd: the reader is not necessarily standing in the tree being
+            # named, and these are relative pathspecs.
+            log_warning "Remove it with: cd $root_abs && git clean -Xdf -- bin lib include/axl-sdk share/axl"
+        else
+            # A source tarball has no .git. Name the paths -- and name them
+            # SUFFIXED, since include/ and share/ hold sources of their own.
+            log_warning "Remove it with: rm -rf $root_abs/bin $root_abs/lib $root_abs/include/axl-sdk $root_abs/share/axl"
+        fi
+    fi
+
+    if [[ "$prefix_abs" != "$old_abs" ]] && ver="$(_axl_staged_sdk_version "$old_abs")"; then
+        log_warning "a staged SDK (version $ver) remains at $old_abs (the pre-O1 default)."
+        log_warning "Nothing refreshes it now -- it will go stale silently."
+        # Safe here where it is not one level up: out/ holds build trees and
+        # Sphinx output, never sources.
+        log_warning "Remove it with: rm -rf $old_abs/{bin,lib,include,share}"
+    fi
+}
+
+# --------------------------------------------------------------------------
 # arch_dir — map EDK2 arch name to image directory name
 # --------------------------------------------------------------------------
 

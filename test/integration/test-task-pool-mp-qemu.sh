@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=30 local-only=0
+# test-meta: arch=both needs= est=24 local-only=0
 # test-task-pool-mp-qemu.sh — multi-core AxlTaskPool race regression.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet). The

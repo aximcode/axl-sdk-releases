@@ -74,10 +74,61 @@ esac
 # they invoked.
 AXL_PROG="${AXL_CC_PROGNAME:-$(basename "$0")}"
 
+# SDK_DIR is derived, not verified, and in one layout the derivation is
+# meaningless: run as scripts/axl-cc from a checkout it resolves to the repo
+# root, which is not an install prefix. That used to surface only as the
+# "no SDK libraries" failure below -- incidental, and only on a CLEAN tree. A
+# tree that was ever installed in-tree (`install.sh --prefix .`, the default
+# before ./out) still has bin/ lib/ share/axl/ sitting there, all gitignored
+# by name, and then nothing fails: the source script serves the leftovers and
+# reports THEIR version. Measured downstream at "axl-cc 2.8.7 (built
+# 2026-07-08)" inside a checkout that had just staged 4.2.0.
+#
+# So refuse by name instead of resolving against whatever is lying around.
+# Checked BOTH ways: living in a directory called scripts/ AND next to a
+# Makefile and a src/. Neither alone is enough -- /usr/src exists on most
+# systems, and an SDK installed to /usr would otherwise refuse to run.
+axl_cc_in_source_tree() {
+    [[ "${SCRIPT_DIR##*/}" == "scripts" ]] &&
+    [[ -d "$SDK_DIR/src" ]] && [[ -f "$SDK_DIR/Makefile" ]]
+}
+
+axl_cc_refuse_source_tree() {
+    echo "ERROR: this is the SOURCE copy of $AXL_PROG. It resolves its SDK" >&2
+    echo "       root to $SDK_DIR," >&2
+    echo "       which is a checkout, not an install prefix -- so it has no" >&2
+    echo "       SDK to answer for, and anything it does find there came from" >&2
+    echo "       an old in-tree install rather than from this tree." >&2
+    echo "       Stage one, then run the staged driver:" >&2
+    echo "         $SDK_DIR/scripts/install.sh --arch $ARCH" >&2
+    echo "         $SDK_DIR/stage/bin/$AXL_PROG ..." >&2
+    echo "       (If this DID work here before, an old \`install.sh --prefix .\`" >&2
+    echo "        left bin/ lib/ share/axl/ behind and you were building" >&2
+    echo "        against those; install.sh names them and how to remove them.)" >&2
+    exit 1
+}
+
 ARCH="x64"
 TYPE="app"
 BUILD="release"
 RUNTIME="full"
+# `-u SYMBOL` pairs added by --minimal-runtime=FEATURES. Empty otherwise.
+RUNTIME_FORCE=()
+# The log engine is opt-in AT LINK TIME: axl_log_full / axl_log are trampolines
+# that forward to a WEAK _axl_log_vdispatch, so without this `-u` an image
+# links the emitters and discards every record. Every ordinary link takes it;
+# --minimal-runtime is the one that does not, and says so with `log` / `nolog`.
+# Mirrors $(LOG_ENGINE_PULL) in the Makefile.
+LOG_ENGINE_SYM="_axl_log_vdispatch"
+# "" = the caller has not said; "log" / "nolog" = they have. Only consulted
+# under --minimal-runtime; every other link pulls the engine unconditionally.
+LOG_CHOICE=""
+# Same shape for argv: "" = unsaid, "args" / "noargs" = said. Recorded rather
+# than turned straight into a `-u` because the check below has to tell "said
+# noargs" from "said nothing" -- they mean the same thing to the linker and
+# opposite things to the reader.
+ARGS_CHOICE=""
+ARGS_SYM="_axl_args_init"
 ENTRY=""
 OUTPUT=""
 VERBOSE=false
@@ -151,6 +202,39 @@ while [[ $# -gt 0 ]]; do
         --debug)    BUILD="debug"; shift ;;
         --release)  BUILD="release"; shift ;;
         --minimal-runtime) RUNTIME="minimal"; shift ;;
+        --minimal-runtime=*)
+            RUNTIME="minimal"
+            # Comma list of features to opt BACK IN. Each becomes a `-u` at
+            # link time, which pulls the archive member that defines the
+            # symbol and so resolves the CRT0's weak reference to it.
+            _feat="${1#*=}"
+            IFS=',' read -r -a _feats <<< "$_feat"
+            for _f in "${_feats[@]}"; do
+                case "$_f" in
+                    stdio) RUNTIME_FORCE+=("-u" "axl_stream_init") ;;
+                    # log/nolog and args/noargs are recorded rather than
+                    # appended, because each pair is two answers to ONE
+                    # question and the checks below have to tell "said no"
+                    # from "said nothing".
+                    log|nolog)
+                        if [[ -n "$LOG_CHOICE" && "$LOG_CHOICE" != "$_f" ]]; then
+                            echo "ERROR: --minimal-runtime: 'log' and 'nolog' contradict each other." >&2
+                            exit 1
+                        fi
+                        LOG_CHOICE="$_f" ;;
+                    args|noargs)
+                        if [[ -n "$ARGS_CHOICE" && "$ARGS_CHOICE" != "$_f" ]]; then
+                            echo "ERROR: --minimal-runtime: 'args' and 'noargs' contradict each other." >&2
+                            exit 1
+                        fi
+                        ARGS_CHOICE="$_f" ;;
+                    "")    ;;
+                    *) echo "ERROR: unknown --minimal-runtime feature '$_f'." >&2
+                       echo "  Known: stdio, args, noargs, log, nolog (comma-separated)." >&2
+                       exit 1 ;;
+                esac
+            done
+            shift ;;
         --embed)    EMBEDS+=("$2"); shift 2 ;;
         --service)  SERVICE_NAME="$2"; shift 2 ;;
         --hosted)
@@ -200,6 +284,12 @@ while [[ $# -gt 0 ]]; do
         -MF|-MT|-MQ)
             CFLAGS_EXTRA+=("$1" "$2"); shift 2 ;;
         --version)
+            # Refused rather than answered "unknown": this is the call that
+            # lied. On a dirty checkout it printed a six-week-old version and
+            # exited 0; on a clean one it prints "unknown" and exits 0. Both
+            # are silent, and the first is the one that gets pasted into a
+            # report as evidence of which library was measured.
+            axl_cc_in_source_tree && axl_cc_refuse_source_tree
             VER=$(cat "$SDK_DIR/share/axl/version" 2>/dev/null || echo "unknown")
             DATE=$(cat "$SDK_DIR/share/axl/build-date" 2>/dev/null || echo "unknown")
             echo "$AXL_PROG $VER (gcc, built $DATE)"
@@ -252,9 +342,28 @@ Options:
   --entry NAME          Custom entry point for drivers
   --debug               Debug build (-Og, DWARF, leak tracking)
   --release             Release build (-Os, DWARF, no leak tracking) [default]
-  --minimal-runtime     Link against axl-crt0-minimal.o (no registry,
-                        no atexit, no signal notify, no default loop).
-                        App-type only. See docs/AXL-Lifecycle.md §10.4.
+  --minimal-runtime[=FEATURES]
+                        Link axl-crt0-minimal.o: firmware globals, main,
+                        exit status, and NOTHING else. App-type only.
+                        FEATURES is a comma list opting pieces back in:
+                          stdio   force the stream layer in (it also
+                                  self-initialises whenever the app
+                                  references axl_printf and friends)
+                          args    give main() its argc/argv
+                          noargs  confirm main() does not need them
+                          log     link the log engine, so axl_error and
+                                  friends emit (every other build shape
+                                  links it by default)
+                          nolog   confirm you want them to no-op, and
+                                  keep the ~6 KB
+                        `--minimal-runtime=stdio,args` is the behaviour
+                        this flag had before it was made truly minimal.
+                        An app that calls a log macro must say `log` or
+                        `nolog`, and one whose main() takes parameters
+                        must say `args` or `noargs`: silence is a fine
+                        answer, but not one this driver will assume on
+                        your behalf. main(void) needs neither.
+                        See docs/AXL-Lifecycle.md §10.4.
   --embed PATH[=NAME]   Embed an arbitrary binary blob (driver .efi,
                         CA bundle, static config, anything) into the
                         output. Generates the .incbin sidecar and
@@ -446,7 +555,23 @@ if [[ -n "$SERVICE_NAME" ]]; then
     fi
     fwd=("--arch" "$ARCH")
     [[ "$BUILD"   == "debug" ]]   && fwd+=("--debug")
-    [[ "$RUNTIME" == "minimal" ]] && fwd+=("--minimal-runtime")
+    if [[ "$RUNTIME" == "minimal" ]]; then
+        # Forward the FEATURES too, or the sub-build silently loses them and
+        # produces an image whose main() gets no argv.
+        _ff=""
+        for _i in "${RUNTIME_FORCE[@]:-}"; do
+            case "$_i" in
+                axl_stream_init) _ff="${_ff:+$_ff,}stdio" ;;
+            esac
+        done
+        # The log and argv answers too: without them the sub-build re-derives
+        # each from the sub-build's OWN objects and can reach a different
+        # verdict -- or, for `nolog`/`noargs`, hit a check this driver has
+        # already satisfied.
+        [[ -n "$LOG_CHOICE"  ]] && _ff="${_ff:+$_ff,}$LOG_CHOICE"
+        [[ -n "$ARGS_CHOICE" ]] && _ff="${_ff:+$_ff,}$ARGS_CHOICE"
+        fwd+=("--minimal-runtime${_ff:+=$_ff}")
+    fi
     [[ "$VERBOSE" == "true" ]]    && fwd+=("--verbose")
     [[ "$NO_EH_FRAME" == "true" ]] && fwd+=("--no-eh-frame")
     # --hosted must survive the re-invocation, or `--service NAME --hosted`
@@ -534,10 +659,6 @@ if [[ -z "$OUTPUT" ]]; then
 fi
 
 LIB_DIR="$SDK_DIR/lib/axl/$ARCH"
-if [[ ! -d "$LIB_DIR" ]]; then
-    echo "ERROR: no SDK libraries for arch '$ARCH' in $LIB_DIR" >&2
-    exit 1
-fi
 
 # Image type → entry + CRT0
 case "$TYPE" in
@@ -836,6 +957,25 @@ if [[ "$HAS_C" == "true" || ${#EMBEDS[@]} -gt 0 ]] \
     fi
     echo "       C is compiled bare-metal on both arches so a build uses no" >&2
     echo "       host headers; see docs/AXL-Libc-Substrate-Design.md." >&2
+    rm -rf "$TMPDIR"
+    exit 1
+fi
+
+# AFTER the toolchain refusal above, deliberately. These checks used to run
+# ~300 lines earlier, which meant `AXL_TOOLCHAIN=cross` with a forgotten
+# locator reported "no SDK libraries" instead of naming the variable that was
+# unset -- the less useful of the two answers, for the mistake most likely to
+# produce it. A missing locator is a configuration error the user can act on,
+# and saying the rest second costs nothing.
+#
+# "Running the source script rather than an installed one" used to be a guess
+# this comment made about a missing lib dir. It is now checked directly, and
+# first, because the two are not the same condition: a checkout with leftover
+# in-tree install artifacts HAS a lib dir and is still the wrong SDK.
+axl_cc_in_source_tree && axl_cc_refuse_source_tree
+
+if [[ ! -d "$LIB_DIR" ]]; then
+    echo "ERROR: no SDK libraries for arch '$ARCH' in $LIB_DIR" >&2
     rm -rf "$TMPDIR"
     exit 1
 fi
@@ -1208,8 +1348,18 @@ SO_FILE="$TMPDIR/output.so"
 # undefined `operator new` that named no flag.
 _link_objs=(${OBJS[@]+"${OBJS[@]}"} ${PREBUILT_OBJS[@]+"${PREBUILT_OBJS[@]}"})
 _link_undef=""
+# Whether the scan actually RAN, which is not the same question as whether it
+# found anything. CXX_LINK below can treat an unreadable object as "not C++"
+# and still fail loudly at the link -- an undefined `operator new` names
+# itself. The log check cannot: there, "could not look" and "nothing logs"
+# both read as an empty scan, and guessing wrong produces a SILENT image. So
+# the two answers are kept apart.
+_link_undef_ok=true
 if [[ ${#_link_objs[@]} -gt 0 ]]; then
-    _link_undef="$("${NM_BIN:-nm}" -u "${_link_objs[@]}" 2>/dev/null || true)"
+    if ! _link_undef="$("${NM_BIN:-nm}" -u "${_link_objs[@]}" 2>/dev/null)"; then
+        _link_undef=""
+        _link_undef_ok=false
+    fi
 fi
 # Itanium-mangled or __cxa_* undefined symbols mean a C++ translation unit is
 # in this link. `_Z` covers operator new/delete and every std:: reference;
@@ -1218,6 +1368,163 @@ CXX_LINK="false"
 if printf '%s\n' "$_link_undef" | grep -q "^ *U _Z\|^ *U __cxa_\| _Z\| __cxa_"; then
     CXX_LINK="true"
 fi
+# THE LOG ENGINE, decided from the same nm pass.
+#
+# axl_log_full / axl_log are trampolines over a WEAK _axl_log_vdispatch
+# (src/log/axl-log-dispatch.h), so the engine -- and with it the printf engine,
+# the console renderer and the handler table, ~6 KB on x64 -- lands in an image
+# only if the link asks. Every shape except --minimal-runtime asks by default,
+# which is what keeps ordinary images behaving exactly as before.
+#
+# For --minimal-runtime the answer has to come from the caller, and the failure
+# mode if it does not is the one worth spending an error on: an app calls
+# axl_error(), the record goes nowhere, and nothing anywhere says so. So if the
+# CALLER'S OWN objects reference an emitter and the caller named neither `log`
+# nor `nolog`, refuse the link. libaxl's own internal logging is deliberately
+# NOT a trigger -- silencing that is exactly what the flag is for.
+LOG_ENGINE_ARGS=()
+if [[ "$RUNTIME" != "minimal" || "$LOG_CHOICE" == "log" ]]; then
+    LOG_ENGINE_ARGS=("-u" "$LOG_ENGINE_SYM")
+elif [[ -z "$LOG_CHOICE" && "$_link_undef_ok" != "true" ]]; then
+    echo "ERROR: --minimal-runtime: cannot tell whether this app logs." >&2
+    echo "" >&2
+    echo "  '${NM_BIN:-nm}' could not read the objects going into this link," >&2
+    echo "  so the check that would have told you whether axl_error and" >&2
+    echo "  friends are about to become no-ops could not run. Guessing here" >&2
+    echo "  risks shipping an image that silently logs nothing, so say which" >&2
+    echo "  you meant instead:" >&2
+    echo "" >&2
+    echo "    --minimal-runtime=log     link the engine" >&2
+    echo "    --minimal-runtime=nolog   let the calls no-op" >&2
+    rm -rf "$TMPDIR"
+    exit 1
+elif [[ -z "$LOG_CHOICE" ]] && \
+     printf '%s\n' "$_link_undef" | grep -qE 'U (axl_log|axl_log_full)$'; then
+    echo "ERROR: --minimal-runtime drops the log engine, and this app logs." >&2
+    echo "" >&2
+    echo "  Your objects reference axl_log_full/axl_log (that is what" >&2
+    echo "  axl_error/axl_warning/axl_info/axl_debug/axl_trace expand to)." >&2
+    echo "  Under --minimal-runtime those calls no-op unless the engine is" >&2
+    echo "  linked, so say which you meant:" >&2
+    echo "" >&2
+    echo "    --minimal-runtime=log     emit them (costs ~6 KB)" >&2
+    echo "    --minimal-runtime=nolog   let them no-op, and keep the bytes" >&2
+    echo "" >&2
+    echo "  Combine with other features as usual, e.g." >&2
+    echo "  --minimal-runtime=stdio,args,nolog." >&2
+    rm -rf "$TMPDIR"
+    exit 1
+fi
+
+# ARGV, decided from DWARF because nm cannot answer it.
+#
+# Same doctrine as the log check above, different instrument. Calling
+# axl_error() leaves an undefined axl_log_full in the caller's object, so `nm`
+# settles that one. argv leaves NO symbol -- it arrives in registers, and
+# `main(void)` and `main(int, char **)` are one name with one linkage. So the
+# reading is main's DW_TAG_formal_parameter children, which are there because
+# -g -gdwarf is on in DEBUG *and* RELEASE.
+#
+# WHAT THE FAILURE LOOKS LIKE. `--minimal-runtime` links axl-crt0-minimal.o,
+# whose reference to _axl_args_init is WEAK: unresolved, it is NULL, the CRT0
+# skips the call and main gets argc=0/argv=NULL. No link error, no warning --
+# an argv-reading program that simply sees no arguments.
+#
+# WHY IT IS WORTH A REFUSAL EVEN THOUGH IT DOES NOT HAPPEN TODAY. Measured on
+# this tip, a bare --minimal-runtime app DOES receive argv: axl-cxxrt-stubs.o
+# is on every link (the porting layer travels with the C library), it strongly
+# references axl_file_info, and that drags axl-fs.o -> axl-driver.o ->
+# axl-app.o, which defines _axl_args_init. So the weak reference binds by
+# accident, through an edge that has nothing to do with argv. That is a
+# coincidence to be spent, not a guarantee: the day that edge moves, every
+# bare --minimal-runtime image starts seeing an empty argv and nothing says so.
+# Asking now turns the accident into a declaration.
+# Only ASKED under --minimal-runtime with no answer given -- every other shape
+# links argv unconditionally and never reads this. The scan is not free: it
+# dumps the DWARF of every object AND every archive on the command line
+# (measured at ~1.1M lines / 0.6s for one 16 MB .a), which is pure waste on the
+# ordinary link that will not consult the result.
+_main_argv="unknown"     # unknown | void | takes
+if [[ "$RUNTIME" == "minimal" && -z "$ARGS_CHOICE" && ${#_link_objs[@]} -gt 0 ]]; then
+    # A STACK, not one frame. C++ nests DW_TAG_subprogram DIEs -- a lambda's
+    # operator() and a local class's member function live INSIDE main's DIE --
+    # so a reader holding a single frame loses main's identity the moment it
+    # descends and reports `unknown` for a main it is looking straight at. That
+    # made every C++ app using a lambda fail this check; no C fixture can reach
+    # it.
+    #
+    # Reports the MAX params across every non-declaration `main` frame, so a
+    # prototype DIE beside the definition cannot mask the definition's
+    # parameters. Parameters are counted only at sdepth+1, so a nested
+    # function's parameters are never attributed to main.
+    _main_argv="$(${CROSS}objdump --dwarf=info "${_link_objs[@]}" 2>/dev/null | awk '
+        function popto(d) {
+            while (sp > 0 && d <= sdepth[sp]) {
+                if (smain[sp] && !sdecl[sp]) {
+                    found = 1; if (sparams[sp] > best) best = sparams[sp]
+                }
+                sp--
+            }
+        }
+        /^ <[0-9]+><[0-9a-f]+>:/ {
+            d = $0; sub(/^ </, "", d); sub(/>.*/, "", d); d += 0
+            t = $0; sub(/.*\(DW_TAG_/, "", t); sub(/\).*/, "", t)
+            popto(d); cursub = 0
+            if (t == "subprogram") {
+                sp++; sdepth[sp] = d; smain[sp] = 0; sdecl[sp] = 0; sparams[sp] = 0
+                cursub = 1
+            } else if (sp > 0 && t == "formal_parameter" && d == sdepth[sp] + 1) {
+                sparams[sp]++
+            }
+            next
+        }
+        # Guarded on cursub so the attributes of a nested DIE cannot be read as
+        # the enclosing subprogram s -- a variable named "main" is not a main.
+        cursub && /DW_AT_name/        && $NF == "main" { smain[sp] = 1 }
+        cursub && /DW_AT_declaration/                  { sdecl[sp] = 1 }
+        END { popto(0); print found ? (best > 0 ? "takes" : "void") : "unknown" }
+    ')"
+    [[ -n "$_main_argv" ]] || _main_argv="unknown"
+fi
+
+ARGS_ENGINE_ARGS=()
+if [[ "$RUNTIME" != "minimal" || "$ARGS_CHOICE" == "args" ]]; then
+    ARGS_ENGINE_ARGS=("-u" "$ARGS_SYM")
+elif [[ "$ARGS_CHOICE" == "noargs" ]]; then
+    :   # said, and said no. Nothing to force and nothing to ask.
+elif [[ "$_main_argv" == "unknown" ]]; then
+    echo "ERROR: --minimal-runtime: cannot tell whether this app reads argv." >&2
+    echo "" >&2
+    echo "  main's parameters are read from DWARF, and none of the objects" >&2
+    echo "  going into this link carry a readable 'main' -- a prebuilt object" >&2
+    echo "  compiled without -g, or no main here at all. 'could not look' and" >&2
+    echo "  'main takes no arguments' are the same empty answer, and guessing" >&2
+    echo "  wrong ships an image whose argv is silently empty. So say which" >&2
+    echo "  you meant:" >&2
+    echo "" >&2
+    echo "    --minimal-runtime=args     give main() its argc/argv" >&2
+    echo "    --minimal-runtime=noargs   confirm it does not need them" >&2
+    rm -rf "$TMPDIR"
+    exit 1
+elif [[ "$_main_argv" == "takes" ]]; then
+    echo "ERROR: --minimal-runtime does not give main() argv, and this main" >&2
+    echo "       takes it." >&2
+    echo "" >&2
+    echo "  Your main is declared with parameters, and --minimal-runtime links" >&2
+    echo "  a CRT0 whose reference to the argv setup is weak: unresolved, main" >&2
+    echo "  is called with argc=0 and argv=NULL. There is no link error for" >&2
+    echo "  that -- the program just sees no arguments -- so say which you" >&2
+    echo "  meant:" >&2
+    echo "" >&2
+    echo "    --minimal-runtime=args     give main() its argc/argv" >&2
+    echo "    --minimal-runtime=noargs   ignore them, and keep the bytes" >&2
+    echo "" >&2
+    echo "  Combine with other features as usual, e.g." >&2
+    echo "  --minimal-runtime=stdio,args,nolog." >&2
+    rm -rf "$TMPDIR"
+    exit 1
+fi
+
 # A .cpp on THIS command line settles it without consulting nm. Folded in here
 # rather than tested alongside CXX_LINK at each use, so there is ONE answer to
 # "is this a C++ link" — the two were spelled `HAS_CPP || CXX_LINK` at three
@@ -1438,6 +1745,9 @@ run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
     -T "$LINK_LDS" \
     ${VERSION_SCRIPT_ARGS[@]+"${VERSION_SCRIPT_ARGS[@]}"} \
     ${LDFLAGS_EXTRA[@]+"${LDFLAGS_EXTRA[@]}"} \
+    ${RUNTIME_FORCE[@]+"${RUNTIME_FORCE[@]}"} \
+    ${LOG_ENGINE_ARGS[@]+"${LOG_ENGINE_ARGS[@]}"} \
+    ${ARGS_ENGINE_ARGS[@]+"${ARGS_ENGINE_ARGS[@]}"} \
     ${LDFLAGS_USER[@]+"${LDFLAGS_USER[@]}"} \
     -o "$SO_FILE" \
     $CRT0_OBJS \
@@ -1556,10 +1866,16 @@ elif [[ "$_ctor_lo" != "$_ctor_hi" ]]; then
     rm -f "$OUTPUT" "${OUTPUT%.efi}.so"; rm -rf "$TMPDIR"; exit 1
 fi
 
+# --strip-all: objcopy's ELF->PE writes a COFF symbol table the firmware never
+# reads -- ~20% of a small image. Symbols stay in the .so beside it, which is
+# what pe-set-debug points the PE debug directory at. Must match the Makefile's
+# OBJCOPY_STRIP; `make check-pe-stripped` reads the produced image to catch a
+# path that drifts.
 run_cmd ${CROSS}objcopy \
     -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
     -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir \
     -j .eh_frame -j .gcc_except_table \
+    --strip-all \
     --output-target="$PE_TARGET" --subsystem=$SUBSYSTEM \
     "$SO_FILE" "$OUTPUT" || { echo "ERROR: objcopy failed" >&2; rm -rf "$TMPDIR"; exit 1; }
 

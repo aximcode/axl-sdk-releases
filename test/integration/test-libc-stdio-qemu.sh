@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=110
+# test-meta: arch=both needs= est=28
 # test-libc-stdio-qemu.sh — newlib's stdio runs on AxlStream.
 #
 # P2 of AXL-Libc-Substrate-Design.md §4d/§4c.1. newlib defines NONE of the

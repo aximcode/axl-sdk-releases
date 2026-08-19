@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=170 local-only=0
+# test-meta: arch=both needs= est=38 local-only=0
 # test-cxx-exceptions-qemu.sh — real try/catch under UEFI, and the price a C
 # image does NOT pay for it.
 #

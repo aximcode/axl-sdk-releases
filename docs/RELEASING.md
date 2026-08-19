@@ -32,7 +32,7 @@ gate is the full suite run locally**, which is fast in parallel:
 
 ```sh
 make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
-./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 0 failures required
+./test/integration/run-integration.sh --no-cache -j"$(nproc)"   # 0 failures required
 scripts/lint.sh                                        # clang-tidy exactly as CI runs it
 ```
 
@@ -48,6 +48,13 @@ scripts/cut-release.sh X.Y.Z --force-ci # --ci-gate, and dispatch even if the st
 ```
 
 **`--ci-gate` no longer always dispatches.** A clean, COMPLETE
+**`--no-cache` is required for a release gate, not optional.** Caching is on by
+default (it skips a test whose inputs are byte-identical to its last green run),
+and a cached run deliberately refuses to write the stamp — it skipped tests on
+the strength of their inputs looking unchanged, which is the right answer for an
+inner loop and the wrong one for certifying a tree. `cut-release.sh` says so if
+it finds no stamp.
+
 `run-integration.sh` writes `test/integration/.last-run-stamp` (gitignored —
 it describes one machine's run, not a property of the tree). If that stamp
 covers the release commit, `--ci-gate` is satisfied without dispatching
@@ -81,74 +88,79 @@ longer re-runs it. `--ci-gate` makes the cut dispatch CI on `main` and wait for 
 before tagging. The `--ci` flag on the runner excludes the `local-only` tests CI
 runners can't execute (patched-QEMU SMBus, usb-mouse pointer) — that's what CI runs.
 
-### Registering the self-hosted runner (optional, and why you would)
-
-Only relevant when you actually want CI to run — a major tag, a toolchain
-bump, or `--force-ci`. A normal cut skips CI entirely via the stamp above, so
-none of this is on the critical path for a release.
-
-**Why:** `run-integration.sh` picks `nproc - 2` workers. A GitHub-hosted runner
-has 2 cores, so that evaluates to **one** worker and the QEMU job takes ~50
-minutes. The same unchanged line gives **six** on an 8-core workstation, for
-~9 minutes and zero Actions minutes. Nothing in the repo needs to change to get
-that — only where the job runs. See `AXL-CI-Release-Speed-Design.md` §10.
-
-**Register it** (once per machine; the org's `Default` runner group has
-`visibility=all`, so one registration serves axl-sdk and its consumers):
+### Before a tag: check docs at CI's doxygen version
 
 ```sh
-# 1. Get a registration token (expires in an hour).
-gh api -X POST /orgs/aximcode/actions/runners/registration-token --jq .token
+scripts/build-docs.sh --ci-doxygen    # runs CI's doxygen in a container
+```
 
-# 2. Install the runner under a directory of its own.
+`docs.yml` fires on **every** `v*` tag and a tag cannot be re-cut, so this is
+the one gate worth running that the normal `verify.sh` cannot substitute for.
+A dev box's doxygen is newer than the `ubuntu-latest` apt package CI installs,
+and it ACCEPTS markup the older one rejects — so a locally-clean docs gate is
+not evidence. That skew shipped broken docs twice: v3.2.0 and v4.2.0.
+
+### Registering a self-hosted runner (any dev host)
+
+Jobs run in a **container** (`ubuntu:24.04`, CI's own image), so a runner host
+needs Docker and KVM — **not** the AXL toolchain. That is what makes this
+portable: any machine you develop on can become the runner, and a second one
+can join without displacing the first.
+
+**Prerequisites**
+
+```sh
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo dnf remove podman-docker            # it owns /usr/bin/docker; docker-ce-cli must
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$(id -un)"      # log out/in, or use `sg docker`
+```
+
+**Docker, not podman**, and the reason is not preference. The Actions runner
+drives the Docker CLI and API; podman's compat socket runs container jobs but
+**will not create a missing bind-mount source**, and the runner only populates
+`_work/_actions` for a job that uses an action — so any job without a `uses:`
+step fails to start a container. Details in
+`AXL-CI-Release-Speed-Design.md` §11.4.
+
+**Register** (once per machine; the org's `Default` runner group is
+`visibility=all`, so one registration serves every repo):
+
+```sh
 mkdir -p ~/actions-runner && cd ~/actions-runner
 curl -fsSLO https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
 tar xzf actions-runner-linux-x64.tar.gz
 
-# 3. Configure. The `axl-qemu` LABEL is what ci.yml selects on — the name is
-#    free, the label is not.
 ./config.sh --url https://github.com/aximcode \
-            --token <TOKEN> \
+            --token "$(gh api -X POST /orgs/aximcode/actions/runners/registration-token --jq .token)" \
+            --name "axl-qemu-$(hostname -s)" \
             --labels axl-qemu \
-            --unattended
+            --unattended --replace
 
-# 4. Run it as a service so it survives a logout.
-sudo ./svc.sh install && sudo ./svc.sh start && sudo ./svc.sh status
+sudo ./svc.sh install "$(id -un)" && sudo ./svc.sh start
 ```
 
-Confirm GitHub can see it — this is the check that distinguishes "registered"
-from "online", and a job targeting an offline runner queues rather than fails:
+The **label** `axl-qemu` is what the workflow selects on; the **name** only has
+to be unique, which is why it carries the hostname. Register several hosts with
+the same label and GitHub sends each job to whichever is idle.
+
+**Confirm it is ONLINE, not merely registered** — a job targeting a label whose
+runners are all offline queues rather than failing:
 
 ```sh
 gh api /orgs/aximcode/actions/runners \
-  --jq '.runners[] | {name, status, labels: [.labels[].name]}'
+  --jq '.runners[] | {name, status, busy, labels: [.labels[].name]}'
 ```
 
-**Then use it.** The QEMU job takes a `runner` input, defaulting to `hosted`:
+**Decommissioning matters.** A retired machine left registered is a runner that
+is permanently offline; if it is the only one, jobs queue forever. From the
+host: `sudo ./svc.sh stop && sudo ./svc.sh uninstall && ./config.sh remove
+--token <removal-token>`. Or delete it in the org's runner settings.
 
-```sh
-gh workflow run ci.yml --ref main -f runner=self-hosted
-```
-
-Once you trust it, flip the input's `default:` in `ci.yml` from `hosted` to
-`self-hosted` — that one word is the whole switch.
-
-**Three things to know before you rely on it:**
-
-- **`apt-get` and the `/dev/kvm` chmod are guarded** with
-  `if: runner.environment == 'github-hosted'`. That guard is load-bearing: the
-  job installs packages, and without it CI would `apt-get` your workstation.
-  If you add a setup step, guard it the same way.
-- **A release now waits on the machine being awake.** There is no automatic
-  hosted fallback (the design's §4.1 plan job was not built, deliberately —
-  §4.2's sharded fallback costs MORE Actions minutes than the serial run it
-  replaces). If the box is down, dispatch with `-f runner=hosted`.
-- **`concurrency: axl-qemu-<ref>`** serialises dispatches so two cannot contend
-  for one QEMU host.
-
-Self-hosted on a PRIVATE repo carries none of the fork-PR risk that makes
-self-hosted runners dangerous on public ones: there are no untrusted
-contributors to run code as us.
+**Sanity check:** `.github/workflows/runner-probe.yml` dispatches a container
+job that prints the distro and whether `/dev/kvm` is usable. Run it after
+registering a new host.
 
 ### GitHub Actions trigger policy
 
@@ -494,7 +506,7 @@ carries it, so the tag flow publishes exactly the same way.
 > **local** suite — run it before you cut:
 >
 > ```sh
-> ./test/integration/run-integration.sh -j"$(nproc)"   # 0 failures required
+> ./test/integration/run-integration.sh --no-cache -j"$(nproc)"   # 0 failures required
 > scripts/lint.sh                                       # clang-tidy as CI runs it
 > ```
 

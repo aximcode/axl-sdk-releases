@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=60 local-only=1
+# test-meta: arch=x64 needs=socat est=24 local-only=1
 # test-sendkey-load-qemu.sh — run-qemu.sh --sendkey must deliver EVERY key,
 # including when the host is busy.
 #

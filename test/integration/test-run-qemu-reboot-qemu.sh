@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=60 local-only=0
+# test-meta: arch=both needs= est=44 local-only=0
 # test-run-qemu-reboot-qemu.sh — a guest-initiated reset must be able to
 # re-POST the SAME VM, so a consumer can test what its firmware does on the
 # NEXT boot (boot counters, rollback-on-next-boot, NVRAM that must survive).

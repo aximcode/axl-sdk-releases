@@ -317,6 +317,16 @@ _axl_service_driver_unload_stub(EFI_HANDLE image_handle)
         m_drv_cfg = NULL;
     }
     m_drv_svc = NULL;
+
+    /* C++ global destructors + axl_atexit callbacks, LAST and only on
+       success — the same contract AXL_DRIVER's stub applies, for the same
+       two reasons: the consumer's teardown above may read globals, and a
+       failing unload leaves the image RESIDENT, where destructed globals
+       would be worse than undestructed ones. axl_driver_init (which
+       _axl_service_driver_init calls) is what ran the constructors. */
+    if (rc == 0) {
+        axl_driver_cleanup();
+    }
     return (rc == 0) ? EFI_SUCCESS : EFI_ABORTED;
 }
 
@@ -342,6 +352,7 @@ _axl_service_driver_init(
     AxlGuid svc_guid;
     if (axl_service_guid(svc, &svc_guid) != AXL_OK) {
         m_drv_svc = NULL;
+        axl_driver_cleanup();   /* see the entry-failure note below */
         return AXL_EFI_INVALID_PARAMETER;
     }
 
@@ -410,6 +421,7 @@ _axl_service_driver_init(
             axl_config_free(m_drv_cfg); m_drv_cfg = NULL;
         }
         m_drv_svc = NULL;
+        axl_driver_cleanup();   /* see the entry-failure note below */
         return AXL_EFI_ABORTED;
     }
 
@@ -422,6 +434,7 @@ _axl_service_driver_init(
             axl_config_free(m_drv_cfg); m_drv_cfg = NULL;
         }
         m_drv_svc = NULL;
+        axl_driver_cleanup();   /* see the entry-failure note below */
         return AXL_EFI_OUT_OF_RESOURCES;
     }
 
@@ -435,6 +448,16 @@ _axl_service_driver_init(
             axl_config_free(m_drv_cfg); m_drv_cfg = NULL;
         }
         m_drv_svc = NULL;
+        /* ENTRY FAILURE IS THE OTHER TEARDOWN PATH. EDK2's CoreStartImage
+           unloads an image whose DriverEntry returned an error through
+           CoreUnloadAndCloseImage, which -- unlike CoreUnloadImage -- never
+           invokes Image->Info.Unload. So _axl_service_driver_unload_stub does
+           NOT run on any of these four returns, and this is the only place the
+           constructors axl_driver_init ran can be undone. Without it a failed
+           service load leaks every global's destructor, the atexit table
+           itself, and on an exceptions build the registered .eh_frame table.
+           Idempotent, so the success path's later call is unaffected. */
+        axl_driver_cleanup();
         return AXL_EFI_ABORTED;
     }
 

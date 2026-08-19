@@ -137,8 +137,10 @@ binding_main(
     //    EFI_DRIVER_BINDING_PROTOCOL + EFI_COMPONENT_NAME2_PROTOCOL with the
     //    managed thunks and copies the descriptor (so this stack value is
     //    fine; `name` and `binds` are borrowed and must outlive the driver —
-    //    here they are static/literal). binding_unload uninstalls it (driver
-    //    unload doesn't drain axl_atexit, so the teardown is explicit).
+    //    here they are static/literal). binding_unload uninstalls it
+    //    explicitly -- the axl_atexit safety net does now run on driver
+    //    unload, but only an explicit uninstall can disconnect first and
+    //    report a failure.
     AxlDriverBinding db = {
         .name      = "AXL Widget Driver",
         .binds     = &gWidgetGuid,
@@ -159,8 +161,12 @@ binding_main(
     mController = NULL;
     if (axl_protocol_install(&gWidgetGuid, &mWidget, &mController) != AXL_OK) {
         axl_error("failed to publish synthetic widget controller");
-        // Entry returns non-zero -> firmware will NOT call our unload, so we
-        // own teardown. The binding is removed by its own axl_atexit hook.
+        // Entry returns non-zero -> the firmware unloads us via
+        // CoreUnloadAndCloseImage, which does NOT call our unload. AXL_DRIVER
+        // runs axl_driver_cleanup() on this path, which drains axl_atexit and
+        // so removes the binding through its safety-net hook. Nothing to do
+        // here -- but note the hook cannot disconnect a bound controller, so
+        // a driver that may have connected one must unwind before returning.
         return AXL_ERR;
     }
 
@@ -185,10 +191,13 @@ binding_main(
 // ---------------------------------------------------------------------------
 // DriverUnload body
 //
-// Driver unload does NOT drain axl_atexit (only AXL_APP / CRT0 do), so a
-// Type-B driver uninstalls its binding explicitly here — leaving it installed
-// would dangle EFI_DRIVER_BINDING_PROTOCOL on the freed image handle and crash
-// the next `connect`/`drivers`. Order matters: disconnect the controller first
+// Driver unload DOES drain axl_atexit now (axl_driver_cleanup), so the
+// binding's safety-net hook would eventually remove it -- but a Type-B driver
+// uninstalls explicitly here anyway, because the hook runs after this callback
+// and cannot disconnect a still-bound controller or report the failure.
+// Leaving it installed would dangle EFI_DRIVER_BINDING_PROTOCOL on the freed
+// image handle and crash the next `connect`/`drivers`. Order matters:
+// disconnect the controller first
 // (so the binding's Stop releases its BY_DRIVER open), then uninstall the
 // binding (now unreferenced), then tear down the synthetic controller we own.
 // ---------------------------------------------------------------------------

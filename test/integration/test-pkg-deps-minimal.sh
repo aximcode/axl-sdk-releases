@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=podman est=40 local-only=0
+# test-meta: arch=x64 needs=podman est=8 local-only=0
 # test-pkg-deps-minimal.sh — are the package's DECLARED dependencies enough?
 #
 # WHY THIS EXISTS. release.yml's .deb smoke test installs the package and drives

@@ -38,6 +38,13 @@ fi
 PLAIN="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/http-plain-selftest.efi"
 FETCH="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/fetch.efi"
 
+# NOTE ON THE MARGIN, since the numbers moved a lot and look alarming.
+# Images are objcopy'd with --strip-all, so the COFF symbol table is gone and
+# most `mbedtls` hits used to be SYMBOL NAMES. Measured on the same fetch.efi:
+# 452 matches unstripped, 3 stripped. Assertion 2 below still holds -- the 3
+# are genuine .rodata strings -- but it is now a thin margin rather than a
+# comfortable one, so read a future failure there as "mbedTLS stopped linking"
+# only after checking it is not "mbedTLS stopped carrying literals".
 mbedtls_strings() { strings "$1" 2>/dev/null | grep -c -i mbedtls; }
 
 # 1. The plain-HTTP-only client must contain NO mbedTLS.

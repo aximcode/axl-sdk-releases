@@ -616,6 +616,110 @@ firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
 - Deviations from the design doc, recorded in its §12: `--listen-ip`/`--source-ip` not implemented (no library API takes a bind address); `9p` excluded from the busybox multiplexer (it links two embedded driver blobs); the headline `mount -t 9p` proof realized as an equivalent host Python client, with the kernel mount documented as manual and explicitly not claimed as tested
 - Non-goals for v1: 9P-over-TLS, virtio-9p transport, base 9P2000/`.u` dialects, `Tauth`, mount-side read caching
 
+### Local gate wall time — [AXL-CI-Release-Speed-Design.md](AXL-CI-Release-Speed-Design.md) §12
+The pre-commit gate a human waits on is 15m04s, and that document had spent
+eleven sections optimising CI without ever measuring it. Measured 2026-08-19:
+`verify.sh` 61 s + integration X64 569 s + AARCH64 274 s = **904 s**, of which
+**93% is the integration suite**. The suite is **233 guest boots** and
+essentially nothing else (mean 14.5 s/boot), and at a ~7 s floor per boot
+**47% of it is overhead that tests nothing**.
+
+Two findings shape every phase below and are worth carrying into them:
+**the pool is already 99% packed** (3,385 s over 6 workers is a 564 s floor,
+measured 569 s), so no scheduling change can help and only doing less work
+does; and **relevance-guessing by module is unsafe here** — `8af4e530` touched
+`src/log/` and changed every image in the tree through a link-time edge no
+directory map can see (§12.5). Association is therefore by staged artifact,
+never by path.
+
+- [x] **Phase 0 — measure, then instrument.** §12.1 wall clock + packing
+  arithmetic; `--only-local` (§12.10), the inverse of `--ci`, taking the inner
+  loop **904 s -> 495 s (-45%)**; boot instrumentation `AXL_TEST_PROFILE` +
+  `lib/profile-report.py` (§12.11) at **zero measured cost** (568.15 s profiled
+  vs 569 s not), including `--affected` for artifact-based association.
+  Two corrections recorded rather than smoothed over: the estimate for
+  `--only-local` was 122 s and it measured 382 s (the scoped run is
+  *tail*-bound, not work-bound), and the first instrumentation covered 25% of
+  tests while looking complete
+- [x] **Phase 1 — `test-console-device-qemu.sh` split four ways.** 15 serial
+  DEBUG-OVMF boots at 25.3 s each, unmergeable (each scenario loads a different
+  driver and screenshots it), so split — and sized, not guessed: four is the
+  first split whose largest piece (~107 s) gets under the 122 s work floor, so a
+  fifth buys nothing. **`--only-local` X64 382 s -> 194 s; inner loop 495 s ->
+  306 s.** All 42 assertions preserved exactly; the full run is unchanged (573 s
+  vs 569 s) because it is work-bound and splitting moves work rather than
+  removing it. **Exit was <= 300 s and this is 306 s — a 1.9% miss, recorded
+  rather than rounded.** The constraint moved: six local-only tests are now
+  >= 87 s and fill all six workers at once, so packing is 65% against the full
+  run's 99%. Phase 2 clears the remainder
+- [x] **Phase 2 — longest-first scheduling, not the planned split.** The pool
+  consumed tests in the glob's alphabetical order; feeding a fixed job set to N
+  workers is makespan scheduling, and longest-processing-time-first is within
+  4/3 of optimal where arbitrary order has no bound. One `sort` on the `est=`
+  every test already declares: **`--only-local` X64 194 s -> 134 s (65% -> 93%
+  packing), inner loop 306 s -> 246 s**, no test changed. Also clears Phase 1's
+  6 s miss. The full run does not move, as predicted — it was already 99% packed
+- [x] **Phase 3 — merge boots (pilot).** `test-tar-qemu.sh` 7 boots -> 1,
+  **50 s -> 7.3 s**, 11 assertions preserved + 1 added; full X64 571 s -> 564 s,
+  boots 226 -> 220. It merged because nothing needed isolation: every boot
+  mounted the same host dir and the scenarios were already coupled through it.
+  **The payoff estimate fell twice — -35%, then -22%, then a measured ~-9% —
+  and the reason is the finding: the boots you CAN remove are the cheap ones.**
+  Tar's were ~7 s each; the 15 s suite mean is dragged up by boots that are not
+  candidates (console-device 25 s, cpu-spike 44 s). Expensive boots are
+  expensive because they do something, and that something usually forbids
+  merging. **Recommendation: stop or cherry-pick** — the remaining ~19 buy ~43 s
+  on a once-per-push run, for 19 rewrites each carrying cascade risk
+- [ ] **Phase 2b — the remaining multi-boot tests, exit RESTATED.** The original
+  exit (full X64 -> <= 450 s) is **not reachable by splitting**: the full run is
+  work-bound, so splitting moves work and removes none. Only MERGING boots
+  reduces it, and those boots exist for state isolation (a different driver, or
+  clean firmware), so merging trades wall clock for cross-contamination.
+  Post-LPT the scoped run has ~9 s of headroom left. **Recommendation: stop
+  unless a specific test can shed boots without losing isolation**
+- [x] **Phase 3b — is the digest cache worth building? YES, measured.** A
+  library change (`src/mem/axl-mem.c`) changes only **44 of 118** staged
+  artifacts, leaving **46% of the work skippable — full X64 560 s -> 304 s**; a
+  tool-only change leaves 86% of tests skippable. **This reverses §12.7**,
+  which claimed it buys nothing on a libaxl change: that conflated RELINKING
+  with CHANGING — `--gc-sections` plus selective archive linking leaves most
+  images byte-identical. Getting there needed the artifact capture fixed first
+  (82 -> 149 of 169 tests recorded), and two no-op perturbations were thrown
+  away en route (a comment emits identical code, so the probe measured nothing
+  while appearing to confirm §12.7)
+- [x] **Phase 4 — SHIPPED: `run-integration.sh --cache`.** Full X64
+  **564 s -> 71-78 s** warm (136 cached, 34 ran; three runs 77.6/72.7/70.9); `--only-local` 133 s -> 24 s.
+  Default path unchanged (re-measured 564 s / 247 s). Soundness shown by
+  perturbing `tools/grep.c` and watching exactly the three tests that stage
+  `grep.efi` wake up, everything else stay cached, 170/0. `test-test-cache.sh`
+  holds 13 property assertions, all but two asserting a MISS (the dangerous
+  direction is a false hit). Excluded from the release-gate stamp and prints
+  `PARTIAL`. Does NOT cover the host environment; 37 tests always run and each
+  is a "cannot prove", not a "probably fine" (§12.16.2). **78 s is a NO-CHANGE
+  re-run; after a library change it is ~304 s (§12.15)**
+- [ ] **NOT SCHEDULED — cache `verify.sh`'s jobs too (§12.17).** Recorded as a
+  level to reach for **only if the local gate starts feeling slow again**.
+  `verify.sh` is CONCURRENCY-bound (61 s wall against a 197 s sum, 12 s above
+  its longest job), so unlike the integration suite skipping only helps when it
+  removes the critical-path job. The two unit suites are 49 s and 48 s of it and
+  are structurally identical to an integration test, so the §12.16 cache would
+  extend to them: expected ~43 s, or ~30 s with docs cached, giving a ~40 s
+  inner loop. **Not built because the risk outgrows the payoff**: skipping a
+  unit job means not running 10,497 assertions, and a subtly wrong key hides a
+  regression rather than costing time. Also records a correction — §12.2 ranked
+  this last at 6.7% of a 904 s gate; the inner loop is now ~85 s and
+  `verify.sh` is ~85% of it, so the reason expired even though the 61 s did not
+- [ ] **Phase 5 — clang-tidy scoping, for CI only.** Deliberately last: it is
+  the intuitive first target and §12.2 shows it is worth **at most 61 s**
+  locally, though CI's ratio is reversed (~7 min)
+- Deliberately NOT on this list: **making boots cheaper.** At a ~7 s floor it
+  would beat everything above, but `run-qemu.sh` already skips the Boot Manager
+  countdown and ~7 s is close to what an OVMF boot costs. Recorded in §12.12 so
+  it is not re-proposed as an obvious win without a measurement
+- **Doc rule for this project:** each phase updates §12 with what it MEASURED,
+  not what it intended, and ROADMAP ticks only after `verify.sh` and both
+  integration arches are green
+
 ---
 
 ## Open backlog

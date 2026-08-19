@@ -41,7 +41,7 @@
 # ordinary keys, so they reach the app's input callback intact.
 #
 # Usage:
-#   scripts/install.sh --arch x64     # one-time, produces out/bin/axl-cc
+#   scripts/install.sh --arch x64     # one-time, produces stage/bin/axl-cc
 #   test/integration/test-input-keys-qemu.sh            # X64 (default)
 #   test/integration/test-input-keys-qemu.sh --arch AARCH64
 #

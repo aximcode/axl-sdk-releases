@@ -54,6 +54,57 @@
 #define KEYPRESS_SPIN_BUDGET_US     (5u * POLL_INTERVAL_US)
 #define KEYPRESS_SPIN_ITERS         200000u
 
+/* The burst that replaced a SINGLE second dispatch, and why the shape
+   changed.
+
+   The invariant is "selected at most once per POLL TICK, not on every call".
+   Sampling it with one call made the margin 1-vs-0: the assertion held only
+   while the pair of calls stayed inside one 10 ms period, so any host
+   preemption longer than that flipped it. Phase-pinning made the window a
+   FULL period instead of an arbitrary 0..period slice, and the previous
+   revision measured the window to excuse a stall -- but the excuse never
+   fired on the failure it was written for (a loaded verify.sh, 2026-08-19:
+   FAIL with no NOTE, so the guard's own window looked clean). It cannot
+   reliably fire, because it compares axl_time_get_us() against a period timed
+   by the FIRMWARE; under host contention those two clocks diverge, and the
+   guard reads the one that under-reports.
+
+   So stop sampling and stop excusing. 64 back-to-back dispatches turn the
+   margin into 64-vs-0: a source that ignored the gate is selected by EVERY
+   call, while a healthy one is selected only when a tick genuinely arrives
+   mid-burst -- and each of those costs a full 10 ms, which the bound below
+   allows for out of the burst's own measured duration. A 50 ms stall inside
+   the burst now RAISES the bound instead of invalidating the test.
+
+   64 calls is microseconds of CheckEvent on any host that runs this suite,
+   so the healthy count is 0. SLACK covers the clock divergence above without
+   needing to model it. The CEILING keeps the assertion able to FAIL: without
+   it a long enough stall would compute an allowance >= the burst size, and a
+   bound nothing can exceed is a green that means nothing. Hitting the ceiling
+   is reported.
+
+   WHAT THIS IS AND IS NOT EVIDENCE OF. The 2026-08-19 failure was ONE
+   spurious re-selection (the single dispatch returned 0 instead of 1) inside
+   a window the guard measured as under a period. That count is 1, and 1 <=
+   SLACK -- so this shape would have PASSED that exact run. That is the claim
+   being made, and it is checkable from the failure itself. What is NOT
+   claimed is a reproduction: 12 runs of the OLD shape under 2x-nproc CPU hogs
+   stayed green on BOTH x64 (KVM) and aa64 (TCG), so no control was found that
+   moves the old assertion on demand, and a green run of THIS shape under the
+   same load would therefore prove nothing. The case rests on the margin and
+   the derived bound, not on a load test.
+
+   THE COST, stated rather than buried: SLACK also admits a hypothetical
+   regression that selected the source exactly TWICE per tick. No plausible
+   edit produces that -- the gate is a single CheckEvent, so the failure modes
+   are "gone" (64, caught here) and "always false" (0 ever, caught by the
+   re-arm assertion below). Tightening SLACK to 1 would close it and leave
+   zero headroom above the failure this is fixing, which is the trade that
+   made the previous revision flaky. */
+#define KEYPRESS_BURST_CALLS        64u
+#define KEYPRESS_BURST_SLACK        2u
+#define KEYPRESS_BURST_CEILING      (KEYPRESS_BURST_CALLS / 2u)
+
 // ---------------------------------------------------------------------------
 // Test 1: Timer fires N times then quits
 // ---------------------------------------------------------------------------
@@ -1339,9 +1390,9 @@ test_keypress_drain_non_blocking(void)
        The firmware queue is empty here, so the callback never fires — what is
        under test is that the source is reachable at all, and gated to one
        drain per tick. */
-    int      second_dispatch = 0;
-    uint64_t gap_us          = 0;
-    uint64_t tick_at_us      = 0;
+    unsigned reselected = 0;
+    uint64_t burst_us   = 0;
+    uint64_t tick_at_us = 0;
 
     /* Drain whatever is already selected, leaving the loop idle. */
     bool drained = keypress_spin_until(loop, 1, NULL);
@@ -1349,18 +1400,37 @@ test_keypress_drain_non_blocking(void)
        tick_at_us stamps the moment just before that dispatch consumed it. */
     bool synced  = drained && keypress_spin_until(loop, 0, &tick_at_us);
 
-    second_dispatch   = axl_loop_dispatch(loop, false);
+    /* The burst. Nothing between the calls -- no Stall, no test_check (serial
+       I/O would itself span ticks). An ungated source answers all 64. */
+    for (unsigned i = 0; i < KEYPRESS_BURST_CALLS; i++) {
+        if (axl_loop_dispatch(loop, false) == 0) {
+            reselected++;
+        }
+    }
     uint64_t ended_us = axl_time_get_us();
 
-    /* The measured window runs from BEFORE the pinning dispatch (so it covers
-       that dispatch's own firmware key-drain, where a preemption is just as
-       fatal to the invariant) through the second dispatch. axl_time_get_us()
-       reports 0 when the counter frequency is unavailable; a guard that cannot
-       see is worse than no guard, so that is reported rather than read as a
-       clean gap of 0. */
+    /* Measured from BEFORE the pinning dispatch, so it covers that dispatch's
+       own firmware key-drain -- a preemption there is just as able to advance
+       the tick as one inside the burst. axl_time_get_us() reports 0 when the
+       counter frequency is unavailable; that is reported rather than read as a
+       clean duration of 0. */
     bool clock_ok = (tick_at_us != 0 && ended_us != 0);
     if (clock_ok) {
-        gap_us = ended_us - tick_at_us;
+        burst_us = ended_us - tick_at_us;
+    }
+
+    /* The bound is DERIVED, not tuned: every legitimate re-selection costs a
+       whole poll period, so the burst's own measured duration says how many
+       could have happened. A slow host raises its own bar. With the clock
+       unavailable only SLACK applies, which is still a 64-vs-2 discriminator
+       against the defect. */
+    unsigned allowance = KEYPRESS_BURST_SLACK;
+    if (clock_ok) {
+        allowance += (unsigned)(burst_us / POLL_INTERVAL_US);
+    }
+    bool capped = (allowance > KEYPRESS_BURST_CEILING);
+    if (capped) {
+        allowance = KEYPRESS_BURST_CEILING;
     }
 
     /* Ordered so the most explanatory NOTE wins. A failed sync is reported
@@ -1378,23 +1448,32 @@ test_keypress_drain_non_blocking(void)
                        : "");
     } else if (!clock_ok) {
         axl_printf("  NOTE: keypress drain: axl_time_get_us() is unavailable, "
-                   "so the post-tick gap could not be measured; the assertion "
-                   "below is running unguarded\n");
-    } else if (gap_us >= POLL_INTERVAL_US) {
-        axl_printf("  NOTE: keypress drain: the host preempted us for %llu us "
-                   "(>= one %llu us period) between the tick and the check; "
-                   "the assertion below is measuring a loaded host, not the "
-                   "loop\n",
-                   (unsigned long long)gap_us,
-                   (unsigned long long)POLL_INTERVAL_US);
+                   "so the burst allowance is SLACK (%u) alone rather than "
+                   "SLACK plus the periods that actually elapsed\n",
+                   KEYPRESS_BURST_SLACK);
+    } else if (capped) {
+        axl_printf("  NOTE: keypress drain: the burst took %llu us (>= %u "
+                   "periods); the allowance was capped at %u so the assertion "
+                   "can still fail. A failure below is a loaded host, not a "
+                   "loop defect\n",
+                   (unsigned long long)burst_us,
+                   (unsigned)KEYPRESS_BURST_CEILING,
+                   (unsigned)KEYPRESS_BURST_CEILING);
+    } else if (reselected > 0) {
+        axl_printf("  NOTE: keypress drain: %u of %u burst dispatches were "
+                   "re-selected across %llu us (allowance %u); a tick landed "
+                   "inside the burst, which is legitimate\n",
+                   reselected, (unsigned)KEYPRESS_BURST_CALLS,
+                   (unsigned long long)burst_us, allowance);
     }
 
     test_check(synced,
                "loop: non-blocking dispatch drains keypress on the poll tick");
     test_check(keypress_drain_calls == 0,
                "loop: empty key queue -> keypress callback not invoked");
-    test_check(second_dispatch == 1,
-               "loop: keypress is not re-selected before the next poll tick");
+    test_check(reselected <= allowance,
+               "loop: keypress is gated on the poll tick, not re-selected on "
+               "every dispatch");
 
     /* The next tick re-arms it (the poll timer is periodic). */
     gBS->Stall(2 * POLL_INTERVAL_US);

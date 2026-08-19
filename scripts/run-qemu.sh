@@ -810,10 +810,19 @@ if [[ -n "$_axl_tmp_base" ]]; then
     # same dirs are at depth 2 under a leftover axl-itest.*/. At depth 1 a leak
     # from a hard-killed parallel run could never be swept, which is exactly
     # how five orphans sat for three days.
+    #
+    # BOTH prefixes, and the second one is why a base could never empty. This
+    # matched only `axl-qemu.*`, but an `axl-itest.*` base left by a C-test run
+    # also holds `axl-ctest.*` children -- nothing swept those, so the `rmdir`
+    # below could never succeed on such a base. Reported by a consumer whose
+    # every run-qemu.sh invocation exited 1 instantly against a five-hour-old
+    # /dev/shm/axl-itest.*/ holding six axl-ctest.* dirs.
     while IFS= read -r local_d; do
         [[ -n "$local_d" ]] || continue
         pgrep -af -- "$local_d" >/dev/null 2>&1 || rm -rf "$local_d"
-    done < <(find "$_axl_tmp_base" -maxdepth 2 -type d -name 'axl-qemu.*' -mmin +10 2>/dev/null)
+    done < <(find "$_axl_tmp_base" -maxdepth 2 -type d \
+                  \( -name 'axl-qemu.*' -o -name 'axl-ctest.*' \) \
+                  -mmin +10 2>/dev/null)
     # Then the parent bases the loop above may have just emptied. `rmdir`, not
     # `rm -rf`: it removes a base only if nothing is left in it, so a base
     # still holding a live guest's dir is left alone even if the age and pgrep
@@ -831,9 +840,21 @@ if [[ -n "$_axl_tmp_base" ]]; then
     # shell that echoes or greps the path defers the sweep. That errs toward
     # keeping a dead dir rather than removing a live one, which is the right
     # direction for a defence-in-depth sweep.
+    #
+    # `|| true` IS LOAD-BEARING, and its absence was a silent total failure.
+    # `rmdir` returns 1 on a NON-EMPTY directory; `2>/dev/null` hides the
+    # message but not the status, and the command after the final `||` is NOT
+    # exempt from `set -e` -- so one un-emptied base made this script exit 1
+    # with NO output at all, no error line and empty .log files, on every
+    # invocation until someone cleared /dev/shm by hand. A consumer lost a day
+    # to it and read it as a rendering regression.
+    #
+    # Best-effort cleanup must never be able to fail the run it is cleaning up
+    # for. The sweep above now empties both child prefixes so this can usually
+    # succeed; `|| true` is what guarantees that when it cannot, nothing breaks.
     while IFS= read -r local_b; do
         [[ -n "$local_b" ]] || continue
-        pgrep -af -- "$local_b" >/dev/null 2>&1 || rmdir "$local_b" 2>/dev/null
+        pgrep -af -- "$local_b" >/dev/null 2>&1 || rmdir "$local_b" 2>/dev/null || true
     done < <(find "$_axl_tmp_base" -maxdepth 1 -type d -name 'axl-itest.*' -mmin +10 2>/dev/null)
     TMPDIR=$(mktemp -d -p "$_axl_tmp_base" axl-qemu.XXXXXXXX)
 else
@@ -1387,6 +1408,54 @@ if [[ "${QEMU_DRYRUN:-0}" == "1" ]]; then
         printf 'QEMU_DRYRUN: %s\n' "$tok"
     done
     exit 0
+fi
+
+# Profiling: ONE record per guest LAUNCH, when AXL_TEST_PROFILE is set.
+#
+# AFTER the dry-run exit, and that placement is the whole correctness of the
+# count. It sat above, at command assembly -- the single point every launch
+# passes through -- which is true and was not enough: QEMU_DRYRUN=1 ASSEMBLES
+# the command and exits without a guest, and so do the late validation
+# failures. test-run-qemu-flags.sh is host-only argument parsing and was
+# credited with SEVEN boots in ONE second, which is what exposed it. Every
+# real launch is below this line; nothing that exits above it boots anything.
+#
+# A COUNT and not a duration: run-qemu.sh installs and REPLACES an EXIT trap in
+# four places, so a fifth for the stop stamp would clobber a cleanup that
+# removes the guest's TMPDIR. Seconds-per-boot is derived from the runner's own
+# per-test time instead, which needs no exit hook.
+#
+# 71 of the integration tests reach QEMU this way and are invisible to the
+# hooks in common-test.sh, which instruments the OTHER, disjoint path
+# (common-test.sh launches QEMU itself -- see its note at test_build_qemu_cmd).
+# Instrumenting only that path measured 41 tests and 15% of the suite's work
+# while looking like a complete report.
+if [[ -n "${AXL_TEST_PROFILE:-}" ]]; then
+    printf 'qemu|%s\n' "${AXL_TEST_PROFILE_NAME:-run-qemu}" >> "$AXL_TEST_PROFILE"
+    # ...and WHAT this launch put in the guest. test_add_efi records the same
+    # thing for the common-test.sh path, and misses every test that reaches a
+    # guest through here -- 87 of 169 tests staged no recordable artifact until
+    # this line existed, which made an artifact-keyed cache unable to prove
+    # anything about half the suite (AXL-CI-Release-Speed-Design.md §12.15).
+    if [[ -n "${EFI_FILE:-}" && -f "${EFI_FILE:-}" ]]; then
+        printf 'efi|%s|%s|%s\n' "${AXL_TEST_PROFILE_NAME:-run-qemu}" \
+            "$(basename "$EFI_FILE")" \
+            "$(sha256sum "$EFI_FILE" 2>/dev/null | cut -d' ' -f1)" \
+            >> "$AXL_TEST_PROFILE"
+    fi
+fi
+
+# Skip-cache inputs, for the tests that reach a guest through here rather than
+# through common-test.sh's launcher. Separate from the profile above because the
+# cache is on in ordinary runs while the profile is a measurement tool. See
+# test/integration/lib/test-cache.sh.
+if [[ -n "${AXL_TEST_CACHE:-}" && -d "${AXL_TEST_CACHE:-/nonexistent}" \
+      && -n "${AXL_TEST_PROFILE_NAME:-}" ]]; then
+    for _ci in "${EFI_FILE:-}" "${FW_CODE:-}" "${FW_VARS:-}" "${SHELL_EFI:-}"; do
+        [[ -n "$_ci" && -f "$_ci" ]] || continue
+        printf '%s\n' "$(cd "$(dirname "$_ci")" && pwd)/$(basename "$_ci")" \
+            >> "$AXL_TEST_CACHE/${AXL_TEST_PROFILE_NAME}.inputs"
+    done
 fi
 
 # Interactive mode — hand the host TTY to QEMU. No pipeline, no

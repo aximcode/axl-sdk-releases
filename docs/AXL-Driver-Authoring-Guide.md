@@ -218,13 +218,18 @@ that, the firmware's `ConnectController` drives your callbacks against
 matching controllers.
 
 **Tear it down from your unload callback** with
-`axl_driver_binding_uninstall` — firmware-driven driver unload does *not*
-drain `axl_atexit`, so leaving the binding installed would dangle
+`axl_driver_binding_uninstall` — leaving the binding installed would dangle
 `EFI_DRIVER_BINDING_PROTOCOL` on the freed image handle (a crash on the next
 `connect`/`drivers`). Disconnect any controllers you manage first
 (`axl_driver_disconnect_handle`) so the binding is unreferenced when you
-uninstall it. (AXL also registers an `axl_atexit` hook, but it only covers an
-*app* that installs a binding, not a driver being unloaded.)
+uninstall it.
+
+AXL also registers an `axl_atexit` hook as a safety net, and since
+`axl_driver_init` initialises that table it now fires on **both** exit paths —
+app exit and driver unload (`axl_driver_cleanup`). Do not rely on it in place
+of the explicit call: it runs *after* your unload callback, so it cannot
+disconnect a still-bound controller, and it cannot report the failure when the
+firmware refuses the uninstall.
 
 To exercise it under QEMU, `load` the driver and `connect` a controller:
 

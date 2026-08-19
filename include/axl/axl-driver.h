@@ -195,11 +195,17 @@ typedef struct {
  * the lifetime note on AxlDriverBinding) and retains the binding record while
  * it is installed.
  *
- * **Teardown:** a *driver* must call axl_driver_binding_uninstall from its
- * unload callback — firmware-driven driver unload does NOT drain axl_atexit.
- * AXL does register an axl_atexit hook as a safety net, but that fires only at
- * app exit (AXL_APP / CRT0), so it covers an *app* that installs a binding,
- * not a driver being unloaded.
+ * **Teardown:** call axl_driver_binding_uninstall from your unload callback.
+ * AXL also registers an axl_atexit hook as a safety net, and that net now
+ * covers BOTH exit paths — app exit (AXL_APP / CRT0) and driver unload (via
+ * axl_driver_cleanup, which the DriverEntry macros call). It used to cover
+ * only the first, because a driver image never initialised the atexit table
+ * and the registration silently failed.
+ *
+ * Uninstalling explicitly is still the right shape rather than a formality:
+ * your unload callback runs BEFORE the drain, so a binding the firmware still
+ * references fails teardown while you can still return non-zero and have the
+ * firmware keep the image loaded. Left to the net, that failure is invisible.
  *
  * v1 installs **one binding per driver image** (on the image handle) — the
  * "device driver binds to protocol X" case. A second call returns AXL_ERR
@@ -225,12 +231,18 @@ axl_driver_binding_install(
  * image, so this takes no argument — it removes that binding.
  *
  * **Call this from a driver's unload callback.** AXL also registers the same
- * teardown via axl_atexit, but that fires only at app exit (AXL_APP / CRT0),
- * NOT on firmware-driven driver unload — so a Type-B *driver* must uninstall
- * its binding explicitly here, after disconnecting any controllers it manages
- * (otherwise the firmware still references the binding and the uninstall
- * fails). Apps that install a binding can rely on the axl_atexit hook instead.
- * Calling this removes that hook, so it never double-runs.
+ * teardown via axl_atexit, and since axl_driver_init initialises that table
+ * the hook now fires on BOTH exit paths — app exit (AXL_APP / CRT0) and driver
+ * unload (axl_driver_cleanup). It used to fire only on the first, because a
+ * driver image never initialised the table and the registration silently
+ * failed.
+ *
+ * Uninstalling explicitly here is still required rather than merely tidy: it
+ * runs BEFORE the drain, and it must follow disconnecting any controllers you
+ * manage, because the firmware still references a bound binding and the
+ * uninstall then FAILS. Left to the hook, that failure is invisible — the hook
+ * cannot report and cannot disconnect for you. Calling this removes the hook,
+ * so it never double-runs.
  *
  * @return AXL_OK if the binding was uninstalled and freed; AXL_ERR if no
  *     binding is installed, or if the firmware still references it (e.g. a
@@ -441,6 +453,20 @@ axl_driver_set_load_options(
  * DriverEntry to set up firmware table pointers (gST/gBS/gRT)
  * and I/O streams so axl_printf, axl_malloc, etc. work.
  *
+ * It ALSO runs the image's C++ global constructors (`.init_array`)
+ * and initialises the `axl_atexit` table they register destructors
+ * into — the two are one step, because `axl_atexit` refuses
+ * registration while its table is NULL, so constructing without it
+ * would drop every destructor silently.
+ *
+ * **That makes this half of a pair.** A hand-written `DriverEntry`
+ * MUST call @ref axl_driver_cleanup on both exit paths — from its
+ * unload callback, and before returning a failure status from
+ * `DriverEntry` itself (the firmware does not call `Unload` for an
+ * image whose entry failed). The `AXL_DRIVER` / `AXL_SHARED_DRIVER`
+ * / `AXL_SERVICE_DRIVER` macros do this for you; the manual shape
+ * below does not.
+ *
  * Most drivers don't need to call this directly — the
  * `AXL_DRIVER(entry, unload)` macro in `<axl.h>` emits the
  * DriverEntry stub and wires `axl_driver_init` automatically.
@@ -466,11 +492,68 @@ axl_driver_set_load_options(
  * }
  * @endcode
  */
+/// @see axl_driver_cleanup
 void
 axl_driver_init(
     AxlHandle        image_handle,  ///< image handle from DriverEntry
     AxlSystemTable  *system_table   ///< system table from DriverEntry
 );
+
+/**
+ * @brief Run the driver image's C++ global destructors and
+ *        `axl_atexit` callbacks.
+ *
+ * LIFO, then the table holding them is released. This is the
+ * counterpart to the constructor half of `axl_driver_init` — it
+ * does **not** undo that function's other work (the firmware
+ * globals and the stream layer stay up; they belong to the image,
+ * which the firmware is about to reclaim).
+ *
+ * Most drivers don't need to call this directly — `AXL_DRIVER`,
+ * `AXL_SHARED_DRIVER` and `AXL_SERVICE_DRIVER` all call it from
+ * the stubs they emit. Call it yourself only from a hand-written
+ * `DriverEntry` that calls `axl_driver_init` directly (the tier-2
+ * spec-protocol shape shown above) — otherwise the image's
+ * destructors never run.
+ *
+ * **Two exit paths, and a hand-written entry must cover both:**
+ *
+ * - **Unload** — from your unload callback, AFTER your own teardown
+ *   and only if it succeeded. Ordering: an unload callback may
+ *   legitimately read globals, and the reverse order would hand it
+ *   destructed state. Success-only: a failing unload leaves the
+ *   image RESIDENT (the firmware surfaces the status from
+ *   `gBS->UnloadImage` and keeps the image loaded), so destructing
+ *   its globals would leave a live image on torn-down state — and
+ *   nothing is lost, because a retried unload re-enters and drains.
+ * - **Entry failure** — before returning a non-zero status from
+ *   `DriverEntry`. EDK2 unloads a failed image through
+ *   `CoreUnloadAndCloseImage`, which never invokes the image's
+ *   `Unload`, so your unload callback does **not** run and this is
+ *   the only chance to undo the constructors.
+ *
+ * Idempotent — a second call is a no-op, so a consumer whose own
+ * unload function calls this while using a macro whose stub also
+ * calls it does not double-run destructors.
+ *
+ * @note **TPL.** On the self-reload path
+ *       (@ref axl_service_reload) the unload is issued from a timer
+ *       notify, so destructors can run as high as `TPL_CALLBACK`,
+ *       where `gBS->WaitForEvent` returns `EFI_UNSUPPORTED`. A
+ *       destructor must not block on an event or a synchronous
+ *       network wait; do that work in your unload callback, which
+ *       has the same constraint but is yours to reason about.
+ *
+ * @note C++ static destructors register through `__cxa_atexit` at
+ *       run time, not through `.fini_array`; AXL never walks
+ *       `.fini_array`, so a function marked
+ *       `__attribute__((destructor))` does NOT run here. Use a
+ *       global object's destructor, or `axl_atexit`.
+ *
+ * @see axl_driver_init
+ */
+void
+axl_driver_cleanup(void);
 
 /**
  * @brief Set the unload callback for the current driver image.

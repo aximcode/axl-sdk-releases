@@ -288,16 +288,24 @@ build: it compiles the library and stages a complete SDK under
 `stage/include/`), so the driver to invoke is **`./stage/bin/axl-cc`**.
 `out/` holds build trees and Sphinx output only — a build directory is
 not an install prefix.
-`scripts/axl-cc` is not a standalone driver — run from a raw
-checkout it fails with `no SDK libraries ... lib/axl/<arch>`
-because it resolves its SDK root to the repo top, where nothing is
-staged yet. Stage first, then use `stage/bin/axl-cc` (or add it to
-`PATH`):
+`scripts/axl-cc` is not a standalone driver — run from a checkout
+it refuses by name, because it resolves its SDK root to the repo
+top, which is a source tree rather than an install prefix. It used
+to fail only incidentally, with `no SDK libraries ... lib/axl/<arch>`
+— and only on a *clean* checkout: a tree that had ever been
+installed in-tree (`install.sh --prefix .`) still had `bin/ lib/
+share/axl/` sitting there, all gitignored, and the source script
+quietly served those instead. Stage first, then use
+`stage/bin/axl-cc` (or add it to `PATH`):
 
 ```bash
-./scripts/install.sh --arch x64        # stages ./out
+./scripts/install.sh --arch x64        # stages ./stage
 ./stage/bin/axl-cc hello.c -o hello.efi
 ```
+
+`install.sh` also warns about a staged SDK left at either historical
+prefix — `./out` (the pre-O1 default) or the source root itself — and
+names the command that removes it.
 
 ### Host-side QEMU testing tooling
 

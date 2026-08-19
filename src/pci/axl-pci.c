@@ -355,6 +355,20 @@ axl_pci_get_class_code(AxlPciAddr addr, uint32_t *class_code)
     if (class_code == NULL) {
         return AXL_ERR;
     }
+    /* Absent-function precheck, matching axl_pci_get_vid_did and
+       axl_pci_get_header_type. Without it this was the one standard-header
+       accessor that reported an absent function as SUCCESS: the bus answers
+       all-ones, the fold below produces 0xFFFFFF, and the caller gets AXL_OK
+       with a plausible-looking 24-bit value it can only recognise by knowing
+       the fold width -- which is exactly the disambiguation the sibling
+       accessors exist to spare it.
+       The cost is honest and small: every known caller reads VID/DID
+       immediately before this, so the read repeats one they just did. A
+       redundant config read is the cheaper of the two errors. */
+    uint16_t v;
+    if (axl_pci_read_config_16(addr, 0x00, &v) != AXL_OK || v == 0xFFFF) {
+        return AXL_ERR;
+    }
     uint8_t prog_if, sub, base;
     if (axl_pci_read_config_8(addr, 0x09, &prog_if) != AXL_OK ||
         axl_pci_read_config_8(addr, 0x0A, &sub)     != AXL_OK ||

@@ -68,6 +68,20 @@ string.
 
 ### Driver side
 
+> **From C++, declare `run` `noexcept`** (or `AXL_CB_NOEXCEPT`, which
+> is that in C++ and nothing in C). It lands in
+> `AxlSharedDriverVtable::run`, which carries `AXL_CB_NOEXCEPT`, and
+> since C++17 `noexcept` is part of the function type — so a plain
+> declaration is a type mismatch rather than a warning. `init` and
+> `unload` are called directly and need no such marker.
+>
+> The rule is *the callbacks AXL stores*, so it differs per macro:
+> `AXL_SERVICE_DRIVER`'s `setup` and `teardown` DO need it (they land
+> in `AxlServiceSetup` / `AxlServiceTeardown`), while `AXL_DRIVER`'s
+> entry and unload do not. Everything else on this page is
+> language-neutral; C++ globals get constructors and destructors, on
+> the schedule in Hazards below.
+
 Define three `static` functions — `init`, `run`, `unload` — FIRST,
 then invoke `AXL_SHARED_DRIVER` LAST:
 
@@ -374,6 +388,81 @@ order of magnitude. This holds whether the resolve step runs via
 the turnkey macros or the Advanced primitives directly — both go
 through the same `axl_driver_ensure_with_embedded` short-circuit.
 
+### The per-image floor, and why it decides layout
+
+**Every separate `.efi` costs ~47 KB before one line of your code.**
+Measured, x64, RELEASE, `int main(void) { return 0; }`: **47,247
+bytes**. A thin launcher is that floor plus ~31 KB of resolution
+machinery. So a layout shipping N commands as N images pays N × 47 KB
+in floor alone — which for a 34-command fleet is ~1.6 MB, and is
+usually the term that decides *thin launchers* versus *one multi-call
+binary*, not the shared library the pattern exists to deduplicate.
+
+Where it goes (RELEASE, x64) — and **file bytes and runtime memory
+are different budgets**, which is easy to conflate because
+`nm --size-sort` lists them together:
+
+| item | bytes | in the file? |
+|---|--:|---|
+| `.text` | 27,264 | yes |
+| **COFF symbol table + string table** | **9,989** | yes — and **removed** as of the `--strip-all` change; the firmware never read it |
+| `.rodata` + `.data` + relocs + `.dynamic`/`.dynsym`/`.dbgdir` | 6,052 | yes |
+| PE headers + `0x200` section padding | 4,060 | yes — irreducible |
+| `.bss` | 4,496 | **NO — its `PointerToRawData` is 0** |
+
+**A correction, because this table got it wrong twice.** The first version
+listed `.bss` items as file bytes; they are not. The second computed "headers +
+padding" as *file size minus section sizes* and labelled the residual **14,049**
+without checking what was in it — most of it was the symbol table. Both errors
+are the same move: naming a subtraction instead of measuring it. The figures
+above are measured per line.
+
+`.bss` occupies **zero file bytes**: it is runtime memory the loader
+zero-fills. So the tables that dominate it — `mEventCloseRing` (2,048)
+and `mNotifyTimerTable` (1,536) — cost RAM per *loaded* image and
+nothing per image *shipped*. Measured: halving the close guard's
+record dropped `.bss` by 4,096 and left the `.efi` byte-identical.
+
+The file side, by contributor:
+
+| item | bytes | why it is linked |
+|---|--:|---|
+| `axl_vformat` + `axl_dtoa` + `kCachedPowers` | 5,867 | the formatter and its float path, pulled by the log and stream layers |
+| `log_dispatch` + `axl_log_init_from_env` | 2,255 | the log layer that `_axl_init` wires |
+
+**`--minimal-runtime` is NOT the lever**, and it is worth saying so
+because it is the obvious guess: measured at **46,462 bytes**, it saves
+**785**. It skips the registry/atexit/signal half of `_axl_init`, but
+the floor is `axl_stream_init` and the console — and `axl-console.o`
+transitively pulls the event backend and the formatter, which the
+minimal CRT0 still reaches.
+
+So the floor moved once and is now **fixed in practice**: images are
+stripped, which took ~20% off, and the remainder is code plus ~4 KB of
+PE structure no source change can touch. Plan a multi-command layout
+around what is left rather than expecting a flag to move it — every
+separate `.efi` still pays it, which is the argument for one
+multi-call binary over N launchers.
+
+For how far a launcher could go if it linked no libaxl at all — and
+what that costs — see `sdk/examples/hello-minimal.{c,cpp}` and
+[AXL-Minimal-Image-Notes.md](AXL-Minimal-Image-Notes.md), which
+measure it at ~4.6 KB against ~47 KB.
+
+One file-side item is reducible in principle and is not a knob that
+exists today: the float formatter is only reachable because
+`axl-format.o` is a single object, so an image that never formats a
+float still carries `axl_dtoa` + `kCachedPowers` (~1.8 KB).
+
+**Do NOT expect the event close guard to be one.** It reads like a
+diagnostic — it is called a ring, and its comment is dated
+`DIAG 2026-04-27` — but `axl_backend_event_close` *skips* a repeat
+close, and DxeCore's `CoreCloseEvent` `#GP`s on a stale handle.
+Compiling it out would trade RAM for a firmware crash. Its forensics
+(the first close's `file`/`line`) are already `AXL_MEM_DEBUG`-only;
+the guard itself is unconditional by design. It also costs no file
+bytes at all — see the `.bss` note above.
+
 ## Hazards and contracts
 
 **Shared vtable struct layout.** Only a concern if you've opted into
@@ -402,6 +491,58 @@ consumer that calls `axl_driver_unload` (or otherwise sees the
 driver unloaded from under it) holds a stale `vt` pointer after
 that point — either keep the driver resident for the full boot
 session, or re-locate the protocol on every entry.
+
+**C++ globals: constructors and destructors DO run, and here is
+exactly when.** A driver image runs its `.init_array` from
+`axl_driver_init`, which every DriverEntry-emitting macro reaches
+(`AXL_DRIVER` directly, `AXL_SHARED_DRIVER` through its expansion,
+`AXL_SERVICE_DRIVER` through `_axl_service_driver_init`). Global
+destructors run from `axl_driver_cleanup` on the unload path. The
+ordering is fixed and worth knowing:
+
+| when | what runs |
+|---|---|
+| DriverEntry | firmware globals, streams, image path, **then constructors** |
+| your `init` / entry / `setup` | after constructors — globals are live |
+| your `run` | driver already resident; constructors ran once, at load |
+| your `unload` | **before** destructors — globals are still live |
+| after a SUCCESSFUL unload | destructors + `axl_atexit` callbacks, LIFO |
+| after a FAILED `DriverEntry` | destructors, immediately — see below |
+
+Four consequences a consumer has to code against:
+
+- **`.fini_array` is never walked.** A C++ static destructor does not
+  live there — it registers at run time through `__cxa_atexit`, which
+  AXL routes to `axl_atexit` (measured on both arches: an object with
+  a global destructor carries no `.fini_array` section at all). So
+  destructors of global objects run, but a function marked
+  `__attribute__((destructor))` does **not**. Use a global object, or
+  `axl_atexit`.
+- **A failed unload runs no destructors.** If your unload function
+  returns non-zero the firmware keeps the image RESIDENT, so AXL
+  deliberately leaves its globals constructed rather than leaving a
+  live image on torn-down state. Nothing is lost: a retried unload
+  re-enters the stub and drains then.
+- **A failed `DriverEntry` runs them immediately, and your unload
+  callback never runs at all.** EDK2 reclaims a refused image through
+  `CoreUnloadAndCloseImage`, which does not invoke `Unload` — so the
+  macros drain on that branch instead. If you hand-write
+  `DriverEntry`, you must call `axl_driver_cleanup()` before returning
+  a failure status, or a refused load leaks every destructor, the
+  atexit table, and (on an exceptions build) the registered
+  `.eh_frame` table. Note the drain cannot disconnect controllers or
+  report a teardown failure — unwind those yourself before returning.
+- **Reload is a clean slate.** A driver can be unloaded and reloaded
+  within one boot, unlike an app. The firmware loads a fresh image
+  copy each time and AXL's own `_start` zeroes `.bss` before
+  `DriverEntry` — so constructors run again from zero, and a counter
+  incremented by a constructor reads 1 on every load, never 2. That is
+  asserted by `test-cxx-driver-ctors-qemu.sh`, not assumed.
+
+If you write `DriverEntry` by hand (the tier-2 spec-protocol shape)
+rather than using a macro, you get constructors from your
+`axl_driver_init` call but you must call `axl_driver_cleanup()`
+yourself on the unload path, or the image's destructors never run.
 
 **Identity.** The vtable GUID is derived from the `name` string both
 halves pass — `AXL_SHARED_DRIVER`'s and

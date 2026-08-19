@@ -991,6 +991,35 @@ types in public API, no space before parens.
    UEFI types are confined to `_impl` declarations and internal
    implementation files.
 
+10. **A subsystem the image never uses must not link.** The library
+    is one archive and images select from it, so a subsystem earns
+    its place in an image by being called — not by sharing an object
+    with something that is. The mechanism is deliberately boring: put
+    the entry point in an object of its own and reach the heavy part
+    through a **weak** symbol, so the decision is made by the linker
+    and a link that wants the subsystem asks for it with `-u`.
+
+    Logging is the worked example (`src/log/axl-log-emit.c` +
+    `src/log/axl-log-dispatch.h`, 2026-08-19), and it is worth
+    knowing why it took so long to find: `ld --cref` names the FIRST
+    puller of an archive member, and fixing that one puller had been
+    the obvious plan for months. It would have saved nothing — 27 of
+    the 51 members in a do-nothing image referenced the log emitter,
+    and the map only ever showed the first. **Census the references
+    with `nm` over every member before designing around a map.**
+
+    Two rules keep this from becoming a footgun, and both are
+    enforced rather than documented:
+
+    - **Every ordinary link takes the subsystem.** The opt-out is one
+      named build shape (`--minimal-runtime`), not a default. The
+      in-tree macros carry `$(LOG_ENGINE_PULL)` and `axl-cc` passes
+      it unless asked not to.
+    - **Opting out is a choice someone made.** If the caller's own
+      objects reference the subsystem, `axl-cc` refuses the link
+      until they say `log` or `nolog`. A subsystem that quietly
+      stopped working would be worse than one that costs bytes.
+
 ## Project
 
 ### Repository

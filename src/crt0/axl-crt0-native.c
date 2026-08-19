@@ -5,8 +5,10 @@
  * axl-crt0-native.c — Native UEFI entry point for AXL applications.
  *
  * Initializes firmware table globals and bridges to int main().
- * Used only for applications (not drivers — drivers provide their
- * own entry point and call _axl_init() directly).
+ * Used only for applications. A driver provides its own entry point
+ * (DriverEntry) and calls axl_driver_init() / axl_driver_cleanup()
+ * instead — see <axl/axl-driver.h>. Both pairs run .init_array and
+ * drain axl_atexit; they differ in what else they set up.
  *
  * Part of the AximCode AXL SDK.
  */

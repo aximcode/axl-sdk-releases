@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=25 local-only=0
+# test-meta: arch=both needs= est=16 local-only=0
 # test-service-pin-path-qemu.sh — AxlServiceDeploy.driver_path pins the
 # driver image: exactly one file, no 4-path search, no embedded fallback.
 #

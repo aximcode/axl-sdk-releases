@@ -468,9 +468,11 @@ test_driver_binding(void)
                "binding: synthetic controller uninstalled cleanly after Stop");
 
     /* Explicit teardown — the path a Type-B *driver* uses from its unload
-       callback (the axl_atexit hook only fires at app exit, not driver
-       unload). Proven to really remove the binding by a fresh install
-       succeeding again afterward, then a final uninstall to leave clean. */
+       callback. The axl_atexit hook is a safety net on both exit paths now
+       (axl_driver_cleanup drains it on driver unload), but it runs after the
+       unload callback and so cannot disconnect or report. Proven to really
+       remove the binding by a fresh install succeeding again afterward, then
+       a final uninstall to leave clean. */
     test_check(axl_driver_binding_uninstall() == AXL_OK,
                "binding: explicit uninstall succeeds");
     test_check(axl_driver_binding_install(&db) == AXL_OK,

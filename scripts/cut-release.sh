@@ -307,6 +307,17 @@ if $CI_GATE && ! $FORCE_CI && release_gate_covers "$REL_SHA" >/dev/null 2>&1; th
     say "CI gate satisfied locally — $(release_gate_covers "$REL_SHA")"
     note "skipping the CI dispatch (pass --force-ci to run it anyway)"
 elif $CI_GATE; then
+    # No usable stamp. Since 2026-08-19 the commonest reason is not "you did
+    # not run the suite" but "you ran it WITH THE CACHE" -- caching is on by
+    # default (run-integration.sh), and a cached run deliberately refuses to
+    # stamp, because it skipped tests whose inputs merely looked unchanged.
+    # Say so before dispatching, or the fix reads as "run it again" and the
+    # next run is cached too.
+    say "No uncached local stamp covers $REL_SHA."
+    note "a CACHED run cannot stamp -- for the local gate use:"
+    note "    ./test/integration/run-integration.sh --no-cache --arch X64"
+    note "    ./test/integration/run-integration.sh --no-cache --arch AARCH64"
+    note "dispatching CI instead (this is correct, just slower)"
     # CI no longer auto-runs on a push, so trigger it on the release commit and
     # wait for it before tagging.
     say "Triggering CI on main (--ci-gate)"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=90 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0
 # test-cxx-iostreams-qemu.sh — the REAL <iostream> under UEFI, end to end.
 #
 # This suite exists because of P4 (docs/AXL-Libc-Substrate-Design.md §4d).

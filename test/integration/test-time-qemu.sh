@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=12 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0
+# arch=both since 2026-08-19: verified passing on AARCH64 unchanged (21/0). It was
+# x64-only with no stated reason -- never ported, not unportable.
 # test-time-qemu.sh — round-trip the RTC-write API
 # (axl_time_set_realtime / axl_time_set_unix) against OVMF's emulated
 # real-time clock.

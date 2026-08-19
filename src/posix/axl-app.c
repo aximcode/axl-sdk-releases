@@ -467,17 +467,15 @@ _axl_args_init(void *image_handle)
 }
 
 void
-_axl_args_free(void)
+_axl_image_path_free(void)
 {
-    if (mArgv == NULL) {
-        return;
-    }
-    for (int i = 0; i < mArgc; i++) {
-        axl_free(mArgv[i]);
-    }
-    axl_free(mArgv);
-    mArgv = NULL;
-    mArgc = 0;
+    /* SPLIT OUT of _axl_args_free, and the split is the fix. These frees used
+       to sit BELOW that function's `if (mArgv == NULL) return;`, so they were
+       reachable only from an app: _axl_args_init is app-only, a driver's
+       mArgv is always NULL, and _axl_init_image_path allocates on EVERY
+       driver load. A resident service that reloads itself leaked one or two
+       heap strings per cycle, permanently. axl_driver_cleanup calls this. */
+
     /* mImageAnchor either IS mImagePath or is a separate allocation; free
        each exactly once. */
     if (mImageAnchor != NULL && mImageAnchor != mImagePath) {
@@ -491,6 +489,20 @@ _axl_args_free(void)
     /* Firmware-owned, nothing to free — but it must not outlive the capture
        it belongs to, or a re-init would keep the stale handle. */
     mImageDeviceHandle = NULL;
+}
+
+void
+_axl_args_free(void)
+{
+    if (mArgv != NULL) {
+        for (int i = 0; i < mArgc; i++) {
+            axl_free(mArgv[i]);
+        }
+        axl_free(mArgv);
+        mArgv = NULL;
+        mArgc = 0;
+    }
+    _axl_image_path_free();
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=20 local-only=1
+# test-meta: arch=x64 needs= est=5 local-only=1
 # test-axl-cc-hosted-headers.sh — a consumer that directly #include's hosted
 # libc headers (<string.h>, <stdlib.h>, <stdio.h>, ...) must build via the
 # STAGED SDK for EVERY staged arch, and must resolve them from the SDK's own

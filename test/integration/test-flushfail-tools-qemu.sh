@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=35 local-only=0
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-flushfail-tools-qemu.sh -- a TOOL's write path against media whose
 # flush fails.
 #

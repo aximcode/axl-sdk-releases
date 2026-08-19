@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=X64 est=45 local-only=1
+# test-meta: arch=X64 est=13 local-only=1
 # test-kbtune-driver-qemu.sh — hazard-safe lifecycle test for the kbtune-drv
 # resident console-conditioning shim.
 #

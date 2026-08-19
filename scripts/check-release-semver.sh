@@ -79,6 +79,14 @@ SECTION="$(awk '/^## Unreleased$/ {f=1; next} /^## / {f=0} f' CHANGELOG.md)"
 
 LEVEL="$(bump_level "$PREV" "$VERSION")"
 
+# The listing below spans the WHOLE "### Breaking" section (heading to the next
+# "### "), not a fixed window after the heading. It was `grep -A3`, which reads
+# three lines past the heading -- fine for the one-line bullets in the test
+# fixtures, and wrong for real entries, which run to several paragraphs each. It
+# named the FIRST breaking entry and dropped every other one, with nothing to
+# say it had. That is this script's own incident one layer in: the information
+# sits in the file and never reaches the person deciding --allow-breaking, who
+# sees a short list and reads it as a complete one.
 if grep -q '^### Breaking' <<<"$SECTION" && [[ "$LEVEL" != major ]]; then
     if $ALLOW_BREAKING; then
         echo "check-release-semver: '### Breaking' present and $PREV -> $VERSION is a" \
@@ -89,7 +97,7 @@ ERROR: CHANGELOG '## Unreleased' has a '### Breaking' section, but
        $PREV -> $VERSION is a $LEVEL bump.
 
        Breaking entries under it:
-$(grep -A3 '^### Breaking' <<<"$SECTION" | grep '^- ' | sed 's/^/         /' | cut -c1-78)
+$(awk '/^### Breaking/{inb=1;next} /^### /{inb=0} inb && /^- /' <<<"$SECTION" | sed 's/^/         /' | cut -c1-78)
 
        "## Unreleased" is branch-wide state; a release is a commit range.
        They agree only when the release is everything on this branch since

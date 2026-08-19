@@ -166,7 +166,7 @@ render-timer callback, which is only safe because `axl_console_device_uninstall`
 disconnects our (full-screen, non-80x25) device from the ConSplitter aggregates before
 re-adding GraphicsConsole — otherwise the mode reconstruction asserts
 (`ConSplitter.c:2983`). On load fbcon prints a one-line "press Ctrl+\ to leave" notice.
-Regression: `test-console-device-qemu.sh` Scenarios 7 (fbcon-leave), 8 (fbcon-exit),
+Regression: `test-console-device-fbcon-life-qemu.sh` — fbcon-leave, fbcon-exit,
 9 (fbcon-reload — re-running `fbcon.efi` reaps the lingering instance + re-takes-over).
 
 ## 3. Testing

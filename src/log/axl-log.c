@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include "../backend/axl-backend.h"
 #include <axl/axl-log.h>
+#include "axl-log-dispatch.h"
 #include <axl/axl-str.h>
 #include <axl/axl-format.h>
 
@@ -369,51 +370,33 @@ static void ensure_env_init_once(void);
 // Public API
 // ---------------------------------------------------------------------------
 
+/* The engine behind axl_log_full / axl_log, which live in axl-log-emit.c and
+ * reach this function through a WEAK reference. Defining it here is what makes
+ * this whole object — and the printf engine, the console renderer and the
+ * handler table with it — opt-in at link time. See axl-log-dispatch.h.
+ *
+ * The va_list arrives already started; the emitter owns va_start/va_end. That
+ * also disposes of the clang-tidy valist.Uninitialized false positive the old
+ * shape had to be written around: there is no declared-but-unstarted va_list
+ * here for the analyzer to trace get_effective_level's axl_strcmp call from. */
 void
-axl_log_full(int level, const char *domain, const char *func,
-             int line, const char *fmt, ...)
+_axl_log_vdispatch(int level, const char *domain, const char *func,
+                   int line, const char *fmt, va_list args)
 {
     /* Apply AXL_LOG_LEVEL on first emission (idempotent). */
     ensure_env_init_once();
 
-    /* Early-return BEFORE the va_list declaration. clang-tidy's
-       valist.Uninitialized analyzer otherwise traces the
-       get_effective_level → axl_strcmp call from inside the
-       declared-but-unstarted lifetime and false-positives an
-       "uninitialized va_list" diagnostic. Functionally identical;
-       cheaper too, since the level filter skips the buffer alloc. */
+    /* Level filter before the buffer: a suppressed record costs a compare. */
     if (level > get_effective_level(domain)) {
         return;
     }
 
-    va_list args;
-    char    msg_buf[MSG_BUF_SIZE];
-    BufCtx  bc = { msg_buf, 0, sizeof (msg_buf) };
+    char   msg_buf[MSG_BUF_SIZE];
+    BufCtx bc = { msg_buf, 0, sizeof (msg_buf) };
 
-    va_start(args, fmt);
     axl_vformat(buf_write, &bc, fmt, args);
-    va_end(args);
 
     log_dispatch(level, domain, func, line, msg_buf);
-}
-
-void
-axl_log(int level, const char *domain, const char *fmt, ...)
-{
-    ensure_env_init_once();
-    if (level > get_effective_level(domain)) {
-        return;
-    }
-
-    va_list args;
-    char    msg_buf[MSG_BUF_SIZE];
-    BufCtx  bc = { msg_buf, 0, sizeof (msg_buf) };
-
-    va_start(args, fmt);
-    axl_vformat(buf_write, &bc, fmt, args);
-    va_end(args);
-
-    log_dispatch(level, domain, NULL, 0, msg_buf);
 }
 
 void

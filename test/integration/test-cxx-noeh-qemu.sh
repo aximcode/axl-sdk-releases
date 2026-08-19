@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=90 local-only=0
+# test-meta: arch=both needs= est=13 local-only=0
 # test-cxx-noeh-qemu.sh — `axl-c++ --no-eh-frame`: an ~18% smaller C++ image
 # that still halts readably.
 #

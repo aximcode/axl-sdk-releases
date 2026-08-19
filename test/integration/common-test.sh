@@ -18,6 +18,13 @@ set -euo pipefail
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$TESTS_DIR")")"
 source "$PROJECT_DIR/scripts/axl-common.sh"
+# Inert unless AXL_TEST_PROFILE is set. See lib/profile.sh for what it records
+# and why the unit is a guest BOOT rather than a test.
+# shellcheck source=lib/profile.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/profile.sh"
+# Inert unless AXL_TEST_CACHE names a directory. See lib/test-cache.sh.
+# shellcheck source=lib/test-cache.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-cache.sh"
 
 # The build tree for this run's arch — ASKED OF MAKE, never composed here.
 #
@@ -179,6 +186,13 @@ test_setup() {
     QEMU_DIR="$(dirname "$TEST_QEMU_BIN")"
     export QEMU_DIR
     find_firmware "$TEST_ARCH" || { echo "Firmware not found for $TEST_ARCH"; exit 1; }
+    # Truncation happens in run-integration.sh's run_one, NOT here: several
+    # tests call test_setup more than once (test-sd-sibling drives three
+    # images), and truncating per setup would discard the earlier images'
+    # inputs. Tests driven purely through run-qemu.sh never reach this function
+    # at all, so the runner is the only place that sees every test exactly once.
+    cache_record_input "$(basename "$0")" "${FW_CODE:-}"
+    cache_record_input "$(basename "$0")" "${FW_VARS:-}"
 
     # Copy NVRAM template
     cp "$FW_VARS" "$TEST_NVRAM"
@@ -251,6 +265,8 @@ test_add_efi() {
 
     mkdir -p "$TEST_STAGING/$(dirname "$dest")"
     cp "$src" "$TEST_STAGING/$dest"
+    _prof_efi "$src" "$dest"
+    cache_record_input "$(basename "$0")" "$src"
 }
 
 # Add NIC drivers for the current arch
@@ -604,6 +620,7 @@ test_add_smbus_eeprom() {
 # owned any stall. Falls back to untimestamped output if `ts` isn't
 # installed.
 test_run_foreground() {
+    _prof_boot_start
     local timeout_sec="${1:-20}"
     #
     # AArch64 QEMU under TCG boots noticeably slower than x86_64 and
@@ -626,6 +643,12 @@ test_run_foreground() {
     local _wrapper=$!
     cpu_monitor_start "$(_test_qemu_pid)" "$TEST_TMPDIR"
     wait "$_wrapper" 2>/dev/null || true
+    # A foreground boot starts and ends inside this one call, so it is timed
+    # exactly -- no trap and no pairing across functions. The third launcher
+    # found while instrumenting: hooking only test_run_background left every
+    # test that boots this way reporting ZERO boots, which reads as a cheap
+    # test rather than an unmeasured one.
+    _prof_boot_end "foreground"
     test_cpu_check || true
     axl_report_hostfwd_failure "$TEST_LOG" "$(basename "$0")" || true
 
@@ -706,6 +729,7 @@ test_cpu_advisory_off() {
 # the test went straight to test_wait_for and reported "server did not start
 # within 60s" a minute later. Check the moment QEMU has had a chance to fail.
 test_run_background() {
+    _prof_boot_start
     if [[ -n "${TEST_STDIN_FD:-}" ]]; then
         "${TEST_QEMU_CMD[@]}" > "$TEST_LOG" 2>&1 <&"$TEST_STDIN_FD" &
     else
@@ -769,10 +793,18 @@ test_wait_for() {
 
     for i in $(seq 1 "$timeout_sec"); do
         if grep -q "$pattern" "$TEST_LOG" 2>/dev/null; then
+            # Profiled here rather than at test_cleanup: a test with several
+            # scenarios boots and waits repeatedly, and cleanup runs once. This
+            # is the point where THIS guest finished doing what was asked.
+            _prof_boot_end "$pattern"
             return 0
         fi
         sleep 1
     done
+    # A boot that never produced its pattern still burned the wall clock, and
+    # is usually the most expensive one in the run -- record it rather than
+    # dropping it and under-reporting the total.
+    _prof_boot_end "TIMEOUT:$pattern"
     # Timed out. Before the caller reports "the server never came up", say so
     # if the guest never had a network to come up on.
     axl_report_hostfwd_failure "$TEST_LOG" "$(basename "$0")" || true

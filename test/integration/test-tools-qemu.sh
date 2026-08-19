@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=X64 needs= est=120 local-only=1
+# test-meta: arch=X64 needs= est=31 local-only=1
 # test-tools-qemu — behavioral coverage for the CLI tools that the
 # happy-path output test (test-tools.sh) doesn't reach: EXIT CODES
 # (%lasterror%), ERROR/failure paths (missing file, bad args), and the

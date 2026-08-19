@@ -9,7 +9,15 @@
 
 #include <axl/axl-cancellable.h>
 #include <axl/axl-event.h>
+#include <axl/axl-log.h>
 #include <axl/axl-wait.h>
+
+#include <axl/axl-str.h>   /* axl_strstr */
+
+#include "axl-backend.h"   /* axl_backend_event_{create,close} — the
+                              double-close guard has no public call site */
+
+AXL_LOG_DOMAIN("test");
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -408,6 +416,118 @@ test_event_use_after_free_detection(void)
 }
 
 // ---------------------------------------------------------------------------
+// Backend double-close guard
+//
+// axl_backend_event_close keeps a ring of recently-closed handles and REFUSES
+// a second close of the same one. That is not a diagnostic: DxeCore's
+// CoreCloseEvent #GPs on a stale handle, so the refusal is what keeps the
+// machine up. It had NO test -- it is reached only from internal teardown
+// paths, so no public call site drives it. These two are the safety net for
+// its storage layout.
+//
+// Observed through the LOG RING rather than as "it did not crash": the guard
+// announces each refusal, so the count of DOUBLE-CLOSE lines is a value.
+// ---------------------------------------------------------------------------
+
+/* Count log entries whose message carries @a needle. */
+static size_t
+count_log_matches(AxlLogRing *ring, const char *needle)
+{
+    AxlLogEntry entry;
+    size_t      n     = 0;
+    size_t      total = axl_log_ring_count(ring);
+
+    for (size_t i = 0; i < total; i++) {
+        if (axl_log_ring_get(ring, i, &entry)
+            && axl_strstr(entry.message, needle) != NULL) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static void
+test_event_backend_double_close_is_refused(void)
+{
+    AxlLogRing     *ring = axl_log_ring_new(32, 256);
+    AxlEventHandle  ev   = NULL;
+
+    test_check(ring != NULL, "double-close: log ring allocated");
+    if (ring == NULL) {
+        return;
+    }
+    axl_log_ring_attach(ring);
+
+    test_check(axl_backend_event_create(&ev) == AXL_OK && ev != NULL,
+               "double-close: backend event created");
+    if (ev == NULL) {
+        axl_log_ring_attach(NULL);
+        axl_log_ring_free(ring);
+        return;
+    }
+
+    /* The first close is real, and must announce nothing. */
+    axl_backend_event_close(ev);
+    test_check(count_log_matches(ring, "DOUBLE-CLOSE") == 0,
+               "double-close: the first close announces nothing");
+
+    /* The second close of the SAME handle must be refused rather than passed
+       to the firmware. Reaching CoreCloseEvent here is the #GP the ring exists
+       to prevent, so surviving this line is part of the assertion. */
+    axl_backend_event_close(ev);
+    test_check(count_log_matches(ring, "DOUBLE-CLOSE") == 1,
+               "double-close: the second close is refused, exactly once");
+
+    /* A third, to prove the record is not consumed by the first refusal. */
+    axl_backend_event_close(ev);
+    test_check(count_log_matches(ring, "DOUBLE-CLOSE") == 2,
+               "double-close: still refused on a third attempt");
+
+    axl_log_ring_attach(NULL);
+    axl_log_ring_free(ring);
+}
+
+static void
+test_event_recycled_handle_closes_normally(void)
+{
+    AxlLogRing     *ring  = axl_log_ring_new(32, 256);
+    AxlEventHandle  first = NULL;
+    AxlEventHandle  again = NULL;
+
+    test_check(ring != NULL, "recycled: log ring allocated");
+    if (ring == NULL) {
+        return;
+    }
+
+    /* Close one, then create another. The firmware commonly hands back the
+       SAME address, and the ring's create-side hook must clear the stale
+       record -- otherwise the new event's legitimate close is refused as a
+       false double-close and the handle leaks for the rest of the boot. */
+    test_check(axl_backend_event_create(&first) == AXL_OK && first != NULL,
+               "recycled: first event created");
+    axl_backend_event_close(first);
+
+    test_check(axl_backend_event_create(&again) == AXL_OK && again != NULL,
+               "recycled: second event created");
+
+    axl_log_ring_attach(ring);
+    axl_backend_event_close(again);
+    test_check(count_log_matches(ring, "DOUBLE-CLOSE") == 0,
+               "recycled: a re-created handle closes without a false refusal");
+    axl_log_ring_attach(NULL);
+
+    /* That assertion only bites when the address really was reused. Say so
+       when it was not, so a silent pass cannot masquerade as coverage on
+       firmware that never recycles. */
+    if (first != again) {
+        axl_debug("recycled: firmware did not reuse the address "
+                  "(%p vs %p) -- the clear-on-create path was not exercised",
+                  (void *)first, (void *)again);
+    }
+    axl_log_ring_free(ring);
+}
+
+// ---------------------------------------------------------------------------
 // AxlCancellable lifecycle + state
 // ---------------------------------------------------------------------------
 
@@ -659,6 +779,8 @@ test_event_main(
     test_event_cancelled_wait_preserves_is_set();
     test_event_timed_out_wait_preserves_is_set();
     test_event_use_after_free_detection();
+    test_event_backend_double_close_is_refused();
+    test_event_recycled_handle_closes_normally();
 
     /* axl_wait_* */
     test_wait_for_flag_already_true();

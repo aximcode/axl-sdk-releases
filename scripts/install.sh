@@ -449,24 +449,16 @@ install -C -m 644 "$LIBAXL_DIR/include/axl/"*.h                   "$PREFIX/inclu
 install -C -m 644 "$LIBAXL_DIR/include/axl/"*.hpp                 "$PREFIX/include/axl-sdk/axl/"
 install -C -m 644 "$LIBAXL_DIR/include/uefi/"*.h                  "$PREFIX/include/axl-sdk/uefi/"
 install -C -m 644 "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/axl-sdk/uefi/generated/"
-# Point out a staged SDK left in the OLD default location (./out), which is
-# where --prefix defaulted before O1 moved it to ./stage. It is not stale
-# today -- it was correct when it was written -- but nothing refreshes it any
-# more, so the next edit to axl-cc or a public header leaves it serving the
-# previous build to anyone who still types out/bin/axl-cc from muscle memory
-# or an old script. That is the same trap the compat/ removal below exists
-# for, one directory up.
+# Point out a staged SDK left at either HISTORICAL default -- ./out (where
+# --prefix pointed before O1 moved it to ./stage) or the source root itself
+# (`install.sh --prefix .`, older still). Neither is stale the day it is
+# written; both go stale silently, and the source-root one is the case that
+# makes scripts/axl-cc answer for a build weeks behind its own checkout.
 #
-# WARNED, NOT DELETED, and the asymmetry is deliberate: compat/ sits inside
-# the prefix this run owns and is ours to clean, whereas ./out is a directory
-# this invocation was not asked to touch. Removing files outside your own
-# --prefix is a surprise nobody asked for.
-_old_default="$LIBAXL_DIR/out"
-if [[ "$PREFIX" != "$_old_default" && -x "$_old_default/bin/axl-cc" ]]; then
-    log_warning "a staged SDK remains at $_old_default (the pre-O1 default)."
-    log_warning "Nothing refreshes it now -- it will go stale silently."
-    log_warning "Remove it with: rm -rf $_old_default/{bin,lib,include,share}"
-fi
+# The candidates and the removal advice live in axl-common.sh, not here: two
+# spellings of "where a stale SDK can hide" is precisely how the source root
+# went uncovered for the whole life of the ./out warning.
+axl_warn_stale_sdk_prefix "$PREFIX" "$LIBAXL_DIR"
 
 # Remove a compat/ left behind by an OLDER install into this same prefix.
 # install.sh stopped CREATING it, which is not the same as removing it: an

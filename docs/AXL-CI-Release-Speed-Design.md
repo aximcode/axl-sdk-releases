@@ -65,6 +65,14 @@ Two bounds worth stating before the design:
 
 ### 4.1 Runner selection — a `plan` job, not a hardcoded `runs-on`
 
+> **STATUS: landed in a simpler form than this section describes.** There is no
+> separate `plan` job. `ci.yml` selects with one `runs-on` expression that
+> defaults to the self-hosted runner and falls back to `ubuntu-latest` when a
+> `workflow_dispatch` passes `runner: hosted` -- which delivers this section's
+> actual requirement (never a hardcoded runner; a fallback when the box is
+> down) without a job whose only output is a label. The design below is kept
+> for its reasoning, not as a description of the code.
+
 The QEMU job targets `[self-hosted, linux, X64, axl-qemu]`. A `plan` job
 (~1 billable min) decides where the work goes and how it is split, and emits
 `runs-on` + the shard matrix as outputs:
@@ -268,14 +276,984 @@ action; no procedure exists in this repo for installing the Actions runner,
 labelling it `axl-qemu`, or running it as a service. That gap is the reason
 this step "cannot be validated from the repo alone".
 
+## 11. REVISION 2026-08-18 (second) — the constraint that shaped this is GONE
+
+§1-§7 optimise around Actions minutes being scarce. With a self-hosted runner
+they are not scarce, and the conclusions invert rather than merely improve.
+
+### 11.1 What was measured
+
+| | hosted | self-hosted |
+|---|--:|--:|
+| QEMU integration | ~50 min, 1 worker | **9m20s**, 6 workers |
+| billable | ~42 min | **0** |
+
+No repo change produced that. `run-integration.sh` picks `nproc - 2`, which is
+1 on a 2-core hosted runner and 6 on an 8-core box.
+
+### 11.2 The policy inverts: CI returns to running on push to `main`
+
+CI was made dispatch-only to save minutes, with the local suite as the
+authoritative gate. The cost of that policy came due on 2026-08-18: CI had last
+been green on **2026-08-13**, ~40 commits earlier, and was red in three places
+that nobody had seen. Two of the three are things a dev box **structurally
+cannot** catch:
+
+- a **clean checkout could not link** — `$(PORTING_OBJS)` were on no target's
+  prerequisite list, invisible to any tree that already had them built;
+- **docs broke under CI's older Doxygen** while the local gate reported clean;
+- packaging dependencies had drifted.
+
+Five days of undetected red is a worse trade than the minutes ever were. At
+zero cost and nine minutes, CI runs on push to `main` again, with
+`cancel-in-progress: true` so a burst collapses to one run.
+
+### 11.3 Jobs run in a CONTAINER, which is what makes the runner portable
+
+Running jobs directly on the host would make every runner a bespoke machine
+and re-create the drift above. Each job takes `container: ubuntu:24.04` —
+CI's own image — so:
+
+- the environment is identical everywhere, and the Doxygen skew of §10.5
+  disappears rather than needing a separate gate;
+- a fresh container per run means warm-tree bugs cannot hide;
+- `apt-get` inside the container is correct, so the
+  `runner.environment == 'github-hosted'` guards are DELETED rather than kept
+  as a permanent asterisk;
+- a new host needs only Docker and the runner, not the full dev toolchain.
+
+`--device /dev/kvm` passes acceleration through; verified working.
+
+### 11.4 Docker, not podman — measured, not preferred
+
+The runner shells out to the Docker CLI and API. Podman's compat socket got
+container jobs running, but three divergences surfaced in the first ten
+minutes, and the third is disqualifying:
+
+| symptom | cause |
+|---|---|
+| `statfs /var/run/docker.sock: permission denied` | the runner bind-mounts the socket and stats it as its own user; podman's rootful socket is `root:root` |
+| still denied after `SocketGroup=docker` | `/run/podman` is itself `0700`, so group access on the socket buys nothing without directory traversal |
+| `statfs .../_work/_actions: no such file` | **Docker auto-creates a missing bind-mount source; podman does not** — and the runner only populates `_actions` for a job that uses an action, so any job without a `uses:` step cannot start a container |
+
+The first two are fixable with a drop-in and a `tmpfiles.d` entry. The third is
+a behavioural difference in the runner's own contract, and working around it
+would mean constraining every workflow. **docker-ce is installed instead**
+(29.7.2, `cgroup=systemd`, `runc`), which publishes for el10. Proven both
+ways: a container job with a `uses:` step, and one WITHOUT — the case podman
+refused.
+
+Host requirements are therefore: Docker, the `docker` group, `/dev/kvm`, and
+the runner. Nothing about the AXL toolchain.
+
+### 11.5 The jobs are SEQUENCED, and the apt lists say what they mean
+
+Two follow-ups to §11.3, both cheap and both measured.
+
+**`needs: build` on `integration` and on `lint`.** The workflow had no `needs:`
+at all, so all four jobs were eligible at once. The runner is one machine with
+one job slot, so they were already serial — what was missing was any control
+over the ORDER, and it went badly twice in a row:
+
+| run | order | `gcc x64` finished |
+|---|---|---|
+| 32188096048 | clang-tidy, gcc aa64, **QEMU 9m16s**, gcc x64 | last, at 14m15s |
+| 32190974374 | gcc aa64, clang-tidy, **QEMU 9m12s**, gcc x64 | last, at ~14m |
+
+A broken x64 build therefore paid for the whole run and reported the compile
+error *after* the QEMU suite had already failed on it. Gating both consumers on
+`build` puts the ~2-minute compile of both arches first; a failure there now
+ends the run there.
+
+`needs: build` waits for BOTH matrix legs, which is what `fail-fast: false`
+(§11.3) is for — x64 and aa64 each report, and only then are the dependents
+skipped. `lint` is included on the weaker but sufficient ground that it
+compiles the tree too (`bear -- make tests tools AXL_CPP=1`) and four of its
+gates link images, so a rejected build fails it for the same cause three
+minutes later. The cost is losing clang-tidy findings on a red-build run, which
+the re-push returns.
+
+**Not** `integration: needs: [build, lint]`, though it is tempting to order the
+9-minute job behind the 3-minute one. That costs nothing on a single-slot
+runner and permanently forbids the two running concurrently — which is exactly
+what a second `axl-qemu` registration (§9) or the `-f runner=hosted` fallback
+would otherwise buy. Sequence on the real dependency, not on duration.
+
+**The apt lists are HOST tooling only.** Target code is 100% bare-metal
+toolchain on both arches, so the question for each package is what runs on the
+BUILD machine. Measured by dry-running the build job's own targets rather than
+by reading the lists: across **463 recipe lines** per arch, exactly one
+invokes an unprefixed host tool —
+
+```
+gcc -Wall -O2 -o <builddir>/pe-set-debug scripts/pe-set-debug.c
+```
+
+— and `aarch64-linux-gnu-` appears **zero** times for either arch.
+
+- **`gcc` stays, in all three jobs.** It is `$(HOSTCC)`, and `pe-set-debug` is
+  on every `.efi` link (`LINK_CRT0_CMD`). It is a native binary for the build
+  machine, so no cross can produce it. This is the entry most likely to be
+  deleted by someone tidying up after the hermetic migration, which is why each
+  list now says so at the point of use.
+- **`gcc-aarch64-linux-gnu` + `binutils-aarch64-linux-gnu` are gone** — 22
+  packages, 43 MB, on every aa64 build. `CC` is ARM's bare-metal gcc and
+  `CROSS` is `AXL_AA64_BINUTILS_PREFIX`; nothing has invoked the Linux cross
+  since 119c8d76. `release.yml`'s package `Depends` had already made this trim;
+  the workflow's own installs had not. Removing it emptied the `cross:` matrix
+  key, which went with it.
+- **`g++` is gone** from `lint` and `integration`. No host C++ compiler is
+  invoked anywhere: `$(CXX)` is a bare-metal path and clang-tidy's C++ pass
+  replays that compile database with clang. The one plausible need was
+  `check-fuzz-link` — libFuzzer's runtime is C++ — and `clang` pulls
+  `libstdc++-15-dev`, verified by linking and running a fuzz target in
+  `ubuntu:26.04` with no `g++` installed.
+- **`sudo` is gone** from `build`; the container is root and
+  `install-toolchain.sh` checks `id -u` first.
+- **`binutils` stays in `lint` and `integration`, and only there**, because
+  only those invoke it unprefixed: `check-cxx-entry` runs `nm`, `check-no-avx`
+  and `check-bss-clear` pick plain `objdump` for x86-64 objects, and four
+  integration tests shell out to `nm` / `objdump` / `strings`. Dropping it from
+  `build` is truth-in-labelling rather than a size win — `gcc` Depends on it,
+  so it arrives regardless — but the comment it replaces claimed the build got
+  `ld`, `ar` and `objcopy` from apt, and that stopped being true when x64
+  binutils moved to our own toolchain.
+
+### 11.6 Prose does not trigger CI, and the exclusion is deliberately narrow
+
+`push: [main]` landed with no path filter, so a commit touching only design
+docs and handoffs paid the full ~14-minute run — three of them in one evening,
+every one triggered by a document *about* the CI. Free in dollars, not free in
+noise: it keeps the runner busy while nothing real is under test, and it lets a
+genuinely red run hide among doc-triggered ones.
+
+The filter is **`paths-ignore: ['docs/**.md']`, and nothing else.** The obvious
+spelling — `'**/*.md'` plus `'docs/**'`, which is what the task was originally
+written as — silently disables three gates:
+
+| pattern | what it would take with it |
+|---|---|
+| `'docs/**'` | **docs/sphinx/**: 104 `.rst` files that `check-doc-coverage.py` reads to decide whether every public header is wired into the docs. An `.rst` edit must still be verified. |
+| `'**/*.md'` | **the root `README.md`**, whose CONTENT is asserted on by `test-toolchain-variant.sh` — "README documents no `make CROSS=` build command". That is an integration test, not a doc build, and it would go unrun on exactly the commits that can break it. |
+| `'**/*.md'` | **the 33 `src/*/README.md`** files that Sphinx `.. include::`s into the module pages. |
+
+The second is the one worth remembering: the trap generalises past the doc
+build. "Prose" is not a synonym for "nothing depends on it" — a test can assert
+on documentation, and this repo has one that does.
+
+What the filter still costs, stated rather than hidden: `check-nul` scans every
+tracked text file, `.md` included — its own docstring names `.md` as a target —
+so a NUL byte landing in `docs/*.md` goes unseen until the next non-prose push.
+It is a whole-tree scan rather than a diff, so nothing escapes permanently; the
+detection is delayed, not lost. `workflow_dispatch` is not path-filtered, so
+the manual backstop always runs everything, and `docs.yml` is untouched (tags
+and dispatch only), so a docs change still publishes exactly as before.
+
+## 12. REVISION 2026-08-19 — the LOCAL loop is the long pole
+
+Everything above optimises CI. CI is now ~9m20s on our own box at zero cost
+(§11.1), and it runs in parallel with whatever the developer does next. The
+cost that is actually felt is the LOCAL pre-commit gate, which is paid serially
+by a human, once per iteration, and which this document had never measured.
+
+### 12.1 What the local gate costs, measured
+
+Warm tree, each run **alone and serially** (concurrent runs distort both: a
+`verify.sh` run during a build hit its own 95 s wall-clock ratchet at 102 s and
+the aa64 unit suite went red on a timing test, neither of which reproduced
+alone). All three green. 8-core box, `run-integration.sh` picks `nproc - 2` = 6
+workers.
+
+| | wall |
+|---|--:|
+| `scripts/verify.sh` (5 concurrent jobs) | **61 s** |
+| `run-integration.sh --arch X64` (164 tests) | **569 s** |
+| `run-integration.sh --arch AARCH64` (66 tests) | **274 s** |
+| **total** | **904 s ≈ 15m04s** |
+
+**The pool is saturated, so wall time is proportional to work.** Summed
+test-time and the perfect-packing floor it implies, from the SAME runs as the
+wall times above (an earlier run summed 3,396 s for X64; quoting one run's work
+against another run's wall is how these two figures drifted apart in the first
+draft of this section):
+
+| | work | / 6 workers = floor | measured | efficiency |
+|---|--:|--:|--:|--:|
+| X64 | 3,385 s | 564 s | 569 s | **99%** |
+| AARCH64 | 1,488 s | 248 s | 274 s | 90% |
+
+Two consequences, and both matter below:
+
+- **No scheduling win exists.** At 99% there is nothing for more workers,
+  better packing or reordering to recover. Only running less work helps —
+  which is why §12.6 is about skipping and not about scheduling.
+- **Skipping converts ~1:1 into wall time.** Drop N% of the work and the wall
+  drops about N%, as long as the run stays work-bound. It does not always
+  (§12.10).
+
+The X64 critical path is the total, not any one test: the longest single test
+is 379 s, comfortably under the 564 s floor.
+
+| slowest X64 tests | s | `local-only` |
+|---|--:|:-:|
+| `test-console-device-qemu.sh` | 379 | yes |
+| `test-cpu-spike-qemu.sh` | 177 | no |
+| `test-old-shell-qemu.sh` | 117 | yes |
+| `test-9p-server-qemu.sh` | 106 | no |
+| `test-kbtune-bounce-qemu.sh` | 87 | yes |
+| `test-netload-qemu.sh` | 69 | no |
+
+Checked and NOT true, so it is recorded rather than left to be re-suspected:
+the integration suite does **not** re-run the unit suite. `discover_tests`
+excludes `test-axl.sh` by name, and the timed X64 log contains no entry for it.
+
+### 12.2 The measurement inverts the obvious fix
+
+The intuitive target is `clang-tidy`: it is named in §9 as the second-largest
+CI job at ~7 min, and it is the long pole *inside* `verify.sh`. Scoping it to
+changed files is easy, safe, and file-level.
+
+It is also worth **at most 61 seconds locally**, because that is the whole of
+`verify.sh` — 6.7% of the gate. **93% of the local cost is the integration
+suite**, which has no change-scoping mechanism of any kind. Any work that does
+not touch `run-integration.sh` is optimising the wrong 7%.
+
+(clang-tidy scoping is still worth doing for CI, where the ratio is reversed.
+It just is not the answer to "the local gate takes too long".)
+
+### 12.3 What selection already exists
+
+- **`verify.sh --only=JOB`** — job-level, and it already implements the rule
+  this document adopts below: a filtered run never prints a bare `ALL GREEN`,
+  it names what did not run.
+- **`run-integration.sh --shard i/K`, `--arch`, `--ci`, `--list`** — splits
+  work across machines; does not reduce it.
+- **CI `paths-ignore: docs/**.md`** — narrow on purpose (§11.6).
+- **Nothing maps source files to tests.** `# test-meta: needs=` looks like a
+  dependency declaration and is not: it names external *tools* (socat, swtpm,
+  gpu), so it gates availability, not relevance.
+
+### 12.4 Prior art, judged against this tree rather than in the abstract
+
+| approach | mechanism | verdict here |
+|---|---|---|
+| **Go's test cache** | hash the test's *observed* inputs; identical hash replays the cached PASS | **The fit.** `common-test.sh` already funnels every staged image through `test_add_efi`, so the harness sees the inputs without anyone declaring them. Safe by construction: it can only skip when the bytes under test are identical. |
+| **pytest-testmon / Jest `--onlyChanged`** | per-test coverage map; re-run tests whose covered lines changed | **No.** Coverage does not cross the QEMU boundary, and the couplings that break this tree are link-time, not execution-time (§12.5). |
+| **Bazel / Buck2** | declared file->target graph plus a remote cache | Correct for a monorepo, wrong cost for one Makefile. Borrow only the idea of a per-test declared edge — which `# test-meta:` is the natural home for if we ever want one. |
+| **Meta predictive test selection** | model trained on historical failures | Needs a failure corpus this repo does not have. |
+
+### 12.5 Why "changed files -> related tests" is specifically unsafe here
+
+The worked example is the commit that prompted this section. `8af4e530` touched
+`src/log/` and `Makefile`. A relevance map — by include graph, by directory, by
+coverage — would have selected the logging tests.
+
+The actual risk surface was **every image in the tree**, and the failure mode
+was at **link** time: an image silently losing its log engine and discarding
+every record. Nothing in an include graph or a coverage profile can see that
+edge. It took a new artifact-reading gate plus the existing leak gate to cover
+it, and a sabotage of one link macro took the *entire unit suite* red.
+
+That is the general shape of this codebase's coupling. A relevance heuristic
+would be wrong exactly where being wrong is silent.
+
+### 12.6 The design: cache on what a test actually staged
+
+Not relevance — **inputs**. On a green finish, record for each test the digest
+set of everything it staged (`test_add_efi`), plus the test script itself, the
+harness (`common-test.sh`, `run-qemu.sh`), the firmware image, and the
+toolchain id. Next run, skip a test whose set is byte-identical.
+
+This cannot produce a wrong green from a bad guess: the only thing it asserts
+is that the bytes under test have not moved.
+
+### 12.7 What it buys — **superseded by §12.15, which measured it**
+
+> **This section's central claim is WRONG and the measurement is in §12.15.**
+> It is kept because the reasoning error is worth seeing: "a `libaxl.a` change
+> relinks nearly every image" conflates RELINKING with CHANGING. Every image is
+> relinked; `--gc-sections` plus selective archive-member linking means most of
+> them come out BYTE-IDENTICAL, because they never linked the code that
+> changed. Measured, a core-library edit changes 44 of 118 artifacts and leaves
+> **46% of the suite's work skippable**, not 0%.
+
+**Nothing, on the most common commit.** A `libaxl.a` change relinks nearly
+every image, so nearly every digest set changes and everything re-runs — which
+is correct, and is also the answer for most of the work done here.
+
+Where it pays:
+
+- a `tools/*.c`-only commit, which leaves the library and every non-tool image
+  byte-identical;
+- a commit touching only one test script;
+- a re-run after a flake, where nothing changed at all — today that costs the
+  full 569 s to learn what one test does.
+
+**The payoff distribution is the open question, and it is cheap to answer
+before building anything**: log the digest sets for one full run, then replay
+them against a few real historical commits (`git show --stat`) and count how
+many of the 164 would have been skipped. If the answer for a tools-only commit
+is not most of them, the feature is not worth its invalidation surface.
+
+### 12.8 Reporting rule — decided
+
+**A scoped or cached run never reports a bare green; it names what it did not
+run.** `verify.sh --only` already does this and the reasoning generalises: the
+failure this tree keeps meeting is a gate that cannot see a change reporting
+the same green as one that can. A cached pass and a real pass must not look
+alike in a terminal or in a CI log.
+
+### 12.9 CI stays unrestricted on push
+
+§11.2 records what the opposite policy cost: five days and ~40 commits of
+undetected red, in three places, two of which a dev box structurally cannot
+catch. A cache is only as good as its input capture — it will not see a
+rebuilt OVMF, a harness edit outside the recorded set, or a toolchain bump.
+The local gate gets faster; the push gate stays whole.
+
+### 12.10 SHIPPED: `--only-local`, and what it actually measured
+
+Before building the cache, the cheapest lever turned out to be an asymmetry
+already encoded in the tree. `# test-meta: local-only=1` marks tests a CI
+runner structurally cannot run, and `--ci` already excludes them. **X64: those
+are 14 tests and 733 s of the suite's 3,385 s.** The other 2,652 s -- 78% of
+what a developer waits for -- is work CI repeats on every push to `main`, on
+our own box, for free, minutes later.
+
+`run-integration.sh --only-local` is the inverse of `--ci`: run only what a
+push will not tell you.
+
+| | before | after |
+|---|--:|--:|
+| `verify.sh` | 61 s | 61 s |
+| integration X64 | 569 s | **382 s** |
+| integration AARCH64 | 274 s | **52 s** |
+| **total** | **904 s** | **495 s** |
+
+**-409 s, -45%.**
+
+**The estimate was 122 s and the measurement was 382 s, and the gap is the
+useful part.** 733 s over 6 workers predicts 122 s -- but that arithmetic
+assumes the run stays WORK-bound, and dropping to 14 tests makes it TAIL-bound:
+`test-console-device-qemu.sh` alone is 379 s, so `max(733/6, 379) = 379`.
+Measured 382.
+
+So the full suite and the scoped suite have different critical paths and want
+different fixes. The full suite is work-bound at 99% packing efficiency (§12.1)
+and only responds to doing less. The scoped suite is one test:
+**`test-console-device-qemu.sh` is 11% of the whole suite's work and 100% of
+the scoped run's critical path.** Splitting or shortening it takes the inner
+loop to roughly 230 s; nothing else moves it at all.
+
+**It is not a pre-push gate, and it says so.** Per §12.8 the run prints
+`integration: PARTIAL -- only-local: ran the N test(s) CI cannot, SKIPPED
+everything CI does run.` It is also excluded from the release-gate stamp
+(§10.3) -- and so is `--ci`, which could previously write a "complete run"
+stamp having skipped every local-only test. That was the same defect this flag
+would have introduced, one flag earlier.
+
+### 12.11 Instrumented: the suite is guest boots, and nothing else
+
+`AXL_TEST_PROFILE=<file>` turns on per-boot instrumentation
+(`test/integration/lib/profile.sh`, inert otherwise -- **568.15 s profiled vs
+569 s not**, and no file is written when it is off).
+`lib/profile-report.py` reads it.
+
+X64, one full run:
+
+| | |
+|---|--:|
+| guest boots | **226** |
+| suite test-time | 3,385 s |
+| mean per boot | **15.0 s** |
+| directly-timed boots | median **12.1 s**, min **6.8 s**, max 60 s |
+
+**Essentially 100% of the suite's cost is guest boots.** `hello-minimal` boots
+once, does almost nothing, and takes **7.05 s** -- so ~7 s is the floor per
+boot (QEMU start, OVMF init, shell, `startup.nsh`, reset). **226 x 7 ~= 1,582 s,
+47% of the suite, is boot overhead that tests nothing.**
+
+The count read 233 until 2026-08-19: the record was emitted where the QEMU
+command is ASSEMBLED, which is one point every launch passes through and is
+still not the same as a launch. `QEMU_DRYRUN=1` assembles and exits, and so do
+the late validation failures -- so `test-run-qemu-flags.sh`, host-only argument
+parsing that boots nothing at all, was credited with SEVEN boots in ONE second.
+That impossibility is what exposed it. The record now sits after the dry-run
+exit, below which every real launch happens. The correction was confined to
+that one test (7 -> 0) and moved no conclusion.
+
+Where the boots are:
+
+| | tests | boots | seconds |
+|---|--:|--:|--:|
+| boot exactly once | 117 | 117 | 1,786 |
+| boot more than once | **29** | **116** | **1,446** |
+
+Collapsing every multi-boot test to a single boot would take 233 -> 146 boots
+and reclaim ~600 s of pure overhead. Ten tests hold >=4 serial boots, and one
+dominates: **`test-console-device-qemu.sh` holds 15 boots at 25.3 s each** --
+2x the median, because it runs DEBUG OVMF deliberately (it asserts on firmware
+ASSERTs). It is also `local-only=1`, so **CI never pays for it and the whole
+379 s is a local-only cost, on every run.**
+
+The caveat that stops this being a global fix: those 116 boots are mostly not
+redundant. They load different drivers or need clean firmware state, which is
+*why* they are separate boots. Merging is per-test work, not a sweep.
+
+#### 12.11.1 The first instrumentation was wrong and looked complete
+
+It hooked `test_run_background`/`test_wait_for` and reported "41 boots across
+41 tests, 521 s of guest time" -- a confident, well-formatted report covering
+**25% of tests and 15% of the work**, with `test-console-device-qemu.sh`, the
+single most expensive test, absent entirely.
+
+There are **three** general paths from a test to a guest, and they are
+disjoint:
+
+| path | tests | seam |
+|---|--:|---|
+| `test_run_background` + `test_wait_for` | ~41 | timed exactly |
+| `test_run_foreground` | many | timed exactly (starts and ends in one call) |
+| `scripts/run-qemu.sh` | 71 | **counted only** |
+
+`run-qemu.sh` is counted rather than timed because it installs and REPLACES an
+EXIT trap in four places; a fifth for the stop stamp would clobber a cleanup
+that removes the guest's TMPDIR. Seconds-per-boot for that path is derived from
+the runner's own per-test time, and the report marks those figures `~` rather
+than presenting them as measured.
+
+A fourth path is private to `test-crashhandler.sh`, which assembles its own
+QEMU command (it strips KVM, because the crash handler needs a real `#GP`).
+Left uninstrumented and recorded in `profile.sh` instead -- hooking a private
+command assembly is a worse trade than saying so.
+
+**The report now prints a `recorded NO boot` section**, so the next gap
+announces itself instead of reading as a fast test. Host-only tests (a link
+probe, an `axl-cc` flag check) legitimately appear there; a `*-qemu.sh` test
+appearing there is a bug in the instrumentation. That section is what found the
+`test_run_foreground` gap.
+
+#### 12.11.2 `--affected` — association by artifact, working today
+
+    python3 test/integration/lib/profile-report.py prof.txt \
+        --affected out/native-x64/hello.efi
+
+Maps changed build artifacts to the tests that stage them, using the `efi|`
+records (destination + sha256 captured at `test_add_efi`). This is §12.6's
+association question answered from data rather than from a directory map, for
+the reason in §12.5 -- and it prints artifacts that **no** profiled test stages,
+because "cannot be mapped" must be visibly different from "affects nothing".
+
+### 12.15 Phase 3 answered: the cache is worth building
+
+§12.7 asserted the digest cache buys nothing on a library change, which is most
+commits, and that assertion is what kept it below the line in every ranking
+here. It is wrong. Measured by perturbing one source, rebuilding, and diffing
+the digests of the 118 artifacts the suite actually stages:
+
+| change | artifacts changed | tests that must run | skippable |
+|---|--:|--:|--:|
+| tool only (`tools/grep.c` help string) | 2 of 118 | 3 | **146 (86%)** |
+| library (`src/mem/axl-mem.c` string) | 44 of 118 | 76 | **73 (43%)** |
+
+Weighted by WORK rather than test count, which is what wall clock follows:
+
+    library change:  3,361 s total
+                     1,725 s must run
+                       101 s cannot be proven unaffected (20 tests stage nothing)
+                     1,535 s SKIPPABLE  = 46% of the work
+                     => full X64 560 s -> 304 s
+
+**The error was conflating RELINKING with CHANGING.** Every image is relinked
+when `libaxl.a` changes. Most come out byte-identical, because
+`--gc-sections` plus selective archive-member linking means an image that never
+linked the code that changed contains the same bytes it did before. Only 44 of
+118 artifacts moved.
+
+That makes the cache the largest remaining win by a distance -- bigger than
+everything shipped in §12.10, §12.13 and the rollout combined, and it is the
+only one that touches the FULL run, which §12.1 showed is work-bound and
+therefore only responds to running less.
+
+#### 12.15.1 What had to be fixed to measure it at all
+
+The artifact capture was recording **82 of 169 tests**. `test_add_efi` is
+common-test.sh's staging path, and the 71 tests that reach a guest through
+`run-qemu.sh` pass their `.efi` positionally, so `run-qemu.sh` staged it and
+nothing recorded it -- the same disjoint-path gap that made the first boot
+instrumentation cover a quarter of the suite (§12.11.1). Recording `$EFI_FILE`
+alongside the boot record takes it to **149 of 169**. The remaining 20 are
+genuinely host-only (link probes, `axl-cc` flag checks, the CMake package) and
+stage nothing; they can never be proven unaffected and must always run. That
+is 101 s of the 3,361 s, and it is the cache's floor.
+
+#### 12.15.2 Two no-op perturbations, and what they cost
+
+The first two attempts measured nothing and said so convincingly: **0 changed
+artifacts** for a `tools/grep.c` edit, then **0** for a `src/data/axl-str.c`
+edit. Both inserted a COMMENT, which emits byte-identical code. Read quickly,
+the first reading confirmed §12.7's claim -- a library change that appears to
+invalidate nothing -- for entirely the wrong reason.
+
+`sabotage.sh --expect-fail` exists to refuse exactly this, and it was not in
+play because this is a MEASUREMENT rather than an assertion, so there was no
+"the suite must notice" to invert. The lesson generalises past sabotage: **a
+perturbation used as a measuring instrument needs its own proof that it
+perturbs something.** Changing a string literal does; changing a comment does
+not.
+
+#### 12.15.3 What the number is NOT
+
+One library file, one commit shape. `axl-mem.c` is linked by 64 of the members
+in a do-nothing image, so it is a WIDELY linked file, but it is still one
+sample -- a public-header change that alters a struct layout would invalidate
+more, and a leaf module fewer. The distribution across real commits is not
+measured, and §12.12 keeps that as the next step rather than assuming this
+number generalises.
+
+### 12.16 SHIPPED: the skip cache — full X64 564 s -> 78 s
+
+`run-integration.sh` skips a test whose inputs are byte-identical to its last
+GREEN run (`test/integration/lib/test-cache.sh`). **On by default since the
+same day it shipped**, and the reason is behavioural rather than technical: it
+was built opt-in, and then not used once in the session that built it -- the
+full uncached gate was run after every change instead. A flag that the author
+does not type is not going to be typed by anyone.
+
+`--no-cache` turns it off, and that is the run a pre-push or release gate must
+use: **only an uncached run writes the release-gate stamp**, and `--ci` implies
+`--no-cache` because CI is the backstop (§11.2 records five days of undetected
+red when it was not run) and a backstop that skips is not one. `cut-release.sh`
+names `--no-cache` when it finds no usable stamp, so the fix does not read as
+"run it again" -- which would be cached too.
+
+| | no cache | `--cache`, warm |
+|---|--:|--:|
+| full X64 | 564 s | **71-78 s** (136 cached, 34 ran) |
+| `--only-local` X64 | 133 s | **24 s** |
+
+Three independent warm runs: 77.6 s, 72.7 s, 70.9 s. The spread is ambient load
+on a shared box, not variance in the cache. The no-cache baseline reproduces to
+**564.06 / 564.10 s** across runs half an hour apart, which is what makes the
+pair trustworthy -- a contaminated measurement does not land 0.04 s from an
+independent one.
+
+**The order of operations is the design**, because what a test stages is only
+knowable by running it -- there is nothing to hash before the first run. Run 1
+records each input as the test stages it and commits a key on green; run N
+re-hashes the RECORDED list. The list stays valid only while the test would
+stage the same things, which is why the test script and the harness are in the
+key: change either, the key misses, the test runs, and the list is rewritten.
+Go's test cache in miniature -- observed inputs, never declared ones.
+
+#### 12.16.1 The soundness demonstration
+
+Not "it got faster", which any broken cache achieves. Perturb `tools/grep.c`,
+rebuild, re-run the full suite against a warm cache, and see WHICH tests wake
+up:
+
+    test-axl-busybox.sh   (embeds grep.efi)
+    test-shell-pipe.sh    (pipes through it)
+    test-tools.sh         (tests it)
+
+Three, and exactly the three that stage `grep.efi`. Everything else stayed
+cached, and the run was 170/0.
+
+`test-test-cache.sh` holds the property tests -- 13 assertions, and every one
+except the two controls asserts a MISS, because the dangerous direction is a
+false hit: a changed artifact, test script, `common-test.sh`, `run-qemu.sh`,
+any `lib/*.sh`, a different arch, a different `AXL_TLS`, a vanished input, no
+record at all, and a key dropped after a red run. The two controls exist
+because a cache that never hits is trivially sound and useless, and would pass
+a file made only of miss assertions.
+
+#### 12.16.2 What it does NOT cover, and the 37 that always run
+
+The key covers every staged artifact by SOURCE path and digest, the firmware
+(`FW_CODE`/`FW_VARS` are recorded like any other input), the test script, the
+harness, the arch and `AXL_TLS`. A toolchain change is covered transitively --
+it changes the artifacts.
+
+It does NOT cover the host environment: `nproc`, `/dev/shm`, network
+reachability, the version of python/tar/socat a test shells out to. A test
+whose result is not a pure function of the tree cannot be seen to change. That
+is why the cache is opt-in, why a cached run prints
+`integration: PARTIAL -- --cache: N test(s) SKIPPED`, and why it is excluded
+from the release-gate stamp alongside `--shard`, `--ci` and `--only-local`.
+
+The 37 that ran on a warm no-change suite are the honest floor, and each is a
+"cannot prove", never a "probably fine":
+
+- **20 host-only tests** stage nothing (link probes, `axl-cc` flag checks, the
+  CMake package). Nothing to hash, so nothing to compare.
+- **3 stage a temp file that is gone by key time**, so `cache_key` refuses to
+  answer -- a missing input reads as a miss, never a hit.
+- **`test-json-corpus-qemu.sh`** SKIPs when the external corpora are not cloned,
+  so it boots nothing and records nothing.
+- the rest are tests whose artifacts genuinely moved.
+
+#### 12.16.3 A measurement-hygiene note that cost real time
+
+Two of these numbers were re-taken because an orphaned `sphinx-build` was found
+running at 48% CPU. It came from a command of mine being interrupted mid-flight:
+the shell died and `sphinx-build -j auto` reparented to init, where it competes
+for all 8 cores. `scripts/build-docs.sh` runs TWO of them concurrently (html and
+man), so a stray one is a heavy contaminator, and `verify.sh` does not leak one
+when it completes normally -- verified.
+
+The sweep then made it worse: `pkill -f 'sphinx-build'` matches its OWN command
+line and killed the shell running it. Kill by PID, from a `ps | grep '[s]phinx'`
+bracket pattern.
+
+**Before quoting a wall-clock number here, check `ps` for strays and quote more
+than one run.** The reproducibility above is the evidence, not the environment.
+
+#### 12.16.4 Both numbers are real, and they answer different questions
+
+78 s is a **no-change re-run** -- the flake retry, the "did I break anything
+with that doc edit" loop. After a real library change the figure is the §12.15
+one, ~304 s, because 46% of the work is skippable and the rest is not. Quoting
+78 s as the cost of a library change would be the same category error §12.13.1
+already paid for twice.
+
+### 12.17 NOT SCHEDULED — caching `verify.sh`'s jobs, if the clock is felt again
+
+Recorded as a level to reach for later, deliberately not built. **Trigger: pick
+this up only if the local gate starts feeling slow again.** Measured
+2026-08-19, each job alone against all five concurrently:
+
+| job | alone |
+|---|--:|
+| x64 unit suite | 49.1 s |
+| aa64 unit suite | 47.7 s |
+| docs | 43.5 s |
+| lint | 30.3 s |
+| make gates | 26.6 s |
+| sum | 197.2 s |
+| **all five concurrently** | **61.2 s** |
+
+**`verify.sh` is CONCURRENCY-bound, and that is the whole analysis.** Wall is
+61 s against a 197 s sum, and only 12 s above the longest single job. So
+skipping a job buys nothing unless it is the one on the critical path -- the
+opposite of the integration suite, which is WORK-bound at 99% packing (§12.1)
+and where skipping converts ~1:1. Same distinction, opposite conclusion; it is
+worth re-deriving rather than assuming, because the two look alike.
+
+What a path-based `--changed` would buy, by commit shape:
+
+| shape | jobs that can see it | wall |
+|---|---|--:|
+| docs-only | docs | ~43 s (-18) |
+| test-only | make | ~27 s (-34) |
+| `src/*.c` | x64, aa64, lint, make | ~55 s (**-6**) |
+
+6-34 s, and the COMMON case is the worst one: the two unit suites are the
+longest jobs and every source change touches them.
+
+**A correction this section exists to record.** §12.2 ranked this work last
+because it was "worth at most 61 s, 6.7% of the gate". True then. The inner
+loop is now ~85 s and `verify.sh` is ~85% of it, so the reason for the ranking
+has expired even though the 61 s has not moved. That is the third time in this
+arc that removing the largest cost reshuffled what mattered -- the pattern is
+worth more than any of the individual numbers.
+
+**If picked up, extend the §12.16 cache rather than building a `--changed`.**
+The two unit suites are 49 s and 48 s of the critical path and are structurally
+identical to an integration test: one QEMU boot whose inputs are the test
+`.efi`s, the firmware and the harness. If `libaxl` is unchanged those binaries
+are byte-identical and the run is skippable on the same proof -- measured
+artifacts, never guessed relevance (§12.5). Expected: both arch jobs cached
+takes wall to `max(docs 43, lint 30, make 27)` ~= 43 s; docs is cacheable too
+(its inputs are the public headers plus `src/*/README.md`, both hashable), which
+would give ~30 s, and an inner loop of ~40 s.
+
+**Why it is not built now.** The risk is materially larger than for
+integration: skipping a unit job means not executing **10,497 assertions**, so
+a key that is subtly wrong hides a real regression instead of merely costing
+time. Integration tests fail loudly and individually; a skipped unit suite is
+silent. It would need the §12.8 treatment (PARTIAL, never a bare green,
+excluded from the release-gate stamp) plus no-cache-by-default in CI, and the
+payoff -- 20-45 s on a gate that is already ~85 s -- does not currently justify
+that care.
+
+### 12.18 The x64-only census, audited — and two silent-coverage fixes
+
+§12.14 said the X64/AARCH64 asymmetry is COVERAGE and declined to say how much
+of it is legitimate, because the obvious grep was caught missing a reason
+spelled `DEBUG-OVMF` with a hyphen. Audited properly:
+
+| | |
+|---|--:|
+| tests declaring `arch=x64` | 102 |
+| header states an architecture reason | 74 |
+| no stated reason, but HOST-ONLY (0 boots) -- `arch=x64` just means "run once" | 7 |
+| **guest tests, x64-only, no stated reason** | **21** |
+
+21, not the 65 the first grep claimed. The 7 host-only ones are not an
+asymmetry at all: a link probe or an `axl-cc` flag check has no architecture,
+and `arch=x64` is how the runner is told to run it once.
+
+**Three of the 21 were tested on aa64 and all three passed unchanged** --
+`test-time-qemu.sh` (21/0), `test-yield-ctrlc.sh`, and
+`test-console-readline-qemu.sh`, which already printed `PASS (AARCH64)`. So the
+arch support was there and only the `test-meta` line said otherwise. All three
+are now `arch=both`; aa64 selects 71 tests where it selected 68.
+
+That is a sample of 3, and it is evidence about the sample and not a claim
+about the remaining 18. It does establish the category though: **some of this
+residual is "never ported", not "unportable"**, and a per-test check is cheap
+(run it with `--arch AARCH64` and read the exit code). The remaining 18:
+
+    ata  axbench-ctrlc  cpu-topology  https-driver  input-modifiers  net-config
+    nic  nvme  scsi  sendkey-render  shell-coexist  shell-fv  shell-launcher
+    smart  tcp-close-pendtx-driver  tcp-multi-transmit  ws-broadcast-tls
+    ws-teardown-driver
+
+Several plainly depend on emulated devices (`nvme`, `ata`, `scsi`, `nic`) whose
+aa64 availability is a real question rather than an oversight. Nobody should
+flip one without running it.
+
+#### 12.18.1 A skipped test was being counted as a pass
+
+`exit 0` was the convention for "this test declined to run", so the suite
+counted it among its passes. **39 of 176 tests can take that path.** On this
+machine exactly one does: `test-json-corpus-qemu.sh`, whose corpora are not
+vendored -- so a run that tested no JSON corpus at all reported the same green
+as one that tested every document in it.
+
+`run-integration.sh` now scores **exit 77** (the automake convention) as SKIP:
+its own verdict, neither PASS nor FAIL, named in the totals
+(`N passed, M failed, K SKIPPED`) and listed underneath. It is handled BEFORE
+the retry (a test that cannot run will not run better the second time) and
+before the cache (the reason it skipped is not in the key, so committing one
+would skip it forever afterwards).
+
+Converted: `test-json-corpus-qemu.sh`. The other 38 are latent -- they only
+matter on a machine missing the dependency -- and adopt 77 as they are touched
+rather than in a sweep. `test-runner-selftest.sh` asserts the mechanism with a
+stub that exits 77, including that it is scored neither PASS nor FAIL.
+
+### 12.12 Rollout — revised by what §12.10 and §12.11 measured
+
+**Tracked as phases in [ROADMAP.md](ROADMAP.md) → "Local gate wall time".**
+That file owns what is done and pending; this section owns the design and the
+measurements. Each phase updates this section with what it MEASURED rather than
+what it intended — the two have already diverged twice here (§12.10's 122 s
+estimate against a 382 s measurement, and §12.11's first instrumentation
+covering a quarter of the suite while looking complete), and both times the
+divergence was the useful part.
+
+
+**Done:** `--only-local` (§12.10), 904 s -> 495 s with no new machinery; the
+boot instrumentation (§12.11), which turned "where does the time go" from a
+guess into a table; and Phase 1 below. §12.11 also subsumed rollout step 3 of
+the previous revision -- digest recording already exists, as the `efi|` records.
+
+Ranked by what the measurements say, not by what looked obvious first:
+
+1. [DONE] **`test-console-device-qemu.sh` split four ways.** It held 15 serial
+   DEBUG-OVMF boots at 25.3 s each. The scenarios cannot be MERGED -- each loads
+   a different driver at the shell prompt and screenshots it -- so they are
+   split, and the split is sized rather than guessed: the local-only set is
+   ~733 s of work over 6 workers, a 122 s floor, so the longest piece only has
+   to get under that. **Four is the first split that reaches it** (largest
+   piece ~107 s); a fifth would buy nothing.
+
+   | | before | after |
+   |---|--:|--:|
+   | `--only-local` X64 | 382 s | **194 s** |
+   | `--only-local` aa64 | 52 s | 51 s |
+   | full X64 | 569 s | 573 s |
+   | full aa64 | 274 s | 257 s |
+   | **inner loop** (`verify.sh` + both `--only-local`) | **495 s** | **306 s** |
+
+   All 42 assertions preserved exactly (12+12+9+9, against 11 `run_scenario` x3
+   plus 2 serial scenarios x2 and two inline at 3+2). The full run is unchanged
+   because it is work-bound (§12.1) and splitting moves work rather than
+   removing it -- predicted, and confirmed at 573 s against 569 s.
+
+   **The exit criterion was <= 300 s and it landed at 306 s.** Recorded as a
+   miss rather than rounded: 1.9% short. The cause is that the binding
+   constraint moved again. With 17 local-only tests over 6 workers the pool
+   packs lumpily -- six tests are now >= 87 s (`old-shell` 117, `fbcon-life`
+   107, `takeover` 101, `fbcon` 97, `input` 92, `kbtune-bounce` 87) and fill
+   every worker at once, so the run measures 194 s against a 125 s work floor:
+   65% packing, where the full run gets 99%. It is no longer one test, and
+   Phase 2 clears the remainder as a side effect.
+2. [DONE, and not what was planned] **Longest-first scheduling.** Phase 2 was
+   going to be "split `test-old-shell-qemu.sh` next". Reading the code first
+   found something cheaper: the pool consumed tests in DISCOVERY order, i.e.
+   the glob's alphabetical one, which is arbitrary with respect to cost. Feeding
+   a fixed job set to N workers is makespan scheduling, where
+   longest-processing-time-first is the classic greedy and is within 4/3 of
+   optimal; arbitrary order has no bound at all, because a long test that starts
+   last runs alone while five workers idle. A `sort` on the `est=` every test
+   already declares:
+
+   | | before | after |
+   |---|--:|--:|
+   | `--only-local` X64 | 194 s | **134 s** |
+   | `--only-local` aa64 | 51 s | 51 s |
+   | full X64 | 573 s | 571 s |
+   | full aa64 | 257 s | **244 s** |
+   | **inner loop** | 306 s | **246 s** |
+
+   **The scoped run went from 65% to 93% packing** (134 s against its 125 s
+   floor) with no test changed, which is the best ratio in this whole exercise.
+   The full run does not move, and that was predicted rather than discovered:
+   §12.1 already measured it at 99%, because with 164 tests there is always
+   small work left to fill a gap. Order only decides the makespan when the job
+   set is small and lumpy -- which is exactly what `--only-local` is.
+
+   It also clears Phase 1's 6 s miss: the inner loop is now **246 s** against
+   that phase's <= 300 s exit.
+
+   Checked and NOT done: refreshing `est=` from the profiler's measurements.
+   Only 2 of 169 are off by >= 25 s and both are OVER-estimates, which LPT
+   handles safely (it just starts them early). The churn would have bought
+   nothing.
+3. **The other multi-boot tests** -- `test-old-shell-qemu.sh` (117 s, 6 boots)
+   is the longest that remains. 29 tests hold 116 of the 233 boots.
+   **The exit number for this one needs restating**, because Phase 1 proved
+   splitting cannot deliver it: the full run is work-bound at 99%, so splitting
+   MOVES work between workers and removes none. Only MERGING boots reduces the
+   full run, and those boots mostly exist for state isolation -- each loads a
+   different driver or needs clean firmware -- so merging trades wall clock for
+   cross-contamination and worse diagnosis. Splitting still helps the SCOPED
+   run, but after LPT that is already at 93% packing, so the remaining headroom
+   there is ~9 s. **Recommendation: stop here unless a specific test can shed
+   boots without losing isolation.**
+3. [DONE -- §12.15] **The digest cache's payoff, measured.** The answer
+   reverses the ranking: a library change leaves **46% of the work skippable**
+   (full X64 560 s -> 304 s), and a tool-only change 86% of tests. §12.7's
+   "buys nothing on a libaxl change" conflated relinking with changing.
+4. **BUILD THE SKIPPING HALF**, with §12.8's reporting. Now the largest
+   remaining win by a distance, and the only one that touches the FULL run.
+   Needs, beyond what §12.15 already records: the test script, the harness
+   (`common-test.sh`, `run-qemu.sh`), the firmware image and the toolchain id in
+   the key -- an artifact digest alone does not see those. The 20 tests that
+   stage nothing must always run; that is the floor and it is 101 s.
+   Before building, sample more commit shapes (§12.15.3): one widely-linked
+   library file is one data point, not a distribution.
+5. **clang-tidy scoping** for CI, separately. Deliberately last: it is the
+   intuitive target and §12.2 shows it is worth at most 61 s locally.
+
+**Not on this list: making boots cheaper.** At a ~7 s floor and a 12.1 s
+median, halving per-boot cost would beat everything above -- but `run-qemu.sh`
+already skips the Boot Manager countdown, and ~7 s is close to what an OVMF
+boot costs. Recorded so it is not re-proposed as an obvious win without a
+measurement behind it.
+
+### 12.13 Phase 3 — merging boots, and why the payoff kept shrinking
+
+Splitting helps the scoped run; only MERGING boots helps the full one (§12.1 is
+work-bound). `test-tar-qemu.sh` was the pilot: **7 boots -> 1, 50 s -> 7.3 s**,
+all 11 assertions preserved plus a new one asserting the guest reached the last
+step.
+
+It merged cleanly because nothing there needed isolation. Every boot mounted the
+SAME host directory and differed only in `tar.efi`'s arguments, and the
+scenarios were already coupled THROUGH that mount -- step 2 lists what step 1
+wrote, step 7 extracts what step 5 wrote. The dependency was never the boot; it
+was the filesystem. One shell session running them in order preserves it
+exactly.
+
+#### 12.13.1 The estimate fell twice, and the reason is the useful part
+
+| estimate | basis | full-X64 saving |
+|---|---|--:|
+| first | all 32 multi-boot tests merge; 84 boots at the 15 s mean | ~200 s (**-35%**) |
+| second | keyword split + hand audit; ~50 boots at the 15 s mean | ~125 s (**-22%**) |
+| **measured** | tar's 6 boots removed = **7 s of wall**; extrapolated | ~50 s (**-9%**) |
+
+**The boots you can remove are the cheap ones.** That is the whole correction.
+Tar's boots were ~7 s each -- a trivial payload paying full firmware boot --
+while the 15 s suite mean is dragged up by boots that are NOT candidates:
+`console-device` at 25.3 s (DEBUG OVMF, one driver each), `cpu-spike` at 44 s
+(the boot is doing real work). Expensive boots are expensive *because* they do
+something, and the something is usually what forbids merging. Applying a suite
+mean to a self-selected cheap subset is what produced both earlier figures.
+
+Measured end to end: full X64 **571 s -> 564 s**, boots **226 -> 220**.
+
+#### 12.13.2 What it costs, and the recommendation
+
+A merged test loses per-scenario isolation: a guest-side failure in an early
+step leaves later steps running against missing inputs, so one fault can print
+several failures. Tar mitigates it with per-step markers, a per-step transcript
+slice, and an explicit "reached the last step" assertion that fires FIRST -- so
+a dead boot reads as one dead boot rather than six tar bugs. That mitigation is
+per-test work; it is not a sweep.
+
+**Recommendation: stop here, or cherry-pick.** The remaining ~19 candidates buy
+about **43 s** of wall, on a run performed once before a push, at the cost of
+19 test rewrites each carrying that cascade risk. The pilot was worth doing --
+`test-tar-qemu.sh` is now 7.3 s instead of 50 s and reads better -- but the
+marginal ones are not, and the inner loop (§12.10, §12.12) is where a developer
+actually feels the clock.
+
+A trap worth recording from the pilot: the shell echoes a command BEFORE its
+output, so the transcript carries `FS0:\> echo TARSTEP:2` and then `TARSTEP:2`.
+A `sed` range ending at the next `/TARSTEP:/` closes on the echoed marker
+itself and returns one line -- which read as "tar -t listed nothing", a guest
+bug that did not exist. Slice from the bare marker line to the next command
+echo.
+
+### 12.14 Why X64 takes 2.3x AARCH64, which is not a speed difference
+
+The natural reading of `X64 564 s / AARCH64 244 s` is that x64 is slower, and
+the natural objection is that it should be the other way round -- aa64 runs
+under TCG with no KVM. Both readings are wrong, in opposite directions.
+
+| | X64 | AARCH64 |
+|---|--:|--:|
+| tests selected | 169 | **68** |
+| guest boots | 220 | **80** |
+| test-time (work) | 3,385 s | 1,488 s |
+| wall | 564 s | 244 s |
+| per boot, mean | 12.6 s | **14.4 s** |
+| per boot, median | 12.2 s | 12.1 s |
+| per boot, min | **6.8 s** | **11.4 s** |
+
+**Per boot, aa64 IS slower** -- 14% on the mean and **68% at the floor**, which
+is the TCG penalty showing up exactly where it should. x64 simply runs 2.75x
+the boots. Work is 2.3x and wall is 2.3x, matching to the digit because both
+arches are work-bound at 6 workers (§12.1).
+
+The medians are identical (12.1 vs 12.2), and that is the informative part.
+Emulation costs CPU, so it is visible in the FLOOR -- firmware init, shell
+startup, the parts that are pure computation. A median boot is dominated by
+waiting on its payload, where the two arches converge. **Emulation is expensive
+for cheap boots and nearly free for expensive ones.**
+
+So the asymmetry is COVERAGE: 101 tests declare `arch=x64`, 60 declare `both`,
+and **none declares aa64**. aa64 exercises 40% of the suite.
+
+How many of those 101 are legitimately x86-bound (KVM, virtiofs, DEBUG OVMF,
+Shell106, the MS x64 ABI) is NOT recorded here, because the obvious way to
+count it does not work: a keyword grep over the headers reported "65 state no
+reason" and was then caught missing the stated reason in the four
+console-device files, which spell it `DEBUG-OVMF` with a hyphen. A number that
+wrong in its first spot-check is not worth quoting; establishing it needs a
+per-test read.
+
+One consequence worth knowing before anyone "balances" the arches: parity would
+make aa64 the SLOWER run, not a matching one -- 220 boots at a 11.4 s floor
+against x64's 6.8 s.
+
 ## 9. Open questions
 
-- **Does the hosted shard count want to be 4 or 6?** 4 gives ~14 min at +12
-  billable; 6 gives ~10 min at +15. Pick after the first real hosted run, since
-  the per-shard fixed cost is the estimate with the least evidence behind it.
-- **Should `clang-tidy` (7 min, container `apt` every run) cache its image?**
-  Out of scope here; it is the second-largest CI job now that the first is
-  fixed.
-- **Does the runner want a second registration** so the hosted-style 4-way
-  shard can also run on the box? Only worth it if the 9-minute self-hosted run
-  becomes the critical path, which it is not today.
+- ~~**Does the hosted shard count want to be 4 or 6?**~~ **MOOT.** §10.2 dropped
+  hosted sharding outright (it trades billable minutes for wall time, and the
+  self-hosted runner removed the problem it solved). The question outlived the
+  approach it belonged to; kept struck through rather than deleted so nobody
+  re-derives it.
+- **OPEN — should `clang-tidy` (7 min, container `apt` every run) cache its
+  image?** Now the largest CI job. Overlaps §12.12 step 5 (scoping it to
+  changed files): caching attacks the fixed `apt` cost, scoping attacks the
+  per-file cost, and they compose. §12.2 is the caveat -- both are worth ~0
+  LOCALLY, since `verify.sh` is 61 s in total.
+- **OPEN, low priority — does the runner want a second registration** so the
+  hosted-style 4-way shard can also run on the box? Only worth it if the
+  9-minute self-hosted run becomes the critical path, which it is not: §12
+  established the LOCAL gate as the long pole.

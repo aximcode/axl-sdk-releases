@@ -345,7 +345,7 @@ No EDK2. No Python. No Java. No Make.
    ```
    git clone axl-sdk
    ./scripts/install.sh --arch x64
-   # produces out/bin/axl-cc, out/lib/libaxl.a, out/include/
+   # produces stage/bin/axl-cc, stage/lib/axl/<arch>/libaxl.a, stage/include/
    ```
 
 2. **Download a release tarball** (consumer workflow):

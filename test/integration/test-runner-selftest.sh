@@ -9,6 +9,15 @@ stub=$(mktemp -d); trap 'rm -rf "$stub"' EXIT
 printf '#!/bin/bash\nexit 0\n'   > "$stub/test-pass-qemu.sh"
 printf '#!/bin/bash\nexit 1\n'   > "$stub/test-fail-qemu.sh"
 printf '#!/bin/bash\nsleep 30\n' > "$stub/test-hang-qemu.sh"
+# Exit 77 is the automake convention for "skipped". A test that cannot run --
+# an absent external corpus, a missing host tool -- must NOT be counted as a
+# pass: 39 of the 176 integration tests can exit 0 having tested nothing, and
+# the suite reported them among "170 passed".
+printf '#!/bin/bash\necho "SKIP: nothing to test"\nexit 77\n' > "$stub/test-skip-qemu.sh"
+# Reports whether the runner enabled caching for it. AXL_TEST_CACHE is the only
+# thing a test can observe about that decision, so it is what the assertions
+# below read -- rather than inspecting the runner's internals.
+printf '#!/bin/bash\necho "CACHEENV=${AXL_TEST_CACHE:-unset}"\nexit 0\n' > "$stub/test-cacheprobe-qemu.sh"
 chmod +x "$stub"/*.sh
 
 fail=0
@@ -19,14 +28,52 @@ out=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh -j1 --timeout 2 2>&1); rc
 need "test-pass-qemu.sh PASS" "$out"
 need "test-fail-qemu.sh FAIL" "$out"
 need "test-hang-qemu.sh TIMEOUT" "$out"
+# A skip is its own verdict, and must be neither PASS nor FAIL.
+need "test-skip-qemu.sh SKIP" "$out"
+grep -qE 'test-skip-qemu\.sh (PASS|FAIL)' <<<"$out" \
+    && { echo "  FAIL: an exit-77 test was scored PASS/FAIL, not SKIP"; fail=1; }
+# ...and the totals must say so, or a suite that skipped half of itself still
+# reads as a clean run.
+need "skipped" "$out"
 [[ $rc -ne 0 ]] || { echo "  FAIL: runner exit 0 despite a failing test"; fail=1; }
 [[ $fail -eq 0 ]] && echo "  PASS: serial verdicts + non-zero exit"
+
+# --- caching is ON BY DEFAULT, and OFF for the runs that must be authoritative
+#
+# The cache skips a test whose inputs are byte-identical to its last green run
+# (lib/test-cache.sh). It is the default because an opt-in flag does not get
+# typed -- measured the hard way: it was built and then not used once in the
+# session that built it. What must NOT be cached is the run that certifies a
+# tree: --no-cache for a pre-push/release gate, and --ci, because CI is the
+# backstop and a backstop that skips is not one.
+# A test's stdout goes to its per-test log, not the runner's, so the probe is
+# read from there. The runner prints the log directory on its last line.
+cacheenv() {   # $1.. = runner args; echoes the probe's observation
+    local out logdir
+    out=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh "$@" 2>&1)
+    logdir=$(grep -oE '^logs: .*' <<<"$out" | tail -1 | cut -d' ' -f2)
+    [[ -n "$logdir" ]] && grep -h -oE 'CACHEENV=[^ ]*' \
+        "$logdir/test-cacheprobe-qemu.sh.log" 2>/dev/null | tail -1
+}
+[[ "$(cacheenv -j1 --timeout 2)" == CACHEENV=/* ]] \
+    || { echo "  FAIL: caching is not on by default"; fail=1; }
+[[ "$(cacheenv -j1 --timeout 2 --no-cache)" == "CACHEENV=unset" ]] \
+    || { echo "  FAIL: --no-cache did not disable the cache"; fail=1; }
+[[ "$(cacheenv -j1 --timeout 2 --ci)" == "CACHEENV=unset" ]] \
+    || { echo "  FAIL: --ci did not disable the cache — CI would skip tests"; fail=1; }
+outc=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh -j1 --timeout 2 2>&1)
+# The PARTIAL banner must fire only when something was actually skipped, or it
+# is printed on every run and stops carrying information.
+grep -q 'PARTIAL -- --cache' <<<"$outc" \
+    && { echo "  FAIL: PARTIAL printed with 0 cached tests"; fail=1; }
+[[ $fail -eq 0 ]] && echo "  PASS: cache on by default; off for --no-cache and --ci"
 
 # --- parallel (-j4): same verdicts as serial, still non-zero exit ---
 outp=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh -j4 --timeout 2 2>&1); rcp=$?
 need "test-pass-qemu.sh PASS" "$outp"
 need "test-fail-qemu.sh FAIL" "$outp"
 need "test-hang-qemu.sh TIMEOUT" "$outp"
+need "test-skip-qemu.sh SKIP" "$outp"
 [[ $rcp -ne 0 ]] || { echo "  FAIL: -j4 exit 0 despite a failing test"; fail=1; }
 [[ $fail -eq 0 ]] && echo "  PASS: -j4 verdicts + non-zero exit"
 

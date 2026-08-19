@@ -494,9 +494,24 @@ endif
 RELOC_OBJ      = $(BUILDDIR)/axl-reloc.o
 DEBUG_INFO_OBJ = $(BUILDDIR)/axl-debug-info.o
 # Apps (int main): asm CRT0 → _AxlEntry(C CRT0) → main
-LINK_CRT0   = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ)
+# TWO SPELLINGS ON PURPOSE, and conflating them is what broke a clean build.
+#
+# $(PORTING_OBJS) go on EVERY link since P4 (they are inside LINK_LIBS's
+# --start-group), so every link target must WAIT for them -- but they must not
+# appear on the command line a second time, or the two copies multiply-define
+# each other outside and inside the group.
+#
+#   LINK_CRT0_CMD  what the RECIPE puts on the ld line
+#   LINK_CRT0      what a TARGET lists as prerequisites (adds PORTING_OBJS)
+#
+# Without this, a target's prerequisites named neither glue object, so a CLEAN
+# checkout failed at `ld: cannot find .../axl-cxxrt-alloc.o` -- invisible on
+# any warm tree, which is why it reached CI rather than a dev box.
+LINK_CRT0_CMD   = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ)
+LINK_CRT0       = $(LINK_CRT0_CMD) $(PORTING_OBJS)
 # Tests/AXL_APP: asm CRT0 → _AxlEntry(from AXL_APP macro)
-LINK_CRT0_T = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ)
+LINK_CRT0_T_CMD = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ)
+LINK_CRT0_T     = $(LINK_CRT0_T_CMD) $(PORTING_OBJS)
 
 # .eh_frame / .gcc_except_table are here on EVERY link and cost a non-exceptions
 # image nothing -- measured byte-identical with `cmp`, because --gc-sections has
@@ -506,6 +521,21 @@ LINK_CRT0_T = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ)
 # thrown away: a failure that appears only at the first throw. What must stay
 # conditional is the KEEP() in the linker script (elf_*_efi_eh.lds), which is
 # what actually costs a C image +16.8%.
+# --strip-all on every PE conversion. objcopy's ELF->PE writes a COFF symbol
+# table + string table after the last section; the firmware reads NEITHER (the
+# loader uses the section table, the relocation directory and the entry point),
+# and it is ~20% of a small image -- 9,989 bytes of a 47,365-byte do-nothing
+# app, 117,146 of the shipped Hexview.efi. Nothing is lost: the side-by-side
+# .so keeps every symbol and pe-set-debug points the PE debug directory at it,
+# which is the chain rsod-decode follows. `.dbgdir` is a SECTION and survives.
+#
+# Kept OUT of OBJCOPY_SECTIONS, which is the `-j` list check-flag-parity
+# compares across build paths -- a non-`-j` flag in there would confuse that
+# gate's parse. `make check-pe-stripped` guards this one instead, and it reads
+# the ARTIFACT rather than the command line, so a path that drifts is caught by
+# its output.
+OBJCOPY_STRIP = --strip-all
+
 OBJCOPY_SECTIONS = -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
                    -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir \
                    -j .eh_frame -j .gcc_except_table
@@ -544,9 +574,18 @@ LIBGCC_A   := $(shell $(CC) -print-file-name=libgcc.a)
 # ints, 80 is ten size_t. Deterministic, and it disables itself the moment the
 # toolchain is rebuilt correctly. src/cxxrt/axl-cxxrt-alloc.c only displaces
 # newlib's mallinfo when this says the layout is wrong.
-MALLINFO_SIZE := $(shell $(CROSS)nm -S --defined-only \
+# NO `strtonum` -- it is a GAWK EXTENSION, and every container this builds in
+# has mawk (`/usr/bin/awk -> mawk` in ubuntu:24.04 and 26.04, and neither apt
+# list installs gawk). mawk exits 2 printing "function strtonum never defined",
+# so this expanded to EMPTY in CI and -DAXL_NEWLIB_MALLINFO_INT=1 was never
+# applied there -- while every local build on a gawk box applied it. A silent
+# local-vs-CI divergence in a compile flag, which is the class this tree has
+# paid for repeatedly. Hex conversion is done by the shell instead, which is
+# POSIX. `make check-awk-portability` now fails on a reintroduction.
+MALLINFO_SIZE := $(shell sz=$$($(CROSS)nm -S --defined-only \
     $$($(CC) -print-file-name=libc.a) 2>/dev/null \
-    | awk '/__malloc_current_mallinfo/ { print strtonum("0x"$$2); exit }')
+    | awk '/__malloc_current_mallinfo/ { print $$2; exit }'); \
+    [ -n "$$sz" ] && echo $$((0x$$sz)))
 ifeq ($(MALLINFO_SIZE),40)
 CFLAGS_BASE += -DAXL_NEWLIB_MALLINFO_INT=1
 endif
@@ -584,39 +623,92 @@ LINK_LIBS_CXX = --start-group $(CXX_PORTING_OBJS) $(PREFIX)/lib/libaxl.a \
                 $(LIBSTDCXX_A) $(LIBSUPCXX_A) $(LIBC_A) $(LIBM_A) \
                 $(LIBGCC_A) --end-group
 
+# The log engine is OPT-IN at link time, and this is the opt-in.
+#
+# axl_log_full / axl_log live in axl-log-emit.o and reach axl-log.o through a
+# WEAK _axl_log_vdispatch (src/log/axl-log-dispatch.h), so no ordinary
+# reference pulls the engine. Without this `-u` an image links the emitters and
+# silently discards every record -- which is exactly what `--minimal-runtime`
+# wants and exactly what nothing else does.
+#
+# It goes on the LINK LINE rather than into a CRT0 object because the CRT0 is
+# not the discriminator: unit-test binaries take $(LINK_CRT0_T_CMD), which is
+# crt0+reloc+debug-info with no axl-crt0-native.o, and their leak verdict --
+# the one test_check_leaks reads -- goes out through axl_warning. A pull
+# anchored to the app CRT0 would have silenced every one of them.
+#
+# Every macro below carries it EXCEPT LINK_EFI_APP_MINIMAL, whose whole
+# purpose is to leave it out. axl-cc spells the same distinction
+# `--minimal-runtime=log` / `=nolog`; scripts/check-flag-parity.py holds the
+# two spellings together.
+LOG_ENGINE_PULL = -u _axl_log_vdispatch
+
 # Host tool: patches PE debug data directory after objcopy
 PE_SET_DEBUG = $(BUILDDIR)/pe-set-debug
 
 # Link macro for gcc: ld → ELF .so, objcopy → PE/COFF, pe-set-debug → module name
 define LINK_EFI_APP
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
-	    -o $(2:.efi=.so) $(LINK_CRT0) $(1) $(LINK_LIBS)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) $(LOG_ENGINE_PULL) \
+	    -o $(2:.efi=.so) $(LINK_CRT0_CMD) $(1) $(LINK_LIBS)
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
 	$(PE_SET_DEBUG) $(2)
 endef
 
 # Like LINK_EFI_APP but links the minimal CRT0 (axl-cc --minimal-runtime):
 # skips _axl_init (registry/atexit/signal). Used to test the minimal entry
 # point's exit-status return path.
+# $(3) is the optional `-u SYMBOL` set that opts a --minimal-runtime image
+# back into a feature. The minimal CRT0 references axl_stream_init and the
+# argv trio WEAKLY, so each is absent unless something pulls its archive
+# member; `-u` is what pulls it. axl-cc spells the same thing
+# `--minimal-runtime=stdio,args`.
 define LINK_EFI_APP_MINIMAL
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) $(3) \
 	    -o $(2:.efi=.so) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_MINIMAL_OBJ) $(1) $(LINK_LIBS)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
 	$(PE_SET_DEBUG) $(2)
 endef
 
 define LINK_EFI_TEST
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
-	    -o $(2:.efi=.so) $(LINK_CRT0_T) $(1) $(LINK_LIBS)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) $(LOG_ENGINE_PULL) \
+	    -o $(2:.efi=.so) $(LINK_CRT0_T_CMD) $(1) $(LINK_LIBS)
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
 	$(PE_SET_DEBUG) $(2)
 endef
 
 define LINK_EFI_DRIVER
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) $(LOG_ENGINE_PULL) \
 	    --defsym=_AxlEntry=DriverEntry \
 	    -o $(2:.efi=.so) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(1) $(LINK_LIBS)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=11 $(2:.efi=.so) $(2)
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=11 $(2:.efi=.so) $(2)
+	$(PE_SET_DEBUG) $(2)
+endef
+
+# A C++ DRIVER image: LINK_EFI_DRIVER's entry/subsystem with LINK_EFI_APP_CXX's
+# libraries and linker script. Both halves matter and neither is optional.
+#
+#   $(EFI_LDS_EH)   the exceptions script, which KEEPs .eh_frame. Every C++
+#                   link takes it since P4 -- libstdc++ is compiled WITH
+#                   exceptions whatever this source passed, so a throw out of
+#                   it needs a registered frame table to reach the terminate
+#                   handler rather than dying mutely.
+#   KEEP(.init_array) is in BOTH scripts, and is why a driver's constructors
+#                   survive --gc-sections at all: nothing REFERENCES an
+#                   .init_array entry. Being kept is not the same as being
+#                   RUN, which is the whole point of the fixture this macro
+#                   builds -- a driver image carried the entries and called
+#                   none of them.
+define LINK_EFI_DRIVER_CXX
+	@if [ -z "$(LIBSTDCXX_A)" ] || [ -z "$(LIBSUPCXX_A)" ]; then \
+	    echo "$(2): FAIL — '$(CXX)' has no static libstdc++.a / libsupc++.a,"; \
+	    echo "  which every C++ link needs since P4. Install the bare-metal"; \
+	    echo "  toolchain: axl-install-toolchain $(ARCH)"; \
+	    exit 1; \
+	fi
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) $(LOG_ENGINE_PULL) \
+	    --defsym=_AxlEntry=DriverEntry \
+	    -o $(2:.efi=.so) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(1) $(LINK_LIBS_CXX)
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=11 $(2:.efi=.so) $(2)
 	$(PE_SET_DEBUG) $(2)
 endef
 
@@ -701,6 +793,7 @@ LIB_SOURCES = \
     src/format/axl-dtoa.c \
     src/format/axl-strtod.c \
     src/log/axl-log.c \
+    src/log/axl-log-emit.c \
     src/log/axl-log-ring.c \
     src/log/axl-log-line.c \
     src/log/axl-log-file.c \
@@ -1131,10 +1224,29 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-cxx-entry check-nul check-test-registered check-tautology \
     check-fuzz-link check-examples check-json-dialect check-flag-parity \
     check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
-    check-log-levels check-handle-exclusions check-libc-overlap check-build-mode
+    check-log-levels check-handle-exclusions check-libc-overlap check-build-mode \
+    check-awk-portability
+
+# Gates that need BUILT IMAGES, and therefore CANNOT be in LINT_GATES.
+#
+# The rule for LINT_GATES is "reports clean and builds no libaxl.a", because
+# verify.sh runs `make $(LINT_GATES)` CONCURRENTLY with the x64 and aa64 jobs,
+# and those resolve to the same default PREFIX. These two carry
+# $(PREFIX)/*.efi prerequisites, so each would run the libaxl.a recipe -- whose
+# first act is `rm -f $@` -- underneath a build that is mid-link. Two separate
+# `make` processes do not coordinate; nothing here locks.
+#
+# Deriving LINT_GATES into verify.sh made the two LISTS unable to drift, which
+# is not the same property as every member being safe to run beside a build.
+# That is what this split adds: membership of LINT_GATES now means what its
+# comment always said it meant.
+LINT_GATES_ARTIFACT := check-pe-stripped check-log-linkage
 
 print-lint-gates:
 	@echo $(LINT_GATES)
+
+print-lint-gates-artifact:
+	@echo $(LINT_GATES_ARTIFACT)
 
 # Generic accessor for any variable, for gates and for humans debugging a build
 # that looks wrong. `print-%` is ALREADY excluded from NONCLEAN_GOALS (see
@@ -1142,8 +1254,20 @@ print-lint-gates:
 # could wipe $(BUILDDIR) while verify.sh is building into it concurrently.
 # scripts/check-dep-tracking.py builds its own throwaway makefile to get this;
 # it can stop once anything else needs a second copy.
+#
+# `$(info)`, not `@echo '$($*)'`, and NOT a style choice: the value goes
+# straight to stdout without a shell seeing it. Under AXL_TLS=1, CFLAGS carries
+# -DMBEDTLS_CONFIG_FILE='<axl-mbedtls-config.h>', whose embedded quotes CLOSE
+# the echo argument and leave `<axl-mbedtls-config.h>` as a redirect --
+# `print-CFLAGS` then died with "No such file or directory" and named neither
+# the flag nor the quoting. Exactly the hazard that made the build-state
+# signature hash the empty string under AXL_TLS=1 (see the $(file ...) note at
+# the signature block); a variable printer that cannot print every variable is
+# the same bug one layer up. `@:` gives the rule a command so make does not
+# report it as having nothing to do.
 print-%:
-	@echo '$($*)'
+	$(info $($*))
+	@:
 
 # $(CC)'s libc include directory, reported for TOOLS THAT REPLAY THE COMPILE
 # DATABASE WITH A DIFFERENT DRIVER -- clang-tidy above all.
@@ -1366,7 +1490,8 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-examples check-json-dialect check-log-levels driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest cxx-seam-selftest cxx-json-selftest
+.PHONY: print-lint-gates-artifact
+.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-examples check-json-dialect check-log-levels check-log-linkage driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal minimal-log-off minimal-log-on compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test cxx-ctor-test hello-minimal shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest cxx-seam-selftest cxx-json-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1393,21 +1518,53 @@ check-ascii:
 # undefined-reference link failure. C never triggers this (no name mangling)
 # and no C++ driver exists in the tree, so this compile+nm check is the only
 # thing guarding the AXL_ENTRY_LINKAGE `extern "C"` wrap. Host g++, .o only.
+#
+# THREE VARIANTS, one per DriverEntry-emitting macro. Each emits the image's
+# single `DriverEntry`, so they cannot share a translation unit; the fixture is
+# compiled once per AXL_ENTRY_FIXTURE_* define.
+#
+# Covering AXL_DRIVER alone is what let AXL_SHARED_DRIVER ship UN-COMPILABLE
+# from C++ for its whole life: its expansion forward-declares the consumer's
+# `run` without AXL_CB_NOEXCEPT and then stores it in a vtable slot that has it
+# -- the two agree in C and contradict in C++, where noexcept is part of the
+# function type. Nothing caught it because every driver fixture in the tree is
+# C, and so is every consumer's.
+#
+# The .init_array count is the other half: each variant's object must carry the
+# fixture's global constructor. That the entry is REGISTERED is all a compile
+# check can see; that it actually RUNS is test-cxx-driver-ctors-qemu.sh, and
+# the two exist because a driver image did the first and not the second.
 check-cxx-entry:
-	@obj=$$(mktemp --suffix=.o); \
-	$(CXX) $(CXXFLAGS_BASE) -Iinclude -c test/cxx-entry-linkage.cpp -o $$obj || \
-	  { echo "check-cxx-entry: FAIL — C++ fixture did not compile"; rm -f $$obj; exit 1; }; \
-	fail=0; \
-	for sym in _AxlEntry DriverEntry; do \
-	  if nm $$obj | grep -qE " T $$sym$$"; then \
-	    echo "check-cxx-entry: $$sym is unmangled (C linkage)"; \
-	  else \
-	    echo "check-cxx-entry: FAIL — $$sym is missing or name-mangled in C++ (needs AXL_ENTRY_LINKAGE)"; \
-	    nm $$obj | grep -i "$$sym" | sed 's/^/    /'; fail=1; \
+	@fail=0; \
+	for variant in DRIVER SHARED SERVICE; do \
+	  obj=$$(mktemp --suffix=.o); \
+	  if ! $(CXX) $(CXXFLAGS_BASE) -Iinclude -DAXL_ENTRY_FIXTURE_$$variant \
+	       -c test/cxx-entry-linkage.cpp -o $$obj 2>$$obj.err; then \
+	    echo "check-cxx-entry: FAIL — AXL_$$variant fixture did not compile from C++"; \
+	    sed 's/^/    /' $$obj.err | head -12; \
+	    rm -f $$obj $$obj.err; fail=1; continue; \
 	  fi; \
+	  rm -f $$obj.err; \
+	  syms="DriverEntry"; \
+	  [ "$$variant" = "DRIVER" ] && syms="_AxlEntry DriverEntry"; \
+	  for sym in $$syms; do \
+	    if $(CROSS)nm $$obj | grep -qE " T $$sym$$"; then \
+	      echo "check-cxx-entry: AXL_$$variant — $$sym is unmangled (C linkage)"; \
+	    else \
+	      echo "check-cxx-entry: FAIL — AXL_$$variant: $$sym is missing or name-mangled in C++ (needs AXL_ENTRY_LINKAGE)"; \
+	      $(CROSS)nm $$obj | grep -i "$$sym" | sed 's/^/    /'; fail=1; \
+	    fi; \
+	  done; \
+	  n=$$($(CROSS)objdump -h $$obj | awk '$$2 == ".init_array" { print $$3 }'); \
+	  if [ -z "$$n" ] || [ $$((0x$$n)) -eq 0 ]; then \
+	    echo "check-cxx-entry: FAIL — AXL_$$variant: the fixture's global constructor"; \
+	    echo "  registered NO .init_array entry, so the runtime half of this"; \
+	    echo "  contract would pass by testing nothing."; \
+	    fail=1; \
+	  fi; \
+	  rm -f $$obj; \
 	done; \
-	rm -f $$obj; \
-	[ $$fail -eq 0 ] && echo "check-cxx-entry: clean"; \
+	[ $$fail -eq 0 ] && echo "check-cxx-entry: clean — 3 macros compile from C++, entries unmangled, ctors registered"; \
 	exit $$fail
 
 # Every QEMU integration test must carry a `# test-meta:` header so it is
@@ -1513,6 +1670,114 @@ check-libc-overlap:
 # Three assertions, and the DEBUG one is not filler: without it this passes just
 # as well for a Makefile that forced RELEASE unconditionally, which would be a
 # different silent-wrong-flags bug.
+# No gawk-only awk function in build glue. /usr/bin/awk is MAWK in both
+# containers CI uses and neither apt list installs gawk, so a gawk extension
+# works on a dev box and fails -- or worse, silently expands to nothing -- in
+# CI. `strtonum` in MALLINFO_SIZE meant -DAXL_NEWLIB_MALLINFO_INT=1 was applied
+# locally and NOT in CI, undetected; the same call in check-cxx-entry failed
+# loudly but with the wrong diagnosis. See scripts/check-awk-portability.py.
+# Every produced .efi carries no COFF symbol table. Reads the ARTIFACT, not the
+# command line, so a build path that drifts is caught by its output -- which is
+# what a flag comparison cannot do. See scripts/check-pe-stripped.py.
+#
+# Scans the images the tree already builds for other gates rather than
+# demanding its own: cheap, and it fails loudly if none exist.
+# ===================================================================
+# hello-minimal — the smallest useful AXL-adjacent image: prints one
+# command-line argument, links NO libaxl, ~4.6 KB against ~47 KB for
+# the smallest image that does link it.
+#
+# A supported example, not a toy: sdk/examples/hello-minimal.{c,cpp}
+# are compile-gated by check-examples like every other example, and
+# test-hello-minimal-qemu.sh boots all four (2 languages x 2 arches)
+# and asserts the argument comes back.
+#
+# WHY IT EXISTS. --minimal-runtime cannot reach this size. It is much
+# closer than it was -- the log layer is opt-in now, which took it from
+# 36,864 to 30,720 on x64 -- but what remains is structural: an image
+# that touches gBS links the backend, and the backend installs
+# protocols, which reaches axl-driver.o and the runtime behind it. See
+# docs/AXL-Minimal-Image-Notes.md for the measurement and for the
+# three things that are NOT optional even here (PE bootstrap, the MS
+# x64 ABI, verified struct offsets).
+#
+# Deliberately NOT in `all`: it is the reference for a consumer
+# building a command-named launcher, not something every build needs.
+# ===================================================================
+.PHONY: hello-minimal
+hello-minimal: $(PREFIX)/hello-minimal-c.efi $(PREFIX)/hello-minimal-cxx.efi
+	@for i in $^; do \
+	    printf '  %-34s %7d bytes\n' "$$(basename $$i)" "$$(stat -c%s $$i)"; \
+	done
+
+# A global constructor here would be REGISTERED AND NEVER RUN -- there is no
+# runtime to walk .init_array. Assert the array is empty rather than trusting
+# the source to stay constructor-free; that is the same silent-failure shape
+# the driver .init_array defect had.
+$(PREFIX)/hello-minimal-cxx.efi: sdk/examples/hello-minimal.cpp $(GCC_CRT0) $(RELOC_OBJ) | $(PREFIX)
+	$(CXX) $(CXXFLAGS) -c $< -o $(BUILDDIR)/hello-minimal-cxx.o
+	@n=$$($(CROSS)objdump -h $(BUILDDIR)/hello-minimal-cxx.o \
+	        | awk '$$2 == ".init_array" { print $$3 }'); \
+	  if [ -n "$$n" ] && [ $$((0x$$n)) -ne 0 ]; then \
+	    echo "hello-minimal: FAIL -- hello-minimal.cpp registered a global"; \
+	    echo "  constructor, and this image has NO runtime to run it. It"; \
+	    echo "  would be silently unconstructed. Use constant-initialised"; \
+	    echo "  globals only."; exit 1; \
+	  fi
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
+	    -o $(@:.efi=.so) $(GCC_CRT0) $(RELOC_OBJ) $(BUILDDIR)/hello-minimal-cxx.o
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) \
+	    --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
+
+$(PREFIX)/hello-minimal-c.efi: sdk/examples/hello-minimal.c $(GCC_CRT0) $(RELOC_OBJ) | $(PREFIX)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $(BUILDDIR)/hello-minimal-c.o
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
+	    -o $(@:.efi=.so) $(GCC_CRT0) $(RELOC_OBJ) $(BUILDDIR)/hello-minimal-c.o
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) \
+	    --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
+
+.PHONY: check-pe-stripped
+check-pe-stripped: $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/hello.efi
+	@python3 scripts/check-pe-stripped.py \
+	    $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/hello.efi
+
+# An image that logs must carry the engine that logs (scripts/check-log-linkage.py).
+#
+# The prerequisites are ONE IMAGE PER LINK MACRO, because the macros are what
+# can drift and a gate that reads three apps would miss the driver:
+#
+#   hello.efi                    LINK_EFI_APP
+#   driver.efi                   LINK_EFI_DRIVER
+#   cxx-seam-selftest.efi        the hand-rolled C++ app link
+#   minimal-log-on.efi           LINK_EFI_APP_MINIMAL + $(LOG_ENGINE_PULL)
+#   minimal-log-off.efi          LINK_EFI_APP_MINIMAL alone -- the NEGATIVE
+#                                case, and the script fails if it is absent:
+#                                a gate that only ever sees compliant images
+#                                is not testing anything.
+#
+# NONE of these is built by `all` or by `tests`, and that is a REQUIREMENT
+# rather than a coincidence. verify.sh runs this job concurrently with the x64
+# arch job, which runs `make all tests` -- so naming a target that job also
+# builds puts two make processes on one `ld -o`. An early version of this list
+# named AxlTestLog.efi and did exactly that. (check-pe-stripped's two images
+# are outside `all tests` for the same reason; see the NONCLEAN_GOALS note.)
+#
+# LINK_EFI_TEST is therefore covered elsewhere, and better: every unit binary
+# prints its leak verdict through axl_warning, so a test link that lost the
+# pull prints none and test_check_leaks fails the whole suite naming the
+# silent binaries. Verified by sabotage -- removing $(LOG_ENGINE_PULL) from
+# LINK_EFI_TEST failed test-axl.sh, loudly, on the leak gate.
+.PHONY: check-log-linkage
+LOG_LINKAGE_IMAGES = $(PREFIX)/hello.efi \
+    $(PREFIX)/driver.efi $(PREFIX)/cxx-seam-selftest.efi \
+    $(PREFIX)/minimal-log-on.efi $(PREFIX)/minimal-log-off.efi
+check-log-linkage: $(LOG_LINKAGE_IMAGES)
+	@CROSS=$(CROSS) python3 scripts/check-log-linkage.py $(LOG_LINKAGE_IMAGES)
+
+.PHONY: check-awk-portability
+check-awk-portability:
+	@python3 scripts/check-awk-portability.py
+
 check-build-mode:
 	@r=$$($(MAKE) -s BUILD=release print-CFLAGS_BUILD); \
 	case "$$r" in *-DNDEBUG*) ;; *) \
@@ -2465,10 +2730,10 @@ $(PREFIX)/cxx-streams-selftest.efi: $(BUILDDIR)/cxx-streams-selftest.o \
 	    echo "  bare-metal toolchain: axl-install-toolchain $(ARCH)"; \
 	    exit 1; \
 	fi
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) \
-	    -o $(@:.efi=.so) $(LINK_CRT0) $(BUILDDIR)/cxx-streams-selftest.o \
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) $(LOG_ENGINE_PULL) \
+	    -o $(@:.efi=.so) $(LINK_CRT0_CMD) $(BUILDDIR)/cxx-streams-selftest.o \
 	    $(LINK_LIBS_CXX)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
 	$(PE_SET_DEBUG) $@
 
 $(BUILDDIR)/cxx-streams-selftest.o: test/integration/cxx-streams-selftest.cpp | $(BUILDDIR)
@@ -2499,10 +2764,10 @@ $(PREFIX)/cxx-seam-selftest.efi: $(BUILDDIR)/cxx-seam-selftest.o \
 	    echo "  bare-metal toolchain: axl-install-toolchain $(ARCH)"; \
 	    exit 1; \
 	fi
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) \
-	    -o $(@:.efi=.so) $(LINK_CRT0) $(BUILDDIR)/cxx-seam-selftest.o \
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) $(LOG_ENGINE_PULL) \
+	    -o $(@:.efi=.so) $(LINK_CRT0_CMD) $(BUILDDIR)/cxx-seam-selftest.o \
 	    $(LINK_LIBS_CXX)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
 	$(PE_SET_DEBUG) $@
 
 $(BUILDDIR)/cxx-seam-selftest.o: test/integration/cxx-seam-selftest.cpp | $(BUILDDIR)
@@ -2523,10 +2788,10 @@ $(PREFIX)/cxx-json-selftest.efi: $(BUILDDIR)/cxx-json-selftest.o \
 	    echo "  axl-install-toolchain $(ARCH)"; \
 	    exit 1; \
 	fi
-	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) \
-	    -o $(@:.efi=.so) $(LINK_CRT0) $(BUILDDIR)/cxx-json-selftest.o \
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS_EH) $(LOG_ENGINE_PULL) \
+	    -o $(@:.efi=.so) $(LINK_CRT0_CMD) $(BUILDDIR)/cxx-json-selftest.o \
 	    $(LINK_LIBS_CXX)
-	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) $(OBJCOPY_STRIP) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
 	$(PE_SET_DEBUG) $@
 
 $(BUILDDIR)/cxx-json-selftest.o: test/integration/cxx-json-selftest.cpp | $(BUILDDIR)
@@ -2605,11 +2870,40 @@ $(BUILDDIR)/exit-status-selftest.o: test/integration/exit-status-selftest.c | $(
 # Same source, linked against the MINIMAL CRT0 (--minimal-runtime): the
 # thin-launcher case where main returns rather than calling axl_exit, so the
 # armed exit status must be honored on the return path.
+#
+# $(LOG_ENGINE_PULL) is here for the same reason as the other two `-u`s: this
+# fixture is built in DEBUG by the suite, and an AXL_MEM_DEBUG leak report goes
+# out through axl_warning. Without it the fixture would run the report and
+# print nothing, so a leak in it would stop being reported.
 exit-status-selftest-minimal: $(PREFIX)/exit-status-selftest-minimal.efi
 	@echo "  Built: $(PREFIX)/exit-status-selftest-minimal.efi"
 
 $(PREFIX)/exit-status-selftest-minimal.efi: $(BUILDDIR)/exit-status-selftest.o $(CRT0_MINIMAL_OBJ) $(PREFIX)/lib/libaxl.a
-	$(call LINK_EFI_APP_MINIMAL,$(BUILDDIR)/exit-status-selftest.o,$@)
+	$(call LINK_EFI_APP_MINIMAL,$(BUILDDIR)/exit-status-selftest.o,$@,-u _axl_args_init -u axl_stream_init $(LOG_ENGINE_PULL))
+
+# minimal-log-{off,on} — ONE source, TWO link lines, for
+# test-minimal-log-qemu.sh. `off` is a plain --minimal-runtime image and `on`
+# adds $(LOG_ENGINE_PULL), which is exactly what `axl-cc
+# --minimal-runtime=stdio,log` produces. The pair is the control: an image that
+# logs proves the check can see a log record, so the other one's silence is
+# evidence rather than a broken fixture.
+#
+# Both take `-u axl_stream_init`, because the marker that proves the no-engine
+# image survived axl_error goes out through axl_printf.
+minimal-log-off: $(PREFIX)/minimal-log-off.efi
+	@echo "  Built: $(PREFIX)/minimal-log-off.efi"
+
+minimal-log-on: $(PREFIX)/minimal-log-on.efi
+	@echo "  Built: $(PREFIX)/minimal-log-on.efi"
+
+$(PREFIX)/minimal-log-off.efi: $(BUILDDIR)/minimal-log-selftest.o $(CRT0_MINIMAL_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP_MINIMAL,$(BUILDDIR)/minimal-log-selftest.o,$@,-u axl_stream_init)
+
+$(PREFIX)/minimal-log-on.efi: $(BUILDDIR)/minimal-log-selftest.o $(CRT0_MINIMAL_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP_MINIMAL,$(BUILDDIR)/minimal-log-selftest.o,$@,-u axl_stream_init $(LOG_ENGINE_PULL))
+
+$(BUILDDIR)/minimal-log-selftest.o: test/integration/minimal-log-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
 # Build compositor-selftest.efi — AxlCompositor end-to-end present test.
@@ -3003,6 +3297,68 @@ $(BUILDDIR)/image-path-test.o: test/integration/image-path-test.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# Build cxx-ctor-test.efi + the three C++ driver images — fixture for
+# test-cxx-driver-ctors-qemu.sh: a driver image must RUN its .init_array,
+# and must run the matching destructors on unload.
+#
+# ONE SOURCE, THREE IMAGES. Each of AXL_DRIVER / AXL_SHARED_DRIVER /
+# AXL_SERVICE_DRIVER emits the image's single DriverEntry, so they cannot share
+# a translation unit; cxx-ctor-driver.cpp is compiled once per
+# AXL_CTOR_FIXTURE_* define. Three separate .cpp files would have been three
+# copies of the sentinel, which is the thing whose exact values the test
+# asserts on.
+#
+# The launcher is C on purpose: it is not what is under test, and keeping it C
+# means a failure cannot be blamed on the C++ layer.
+#
+# NOT in `tests` or `all` — built by its test script, like image-path-test
+# above. Three C++ driver links is ~1 s that every `make` would otherwise pay.
+# ===================================================================
+
+cxx-ctor-test: $(PREFIX)/cxx-ctor-test.efi $(PREFIX)/cxx-ctor-driver.efi \
+               $(PREFIX)/cxx-ctor-sd-driver.efi $(PREFIX)/cxx-ctor-svc-driver.efi \
+               $(PREFIX)/cxx-ctor-fe-driver.efi $(PREFIX)/cxx-ctor-fu-driver.efi
+	@echo "  Built: cxx-ctor-test.efi + 5 C++ driver images"
+
+$(PREFIX)/cxx-ctor-driver.efi: $(BUILDDIR)/cxx-ctor-driver.o \
+                               $(PREFIX)/lib/libaxl.a $(CXX_PORTING_OBJS)
+	$(call LINK_EFI_DRIVER_CXX,$(BUILDDIR)/cxx-ctor-driver.o,$@)
+$(BUILDDIR)/cxx-ctor-driver.o: test/integration/cxx-ctor-driver.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(PREFIX)/cxx-ctor-sd-driver.efi: $(BUILDDIR)/cxx-ctor-sd-driver.o \
+                                  $(PREFIX)/lib/libaxl.a $(CXX_PORTING_OBJS)
+	$(call LINK_EFI_DRIVER_CXX,$(BUILDDIR)/cxx-ctor-sd-driver.o,$@)
+$(BUILDDIR)/cxx-ctor-sd-driver.o: test/integration/cxx-ctor-driver.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -DAXL_CTOR_FIXTURE_SHARED -c $< -o $@
+
+$(PREFIX)/cxx-ctor-svc-driver.efi: $(BUILDDIR)/cxx-ctor-svc-driver.o \
+                                   $(PREFIX)/lib/libaxl.a $(CXX_PORTING_OBJS)
+	$(call LINK_EFI_DRIVER_CXX,$(BUILDDIR)/cxx-ctor-svc-driver.o,$@)
+$(BUILDDIR)/cxx-ctor-svc-driver.o: test/integration/cxx-ctor-driver.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -DAXL_CTOR_FIXTURE_SERVICE -c $< -o $@
+
+# The two FAILURE-path images. Their entry / unload deliberately return
+# non-zero, which is the only way to reach the two drains that every
+# success-path fixture leaves untested.
+$(PREFIX)/cxx-ctor-fe-driver.efi: $(BUILDDIR)/cxx-ctor-fe-driver.o \
+                                  $(PREFIX)/lib/libaxl.a $(CXX_PORTING_OBJS)
+	$(call LINK_EFI_DRIVER_CXX,$(BUILDDIR)/cxx-ctor-fe-driver.o,$@)
+$(BUILDDIR)/cxx-ctor-fe-driver.o: test/integration/cxx-ctor-driver.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -DAXL_CTOR_FIXTURE_FAILENTRY -c $< -o $@
+
+$(PREFIX)/cxx-ctor-fu-driver.efi: $(BUILDDIR)/cxx-ctor-fu-driver.o \
+                                  $(PREFIX)/lib/libaxl.a $(CXX_PORTING_OBJS)
+	$(call LINK_EFI_DRIVER_CXX,$(BUILDDIR)/cxx-ctor-fu-driver.o,$@)
+$(BUILDDIR)/cxx-ctor-fu-driver.o: test/integration/cxx-ctor-driver.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -DAXL_CTOR_FIXTURE_FAILUNLOAD -c $< -o $@
+
+$(PREFIX)/cxx-ctor-test.efi: $(BUILDDIR)/cxx-ctor-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/cxx-ctor-test.o,$@)
+$(BUILDDIR)/cxx-ctor-test.o: test/integration/cxx-ctor-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
 # Build axl-shell-launcher.efi — the test harness stages this as
 # \EFI\BOOT\BOOTX64.EFI in place of the Shell. It sibling-loads Shell.efi with
 # LoadOptions "-delay 0" so the EDK2 Shell skips its 5 s startup countdown,
@@ -3326,7 +3682,7 @@ $(BUILDDIR)/crashhandler-%.o: drivers/crashhandler/%.c | $(BUILDDIR)
 # console-device-smoke.efi — DEBUG-OVMF smoke consumer driver for
 # axl-console-device: installs the take-over device and renders its ops to a GOP
 # grid. LOCAL-ONLY (needs a GPU + DEBUG OVMF); see the file header for the run
-# recipe and test-console-device-qemu.sh.
+# recipe and test-console-device-takeover-qemu.sh.
 console-device-smoke: $(PREFIX)/drivers/console-device-smoke.efi
 	@echo "  Built: $(PREFIX)/drivers/console-device-smoke.efi"
 
@@ -3339,7 +3695,8 @@ $(BUILDDIR)/console-device-smoke.o: test/integration/console-device-smoke.c | $(
 # console-device-passthrough-smoke.efi — same source, -DPASSTHROUGH_LOCAL: takes
 # over WITHOUT evicting the firmware consoles, so GraphicsConsole keeps painting the
 # local display while our grid still receives every op. Drives the passthrough
-# scenario of test-console-device-qemu.sh (the inverse of Scenario 1's clean-region
+# scenario of test-console-device-takeover-qemu.sh (the inverse of the take-over
+# scenario's clean-region
 # check: ink past the grid proves the local console is still alive).
 console-device-passthrough-smoke: $(PREFIX)/drivers/console-device-passthrough-smoke.efi
 	@echo "  Built: $(PREFIX)/drivers/console-device-passthrough-smoke.efi"
@@ -3352,7 +3709,7 @@ $(BUILDDIR)/console-device-passthrough-smoke.o: test/integration/console-device-
 
 # console-device-restore-smoke.efi — same source, -DSELF_UNINSTALL_MS: takes over,
 # then after that many ms uninstalls the device so the re-tagged firmware console
-# comes back. Drives Scenario 2 of test-console-device-qemu.sh (uninstall-restore).
+# comes back. Drives the restore scenario of test-console-device-takeover-qemu.sh.
 console-device-restore-smoke: $(PREFIX)/drivers/console-device-restore-smoke.efi
 	@echo "  Built: $(PREFIX)/drivers/console-device-restore-smoke.efi"
 
@@ -3386,7 +3743,7 @@ $(BUILDDIR)/console-device-wide-smoke.o: test/integration/console-device-smoke.c
 # console-device-input-smoke.efi — same source with -DTAKE_INPUT: the device also
 # becomes the sole ConInEx (evicts the raw keyboard) + runs the read loop, so a
 # --sendkey keystroke can ONLY reach the shell through our relay. Drives the input
-# scenario of test-console-device-qemu.sh (keys reach the shell -> our grid renders
+# scenario of test-console-device-input-qemu.sh (keys reach the shell -> our grid renders
 # the typed command's output; the evicted keyboard proves no double-delivery).
 console-device-input-smoke: $(PREFIX)/drivers/console-device-input-smoke.efi
 	@echo "  Built: $(PREFIX)/drivers/console-device-input-smoke.efi"
@@ -3420,7 +3777,7 @@ $(BUILDDIR)/console-device-input-restore-smoke.o: test/integration/console-devic
 # 80x25 BaseMode and fail. axl_console_device_uninstall disconnects our device from
 # the aggregates BEFORE re-adding the firmware console, so the reconstruction sees
 # only firmware consoles. The 80x25 restore-smoke could not catch this (80x25 IS the
-# BaseMode). Drives the wide-restore scenario of test-console-device-qemu.sh.
+# BaseMode). Drives the wide-restore scenario of test-console-device-input-qemu.sh.
 console-device-wide-restore-smoke: $(PREFIX)/drivers/console-device-wide-restore-smoke.efi
 	@echo "  Built: $(PREFIX)/drivers/console-device-wide-restore-smoke.efi ($(SMOKE_COLS)x$(SMOKE_ROWS))"
 

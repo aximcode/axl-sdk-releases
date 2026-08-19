@@ -74,4 +74,17 @@ _axl_init_image_path(void *image_handle);
 const char *
 _axl_app_image_anchor(void);
 
+/**
+ * Release the image-path capture made by `_axl_init_image_path`.
+ *
+ * Called by `_axl_args_free` on the app path and by `axl_driver_cleanup`
+ * on the driver path. It is deliberately NOT behind `_axl_args_free`'s
+ * `mArgv` guard: a driver never populates argv, so anything gated on it is
+ * unreachable from a driver image and the capture would leak on every load.
+ *
+ * Idempotent.
+ */
+void
+_axl_image_path_free(void);
+
 #endif /* AXL_IMAGE_INTERNAL_H */

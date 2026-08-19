@@ -30,11 +30,20 @@ test_meta_field() {
 
 # Print runnable test scripts, one per line, filtered by arch + local-only.
 discover_tests() {
-    local want_arch="X64" include_local=0
+    local want_arch="X64" include_local=0 only_local=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --arch) want_arch="$2"; shift 2 ;;
             --include-local-only) include_local=1; shift ;;
+            # The INVERSE of what --ci selects: ONLY the tests a CI runner
+            # structurally cannot run. Measured 2026-08-19, X64: 14 tests and
+            # 733 s of the suite's 3,385 s. The other 2,652 s is work CI
+            # repeats on every push to main, on our own box, for free -- so
+            # for an inner-loop run it is the 78% that buys nothing a push
+            # would not tell you minutes later. Implies --include-local-only,
+            # since asking for only local-only tests and then filtering them
+            # out would select nothing.
+            --only-local) only_local=1; include_local=1; shift ;;
             *) shift ;;
         esac
     done
@@ -49,6 +58,7 @@ discover_tests() {
         arch=$(test_meta_field "$f" arch)
         lo=$(test_meta_field "$f" local-only)
         [[ "$lo" == "1" && $include_local -eq 0 ]] && continue
+        [[ "$lo" != "1" && $only_local -eq 1 ]] && continue
         case "$arch" in
             both) : ;;
             x64)    [[ "$want_arch" == "X64" ]] || continue ;;

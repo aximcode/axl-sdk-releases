@@ -28,9 +28,26 @@ typedef struct {
 static AxlArray *mAtexit;
 static uint64_t  mNextSeq = 1;
 
+/* True once axl_driver_init has run: this image is a driver, so the table
+ * belongs to axl_driver_cleanup and _axl_cleanup must not drain it. See
+ * axl-atexit-internal.h for why that matters. */
+static bool      mIsDriverImage;
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+void
+_axl_atexit_mark_driver_image(void)
+{
+    mIsDriverImage = true;
+}
+
+bool
+_axl_atexit_is_driver_image(void)
+{
+    return mIsDriverImage;
+}
 
 void
 _axl_atexit_init(void)

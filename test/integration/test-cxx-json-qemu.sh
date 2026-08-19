@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=75 local-only=0
+# test-meta: arch=both needs= est=16 local-only=0
 # test-cxx-json-qemu.sh — the C++ JSON API (C6), run under QEMU.
 #
 # Covers AXL-Cxx-Design.md §9 phase C6 and the C additions it required:

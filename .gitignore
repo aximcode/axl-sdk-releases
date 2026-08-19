@@ -85,3 +85,6 @@ toolchain/*/work/
 toolchain/*/out/
 toolchain/*/build.log
 test/integration/.last-run-stamp
+
+# Skip-cache keys: one machine's run history, not a property of the tree.
+test/integration/.test-cache/

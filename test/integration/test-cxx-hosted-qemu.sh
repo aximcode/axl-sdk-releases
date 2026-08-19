@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=110 local-only=0
+# test-meta: arch=both needs= est=76 local-only=0
 # test-cxx-hosted-qemu.sh — the standard containers under UEFI, end to end.
 #
 # THE NAME IS HISTORICAL. There is no hosted MODE any more: task T3 dropped

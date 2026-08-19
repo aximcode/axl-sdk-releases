@@ -3,6 +3,236 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.3.0 — 2026-08-19
+### Breaking
+
+- **`--minimal-runtime` means minimal: it no longer implies `stdio` and
+  `args`.** The flag used to link the stream layer and argv handling
+  unconditionally; it now links `axl-crt0-minimal.o` — firmware globals,
+  `main`, exit status — and nothing else. `--minimal-runtime=stdio,args` is
+  the old behaviour spelled out.
+
+  **This silently changes the meaning of a flag consumers already pass**,
+  which is why it is filed here rather than under *Changed*. Each of the three
+  pieces is handled, by a different mechanism:
+
+  - `stdio` **self-corrects**: referencing `axl_printf` and friends pulls the
+    stream layer, and it self-initialises. Nothing to declare.
+  - `log` **is refused**. An app whose own objects reference an emitter and
+    that named neither `log` nor `nolog` is refused at link with both spellings
+    named. Silence is a fine answer; it is not one the driver assumes for you.
+  - `args` **is now refused too** — new in this release, and the reason this
+    entry is worth reading twice. A `--minimal-runtime` link whose `main` is
+    declared with parameters is refused unless the caller names `args` or
+    `noargs` (a new keyword, the counterpart to `nolog`). `main(void)` is
+    unaffected and has nothing to declare.
+
+  Logging is visible to `nm` — `axl_error` leaves an undefined `axl_log_full`
+  in the caller's object. **Reading `argv` emits no symbol at all**: it arrives
+  in registers, and `main(void)` and `main(int, char **)` are one name with one
+  linkage. So `main`'s arity is read from DWARF, which is available because
+  `-g -gdwarf` is on in `DEBUG` *and* `RELEASE`. When it cannot be read — a
+  prebuilt object compiled without debug info — that is its own refusal, since
+  "could not look" and "takes no arguments" are the same empty answer.
+
+  **Why guard something that does not currently fail.** Measured on this tip, a
+  bare `--minimal-runtime` app *does* receive argc/argv — an app returning
+  `argc` as its exit status answers `0x3` for two arguments and `0x1` for none.
+  It gets them by accident: `axl-cxxrt-stubs.o` is on every link (the porting
+  layer travels with the C library) and strongly references `axl_file_info`,
+  which drags `axl-fs.o` -> `axl-driver.o` -> `axl-app.o`, and `axl-app.o` is
+  what defines `_axl_args_init`. The CRT0's weak reference binds through an edge
+  that has nothing to do with argv. That is a coincidence to be spent, not a
+  contract: the day it moves, every bare `--minimal-runtime` image starts seeing
+  an empty argv with no build error and no diagnostic. Asking now turns the
+  accident into a declaration.
+
+- **`axl_pci_get_class_code` now returns `AXL_ERR` for an absent function**,
+  matching `axl_pci_get_vid_did` and `axl_pci_get_header_type`. It was the one
+  standard-header accessor with no presence precheck: an absent function's
+  config space reads all-ones, so it returned **`AXL_OK` with `0xFFFFFF`** — a
+  plausible-looking 24-bit value a caller could only recognise by knowing the
+  fold width, which is exactly the disambiguation the sibling accessors exist
+  to spare it. 4.0.0 documented the asymmetry; this removes it. `class_code` is
+  left untouched on the error return.
+
+  **Who this affects:** code that reads a non-`AXL_OK` return as a *bus error*
+  worth reporting now sees absent functions as well. Callers that gate on
+  `axl_pci_get_vid_did` first — which already folds absent into `AXL_ERR` — are
+  unaffected, because an absent function never reaches the call. No in-tree
+  caller changes behaviour: `axl_pci_next` skips absent slots by default, and
+  the one path that can yield them (`axl_pci_find_by_class(0xFFFFFF, …)`)
+  filtered them by class anyway.
+
+  Costs one redundant 16-bit config read per call, since every known caller
+  reads VID/DID immediately before. That is the cheaper of the two errors.
+
+  **It is not a fix for firmware that answers absent functions with something
+  other than `0xFFFF`.** Presence is decided by the bus-level sentinel; a
+  platform returning a different constant defeats this precheck exactly as it
+  defeats the two sibling accessors, and a consumer facing one still needs its
+  own filter.
+
+### Added
+
+- **`hello-minimal` is a supported example**, promoted from a spike. Examples
+  ship in the `.deb`/`.rpm` packages and are gated by `make check-examples`,
+  so this is consumer-visible surface rather than a test fixture.
+
+### Changed
+
+- **Every produced `.efi` is stripped of its COFF symbol table (~20%).**
+  `objcopy`'s ELF -> PE conversion wrote a COFF symbol and string table after
+  the last section that the firmware never reads — the PE loader uses the
+  section table, the relocation directory and the entry point. It was simply
+  never removed.
+
+  | image | before | after | |
+  |---|---|---|---|
+  | do-nothing AXL app | 47,365 | 37,376 | −21.1% |
+  | `hello.efi` | 59,914 | 47,616 | −20.5% |
+  | `hello.efi` (aa64) | 69,203 | 50,190 | −27.5% |
+  | a shipped 552 KB tool | 552,346 | 435,200 | −21.2% |
+  | a shipped 2.9 MB tool | 2,971,435 | 2,952,192 | −0.6% |
+
+  The last row is the useful counter-case: the win is largest where images are
+  small and floor-dominated, near zero where the image is real code. **Do not
+  quote ~20% as a fleet number** — a consumer measured 15–36% across four real
+  x64 tools, which is the honest range.
+
+- **The log engine is opt-in at link time**, so `--minimal-runtime` can
+  actually drop it: 36,864 -> 30,720. `axl_log_full` / `axl_log` became
+  trampolines in `axl-log-emit.o` forwarding to a weak `_axl_log_vdispatch`,
+  and a link that wants logging asks with `-u _axl_log_vdispatch`. Every build
+  shape except `--minimal-runtime` asks by default, so ordinary images are
+  unchanged. **Zero call sites changed** — the seam deliberately went where the
+  callers are not, because a `--cref` map named only the *first* puller in link
+  order while `nm` found 27 archive members carrying a strong `U axl_log_full`
+  (682 call sites in 140 files library-wide).
+
+- **`axl-cc` names the unset locator instead of the missing lib dir.** With
+  `AXL_TOOLCHAIN=cross` and a forgotten locator it reported `no SDK libraries
+  for arch 'x64' …` rather than naming `AXL_X64_GCC`: the `LIB_DIR` check ran
+  ~300 lines before the toolchain refusal and won the race for the mistake most
+  likely to produce it. A missing locator is a configuration error the caller
+  can act on; the other is reported second.
+
+- **The event close ring is smaller (−4 KB `.bss` per loaded image), and it
+  stays in RELEASE.** It reads as a diagnostic and is not: it *returns*,
+  skipping a second `gBS->CloseEvent`, to avoid a DxeCore `CoreCloseEvent`
+  `#GP`. Compiling it out would have traded RAM for a firmware crash on shipped
+  images. It costs **zero file bytes** either way — `.bss` has
+  `PointerToRawData = 0`, so halving the record left the `.efi` byte-identical
+  at 47,365.
+
+### Fixed
+
+- **A driver image registered C++ constructors and ran none of them.** An app
+  image initialised the C++ runtime (`AXL_APP` -> `_axl_init` ->
+  `_axl_cxxabi_run_init_array`); a driver image never reached it, so a driver
+  linked `__init_array_start`/`__init_array_end` bracketing real constructors
+  and nothing that walked them. Measured before the fix: 2 constructors
+  registered, 0 walkers, in all three images. No link error, no warning — and
+  because crt0 zeroes `.bss`, every unconstructed global read as a plausible 0
+  rather than faulting, putting the symptom nowhere near the cause.
+  `axl_driver_init` now walks `.init_array` for all three DriverEntry-emitting
+  macros.
+
+- **A clean checkout could not link.** P4 put `$(PORTING_OBJS)` on every link
+  inside `LINK_LIBS`'s `--start-group`, but no link target listed them as
+  prerequisites, so `make` never built them first and a cold tree failed with
+  `cannot find …/axl-cxxrt-alloc.o`. Invisible on any warm tree, which is why
+  it survived ~40 commits and reached CI. The two roles of `LINK_CRT0`
+  (prerequisite list for 77 targets, and recipe text in five places) are now
+  split, so the objects land on the `ld` line exactly once.
+
+- **`run-qemu.sh` exited 1 with no output at all** when a stale scratch
+  directory was left in `/dev/shm`. `rmdir` returns 1 on a non-empty directory;
+  `2>/dev/null` hid the message but not the status, and the command after the
+  final `||` is not exempt from `set -e`. The depth-2 sweep matched only
+  `axl-qemu.*`, so an `axl-itest.*` base holding `axl-ctest.*` children could
+  never empty. Both halves fixed. Ships to consumers via host-tools.
+
+- **`check-awk-portability` could not see `axl-cc`, the script it most needed
+  to.** It found files by glob, and `scripts/*.sh` matches neither
+  `scripts/axl-cc` nor its `axl-c++` alias — the two scripts that ship to
+  consumers carry no extension. The driver holds the largest awk program in the
+  tree and the gate read none of it: a `strtonum` planted there was reported as
+  *"clean — 203 build files, no gawk-only functions"*, which reads exactly like
+  coverage. Discovery now also picks up tracked, extensionless files with a
+  shell shebang, which covers the next such script on the day it is written. A
+  new `--list` mode makes what the gate scans assertable, and
+  `test-awk-portability-gate.sh` asserts it — a scanner's silence means nothing
+  until you can show it was looking.
+
+- **`verify.sh` ran two artifact-building gates concurrently with the builds
+  they share a prefix with.** `check-pe-stripped` and `check-log-linkage` sit in
+  `LINT_GATES`, whose contract is "reports clean and builds no `libaxl.a`" —
+  but both take `$(PREFIX)/*.efi` prerequisites, so each runs the `libaxl.a`
+  recipe (first act: `rm -f $@`) underneath an x64 job building into that same
+  default prefix. Two separate `make` processes, nothing locking. Deriving
+  `LINT_GATES` from the Makefile stopped the two *lists* drifting, which is not
+  the same property as every member being safe beside a build. They move to
+  `LINT_GATES_ARTIFACT` and run serially after the parallel jobs — also the
+  cheapest place for them, since the x64 job has just built every image they
+  read.
+
+- **`check-release-semver.sh` named only the FIRST breaking entry.** The
+  refusal listed entries with `grep -A3`, a fixed three-line window after the
+  heading — enough for the one-line bullets in its own fixtures, wrong for real
+  entries, which run to several paragraphs each. So it printed one bullet and
+  silently dropped the rest, and the person deciding whether to pass
+  `--allow-breaking` read a short list as a complete one. That is the incident
+  this guard exists to prevent, one layer in: the information sits in the file
+  and never reaches the reader. It now spans the whole section, stopping at the
+  next `###` heading so it cannot spill into *Fixed* either.
+
+- **A staged SDK left inside the source tree can no longer serve itself as the
+  SDK.** `scripts/axl-cc` resolves its SDK root to the repo top, which is
+  meaningless for a checkout — until the checkout happens to *look* like a
+  prefix, which is what an old `install.sh --prefix .` leaves behind. Those
+  four paths (`bin/ lib/ include/axl-sdk/ share/axl/`) are gitignored by name,
+  so `git status` reads clean throughout. Reported from a consumer build
+  against the dev tip, where `scripts/axl-cc --version` answered **2.8.7 (built
+  2026-07-08)** inside a checkout that had just staged 4.2.0 — six weeks and
+  two major versions behind itself. Nothing fails: it compiles, links, boots
+  and passes, against the wrong library. The failure corrupts a *measurement*,
+  not a build.
+
+  Two independent guards, because the first only helps people who run
+  `install.sh`:
+
+  - **`install.sh` warns** about a staged SDK at either historical prefix. It
+    already did this for the pre-O1 `./out` default; the source root is the
+    other one and was uncovered, so a run that staged 4.2.0 into `stage/` said
+    nothing about the 2.8.7 one level up. Both candidates and their removal
+    advice now come from one helper (`axl_warn_stale_sdk_prefix`) rather than
+    two hand-maintained spellings — the drift that left this gap. Still
+    **warned, not deleted**: neither directory is the prefix that run owns.
+
+  - **`scripts/axl-cc` refuses by name** rather than resolving against whatever
+    is lying around, from `--version` as well as from a compile. `--version`
+    was the call that lied, and it exited 0 either way — with a stale version
+    on a dirty tree, with `unknown` on a clean one.
+
+  The removal advice differs per candidate and that is load-bearing: at the
+  source root `share/` and `include/` hold tracked sources, so the `./out`
+  message's `{bin,lib,include,share}` brace expansion would delete the tree it
+  is trying to protect. A checkout is told `git clean -Xdf --` those four
+  gitignored paths; an unpacked source tarball, which has no `.git`, is given
+  the paths explicitly.
+
+  `README.md` promised a raw checkout "fails with `no SDK libraries`". That was
+  true only for a *clean* checkout, and only incidentally; it is now a refusal
+  that names the cause.
+
+  **The same leftovers had already cost a second, unrelated debugging session.**
+  `test-toolchain-variant.sh` was green locally and red in CI, because an
+  untracked `<repo>/lib/axl/x64` from an old in-tree install made an early
+  existence check succeed on one box and not the other. That was diagnosed and
+  worked around as a test-ordering problem; it was this. A stale prefix does not
+  announce itself as a stale prefix — it shows up as two machines disagreeing.
+
 ## 4.2.0 — 2026-08-18
 ### Added
 

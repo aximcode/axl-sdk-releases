@@ -6,17 +6,33 @@
     UEFI: `__dso_handle`, `__cxa_atexit`, and a hook that walks
     `.init_array` to fire global constructors.
 
-    Pure-C apps pay zero cost — none of these symbols are referenced
-    by C code, so libaxl.a's archive selection skips this object
-    entirely.  Apps that include even one C++ source pull this object
-    in via compiler-generated references to `__dso_handle` /
-    `__cxa_atexit`.
+    What a PURE-C image pays is the walker below and nothing else.
+    Both entry paths reference `_axl_cxxabi_run_init_array`
+    unconditionally, so archive selection pulls this object into every
+    image; `--gc-sections` then drops the rest, and `nm` on a
+    C-only app confirms it — the walker is present, `__dso_handle` and
+    `__cxa_atexit` are not.  An image with even one C++ source keeps
+    those two as well, via compiler-generated references.
 
-    `_axl_cxxabi_run_init_array` is called from `_axl_init` after the
-    rest of the runtime is up, so ctors may freely call `axl_printf`,
-    `axl_malloc`, etc.  Destructors registered by `__cxa_atexit` go
-    through `axl_atexit`, which means C++ static dtors and C atexit
-    callbacks share LIFO ordering during `_axl_cleanup`.
+    `_axl_cxxabi_run_init_array` is called from BOTH entry paths, in
+    each case after the rest of the runtime is up so ctors may freely
+    call `axl_printf`, `axl_malloc`, etc:
+
+      app     `_axl_init`        (src/runtime/axl-runtime.c)
+      driver  `axl_driver_init`  (src/util/axl-driver.c)
+
+    The driver half was missing for the whole life of the C++ layer,
+    and failed silently — a driver image carried constructors nothing
+    ever ran, and .bss zeroing made every unconstructed global read as
+    a plausible 0 rather than fault.
+
+    Destructors registered by `__cxa_atexit` go through `axl_atexit`,
+    which means C++ static dtors and C atexit callbacks share LIFO
+    ordering — during `_axl_cleanup` for an app, and during
+    `axl_driver_cleanup` on a driver's unload path.  Note that
+    `axl_atexit` refuses registration while its table is NULL, so
+    whichever entry path runs the constructors must have called
+    `_axl_atexit_init` FIRST or every destructor is silently dropped.
 **/
 
 #include <stddef.h>

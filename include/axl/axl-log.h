@@ -69,6 +69,17 @@ extern "C" {
  *
  * Prefer the convenience macros (axl_error, axl_info, etc.) which
  * fill in func/line.
+ *
+ * @note **The log engine is opt-in at link time.** This function is a
+ *     trampoline over a weak internal symbol, so an image whose link did
+ *     not ask for the engine discards every record here — it is not
+ *     even formatted. Every build shape asks by default; the sole
+ *     exception is `axl-cc --minimal-runtime`, which is documented to
+ *     link nothing it was not asked for. Opt back in with
+ *     `--minimal-runtime=log` (and see `--minimal-runtime=nolog` to
+ *     confirm you want the silence — an app whose own objects call a
+ *     log macro must say which it meant, so the choice can never be
+ *     made for you by accident). Costs ~6 KB on x64.
  */
 void
 axl_log_full(
@@ -82,6 +93,8 @@ axl_log_full(
 
 /**
  * @brief Log a message without source location.
+ *
+ * @note Opt-in at link time exactly as #axl_log_full is.
  */
 void
 axl_log(

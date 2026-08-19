@@ -112,7 +112,7 @@ edk2-stable202511; captured by `spike/conprov-cv2.c`.
    ConSplitter exposes post-eviction, so `SetMode(0)` maps to our geometry; the
    logger's `ClearScreen` on `SetMode` routes a harmless clear down to the consumer
    at take-over. When nothing wraps `gST->ConOut` this is a no-op re-affirm.
-   Regression: `test-console-device-qemu.sh` Scenario 3 (wide smoke built
+   Regression: `test-console-device-takeover-qemu.sh` wide-geometry (wide smoke built
    `-DPRECACHE_SMALL` forces the stale-small window → 4/4 assert without this step,
    8/8 clean with it).
 
@@ -159,7 +159,7 @@ un-does the take-over in three steps, and the *order* matters:
    use-after-free:** our `SimpleTextOut` lives inside the device struct we
    `axl_free` at the end, so a stale fan-out entry means the *next* `OutputString`
    on `gST->ConOut` jumps through a freed vtable and **hangs**. This was caught
-   under DEBUG OVMF by `test-console-device-qemu.sh` Scenario 2 (bisection: the
+   under DEBUG OVMF by `test-console-device-takeover-qemu.sh` restore (bisection: the
    `uninstall` call returns, the first post-restore `OutputString` wedges;
    skipping the free makes it succeed — confirming the dangling reference).
 3. **Uninstall our protocols and free.** With ConSplitter no longer referencing

@@ -25,17 +25,50 @@
 AXL_LOG_DOMAIN("backend");
 
 // ---------------------------------------------------------------------------
-// Event close debug ring — DIAG 2026-04-27
+// Event double-close GUARD — DIAG 2026-04-27
+//
+// NOT a diagnostic, despite the origin note and the "debug ring" it used to be
+// called. axl_backend_event_close_dbg SKIPS a repeat close, and DxeCore's
+// CoreCloseEvent #GPs on a stale handle -- so this table is what keeps the
+// machine up, in RELEASE as much as in DEBUG. Do not compile it out.
+//
+// WHAT IS conditional is the FORENSICS. The record used to carry the first
+// close's file/line and a `closed` flag alongside the handle: 24 bytes padded,
+// x256 = 6,144 bytes of .bss in EVERY image, which is 13% of the ~47 KB floor
+// a do-nothing AXL app pays before its own first line (see
+// AXL-Shared-Driver-Recipe.md). The handle alone is all the GUARD needs --
+// `handle != NULL` means exactly "closed and not since re-created", which is
+// what both writers below already maintained -- so file/line now live only
+// under AXL_MEM_DEBUG, where images are not size-constrained and the message
+// naming the first close site is worth having.
+//
+//   RELEASE  8 B x 256 = 2,048    guard intact, message names only the handle
+//   DEBUG   24 B x 256 = 6,144    unchanged, full first-close attribution
+//
+// The depth stays 256 in both, deliberately: shrinking the ring would shorten
+// the window in which a repeat close is caught, which is the one property that
+// must not differ between what is tested and what ships.
 // ---------------------------------------------------------------------------
 
 #define EVENT_CLOSE_RING_SIZE  256
 
 typedef struct {
+    /* NULL = free slot. Non-NULL = this handle was closed and has not been
+     * handed back by a later CreateEvent. That is the whole guard state. */
     void        *handle;
+#ifdef AXL_MEM_DEBUG
     const char  *file;
     int          line;
-    bool         closed;   /* true after a close; cleared by a fresh create */
+#endif
 } EventCloseRecord;
+
+/* The size win is the point of the layout, so pin it: a field added back
+ * without thought costs 256x its padded size in every shipped image. */
+#ifndef AXL_MEM_DEBUG
+_Static_assert(sizeof(EventCloseRecord) == sizeof(void *),
+               "RELEASE close-guard record must stay handle-sized -- 256 of "
+               "these sit in .bss in every image; see the note above");
+#endif
 
 static EventCloseRecord  mEventCloseRing[EVENT_CLOSE_RING_SIZE];
 static size_t            mEventCloseHead;
@@ -53,7 +86,6 @@ event_close_ring_record_create(void *handle)
     for (size_t i = 0; i < EVENT_CLOSE_RING_SIZE; i++) {
         if (mEventCloseRing[i].handle == handle) {
             mEventCloseRing[i].handle = NULL;
-            mEventCloseRing[i].closed = false;
         }
     }
 }
@@ -396,10 +428,12 @@ axl_backend_event_close_dbg(
         return;
     }
 
-    /* Scan ring for a prior close of the same handle. */
+    /* Scan the ring for a prior close of the same handle. A non-NULL match is
+       one: `event` is non-NULL here, so a free slot can never compare equal. */
     for (size_t i = 0; i < EVENT_CLOSE_RING_SIZE; i++) {
         EventCloseRecord *rec = &mEventCloseRing[i];
-        if (rec->closed && rec->handle == (void *)event) {
+        if (rec->handle == (void *)event) {
+#ifdef AXL_MEM_DEBUG
             axl_warning("DOUBLE-CLOSE: event=%p first-closed-at=%s:%d "
                         "now-being-closed-at=%s:%d -- skipping to avoid "
                         "DxeCore CoreCloseEvent #GP",
@@ -408,6 +442,14 @@ axl_backend_event_close_dbg(
                         rec->line,
                         file ? file : "?",
                         line);
+#else
+            /* Same refusal, without the 4 KB of .bss the attribution costs.
+               The site now being closed is still named, which is the half a
+               consumer can act on. */
+            axl_warning("DOUBLE-CLOSE: event=%p now-being-closed-at=%s:%d "
+                        "-- skipping to avoid DxeCore CoreCloseEvent #GP",
+                        (void *)event, file ? file : "?", line);
+#endif
             return;
         }
     }
@@ -415,9 +457,10 @@ axl_backend_event_close_dbg(
     /* Record this close before performing it. */
     EventCloseRecord *rec = &mEventCloseRing[mEventCloseHead];
     rec->handle = (void *)event;
+#ifdef AXL_MEM_DEBUG
     rec->file   = file;
     rec->line   = line;
-    rec->closed = true;
+#endif
     mEventCloseHead = (mEventCloseHead + 1) % EVENT_CLOSE_RING_SIZE;
 
     /* If this was a notify-timer created by

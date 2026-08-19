@@ -326,6 +326,12 @@ void _axl_cleanup(void);
   static AxlEfiStatus AXLAPI                                             \
   _axl_driver_unload_stub(AxlHandle _img) {                              \
     int _rc = unload_func(_img);                                         \
+    /* Consumer unload FIRST, global destructors SECOND -- an unload    */\
+    /* function may legitimately read globals, and the reverse order    */\
+    /* would hand it destructed state. And only when it SUCCEEDED: a    */\
+    /* failing unload leaves the image resident, so destructing its     */\
+    /* globals would leave a live image running on torn-down state.     */\
+    if (_rc == 0) { axl_driver_cleanup(); }                              \
     return (_rc == 0) ? AXL_EFI_SUCCESS : AXL_EFI_ABORTED;               \
   }                                                                      \
                                                                          \
@@ -334,13 +340,27 @@ void _axl_cleanup(void);
     axl_driver_init(_ImageHandle, _SystemTable);                         \
     axl_driver_set_unload((void *)_axl_driver_unload_stub);              \
     int _rc = entry_func(_ImageHandle, _SystemTable);                    \
+    /* ENTRY FAILURE IS THE OTHER TEARDOWN PATH, and the firmware gives  */\
+    /* no second chance: EDK2's CoreStartImage unloads a failed image    */\
+    /* through CoreUnloadAndCloseImage, which -- unlike CoreUnloadImage  */\
+    /* -- never invokes Image->Info.Unload. So the stub above does NOT   */\
+    /* run here, and this is the only place the constructors that        */\
+    /* axl_driver_init just ran can be undone. Without it a failed load  */\
+    /* leaks every global's destructor, the atexit table itself, and (on */\
+    /* an exceptions build) the registered .eh_frame table.              */\
+    if (_rc != 0) { axl_driver_cleanup(); }                              \
     return (_rc == 0) ? AXL_EFI_SUCCESS : AXL_EFI_ABORTED;               \
   }
 
 /**
  * AXL_SHARED_DRIVER(name_str, init_fn, run_fn, unload_fn):
  *   int init_fn(void)           — heavy per-boot setup; 0 = ok (else abort load)
- *   int run_fn(int, char **)    — per-dispatch entry (== int main)
+ *   int run_fn(int, char **) AXL_CB_NOEXCEPT
+ *                               — per-dispatch entry (== int main).
+ *                                 The marker is nothing in C; from C++ it is
+ *                                 REQUIRED, because this lands in a vtable
+ *                                 slot declared noexcept and since C++17 that
+ *                                 is part of the function type.
  *   int unload_fn(void)         — teardown; 0 = ok
  *
  * Emits the driver image's DriverEntry/Unload: runs init_fn once, publishes
@@ -357,7 +377,7 @@ void _axl_cleanup(void);
  *
  * @code
  *   static int my_init(void);
- *   static int my_run(int argc, char **argv);
+ *   static int my_run(int argc, char **argv) AXL_CB_NOEXCEPT;
  *   static int my_unload(void);
  *
  *   static int my_init(void) {
@@ -365,7 +385,7 @@ void _axl_cleanup(void);
  *       return 0;
  *   }
  *
- *   static int my_run(int argc, char **argv) {
+ *   static int my_run(int argc, char **argv) AXL_CB_NOEXCEPT {
  *       // ... per-dispatch entry, like int main ...
  *       return 0;
  *   }
@@ -381,9 +401,26 @@ void _axl_cleanup(void);
  * Use AXL_SHARED_DRIVER xor AXL_DRIVER xor AXL_SERVICE_DRIVER per
  * translation unit — each emits the image's single DriverEntry.
  */
+/* AXL_CB_NOEXCEPT on run_fn ONLY, and it is not cosmetic. The slot it
+ * initialises below -- AxlSharedDriverVtable::run -- carries it, and since
+ * C++17 `noexcept` is part of the function TYPE, so a declaration without it
+ * yields `int (*)(int, char **)` where the vtable wants
+ * `int (*)(int, char **) noexcept`. That agrees in C (where the macro expands
+ * to nothing) and is a hard error in C++, which is why this macro could not be
+ * used from C++ at all: the offending declaration is the macro's OWN, so
+ * declaring the callback noexcept at the call site -- which the recipe's
+ * static-first, macro-last rule already tells you to do -- does not help.
+ *
+ * init_fn and unload_fn deliberately do NOT get it. They are called directly
+ * by the stubs below rather than stored in an AXL_CB_NOEXCEPT slot, so
+ * requiring it would be a source-breaking demand on C++ consumers for nothing:
+ * a consumer who defined `static int my_init(void)` would suddenly need
+ * `noexcept` to match a declaration that has no reason to want it. The rule
+ * across the SDK is that AXL_CB_NOEXCEPT belongs on callbacks AXL STORES.
+ */
 #define AXL_SHARED_DRIVER(name_str, init_fn, run_fn, unload_fn)             \
   int init_fn(void);                                                        \
-  int run_fn(int, char **);                                                 \
+  int run_fn(int, char **) AXL_CB_NOEXCEPT;                                 \
   int unload_fn(void);                                                      \
   static AxlSharedDriverVtable _axl_sd_vtable = { run_fn };                 \
   static AxlHandle             _axl_sd_handle = NULL;                       \

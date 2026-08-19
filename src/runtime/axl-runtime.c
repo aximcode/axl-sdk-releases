@@ -282,8 +282,21 @@ _axl_cleanup(void)
     axl_backend_console_set_page_break(false);
 
     /* atexit callbacks fire first — they may free resources that
-     * would otherwise be caught (noisily) by the sweep. */
-    _axl_atexit_run_all();
+     * would otherwise be caught (noisily) by the sweep.
+     *
+     * NOT in a driver image, where that table belongs to
+     * axl_driver_cleanup. This path is reachable from a driver:
+     * _axl_poll_break calls axl_exit(1) on a shell break with no handler
+     * installed, and it sits under ordinary library work (axl-fs,
+     * axl-http-client, axl-digest, axl-sort). The drain was a guaranteed
+     * no-op there until axl_driver_init began populating the table; left
+     * unguarded it would now run every global destructor, after which
+     * gBS->Exit FAILS for a non-current image and spins — leaving a live
+     * driver on destructed state. The spin predates this; destroying the
+     * image's C++ state on the way into it would not. */
+    if (!_axl_atexit_is_driver_image()) {
+        _axl_atexit_run_all();
+    }
 
     _axl_args_free();
 

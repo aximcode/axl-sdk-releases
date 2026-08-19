@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=70 local-only=0
+# test-meta: arch=x64 needs= est=15 local-only=0
 # test-tool-redirect-pipe-qemu.sh — every axl-sdk tool's stdout survives the
 # four UEFI-shell output operators, and the byte encoding of each is correct.
 #

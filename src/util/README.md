@@ -350,6 +350,15 @@ EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE ImageHandle,
 }
 ```
 
+`axl_driver_init` also runs the image's C++ global constructors, and
+`axl_driver_cleanup` runs the matching destructors. The macros
+(`AXL_DRIVER`, `AXL_SHARED_DRIVER`, `AXL_SERVICE_DRIVER`) call the
+second for you from the unload stub, after your unload function and
+only if it succeeded. **A hand-written `DriverEntry` like the one
+above must call `axl_driver_cleanup()` itself on the unload path**, or
+the image's destructors never run. See `<axl/axl-driver.h>` for the
+full ordering contract, including why `.fini_array` is not walked.
+
 See `sdk/examples/driver.c` for a complete example.
 
 ### Surviving a Driver That Hangs the Box (AxlAttempt)

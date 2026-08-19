@@ -487,12 +487,11 @@ test_pci_get_vid_did_class_code(void)
     test_check(axl_pci_get_vid_did(root, NULL, &did) == AXL_ERR, "pci get_vid_did: NULL vid");
     test_check(axl_pci_get_class_code(root, NULL) == AXL_ERR,       "pci get_class_code: NULL out");
 
-    /* The three standard-header accessors do NOT agree about an absent
-       function, and that asymmetry is deliberate-but-surprising enough to pin
-       here rather than leave for a consumer to rediscover.
-       axl_pci_get_vid_did and axl_pci_get_header_type fold "absent" into
-       AXL_ERR; axl_pci_get_class_code does not, and hands back 0xFFFFFF with
-       AXL_OK -- a plausible-looking 24-bit value.
+    /* All three standard-header accessors agree about an absent function:
+       AXL_ERR. get_class_code was the odd one out until it gained the
+       precheck its two siblings already had -- it returned AXL_OK with
+       0xFFFFFF, a plausible-looking 24-bit value that a caller had to know
+       the fold width to recognise.
        Wanted: a MAPPED but absent function. The bus=0xFF address above is
        unmapped, so its reads fail outright and the all-ones path never runs;
        bus 0 is mapped by MCFG, so an empty function there reads all-ones. */
@@ -515,19 +514,24 @@ test_pci_get_vid_did_class_code(void)
     }
 
     if (found_absent) {
-        uint32_t          absent_cc = 0;
+        /* The out param must be left ALONE on the error return, not written
+           with the all-ones fold. A caller that ignores the status and reads
+           the value would otherwise see 0xFFFFFF and be back where it
+           started, so this initialiser is what it must still be holding --
+           a poison value, since 0 is what a real read could produce. */
+        uint32_t          absent_cc = 0xA5A5A5u;
         AxlPciHeaderType  absent_ht;
         bool              absent_mf;
-        test_check(axl_pci_get_class_code(mapped_absent, &absent_cc) == AXL_OK
-                   && absent_cc == 0xFFFFFFu,
-                   "pci get_class_code: absent function reads 0xFFFFFF as AXL_OK "
-                   "(no presence precheck -- see axl-pci.h)");
+        test_check(axl_pci_get_class_code(mapped_absent, &absent_cc) == AXL_ERR
+                   && absent_cc == 0xA5A5A5u,
+                   "pci get_class_code: absent function returns AXL_ERR and "
+                   "leaves class_code untouched");
         test_check(axl_pci_get_header_type(mapped_absent, &absent_ht, &absent_mf)
                    == AXL_ERR,
                    "pci get_header_type: same absent function returns AXL_ERR "
-                   "(it DOES precheck) -- the documented asymmetry");
+                   "-- all three accessors now agree");
     } else {
-        test_skip_n(2, "pci absent-function asymmetry (no mapped-but-absent "
+        test_skip_n(2, "pci absent-function agreement (no mapped-but-absent "
                        "function on bus 0 in this image)");
     }
 }

@@ -42,7 +42,7 @@ cd "$(dirname "$SCRIPT_DIR")" || exit 1
 
 WANT_DOCS=1
 ONLY=""
-ALL_JOBS=(x64 aa64 lint make docs)
+ALL_JOBS=(x64 aa64 lint make makeimg docs)
 for a in "$@"; do
     case "$a" in
         --no-docs) WANT_DOCS=0 ;;
@@ -68,7 +68,7 @@ if [[ -n "$ONLY" ]]; then
         case " ${JOBS[*]} " in *" $j "*) ;; *) SKIPPED+=("$j") ;; esac
     done
 else
-    JOBS=(x64 aa64 lint make)
+    JOBS=(x64 aa64 lint make makeimg)
     [[ $WANT_DOCS -eq 1 ]] && JOBS+=(docs) || SKIPPED+=(docs)
 fi
 
@@ -111,6 +111,30 @@ want make && run make make "${MAKE_CHECKS[@]}" &
 want docs && run docs ./scripts/build-docs.sh &
 wait
 
+# THE ARTIFACT GATES RUN HERE, AFTER the wait, and the placement is the point.
+# check-pe-stripped and check-log-linkage take $(PREFIX)/*.efi as prerequisites,
+# so each runs the libaxl.a recipe -- which begins `rm -f $@` -- and the x64 job
+# above builds into that same default PREFIX. Run beside it, they are two
+# unsynchronised `make` processes racing one archive; nothing here locks.
+#
+# Deriving LINT_GATES from the Makefile made the two LISTS unable to drift.
+# That is not the same property as every member being safe to run beside a
+# build, which is what its comment claims -- so the Makefile now splits the
+# two, and membership of LINT_GATES means what it says again.
+#
+# Serial and last is also the CHEAPEST place: the x64 job has just built every
+# image these need, so both are a read of warm artifacts rather than a build.
+if want makeimg; then
+    mapfile -t ART_CHECKS < <(make -s print-lint-gates-artifact | tr ' ' '\n' | grep -v '^$')
+    if (( ${#ART_CHECKS[@]} == 0 )); then
+        echo "verify.sh: refusing to run -- 'make print-lint-gates-artifact'" \
+             "named no gates. A gate runner that runs nothing reports ALL" \
+             "GREEN forever." >&2
+        exit 2
+    fi
+    run makeimg make "${ART_CHECKS[@]}"
+fi
+
 fail=0
 printf '%-6s %-4s %s\n' JOB RC DETAIL
 for j in "${JOBS[@]}"; do
@@ -125,6 +149,7 @@ for j in "${JOBS[@]}"; do
         # clean" was the first thing this printed. RC is the real verdict; this
         # column is informational.
         make)     detail="$(grep -c ': clean' "$OUT/$j.log") gate lines clean" ;;
+        makeimg)  detail="$(grep -c ': clean\|: OK' "$OUT/$j.log") image gate(s) clean (serial: they build)" ;;
     esac
     printf '%-6s %-4s %s\n' "$j" "$rc" "${detail:-see $OUT/$j.log}"
     [[ "$rc" == "0" ]] || fail=1

@@ -62,6 +62,25 @@ check() {
     fi
 }
 
+# $1 label, $2 target version, $3.. substrings the refusal output MUST name.
+# Separate from check() because an exit code is not the whole contract: the
+# refusal is a REPORT a human reads to decide --allow-breaking, so what it
+# LISTS is load-bearing. A truncated list reads as a complete one.
+check_names() {
+    local label="$1" target="$2"; shift 2
+    local out; out="$(cd "$WORK/repo" && "$GUARD" "$target" 2>&1)" || true
+    local missing=""
+    for want in "$@"; do
+        [[ "$out" == *"$want"* ]] || missing+=" '$want'"
+    done
+    if [[ -z "$missing" ]]; then
+        pass "$label"
+    else
+        fail "$label (never named:$missing)"
+        printf '        %s\n' "$out" | head -8
+    fi
+}
+
 echo "=== release semver guard ==="
 
 # --- the incident itself -------------------------------------------------
@@ -87,6 +106,28 @@ check "ignores '### Breaking' in an ALREADY-RELEASED section" 3.2.3 0
 # --- a heading that merely mentions the word ------------------------------
 fixture 3.2.2 "$(printf '### Fixed\n- restored a thing that was breaking builds\n')"
 check "prose containing 'breaking' is not a Breaking heading" 3.2.3 0
+
+# --- the refusal must name EVERY breaking entry, not the first ------------
+#
+# Real entries run to several paragraphs. A listing that reads only a few lines
+# past the heading names the first bullet and silently drops the rest -- and the
+# reader deciding whether to pass --allow-breaking sees a list that looks
+# complete. That is the original incident again, one layer in: the information
+# is present in the file and absent from the report.
+fixture 4.2.0 "$(printf '### Breaking\n\n- **FIRST breaking entry.** Lorem ipsum dolor sit amet, a body\n  long enough to run past the heading by several lines.\n\n  A second paragraph, because real entries have them.\n\n  | a | table |\n  |---|---|\n  | of | numbers |\n\n- **SECOND breaking entry.** Also multi-line, and the one a\n  short listing drops.\n\n  With its own trailing paragraph.\n\n### Fixed\n\n- **NOT a breaking entry** and must not be listed as one.\n')"
+check       "refuses a MINOR carrying multi-paragraph breaking entries" 4.3.0 1
+check_names "the refusal names EVERY breaking entry, not just the first" 4.3.0 \
+            "FIRST breaking entry" "SECOND breaking entry"
+
+# ...and does not spill into the next section. A listing that ran to the end of
+# the body would report Fixed entries as breaking, which is the same defect
+# pointing the other way and just as misleading.
+out="$(cd "$WORK/repo" && "$GUARD" 4.3.0 2>&1)" || true
+if [[ "$out" != *"NOT a breaking entry"* ]]; then
+    pass "...and stops at the next '###' heading"
+else
+    fail "the listing ran past '### Breaking' into the following section"
+fi
 
 echo ""
 printf 'release semver guard: %d passed, %d failed\n' "$PASS" "$FAIL"

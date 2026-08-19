@@ -1140,12 +1140,55 @@ on multi-MB documents.
 
 ### 10.4 Minimal runtime opt-out
 
-**Status: landed 2026-04-20.** `src/crt0/axl-crt0-minimal.c` ships
-as a peer to `axl-crt0-native.c` and is selected via
-`axl-cc --minimal-runtime`. The minimal CRT0 sets the firmware
-globals, calls `axl_stream_init()` (needed by `axl_printf`), parses
-argv, calls `main`, returns. It skips `_axl_registry_init`,
-`_axl_atexit_init`, `_axl_signal_init`, and default-loop creation.
+**Status: landed 2026-04-20; made genuinely minimal 2026-08-19.**
+`src/crt0/axl-crt0-minimal.c` ships as a peer to
+`axl-crt0-native.c` and is selected via `axl-cc --minimal-runtime`.
+The minimal CRT0 sets the firmware globals, calls `main`, honours a
+pending `axl_set_exit_status`, returns. It skips
+`_axl_registry_init`, `_axl_atexit_init`, `_axl_signal_init`, and
+default-loop creation.
+
+Everything else is opted back in by FEATURE, and each feature is a
+link decision rather than a code path — `axl-cc` turns it into a
+`-u SYMBOL` that pulls the archive member which defines it:
+
+| feature | what it restores |
+|---|---|
+| `stdio` | force the stream layer in (it also self-initialises whenever the app references `axl_printf` and friends) |
+| `args`  | `main()` gets its `argc`/`argv` |
+| `noargs`| confirm `main()` does not need them |
+| `log`   | the log engine, so `axl_error` and friends emit |
+| `nolog` | confirm you want them to no-op, and keep the bytes |
+
+`--minimal-runtime=stdio,args` is the behaviour the flag had before.
+
+**Two of those are questions the driver will not answer for you.** An
+app whose own objects call a log macro must name `log` or `nolog`, and
+one whose `main` is declared with parameters must name `args` or
+`noargs`; `axl-cc` refuses the link otherwise. An image cannot go quiet,
+or lose its arguments, without someone having chosen it. `main(void)`
+needs neither — it has nothing to declare.
+
+The two are read by different instruments, and the reason is worth
+knowing when a refusal surprises you. Logging is visible to `nm`:
+`axl_error` expands to a call, so the caller's object carries an
+undefined `axl_log_full`. **Reading `argv` emits no symbol at all** —
+it arrives in registers, and `main(void)` and `main(int, char **)` are
+one name with one linkage — so `main`'s arity is read from DWARF
+(`-g -gdwarf` is on in `DEBUG` *and* `RELEASE`). When it cannot be read
+— a prebuilt object compiled without debug info — that is its own
+refusal, because "could not look" and "takes no arguments" are the same
+empty answer and guessing wrong ships an image with a silently empty
+`argv`.
+
+> **The `argv` guarantee is currently a coincidence, which is why it is
+> asked about.** On today's tree a bare `--minimal-runtime` image *does*
+> receive `argv`: `axl-cxxrt-stubs.o` is on every link (the porting layer
+> travels with the C library), it strongly references `axl_file_info`,
+> and that drags `axl-fs.o` → `axl-driver.o` → `axl-app.o`, which defines
+> `_axl_args_init`. The CRT0's weak reference binds through an edge that
+> has nothing to do with `argv`. Declare what you use; the coincidence is
+> not a contract.
 
 The registry and atexit APIs no-op safely when their storage is
 NULL (`_axl_registry_add` returns 0, `axl_atexit` returns 0), so
@@ -1159,12 +1202,22 @@ Behavior contrast on a `runtime-demo leak-event` debug build:
 - Minimal runtime: no sweep; the debug leak report prints the raw
   allocation site. Apps that opt out own their cleanup.
 
-Binary size is effectively identical in release builds because
-`-ffunction-sections` + `--gc-sections` already elides unused
-runtime code. The flag is a *behavior* opt-out (exit semantics,
-resource tracking), not primarily a size knob. Drivers and
-runtime images are unaffected: they supply their own entry and
-don't link either CRT0, same as before.
+**Size.** This paragraph used to say the flag was not a size knob,
+and it was right about the code as it then stood: everything the
+CRT0 skipped was already elided by `-ffunction-sections` +
+`--gc-sections`, and the pieces it *kept* — the stream layer, and a
+log engine that 27 archive members referenced — were the floor. Both
+are opt-in now. A do-nothing x64 RELEASE image measures **30,720
+bytes** against **36,864** for the full runtime; before this work the
+same pair was 36,864 against 37,376. See
+`docs/AXL-Minimal-Image-Notes.md` for where the remaining 30 KB goes
+and for the ~4.6 KB an image that links no `libaxl` at all reaches.
+
+It remains a *behaviour* opt-out as well (exit semantics, resource
+tracking), and that half is unchanged. Drivers and runtime images
+are unaffected: they supply their own entry and don't link either
+CRT0, same as before — and every ordinary link, theirs included,
+carries the log engine by default.
 
 ## 11. What this doesn't help with
 

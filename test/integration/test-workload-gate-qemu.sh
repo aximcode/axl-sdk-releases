@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=45 local-only=0
+# test-meta: arch=x64 needs= est=29 local-only=0
 # test-workload-gate-qemu.sh — run-qemu.sh --workload declares what SHAPE of
 # run this is, so the CPU gate stops mismeasuring compute-bound guests.
 #

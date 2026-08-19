@@ -11,7 +11,7 @@
 #   - an unrecognized --long option is a clear axl-cc error, not a silent
 #     forward or a "source not found".
 #
-# Requires scripts/install.sh --arch x64 to have staged out/bin/axl-cc + libs
+# Requires scripts/install.sh --arch x64 to have staged stage/bin/axl-cc + libs
 # (the artifact under test). Exits 2 if the staged SDK isn't present.
 #
 # Usage: ./test/integration/test-axl-cc-flags.sh [--arch X64]
@@ -56,6 +56,21 @@ fi
 
 SRC="$PROJECT_DIR/sdk/examples/hello.c"
 [[ -f "$SRC" ]] || { echo "FAIL: source missing: $SRC"; exit 1; }
+
+# The bare-metal cross, for the one assertion below that needs an object axl-cc
+# did NOT compile (axl-cc always passes -g, so it cannot produce a
+# debug-info-free object itself). Read from the same conf the Makefile and
+# axl-cc read, rather than a fourth spelling -- that is what check-flag-parity
+# and check-toolchain-conf exist to prevent.
+X64_GCC=""
+for _conf in "$PROJECT_DIR/scripts/axl-toolchains.conf" \
+             "$(test_sdk_dir)/share/axl/axl-toolchains.conf"; do
+    if [[ -r "$_conf" ]]; then . "$_conf"; break; fi
+done
+X64_GCC="${AXL_X64_GCC:-${AXL_X64_GCC_DEFAULT:-}}"
+[[ -x "$X64_GCC" ]] || X64_GCC=""
+X64_GXX="${AXL_X64_GXX:-${AXL_X64_GXX_DEFAULT:-}}"
+[[ -x "$X64_GXX" ]] || X64_GXX=""
 
 WORK="$TEST_TMPDIR/axl-cc-flags"
 mkdir -p "$WORK"
@@ -552,6 +567,226 @@ check "$?" "a build naming no host path still succeeds"
 "$AXL_CC" --allow-host-paths -I/usr/include "$HM/clean.c" -o "$HM/d.efi" \
     >"$HM/opt.log" 2>&1
 check "$?" "--allow-host-paths permits it, as the error message promises"
+
+# --------------------------------------------------------------------------
+# --minimal-runtime and the log engine.
+#
+# The engine is opt-in at link time, so a --minimal-runtime app that calls
+# axl_error() gets a NO-OP unless it asks for `log`. Silence that the author
+# did not choose is the failure mode this section exists to prevent: axl-cc
+# reads the caller's OWN objects for a reference to axl_log_full and refuses
+# the link unless one of `log` / `nolog` says which they meant.
+#
+# `nolog` is not decoration -- without it the check would have no way to say
+# "yes, silent, I know", and a check with no escape hatch gets disabled.
+# --------------------------------------------------------------------------
+ML="$WORK/minlog"
+mkdir -p "$ML"
+cat > "$ML/logs.c" <<'EOF'
+#include <axl.h>
+AXL_LOG_DOMAIN("t");
+int main(void) { axl_error("x"); return 0; }
+EOF
+cat > "$ML/quiet.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+
+# The image's link map is the reading, not the exit code: every one of these
+# links succeeds, and what differs is whether axl-log.o is in it.
+engine_linked() { grep -q 'libaxl\.a(axl-log\.o)' "$1"; }
+
+"$AXL_CC" --minimal-runtime "$ML/logs.c" -o "$ML/a.efi" >"$ML/bare.log" 2>&1
+ml_rc=$?
+[[ "$ml_rc" -ne 0 ]] && grep -q -- "--minimal-runtime=log" "$ML/bare.log" \
+                     && grep -q -- "nolog" "$ML/bare.log"
+check "$?" "--minimal-runtime on a logging app errors and names log/nolog (rc=$ml_rc)"
+
+"$AXL_CC" --minimal-runtime=log "$ML/logs.c" -Wl,-Map="$ML/on.map" \
+    -o "$ML/on.efi" >"$ML/on.log" 2>&1
+ml_rc=$?
+[[ "$ml_rc" -eq 0 ]] && engine_linked "$ML/on.map"
+check "$?" "--minimal-runtime=log links the log engine (rc=$ml_rc)"
+
+"$AXL_CC" --minimal-runtime=nolog "$ML/logs.c" -Wl,-Map="$ML/off.map" \
+    -o "$ML/off.efi" >"$ML/off.log" 2>&1
+ml_rc=$?
+[[ "$ml_rc" -eq 0 ]] && ! engine_linked "$ML/off.map"
+check "$?" "--minimal-runtime=nolog builds and drops the log engine (rc=$ml_rc)"
+
+# The control. A check that rejected every --minimal-runtime link would pass
+# the first assertion above on its own.
+"$AXL_CC" --minimal-runtime "$ML/quiet.c" -o "$ML/q.efi" >"$ML/quiet.log" 2>&1
+check "$?" "--minimal-runtime on an app that never logs still builds"
+
+# ...and the case where the check cannot RUN. An unreadable object makes the
+# nm scan fail, which looks exactly like "nothing in here logs" -- so treating
+# the two the same would ship a silent image on a broken toolchain and say
+# nothing. The refusal must name the ambiguity, not guess.
+printf 'not an object\n' > "$ML/bad.o"
+"$AXL_CC" --minimal-runtime "$ML/quiet.c" "$ML/bad.o" -o "$ML/u.efi" \
+    >"$ML/unreadable.log" 2>&1
+ml_rc=$?
+[[ "$ml_rc" -ne 0 ]] && grep -q "cannot tell whether this app logs" "$ML/unreadable.log"
+check "$?" "an unreadable object errors rather than assuming silence (rc=$ml_rc)"
+
+# ...and naming the answer gets past it, so the escape hatch the message
+# offers actually works.
+"$AXL_CC" --minimal-runtime=nolog "$ML/quiet.c" "$ML/bad.o" -o "$ML/u2.efi" \
+    >"$ML/unreadable2.log" 2>&1
+ml_rc=$?
+# The link itself still fails on the junk object -- that is ld's business and
+# it says so loudly. What must NOT appear is this driver's ambiguity refusal.
+! grep -q "cannot tell whether this app logs" "$ML/unreadable2.log"
+check "$?" "naming nolog gets past the ambiguity check (rc=$ml_rc)"
+
+# The other control, and the one that matters most: an ORDINARY build is
+# untouched. If the seam ever stopped being pulled by default, every image AXL
+# has ever produced would go silent and no other assertion here would notice.
+"$AXL_CC" "$ML/logs.c" -Wl,-Map="$ML/full.map" -o "$ML/full.efi" \
+    >"$ML/full.log" 2>&1
+ml_rc=$?
+[[ "$ml_rc" -eq 0 ]] && engine_linked "$ML/full.map"
+check "$?" "a default (full-runtime) build still links the log engine (rc=$ml_rc)"
+
+# --------------------------------------------------------------------------
+# --minimal-runtime and argv: the SAME refusal shape as log, for a hazard that
+# cannot be detected the same way.
+#
+# `args` used to be a silent feature: pass it and main gets argc/argv, omit it
+# and it does not. The log side refuses rather than shipping unchosen silence,
+# and this is the same class of defect one step quieter -- main receives argc=0
+# and nothing anywhere says so.
+#
+# WHAT MAKES IT DIFFERENT. Log is DETECTABLE: calling axl_error leaves an
+# undefined axl_log_full in the caller's object, so `nm -u` answers the
+# question. argv leaves NO symbol -- it arrives in registers, and `main(void)`
+# and `main(int, char **)` are the same name with the same linkage. So the
+# reading comes from DWARF instead: -g -gdwarf is on in DEBUG *and* RELEASE, so
+# main's DW_TAG_formal_parameter children are there to count.
+#
+# And when they are NOT -- a prebuilt object compiled elsewhere without debug
+# info -- that is the `cannot tell` branch, which log already has and which
+# matters more here: "could not look" and "main takes no arguments" are the
+# same empty answer, and guessing wrong produces an image whose argv is
+# silently empty.
+#
+# NOTE ON WHAT IS NOT ASSERTED. There is deliberately no link-map assertion
+# pairing `=args` against `=noargs`, because today it would be a lie: every
+# link carries axl-cxxrt-stubs.o (the porting layer travels with the C
+# library), it strongly references axl_file_info, and that drags
+# axl-fs.o -> axl-driver.o -> axl-app.o, which is what defines _axl_args_init.
+# So argv currently arrives whether or not you ask. That is the coincidence
+# this refusal exists to stop depending on -- so what IS asserted is that the
+# DECLARATION reaches the link line, which is the part that stays true when the
+# coincidence moves.
+# --------------------------------------------------------------------------
+MA="$WORK/minargs"
+mkdir -p "$MA"
+cat > "$MA/uses.c" <<'EOF'
+int main(int argc, char **argv) { (void)argv; return argc; }
+EOF
+cat > "$MA/void.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+
+# 1. The refusal itself, and it must name BOTH spellings -- a message that
+#    offers only `args` teaches everyone to opt in whether they need it or not.
+"$AXL_CC" --minimal-runtime "$MA/uses.c" -o "$MA/a.efi" >"$MA/bare.log" 2>&1
+ma_rc=$?
+[[ "$ma_rc" -ne 0 ]] && grep -q -- "--minimal-runtime=args" "$MA/bare.log" \
+                     && grep -q -- "noargs" "$MA/bare.log"
+check "$?" "--minimal-runtime on an app whose main takes argv errors, naming args/noargs (rc=$ma_rc)"
+
+# 2. THE CONTROL, and the one that matters: a check that refused every minimal
+#    link would pass assertion 1 on its own. main(void) is the shape that has
+#    nothing to declare, and it must still build with no ceremony.
+"$AXL_CC" --minimal-runtime "$MA/void.c" -o "$MA/v.efi" >"$MA/void.log" 2>&1
+check "$?" "--minimal-runtime on a main(void) app still builds untouched"
+
+# 3. `=args` builds AND puts the declaration on the ld line. This is the
+#    assertion with teeth: -u _axl_args_init is what still pulls axl-app.o on
+#    the day the incidental chain above stops doing it for free.
+"$AXL_CC" -v --minimal-runtime=args "$MA/uses.c" -o "$MA/on.efi" >"$MA/on.log" 2>&1
+ma_rc=$?
+[[ "$ma_rc" -eq 0 ]] && grep -q -- "-u _axl_args_init" "$MA/on.log"
+check "$?" "--minimal-runtime=args builds and forces _axl_args_init (rc=$ma_rc)"
+
+# 4. ...and `=noargs` builds WITHOUT it. Without this pair, a --minimal-runtime
+#    that appended the -u unconditionally would satisfy 3 and mean nothing.
+"$AXL_CC" -v --minimal-runtime=noargs "$MA/uses.c" -o "$MA/off.efi" >"$MA/off.log" 2>&1
+ma_rc=$?
+[[ "$ma_rc" -eq 0 ]] && ! grep -q -- "-u _axl_args_init" "$MA/off.log"
+check "$?" "--minimal-runtime=noargs builds and does NOT force it (rc=$ma_rc)"
+
+# 5. The two answers to one question cannot both be given.
+"$AXL_CC" --minimal-runtime=args,noargs "$MA/void.c" -o "$MA/c.efi" >"$MA/contra.log" 2>&1
+ma_rc=$?
+[[ "$ma_rc" -ne 0 ]] && grep -q "contradict" "$MA/contra.log"
+check "$?" "--minimal-runtime=args,noargs is refused as contradictory (rc=$ma_rc)"
+
+# 6. The `cannot tell` branch. A prebuilt object with no debug info hides
+#    main's arity, which looks exactly like main(void) -- so treating the two
+#    the same would ship an image with empty argv and say nothing.
+[[ -n "$X64_GCC" ]] && "$X64_GCC" -c -g0 -ffreestanding "$MA/uses.c" -o "$MA/nodwarf.o" 2>/dev/null
+if [[ -f "$MA/nodwarf.o" ]]; then
+    "$AXL_CC" --minimal-runtime "$MA/nodwarf.o" -o "$MA/u.efi" >"$MA/nod.log" 2>&1
+    ma_rc=$?
+    [[ "$ma_rc" -ne 0 ]] && grep -q "cannot tell whether this app reads argv" "$MA/nod.log"
+    check "$?" "an object with no debug info errors rather than assuming main(void) (rc=$ma_rc)"
+
+    # ...and the escape hatch the message offers actually works. A check with
+    # no way past it gets disabled.
+    "$AXL_CC" --minimal-runtime=noargs "$MA/nodwarf.o" -o "$MA/u2.efi" >"$MA/nod2.log" 2>&1
+    ! grep -q "cannot tell whether this app reads argv" "$MA/nod2.log"
+    check "$?" "naming noargs gets past the arity ambiguity check"
+else
+    check 0 "SKIP: no cross gcc to build a debug-info-free object"
+    check 0 "SKIP: (paired with the above)"
+fi
+
+# 6b. C++ NESTS subprograms, and the arity reader must survive it. A lambda's
+#     operator() and a local class's member function are DW_TAG_subprogram DIEs
+#     *inside* main's -- so a reader that tracks one frame loses main's identity
+#     the moment it descends, and answers "unknown" (or worse, the nested
+#     function's parameter count) for a main it can plainly see. Both spellings
+#     are asserted because they nest at different depths, and both were wrong.
+#
+#     This is the case no C fixture can reach, which is exactly why it is here:
+#     every other assertion in this section passes against a reader that is
+#     broken for every C++ app that uses a lambda.
+if [[ -n "$X64_GXX" ]]; then
+    cat > "$MA/lam_void.cpp" <<'EOF'
+int main(void) { auto g = [](int a, int b) { return a + b; }; return g(1, 2); }
+EOF
+    cat > "$MA/lam_args.cpp" <<'EOF'
+int main(int argc, char **argv) { auto g = [](int a) { return a; }; (void)argv; return g(argc); }
+EOF
+    cat > "$MA/lcl_void.cpp" <<'EOF'
+int main(void) { struct L { int f(int a, int b) { return a + b; } }; L l; return l.f(1, 2); }
+EOF
+    "$AXL_CC" --minimal-runtime "$MA/lam_void.cpp" -o "$MA/lv.efi" >"$MA/lv.log" 2>&1
+    check "$?" "--minimal-runtime on a C++ main(void) with a lambda still builds"
+
+    "$AXL_CC" --minimal-runtime "$MA/lcl_void.cpp" -o "$MA/cv.efi" >"$MA/cv.log" 2>&1
+    check "$?" "--minimal-runtime on a C++ main(void) with a local class still builds"
+
+    # ...and the nesting must not hide a main that DOES take argv.
+    "$AXL_CC" --minimal-runtime "$MA/lam_args.cpp" -o "$MA/la.efi" >"$MA/la.log" 2>&1
+    ma_rc=$?
+    [[ "$ma_rc" -ne 0 ]] && grep -q -- "noargs" "$MA/la.log"
+    check "$?" "--minimal-runtime on a C++ main(argc,argv) with a lambda still refuses (rc=$ma_rc)"
+else
+    check 0 "SKIP: no C++ cross toolchain for the nested-subprogram cases"
+    check 0 "SKIP: (paired)"
+    check 0 "SKIP: (paired)"
+fi
+
+# 7. An ORDINARY build is untouched. --minimal-runtime is the only shape that
+#    has to ask; every other one links argv by default and always has.
+"$AXL_CC" "$MA/uses.c" -o "$MA/full.efi" >"$MA/full.log" 2>&1
+ma_rc=$?
+[[ "$ma_rc" -eq 0 ]] && ! grep -q "reads argv" "$MA/full.log"
+check "$?" "a default (full-runtime) build never asks about argv (rc=$ma_rc)"
 
 echo "--- results ---"
 echo "axl-cc flag passthrough: $pass passed, $fail failed"

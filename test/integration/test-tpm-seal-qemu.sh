@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=swtpm est=25 local-only=0
+# test-meta: arch=x64 needs=swtpm est=16 local-only=0
 # test-tpm-seal-qemu.sh — axl_tpm_seal / axl_tpm_unseal against a
 # swtpm-backed TPM 2.0.
 #

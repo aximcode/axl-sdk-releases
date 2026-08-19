@@ -191,26 +191,33 @@ axl_pci_get_vid_did(
  * `(base << 16) | (sub << 8) | prog_if` form — same shape consumed
  * by axl_pci_find_by_class.
  *
- * **This does NOT precheck that the function is present**, unlike
- * @ref axl_pci_get_vid_did and @ref axl_pci_get_header_type, which both fold
- * "absent" into `AXL_ERR`. An absent function's config space reads all-ones,
- * so this returns **`AXL_OK` with `0xFFFFFF`** — a plausible-looking value,
- * not an error. Gate on @ref axl_pci_get_vid_did first if presence matters;
- * enumeration helpers such as @ref axl_pci_find_by_class already do.
+ * **An absent function is `AXL_ERR`**, matching @ref axl_pci_get_vid_did and
+ * @ref axl_pci_get_header_type — all three standard-header accessors fold
+ * "not present" into the error return so callers never have to disambiguate
+ * it from a real value. @p class_code is left untouched on any error.
  *
- * **The value is 24 bits.** The absent/unknown reading is `0xFFFFFF`, *not*
- * `0xFFFFFFFF` — a 32-bit comparison silently never matches, which turns a
- * phantom-function skip into dead code. `0xFFFFFF` is also what a present but
- * class-less function reads as (base class 0xFF, "does not fit any defined
- * class"), so it is not by itself proof of absence.
+ * @warning **Behaviour change since 4.2.0.** Up to and including that
+ *     release, this accessor alone had no presence precheck: an absent
+ *     function's config space reads all-ones, so it returned **`AXL_OK`
+ *     with `0xFFFFFF`** — a plausible-looking value, not an error. Code
+ *     written against that shape, which treats a non-`AXL_OK` return as a
+ *     *bus error* worth reporting, will now report absent functions too.
  *
- * @note The asymmetry with the two sibling accessors is known and may be
- *     reconciled in a future release. Do not rely on `AXL_OK` being returned
- *     for an absent function; treat `0xFFFFFF` as "no usable class" either
- *     way.
+ * **The value is 24 bits.** `0xFFFFFF` is *not* `0xFFFFFFFF` — a 32-bit
+ * comparison silently never matches, which turns a phantom-function skip
+ * into dead code. It remains reachable on success: a *present* function may
+ * report base class 0xFF, "does not fit any defined class". So `0xFFFFFF`
+ * means "no usable class", never "nothing there" — the precheck above is
+ * what answers the second question.
  *
- * @return AXL_OK on success — including for an absent function, see above —
- *     AXL_ERR on bus error or if @p class_code is NULL.
+ * @note Presence is decided by the vendor ID at offset 0x00 reading
+ *     `0xFFFF`, which is the bus-level sentinel. Firmware that returns some
+ *     *other* constant for an absent function (observed in the field) defeats
+ *     this, as it defeats the two sibling accessors; a caller facing such a
+ *     platform still needs its own filter.
+ *
+ * @return AXL_OK on success, AXL_ERR if the function is absent, on bus error,
+ *     or if @p class_code is NULL.
  */
 AXL_WARN_UNUSED int
 axl_pci_get_class_code(
@@ -246,10 +253,12 @@ typedef enum {
  * enum — callers can compare against the named constants and treat
  * unknown values as opaque. Bus error returns -1.
  *
- * Like @ref axl_pci_get_vid_did, the "function absent" sentinel is folded
- * into the return code, so a caller never has to disambiguate "header type
- * 0x7F, multi-function" from "nothing is there".
- * (@ref axl_pci_get_class_code deliberately does not do this — see its note.)
+ * Like @ref axl_pci_get_vid_did and @ref axl_pci_get_class_code, the
+ * "function absent" sentinel is folded into the return code, so a caller
+ * never has to disambiguate "header type 0x7F, multi-function" from
+ * "nothing is there". All three standard-header accessors agree; the
+ * class-code one only joined them after 4.2.0, so check its note before
+ * relying on that against an older SDK.
  *
  * @return AXL_OK on success, AXL_ERR if the function is absent or on bus
  *     error.

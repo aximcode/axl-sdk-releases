@@ -9,6 +9,8 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "../runtime/axl-atexit-internal.h"  /* _axl_atexit_init / _run_all */
+#include "../runtime/axl-cxxabi-internal.h"  /* _axl_cxxabi_run_init_array */
 #include "axl-image-internal.h"   /* _axl_init_image_path */
 #include "axl-driver-internal.h"  /* _axl_driver_ensure_with_embedded_info */
 #include <axl/axl-driver.h>
@@ -1247,6 +1249,58 @@ axl_driver_init(
        a ParentHandle fallback for buffer-loaded drivers — see
        axl-image-internal.h for the contract. */
     _axl_init_image_path((void *)image_handle);
+
+    /* BEFORE the constructors, not after, and this order is the whole
+       reason the two calls are adjacent. A C++ static destructor does
+       NOT land in .fini_array — measured on both arches, the object
+       carries no such section at all. It registers at RUN TIME, from
+       inside its own constructor, through __cxa_atexit, which AXL
+       routes to axl_atexit. And axl_atexit REFUSES registration while
+       its table is NULL, returning 0 that __cxa_atexit turns into -1
+       that the compiler-generated caller discards.
+
+       So walking .init_array without initialising this table first
+       would not merely leave destructors unrun: it would leave every
+       one of them silently UNREGISTERED — a fresh instance of exactly
+       the silent-failure bug this call pair exists to fix. The table
+       frees itself in _axl_atexit_run_all (axl_driver_cleanup). */
+    _axl_atexit_mark_driver_image();
+    _axl_atexit_init();
+
+    /* C++ global constructors fire last, after the rest of the driver
+       runtime is up, so ctors may use axl_printf / axl_malloc / etc.
+       Mirrors _axl_init's ordering and its comment.
+
+       THIS IS THE CALL A DRIVER IMAGE DID NOT HAVE. An app reached it
+       via _axl_init; a driver's entry path stopped here, so a driver
+       image linked __init_array_start / __init_array_end bracketing
+       real constructors and nothing that ever walked them. Silently:
+       no link error, no warning, no diagnostic — and because crt0
+       zeroes .bss, every unconstructed global read as all-zero rather
+       than faulting, which puts the symptom nowhere near the cause.
+       No-op for pure-C drivers (empty .init_array). */
+    _axl_cxxabi_run_init_array();
+}
+
+void
+axl_driver_cleanup(void)
+{
+    /* The unload-side counterpart to axl_driver_init's two calls above.
+       Drains in LIFO order and frees the table, so a driver that is
+       unloaded and reloaded in one boot gets a clean table each time.
+
+       Idempotent: _axl_atexit_run_all NULLs the table on the way out
+       and returns immediately when it is already NULL, so a consumer
+       with a hand-written DriverEntry that calls this AND uses a macro
+       that also calls it does not run destructors twice. */
+    _axl_atexit_run_all();
+
+    /* And the image-path capture _axl_init_image_path made above. On the app
+       path _axl_args_free does this; a driver has no argv, and these frees
+       used to sit behind that function's mArgv guard where a driver could
+       never reach them -- so every driver load leaked the capture, and a
+       self-reloading service leaked it per cycle. */
+    _axl_image_path_free();
 }
 
 // ---------------------------------------------------------------------------
@@ -2201,10 +2255,20 @@ db_teardown(void)
     return AXL_OK;
 }
 
-// axl_atexit hook — the app-exit safety net. Driver unload does NOT drain
-// axl_atexit (only AXL_APP / CRT0 do), so a Type-B *driver* uninstalls its
-// binding explicitly via axl_driver_binding_uninstall; this covers the
-// app-style path where a binding outlives main.
+// axl_atexit hook — the safety net, on BOTH exit paths now. It used to fire
+// only at app exit, because axl_driver_init never initialised the atexit table
+// and the registration below silently returned 0. Since axl_driver_init runs
+// .init_array (and therefore must init that table first), a driver's unload
+// drains it too, via axl_driver_cleanup.
+//
+// That makes this a real net for a driver rather than a dead registration, and
+// it does NOT double-run: axl_driver_binding_uninstall removes the hook after a
+// successful teardown, and if it is reached anyway db_teardown is idempotent —
+// a NULL g_db_rec returns AXL_ERR without freeing anything.
+//
+// A driver should still uninstall explicitly from its unload callback: the
+// consumer's unload runs BEFORE this drain, so a binding the firmware still
+// references fails teardown while the consumer can still report it.
 static void
 db_cleanup(void *p)
 {
@@ -2263,8 +2327,9 @@ axl_driver_binding_install(const AxlDriverBinding *db)
         return AXL_ERR;
     }
     // Track for explicit uninstall (driver-unload path) and register the
-    // app-exit safety-net hook. Driver unload must call
-    // axl_driver_binding_uninstall — axl_atexit only drains at app exit.
+    // safety-net hook, which now drains on a driver unload too (see db_cleanup).
+    // Uninstalling explicitly from the unload callback is still the right shape:
+    // it runs before the drain, so a still-referenced binding is reportable.
     g_db_rec = r;
     g_db_atexit = axl_atexit(db_cleanup, r);
     return AXL_OK;

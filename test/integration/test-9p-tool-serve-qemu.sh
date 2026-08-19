@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=140 local-only=0
+# test-meta: arch=both needs= est=72 local-only=0
 # test-9p-tool-serve-qemu.sh -- `9p serve` as a RESIDENT driver. The guest
 # Shell runs `9p.efi serve fs0:\9pexport --detach`, which deploys the
 # embedded 9p-serve-dxe.efi; the driver brings the NIC up, exports the

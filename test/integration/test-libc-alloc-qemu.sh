@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=70
+# test-meta: arch=both needs= est=18
 # test-libc-alloc-qemu.sh — newlib's internals allocate through AXL, not dlmalloc.
 #
 # P1 of AXL-Libc-Substrate-Design.md §4d. AXL exports the PLAIN allocator names,

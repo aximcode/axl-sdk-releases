@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=70 local-only=0
+# test-meta: arch=both needs= est=43 local-only=0
 # test-9p-tool-qemu.sh -- the `9p` TOOL against a host 9P server. Same
 # guest-connects-out topology as test-9p-qemu.sh (p9-server.py on the host,
 # reached at 10.0.2.2:<port> through QEMU user-net), but the guest runs the

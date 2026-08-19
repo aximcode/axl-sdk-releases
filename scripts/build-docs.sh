@@ -10,6 +10,34 @@ OUT_DIR="$ROOT_DIR/out/docs"
 
 source "$SCRIPT_DIR/axl-common.sh"
 
+# --ci-doxygen: run Doxygen at the version CI ACTUALLY USES, in a container,
+# and stop. The skew documented below is not theoretical -- it shipped broken
+# docs for v3.2.0 and again for v4.2.0, both times with a locally-clean gate.
+# A newer local doxygen ACCEPTS markup 1.9.8 rejects, so this gate cannot see
+# the failure it exists to prevent unless it is asked to.
+#
+# Run before any tag: docs.yml fires on EVERY v* tag, and a tag cannot be
+# re-cut.
+if [[ "${1:-}" == "--ci-doxygen" ]]; then
+    engine=$(command -v podman || command -v docker) \
+        || { echo "need podman or docker to reproduce CI's doxygen"; exit 2; }
+    echo "Reproducing CI's doxygen (ubuntu:24.04 apt package)..."
+    out=$("$engine" run --rm -v "$ROOT_DIR":/src:z -w /src ubuntu:24.04 bash -c \
+        'apt-get update -qq >/dev/null 2>&1 \
+         && apt-get install -y -qq doxygen >/dev/null 2>&1 \
+         && echo "doxygen $(doxygen --version)" >&2 \
+         && cd docs/sphinx && doxygen Doxyfile' 2>&1) || true
+    diag=$(printf '%s\n' "$out" | grep -E ": (error|warning):" || true)
+    printf '%s\n' "$out" | grep -E '^doxygen ' || true
+    if [[ -n "$diag" ]]; then
+        printf '%s\n' "$diag"
+        echo "FAIL: CI's doxygen reports the above; a local build will NOT show them."
+        exit 1
+    fi
+    echo "OK: clean at CI's doxygen version too."
+    exit 0
+fi
+
 # --------------------------------------------------------------------------
 # Check prerequisites
 # --------------------------------------------------------------------------

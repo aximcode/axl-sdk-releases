@@ -173,3 +173,55 @@ Read-modify-write, not a fresh struct: `axl_serial_set_mode` takes the whole
 `AxlSerialMode` and treats a zero field as "device default", so a partly
 filled one silently re-rates the port. For scale, a full 640-byte line takes
 about 55 ms at 115200 8N1.
+
+## The engine is opt-in at link time
+
+`axl_error` and friends expand to `axl_log_full`, which lives in
+`axl-log-emit.o` and forwards to a **weak** `_axl_log_vdispatch` defined in
+`axl-log.o`. Nothing pulls the engine implicitly: a link that wants logging
+asks for it with `-u _axl_log_vdispatch`.
+
+That indirection is not decoration. Every emitter call site in the library is
+an ordinary strong reference — 682 of them across 140 files, and 27 of the 51
+archive members in a *do-nothing* image carry one. While the emitters and the
+engine shared an object, every image AXL had ever produced linked the level
+filter, the domain table, the handler table, the console renderer and the
+wallclock chain behind its timestamps, whether or not it logged. It cost 6,144
+bytes on x64 and 5,632 on aa64 (5,232 of real `.text`+`.rodata` on x64, rounded
+up by the PE's 4 KB section alignment), and it is why `--minimal-runtime`
+measured no saving against the full runtime for as long as the flag existed.
+
+**Every ordinary build links the engine and behaves exactly as before** — the
+in-tree link macros carry `$(LOG_ENGINE_PULL)` and `axl-cc` passes it by
+default. The single exception is `axl-cc --minimal-runtime`, whose contract is
+to link nothing it was not asked for:
+
+```sh
+axl-cc --minimal-runtime=log    app.c -o app.efi   # emit; costs ~6 KB
+axl-cc --minimal-runtime=nolog  app.c -o app.efi   # no-op; keep the bytes
+```
+
+An app whose own objects reference an emitter must name one or the other;
+`axl-cc` refuses the link otherwise, so an image can never go quiet without
+someone having chosen it. Records are discarded *before* formatting, so a
+suppressed call costs a load and a branch.
+
+`nolog` declines to ask for the engine; it does not *forbid* one. An app that
+calls `axl_log_set_level` or `axl_log_add_handler` pulls `axl-log.o` for those,
+which defines the seam, and its `axl_error` calls emit again. That is the right
+answer rather than a leak — an app reaching for the log API wants logging — but
+it does mean `nolog` is not a silence guarantee, and the bytes come back.
+
+Two consequences worth knowing:
+
+- A `--minimal-runtime` image linked against an `AXL_MEM_DEBUG` build of
+  `libaxl.a` prints no leak report unless it asked for the engine — the report
+  is emitted with `axl_warning`. `axl-cc` builds are unaffected: `install.sh`
+  stages a RELEASE library where the report does not exist.
+- The library's *own* diagnostics are not what triggers the `axl-cc` check.
+  Silencing those is precisely what `--minimal-runtime` is for.
+
+`test-log-link-granularity.sh` holds the linkage half and
+`test-minimal-log-qemu.sh` the runtime half — the second matters because the
+weak target is address zero in an engine-less image, so a missing NULL check is
+a fault rather than a quiet regression.

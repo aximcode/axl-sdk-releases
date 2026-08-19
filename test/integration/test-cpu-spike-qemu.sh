@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=80 local-only=0
+# test-meta: arch=x64 needs= est=233 local-only=0
 # test-cpu-spike-qemu.sh — the CPU-spike detector actually detects.
 #
 # run-qemu.sh has had a CPU-spike sampler on by default for a long time, but

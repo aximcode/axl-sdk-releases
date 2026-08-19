@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs=virtiofsd,jq est=15 local-only=1
+# test-meta: arch=both needs=virtiofsd,jq est=5 local-only=1
 # test-json-corpus-qemu.sh -- AXL's JSON reader vs. EXTERNAL public corpora.
 #
 # The corpora are NOT vendored. They are cloned into deps/ (gitignored) by
@@ -69,14 +69,20 @@ esac
 TEST_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$ARCH_SUFFIX")/AxlTestJsonCorpus.efi"
 
 # --- preflight: fail with guidance, never with a mystery -------------------
+#
+# exit 77, not 0. The corpora are NOT vendored, so on a machine that never ran
+# fetch-json-corpora.sh this test declines every time -- and while it exited 0
+# it was counted among the suite's passes, so a run that tested no JSON corpus
+# at all reported the same green as one that tested every document in it.
+# run-integration.sh scores 77 as SKIP and names it in the totals.
 if [[ ! -f "$TEST_EFI" ]]; then
     echo "SKIP: $TEST_EFI not built (run: make tests${ARCH:+ ARCH=$ARCH_SUFFIX})" >&2
-    exit 0
+    exit 77
 fi
 if [[ ! -f "$CORPORA_DIR/AXLCORPUS.TAG" ]]; then
     echo "SKIP: no corpora in $CORPORA_DIR" >&2
     echo "      fetch them with: ./scripts/fetch-json-corpora.sh" >&2
-    exit 0
+    exit 77
 fi
 
 # --- differential oracle ----------------------------------------------------

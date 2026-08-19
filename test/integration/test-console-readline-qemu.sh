@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=15 local-only=0
+# test-meta: arch=both needs=socat est=15 local-only=0
+# arch=both since 2026-08-19: verified passing on AARCH64 unchanged -- it already
+# printed 'PASS (AARCH64)', so the arch support was there and only the test-meta
+# said otherwise.
 # test-console-readline-qemu.sh — end-to-end verification of the
 # interactive console line reader (axl_console_readline / _ex) and the
 # transparent axl_stdin console-line-editing fallback.
@@ -36,7 +39,7 @@
 # combination is deferred (documented in the code-review notes).
 #
 # Usage:
-#   scripts/install.sh --arch x64     # one-time, produces out/bin/axl-cc
+#   scripts/install.sh --arch x64     # one-time, produces stage/bin/axl-cc
 #   test/integration/test-console-readline-qemu.sh            # X64 (default)
 #   test/integration/test-console-readline-qemu.sh --arch AARCH64
 #

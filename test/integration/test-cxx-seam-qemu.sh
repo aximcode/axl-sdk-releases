@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=75 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0
 # test-cxx-seam-qemu.sh — the C++ seams over AXL's C API, run under QEMU.
 #
 # Covers AXL-Cxx-Design.md §9 phases C2, C3 and C5:

@@ -23,12 +23,28 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/discover.sh"
+# shellcheck source=lib/test-cache.sh
+source "$SCRIPT_DIR/lib/test-cache.sh"
 
 ARCH="X64"; TIMEOUT=900; LIST_ONLY=0; JOBS=0; SHARD=""; LOGDIR=""  # JOBS=0 => auto
 # Local-only tests need a capability the GitHub runners lack (a patched QEMU
 # for the SMBus/SPD memdev device, usb-mouse pointer delivery, ...). The dev
 # box HAS those, so the local run includes them by default; --ci drops them.
 INCLUDE_LOCAL="--include-local-only"
+ONLY_LOCAL=0
+# ON BY DEFAULT. An opt-in flag does not get typed: this cache was built and
+# then not used once in the session that built it, while the full uncached gate
+# was run after every change. `--no-cache` turns it off, and it is what a
+# pre-push or release run must use -- only an uncached run writes the
+# release-gate stamp (see the stamp block at the bottom, and
+# AXL-CI-Release-Speed-Design.md §12.16).
+# $SCRIPT_DIR, not a repo-relative path: the runner is invoked from wherever
+# the caller happens to be, and a relative default resolved against THAT --
+# test-runner-selftest.sh cd's into test/integration and created
+# test/integration/test/integration/.test-cache. One cache per checkout,
+# wherever it is run from.
+CACHE_DIR="$SCRIPT_DIR/.test-cache"
+CACHE_HITS=0
 TESTDIR="${RUN_INTEGRATION_DIR:-$SCRIPT_DIR}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,7 +54,25 @@ while [[ $# -gt 0 ]]; do
         --shard)   SHARD="$2"; shift 2 ;;   # i/K (0-based)
         --logdir)  LOGDIR="$2"; shift 2 ;;  # keep per-test output here
         --no-build) RUN_NO_BUILD=1; shift ;; # skip the one-time pre-build (CI: built in a prior job)
-        --ci)      INCLUDE_LOCAL=""; shift ;; # exclude local-only tests (CI runners lack the capability)
+        # --ci also turns the cache OFF. CI is the backstop -- §11.2 records
+        # five days of undetected red when it was not run at all -- and a
+        # backstop that skips tests is not one. (A fresh checkout has no cache
+        # dir anyway, so this is belt and braces, and it is the belt that
+        # matters if anyone ever runs --ci on a working tree.)
+        --ci)      INCLUDE_LOCAL=""; CACHE_DIR=""; shift ;;
+        # The inverse of --ci: ONLY what CI cannot run. For the inner loop,
+        # where the other 78% of the wall clock is work a push repeats for
+        # free. NOT a substitute for the full run before pushing -- see the
+        # banner it prints.
+        --only-local) INCLUDE_LOCAL="--only-local"; ONLY_LOCAL=1; shift ;;
+        # Accepted and a no-op: caching is the default now, and this spelling
+        # exists so an invocation written before that still works.
+        --cache)      CACHE_DIR="$SCRIPT_DIR/.test-cache"; shift ;;
+        # Turn the cache OFF. Required for a run that must certify the tree:
+        # only an uncached run writes the release-gate stamp. lib/test-cache.sh
+        # documents what the key does and does not cover -- the host
+        # environment is the gap, and it is why this switch exists at all.
+        --no-cache)   CACHE_DIR=""; shift ;;
         -j)        JOBS="$2"; shift 2 ;;
         -j*)       JOBS="${1#-j}"; shift ;;
         *) shift ;;
@@ -67,6 +101,13 @@ fi
 export AXL_TLS=1
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MAKE_ARCH=x64; [[ "$ARCH" == "AARCH64" ]] && MAKE_ARCH=aa64
+
+if [[ -n "$CACHE_DIR" ]]; then
+    mkdir -p "$CACHE_DIR"
+    # Absolute: tests run with their own cwd, and run-qemu.sh is a separate
+    # process again.
+    AXL_TEST_CACHE="$(cd "$CACHE_DIR" && pwd)"; export AXL_TEST_CACHE
+fi
 
 if [[ -n "${RUN_INTEGRATION_DIR:-}" ]]; then
     mapfile -t TESTS < <(ls "$TESTDIR"/test-*.sh 2>/dev/null)
@@ -97,6 +138,35 @@ if [[ -n "$SHARD" ]]; then
         load[$min]=$(( load[$min] + e ))
     done < <(printf '%s\n' "${pairs[@]}" | sort -t'|' -k1,1nr)
     TESTS=("${mine[@]}")
+fi
+
+# LONGEST FIRST (LPT), and this is worth more than it looks.
+#
+# The pool takes tests in discovery order, which is the glob's -- alphabetical,
+# i.e. arbitrary with respect to cost. Feeding a fixed set of jobs to N workers
+# is makespan scheduling, where longest-processing-time-first is the classic
+# greedy and is provably within 4/3 of optimal; arbitrary order has no bound at
+# all, because a long test that starts last runs alone while five workers idle.
+#
+# The FULL run barely notices: 164 tests over 6 workers already measured 99%
+# packing (3,385 s of work, a 564 s floor, 569 s actual) because there is always
+# small work left to fill a gap. The SCOPED run is where order decides
+# everything -- `--only-local` is 17 tests of which six are >= 87 s, and it
+# measured 194 s against a 125 s floor: 65%. Same tests, same workers, just
+# started in the wrong order.
+#
+# `est=` is declared by every test and enforced by check-test-meta, so the key
+# already exists and needs no new metadata. It is an ESTIMATE: being wrong
+# costs some packing efficiency and nothing else, since order cannot change a
+# result. Ties keep discovery order (`sort -s`), so a run stays reproducible.
+if [[ ${#TESTS[@]} -gt 1 ]]; then
+    mapfile -t TESTS < <(
+        for _t in "${TESTS[@]}"; do
+            _e=$(test_meta_field "$_t" est 2>/dev/null)
+            [[ "$_e" =~ ^[0-9]+$ ]] || _e=20
+            printf '%s\t%s\n' "$_e" "$_t"
+        done | sort -s -k1,1nr | cut -f2-
+    )
 fi
 
 # Warn when --timeout is too tight for what was selected. stderr only, so
@@ -174,11 +244,50 @@ fi
 # reused the same base, so a genuine collision was retried straight into it.
 # Leaving TEST_PORT_BASE unset is what routes both attempts through the
 # allocator, so a retry draws different ports.
+# Write the runner's OWN per-test duration to the profile. Not a second
+# measurement of the same thing -- it IS the measurement run_one already makes
+# and prints, written where profile-report.py can read it. The report needs
+# totals for all 164 tests to derive seconds-per-boot for the ones instrumented
+# by count only (see scripts/run-qemu.sh).
+_prof_test_total() {
+    [[ -n "${AXL_TEST_PROFILE:-}" ]] || return 0
+    printf 'test|%s|%s\n' "$1" "$2" >> "$AXL_TEST_PROFILE"
+}
+
 run_one() {  # <idx> <test_path>
     local idx="$1" t="$2" name start dur rc
     name=$(basename "$t"); start=$SECONDS
+    # Name the profile records for this test. run-qemu.sh runs as a separate
+    # process and has no other way to know which test launched it.
+    export AXL_TEST_PROFILE_NAME="$name"
+
+    # SKIP CACHE. Decided here and nowhere else, because this is the only place
+    # that sees every test exactly once -- common-test.sh's test_setup runs
+    # three times in some tests, and the run-qemu-only tests never reach it.
+    if [[ -n "$CACHE_DIR" ]] && cache_is_fresh "$name"; then
+        dur=$(( SECONDS - start ))
+        echo "  $name CACHED ${dur}s (inputs identical to its last green run)"
+        echo "$name" >> "$LOGDIR/_cached.txt"
+        return 0
+    fi
+    # A real run rewrites the input list from scratch, so a test that stages
+    # FEWER things than last time does not inherit stale entries.
+    [[ -n "$CACHE_DIR" ]] && cache_begin_inputs "$name"
     timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
     rc=$?
+    # 77 = SKIPPED (the automake convention). Handled BEFORE the retry, because
+    # a test that cannot run will not run any better the second time, and
+    # before the cache, because the reason it skipped -- an absent corpus, a
+    # missing host tool -- is not in the key, so committing one would skip it
+    # forever afterwards.
+    if [[ $rc -eq 77 ]]; then
+        dur=$(( SECONDS - start ))
+        _prof_test_total "$name" "$dur"
+        [[ -n "$CACHE_DIR" ]] && cache_invalidate "$name"
+        echo "$name" >> "$LOGDIR/_skipped.txt"
+        echo "  $name SKIP ${dur}s ($(grep -m1 -oE 'SKIP[:( ].{0,60}' "$LOGDIR/$name.log" 2>/dev/null || echo 'declined to run'))"
+        return 0
+    fi
     if [[ $rc -ne 0 ]]; then
         # Retry once. Most failures under the parallel pool are transient
         # resource-contention flakes (a QEMU starved during boot emits empty
@@ -191,14 +300,21 @@ run_one() {  # <idx> <test_path>
         rc=$?
         if [[ $rc -eq 0 ]]; then
             dur=$(( SECONDS - start ))
+            _prof_test_total "$name" "$dur"
+            [[ -n "$CACHE_DIR" ]] && cache_commit "$name"
             echo "  $name PASS ${dur}s (retry; attempt 1 failed — see $name.attempt1.log)"
             return 0
         fi
     fi
     dur=$(( SECONDS - start ))
+    _prof_test_total "$name" "$dur"
     if [[ $rc -eq 0 ]]; then
+        [[ -n "$CACHE_DIR" ]] && cache_commit "$name"
         echo "  $name PASS ${dur}s"; return 0
     fi
+    # A red test must never be skippable next time, even if its inputs are
+    # somehow identical again.
+    [[ -n "$CACHE_DIR" ]] && cache_invalidate "$name"
     # Failure/timeout (twice): replay the test's captured output (logs live in
     # an ephemeral dir that CI discards, so surface the reason inline). Tail
     # keeps the job log readable when many tests fail at once.
@@ -381,14 +497,51 @@ for f in "$results"/*; do
 done
 
 echo ""
-echo "integration: $pass passed, $failc failed ($ARCH)"
+_nskip=$(wc -l < "$LOGDIR/_skipped.txt" 2>/dev/null | tr -d ' ' || echo 0)
+[[ -n "$_nskip" ]] || _nskip=0
+# Skips are reported in the headline, not buried. A suite that skipped a third
+# of itself and said "N passed" is the same failure shape as a gate that cannot
+# see the change it was run for.
+if [[ "$_nskip" -gt 0 ]]; then
+    echo "integration: $pass passed, $failc failed, $_nskip SKIPPED ($ARCH)"
+    sed 's/^/    skipped: /' "$LOGDIR/_skipped.txt"
+else
+    echo "integration: $pass passed, $failc failed ($ARCH)"
+fi
+# A filtered run NEVER reports as though it were a full one. Same rule
+# verify.sh --only follows, and for the same reason: the failure this tree
+# keeps meeting is a gate that could not see the change reporting the same
+# green as one that could. AXL-CI-Release-Speed-Design.md §12.8.
+_nc=$(wc -l < "$LOGDIR/_cached.txt" 2>/dev/null | tr -d ' ' || echo 0)
+[[ -n "$_nc" ]] || _nc=0
+# Only when something was ACTUALLY skipped. Printed on every run -- which is
+# what a default-on cache would do -- it stops carrying information, and this
+# tree already has the rule that a banner which always fires is not a banner.
+if [[ -n "$CACHE_DIR" && "$_nc" -gt 0 ]]; then
+    echo "integration: PARTIAL -- cache: $_nc test(s) SKIPPED as unchanged" \
+         "since their last green run. Inputs only; the host environment is not" \
+         "in the key. Re-run with --no-cache for a pre-push gate."
+fi
+if [[ $ONLY_LOCAL -eq 1 ]]; then
+    echo "integration: PARTIAL -- only-local: ran the $(printf %d "${#TESTS[@]}") test(s) CI cannot," \
+         "SKIPPED everything CI does run. Not a pre-push gate."
+elif [[ -z "$INCLUDE_LOCAL" ]]; then
+    echo "integration: PARTIAL -- --ci: local-only tests were SKIPPED."
+fi
+[[ -n "$SHARD" ]] && echo "integration: PARTIAL -- shard $SHARD of the suite only."
 echo "logs: $LOGDIR"
 
 # Stamp a clean, COMPLETE run so a release can skip dispatching CI for an
 # answer this run already has (AXL-CI-Release-Speed-Design.md §10.3). Only a
 # full run counts: a --shard or a filtered run did not test everything, so it
 # must not be able to satisfy a release gate.
-if [[ $failc -eq 0 && -z "$SHARD" ]]; then
+#
+# --only-local and --ci are filtered runs by construction and are excluded for
+# exactly that reason. --ci was NOT excluded before and could write the stamp
+# having skipped every local-only test -- the same defect this flag would have
+# introduced, one flag earlier.
+if [[ $failc -eq 0 && -z "$SHARD" && $ONLY_LOCAL -eq 0 && -n "$INCLUDE_LOCAL" \
+      && -z "$CACHE_DIR" ]]; then
     # shellcheck source=lib/release-gate.sh
     source "$SCRIPT_DIR/lib/release-gate.sh"
     release_gate_write "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" \

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=75 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0
 # test-cxx-streams-qemu.sh — axl::cout / axl::cin / axl::cerr and axl::string,
 # built FREESTANDING by the staged SDK's axl-c++ and run under QEMU.
 #

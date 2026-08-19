@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=60 local-only=0
+# test-meta: arch=both needs= est=13 local-only=0
 # test-stack-guard-qemu.sh — the stack protector fires under UEFI.
 #
 # `-fstack-protector-strong` is on by default in the library and in axl-cc.

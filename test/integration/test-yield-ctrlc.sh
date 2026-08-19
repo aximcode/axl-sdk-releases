@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=7 local-only=0
+# test-meta: arch=both needs=socat est=7 local-only=0
+# arch=both since 2026-08-19: verified passing on AARCH64 unchanged. It was x64-only
+# with no stated reason -- never ported, not unportable.
 # test-yield-ctrlc.sh — end-to-end proof that Ctrl-C routes through
 # the axl_yield → default-exit → atexit path for a UEFI app running
 # in QEMU.
@@ -27,7 +29,7 @@
 #      main returns → _axl_cleanup → atexit list fires.
 #
 # Usage:
-#   scripts/install.sh --arch x64     # one-time, produces out/bin/axl-cc
+#   scripts/install.sh --arch x64     # one-time, produces stage/bin/axl-cc
 #   test/integration/test-yield-ctrlc.sh
 #
 # Requires: socat, a staged SDK at out/ (from scripts/install.sh).
