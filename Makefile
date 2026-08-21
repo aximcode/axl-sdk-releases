@@ -1535,7 +1535,21 @@ check-ascii:
 # check can see; that it actually RUNS is test-cxx-driver-ctors-qemu.sh, and
 # the two exist because a driver image did the first and not the second.
 check-cxx-entry:
-	@fail=0; \
+	@for t in nm objdump; do \
+	  if ! $(CROSS)$$t --version >/dev/null 2>&1; then \
+	    echo "check-cxx-entry: CANNOT RUN — $(CROSS)$$t does not execute."; \
+	    $(CROSS)$$t --version 2>&1 | head -3 | sed 's/^/    /'; \
+	    echo "  This gate READS the compiled object: nm for the entry symbols,"; \
+	    echo "  objdump for the .init_array count. A tool that cannot START"; \
+	    echo "  returns an empty answer, and empty is indistinguishable from"; \
+	    echo "  'the symbol is mangled' and 'no constructor was registered'"; \
+	    echo "  unless it is checked FIRST. Both were reported, wrongly, on the"; \
+	    echo "  v4.3.0 tag run: the CI container had no libdebuginfod.so.1, so"; \
+	    echo "  the cross objdump could not load, and this gate blamed codegen."; \
+	    exit 1; \
+	  fi; \
+	done; \
+	fail=0; \
 	for variant in DRIVER SHARED SERVICE; do \
 	  obj=$$(mktemp --suffix=.o); \
 	  if ! $(CXX) $(CXXFLAGS_BASE) -Iinclude -DAXL_ENTRY_FIXTURE_$$variant \
@@ -1547,15 +1561,25 @@ check-cxx-entry:
 	  rm -f $$obj.err; \
 	  syms="DriverEntry"; \
 	  [ "$$variant" = "DRIVER" ] && syms="_AxlEntry DriverEntry"; \
+	  if ! nmout=$$($(CROSS)nm $$obj 2>&1); then \
+	    echo "check-cxx-entry: CANNOT RUN — $(CROSS)nm failed on the object"; \
+	    printf '%s\n' "$$nmout" | head -3 | sed 's/^/    /'; \
+	    rm -f $$obj; fail=1; continue; \
+	  fi; \
 	  for sym in $$syms; do \
-	    if $(CROSS)nm $$obj | grep -qE " T $$sym$$"; then \
+	    if printf '%s\n' "$$nmout" | grep -qE " T $$sym$$"; then \
 	      echo "check-cxx-entry: AXL_$$variant — $$sym is unmangled (C linkage)"; \
 	    else \
 	      echo "check-cxx-entry: FAIL — AXL_$$variant: $$sym is missing or name-mangled in C++ (needs AXL_ENTRY_LINKAGE)"; \
-	      $(CROSS)nm $$obj | grep -i "$$sym" | sed 's/^/    /'; fail=1; \
+	      printf '%s\n' "$$nmout" | grep -i "$$sym" | sed 's/^/    /'; fail=1; \
 	    fi; \
 	  done; \
-	  n=$$($(CROSS)objdump -h $$obj | awk '$$2 == ".init_array" { print $$3 }'); \
+	  if ! odout=$$($(CROSS)objdump -h $$obj 2>&1); then \
+	    echo "check-cxx-entry: CANNOT RUN — $(CROSS)objdump failed on the object"; \
+	    printf '%s\n' "$$odout" | head -3 | sed 's/^/    /'; \
+	    rm -f $$obj; fail=1; continue; \
+	  fi; \
+	  n=$$(printf '%s\n' "$$odout" | awk '$$2 == ".init_array" { print $$3 }'); \
 	  if [ -z "$$n" ] || [ $$((0x$$n)) -eq 0 ]; then \
 	    echo "check-cxx-entry: FAIL — AXL_$$variant: the fixture's global constructor"; \
 	    echo "  registered NO .init_array entry, so the runtime half of this"; \

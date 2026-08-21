@@ -1355,8 +1355,21 @@ _link_undef=""
 # both read as an empty scan, and guessing wrong produces a SILENT image. So
 # the two answers are kept apart.
 _link_undef_ok=true
+# THE CROSS nm, like the two other nm call sites in this script. This one used
+# to default to the bare `nm` on PATH, which is the host's -- the single place
+# a consumer build still reached into the distro toolchain, against 4.0.0's
+# claim that the SDK "takes no compiler, assembler or linker from the distro on
+# either arch". Invisible on an ordinary machine, because a host binutils nm
+# reads both ELF targets fine; found by a consumer poisoning every host
+# toolchain binary on PATH, where it became a hard refusal.
+#
+# Both cross toolchains ship one and $CROSS is already resolved above, so there
+# was never a reason to ask PATH. NM_BIN stays as an override for anyone who
+# needs a different one -- but the DEFAULT is now the toolchain this link is
+# actually using. test-hermetic-toolchain.sh holds the line.
+_nm="${NM_BIN:-${CROSS}nm}"
 if [[ ${#_link_objs[@]} -gt 0 ]]; then
-    if ! _link_undef="$("${NM_BIN:-nm}" -u "${_link_objs[@]}" 2>/dev/null)"; then
+    if ! _link_undef="$("$_nm" -u "${_link_objs[@]}" 2>/dev/null)"; then
         _link_undef=""
         _link_undef_ok=false
     fi
@@ -1388,7 +1401,7 @@ if [[ "$RUNTIME" != "minimal" || "$LOG_CHOICE" == "log" ]]; then
 elif [[ -z "$LOG_CHOICE" && "$_link_undef_ok" != "true" ]]; then
     echo "ERROR: --minimal-runtime: cannot tell whether this app logs." >&2
     echo "" >&2
-    echo "  '${NM_BIN:-nm}' could not read the objects going into this link," >&2
+    echo "  '$_nm' could not read the objects going into this link," >&2
     echo "  so the check that would have told you whether axl_error and" >&2
     echo "  friends are about to become no-ops could not run. Guessing here" >&2
     echo "  risks shipping an image that silently logs nothing, so say which" >&2

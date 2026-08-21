@@ -56,6 +56,8 @@ RELEASES_REPO="aximcode/axl-sdk-releases"
 # Deliberate exception to the semver refusal below: a release that really is
 # meant to carry a documented breaking change under a non-major version.
 ALLOW_BREAKING=""
+# The pre-tag docs gate is ON by default; see where it runs for why.
+RUN_DOCS_CHECK=true
 
 for arg in "$@"; do
     case "$arg" in
@@ -65,6 +67,7 @@ for arg in "$@"; do
         --ci-gate) CI_GATE=true ;;
         --force-ci) CI_GATE=true; FORCE_CI=true ;;
         --allow-breaking) ALLOW_BREAKING=1 ;;
+        --no-docs-check)  RUN_DOCS_CHECK=false ;;
         -*)        echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
         *)
             if [[ -n "$VERSION" ]]; then
@@ -76,7 +79,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$VERSION" ]]; then
-    echo "usage: $0 X.Y.Z [--dry-run] [--yes] [--resume] [--allow-breaking]" >&2
+    echo "usage: $0 X.Y.Z [--dry-run] [--yes] [--resume] [--allow-breaking] [--no-docs-check]" >&2
     exit 2
 fi
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -194,12 +197,20 @@ tag_and_publish() {
     git tag -a "$TAG" -m "$(make_tag_message)"
     git push origin "$TAG"
 
-    # Docs triggers only on a MAJOR tag (vX.0.0); every release tag triggers
-    # Release. CI is NOT triggered by tags at all (it was pre-validated on main
-    # before this cut). Tell the watcher which to expect so it doesn't hang
-    # waiting for a workflow that never runs.
-    local expect="Release"
-    [[ "$VERSION" =~ ^[0-9]+\.0\.0$ ]] && expect="Release Docs"
+    # EVERY `v*` tag starts BOTH Release and Docs -- docs.yml's trigger is
+    # `push: tags: ['v*']`, with no version filter, and RELEASING.md says so in
+    # as many words. This used to expect Docs only on a MAJOR tag (vX.0.0),
+    # which meant that on a minor or patch the watcher never WAITED for it: if
+    # Docs was still queued when Release finished, the cut reported success
+    # having never looked at it. v4.3.0 only got checked because an unrelated CI
+    # run kept the poll loop alive. A tag cannot be re-cut, so a Docs failure
+    # nobody waited for is a broken docs site with a green release.
+    #
+    # CI is not triggered by the TAG -- but it is triggered by the `git push
+    # origin main` this script does two steps earlier, and that push carries the
+    # release commit. So a CI run on this same SHA is expected and the watcher
+    # will see it; it just is not something the tag started.
+    local expect="Release Docs"
     say "Watching $expect for $TAG"
     if ! EXPECT_WORKFLOWS="$expect" scripts/watch-release-runs.sh "$TAG"; then
         die "a release workflow did not succeed — see the output above and 'gh run list'"
@@ -239,6 +250,26 @@ grep -q '^## Unreleased' CHANGELOG.md \
 scripts/check-release-semver.sh "$VERSION" \
     ${ALLOW_BREAKING:+--allow-breaking} \
     || die "release content does not match the version being cut"
+
+# THE DOCS GATE, and it runs BEFORE anything is pushed because it is the one
+# gate that cannot be re-run after the fact: docs.yml fires on every `v*` tag
+# and a tag cannot be re-cut. A dev box's doxygen is NEWER than the apt package
+# CI installs and ACCEPTS markup the older one rejects, so a locally-clean
+# `verify.sh` is not evidence -- that skew shipped broken docs at v3.2.0 and
+# again at v4.2.0. RELEASING.md called it "the one gate worth running that the
+# normal verify.sh cannot substitute for"; being documented was not enough, so
+# it is enforced here.
+#
+# Escapable by name (--no-docs-check) rather than absent: a check with no way
+# past it gets commented out the first time it is inconvenient. The flag says
+# out loud what was skipped.
+if $RUN_DOCS_CHECK; then
+    say "Docs gate — rebuilding at CI's doxygen version (this is the pre-tag gate)"
+    scripts/build-docs.sh --ci-doxygen \
+        || die "docs are not clean at CI's doxygen version — docs.yml would fail on the tag, and a tag cannot be re-cut. Fix the markup, or re-run with --no-docs-check if you accept a broken docs deploy."
+else
+    note "docs gate SKIPPED (--no-docs-check) — docs.yml still fires on this tag"
+fi
 
 PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
 say "Will release $TAG — commits since ${PREV_TAG:-the beginning}"

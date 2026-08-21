@@ -711,7 +711,9 @@ never by path.
   `verify.sh` is ~85% of it, so the reason expired even though the 61 s did not
 - [ ] **Phase 5 — clang-tidy scoping, for CI only.** Deliberately last: it is
   the intuitive first target and §12.2 shows it is worth **at most 61 s**
-  locally, though CI's ratio is reversed (~7 min)
+  locally. CI's ratio is reversed, but by less than this line used to claim:
+  re-measured 2026-08-20, the job is **2 m 38 s** of an 813 s run, of which
+  `lint.sh` is 77 s — so scoping attacks 77 s, not ~7 min (§9)
 - Deliberately NOT on this list: **making boots cheaper.** At a ~7 s floor it
   would beat everything above, but `run-qemu.sh` already skips the Boot Manager
   countdown and ~7 s is close to what an OVMF boot costs. Recorded in §12.12 so
@@ -843,8 +845,13 @@ Grouped, terse; **detail lives in the linked design doc or
   entry below ever happens.
 
 - **CMake as THE build system, replacing the Makefile** —
-  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)**, IN PROGRESS
-  2026-08-15 on branch `worktree-cmake-build-system`. Mike's direction, with
+  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)**, **PROPOSED
+  2026-08-15, retargeted to 5.0.0 on 2026-08-16 — NOT STARTED.** A branch
+  `worktree-cmake-build-system` is reserved but carries **zero** commits main
+  does not have, and is 123 commits behind it (checked 2026-08-20). This entry
+  read "IN PROGRESS on branch ..." while the doc index above read "PROPOSED",
+  which is the kind of disagreement that makes a reader believe work is
+  underway when a branch name is all that exists. Mike's direction, with
   the constraint stated
   explicitly: **we will no longer ship Makefiles** — replaced, not
   supplemented. Today CMake is a CONSUMER-facing path only

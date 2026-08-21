@@ -3,6 +3,101 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.3.1 — 2026-08-20
+### Fixed
+
+- **A consumer build reached into the host toolchain in exactly one place.**
+  `axl-cc` shells out to `nm` three times; two named `${CROSS}nm`, and the
+  `--minimal-runtime` log-emitter check named `${NM_BIN:-nm}` — the host's.
+  `NM_BIN` is never assigned, so that default is what always ran. Both cross
+  toolchains ship an `nm` and `$CROSS` was already resolved, so it now defaults
+  to `${NM_BIN:-${CROSS}nm}`; the override stays.
+
+  No behavioural difference on an ordinary machine — a host binutils `nm` reads
+  both ELF targets fine — which is precisely why it survived. The value is the
+  claim it protects: 4.0.0's *"the SDK now takes no compiler, assembler or
+  linker from the distro on either arch"*. `nm` is binutils, and this was the
+  one place that sentence was not literally true.
+
+  **Broader than first reported.** The finding came from a consumer poisoning
+  every host toolchain binary on `PATH`, where the visible symptom was a hard
+  refusal (*"cannot tell whether this app logs"*) on the one app that left the
+  log question open. But the same `nm` pass runs on **every** link, feeding the
+  C++-link detection as well — so an ordinary full-runtime build was invoking
+  host `nm` too. It merely tolerated the failure silently, which for a C++ link
+  would have mis-detected the link shape rather than degraded politely.
+
+  The diagnostic now names the binary actually tried, which is a cross-prefixed
+  one.
+
+- **Nothing enforced the hermeticity claim, so a one-line gap outlived it.** The
+  4.0.0 statement rested on a one-time inventory; it took a consumer's
+  experiment to find the exception. `test-hermetic-toolchain.sh` makes that
+  experiment permanent: it replaces every host toolchain name on `PATH` with a
+  shim that records itself and exits 111, builds through `axl-cc`, and asserts
+  both that the build succeeds and that **zero** shims were invoked. Recording
+  matters more than the exit code — a build that succeeds having called one of
+  them is still not hermetic.
+
+  It fixes the fixture on the shape that needs inspection (`--minimal-runtime`
+  with the log question deliberately left open); declaring `log` or `nolog`
+  skips the check entirely, so a fixture that declared one would have reported
+  green forever. A grep for unprefixed tool names was considered and rejected:
+  it approximates the property and drifts, where poisoning `PATH` is the
+  property itself.
+
+- **CI could not run the cross `objdump`, and the gate blamed codegen.** The
+  `clang-tidy` job installs host `binutils`, but `check-cxx-entry` reads the
+  compiled object with the *cross* `objdump` from `/opt` — a prebuilt binary
+  linking `libdebuginfod.so.1`, which `ubuntu:26.04` does not ship. It could not
+  load, so the gate counted zero `.init_array` entries and reported *"registered
+  NO .init_array entry"*. That failed the v4.3.0 tag run against code that is
+  clean locally. Adds `libdebuginfod1t64` (the 64-bit `time_t` rename; plain
+  `libdebuginfod1` does not exist on 26.04). The dependency arrived with a
+  deliberate improvement — `check-cxx-entry` moved to the cross tools so
+  `ARCH=aa64` would be reliable rather than accidentally-working — and the apt
+  list was not moved with it.
+
+- **`check-cxx-entry` reported "cannot run" as "found nothing".** Both of its
+  readers were affected, not just the one that failed: a `nm` that cannot start
+  makes `grep` match nothing, which it printed as *"missing or name-mangled in
+  C++"*; an `objdump` that cannot start yields an empty section list, which it
+  printed as *"registered NO .init_array entry"*. An unrunnable toolchain
+  produced **three** wrong diagnoses per variant, each sending the reader after
+  a defect that does not exist. It now probes both tools before trusting either,
+  and checks their exit status at the point of use, so a tool that cannot run
+  says so and names itself. This is the third recorded instance of the shape —
+  `check-awk-portability.py`'s own docstring cites the `strtonum` version.
+
+- **The release watcher never waited for Docs on a non-major tag.** It expected
+  `Docs` only for `vX.0.0`, but `docs.yml`'s trigger is `push: tags: ['v*']`
+  with no version filter, exactly as `RELEASING.md` states. On a minor or patch
+  release, if Docs was still queued when Release finished, the cut reported
+  success having never looked at it — and a tag cannot be re-cut, so that is a
+  broken docs site behind a green release. v4.3.0 was only checked because an
+  unrelated CI run kept the poll loop alive.
+
+- **`run-integration.sh` printed a spurious "No such file or directory"** on
+  every uncached run. The `2>/dev/null` sits on `wc`, but the `<` redirect is
+  performed by the *shell*, so nothing at the call site could suppress it. Both
+  tally files are now created empty up front — there were **two** readers with
+  the identical defect and only one had been reported, so removing the
+  precondition beats defending it twice. Counts were always correct; this was
+  noise, of the kind that trains a reader to skim a release run's stderr.
+
+### Changed
+
+- **`cut-release.sh` now runs the docs gate before it pushes anything.**
+  `scripts/build-docs.sh --ci-doxygen` was documented in `RELEASING.md` as "the
+  one gate worth running that the normal `verify.sh` cannot substitute for" —
+  a dev box's doxygen is newer than CI's and accepts markup the older one
+  rejects, a skew that shipped broken docs at v3.2.0 and v4.2.0. Being
+  documented did not make it happen: it was missed again cutting v4.3.0, which
+  was clean only by luck. Now enforced as a precondition, before the first push,
+  so a failure costs nothing. Escapable by name with `--no-docs-check`, which
+  says out loud what was skipped, because a check with no way past it gets
+  commented out the first time it is inconvenient.
+
 ## 4.3.0 — 2026-08-19
 ### Breaking
 

@@ -80,6 +80,19 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -z "$LOGDIR" ]] && LOGDIR=$(mktemp -d)
 mkdir -p "$LOGDIR"
+# The two tally files exist from the start, EMPTY, because their readers count
+# them with `wc -l < FILE 2>/dev/null`. That 2>/dev/null is on `wc`, but the `<`
+# redirect is performed by the SHELL, so a missing file prints
+# "No such file or directory" to the script's stderr and nothing can suppress it
+# at the call site. Every uncached run printed one; the counts were right (the
+# reader defaults to 0), so it was pure noise -- the kind that trains a reader
+# to skim a release run's stderr.
+#
+# Created here rather than guarded at each reader: there were TWO readers and
+# only one was ever reported, so the fix that scales is to remove the
+# precondition instead of defending it twice.
+: > "$LOGDIR/_skipped.txt"
+: > "$LOGDIR/_cached.txt"
 
 # Auto job count when -j was not given: leave two cores of headroom so a guest
 # isn't starved during boot/setup (starvation there -> empty serial output ->

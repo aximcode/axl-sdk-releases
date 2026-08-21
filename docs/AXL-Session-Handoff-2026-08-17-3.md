@@ -9,7 +9,14 @@
 
 ---
 
-## 0. START HERE — the one pending task
+## 0. CLOSED — the pending task landed
+
+> **STATUS 2026-08-20: this section is HISTORY.** The change below shipped as
+> `7955ba2f` ("build: x64 libaxl.a drops the asynchronous unwind tables") and
+> `CFLAGS_BASE` carries `-fno-asynchronous-unwind-tables` at `Makefile:374`
+> today. `71387bf7` then recorded that the libstdc++ rebuild would have saved
+> zero and the residual was misattributed. Kept for the measurements and the
+> safety argument; do not START HERE.
 
 **Mike APPROVED adding `-fno-asynchronous-unwind-tables` to x64's
 `CFLAGS_BASE`.** Nothing is written yet. It is measured, the safety argument is

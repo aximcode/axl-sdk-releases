@@ -11,7 +11,13 @@
 
 ---
 
-## 0. START HERE — the one open task
+## 0. CLOSED — the one open task is done
+
+> **STATUS 2026-08-20: this section is HISTORY.** The task below was completed
+> by `8af4e530` ("perf(log): the log engine is opt-in at link time —
+> minimal-runtime 36,864 -> 30,720"), and the seven commits this handoff calls
+> "unpushed" shipped in **v4.3.0**. Kept for the measurements and the reasoning,
+> which are still accurate; do not START HERE.
 
 **Break the backend's log dependency so `--minimal-runtime` actually saves
 bytes.** Everything else this session is finished.

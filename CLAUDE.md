@@ -223,8 +223,8 @@ hang/`#GP`, not a clean `AXL_ERR`. See
 
 ## Current State (May 2026)
 
-All migration, cleanup, and style phases done. **10485 unit assertions and 158
-integration tests, 0 failures (2026-08-17)** — `test/integration/.last-pass-count`
+All migration, cleanup, and style phases done. **10497 unit assertions and 171
+integration tests, 0 failures (2026-08-20)** — `test/integration/.last-pass-count`
 is the authority, this line is a snapshot and dates fast. Native backend only (gcc + ld + objcopy).
 Test runner has ratchet check (fails if count drops below baseline).
 

@@ -509,9 +509,10 @@ excludes `test-axl.sh` by name, and the timed X64 log contains no entry for it.
 
 ### 12.2 The measurement inverts the obvious fix
 
-The intuitive target is `clang-tidy`: it is named in §9 as the second-largest
-CI job at ~7 min, and it is the long pole *inside* `verify.sh`. Scoping it to
-changed files is easy, safe, and file-level.
+The intuitive target is `clang-tidy`: it was named in §9 as a ~7-minute CI job
+(re-measured 2026-08-20 at **2 m 38 s**, and third of four — see §9; the old
+figure was a hosted-runner number), and it is the long pole *inside*
+`verify.sh`. Scoping it to changed files is easy, safe, and file-level.
 
 It is also worth **at most 61 seconds locally**, because that is the whole of
 `verify.sh` — 6.7% of the gate. **93% of the local cost is the integration
@@ -1248,12 +1249,48 @@ against x64's 6.8 s.
   self-hosted runner removed the problem it solved). The question outlived the
   approach it belonged to; kept struck through rather than deleted so nobody
   re-derives it.
-- **OPEN — should `clang-tidy` (7 min, container `apt` every run) cache its
-  image?** Now the largest CI job. Overlaps §12.12 step 5 (scoping it to
-  changed files): caching attacks the fixed `apt` cost, scoping attacks the
-  per-file cost, and they compose. §12.2 is the caveat -- both are worth ~0
-  LOCALLY, since `verify.sh` is 61 s in total.
-- **OPEN, low priority — does the runner want a second registration** so the
-  hosted-style 4-way shard can also run on the box? Only worth it if the
-  9-minute self-hosted run becomes the critical path, which it is not: §12
-  established the LOCAL gate as the long pole.
+- ~~**OPEN — should `clang-tidy` (7 min, container `apt` every run) cache its
+  image?** Now the largest CI job.~~ **ANSWERED 2026-08-20: NO.** Both halves of
+  the premise were stale, which is why measuring came first.
+
+  Runs `32440922073` and `32437410282` (self-hosted, both green), whole run
+  **813 s**, jobs strictly sequential — the box has one job slot, so a job's
+  seconds are real wall clock, not hidden behind a peer:
+
+  | job | duration | share |
+  |---|---|---|
+  | `gcc x64` | 60 s | 7% |
+  | `gcc aa64` | 53 s | 7% |
+  | `clang-tidy` | **158 s** | 19% |
+  | QEMU integration (full suite) | **536 s** | **66%** |
+
+  It is **2 m 38 s, not 7 min**, and it is **not the largest job** — QEMU
+  integration is **3.4x** larger. The doc was written when CI ran on
+  GitHub-hosted runners; moving to our own hardware and caching the toolchain
+  shrank it, and the question outlived its own numbers.
+
+  Inside the job: `apt` **25 s / 28 s** across the two runs, the twelve gates
+  ~48 s, `scripts/lint.sh` **77 s** (identical both runs). So caching the image
+  attacks **25 s = 3.1% of the run**, and *at best* — an image still has to be
+  pulled.
+
+  **What it would cost is the reason to decline.** A prebuilt image puts the
+  apt package list in a SECOND place. That is exactly the class that failed the
+  v4.3.0 tag run: `check-cxx-entry` moved to the cross `objdump` and `ci.yml`'s
+  apt list did not move with it, so the cross tool could not load and the gate
+  blamed codegen. Institutionalising a second copy of that list to save 25 s is
+  the wrong trade — and the runner is ours, so there are no billable minutes
+  being saved either, only wall clock that §12 has already established is not
+  the long pole.
+
+  The scoping half (§12.12 step 5) is unaffected by this answer: it attacks the
+  77 s, not the 25 s, and remains open on its own terms.
+- ~~**OPEN, low priority — does the runner want a second registration** so the
+  hosted-style 4-way shard can also run on the box?~~ **ANSWERED 2026-08-20 by
+  the same measurement: not yet, and the ceiling is now known.** With one job
+  slot everything is serial, so a second slot could overlap `clang-tidy` (158 s)
+  with QEMU integration (536 s) — worth **at most 19%** of the run, which is
+  more than image caching buys and still leaves QEMU integration as the floor.
+  The condition stated here has not changed: §12 established the LOCAL gate as
+  the long pole, and a 13-minute CI run on free hardware is not what anyone is
+  waiting for.
