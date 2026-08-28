@@ -612,6 +612,89 @@ axl_pci_ext_cap_id_str(
 );
 
 // ---------------------------------------------------------------------------
+// PCIe Slot Capabilities
+// ---------------------------------------------------------------------------
+
+/// PCI Express Capability Structure ID, in the legacy capability list.
+#define AXL_PCI_CAP_ID_EXPRESS  0x10
+
+/**
+ * @name PCIe Device/Port Types that may implement a slot
+ * @brief Values of the Device/Port Type field (PCI Express Capabilities
+ *     register bits 7:4). Only these two can carry Slot Capabilities.
+ * @{
+ */
+#define AXL_PCI_PORT_TYPE_ROOT_PORT        0x4   ///< Root Port of a Root Complex
+#define AXL_PCI_PORT_TYPE_DOWNSTREAM_PORT  0x6   ///< Downstream Port of a Switch
+/** @} */
+
+/**
+ * @brief Decoded PCIe Slot Capabilities and Slot Status.
+ *
+ * Meaningful only on a Root Port or a Switch Downstream Port whose
+ * PCI Express Capabilities register has Slot Implemented set. Every
+ * other function -- endpoints included -- makes
+ * axl_pci_read_slot_caps() return AXL_ERR rather than a zeroed
+ * struct, because "this function has no slot" and "this slot reads
+ * zero" are different facts and a caller must be able to tell them
+ * apart.
+ *
+ * @a physical_slot_number is what the silicon was strapped or
+ * programmed to report, and firmware's SMBIOS Type 9 slot ID is a
+ * separate, hand-maintained assertion about the same slot -- the two
+ * disagree on real hardware.
+ *
+ * @a presence_detect is the only field here that is not a build-time
+ * assertion: it is the hardware's live answer to whether something is
+ * in the slot right now.
+ */
+typedef struct {
+    uint16_t  physical_slot_number;   ///< Slot Cap bits 31:19 (13 bits)
+    uint8_t   port_type;              ///< Device/Port Type; one of AXL_PCI_PORT_TYPE_*
+    bool      hotplug_capable;        ///< Slot Cap bit 6
+    bool      hotplug_surprise;       ///< Slot Cap bit 5
+    bool      attention_button;       ///< Slot Cap bit 0
+    bool      power_controller;       ///< Slot Cap bit 1
+    bool      mrl_sensor;             ///< Slot Cap bit 2 — an MRL sensor is present
+    bool      electromech_interlock;  ///< Slot Cap bit 17
+    bool      no_command_completed;   ///< Slot Cap bit 18
+    /* Slot power limit, kept as the raw encoded pair rather than a
+       decoded milliwatt figure. The obvious decode
+       (value * scale_multiplier) is WRONG at the top of the range:
+       when @a power_limit_scale is 0 and @a power_limit_value is
+       0xF0..0xFE, the value is not 240..254 W but a set of fixed
+       above-250 W encodings (0xF0 = 250 W, 0xF1 = 275 W, 0xF2 = 300 W;
+       0xF3..0xFE are reserved). Reporting the raw pair cannot be
+       wrong; a decode that forgets this reads 300 W as 242 W. */
+    uint8_t   power_limit_value;      ///< Slot Cap bits 14:7; see note above before decoding
+    uint8_t   power_limit_scale;      ///< Slot Cap bits 16:15 — 0=1.0x, 1=0.1x, 2=0.01x, 3=0.001x
+    bool      presence_detect;        ///< Slot Status bit 6 — LIVE hardware state
+    bool      mrl_sensor_closed;      ///< Slot Status bit 5 inverted (the raw bit is 1 when OPEN)
+    bool      interlock_engaged;      ///< Slot Status bit 7
+} AxlPciSlotCaps;
+
+/**
+ * @brief Read the PCIe Slot Capabilities and Slot Status of @p addr.
+ *
+ * Walks the legacy capability chain for the PCI Express capability
+ * (#AXL_PCI_CAP_ID_EXPRESS), requires the Device/Port Type to be a
+ * Root Port or Switch Downstream Port, and requires Slot Implemented
+ * to be set. Any of those failing is reported as AXL_ERR, and @p out
+ * is left untouched so a caller can distinguish failure from a slot
+ * whose fields happen to read zero.
+ *
+ * @return AXL_OK on success; AXL_ERR if @p out is NULL, @p addr does
+ *     not respond, has no PCI Express capability, is not a root or
+ *     downstream port, has Slot Implemented clear, or any config-space
+ *     read fails.
+ */
+AXL_WARN_UNUSED int
+axl_pci_read_slot_caps(
+    AxlPciAddr       addr,   ///< target function
+    AxlPciSlotCaps  *out     ///< [out] receives decoded slot capabilities
+);
+
+// ---------------------------------------------------------------------------
 // VPD
 // ---------------------------------------------------------------------------
 

@@ -11,30 +11,6 @@
 
 #include <axl/axl-crypto.h>
 
-#ifndef AXL_HAVE_TLS
-
-AxlCipher *
-axl_cipher_ctr_new(AxlCipherAlg alg, const uint8_t *key, size_t key_len,
-                   const uint8_t *iv)
-{
-    (void)alg; (void)key; (void)key_len; (void)iv;
-    return NULL;
-}
-
-int
-axl_cipher_ctr_xcrypt(AxlCipher *c, const uint8_t *in, size_t len, uint8_t *out)
-{
-    (void)c; (void)in; (void)len; (void)out;
-    return AXL_ERR;
-}
-
-void
-axl_cipher_free(AxlCipher *c)
-{
-    (void)c;
-}
-
-#else /* AXL_HAVE_TLS */
 
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -100,4 +76,3 @@ axl_cipher_free(AxlCipher *c)
     }
 }
 
-#endif /* AXL_HAVE_TLS */

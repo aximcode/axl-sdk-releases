@@ -15,7 +15,7 @@
 # TLS server (triggers the handshake + close), THEN curls the plain
 # server — which must still answer.
 #
-# Requires: AXL_TLS=1 build. Auxiliary single-binary test (opt out of the
+# Auxiliary single-binary test (opt out of the
 # test-axl.sh ratchet).
 #
 # Usage: ./test/integration/test-http-multi-qemu.sh [--arch X64|AARCH64]
@@ -34,7 +34,7 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
 make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -2
+    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -2
 
 test_add_efi "$(test_build_dir "$_native_arch")/AxlTestNet.efi"
 

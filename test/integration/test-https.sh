@@ -3,7 +3,6 @@
 # AxlTls HTTPS integration test — boots QEMU with TLS-enabled HTTP server,
 # validates with curl --insecure from the host.
 #
-# Requires: AXL_TLS=1 build
 # Usage: ./test/integration/test-https.sh [--arch X64|AARCH64]
 
 source "$(dirname "$0")/common-test.sh"
@@ -20,7 +19,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
 make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 

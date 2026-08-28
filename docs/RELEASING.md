@@ -31,7 +31,7 @@ identical result — so that trigger was removed.) The **authoritative pre-relea
 gate is the full suite run locally**, which is fast in parallel:
 
 ```sh
-make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
+make ARCH=x64 all tests tools axl-busybox   # one build for the whole gate
 ./test/integration/run-integration.sh --no-cache -j"$(nproc)"   # 0 failures required
 scripts/lint.sh                                        # clang-tidy exactly as CI runs it
 ```
@@ -245,10 +245,10 @@ a comment explaining its trigger).
   wipes every tree under `out/`.
 
 - TLS-enabled build is green if you touched anything in `src/net/`
-  (release.yml hardcodes `AXL_TLS=1` for the published packages):
+  (release.yml builds the published packages the same way):
 
   ```sh
-  AXL_TLS=1 make ARCH=x64 BUILD=RELEASE
+  make ARCH=x64 BUILD=RELEASE
   ```
 
 - **clang-tidy is clean locally.** The CI workflow's `lint` job

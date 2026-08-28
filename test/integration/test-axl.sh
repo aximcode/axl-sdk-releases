@@ -29,7 +29,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
-TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p AxlTestJsonConformance)
+TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p AxlTestJsonConformance AxlTestSsh)
 # Tests deliberately NOT in the default run, each with a reason. The
 # guard below treats anything here as accounted-for.
 TEST_APPS_SKIP=(
@@ -87,6 +87,31 @@ USB_IDS_FILE="$PROJECT_DIR/share/usb-ids.json5"
 if [[ -f "$USB_IDS_FILE" ]]; then
     mkdir -p "$TEST_STAGING"
     cp "$USB_IDS_FILE" "$TEST_STAGING/usb-ids.json5"
+fi
+
+# Real-firmware ACPI captures for the AML namespace walker. These are
+# LOCAL-ONLY by policy -- .gitignore keeps hardware captures out of the
+# repo (see test/fixtures/real-hw/README.md), so CI and fresh clones
+# have neither, and the tests that use them SKIP with balanced counts.
+# Staged flat next to the EFIs, matching the sidecar convention above.
+#
+# Only the DSDTs are staged: the walker's per-table counts are what the
+# tests assert, and hauling 27 SSDTs in would cost ~2.8 MB for coverage
+# the DSDTs already provide.
+for fixture_arch in client server; do
+    dsdt="$PROJECT_DIR/test/fixtures/real-hw/$fixture_arch/acpi/dsdt.dat"
+    if [[ -f "$dsdt" ]]; then
+        mkdir -p "$TEST_STAGING"
+        cp "$dsdt" "$TEST_STAGING/fixture-$fixture_arch-dsdt.dat"
+    fi
+done
+# The server's 26 _SUN objects live in SSDT5, not its DSDT -- and _SUN
+# is the object the slot correlation leans on hardest where SMBIOS
+# publishes no bus address. 8 KB, so it comes along.
+server_ssdt5="$PROJECT_DIR/test/fixtures/real-hw/server/acpi/ssdt5.dat"
+if [[ -f "$server_ssdt5" ]]; then
+    mkdir -p "$TEST_STAGING"
+    cp "$server_ssdt5" "$TEST_STAGING/fixture-server-ssdt5.dat"
 fi
 
 # Test-only class overlay fixture. Carries the "[overlay]" marker

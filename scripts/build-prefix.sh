@@ -7,17 +7,17 @@
 #   ARCH   x64 | aa64 | X64 | AARCH64   (default: $TEST_ARCH, else x64)
 #   --abs  absolute path instead of the repo-relative prefix
 #
-# Honours ARCH, BUILD and AXL_TLS together, because it asks the Makefile
+# Honours ARCH and BUILD together, because it asks the Makefile
 # rather than restating its rule.
 #
-# WHY THIS EXISTS. PREFIX is a function of three inputs and grew a fourth:
-# ARCH always, BUILD since the RELEASE tree split, and AXL_TLS now that a TLS
-# build gets its own tree (a toggle WIPES the objects, and test-axl.sh builds
-# TLS-off while run-integration.sh exports AXL_TLS=1, so sharing one prefix
-# rebuilt ~300 objects on every alternation). Every hand-written
-# "out/native-$arch" is a copy of that rule frozen at one input, and 98 of
-# them across 66 scripts silently pointed at a tree nothing had built the
-# first time the TLS suffix appeared.
+# WHY THIS EXISTS. PREFIX is a function of ARCH and BUILD, and once also of
+# AXL_TLS -- a TLS build got its own tree because toggling the flag wiped the
+# objects. That third input is gone (mbedTLS is unconditional), but the lesson
+# that created this script is not: every hand-written "out/native-$arch" is a
+# copy of the rule frozen at one input, and 98 of them across 66 scripts
+# silently pointed at a tree nothing had built the first time the TLS suffix
+# appeared. Asking instead of composing is why REMOVING that suffix needed no
+# corresponding sweep.
 #
 # It is a SCRIPT, not a shell function, because 51 of those scripts source
 # nothing at all -- they are standalone and cannot use a helper from

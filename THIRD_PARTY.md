@@ -106,9 +106,22 @@ former 4x4 supersampler. It is compiled into **every** `libaxl.a`
 redistributions must acknowledge FreeType in their documentation —
 "Portions of this software are copyright © The FreeType Project
 (www.freetype.org). All rights reserved." Downstream products that
-ship `AxlGfx` path filling must reproduce that acknowledgment. No
-source modifications were made to the vendored files; the
+ship `AxlGfx` path filling must reproduce that acknowledgment. The
 `STANDALONE_` integration shim lives in `src/gfx/axl-gfx-rasterize.c`.
+
+**One source modification has been made**, marked in-place with an
+`AXL fix:` comment in `deps/freetype/ftgrays.c`. Upstream's memory
+estimate reads `max_ex - min_ey`, mixing the x-span's end with the
+y-span's start; the typo is present in current ftgrays master. When a
+clip box has `max_ex < min_ey` — a glyph rotated so its narrow x-extent
+sits at a large y-offset — that signed span goes negative and converts
+to a huge `estimate`, after which `(size_t)estimate * sizeof(TCell)`
+wraps to a small allocation while `cell_null` points far past it,
+corrupting memory. It was observed as a hang rasterizing rotated text
+through `axl_ttf_draw_affine`. Corrected to `max_ex - min_ex`, matching
+the neighbouring `max_ey - min_ey` y-span term. The change is safe
+independently of the bug: `estimate` is only a sizing hint, and
+`gray_convert_glyph` bands-and-retries on pool overflow.
 
 Consumers that only **enumerate** displays do not incur the FTL: the
 GOP-inventory / mode-query accessors (`axl_gfx_output_count` / `_get` /
@@ -117,6 +130,65 @@ GOP-inventory / mode-query accessors (`axl_gfx_output_count` / `_get` /
 `--gc-sections` keeps `ftgrays` out of a binary that never calls a
 path-fill API. The FTL acknowledgment is required only of products that
 ship `AxlGfx` path filling.
+
+## libvterm (VT/xterm terminal-emulator core)
+
+- **Source:** https://github.com/neovim/libvterm (neovim's maintained
+  fork of Paul Evans' libvterm)
+- **Version shipped:** commit `934bc2fbf21800ac3458a499df8820ca5fb45fd3`
+  (2025-11-20), reporting `VTERM_VERSION` 0.3.3
+- **Vendored path in source tree:** `deps/libvterm/`
+- **Copyright:** Copyright (c) 2008 Paul Evans <leonerd@leonerd.org.uk>
+- **License:** [MIT](https://spdx.org/licenses/MIT.html)
+- **Full license text:** `deps/libvterm/LICENSE`
+
+libvterm parses a real VT/xterm byte stream — a serial or SOL console —
+into structured terminal operations, and is the second producer behind
+the `AxlConsoleOps` contract (`AxlVterm`, `<axl/axl-vterm.h>`, Layer 2).
+The library is vendored in full; only Layer 2 is compiled and bound, so
+`--gc-sections` keeps it out of any binary that never constructs a
+`VTerm`.
+
+**The fork is not ABI-identical to Paul Evans' 0.3.3 despite reporting
+the same version macros** — neovim's fork adds
+`VTermStateCallbacks.premove` and `VTermScreenCallbacks.sb_pushline4`.
+Do not check this copy's contract against a distro `/usr/include/vterm.h`.
+
+**Eight local modifications**, confined to the five compiled files
+(`screen.c` is unmodified). Each is marked in-source as
+`AXL patch [n/8]`; `deps/libvterm/README.md` documents them individually
+and `grep -rn 'AXL patch \[' deps/libvterm/src/` finds them all. Seven
+are freestanding-portability or memory-safety fixes — routing the
+default allocator through `axl_calloc`/`axl_free`, dropping `<stdio.h>`
+and `<stdlib.h>`, and removing a `vterm_screen_free()` reference that
+would otherwise pull all of `screen.c` into every image that frees a
+`VTerm`. Patch 8 is the sole behaviour change; see its entry in that
+README. Being MIT, libvterm imposes no attribution obligation beyond
+reproducing the copyright and permission notice, which
+`deps/libvterm/LICENSE` carries.
+
+## LZMA SDK (LZMA codec)
+
+- **Source:** LZMA SDK by Igor Pavlov (https://7-zip.org/sdk.html)
+- **Version shipped:** LZMA SDK 26.01; the vendored files carry their
+  own dates (e.g. `LzmaDec.h` 2023-04-02)
+- **Vendored path in source tree:** `deps/lzma/`
+- **Copyright:** Igor Pavlov. Portions are based on public-domain code
+  by other authors, as the SDK's own LICENSE records: PPMd var.H (2001)
+  by Dmitry Shkarin, and SHA-256 by Wei Dai (Crypto++ library).
+- **License:** **public domain** — "LZMA SDK is written and placed in
+  the public domain by Igor Pavlov."
+- **Full license text:** `deps/lzma/LICENSE`
+
+A curated subset (encoder, decoder and their support headers) providing
+LZMA decompression for `AxlFw`, which parses raw `.fd` / SPI images and
+decompresses LZMA-compressed firmware-volume sections on demand.
+
+Being public domain, the LZMA SDK imposes no attribution obligation on
+redistributed binaries; this entry is documentary. `deps/lzma/errno.h`
+is **not** upstream — it is an AXL-authored shim supplying the handful
+of `errno` definitions the SDK expects, which a freestanding UEFI build
+does not otherwise provide.
 
 ## DejaVu Sans — built-in default font
 

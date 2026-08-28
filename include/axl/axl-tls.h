@@ -3,8 +3,9 @@
 
 /** @file axl-tls.h
  *
- * TLS support using mbedTLS. Optional — requires AXL_TLS=1 at build time.
- * When not available, all functions return -1/NULL/false.
+ * TLS support using mbedTLS, compiled into every build. What activates
+ * it is calling axl_tls_init() at startup, not a build flag;
+ * --gc-sections keeps the stack out of any image that never does.
  *
  * Provides:
  *   - Self-signed ECDSA P-256 certificate generation
@@ -60,7 +61,10 @@ typedef enum {
 
 /**
  * @brief Check if TLS support was compiled in.
- * @return true if AXL_TLS=1 was set at build time.
+ * @return always true — mbedTLS is compiled into every build. Kept as
+ *     public API; what a caller usually wants to know is whether
+ *     axl_tls_init() succeeded, which is what gates https:// at
+ *     runtime.
  */
 bool
 axl_tls_available(void);

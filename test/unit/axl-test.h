@@ -75,7 +75,8 @@ test_survived(const char *name)
  * it how many assertions did not run.
  *
  * @param name what was skipped, and the flag that would enable it -- the
- *     harness matches "AXL_TLS" here for TEST_REQUIRE_TLS=1.
+ *     (the harness once matched "AXL_TLS" here for TEST_REQUIRE_TLS=1;
+ *     mbedTLS is unconditional now, so nothing skips for it.)
  */
 static inline void
 test_skip(const char *name)

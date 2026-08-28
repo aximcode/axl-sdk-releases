@@ -48,7 +48,7 @@
 
     Verification uses `axl_consttime_equal` (@ref axl-crypto.h) for the
     proof compare. Dependency-free except for the digest/HMAC/base64/RNG
-    primitives — works in every build (no AXL_TLS required).
+    primitives, all of which compute using AXL's own SHA-256.
 **/
 
 #ifndef AXL_SCRAM_H

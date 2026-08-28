@@ -30,10 +30,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-cache.sh"
 #
 # 71 scripts used to spell out "$PROJECT_DIR/out/native-$arch" themselves,
 # which is correct only while PREFIX depends on nothing but ARCH. It already
-# depends on BUILD, and folding AXL_TLS into it — so a TLS run stops wiping the
+# depends on BUILD — so runs stop wiping the
 # non-TLS objects and vice versa — would have silently pointed every one of
 # those scripts at a tree nothing had built. The Makefile owns the answer;
-# this asks it. `make -s print-prefix` honours ARCH, BUILD and AXL_TLS
+# this asks it. `make -s print-prefix` honours ARCH and BUILD
 # together, so this stays right through any future split.
 #
 # Memoized per arch: 71 scripts times several calls times a make fork is
@@ -49,10 +49,10 @@ test_build_prefix() {
         *)                    arch=x64  ;;
     esac
     # Key the memo on the TLS state too, not just the arch: a caller may ask
-    # for the TLS prefix (AXL_TLS=1 test_build_prefix x64) in a run whose
+    # for a differently-keyed prefix in a run whose
     # default is non-TLS, and an arch-only key would hand back the cached
     # non-TLS answer -- the exact class of bug this helper exists to prevent.
-    local var="_TEST_BUILD_PREFIX_${arch}_${AXL_TLS:+tls}"
+    local var="_TEST_BUILD_PREFIX_${arch}"
     if [[ -z "${!var:-}" ]]; then
         # Delegates rather than re-asking make itself: scripts/build-prefix.sh
         # is the one definition, since 51 integration scripts source nothing
@@ -73,7 +73,7 @@ test_build_dir() {
 # inputs, which is why it is a separate helper rather than a mode of that one.
 #
 #   test_build_dir   out/native-<arch>[-release][-tls]   objects and images,
-#                    varies with ARCH x BUILD x AXL_TLS
+#                    varies with ARCH x BUILD
 #   test_sdk_dir     out/{bin,lib,include,share}         what install.sh
 #                    produces and a consumer consumes; varies with nothing
 #
@@ -88,42 +88,11 @@ test_sdk_dir() {
     "$PROJECT_DIR/scripts/sdk-prefix.sh" --abs
 }
 
-# AXL_TLS: warn only when a toggle is actually imminent.
-#
-# run-integration.sh exports AXL_TLS=1 for the whole suite. A test run BY HAND
-# with it unset toggles the flag, and the Makefile's state-change rule wipes
-# every .o, libaxl.a and .efi under the prefix. The failure that produces is
-# badly misleading: the link goes looking for crt0/reloc objects the wipe just
-# removed and the test reports "driver build failed", which reads like a code
-# error rather than a flag toggle. (Cost an hour to diagnose once.)
-#
-# Two things this deliberately is NOT:
-#
-#   - not `export AXL_TLS="${AXL_TLS:-1}"`. test-axl.sh sources this file too,
-#     and defaulting the flag changes which sources the unit suite builds --
-#     measured, 8820 -> 8964 tests. Silently moving the number the whole
-#     project ratchets on is not a convenience default's job. (test-axl.sh:28
-#     runs its own make with no AXL_TLS, which is why CI -- despite building
-#     AXL_TLS=1 -- also lands on 8820.)
-#
-#   - not an unconditional warning. test-axl.sh runs constantly with the flag
-#     unset and that is CORRECT there, so warning every time would be noise
-#     advising a change that moves the count.
-#
-# The precise condition is "the recorded state says on and we are about to
-# make it off", which the Makefile already tracks in .axl-tls-state.
-if [[ -z "${AXL_TLS:-}" ]]; then
-    _axl_tls_arch=x64
-    [[ "${1:-}" == *AARCH64* || "${*:-}" == *AARCH64* ]] && _axl_tls_arch=aa64
-    _axl_tls_state="$(test_build_dir "$_axl_tls_arch")/build/.axl-tls-state"
-    if [[ -r "$_axl_tls_state" && "$(cat "$_axl_tls_state" 2>/dev/null)" == "on" ]]; then
-        echo "note: the build tree was last built with AXL_TLS=1 and this run has" >&2
-        echo "      it unset, so make will WIPE and rebuild it (watch for 'cannot" >&2
-        echo "      find axl-crt0-*.o' if that races). Prefer AXL_TLS=1 when running" >&2
-        echo "      a single integration test by hand -- that is what the suite uses." >&2
-    fi
-    unset _axl_tls_arch _axl_tls_state
-fi
+# A block here used to warn when AXL_TLS was about to be toggled: the suite
+# exported it, a hand-run test did not, and the Makefile's state-change rule
+# then wiped every object -- surfacing as "driver build failed", which reads
+# like a code error rather than a flag toggle. It cost an hour to diagnose
+# once. There is no toggle now, and the .axl-tls-state file it read is gone.
 
 # State variables (set by helpers)
 TEST_ARCH="X64"
@@ -296,7 +265,12 @@ test_build_image() {
     shell_efi=$(find_shell_efi "$TEST_ARCH") || true
     if [[ -n "$shell_efi" && -f "$shell_efi" ]]; then
         # Boot the Shell via the AXL launcher ("-delay 0", skips the 5 s startup
-        # countdown); see stage_boot_shell in axl-common.sh.
+        # countdown); see stage_boot_shell in axl-common.sh. No trailing policy
+        # argument, so an unset AXL_SHELL_LAUNCHER means OFF here: this harness
+        # does not inspect its own serial log for the startup sentinel, so it
+        # cannot notice a firmware that never reaches the Shell, and must not
+        # opt anyone into a boot it could not undo. run-integration.sh sets
+        # AXL_SHELL_LAUNCHER=1 explicitly, so the suite still takes the win.
         stage_boot_shell "$TEST_STAGING" "$TEST_ARCH" "$TEST_BOOT_NAME" "$shell_efi"
     fi
 
@@ -1039,11 +1013,10 @@ test_count_results() {
     # this right; the rest did not. Uniform -a, so no reader has to know which
     # greps happen to survive binary detection and which quietly do not.
     #
-    local pass fail skip tls_skips skipped_asserts ratchet_total
+    local pass fail skip skipped_asserts ratchet_total
     pass=$(grep -ac '^PASS:' "$TEST_CLEAN_LOG" || true)
     fail=$(grep -ac '^FAIL:' "$TEST_CLEAN_LOG" || true)
     skip=$(grep -acE '^SKIP(\[[0-9]+\])?:' "$TEST_CLEAN_LOG" || true)
-    tls_skips=$(grep -ac '^SKIP:.*AXL_TLS' "$TEST_CLEAN_LOG" || true)
 
     #
     # Assertions DECLARED skipped by test_skip_n, i.e. "SKIP[n]:". These are
@@ -1168,35 +1141,20 @@ test_count_results() {
 
     #
     # SKIPPED groups. A `#ifdef`-gated test block that compiles to nothing is
-    # invisible in a pass count -- the default build has no TLS, so AxlTestJose
-    # and AxlTestCrypto drop ~190 assertions and still report "0 failed". That
-    # read as success once already and new assertions were called green having
-    # never executed.
+    # invisible in a pass count -- when TLS was optional, AxlTestJose and
+    # AxlTestCrypto dropped ~190 assertions in the default build and still
+    # reported "0 failed". That read as success once already, and new
+    # assertions were called green having never executed. The TLS instance is
+    # gone; the hazard is not, which is why skips are still announced.
     #
-    # So skips are always announced, and TEST_REQUIRE_TLS=1 turns a TLS-gated
-    # skip into a failure. Not the default: a build with no mbedtls submodule is
-    # a supported, everyday configuration, and a suite that went red for it
-    # would just teach everyone to ignore red. The completeness gates before a
-    # commit or a release are what should set it.
+    # So skips are always announced. TEST_REQUIRE_TLS used to live here, turning
+    # a TLS-gated skip into a failure; mbedTLS is unconditional now, so nothing
+    # can skip for want of it and there is no configuration to escalate.
     #
     if (( skip > 0 )); then
         echo ""
         echo "*** $skip test GROUP(S) SKIPPED ($skipped_asserts assertions declared):"
         grep -aE '^SKIP(\[[0-9]+\])?:' "$TEST_CLEAN_LOG" | sed -E 's/^SKIP(\[[0-9]+\])?:/    /'
-        if (( tls_skips > 0 )); then
-            if [[ "${TEST_REQUIRE_TLS:-0}" == "1" ]]; then
-                echo ""
-                echo "FAIL: TEST_REQUIRE_TLS=1 but $tls_skips group(s) need AXL_TLS=1."
-                echo "      Rebuild with TLS and re-run:"
-                echo "        git submodule update --init --depth 1 deps/mbedtls"
-                echo "        AXL_TLS=1 make ARCH=${_native_arch:-x64} all tests"
-                echo "        AXL_TLS=1 $0"
-                return 1
-            fi
-            echo ""
-            echo "    ^ build with AXL_TLS=1 to run these; set TEST_REQUIRE_TLS=1"
-            echo "      to make skipping them a failure."
-        fi
     fi
 
     # Leak verdict. Folded into the final exit (and into the baseline write
@@ -1252,22 +1210,17 @@ test_count_results() {
     # the variable when invoking the suite cannot select the wrong baseline.
     #
     if [[ "${TEST_SKIP_RATCHET:-0}" != "1" ]]; then
-        # One baseline PER BUILD CONFIGURATION. AXL_TLS changes which sources
-        # are compiled and therefore how many tests exist -- measured, 8820
-        # without it and 8964 with. Sharing one file across both is a trap
-        # with teeth, because the baseline is rewritten after every green run
-        # (below): a single AXL_TLS=1 run silently raises it to 8964, and the
-        # next ordinary run then fails with "expected at least 8964 tests but
-        # only 8820 ran" -- a message that blames the tests for what is
-        # actually a stale baseline from a different configuration. That cost
-        # real time to diagnose once; the suffix makes it unrepresentable.
+        # ONE baseline. There were two, .last-pass-count and
+        # .last-pass-count.tls, because AXL_TLS changed which sources compiled
+        # and therefore how many tests existed -- sharing one file meant a
+        # single TLS run raised it and every later non-TLS run failed the
+        # ratchet with a message that blamed the tests for a stale baseline
+        # from a different configuration.
         #
-        # The default (no AXL_TLS) keeps the unsuffixed name so the committed
-        # baseline stays valid and CI is unaffected.
+        # There is one configuration now, so the split is not merely
+        # unnecessary but harmful: two baselines drift. The .tls file was
+        # observed 104 assertions stale, because TLS runs happened less often.
         local baseline_file="$TESTS_DIR/.last-pass-count"
-        if (( tls_skips == 0 )); then
-            baseline_file="$TESTS_DIR/.last-pass-count.tls"
-        fi
         if [[ -f "$baseline_file" ]]; then
             local expected
             expected=$(cat "$baseline_file")

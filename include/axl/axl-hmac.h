@@ -5,10 +5,9 @@
     Keyed-hash message authentication code (HMAC, RFC 2104).
 
     Mirrors GLib's GHmac, layered on the AxlChecksum digest engine
-    (@ref axl-digest.h) — MD5, SHA-1, or SHA-256, no external
-    dependency (works without AXL_TLS=1). Use it to authenticate a
-    message with a shared secret: API tokens, signed cookies, webhook
-    signatures, Redfish/IPMI session integrity.
+    (@ref axl-digest.h) — MD5, SHA-1, SHA-256 or SHA-512. Use it to
+    authenticate a message with a shared secret: API tokens, signed
+    cookies, webhook signatures, Redfish/IPMI session integrity.
 
     The API matches AxlChecksum: create with a key + algorithm, feed
     data incrementally, then read the result once as a hex string or
@@ -53,9 +52,9 @@ typedef struct AxlHmac AxlHmac;
  * @brief Create an HMAC context for @p type keyed with @p key.
  *
  * The key may be any length: keys longer than the hash block size
- * (64 bytes for MD5/SHA-1/SHA-256) are hashed down per RFC 2104, and
- * a @p key_len of 0 is valid (empty key). @p key may be NULL only
- * when @p key_len is 0.
+ * (64 bytes for MD5/SHA-1/SHA-256, 128 for SHA-512) are hashed down
+ * per RFC 2104, and a @p key_len of 0 is valid (empty key). @p key
+ * may be NULL only when @p key_len is 0.
  *
  * @return a new HMAC context, or NULL on allocation failure, an
  *     unsupported @p type, or @p key == NULL with @p key_len > 0.
@@ -102,17 +101,20 @@ axl_hmac_get_string(
  * @brief Get the raw HMAC digest bytes.
  *
  * Finalizes the context. On entry @p *len is the buffer size; on
- * return it is set to the digest length (16/20/32 bytes for
- * MD5/SHA-1/SHA-256), or 0 if the finalize step hit an allocation
- * failure. If the buffer is smaller than the digest, only @p *len
- * bytes are written but @p *len still reports the full digest length.
- * After this call, axl_hmac_update() must not be used.
+ * return it is the number of bytes actually written —
+ * `min(buffer size, digest length)`, where the digest is 16/20/32/64
+ * bytes for MD5/SHA-1/SHA-256/SHA-512. A buffer shorter than the digest
+ * receives a truncated prefix and @p *len reports that shorter
+ * count, never the full length. A @p *len of 0 on return means the
+ * finalize step hit an allocation failure and no MAC exists — the
+ * one other case that yields 0 is a zero-size @p buf, which is
+ * degenerate. After this call, axl_hmac_update() must not be used.
  */
 void
 axl_hmac_get_digest(
     AxlHmac *h,    ///< HMAC context
     uint8_t *buf,  ///< output buffer
-    size_t  *len   ///< [in/out] buffer size / digest length
+    size_t  *len   ///< [in/out] buffer size / bytes written
 );
 
 /**

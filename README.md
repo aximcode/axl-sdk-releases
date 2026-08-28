@@ -190,9 +190,8 @@ sudo dnf install ./axl-sdk.rpm
 Packages ship with mbedtls compiled in, so apps that use
 `https://` URLs link and run without extra setup. Apps that
 don't reference TLS don't incur any binary-size cost — the
-linker only pulls in mbedtls .o files when actually used. Users
-who want an even smaller `libaxl.a` can rebuild from source
-with `AXL_TLS=0`.
+linker only pulls in mbedtls .o files when actually used, which
+`test-tls-strippable.sh` asserts.
 
 **Windows (WSL):** install the Debian or RHEL package inside
 Ubuntu / Debian / Fedora WSL — the `.deb` / `.rpm` paths above
@@ -421,7 +420,7 @@ axl-cc --type driver mydriver.c -o mydriver.efi
 # UDP integration tests
 ./test/integration/test-udp.sh
 
-# HTTPS integration tests (requires AXL_TLS=1 build)
+# HTTPS integration tests
 ./test/integration/test-https.sh
 
 # All architectures (x64 + aa64)
@@ -470,11 +469,13 @@ axl-cc --type driver mydriver.c -o mydriver.efi
   `--allow-uefi` (CMake: `axl_add_driver`, or `ALLOW_UEFI` on
   `axl_add_app`).
 
-### Optional: TLS
+### TLS
 
 TLS support uses [mbedTLS](https://github.com/Mbed-TLS/mbedtls)
-(v3.6.3) as a git submodule. Build with `AXL_TLS=1` to enable
-HTTPS server/client and self-signed certificate generation.
+(v3.6.3) as a **required** git submodule — clone with
+`--recursive`, or run `git submodule update --init --recursive`.
+It is always compiled in; an app that never calls `axl_tls_init`
+links none of it.
 
 ## Built with AXL
 

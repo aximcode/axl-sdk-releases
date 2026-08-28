@@ -3,6 +3,275 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.3.3 — 2026-08-28
+### Changed
+
+- **The `AXL_TLS` build flag is gone — mbedTLS is always compiled in.** The flag
+  existed to spare consumers the size of TLS they do not use, and it never did
+  that: `--gc-sections` plus the `axl_tls_init()` ops indirection already
+  deliver it. Measured from three clean builds, `hello.efi` is **byte-identical
+  by sha256** across the old non-TLS build, the old `AXL_TLS=1` build, and the
+  new unconditional one.
+
+  What the flag *did* cost is on the record: `PREFIX` grew a third input (and
+  when the `-tls` suffix first appeared, 98 hand-composed paths across 66
+  scripts silently pointed at a tree nothing had built); toggling **wiped every
+  object**, which is why the suite forced one value and CI carried "ORDER
+  MATTERS" comments to dodge it; two ratchet baselines drifted (the TLS one was
+  found 104 assertions stale); and four integration tests existed wholly or
+  partly to rebuild binaries the default suite could not exercise.
+
+  **161 more unit assertions now run by default** (10,591 -> 10,752, both
+  arches) — the crypto and JOSE outcomes that used to be skipped unless someone
+  remembered the flag.
+
+  Costs, stated: a clean build goes 2.7 s -> 3.7 s, and `libaxl.a` 17.11 MB ->
+  20.35 MB, for anyone who was previously building without TLS. The archive is
+  unstripped; produced images are unchanged. **mbedTLS is now a required
+  submodule**, and the build says so in one line naming
+  `git submodule update --init --recursive`.
+
+  `AXL_HAVE_TLS` is still defined, and now always is: it reaches public headers,
+  so undefining it would silently disable a consumer's own TLS branch.
+
+### Fixed
+
+- **Attribution: the packages shipped statically-linked third-party code
+  without its licences, and `NOTICE` not at all.** An audit of what
+  `libaxl.a` actually links against what the packages carry found five gaps,
+  four of them obligations rather than bookkeeping:
+
+  - **`NOTICE` was never in the SDK package.** Apache-2.0 §4(d) requires a
+    distribution that includes a NOTICE file to carry its attribution notices
+    into derivative works. The host-tools tarball shipped it; the `.deb`/`.rpm`
+    did not — so the file stating the other obligations was the one missing.
+  - **libvterm** (MIT, statically linked as AxlVterm) had **no THIRD_PARTY.md
+    entry and no licence in the packages**. MIT requires its notice accompany
+    all copies; unlike stb/sdefl/LZMA it offers no public-domain election, so
+    this was a real obligation, not documentation. It also carries **eight
+    local AXL patches** — none of them disclosed.
+  - **FreeType**: THIRD_PARTY.md claimed "No source modifications were made to
+    the vendored files". That was **false** — `ftgrays.c` carries an AXL fix
+    for an upstream typo (`max_ex - min_ey` for `max_ex - min_ex`) that
+    corrupts memory when rasterizing rotated text. Its licence was also absent
+    from the packages despite the FTL's credit clause and ftgrays being
+    compiled into every `libaxl.a`.
+  - **LZMA SDK** had no THIRD_PARTY.md entry (public domain, so documentary
+    only), and its AXL-authored `errno.h` shim was undisclosed.
+  - **The two package paths had drifted**: `release.yml` staged DejaVu's
+    licence and `build-packages.sh` did not.
+
+  All five are fixed and verified by building the package and inspecting it —
+  `NOTICE` plus mbedtls, DejaVu, FreeType, libvterm and EDK2 licences are now
+  present in the `.deb`.
+
+### Added
+
+- **`lsacpi` — an ACPI table browser that also finds where firmware's slot
+  descriptions disagree.** Four sources claim to describe the same physical
+  slots — SMBIOS Type 9, SMBIOS Type 41, the ACPI namespace
+  (`_SUN`/`_UID`/`_PLD` bound by `_ADR`) and the PCIe Slot Capabilities block —
+  and on real hardware they contradict each other. No existing tool sees more
+  than one at a time.
+
+  Default view is the table inventory: signature, length, revision, OEM
+  strings and a checksum verdict per table, with typed decode where a reader
+  exists and an automatic hexdump where none does. `-n` lists namespace
+  devices, `-j` emits JSON, `-s` runs the correlation and marks each
+  disagreement without adjudicating it — which source is right is a
+  per-platform question the operator answers.
+
+  Measured on a Dell PowerEdge XE7745 and an Intel Meteor Lake-H mini-PC:
+  SMBIOS naming a bus address with no device behind it, a Type 9 slot ID
+  disagreeing with the silicon's Physical Slot Number, and a slot SMBIOS calls
+  "In Use" whose Presence Detect reads empty.
+
+- **`axl_pci_read_slot_caps()` — PCIe Slot Capabilities and Slot Status.**
+  Physical Slot Number, hot-plug capability, power limit, and — from Slot
+  Status — **Presence Detect, the only field in the block that is not a
+  build-time assertion**. Returns `AXL_ERR` and leaves `out` untouched for
+  anything that is not a Root Port or Switch Downstream Port with Slot
+  Implemented set, so "this function has no slot" stays distinguishable from
+  "this slot reads zero".
+
+- **A non-evaluating AML namespace walker: `axl_aml_walk_begin/next/truncated`.**
+  Finds `Device` declarations in a DSDT or SSDT and reports the integer objects
+  each carries. **It never executes AML** — a `Method` body is skipped by its
+  length and never entered, and there is no `OperationRegion` access. That
+  boundary is the module's scope statement, revised from "AML interpretation is
+  out of scope" to "no AML **execution**", because parsing static declarations
+  out of a byte stream involves no evaluation, no side effects and no hardware
+  access.
+
+  Every object reports as one of four states — `STATIC`, `METHOD` (present but
+  computed at runtime), `NON_INTEGER` (a string or buffer, read fine but not a
+  number) or `ABSENT`. Collapsing `METHOD` into `ABSENT` would claim the
+  firmware published nothing where one measured server has *every* `_SEG` and
+  `_BBN` behind a Method, one of which resolves to a field inside an
+  `OperationRegion` — a bus number that cannot be had without an interpreter,
+  which is why the correlation takes bus numbers from PCI config space instead.
+
+  Graded against two real firmware images (446 KB and 2.1 MB DSDTs, 396 and
+  1404 devices) with counts matching an independent `iasl`-derived oracle
+  exactly and nothing skipped. Devices declared inside an `If` are reported
+  with a `conditional` flag rather than dropped or asserted, since ~23% of one
+  machine's devices are declared that way.
+
+- **`AXL_INCOMPLETE` (-11) joins `AxlStatus`.** "The input ended mid-item:
+  well-formed so far, but more bytes are needed to decide" — the third outcome
+  every incremental parser over a byte stream needs, and one that neither
+  `AXL_OK` nor `AXL_ERR` can carry. Added for the AxlSsh version-exchange
+  parser, where conflating "not yet" with "malformed" costs either
+  interoperability or a hang. Purely additive: nothing switches exhaustively
+  over `AxlStatus`, so no existing caller changes behaviour.
+
+### Changed
+
+- **The integration suite skips the UEFI Shell's `startup.nsh` countdown —
+  31.4% off the local gate.** Every guest boot was paying the Shell's
+  `Press ESC in 5…1 seconds` prompt: five `gBS->Stall(1s)` busy-waits, ~4.6 s
+  per boot on both arches. `run-integration.sh` now sets
+  `AXL_SHELL_LAUNCHER=1`, which stages a chainloader that starts the Shell with
+  `-delay 0`. Measured back-to-back, uncached, one machine, every run green:
+
+  | arch | OFF | ON | saving |
+  |---|---|---|---|
+  | X64 (172 tests) | 489 s | 368 s | 121 s = 24.7% |
+  | AARCH64 (73 tests) | 322 s | 188 s | 134 s = 41.6% |
+
+  The ROADMAP had parked this work as "not worth it — `run-qemu.sh` already
+  skips the Boot Manager countdown and ~7 s is close to what an OVMF boot
+  costs", asking that it not be re-proposed "without a measurement". The
+  measurement was never taken, and the premise conflated the **Boot Manager**
+  countdown (skipped) with the **Shell's `startup.nsh`** prompt (not skipped).
+  The real floor is 1.6 s on X64, not 7 s.
+
+  The launcher was made opt-in because it "hangs some firmware", and that is
+  *not fixed* — investigated 2026-08-21, and the code was never the variable:
+  the launcher works at the very commit that disabled it (that tree built in a
+  worktree, its own test passes), across three OVMF builds, both arches, and a
+  full uncached suite. What changed is this machine's firmware; the custom OVMF
+  of that era is gone and the trigger went with it. A standalone `run-qemu.sh`
+  therefore kept the conservative default until it could be made safe without a
+  reproducer — see the next entry, which is that.
+
+- **`run-qemu.sh` now uses the shell launcher by default, and heals itself if
+  the firmware cannot take it.** Making the default safe did not require the
+  firmware that hung: it required the default to check its own work. The staged
+  `startup.nsh` echoes `___AXL_APP_OUTPUT_BEGIN___` *before* the app line, so
+  the sentinel can only be missing when the Shell never ran `startup.nsh` at
+  all — never for an app-level failure. On that signal `run-qemu.sh` records a
+  negative verdict against this (arch, firmware, launcher) and re-runs itself
+  without the launcher, so the run still succeeds. Later runs read the verdict
+  and skip straight to the direct boot; the retry is paid once, not every run.
+
+  **Only failures are cached**, which is what makes it safe to trust: working
+  firmware needs no entry and pays nothing, and a stale, unwritable or corrupt
+  verdict can only cost the ~4.6 s/boot saving, never correctness. Verdicts
+  live in `${XDG_CACHE_HOME:-~/.cache}/axl-sdk/shell-launcher-blocklist/`;
+  delete one to give that firmware another try.
+
+  `AXL_SHELL_LAUNCHER=1` still means "always, ignore the cache, no fallback" so
+  a launcher regression stays loud, and `=0` still bisects. New
+  `AXL_SHELL_LAUNCHER_BIN` stages a given PE as the launcher — which is how the
+  fault is now reproducible without the firmware, and so how it is tested.
+
+  Two things this corrected. The consumer risk was overstated: host-tools ships
+  scripts only — no launcher binary, no Makefile, no `libaxl.a` — so packaged
+  consumers never had the launcher and still do not; the affected population is
+  source-tree users. And the failure space has two shapes, only one of which
+  needed anything: a launcher that *returns* is already self-healed by firmware
+  (BdsDxe falls through to `Boot0002 "EFI Internal Shell"`, which runs
+  `startup.nsh` anyway); a launcher that *hangs* never gives control back, and
+  that is the reported shape.
+
+### Fixed
+
+- **The release watcher blocked on a workflow the tag never started, costing
+  69% of a cut.** Measured on v4.3.1: `Release` finished at 4m02s and `Docs` at
+  5m02s — everything the tag produces was done at five minutes — and the script
+  did not return for another **11m05s** of a **16m07s** run, sitting on `CI`.
+
+  `CI` is not triggered by the tag. It is triggered by the `git push origin
+  main` that `cut-release.sh` performs two steps earlier, and its integration
+  job re-runs the same suite the LOCAL uncached gate already certified on that
+  exact commit — which `RELEASING.md` names as the authoritative pre-release
+  gate. It also finishes long after the tag is pushed and the release is
+  published, so blocking on it cannot prevent anything.
+
+  Both the terminal condition and the final verdict scanned **every** workflow
+  on the SHA rather than the expected set. That second half is how v4.3.0
+  reported `RELEASE_VERDICT: FAIL` after successfully publishing all 8 assets:
+  the failure was a CI container defect, on a run the tag did not start. Now
+  only the expected workflows gate; the rest are reported under a heading that
+  says they do not gate, because a red CI is still worth reading — it just
+  cannot un-publish a release that is already out.
+
+  Also corrects, in `watch-release-runs.sh`, the same stale claim already fixed
+  in `cut-release.sh`: "a MAJOR tag triggers Release + Docs, a minor/patch only
+  Release". `docs.yml` fires on every `v*` tag, so a minor release was never
+  waiting for Docs at all.
+
+  **Measured, not estimated, and NOT bought by dropping coverage:** the local
+  uncached gate on both arches is unchanged and still runs before every cut.
+  What was removed is a wait, not a check.
+
+### Changed
+
+- **`AXL_CHECKSUM_SHA512` joins `AxlChecksumType`, and `AxlHmac` gained
+  SHA-512 support with it.** MD5, SHA-1 and SHA-256 stay AXL's own
+  implementations; SHA-512 forwards to `mbedtls_sha512_*` — a hand-written
+  fourth compressor would cost the same bytes while adding cryptographic
+  code nobody needs to audit. `axl-digest.c`'s dispatcher references every
+  algorithm strongly, so the choice is not gated by which algorithm a
+  caller actually uses: **any image touching any checksum — even MD5
+  alone — now links 2,301 B of mbedTLS** (x64 release: the 61 B adapter in
+  `axl-digest-sha512.c`, mbedTLS's `sha512.o` at 2,208 B, and
+  `platform_util.o` at 32 B). `AxlHmac` now handles the 128-byte SHA-512
+  block (the other three use 64), so `hmac-sha2-512` is available end to
+  end.
+
+  **A behaviour change a caller can be surprised by:** `axl_checksum_get_digest()`
+  and `axl_hmac_get_digest()` now set `*len` to the number of bytes
+  *written*, not the algorithm's full digest length. A caller that passed
+  a short buffer and read `*len` back afterward to learn how much space it
+  needed now gets its own buffer size back, which makes an exact fit
+  indistinguishable from a silent truncation. Size buffers with
+  `axl_checksum_type_get_length()` instead. This is a latent-defect fix,
+  not new behaviour invented for its own sake: with only 32-byte digests
+  in the enum the old contract stayed harmless, but a 64-byte digest
+  exposed it directly — had `AxlHmac`'s own fixed-size buffers not been
+  widened in the same phase, the old contract would have handed back a
+  reported length of 64 for a MAC computed into a `char[65]` hex buffer
+  sized for the previous maximum, overflowing it. Both fixes landed before
+  the enum value did, so no shipped commit ever carried the live bug.
+
+### Added
+
+- **Raw public key import and export, and per-algorithm availability.**
+  `axl_pk_key_from_raw_public()` / `axl_pk_key_get_raw_public()` take the
+  encoding an algorithm's own ecosystem uses on the wire rather than a DER
+  container -- uncompressed SEC1 (`0x04 || X || Y`, 65 bytes for P-256, 97 for
+  P-384) for ECDSA, with RSA rejected because it has no meaningful raw form.
+  This is what SSH and COSE consume. `axl_pk_alg_available()` answers a
+  question `axl_pk_available()` cannot: whether *this image* linked a
+  particular algorithm, which distinguishes "not linked" from "the operation
+  failed" -- both of which otherwise surface as a NULL handle.
+
+### Changed
+
+- **`AxlPkKey` is a tagged union behind a per-algorithm provider vtable.** It
+  used to *be* an `mbedtls_pk_context`; Ed25519 cannot be one, because mbedTLS
+  3.6.3 has no twisted-Edwards curve at all. No behaviour changed for ECDSA or
+  RSA -- the same mbedTLS calls run in the same order on the same data, and
+  every existing vector passes unchanged, which is the claim the restructure
+  rests on. The cost is measured, not estimated: an image that verifies and
+  signs but never generates a key grows **+8,976 B `.text`**, because the
+  provider object holds strong references to all eleven operations and
+  `--gc-sections` can no longer separate keygen and the DER writers from what
+  a consumer actually calls. `AXL_PK_ED25519` remains reserved and fails
+  closed at every entry point.
+
 ## 4.3.2 — 2026-08-27
 ### Fixed
 

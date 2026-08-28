@@ -407,9 +407,10 @@ axl_guid_v5(
     axl_checksum_update(cs, name, axl_strlen(name));
 
     /* SHA-1 digest is 20 bytes; we keep the first 16 and overwrite
-       the version + variant bits per RFC 4122 §4.3. axl_checksum_get_digest
-       always sets *len to 20 for SHA-1 — no truncation/short-write
-       case to defend against. */
+       the version + variant bits per RFC 4122 §4.3. This call passes
+       an exact 20-byte buffer, so axl_checksum_get_digest reports 20
+       here -- no truncation/short-write case to defend against at
+       this call site. */
     uint8_t digest[20];
     size_t  digest_len = sizeof(digest);
     axl_checksum_get_digest(cs, digest, &digest_len);

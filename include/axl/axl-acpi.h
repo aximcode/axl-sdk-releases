@@ -22,9 +22,18 @@
     pointers). Other tables stay raw — consumers can walk them via
     the `AxlAcpiHeader` cursor and the table's own definitions.
 
-    Scope is discovery + typed readers; AML interpretation is out
-    of scope (that's ACPICA-sized and not what diagnostic tools
-    need).
+    Scope is discovery, typed readers, and a **non-evaluating** AML
+    namespace walker.
+
+    **AML execution is out of scope, permanently** — that means a
+    bytecode interpreter with `OperationRegion` access, which is
+    ACPICA-sized and not what diagnostic tools need. Parsing static
+    `Name()` declarations out of the byte stream is a different
+    thing: a structural walk with no evaluation, no side effects and
+    no hardware access, and that is what axl_aml_walk_begin() does.
+    A `Method` body is skipped by length and never entered, so
+    anything whose value is not a literal in the table is reported
+    as present-but-unreadable rather than guessed at.
 **/
 
 #ifndef AXL_ACPI_H
@@ -277,6 +286,180 @@ typedef struct {
 int
 axl_acpi_read_facp(
     AxlAcpiFacp  *out   ///< [out] receives decoded FADT
+);
+
+// ---------------------------------------------------------------------------
+// AML namespace walker — parsing only, never evaluation
+// ---------------------------------------------------------------------------
+
+/// Longest namespace path reported, e.g. "\\_SB_.PC00.RP05.PXSX".
+/// Firmware nests deeply but not unboundedly; paths longer than this
+/// are truncated and the node still reported.
+#define AXL_AML_PATH_MAX  128
+
+/// Nesting depth cap. The table is untrusted firmware input, so the
+/// walk must be bounded rather than trusting the byte stream.
+#define AXL_AML_DEPTH_MAX  32
+
+/// Distinct method names remembered for resolving method invocations.
+/// `MethodInvocation := NameString TermArgList` carries no argument
+/// count, so AML cannot be parsed without knowing each method's
+/// declared arity -- see axl_aml_walk_begin(). The two measured
+/// firmware images declare 391 and 73 distinct method names.
+#define AXL_AML_METHOD_MAX  512
+
+/**
+ * @brief How a named object's value was obtained — or why it wasn't.
+ *
+ * This distinction is the walker's reason for existing. A static
+ * walker CAN read `Name(_ADR, 0x001C0004)` and CANNOT read
+ * `Method(_ADR){...}`, and a consumer must never confuse the second
+ * with "the firmware didn't publish one".
+ *
+ * #AXL_AML_VALUE_NON_INTEGER is the fourth case and it is real, not
+ * theoretical: `_UID` is commonly a string (`Name (_UID, "IPMI
+ * Device")`), and reporting that as a Method would claim the walker
+ * could not read something it read perfectly well.
+ *
+ * How much falls in each bucket varies enormously between machines,
+ * so treat it as data rather than assuming a distribution: one
+ * measured client had 34% of its `_ADR` objects behind Methods and
+ * published no `_SUN` at all, while a measured server had every
+ * `_ADR` static and 26 `_SUN`, but every `_SEG` and `_BBN` behind a
+ * Method.
+ */
+typedef enum {
+    AXL_AML_VALUE_STATIC = 0,   ///< a literal in the byte stream; the value is valid
+    AXL_AML_VALUE_METHOD,       ///< declared as a Method — present, but unreadable without executing AML
+    AXL_AML_VALUE_NON_INTEGER,  ///< declared as a String, Buffer or Package — present and static, but not a number
+    AXL_AML_VALUE_ABSENT        ///< not declared on this device at all
+} AxlAmlValueKind;
+
+/**
+ * @brief One named integer object belonging to a device.
+ *
+ * @a value is meaningful only when @a kind is #AXL_AML_VALUE_STATIC.
+ * It is zeroed otherwise, but a caller must branch on @a kind rather
+ * than testing for zero — zero is a perfectly ordinary `_ADR`, `_UID`
+ * or `_SEG`.
+ */
+typedef struct {
+    AxlAmlValueKind  kind;
+    uint64_t         value;   ///< valid only when @a kind is AXL_AML_VALUE_STATIC
+} AxlAmlValue;
+
+/**
+ * @brief One `Device` found in the namespace.
+ *
+ * The integer objects a device may carry, all reported through
+ * #AxlAmlValue so "unreadable" stays distinct from "absent".
+ * `_PLD` is deliberately not an #AxlAmlValue: it is a Buffer, not an
+ * integer, so only its presence is reported.
+ */
+typedef struct {
+    char             path[AXL_AML_PATH_MAX];  ///< full path, NUL-terminated
+    bool             conditional;             ///< declared inside an If/Else — may not exist at runtime
+    bool             path_truncated;          ///< the real path exceeded AXL_AML_PATH_MAX
+    AxlAmlValue      adr;                     ///< _ADR — device+function, the correlation's join key
+    AxlAmlValue      sun;                     ///< _SUN — slot user number
+    AxlAmlValue      uid;                     ///< _UID — unique ID
+    AxlAmlValue      seg;                     ///< _SEG — PCI segment group
+    AxlAmlValue      bbn;                     ///< _BBN — bus number. Very often a Method; see the note on AxlAmlValueKind
+    AxlAmlValueKind  pld_kind;                ///< _PLD is a Buffer; presence only, never a value
+} AxlAmlNode;
+
+/**
+ * @brief Walk state. Allocate on the stack; the walk owns no memory.
+ *
+ * Members are private and prefixed accordingly — read them through
+ * the accessor functions, not directly.
+ */
+typedef struct {
+    const uint8_t  *_aml;             ///< definition block start
+    size_t          _len;             ///< definition block length
+    size_t          _pos;             ///< current offset into _aml
+    bool            _truncated;       ///< the walk stopped on malformed AML
+    bool            _skipped;         ///< a package was stepped over unparsed
+    unsigned        _depth;           ///< current nesting depth
+    /* Per-level scope bookkeeping: the name segment opened at each
+       level, the offset its package ends at, and whether that level
+       was entered through an If/Else. */
+    char            _seg[AXL_AML_DEPTH_MAX][5];
+    size_t          _end[AXL_AML_DEPTH_MAX];
+    bool            _cond[AXL_AML_DEPTH_MAX];
+    /* Method arity table, filled by axl_aml_walk_begin. */
+    char            _mseg[AXL_AML_METHOD_MAX][5];
+    uint8_t         _margc[AXL_AML_METHOD_MAX];
+    unsigned        _mcount;
+} AxlAmlWalk;
+
+/**
+ * @brief Begin walking the AML definition block in @p table.
+ *
+ * @p table is a DSDT or SSDT header. The walk is read-only, allocates
+ * nothing, and executes nothing. Call axl_aml_walk_next() until it
+ * returns false.
+ *
+ * Begins with a pre-pass that records every `Method` declaration's
+ * name and argument count. That pass is not optional: the AML grammar
+ * defines `MethodInvocation := NameString TermArgList` with **no
+ * argument count**, so a parser that meets a call cannot know how many
+ * arguments to step over without having seen the declaration. ACPICA,
+ * `iasl` and the smaller AML interpreters all load the namespace
+ * first for the same reason. Skipping it costs real devices: on one
+ * measured DSDT, 42 of 396 devices sat behind unresolvable calls.
+ *
+ * @return AXL_OK on success, AXL_ERR if @p walk or @p table is NULL,
+ *     or the table is too short to contain a definition block.
+ */
+int
+axl_aml_walk_begin(
+    AxlAmlWalk           *walk,   ///< [out] caller-allocated walk state
+    const AxlAcpiHeader  *table   ///< DSDT or SSDT
+);
+
+/**
+ * @brief Yield the next `Device` found, in declaration order.
+ *
+ * A device declared inside an `If` or `Else` body is yielded with
+ * @c conditional set. The walker cannot know whether the condition
+ * holds without executing AML, so it reports the device *and* the
+ * doubt rather than choosing between dropping real devices and
+ * inventing absent ones. On one measured machine roughly 23% of
+ * devices — including a host bridge — were declared this way.
+ *
+ * @return true when @p out was populated; false at the end of the
+ *     table, or when the walk stopped on malformed AML (which
+ *     axl_aml_walk_truncated() then reports).
+ */
+bool
+axl_aml_walk_next(
+    AxlAmlWalk   *walk,   ///< walk state
+    AxlAmlNode   *out     ///< [out] receives the device
+);
+
+/**
+ * @brief Report whether anything in the table went unseen.
+ *
+ * True for either of two reasons, because to a consumer they mean the
+ * same thing — the device list is incomplete:
+ *
+ * - the walk **stopped** on malformed AML or at #AXL_AML_DEPTH_MAX;
+ * - the walk **skipped** a package whose contents it could not parse,
+ *   and carried on with that package's siblings.
+ *
+ * The second is the common one and is not an error: firmware contains
+ * constructs this walker deliberately does not model, and stepping
+ * over them beats abandoning the table. What matters is that a
+ * consumer rendering a device list can say "there may be more" rather
+ * than implying it saw everything.
+ *
+ * @return true if any part of the definition block went unwalked;
+ *     false if the whole of it was traversed.
+ */
+bool
+axl_aml_walk_truncated(
+    const AxlAmlWalk  *walk   ///< walk state
 );
 
 #ifdef __cplusplus

@@ -23,7 +23,6 @@
 #   2. wss connect x5: read 101, send CLOSE, DON'T drain the 400 KB, close
 #   3. HTTPS GET /api/version                 -> MUST be 200 (RED: 000 = wedge)
 #
-# Requires: AXL_TLS=1 build.
 
 source "$(dirname "$0")/common-test.sh"
 
@@ -38,7 +37,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
 make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 

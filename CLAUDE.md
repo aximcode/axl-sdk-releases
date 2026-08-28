@@ -113,6 +113,33 @@ leads to chicken-and-egg awkwardness.
   leak in `src/` is a library defect, and an intentional
   never-freed allocation gets removed at the source (see
   `AXL_PROTOCOL_NAME_MAX`), not allowlisted in a shell script.
+- **Empty is not an answer unless you know the question was asked.**
+  When a check shells out, distinguish "the tool could not RUN"
+  from "the tool ran and found NOTHING": capture the exit status,
+  do not read the output alone. The two are the same empty string
+  and opposite facts. Six instances in one day (2026-08-20):
+  `check-cxx-entry` reported an `nm` that could not start as
+  "missing or name-mangled in C++" and an `objdump` that could not
+  load as "registered NO .init_array entry" -- a codegen diagnosis
+  for a missing `libdebuginfod.so.1`, which failed the v4.3.0 tag
+  run; `check-awk-portability` reported "clean -- 203 build files"
+  over a `strtonum` it could not see, because its glob never
+  matched the extensionless `axl-cc`; `check-release-semver` named
+  one of two `### Breaking` entries through a `grep -A3` window;
+  `watch-release-runs` would have reported a release green without
+  ever waiting for Docs. `check-awk-portability`'s OWN docstring
+  already recorded an earlier instance of the identical wrong
+  message, which is why this belongs here and not in a comment
+  only that file's next reader sees.
+- **A detector's silence is worth nothing until you have shown it
+  can fail.** Prove it SEES the thing before trusting that it
+  found none: `scripts/sabotage.sh` for a gate, a poisoned `PATH`
+  for a toolchain claim (`test-hermetic-toolchain.sh`), a stub on
+  `PATH` for a network poller (`test-release-watch-scope.sh`).
+  Every new detector gets a control assertion in the same test --
+  and check the control does not pollute what it is proving, which
+  is its own trap: the hermeticity test's control invoked a shim
+  and had to clear the call log before asserting the log was empty.
 - **Independent review is staged** per
   `feedback_code_review_before_commit`: contract-first for new
   public API (unless already designed with the user), an optional
@@ -245,10 +272,10 @@ Test runner has ratchet check (fails if count drops below baseline).
 | AxlTask | src/task/ | axl/axl-task.h, axl-buf-pool.h, axl-async.h |
 | C++ layer | src/cxxrt/axl-cxxrt-terminate.cpp (the only .cpp left in src/) | axl/axl-cxx.hpp (`axl::result`), axl-arena-allocator.hpp (`axl::arena_allocator`), axl-handle.hpp (`axl::unique_handle`, opt-in per type via `AXL_DEFINE_AUTOPTR_CLEANUP`). **C0-C7 ALL SHIPPED as of 2026-08-17** — the seam headers are axl-cstr.hpp (`axl::view`/`adopt`), axl-array.hpp (`array_span` over the new `axl_array_data()`), axl-ntree.hpp (four lazy ranges), axl-radix-tree.hpp, axl-gfx-surface.hpp (`gfx_target_scope`), and axl-json.hpp (`json_document`/`json_writer`/`json_scanner`, chaining `operator[]`). Every one is HEADER-ONLY; the layer compiles no .cpp beyond the runtime glue. Exceptions WORK (`axl-c++ -fexceptions`), but are a per-TU opt-in with `-fno-exceptions` the default, so every header must be usable in both modes — which is why errors are `axl::result` and nothing throws. The standard containers are the default and need no flag -- `std::vector`/`string`/`map`/`unordered_map` work on both arches (`--hosted` is removed; passing it is an error). **ONE C++ LINK SHAPE since P4 (2026-08-17):** every C++ link carries the toolchain's `libstdc++`/`libsupc++`, the four `axl-cxxrt-*.o` glue objects and the EXCEPTIONS linker script -- `libaxl-cxx.a` and its 7 substitute sources are DELETED. That is what makes `<iostream>`/`<sstream>`/`<fstream>` work (booted both arches, `test-cxx-iostreams-qemu.sh`); it costs +46,928 `.text` on a containers image -- but quote the **`.efi`**, +100,339 (58,758 -> 159,097), and note a fixture UNDERSTATES it: a consumer measured **+153,886 to +178,118 (+28-36%)** on four real x64 tools. An iostreams image is ~734 KB of `.text`, which is why `axl::cout` (~700 B over `axl_printf`) stays the default. `axl_mem_fail_next_alloc()` NO LONGER reaches `operator new` -- that is libstdc++'s and calls newlib `malloc`, so C++ OOM fixtures must request an unsatisfiable size instead. **`axl::string` is KEPT** (decided 2026-08-16, design §9c): `std::string` HALTS on OOM under `-fno-exceptions` while `axl::string` sets `bad()`, which `axl::cin` reads to report `AXL_NO_RESOURCES` -- and it measures 564 B against `std::string`'s 1045 B. This was an "open T5 question" for a while; T5 was a doc-restructure task that closed 2026-08-14, so that phrasing was always wrong. See docs/AXL-Cxx-Design.md |
 | AxlNet | src/net/ | axl/axl-tcp.h, axl-udp.h, axl-url.h, axl-http-server.h, axl-http-client.h, axl-inet-address.h, axl-socket.h, axl-socket-client.h, axl-net.h (umbrella) |
-| AxlTls | src/net/ | axl/axl-tls.h (optional: AXL_TLS=1) |
-| AxlCrypto | src/net/ | axl/axl-crypto.h (PK sign/verify, AEAD, ECDH, AES-CTR; AXL_TLS=1) |
-| AxlJose | src/net/ | axl/axl-jose.h (JWS/JWT/JWK; ES256/ES384/RS256/PS256/HS256; AXL_TLS=1) |
-| Axl9p | src/9p/ | axl/axl-9p.h (9P2000.L client over AxlTcp: connect/read_file/list + Phase 2 write path write_file/mkdir/remove/rename; still no server/mount) |
+| AxlTls | src/net/ | axl/axl-tls.h (mbedTLS is always compiled in; `--gc-sections` keeps it out of any image that never calls `axl_tls_init`) |
+| AxlCrypto | src/net/ | axl/axl-crypto.h (PK sign/verify, AEAD, ECDH, AES-CTR). **`AXL_PK_ED25519` is RESERVED and unimplemented** — mbedTLS 3.6.3 has no twisted-Edwards curve at all, so it is a vendoring project, not a config flag (`docs/superpowers/specs/2026-08-21-ed25519-design.md`) |
+| AxlJose | src/net/ | axl/axl-jose.h (JWS/JWT/JWK; ES256/ES384/RS256/PS256/HS256) |
+| Axl9p | src/9p/ | axl/axl-9p.h (9P2000.L client AND server over AxlTcp; all five phases DONE 2026-07-22 -- client read+write, `axl_9p_mount` publishing a Shell-visible fsN:, async `Axl9pServer` exporting an AxlFs subtree, and the `9p` tool) |
 | AxlGfx | src/gfx/ | axl/axl-gfx.h |
 | AxlConsole/AxlVterm | src/util/, src/vterm/ | axl/axl-console-ops.h (producer-agnostic console op vtable), axl-console-tap.h (SIMPLE_TEXT_OUTPUT swap producer), axl-console-device.h (take-over producer), axl-console-mirror.h (console→VT byte-stream encoder + remote input), axl-console-term.h (on-screen AxlConsoleOps grid renderer), axl-vterm.h (VT/xterm byte-stream→ops, Layer 2 over vendored libvterm), axl-console-screen.h (server-side screen model + self-contained snapshot serializer for late-join repaint; shares src/util/axl-console-vt.h pen→SGR encoder with the mirror) |
 | AxlSmbios | src/smbios/ | axl/axl-smbios.h |
@@ -426,11 +453,12 @@ protector was added, including "0 objects instrumented" on a build whose
 command line plainly carried the flag, and a sabotage that looked UNDETECTED
 because the restored source was never rebuilt.
 
-The build now records a SIGNATURE (`$(BUILDDIR)/.axl-build-state`) covering
-three things: the `AXL_TLS` toggle (which sources compile), a hash of
-`CFLAGS`/`CXXFLAGS`/`INCLUDES` (how they compile), and `CC`/`CXX` (which
-compiler emits them); a change in any wipes the objects, both archives and
-every `.efi`/`.so` under `$(PREFIX)`. `$(BUILDDIR)/.axl-flags` holds that
+The build records a SIGNATURE (`$(BUILDDIR)/.axl-build-state`) covering a hash
+of `CFLAGS`/`CXXFLAGS`/`INCLUDES` (how objects compile) and `CC`/`CXX` (which
+compiler emits them); a change in either wipes the objects, both archives and
+every `.efi`/`.so` under `$(PREFIX)`. It once covered a third input, the
+`AXL_TLS` toggle (which sources compile) — that flag is gone, but the mechanism
+stayed, because the other two produce the same class of silently-stale build. `$(BUILDDIR)/.axl-flags` holds that
 compiler pair followed by the exact flag set the neighbouring objects were
 built with — read it first when a build looks wrong.
 
@@ -439,12 +467,15 @@ host-g++ objects, so a full-suite run "with the bare-metal toolchain" silently
 measured the host one. It captures the compiler's SPELLING, not its identity:
 an in-place gcc upgrade or a ccache shim on PATH still hashes the same.
 
-The flags are written with `$(file ...)` and hashed from disk rather than
-piped through a shell: `AXL_TLS=1` adds
-`-DMBEDTLS_CONFIG_FILE='<axl-mbedtls-config.h>'`, whose embedded quotes end
-the shell argument and leave `<...>` as a redirect. The first version hashed
-the empty string under `AXL_TLS=1` — a constant signature is a check that
-never fires.
+The flags are written with `$(file ...)` and hashed from disk rather than piped
+through a shell: `CFLAGS` carries `-DMBEDTLS_CONFIG_FILE=...`, and in its
+original `'<axl-mbedtls-config.h>'` spelling the embedded quotes ended the shell
+argument and left `<...>` as a redirect — the first version hashed the empty
+string, and a constant signature is a check that never fires. The macro is now
+spelled `'"axl-mbedtls-config.h"'`, which removes the redirect hazard AND stops
+`bugprone-macro-parentheses` firing on it: `<name.h>` parses as a comparison,
+and a COMMAND-LINE macro has no file, so no clang-tidy header filter can
+suppress it.
 
 Incremental builds correctly handle public-header restructures
 (add / remove / rename a struct field, type, or function): the

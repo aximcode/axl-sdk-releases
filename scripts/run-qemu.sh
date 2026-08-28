@@ -207,6 +207,13 @@ TAP_IFACE=""          # --tap <ifname>: bridge the NIC to a host tap (real net)
 # --qemu-arg. run-qemu.sh is a generic launcher. See the HF design doc's
 # 2026-06-08 architecture decision.
 
+# The parse loop below shifts every argument away, so keep a verbatim copy for
+# the shell-launcher fallback retry near the end of this script. Set by
+# stage_boot_shell; initialized here because --boot-target never calls it.
+ORIG_ARGV=("$@")
+SHELL_LAUNCHER_STAGED=false
+SHELL_LAUNCHER_PATH=""
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)       ARCH="$2"; shift 2 ;;
@@ -541,6 +548,27 @@ Examples:
   run-qemu.sh --interactive noGPT.efi          # press-a-key stubs
   run-qemu.sh -i --mount ~/efi-apps             # host fs at fsN:, shell prompt
   run-qemu.sh --mount ~/efi-apps myapp.efi      # run myapp + host fs alongside
+
+Environment:
+  AXL_SHELL_LAUNCHER       Boot the Shell through the AXL launcher, which
+                           chains it with "-delay 0" and skips its 5 s
+                           startup countdown (~4.6 s per boot).
+                             unset  auto (default): use it, but if the Shell
+                                    is never reached, record that against
+                                    this firmware and retry without it. The
+                                    verdict is cached, so the retry is paid
+                                    once, not every run.
+                             0      never use it (bisect a launcher fault)
+                             1      always use it, ignoring the cache, with
+                                    NO fallback -- a failure stays loud
+  AXL_SHELL_LAUNCHER_BIN   Stage this binary as the launcher instead of
+                           building one. Must be a PE image.
+  AXL_QEMU_TMPDIR          Base directory for per-run scratch (default
+                           /dev/shm when usable).
+
+  Cached launcher verdicts live in
+  ${XDG_CACHE_HOME:-~/.cache}/axl-sdk/shell-launcher-blocklist/ -- delete
+  a file there to give that firmware another try.
 HELP
             exit 0 ;;
         *)
@@ -885,9 +913,13 @@ if [[ "$BOOT_TARGET" == "true" && -n "$EFI_FILE" ]]; then
 else
     # Boot the Shell via the AXL launcher ("-delay 0", skips the 5 s startup
     # countdown); see stage_boot_shell in axl-common.sh. Falls back to booting
-    # the Shell directly if the launcher can't be built.
+    # the Shell directly if the launcher can't be built. stage_boot_shell sets
+    # SHELL_LAUNCHER_STAGED/_PATH (initialized with ORIG_ARGV above, since
+    # --boot-target skips this branch entirely).
     if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
-        stage_boot_shell "$STAGING" "$ARCH" "$BOOT_NAME" "$SHELL_EFI"
+        # "auto": this script owns the serial log, so it can tell whether the
+        # boot reached the Shell and undo the launcher if it did not.
+        stage_boot_shell "$STAGING" "$ARCH" "$BOOT_NAME" "$SHELL_EFI" auto
     fi
     if [[ -n "$EFI_FILE" ]]; then
         cp "$EFI_FILE" "$STAGING/$EFI_NAME"
@@ -2208,6 +2240,52 @@ Likely causes:
   - QEMU build broken (try: $QEMU_BIN --version)
 EOF
         exit 1
+    fi
+
+    # Shell-launcher self-healing. The staged startup.nsh echoes the sentinel
+    # BEFORE the app line, so the sentinel can only be missing when the Shell
+    # never ran startup.nsh at all — never for an app-level failure. That is
+    # exactly the reported launcher fault (the guest loads BOOTX64.EFI and
+    # never chains to the Shell), so record it against this firmware and redo
+    # the whole run without the launcher.
+    #
+    # Deliberately AFTER the two guards above: a hostfwd bind failure or a
+    # zero-byte log is a broken environment, and must report its own error
+    # instead of being retried into a second identical failure.
+    #
+    # Re-running the whole script rather than retrying in place: staging happens
+    # ~1250 lines above, so this is both the smaller change and the more
+    # faithful one — the second attempt is a genuine launcher-less run, not a
+    # partially rewound one. AXL_SHELL_LAUNCHER=1 opts out: forced-on means a
+    # launcher failure must stay loud. The guard var caps this at a single retry.
+    #
+    # CALL + exit, deliberately NOT exec: exec replaces this process, so neither
+    # the EXIT trap nor the INT/TERM traps ever fire — leaking $TMPDIR (disk
+    # image + logs) and, under --mount, ORPHANING virtiofsd, which keeps holding
+    # the shared directory with an unlinked socket. Keeping this process alive
+    # as the parent keeps that cleanup exactly where it already works, instead
+    # of duplicating the trap's knowledge of what needs killing.
+    #
+    # The memo is written BEFORE the retry on purpose: a caller who wrapped this
+    # script in a `timeout` sized for a single boot will see the retry killed,
+    # but the verdict survives, so their next run takes the direct path and
+    # succeeds. Recording after the retry would lose that.
+    if [[ "$SHELL_LAUNCHER_STAGED" == "true" &&
+          "${AXL_SHELL_LAUNCHER:-auto}" != "1" &&
+          "${AXL_SHELL_LAUNCHER_RETRIED:-0}" != "1" ]] &&
+       ! grep -qF "$APP_OUTPUT_SENTINEL" "$CLEAN"; then
+        shell_launcher_memo_record "$ARCH" "$SHELL_LAUNCHER_PATH"
+        echo "[run-qemu] shell launcher did not reach the Shell on this firmware;" >&2
+        echo "[run-qemu] retrying with a direct Shell boot (recorded, so later runs skip it)." >&2
+        export AXL_SHELL_LAUNCHER=0
+        export AXL_SHELL_LAUNCHER_RETRIED=1
+        # A bare $0 (invoked as `bash run-qemu.sh` from its own directory) would
+        # PATH-search as a command and die 127. `source $(dirname $0)/...` above
+        # resolves relative to the cwd, so match that.
+        _self="$0"
+        [[ "$_self" == */* ]] || _self="./$_self"
+        "$_self" "${ORIG_ARGV[@]}"
+        exit $?
     fi
 
     if [[ "$RAW" == "true" ]]; then

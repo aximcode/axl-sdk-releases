@@ -224,10 +224,11 @@ ERR.
 When the same `static const AxlService` descriptor is initialized
 in two binaries (foreground app + embedded driver image), the
 option struct's layout MUST match across both. Build both from
-the same source tree with identical compile flags (`AXL_TLS`,
-`AXL_MEM_DEBUG`, arch). The Makefile's `AXL_TLS` toggle
-detection wipes AXL-internal stale objects automatically; it
-cannot see consumer-side struct shifts.
+the same source tree with identical compile flags (`AXL_MEM_DEBUG`,
+arch, and anything reaching `CFLAGS`). The Makefile records a
+build-state signature over `CFLAGS`/`CXXFLAGS`/`INCLUDES` and
+`CC`/`CXX`, and wipes AXL-internal stale objects when it changes;
+it cannot see consumer-side struct shifts.
 
 The wire format prefixes each `LoadOptions` payload with the
 8-byte magic `AXLSVC1\0` so a shell-launched UCS-2 LoadOptions

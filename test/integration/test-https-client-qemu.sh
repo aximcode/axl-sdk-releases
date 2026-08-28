@@ -6,7 +6,7 @@
 # (the client-side handshake), reached only by an outbound https request.
 # After the strippable-TLS refactor (src/net/axl-http-client-tls.h), the client
 # reaches TLS only through ops registered by axl_tls_init(); fetch calls that
-# for https URLs. This test boots fetch.efi (AXL_TLS=1) and GETs a host-side
+# for https URLs. This test boots fetch.efi and GETs a host-side
 # https server, confirming the client https path still works end to end.
 #
 # X64-only (SLIRP outbound; AARCH64/TCG has no NIC link). Requires openssl.
@@ -30,7 +30,7 @@ fi
 HOST_PORT=$(test_port 0)    # https server
 PLAIN_PORT=$(test_port 1)   # plain-http redirector -> the https server (cross-scheme)
 
-make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     all tools 2>&1 | tail -3
 TOOLS_DIR="$(test_build_dir x64)/tools"
 test_add_efi "$TOOLS_DIR/fetch.efi"

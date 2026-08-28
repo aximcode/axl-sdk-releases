@@ -55,8 +55,8 @@ AxlRingBuf
 AxlDigest
 ~~~~~~~~~
 
-Message digest checksums (MD5, SHA-1, SHA-256). Standalone
-implementations — available even without ``AXL_TLS=1``.
+Message digest checksums (MD5, SHA-1, SHA-256, SHA-512). MD5, SHA-1
+and SHA-256 are AXL's own; SHA-512 forwards to mbedTLS.
 
 .. doxygenfile:: axl-digest.h
 
@@ -65,8 +65,8 @@ AxlHmac
 
 Keyed-hash message authentication (HMAC, RFC 2104) over the digest
 engine — mirrors GLib's ``GHmac``. For API tokens, signed cookies,
-webhook signatures. No ``AXL_TLS=1`` required. Prefer HMAC-SHA256 for
-new designs.
+webhook signatures. MD5, SHA-1 and SHA-256 are AXL's own; SHA-512
+forwards to mbedTLS. Prefer HMAC-SHA256 for new designs.
 
 .. doxygenfile:: axl-hmac.h
 

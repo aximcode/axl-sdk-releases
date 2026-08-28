@@ -9,7 +9,7 @@
 # with Expect: 100-continue (what `curl -T -` sends by default) must complete
 # (curl rc 0), not hang (rc 28). Regression guard for the TLS upload-path drain.
 #
-# Requires: AXL_TLS=1 build. Auxiliary single-binary test (opt out of ratchet).
+# Auxiliary single-binary test (opt out of ratchet).
 #
 # Usage: ./test/integration/test-webdav-fs-tls-qemu.sh [--arch X64|AARCH64]
 
@@ -28,7 +28,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
 # TLS build
 make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 test_add_efi "$(test_build_dir "$_native_arch")/AxlTestNet.efi"
 

@@ -12006,6 +12006,111 @@ test_checksum_sha256(void)
 }
 
 static void
+test_checksum_sha512(void)
+{
+    /* FIPS 180-4 known-answer vectors. Bytes specified by someone
+       else, so passing is evidence about the standard rather than
+       about our own arithmetic. */
+    char *hex = axl_compute_checksum(AXL_CHECKSUM_SHA512, "", 0);
+    test_check(hex != NULL && axl_strcmp(hex,
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+        "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e") == 0,
+        "checksum sha512: empty string");
+    axl_free(hex);
+
+    hex = axl_compute_checksum(AXL_CHECKSUM_SHA512, "abc", 3);
+    test_check(hex != NULL && axl_strcmp(hex,
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+        "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f") == 0,
+        "checksum sha512: abc");
+    axl_free(hex);
+
+    /* The 896-bit message -- 112 bytes, so it spans two 128-byte
+       blocks and forces the length-padding path across a block
+       boundary. */
+    hex = axl_compute_checksum(AXL_CHECKSUM_SHA512,
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu", 112);
+    test_check(hex != NULL && axl_strcmp(hex,
+        "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018"
+        "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909") == 0,
+        "checksum sha512: 896-bit message");
+    axl_free(hex);
+
+    /* A long repeat -- multi-block, and long enough that a
+       mis-handled buffer boundary shows up. */
+    char a1000[1000];
+    axl_memset(a1000, 'a', sizeof(a1000));
+    hex = axl_compute_checksum(AXL_CHECKSUM_SHA512, a1000, sizeof(a1000));
+    test_check(hex != NULL && axl_strcmp(hex,
+        "67ba5535a46e3f86dbfbed8cbbaf0125c76ed549ff8b0b9e03e0c88cf90fa634"
+        "fa7b12b47d77b694de488ace8d9a65967dc96df599727d3292a8d9d447709c97") == 0,
+        "checksum sha512: 1000 x 'a'");
+    axl_free(hex);
+}
+
+static void
+test_checksum_sha512_incremental(void)
+{
+    /* A vector that only proves mbedTLS works proves nothing about
+       the adapter. This splits the input MID-BLOCK (100 + 100 with a
+       128-byte block) so the streaming state has to survive a call
+       boundary that is not a block boundary. */
+    uint8_t m200[200];
+    for (size_t i = 0; i < sizeof(m200); i++) {
+        m200[i] = (uint8_t)(i % 251);
+    }
+
+    AxlChecksum *cs = axl_checksum_new(AXL_CHECKSUM_SHA512);
+    test_check(cs != NULL, "checksum sha512 incremental: new");
+    if (cs == NULL) {
+        return;
+    }
+
+    axl_checksum_update(cs, m200, 100);
+    axl_checksum_update(cs, m200 + 100, 100);
+    const char *hex = axl_checksum_get_string(cs);
+    test_check(hex != NULL && axl_strcmp(hex,
+        "986058e9895e2c2ab8f9e8cbdf801db12a44842a56a91d5a4e87b1fc98b29372"
+        "2c4664142e42c3c551ff898646268cd92b84ed230b8c94bed7798d4f27cd7465") == 0,
+        "checksum sha512 incremental: split mid-block matches one-shot");
+
+    /* Reset must re-arm the mbedTLS context, not leave it finalized. */
+    axl_checksum_reset(cs);
+    axl_checksum_update(cs, "abc", 3);
+    hex = axl_checksum_get_string(cs);
+    test_check(hex != NULL && axl_strcmp(hex,
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+        "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f") == 0,
+        "checksum sha512 incremental: reset and reuse");
+
+    axl_checksum_free(cs);
+}
+
+static void
+test_checksum_sha512_digest_bytes(void)
+{
+    uint8_t digest[64];
+
+    int rc = axl_compute_checksum_digest(AXL_CHECKSUM_SHA512, "abc", 3,
+                                         digest, sizeof(digest));
+    test_check(rc == AXL_OK, "checksum sha512 digest: compute ok");
+    test_check(digest[0] == 0xdd && digest[1] == 0xaf && digest[2] == 0x35,
+               "checksum sha512 digest: leading bytes of SHA-512(abc)");
+    test_check(digest[63] == 0x9f,
+               "checksum sha512 digest: final byte of SHA-512(abc)");
+
+    /* A 32-byte buffer is too small for a 64-byte digest: the
+       one-shot helper must refuse rather than truncate. This is the
+       assertion that would catch MAX_DIGEST_LEN being left at 32. */
+    uint8_t small[32];
+    rc = axl_compute_checksum_digest(AXL_CHECKSUM_SHA512, "abc", 3,
+                                     small, sizeof(small));
+    test_check(rc == AXL_ERR,
+               "checksum sha512 digest: refuses a 32-byte buffer");
+}
+
+static void
 test_checksum_incremental(void)
 {
     /* Incremental SHA-1 should match one-shot */
@@ -12065,6 +12170,49 @@ test_checksum_get_digest(void)
     test_check(digest[0] == 0x90, "checksum get_digest: first byte");
 
     axl_checksum_free(cs);
+}
+
+static void
+test_checksum_get_digest_short_buffer(void)
+{
+    /* A caller with a buffer smaller than the digest must be told how
+       many bytes it actually received. Reporting the full digest
+       length while writing fewer bytes invites the caller to read
+       past its own buffer -- which is exactly what axl-hmac.c did. */
+    AxlChecksum *cs = axl_checksum_new(AXL_CHECKSUM_SHA256);
+    test_check(cs != NULL, "get_digest short: new sha256");
+    if (cs == NULL) {
+        return;
+    }
+
+    axl_checksum_update(cs, "abc", 3);
+
+    uint8_t buf[8];
+    size_t  len = sizeof(buf);
+    axl_memset(buf, 0xEE, sizeof(buf));
+    axl_checksum_get_digest(cs, buf, &len);
+
+    test_check(len == 8,
+               "get_digest short: reports 8 bytes written, not 32");
+    /* SHA-256("abc") = ba7816bf 8f01cfea ... -- first 8 bytes pinned. */
+    test_check(buf[0] == 0xba && buf[1] == 0x78 && buf[2] == 0x16 &&
+               buf[3] == 0xbf && buf[4] == 0x8f && buf[5] == 0x01 &&
+               buf[6] == 0xcf && buf[7] == 0xea,
+               "get_digest short: wrote the leading 8 digest bytes");
+
+    axl_checksum_free(cs);
+
+    /* An exactly-sized buffer is unchanged by this fix: still 32. */
+    cs = axl_checksum_new(AXL_CHECKSUM_SHA256);
+    if (cs != NULL) {
+        uint8_t full[32];
+        size_t  flen = sizeof(full);
+        axl_checksum_update(cs, "abc", 3);
+        axl_checksum_get_digest(cs, full, &flen);
+        test_check(flen == 32,
+                   "get_digest short: exact buffer still reports 32");
+        axl_checksum_free(cs);
+    }
 }
 
 static void
@@ -12826,6 +12974,8 @@ test_checksum_type_length(void)
                "checksum type_length: sha1 = 20");
     test_check(axl_checksum_type_get_length(AXL_CHECKSUM_SHA256) == 32,
                "checksum type_length: sha256 = 32");
+    test_check(axl_checksum_type_get_length(AXL_CHECKSUM_SHA512) == 64,
+               "checksum type_length: sha512 = 64");
     test_check(axl_checksum_type_get_length((AxlChecksumType)99) == 0,
                "checksum type_length: unknown = 0");
 }
@@ -13651,16 +13801,156 @@ test_hmac_incremental(void)
     // First two bytes of 750c... are 0x75, 0x0c.
     test_check(md5raw[0] == 0x75 && md5raw[1] == 0x0c, "hmac: MD5 digest bytes");
 
-    // Truncating get_digest: small buffer gets *len bytes, *len reports full.
+    // Truncating get_digest: small buffer gets *len bytes, *len reports
+    // that written count -- not the full digest length.
     AXL_AUTOPTR(AxlHmac) ht = axl_hmac_new(AXL_CHECKSUM_SHA256, "Jefe", 4);
     axl_hmac_update(ht, "what do ya want for nothing?", 28);
     uint8_t small[10];
     axl_memset(small, 0xEE, sizeof(small));
     size_t slen = 10;
     axl_hmac_get_digest(ht, small, &slen);
-    test_check(slen == 32, "hmac: truncated get_digest reports full length 32");
+    test_check(slen == 10, "hmac: truncated get_digest reports 10 bytes written");
     // First 10 bytes of 5bdcc146bf60754e6a04... = 5b dc c1 46 bf 60 75 4e 6a 04.
     test_check(small[0] == 0x5b && small[9] == 0x04, "hmac: truncated get_digest first 10 bytes");
+}
+
+static void
+test_hmac_get_digest_short_buffer(void)
+{
+    /* axl_hmac_get_digest carries the same defect as its AxlChecksum
+       twin, and its docstring spelled it out. Same fix, same
+       assertion. */
+    static const uint8_t k20[20] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+    };
+    AxlHmac *h = axl_hmac_new(AXL_CHECKSUM_SHA256, k20, sizeof(k20));
+    test_check(h != NULL, "hmac get_digest short: new");
+    if (h == NULL) {
+        return;
+    }
+
+    axl_hmac_update(h, "Hi There", 8);
+
+    uint8_t buf[8];
+    size_t  len = sizeof(buf);
+    axl_hmac_get_digest(h, buf, &len);
+
+    test_check(len == 8,
+               "hmac get_digest short: reports 8 bytes written, not 32");
+    /* RFC 4231 TC1 HMAC-SHA-256 = b0344c61 d8db3853 ... */
+    test_check(buf[0] == 0xb0 && buf[1] == 0x34 && buf[2] == 0x4c &&
+               buf[3] == 0x61 && buf[4] == 0xd8 && buf[5] == 0xdb &&
+               buf[6] == 0x38 && buf[7] == 0x53,
+               "hmac get_digest short: wrote the leading 8 MAC bytes");
+
+    axl_hmac_free(h);
+}
+
+static void
+test_hmac_rfc4231_sha256(void)
+{
+    /* RFC 4231 HMAC-SHA-256 vectors. These pass today; they are here
+       so that widening the block/digest handling is provably
+       behaviour-preserving for the algorithms that already worked. */
+    static const uint8_t k20[20] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+    };
+    char *mac = axl_compute_hmac(AXL_CHECKSUM_SHA256, k20, sizeof(k20),
+                                 "Hi There", 8);
+    test_check(mac != NULL && axl_strcmp(mac,
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7") == 0,
+        "hmac rfc4231 sha256: TC1");
+    axl_free(mac);
+
+    mac = axl_compute_hmac(AXL_CHECKSUM_SHA256, "Jefe", 4,
+                           "what do ya want for nothing?", 28);
+    test_check(mac != NULL && axl_strcmp(mac,
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843") == 0,
+        "hmac rfc4231 sha256: TC2");
+    axl_free(mac);
+
+    /* TC6 -- a 131-byte key exceeds the 64-byte block and must be
+       hashed down first (RFC 2104). This is the path that a
+       per-algorithm block size changes, so it must be pinned. */
+    uint8_t k131[131];
+    axl_memset(k131, 0xaa, sizeof(k131));
+    mac = axl_compute_hmac(AXL_CHECKSUM_SHA256, k131, sizeof(k131),
+        "Test Using Larger Than Block-Size Key - Hash Key First", 54);
+    test_check(mac != NULL && axl_strcmp(mac,
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54") == 0,
+        "hmac rfc4231 sha256: TC6 oversized key");
+    axl_free(mac);
+}
+
+static void
+test_hmac_rfc4231_sha512(void)
+{
+    /* RFC 4231 HMAC-SHA-512. SHA-512's block is 128 bytes, so TC6's
+       131-byte key is oversized here TOO -- but only just, which is
+       exactly the case a 64-byte block would get wrong in a way the
+       shorter vectors cannot see. */
+    static const uint8_t k20[20] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+    };
+    char *mac = axl_compute_hmac(AXL_CHECKSUM_SHA512, k20, sizeof(k20),
+                                 "Hi There", 8);
+    test_check(mac != NULL && axl_strcmp(mac,
+        "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde"
+        "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854") == 0,
+        "hmac rfc4231 sha512: TC1");
+    axl_free(mac);
+
+    mac = axl_compute_hmac(AXL_CHECKSUM_SHA512, "Jefe", 4,
+                           "what do ya want for nothing?", 28);
+    test_check(mac != NULL && axl_strcmp(mac,
+        "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554"
+        "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737") == 0,
+        "hmac rfc4231 sha512: TC2");
+    axl_free(mac);
+
+    /* TC3 -- a 50-byte message with a 20-byte key: no oversized-key
+       path, so this isolates the block-size arithmetic itself. A
+       64-byte block here produces a well-formed, wrong MAC. */
+    static const uint8_t kaa[20] = {
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa
+    };
+    uint8_t d50[50];
+    axl_memset(d50, 0xdd, sizeof(d50));
+    mac = axl_compute_hmac(AXL_CHECKSUM_SHA512, kaa, sizeof(kaa),
+                           d50, sizeof(d50));
+    test_check(mac != NULL && axl_strcmp(mac,
+        "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39"
+        "bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb") == 0,
+        "hmac rfc4231 sha512: TC3 block-size arithmetic");
+    axl_free(mac);
+
+    /* TC7 -- 131-byte key AND a 152-byte message, both over the
+       128-byte block. */
+    uint8_t k131[131];
+    axl_memset(k131, 0xaa, sizeof(k131));
+    mac = axl_compute_hmac(AXL_CHECKSUM_SHA512, k131, sizeof(k131),
+        "This is a test using a larger than block-size key and a larger "
+        "than block-size data. The key needs to be hashed before being "
+        "used by the HMAC algorithm.", 152);
+    test_check(mac != NULL && axl_strcmp(mac,
+        "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944"
+        "b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58") == 0,
+        "hmac rfc4231 sha512: TC7 oversized key and data");
+    axl_free(mac);
+}
+
+static void
+test_hmac_rejects_unknown_algorithm(void)
+{
+    /* An algorithm with no known block size must fail closed rather
+       than silently MAC with the wrong block. */
+    AxlHmac *h = axl_hmac_new((AxlChecksumType)99, "k", 1);
+    test_check(h == NULL, "hmac: unknown algorithm returns NULL");
+    axl_hmac_free(h);
 }
 
 // ---------------------------------------------------------------------------
@@ -15462,6 +15752,10 @@ test_data_main(int argc, char **argv)
     test_hmac_rfc_vectors();
     test_hmac_edge_cases();
     test_hmac_incremental();
+    test_hmac_get_digest_short_buffer();
+    test_hmac_rfc4231_sha256();
+    test_hmac_rejects_unknown_algorithm();
+    test_hmac_rfc4231_sha512();
     test_bytes_basic();
     test_bytes_storage_flavors();
     test_bytes_refcount();
@@ -15566,8 +15860,12 @@ test_data_main(int argc, char **argv)
     test_checksum_sha1();
     test_checksum_md5();
     test_checksum_sha256();
+    test_checksum_sha512();
+    test_checksum_sha512_incremental();
+    test_checksum_sha512_digest_bytes();
     test_checksum_incremental();
     test_checksum_get_digest();
+    test_checksum_get_digest_short_buffer();
     test_crc32();
     test_adler32();
     test_compress_roundtrip();

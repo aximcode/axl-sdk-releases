@@ -23,4 +23,36 @@ The full mbedtls LICENSE text is installed alongside this NOTICE at
 `third_party/mbedtls/LICENSE` in binary distributions, and is present
 at `deps/mbedtls/LICENSE` in the source tree.
 
+libaxl.a also statically links the components below. Two of them carry
+obligations that survive redistribution in binary form:
+
+FreeType (ftgrays analytic rasterizer) — Portions of this software are
+copyright (c) The FreeType Project (www.freetype.org). All rights
+reserved. The FreeType License carries a credit clause: a product that
+ships AXL's path-filling APIs (axl_gfx_fill_path and the AxlGfx text /
+vector rendering built on it) must reproduce that acknowledgment in its
+documentation. A product that only enumerates displays does not incur
+it — the GOP-inventory accessors live in a separate translation unit,
+so --gc-sections keeps ftgrays out of a binary that never fills a path.
+One source modification has been made to the vendored ftgrays, marked
+in place with an `AXL fix:` comment; see THIRD_PARTY.md. The FreeType
+License text is installed at `third_party/freetype/FTL.TXT` in binary
+distributions and is present at `deps/freetype/FTL.TXT` in the source
+tree.
+
+libvterm — Copyright (c) 2008 Paul Evans <leonerd@leonerd.org.uk>,
+licensed under the MIT License, which requires that its copyright and
+permission notice accompany all copies or substantial portions of the
+software. The full text is installed at `third_party/libvterm/LICENSE`
+in binary distributions and is present at `deps/libvterm/LICENSE` in
+the source tree. This copy carries eight local modifications; see
+THIRD_PARTY.md and `deps/libvterm/README.md`.
+
+The remaining vendored components impose no attribution obligation on
+redistributed binaries, being public domain or offering a public-domain
+election: the LZMA SDK (Igor Pavlov, public domain), stb_image and
+stb_truetype (Sean Barrett, public domain or MIT at the recipient's
+option), and sdefl / sinfl (Micha Mettke, MIT or the Unlicense at the
+recipient's option). They are listed here for completeness.
+
 See THIRD_PARTY.md for full attribution details.

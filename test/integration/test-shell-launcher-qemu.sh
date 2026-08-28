@@ -25,8 +25,11 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 export TEST_SKIP_RATCHET=1
 
-# The launcher is opt-in (stage_boot_shell defaults to booting the Shell
-# directly); enable it for this test, which exists to validate it.
+# =1 is needed here for the OPPOSITE reason it once was. run-qemu.sh now uses
+# the launcher by default and heals itself when the Shell is not reached, which
+# would turn a real launcher regression into a silent slow-but-green pass. =1
+# means "always, ignore the cached verdict, no fallback", so the failure this
+# test exists to catch stays a failure.
 export AXL_SHELL_LAUNCHER=1
 
 TEST_ARCH="X64"

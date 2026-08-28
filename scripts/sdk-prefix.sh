@@ -13,7 +13,7 @@
 #
 #   out/native-<arch>[-release][-tls]   the BUILD directory. Intermediate
 #                                       objects and images; a function of
-#                                       ARCH x BUILD x AXL_TLS. Ask
+#                                       ARCH x BUILD. Ask
 #                                       scripts/build-prefix.sh.
 #   out/{bin,lib,include,share}         the STAGED SDK. What
 #                                       `install.sh --prefix` produces, what a

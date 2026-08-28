@@ -4,7 +4,7 @@
 /** @file axl-crypto.h
  *
  * Generic public-key signature verification. A detached-signature
- * verifier over the mbedTLS that AXL links when built with AXL_TLS=1.
+ * verifier over the mbedTLS that AXL links in every build.
  *
  * This is a low-level cryptographic primitive — the building block for
  * verifying signed firmware updates, signed configuration blobs, or
@@ -12,9 +12,10 @@
  * ships. There is no signing side: signing is done offline by the
  * vendor and the private key never ships in the binary.
  *
- * Optional — like axl-tls.h, the real implementation requires AXL_TLS=1
- * at build time. Without it, axl_pk_available() returns false and
- * axl_pk_verify() returns AXL_ERR (fail-closed). Use axl_pk_available()
+ * Compiled into every build — mbedTLS is an unconditional dependency.
+ * axl_pk_available() reports whether the layer is present at all (it
+ * is); axl_pk_alg_available() answers the question that can still be
+ * no, which is whether THIS IMAGE linked a given algorithm. Use
  * to distinguish "verification not compiled in" from "signature
  * invalid".
  *
@@ -56,8 +57,8 @@ extern "C" {
  * verifiers, SCRAM proofs); a plain `memcmp` leaks the match length
  * through timing and enables byte-at-a-time forgery.
  *
- * Both buffers MUST be at least @p len bytes. Available in every build
- * (no AXL_TLS required).
+ * Both buffers MUST be at least @p len bytes. Depends on nothing but
+ * the compiler.
  *
  * Length is NOT part of the comparison. For a variable- or
  * attacker-influenced secret (e.g. a session token), the caller MUST
@@ -84,8 +85,9 @@ axl_consttime_equal(
  */
 typedef enum {
     AXL_PK_ED25519    = 0,  /**< Ed25519 — reserved; NOT supported by the
-                                 current mbedTLS build (requires PSA crypto,
-                                 which AXL does not enable). axl_pk_verify()
+                                 current mbedTLS build (mbedTLS has no
+                                 twisted-Edwards curve; see
+                                 axl_pk_alg_available()). axl_pk_verify()
                                  returns AXL_ERR for this algorithm. Because
                                  this is value 0, a zero-initialized selector
                                  fails closed (nothing verifies) — always set
@@ -123,8 +125,12 @@ typedef enum {
 /**
  * @brief Whether public-key signature verification was compiled in.
  *
- * True only when AXL was built with AXL_TLS=1 (which links mbedTLS).
- * When false, axl_pk_verify() always returns AXL_ERR regardless of
+ * Always true: mbedTLS is compiled into every build. Kept because it
+ * is public API and because axl_pk_verify() documents a fail-closed
+ * contract against it. For the question that can still answer no —
+ * whether this image linked a particular algorithm — use
+ * axl_pk_alg_available(). When false, axl_pk_verify() returns AXL_ERR
+ * regardless of
  * input — callers that must fail closed on a missing crypto backend
  * can branch on this to log the distinction.
  *
@@ -185,9 +191,9 @@ axl_pk_verify(
 // an AxlPkKey handle: an opaque private or public key the rest of this
 // section operates on.
 //
-// All of these require an AXL_TLS=1 build (mbedTLS); without it
-// axl_pk_key_new / _load_* return NULL and the operations return AXL_ERR
-// (see axl_pk_available()).
+// These need an algorithm this image actually linked. Where one is
+// absent, axl_pk_key_new / _load_* return NULL and the operations
+// return AXL_ERR (see axl_pk_alg_available()).
 
 /**
  * @brief An opaque public-key key pair (or public-only key).
@@ -246,6 +252,76 @@ axl_pk_key_load_public(
 );
 
 /**
+ * @brief Import a public key from its raw, algorithm-native encoding.
+ *
+ * "Raw" means the encoding the algorithm's own ecosystem uses on the
+ * wire, not a DER container:
+ *
+ * - #AXL_PK_ECDSA_P256 / #AXL_PK_ECDSA_P384 — an uncompressed SEC1
+ *   point, `0x04 || X || Y`: 65 bytes for P-256, 97 for P-384.
+ * - #AXL_PK_ED25519 — the 32-byte compressed point (RFC 8032 §5.1.2).
+ *   **Not supported yet**; see axl_pk_alg_available().
+ * - #AXL_PK_RSA has no meaningful raw form and is always rejected —
+ *   use axl_pk_key_load_public() with DER.
+ *
+ * Use axl_pk_key_load_public() when you have a DER
+ * `SubjectPublicKeyInfo` instead.
+ *
+ * @return a new public-only key handle, or NULL if @a alg has no raw
+ *     form, @a raw is NULL, @a len is wrong for @a alg, the bytes are
+ *     not a valid point, or the algorithm is unavailable in this build.
+ */
+AxlPkKey *
+axl_pk_key_from_raw_public(
+    AxlPkAlg       alg,  ///< algorithm the bytes encode
+    const uint8_t *raw,  ///< raw public key bytes
+    size_t         len   ///< length of @a raw in bytes
+);
+
+/**
+ * @brief Export a public key in its raw, algorithm-native encoding.
+ *
+ * The inverse of axl_pk_key_from_raw_public(), and the same encodings.
+ * Works on a public-only handle and on one that also holds a private
+ * key; only public material is ever written.
+ *
+ * Uses the output-buffer protocol of axl_pk_key_get_private_der(): call
+ * with @a out NULL to learn the required size in @a *len, then again
+ * with a buffer at least that large.
+ *
+ * @return #AXL_OK on success; #AXL_ERR if @a key or @a len is NULL, the
+ *     key's algorithm has no raw form, or @a out is non-NULL and
+ *     @a *len is too small (in which case @a *len is set to the size
+ *     needed).
+ */
+int
+axl_pk_key_get_raw_public(
+    const AxlPkKey *key,  ///< key handle
+    uint8_t        *out,  ///< destination, or NULL to query the size
+    size_t         *len   ///< [in/out] buffer size / bytes written
+);
+
+/**
+ * @brief Whether a public-key algorithm is usable in this image.
+ *
+ * Distinct from axl_pk_available(), which reports whether the
+ * public-key layer is present at all. An algorithm can be absent from
+ * an image that has the layer: #AXL_PK_ED25519 is opt-in at link time,
+ * because its precomputed table is ~30 KB of resident `.rodata` that a
+ * firmware driver should not carry unasked.
+ *
+ * Check this before axl_pk_key_new() when the algorithm is chosen at
+ * runtime — it distinguishes "not linked" from "key generation
+ * failed", which both otherwise surface as NULL.
+ *
+ * @return true if @a alg can be used in this image.
+ */
+bool
+axl_pk_alg_available(
+    AxlPkAlg alg  ///< algorithm to query
+);
+
+/**
  * @brief Serialize a key's private half as PKCS#8 DER.
  *
  * Output-buffer protocol (shared by axl_pk_key_get_public_der and
@@ -301,8 +377,9 @@ axl_pk_key_alg(
 /**
  * @brief Sign a message with a private key.
  *
- * Computes SHA-256(@p msg) and signs it. For ECDSA, @p fmt selects the
- * signature byte layout (#AXL_PK_SIG_RAW for SSH/JWS/COSE,
+ * Hashes @p msg with the digest the key's algorithm specifies (SHA-256
+ * for P-256 and RSA, SHA-384 for P-384) and signs it. For ECDSA, @p fmt
+ * selects the signature byte layout (#AXL_PK_SIG_RAW for SSH/JWS/COSE,
  * #AXL_PK_SIG_DER for X.509-style); for RSA @p fmt is ignored.
  *
  * Uses the output-buffer protocol of axl_pk_key_get_private_der() on
@@ -328,8 +405,9 @@ axl_pk_key_sign(
  * @brief Verify a detached signature with a key handle.
  *
  * The handle-based peer of the raw-bytes axl_pk_verify(): verifies a
- * signature over SHA-256(@p msg) using @p key (private or public). For
- * ECDSA, @p fmt must match how the signature was produced, and for
+ * signature over the digest the key's algorithm specifies (SHA-256 for
+ * P-256 and RSA, SHA-384 for P-384) using @p key (private or public).
+ * For ECDSA, @p fmt must match how the signature was produced, and for
  * #AXL_PK_SIG_RAW @p sig_len must be exactly the curve's r||s size
  * (64 bytes for P-256). For RSA, @p fmt is ignored.
  *
@@ -368,8 +446,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlPkKey, axl_pk_key_free)
 // (key, nonce) pair is ever reused) — typically a counter or random
 // value the caller manages; this API does not generate nonces.
 //
-// Requires an AXL_TLS=1 build (mbedTLS); without it the calls return
-// AXL_ERR (see axl_pk_available()).
+// Compiled into every build (mbedTLS). See axl_pk_available().
 
 /**
  * @brief AEAD algorithm selector.
@@ -455,8 +532,7 @@ axl_aead_open(
 // For an SSH key exchange (ecdh-sha2-nistp256, curve25519-sha256) and
 // any ephemeral-DH handshake.
 //
-// Requires an AXL_TLS=1 build (mbedTLS); without it axl_ecdh_new()
-// returns NULL and the operations return AXL_ERR.
+// Compiled into every build (mbedTLS).
 
 /**
  * @brief ECDH curve selector.
@@ -554,8 +630,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlEcdh, axl_ecdh_free)
 // and decryption are the same operation, so one call serves both. The
 // caller supplies a fresh (key, IV) per stream and never reuses one.
 //
-// Requires an AXL_TLS=1 build (mbedTLS); without it axl_cipher_ctr_new()
-// returns NULL and axl_cipher_ctr_xcrypt() returns AXL_ERR.
+// Compiled into every build (mbedTLS).
 
 #define AXL_CIPHER_CTR_IV_LEN  16u  /**< AES-CTR initial counter block size. */
 

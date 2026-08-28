@@ -11,17 +11,6 @@
 
 #include <axl/axl-crypto.h>
 
-#ifndef AXL_HAVE_TLS
-
-AxlEcdh *axl_ecdh_new(AxlEcdhAlg alg) { (void)alg; return NULL; }
-int axl_ecdh_get_public(AxlEcdh *e, uint8_t *out, size_t *len)
-{ (void)e; (void)out; (void)len; return AXL_ERR; }
-int axl_ecdh_compute(AxlEcdh *e, const uint8_t *peer_pub, size_t peer_len,
-                     uint8_t *out, size_t *len)
-{ (void)e; (void)peer_pub; (void)peer_len; (void)out; (void)len; return AXL_ERR; }
-void axl_ecdh_free(AxlEcdh *e) { (void)e; }
-
-#else /* AXL_HAVE_TLS */
 
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -161,4 +150,3 @@ axl_ecdh_free(AxlEcdh *e)
     }
 }
 
-#endif /* AXL_HAVE_TLS */

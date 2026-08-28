@@ -2,7 +2,7 @@
 # test-meta: arch=x64 needs= est=29 local-only=0
 # test-jose-cc-qemu.sh — dogfood axl-jose through the SDK consumer path.
 #
-# Proves a real consumer can use <axl/axl-jose.h>: stages an AXL_TLS=1 SDK,
+# Proves a real consumer can use <axl/axl-jose.h>: stages an SDK,
 # compiles sdk/examples/jose-demo.c with axl-cc (the packaged toolchain +
 # TLS libaxl.a are the artifact under test), runs it under QEMU, and
 # asserts the end-to-end demo passes — JWT sign/verify with claim policy, a
@@ -25,7 +25,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 # Stage a TLS SDK into a dedicated prefix so it never clobbers the default
 # (non-TLS) out/ SDK other axl-cc tests rely on.
 SDK_PREFIX="$PROJECT_DIR/out/sdk-tls"
-echo "+ AXL_TLS=1 install.sh --arch x64 --prefix $SDK_PREFIX"
+echo "+ install.sh --arch x64 --prefix $SDK_PREFIX"
 # Capture to a file and print the tail, rather than `| tail -1`: a pipeline's
 # exit status is the LAST command's, so `install.sh | tail` reports tail's
 # success and a failed install sails past `set -e`.
@@ -37,7 +37,7 @@ echo "+ AXL_TLS=1 install.sh --arch x64 --prefix $SDK_PREFIX"
 # axl_crypto_rng`, which reads as a library defect rather than a staging
 # failure. Diagnosing that cost more than the fix.
 _inst_log="$(mktemp)"
-if ! AXL_TLS=1 "$PROJECT_DIR/scripts/install.sh" --arch x64 \
+if ! "$PROJECT_DIR/scripts/install.sh" --arch x64 \
         --prefix "$SDK_PREFIX" >"$_inst_log" 2>&1; then
     echo "FAIL: install.sh failed to stage the TLS SDK at $SDK_PREFIX" >&2
     echo "      (everything below would have run against a STALE prefix)" >&2

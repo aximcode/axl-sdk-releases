@@ -672,10 +672,28 @@ find_shell_efi() {
 #
 # Built on demand (like the native fwtool-host in find_shell_efi) so a fresh
 # tree / standalone integration test still gets it without a prior `make all`.
+#
+# AXL_SHELL_LAUNCHER_BIN overrides which binary is staged as the launcher,
+# skipping both the build and the default path. Two uses: staging a launcher
+# built elsewhere (a package layout ships no Makefile, so the on-demand build
+# cannot run), and FAULT INJECTION — the fallback test stages a binary that
+# never chains the Shell, which is the only way to exercise the "firmware does
+# not reach the Shell" path without the firmware that once did it. The MZ check
+# applies to the override too: a non-PE override is no launcher at all, and
+# reporting it as one would move the failure to the guest, where it is a hang
+# instead of an error.
 # --------------------------------------------------------------------------
 find_shell_launcher() {
-    local arch="$1"
+    local arch="$1" build="${2:-build}"
     local scripts_dir project_root native_arch launcher
+    if [[ -n "${AXL_SHELL_LAUNCHER_BIN:-}" ]]; then
+        if [[ -f "$AXL_SHELL_LAUNCHER_BIN" ]] &&
+           head -c2 "$AXL_SHELL_LAUNCHER_BIN" | grep -q "MZ"; then
+            echo "$AXL_SHELL_LAUNCHER_BIN"
+            return 0
+        fi
+        return 1
+    fi
     scripts_dir="$(dirname "${BASH_SOURCE[0]}")"
     project_root="$(cd "$scripts_dir/.." && pwd)"
     native_arch="$(arch_dir "$arch")"
@@ -685,12 +703,84 @@ find_shell_launcher() {
     # an older library — must be rebuilt, not reused. make's own dependency check
     # makes this a no-op when the binary is already fresh. (A stale launcher was
     # the cause of a hang mistaken for the launcher being broken.)
-    make -C "$project_root" ARCH="$native_arch" shell-launcher >/dev/null 2>&1 || true
+    if [[ "$build" == "build" ]]; then
+        make -C "$project_root" ARCH="$native_arch" shell-launcher >/dev/null 2>&1 || true
+    fi
     if [[ -f "$launcher" ]] && head -c2 "$launcher" | grep -q "MZ"; then
         echo "$launcher"
         return 0
     fi
     return 1
+}
+
+# --------------------------------------------------------------------------
+# Shell-launcher negative memo
+#
+# The launcher is ON by default, but it was once observed to hang some
+# firmware: the guest loads BOOTX64.EFI and never reaches the Shell. That
+# firmware is gone from every machine here, so the default cannot be made safe
+# by fixing a fault nobody can reproduce. Instead the default VERIFIES ITSELF
+# on whatever firmware it actually meets: run-qemu.sh notices the Shell was
+# never reached, records a memo here, and retries without the launcher. Later
+# runs read the memo and skip straight to the direct Shell boot.
+#
+# ONLY FAILURES ARE RECORDED, which is what makes the cache safe to trust:
+# working firmware needs no entry and pays nothing, and a stale, unwritable or
+# corrupt memo can only cost the 4.6 s/boot saving — never correctness. (Same
+# shape as glibc's syscall fallbacks, which memoize ENOSYS and never success.)
+#
+# The key covers arch + firmware identity + launcher identity, so a firmware
+# upgrade or a rebuilt launcher earns a fresh attempt rather than inheriting an
+# old verdict. Presence of the file IS the verdict; its content is diagnostics
+# for whoever finds it.
+# --------------------------------------------------------------------------
+
+# shell_launcher_memo_path <arch> <launcher> — print the memo path, or return 1
+# when there is nowhere to cache (no XDG_CACHE_HOME and no HOME). Returning 1
+# disables memoization rather than failing the run: the cost is speed.
+shell_launcher_memo_path() {
+    local arch="$1" launcher="$2" cache_root digest
+    cache_root="${XDG_CACHE_HOME:-}"
+    if [[ -z "$cache_root" ]]; then
+        [[ -n "${HOME:-}" ]] || return 1
+        cache_root="$HOME/.cache"
+    fi
+    # size+mtime, not a content hash: the firmware is ~4 MB and this runs on
+    # every boot. A non-GNU stat degrades to a path-only key (coarser, still
+    # correct) instead of breaking the run.
+    local fw_id launcher_id
+    fw_id="${FW_CODE:-none}:$(stat -c '%s:%Y' "${FW_CODE:-/nonexistent}" 2>/dev/null || echo '?')"
+    launcher_id="$launcher:$(stat -c '%s:%Y' "$launcher" 2>/dev/null || echo '?')"
+    digest=$(printf '%s\n%s\n%s\n' "$arch" "$fw_id" "$launcher_id" \
+             | sha256sum | cut -d' ' -f1)
+    echo "$cache_root/axl-sdk/shell-launcher-blocklist/$digest"
+}
+
+# shell_launcher_memo_present <arch> <launcher> — 0 if this combination is
+# already known not to reach the Shell.
+shell_launcher_memo_present() {
+    local memo
+    memo=$(shell_launcher_memo_path "$1" "$2") || return 1
+    [[ -f "$memo" ]]
+}
+
+# shell_launcher_memo_record <arch> <launcher> — record the negative verdict.
+# Never fatal: a read-only or absent cache home just means the next run pays
+# the same one-time timeout again.
+shell_launcher_memo_record() {
+    local arch="$1" launcher="$2" memo
+    memo=$(shell_launcher_memo_path "$arch" "$launcher") || return 0
+    mkdir -p "$(dirname "$memo")" 2>/dev/null || return 0
+    {
+        echo "# axl-sdk: this firmware did not reach the UEFI Shell through the"
+        echo "# AXL shell launcher, so the launcher is skipped for it. Delete this"
+        echo "# file to try again (a firmware or launcher rebuild retries anyway)."
+        echo "arch=$arch"
+        echo "firmware=${FW_CODE:-unknown}"
+        echo "launcher=$launcher"
+        echo "recorded=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+    } > "$memo" 2>/dev/null || return 0
+    return 0
 }
 
 # --------------------------------------------------------------------------
@@ -706,21 +796,50 @@ find_shell_launcher() {
 # --------------------------------------------------------------------------
 stage_boot_shell() {
     local staging="$1" arch="$2" boot_name="$3" shell_efi="$4"
+    # unset_default: what an unset AXL_SHELL_LAUNCHER means for THIS caller.
+    #   auto — the caller can tell whether the boot reached the Shell and undo
+    #          itself if it did not. Only run-qemu.sh can: it owns the serial
+    #          log and the sentinel.
+    #   off  — the caller has no such oracle, so it must not opt a user into a
+    #          launcher that might not come back. Defaulting to `off` means a
+    #          caller that forgets to pass anything gets the safe answer.
+    local unset_default="${5:-off}"
     mkdir -p "$staging/EFI/BOOT"
-    # Booting the Shell DIRECTLY is the default — it is what every consumer's
-    # ambient-Shell boot has always relied on. The -delay 0 launcher (which skips
-    # the 5 s startup countdown) is OPT-IN via AXL_SHELL_LAUNCHER=1: it has been
-    # observed to hang some firmware (the guest loads \EFI\BOOT\BOOTX64.EFI but
-    # never chains to the Shell), so it must not be the default until that fault
-    # is fixed. When enabled, the launcher is staged as the boot binary with
-    # Shell.efi beside it for its sibling resolution.
+    # The -delay 0 launcher skips the Shell's 5 s startup countdown, worth
+    # ~4.6 s on every guest boot. Where it is the default it is safe because it
+    # is SELF-VERIFYING rather than pre-verified: run-qemu.sh records a negative
+    # memo for any firmware that does not reach the Shell through it, and this
+    # consults that memo. See the memo block above for why only failures are
+    # recorded.
+    #
+    #   unset -> $unset_default (see above)
+    #   0     -> off, always (bisect a suspected launcher fault)
+    #   1     -> on, always: the memo is IGNORED and no fallback happens, so a
+    #            launcher regression stays a loud failure. run-integration.sh
+    #            and test-shell-launcher-qemu.sh depend on that.
+    SHELL_LAUNCHER_STAGED=false
+    SHELL_LAUNCHER_PATH=""
+    local mode="${AXL_SHELL_LAUNCHER:-$unset_default}"
     local launcher=""
-    if [[ "${AXL_SHELL_LAUNCHER:-0}" == "1" ]]; then
-        launcher=$(find_shell_launcher "$arch") || launcher=""
+    if [[ "$mode" != "0" && "$mode" != "off" ]]; then
+        # Build the launcher only when it was explicitly ASKED for. In auto mode
+        # this is an optimization, and a silent multi-minute `make` inside what
+        # looks like a QEMU launch is not one — nor is racing another ad-hoc run
+        # in the same tree. A stale prebuilt launcher is safe here precisely
+        # because auto mode can undo itself.
+        local build="build"
+        [[ "$mode" == "1" ]] || build="nobuild"
+        launcher=$(find_shell_launcher "$arch" "$build") || launcher=""
+        if [[ -n "$launcher" && "$mode" != "1" ]] &&
+           shell_launcher_memo_present "$arch" "$launcher"; then
+            launcher=""
+        fi
     fi
     if [[ -n "$launcher" ]]; then
         cp "$launcher" "$staging/EFI/BOOT/$boot_name"
         cp "$shell_efi" "$staging/EFI/BOOT/Shell.efi"
+        SHELL_LAUNCHER_STAGED=true
+        SHELL_LAUNCHER_PATH="$launcher"
     else
         cp "$shell_efi" "$staging/EFI/BOOT/$boot_name"
     fi

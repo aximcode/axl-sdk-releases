@@ -2,8 +2,8 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-pbkdf2.c
-    PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) layered on the dependency-free
-    AxlHmac engine — works in every build (no AXL_TLS).
+    PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) layered on AxlHmac, which
+    computes using AXL's own SHA-256 implementation.
 
     DK = T_1 ‖ T_2 ‖ ... where T_i = U_1 XOR U_2 XOR ... XOR U_c,
     U_1 = HMAC(P, S ‖ INT32BE(i)), U_k = HMAC(P, U_{k-1}).

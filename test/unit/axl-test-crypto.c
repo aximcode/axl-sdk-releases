@@ -4,19 +4,67 @@
 /** @file axl-test-crypto.c
     Unit tests for axl_pk_verify() (public-key signature verification).
 
-    Two layers:
-      - Argument validation and the fail-closed contract run in every
-        build (the stub returns AXL_ERR without AXL_TLS).
-      - The real ECDSA P-256 verify outcomes (valid / tampered / wrong
-        key) require an AXL_TLS=1 build (mbedTLS). They are guarded by
-        AXL_HAVE_TLS; the non-TLS build asserts the unavailable
-        fail-closed contract instead. Exercise the real path via
-        test/integration/test-pk-verify-qemu.sh (AXL_TLS=1).
+    Argument validation, the fail-closed contract, and the real ECDSA
+    P-256 verify outcomes (valid / tampered / wrong key) all run here.
+
+    They used to be two layers: mbedTLS was optional, so the real
+    outcomes sat behind AXL_HAVE_TLS and a non-TLS build asserted an
+    unavailable-stub contract instead. mbedTLS is unconditional now, so
+    there is one layer and the stub branch is gone.
 **/
 
 #include <axl.h>
 #include "axl-test.h"
 #include "../data/pk-ecdsa-p256-vector.h"
+#include "axl-pk-provider.h"
+
+// ---------------------------------------------------------------------------
+// axl_pk_sig_params_ok() -- the one enforcement point for spec §5's
+// domain-separation rule. Both real call sites (axl_pk_key_sign,
+// axl_pk_key_verify) pass compile-time constants that a compiler can
+// fold to a constant result, so this is the only place that exercises
+// the function with values it cannot see at compile time.
+// ---------------------------------------------------------------------------
+
+/* Route every argument through a volatile round-trip so the compiler
+   cannot treat (mode, ctx, ctx_len) as compile-time constants and fold
+   the whole call to a literal true/false -- which would make this test
+   pass without ever running axl_pk_sig_params_ok()'s logic. */
+static bool
+sig_params_ok_runtime(AxlPkSigMode mode, const void *ctx, size_t ctx_len)
+{
+    volatile AxlPkSigMode v_mode    = mode;
+    const void *volatile  v_ctx     = ctx;
+    volatile size_t       v_ctx_len = ctx_len;
+
+    return axl_pk_sig_params_ok(v_mode, v_ctx, v_ctx_len);
+}
+
+static void
+test_pk_sig_params_ok(void)
+{
+    static const uint8_t some_ctx[1] = { 0x2a };
+
+    /* Pure mode, NULL ctx, len 0 -- the one legal combination. */
+    test_check(sig_params_ok_runtime(AXL_PK_SIG_MODE_PURE, NULL, 0) == true,
+               "sig_params_ok: pure/NULL/0 -> true");
+
+    /* Non-NULL ctx with len 0 -- the ambiguous case three review rounds
+       settled: an ignored context must not silently pass. */
+    test_check(sig_params_ok_runtime(AXL_PK_SIG_MODE_PURE, some_ctx, 0)
+                   == false,
+               "sig_params_ok: pure/non-NULL ctx/len 0 -> false");
+
+    /* NULL ctx with a non-zero length -- there is nothing to read. */
+    test_check(sig_params_ok_runtime(AXL_PK_SIG_MODE_PURE, NULL, 1) == false,
+               "sig_params_ok: pure/NULL ctx/len != 0 -> false");
+
+    /* Non-NULL ctx with a non-zero length -- still refused, because pure
+       mode carries no context at all. */
+    test_check(sig_params_ok_runtime(AXL_PK_SIG_MODE_PURE, some_ctx, 1)
+                   == false,
+               "sig_params_ok: pure/non-NULL ctx/len != 0 -> false");
+}
 
 // ---------------------------------------------------------------------------
 // Argument validation — real in every build (validation precedes mbedTLS).
@@ -76,15 +124,14 @@ test_arg_validation(void)
 }
 
 // ---------------------------------------------------------------------------
-// Cryptographic outcomes — require a real mbedTLS (AXL_TLS=1) build.
+// Cryptographic outcomes, against a real mbedTLS.
 // ---------------------------------------------------------------------------
 
 static void
 test_verify_outcomes(void)
 {
-#ifdef AXL_HAVE_TLS
     test_check(axl_pk_available() == true,
-               "pk_available: true in AXL_TLS build");
+               "pk_available: true");
 
     /* The known-good vector verifies. */
     test_check(axl_pk_verify(AXL_PK_ECDSA_P256,
@@ -137,28 +184,15 @@ test_verify_outcomes(void)
                              pk_msg, pk_msg_len,
                              pk_sig, pk_sig_len) == AXL_ERR,
                "pk_verify: malformed pubkey -> AXL_ERR");
-#else
-    /* Without AXL_TLS, verification is not compiled in: it must fail
-       closed (the building block any consumer relies on for safety). */
-    test_check(axl_pk_available() == false,
-               "pk_available: false without AXL_TLS");
-
-    test_check(axl_pk_verify(AXL_PK_ECDSA_P256,
-                             pk_pub, pk_pub_len,
-                             pk_msg, pk_msg_len,
-                             pk_sig, pk_sig_len) == AXL_ERR,
-               "pk_verify: valid sig -> AXL_ERR (verification not built)");
-#endif /* AXL_HAVE_TLS */
 }
 
 // ---------------------------------------------------------------------------
-// Key handles — keygen, serialize, sign, verify (require AXL_TLS).
+// Key handles — keygen, serialize, sign, verify.
 // ---------------------------------------------------------------------------
 
 static void
 test_key_handle(void)
 {
-#ifdef AXL_HAVE_TLS
     // --- ECDSA P-256: live keygen + sign/verify round-trips ---
     AxlPkKey *k = axl_pk_key_new(AXL_PK_ECDSA_P256);
     test_check(k != NULL, "keygen: ECDSA P-256 -> key");
@@ -301,28 +335,163 @@ test_key_handle(void)
                                     rsig, rl) == AXL_OK,
                "round-trip: generated RSA key signs and verifies");
     axl_pk_key_free(rk);
-#else
-    // Without AXL_TLS the whole key-handle API fails closed.
-    test_check(axl_pk_key_new(AXL_PK_ECDSA_P256) == NULL,
-               "keygen: NULL without AXL_TLS");
-    test_check(axl_pk_key_load_private(pk_rsa3072_pkcs8,
-                                       pk_rsa3072_pkcs8_len) == NULL,
-               "load_private: NULL without AXL_TLS");
-    test_check(axl_pk_key_alg(NULL) == AXL_PK_ED25519,
-               "key_alg: NULL -> reserved zero");
-    uint8_t s[8];
-    size_t  sl = sizeof(s);
-    test_check(axl_pk_key_sign(NULL, pk_msg, pk_msg_len, AXL_PK_SIG_DER,
-                               s, &sl) == AXL_ERR,
-               "sign: NULL key -> AXL_ERR");
-#endif /* AXL_HAVE_TLS */
+}
+
+static void
+test_pk_reserved_alg_fails_closed(void)
+{
+    /* AXL_PK_ED25519 is a valid enumerator with no implementation. It
+       must fail closed at every entry point rather than being quietly
+       treated as P-256 -- md_for_alg and ec_order_bytes are ternaries,
+       so no -Wswitch names them when an algorithm is added. */
+    AxlPkKey *k = axl_pk_key_new(AXL_PK_ED25519);
+    test_check(k == NULL, "pk reserved: key_new(ED25519) returns NULL");
+    axl_pk_key_free(k);
+
+    /* A real P-256 key asked to behave as a reserved algorithm cannot
+       be constructed through the public API, so drive the reserved
+       path through the one-shot verifier, which takes the algorithm
+       as an argument. It returns int (AXL_OK / AXL_ERR), not bool, and
+       is AXL_WARN_UNUSED -- the header documents AXL_PK_ED25519 as
+       returning AXL_ERR, and this is what pins that promise. */
+    static const uint8_t junk[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    test_check(axl_pk_verify(AXL_PK_ED25519, junk, sizeof(junk),
+                             junk, sizeof(junk), junk, sizeof(junk))
+                   == AXL_ERR,
+               "pk reserved: verify(ED25519) refuses");
+
+    /* axl_pk_alg_available reports per-algorithm availability, which
+       is what distinguishes 'not linked' from 'failed'. ECDSA and RSA
+       are always in; Ed25519 is not implemented until E2b. */
+    test_check(axl_pk_alg_available(AXL_PK_ECDSA_P256),
+               "pk reserved: P-256 is available");
+    test_check(axl_pk_alg_available(AXL_PK_RSA),
+               "pk reserved: RSA is available");
+    test_check(!axl_pk_alg_available(AXL_PK_ED25519),
+               "pk reserved: Ed25519 is not available yet");
+}
+
+static void
+test_pk_raw_public_roundtrip(void)
+{
+    /* SEC1 uncompressed is 0x04 || X || Y -- 65 bytes for P-256. A
+       round-trip through a freshly generated key is self-checking
+       without pinning a key we do not control: export, re-import,
+       export again, and require the two exports to be identical. */
+    AxlPkKey *key = axl_pk_key_new(AXL_PK_ECDSA_P256);
+    test_check(key != NULL, "pk raw: keygen P-256");
+    if (key == NULL) {
+        return;
+    }
+
+    size_t need = 0;
+    int rc = axl_pk_key_get_raw_public(key, NULL, &need);
+    test_check(rc == AXL_OK && need == 65,
+               "pk raw: P-256 size query reports 65");
+
+    uint8_t raw[65];
+    size_t  len = sizeof(raw);
+    rc = axl_pk_key_get_raw_public(key, raw, &len);
+    test_check(rc == AXL_OK && len == 65, "pk raw: P-256 export");
+    test_check(raw[0] == 0x04, "pk raw: SEC1 uncompressed tag");
+
+    AxlPkKey *back = axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256, raw, len);
+    test_check(back != NULL, "pk raw: re-import");
+    test_check(back != NULL && axl_pk_key_alg(back) == AXL_PK_ECDSA_P256,
+               "pk raw: re-imported key reports P-256");
+
+    uint8_t raw2[65];
+    size_t  len2 = sizeof(raw2);
+    rc = axl_pk_key_get_raw_public(back, raw2, &len2);
+    test_check(rc == AXL_OK && len2 == 65, "pk raw: re-export");
+    test_check(len2 == 65 && axl_memcmp(raw, raw2, 65) == 0,
+               "pk raw: round-trip is byte-identical");
+
+    axl_pk_key_free(back);
+    axl_pk_key_free(key);
+}
+
+static void
+test_pk_raw_public_rejects(void)
+{
+    static const uint8_t junk[65] = { 0x04 };
+
+    /* RSA has no raw form. */
+    test_check(axl_pk_key_from_raw_public(AXL_PK_RSA, junk, sizeof(junk))
+                   == NULL,
+               "pk raw: RSA has no raw form");
+
+    /* Ed25519 is declared but not implemented until E2b. */
+    test_check(axl_pk_key_from_raw_public(AXL_PK_ED25519, junk, 32) == NULL,
+               "pk raw: Ed25519 not available yet");
+
+    /* Wrong length for the curve. */
+    test_check(axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256, junk, 64)
+                   == NULL,
+               "pk raw: P-256 rejects a 64-byte input");
+    test_check(axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256, junk, 97)
+                   == NULL,
+               "pk raw: P-256 rejects a P-384-sized input");
+
+    /* Right length, wrong leading tag -- 0x02/0x03 is a COMPRESSED
+       point, which this entry point does not accept. Distinguishing
+       'unsupported encoding' from 'bad point' matters: a compressed
+       point is well-formed, just not what we take. */
+    uint8_t compressed[65];
+    axl_memset(compressed, 0, sizeof(compressed));
+    compressed[0] = 0x02;
+    test_check(axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256,
+                                          compressed, 65) == NULL,
+               "pk raw: rejects a compressed-point tag");
+
+    /* Right length and tag, but not on the curve. */
+    uint8_t offcurve[65];
+    axl_memset(offcurve, 0xAB, sizeof(offcurve));
+    offcurve[0] = 0x04;
+    test_check(axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256,
+                                          offcurve, 65) == NULL,
+               "pk raw: rejects a point not on the curve");
+
+    /* NULL guards. */
+    test_check(axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256, NULL, 65)
+                   == NULL,
+               "pk raw: NULL input refused");
+    size_t len = 0;
+    test_check(axl_pk_key_get_raw_public(NULL, NULL, &len) == AXL_ERR,
+               "pk raw: NULL key refused");
+
+    /* RSA has no raw export either -- the flen == 0 rejection on the
+       export side, not just the import side already covered above. */
+    AxlPkKey *rsa = axl_pk_key_load_private(pk_rsa3072_pkcs8,
+                                            pk_rsa3072_pkcs8_len);
+    test_check(rsa != NULL, "pk raw: load RSA key for export-reject check");
+    if (rsa != NULL) {
+        uint8_t rsa_buf[512];
+        size_t  rsa_len = sizeof(rsa_buf);
+        test_check(axl_pk_key_get_raw_public(rsa, rsa_buf, &rsa_len)
+                       == AXL_ERR,
+                   "pk raw: RSA export has no raw form -> AXL_ERR");
+        axl_pk_key_free(rsa);
+    }
+
+    /* Too-small output buffer: AXL_ERR, and *len is set to the size
+       that would have been required, per the size-query protocol. */
+    AxlPkKey *p256 = axl_pk_key_new(AXL_PK_ECDSA_P256);
+    test_check(p256 != NULL, "pk raw: keygen P-256 for too-small check");
+    if (p256 != NULL) {
+        uint8_t small_buf[8];
+        size_t  small_len = sizeof(small_buf);
+        test_check(axl_pk_key_get_raw_public(p256, small_buf, &small_len)
+                       == AXL_ERR && small_len == 65,
+                   "pk raw: too-small buffer -> AXL_ERR + required size");
+        axl_pk_key_free(p256);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// AEAD — AES-GCM and ChaCha20-Poly1305 (require AXL_TLS).
+// AEAD — AES-GCM and ChaCha20-Poly1305.
 // ---------------------------------------------------------------------------
 
-#ifdef AXL_HAVE_TLS
 static bool
 buf_eq(const uint8_t *a, const uint8_t *b, size_t n)
 {
@@ -379,12 +548,10 @@ aead_kat(AxlAeadAlg alg, const char *name,
                              bad_aad, aead_aad_len, ct, n, tag,
                              AXL_AEAD_TAG_LEN, pt) == AXL_ERR, msg);
 }
-#endif /* AXL_HAVE_TLS */
 
 static void
 test_aead(void)
 {
-#ifdef AXL_HAVE_TLS
     aead_kat(AXL_AEAD_AES_256_GCM, "aes256gcm", aead_key32, 32,
              aead_gcm256_ct, aead_gcm256_tag);
     aead_kat(AXL_AEAD_AES_128_GCM, "aes128gcm", aead_key16, 16,
@@ -446,27 +613,15 @@ test_aead(void)
                              aead_nonce, AXL_AEAD_NONCE_LEN, aead_aad,
                              aead_aad_len, aead_pt, n, ct, tag, 8) == AXL_ERR,
                "aead: wrong tag length -> AXL_ERR");
-#else
-    uint8_t ct[8], tag[16];
-    test_check(axl_aead_seal(AXL_AEAD_AES_256_GCM, aead_key32, 32,
-                             aead_nonce, AXL_AEAD_NONCE_LEN, NULL, 0,
-                             aead_pt, 8, ct, tag, 16) == AXL_ERR,
-               "aead: seal fails closed without AXL_TLS");
-    test_check(axl_aead_open(AXL_AEAD_AES_256_GCM, aead_key32, 32,
-                             aead_nonce, AXL_AEAD_NONCE_LEN, NULL, 0,
-                             ct, 8, tag, 16, ct) == AXL_ERR,
-               "aead: open fails closed without AXL_TLS");
-#endif /* AXL_HAVE_TLS */
 }
 
 // ---------------------------------------------------------------------------
-// AES-CTR stream cipher (requires AXL_TLS).
+// AES-CTR stream cipher.
 // ---------------------------------------------------------------------------
 
 static void
 test_cipher(void)
 {
-#ifdef AXL_HAVE_TLS
     size_t n = aead_pt_len;
 
     /* KAT: AES-256-CTR encrypt reproduces the reference ciphertext. */
@@ -521,20 +676,12 @@ test_cipher(void)
     test_check(axl_cipher_ctr_xcrypt(NULL, aead_pt, n, ct) == AXL_ERR,
                "cipher: NULL context -> AXL_ERR");
     axl_cipher_free(NULL);  /* NULL-safe */
-#else
-    uint8_t out[8];
-    test_check(axl_cipher_ctr_new(AXL_CIPHER_AES_256_CTR, ctr_key32, 32, ctr_iv) == NULL,
-               "cipher: new fails closed without AXL_TLS");
-    test_check(axl_cipher_ctr_xcrypt(NULL, aead_pt, 8, out) == AXL_ERR,
-               "cipher: xcrypt fails closed without AXL_TLS");
-#endif /* AXL_HAVE_TLS */
 }
 
 // ---------------------------------------------------------------------------
-// ECDH key agreement (requires AXL_TLS).
+// ECDH key agreement.
 // ---------------------------------------------------------------------------
 
-#ifdef AXL_HAVE_TLS
 /* Two-party agreement for one curve: both sides derive the same secret. */
 static void
 ecdh_agreement(AxlEcdhAlg alg, const char *name, size_t pub_len)
@@ -572,12 +719,10 @@ ecdh_agreement(AxlEcdhAlg alg, const char *name, size_t pub_len)
     axl_ecdh_free(a);
     axl_ecdh_free(b);
 }
-#endif
 
 static void
 test_ecdh(void)
 {
-#ifdef AXL_HAVE_TLS
     ecdh_agreement(AXL_ECDH_P256, "p256", 65);
     ecdh_agreement(AXL_ECDH_X25519, "x25519", 32);
 
@@ -612,14 +757,6 @@ test_ecdh(void)
     test_check(axl_ecdh_get_public(NULL, small, &need) == AXL_ERR,
                "ecdh: get_public NULL context -> AXL_ERR");
     axl_ecdh_free(NULL);  /* NULL-safe */
-#else
-    uint8_t out[32];
-    size_t  n = sizeof(out);
-    test_check(axl_ecdh_new(AXL_ECDH_P256) == NULL,
-               "ecdh: new fails closed without AXL_TLS");
-    test_check(axl_ecdh_get_public(NULL, out, &n) == AXL_ERR,
-               "ecdh: get_public fails closed without AXL_TLS");
-#endif /* AXL_HAVE_TLS */
 }
 
 static int
@@ -630,25 +767,17 @@ test_crypto_main(int argc, char **argv)
 
     test_print_header("AxlCrypto");
 
+    test_pk_sig_params_ok();
     test_arg_validation();
     test_verify_outcomes();
     test_key_handle();
+    test_pk_reserved_alg_fails_closed();
+    test_pk_raw_public_roundtrip();
+    test_pk_raw_public_rejects();
     test_aead();
     test_cipher();
     test_ecdh();
 
-#ifndef AXL_HAVE_TLS
-    /* Each function above still runs without TLS, but only to assert its
-       fail-closed path -- roughly 20 assertions standing in for roughly 87.
-       Name what did not run, so the footer says "SKIPPED" rather than looking
-       like a clean sweep, and so TEST_REQUIRE_TLS=1 can refuse the run. */
-    test_skip("crypto: ECDSA/RSA key handles — keygen, serialize, sign, verify "
-              "(needs AXL_TLS=1)");
-    test_skip("crypto: PK verify known-answer vectors (needs AXL_TLS=1)");
-    test_skip("crypto: AEAD seal/open — AES-GCM, ChaCha20-Poly1305 (needs AXL_TLS=1)");
-    test_skip("crypto: AES-CTR stream cipher (needs AXL_TLS=1)");
-    test_skip("crypto: ECDH key agreement, both curves (needs AXL_TLS=1)");
-#endif
 
     return test_print_results();
 }

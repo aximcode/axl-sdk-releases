@@ -10,7 +10,6 @@
 
 #include <axl/axl-crypto.h>
 
-#ifdef AXL_HAVE_TLS
 
 #include <axl/axl-atexit.h>
 #include "axl-crypto-internal.h"
@@ -61,4 +60,3 @@ axl_crypto_rng(void)
     return &g_rng;
 }
 
-#endif /* AXL_HAVE_TLS */

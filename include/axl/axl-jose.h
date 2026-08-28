@@ -26,9 +26,8 @@
  *     matching public key — so the classic RS256<->HS256 confusion is
  *     structurally impossible.
  *
- * Optional — like axl-tls.h / axl-crypto.h, requires AXL_TLS=1 at build
- * time. Without it axl_jose_available() returns false and every call
- * fails closed.
+ * Compiled into every build, like axl-tls.h and axl-crypto.h — mbedTLS
+ * is an unconditional dependency.
  *
  * @code
  * // SoftBMC-style: verify an ES256 license token against a baked-in key.
@@ -57,10 +56,11 @@ extern "C" {
 #endif
 
 /**
- * @brief Whether the JOSE module is available (built with AXL_TLS=1).
+ * @brief Whether the JOSE module is available.
  *
- * When false, every axl_jws_* / axl_jwt_* / axl_jwk_* call fails closed
- * (AXL_ERR / NULL).
+ * @return always true — JOSE is compiled into every build. Kept as
+ *     public API so a consumer's existing fail-closed branch still
+ *     compiles and still reads correctly.
  *
  * @return true if JOSE operations can run.
  */

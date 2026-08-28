@@ -144,7 +144,7 @@ lint_cached() {
 echo "==> clang-tidy ($CT) over src/ (-n1, parallel)"
 # Mirror ci.yml exactly: per-file (-n1) so path-sensitive analyzer checks are
 # deterministic; exclude the backend + the mbedtls platform shim (compile DB
-# has no AXL_TLS=1). .clang-tidy's WarningsAsErrors makes any finding non-zero.
+# .clang-tidy's WarningsAsErrors makes any finding non-zero.
 mapfile -t _src_tus < <(find src -name '*.c' \
     -not -path '*/backend/*' \
     -not -name 'axl-mbedtls-platform.c' | sort)

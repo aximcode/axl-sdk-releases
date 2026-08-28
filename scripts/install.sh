@@ -207,10 +207,10 @@ if [[ "$PRINT_BUILD_LOCK" == "1" ]]; then
     for arch in "${ARCHES[@]}"; do
         # The SAME query the build uses. An earlier draft of this block spelled
         # the prefix out and appended -tls by hand, and was already wrong by
-        # one suffix against the build ten lines down -- the exact drift this
-        # flag exists to make impossible.
+        # one suffix against the build ten lines down -- which is why this asks
+        # rather than composes, and why dropping the suffix touched nothing here.
         _p="$(make -s -C "$LIBAXL_DIR" ARCH="$arch" BUILD=RELEASE \
-            ${AXL_TLS:+AXL_TLS=$AXL_TLS} print-prefix)"
+            print-prefix)"
         printf '%s\n' "$LIBAXL_DIR/$_p.buildlock"
     done
     exit 0
@@ -321,28 +321,25 @@ for arch in "${ARCHES[@]}"; do
     # flake.
     # ASK for the prefix, never compose it. Passing PREFIX on make's command
     # line OVERRIDES the Makefile's own rule, and this line used to hardcode
-    # "out/native-$arch-release" -- which silently defeated d8ab47ee, the split
-    # that gives an AXL_TLS build its own tree. A TLS install and a non-TLS
-    # install both landed here, and since AXL_TLS is in the build-state
-    # SIGNATURE, each alternation WIPED the other's objects (~300 of them,
-    # measured at the time) and rebuilt from scratch. Concurrently, it does not
-    # merely wipe: it corrupts, which is where "the input file ... is empty"
-    # and a stale staged prefix came from.
+    # "out/native-$arch-release" -- which silently defeated the tree split of
+    # the day and made two configurations wipe each other's objects (~300 at a
+    # time), or, concurrently, corrupt them: "the input file ... is empty" and
+    # a stale staged prefix both came from here. The AXL_TLS half of that split
+    # is gone, but the rule that prevented it is why removing it was safe.
     local_prefix="$(make -s -C "$LIBAXL_DIR" ARCH="$arch" BUILD=RELEASE \
-        ${AXL_TLS:+AXL_TLS=$AXL_TLS} print-prefix)"
+        print-prefix)"
     log_info "Building ($arch, gcc, RELEASE)..."
     # SERIALISED on the build tree, not on install.sh. --prefix says where to
     # STAGE; the build always lands in local_prefix, so two install.sh runs
     # with different prefixes still aim `make -j` at one target set. Under the
     # integration suite that is routine rather than exotic: three tests invoke
-    # install.sh and run-integration.sh exports AXL_TLS=1 for all of them, so
-    # they collide on out/native-<arch>-release-tls. Observed symptoms were a
-    # partial archive and objcopy's "the input file ... is empty"; one such
-    # loss left a test linking against a three-week-old staged prefix and
-    # failing on a missing symbol, which reads as a library defect.
+    # install.sh, so they collide on out/native-<arch>-release. Observed
+    # symptoms were a partial archive and objcopy's "the input file ... is
+    # empty"; one such loss left a test linking against a three-week-old staged
+    # prefix and failing on a missing symbol, which reads as a library defect.
     #
-    # d8ab47ee made the two CONFIGURATIONS independent by putting AXL_TLS in
-    # the prefix. This is the other half: two builds of the SAME configuration.
+    # This guards two builds of the SAME configuration. There is only one
+    # configuration now, which makes the collision MORE likely, not less.
     #
     # The lock is keyed on the tree so unrelated configurations still run in
     # parallel, and it is held only across the build -- staging into distinct
@@ -352,7 +349,6 @@ for arch in "${ARCHES[@]}"; do
     _do_build() {
         make -C "$LIBAXL_DIR" \
             ARCH="$arch" PREFIX="$local_prefix" BUILD=RELEASE \
-            ${AXL_TLS:+AXL_TLS=$AXL_TLS} \
             $( [[ "$BUILD_CPP" == "1" ]] && echo "AXL_CPP=1" ) \
             -j "$(nproc)" 2>&1 | tail -3
     }

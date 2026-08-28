@@ -19,7 +19,7 @@
 # run-qemu.sh's --cpu-report prints. Built on the test-https-driver-qemu.sh
 # harness (reliable connect -r + DHCP networking + host port-forward).
 #
-# Requires: AXL_TLS=1 build. X64-only (AARCH64/TCG has no NIC link).
+# X64-only (AARCH64/TCG has no NIC link).
 # Usage: ./test/integration/test-server-cpu-qemu.sh [--arch X64|AARCH64]
 
 source "$(dirname "$0")/common-test.sh"
@@ -43,7 +43,7 @@ CPU_BUDGET_CORES="0.50"
 
 TEST_BUILD_DIR="$(test_build_dir)"
 make -C "$PROJECT_DIR" \
-    ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests echo-server-sync 2>&1 | tail -3
+    ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests echo-server-sync 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 

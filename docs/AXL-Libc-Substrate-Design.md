@@ -1,8 +1,15 @@
 # AXL on a libc substrate — `axl_*` over POSIX, the way GLib sits on libc
 
-> **Status: DIRECTION AGREED 2026-08-11. PHASED AND COSTED 2026-08-17
-> (§4c, §4d). §2-DECISION replaced P1 the same day; P1', P2 and P3
-> LANDED 2026-08-17; P4-P5 not started.**
+> **Status: COMPLETE 2026-08-17. DIRECTION AGREED 2026-08-11, PHASED AND
+> COSTED 2026-08-17 (§4c, §4d). §2-DECISION replaced P1 the same day;
+> P1', P2, P3, P4 and P5 ALL LANDED 2026-08-17** — P4 is the one C++ link
+> shape (`libaxl-cxx.a` deleted; every C++ link now carries the toolchain's
+> libstdc++/libsupc++), P5 was locale, measured to need nothing.
+>
+> This header read "P4-P5 not started" until 2026-08-21, while `P4-RESULT`
+> and a ✅ P5 row sat ~800 lines below it in this same file. It was cited
+> as a live blocker by ROADMAP's networking-layering item; correcting it
+> released that.
 > Supersedes the framing of `AXL-Newlib-Investigation.md`, which recorded
 > this as "an investigation, not a plan". It is a plan now. The
 > measurements in that document remain valid and are not repeated here.

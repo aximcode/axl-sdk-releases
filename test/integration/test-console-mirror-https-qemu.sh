@@ -10,8 +10,7 @@
 # envelope combined with a blocked StartImage. A 200 from the host curl,
 # returned while the Shell is foreground, is the proof.
 #
-# Builds AXL_TLS=1. Stages a real Shell.efi at the ESP root; SKIP-balances if
-# the runner has none. Requires: AXL_TLS=1 toolchain support.
+# Stages a real Shell.efi at the ESP root; SKIP-balances if the runner has none.
 #
 # Usage: ./test/integration/test-console-mirror-https-qemu.sh [--arch X64|AARCH64]
 
@@ -28,7 +27,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
 make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
@@ -75,7 +74,7 @@ if ! test_wait_for "READY" 60; then
     # No-TLS build is a hard config error, not a SKIP.
     test_clean_log
     if grep -qa "NO_TLS" "$TEST_CLEAN_LOG"; then
-        echo "FAIL: built without AXL_TLS=1"
+        echo "FAIL: built without mbedTLS"
     else
         echo "FAIL: server did not reach READY within 60 seconds"
     fi

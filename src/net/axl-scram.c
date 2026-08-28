@@ -5,8 +5,9 @@
     SCRAM-SHA-256 server and client engines (RFC 5802 / RFC 7677).
 
     Plain SCRAM (gs2 header "n,,", no channel binding). Built on the
-    dependency-free digest/HMAC/PBKDF2/base64/RNG primitives plus the
-    constant-time compare — works in every build (no AXL_TLS).
+    digest/HMAC/PBKDF2/base64/RNG primitives plus the constant-time
+    compare, all of which compute using AXL's own SHA-256
+    implementation.
 **/
 
 #include <axl/axl-scram.h>

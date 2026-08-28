@@ -194,6 +194,40 @@ the same forward-progress guard. Without these, ECAM all-1s reads
 on absent BDFs would feed a synthetic header at offset `0xFC` whose
 `next` byte is `0xFF`, looping forever — see commit 8b90954.
 
+### Slot Capabilities
+
+`axl_pci_read_slot_caps` decodes the Slot Capabilities and Slot
+Status registers inside the PCI Express capability:
+
+```c
+AxlPciSlotCaps caps;
+if (axl_pci_read_slot_caps(addr, &caps) == AXL_OK) {
+    axl_printf("  physical slot %u, %s\n",
+               caps.physical_slot_number,
+               caps.presence_detect ? "occupied" : "empty");
+}
+```
+
+It applies only to a **Root Port or Switch Downstream Port with
+Slot Implemented set**. Anything else — an endpoint, a bridge with
+no slot, a function that does not respond — returns `AXL_ERR` and
+leaves `out` untouched, so "this function has no slot" stays
+distinguishable from "this slot's fields read zero". Do not call it
+expecting a zeroed struct on failure.
+
+**`presence_detect` is the only live field.** Everything else in
+the block is strapped or programmed at build time, including
+`physical_slot_number`. Presence Detect is the hardware's own
+answer to whether something is in the slot right now, which makes
+it the anchor when firmware's other slot descriptions disagree.
+
+`mrl_sensor` (the sensor is present) and `mrl_sensor_closed` (its
+current state) come from different registers and are independent —
+a slot with no MRL sensor reports `mrl_sensor == false`, and
+`mrl_sensor_closed` is then meaningless. The raw Slot Status bit is
+1 when the latch is *open*; the struct field inverts it so both
+booleans read in the same direction.
+
 ## Bridges and topology
 
 `axl_pci_bridge_info` reads the bus-number tuple

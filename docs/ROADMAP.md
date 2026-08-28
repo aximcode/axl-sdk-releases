@@ -21,7 +21,7 @@ Library / SDK foundations:
   2026-08-15; retargeted to 5.0.0 on 2026-08-16.** Replace the 3,579-line
   Makefile with CMake. Decision (CMake over Meson) and the measured port
   surface — the `.efi` pipeline (~180 images per arch), the
-  ARCH x BUILD x AXL_TLS prefix rule, 17 gates, 149 make callers, and why
+  ARCH x BUILD prefix rule, 17 gates, 149 make callers, and why
   `axl-cc` is NOT part of the port.
 
   **NOT 4.0.0, and it is breaking.** The entry used to say "for 4.0.0; we stop
@@ -525,7 +525,7 @@ branch, which is how 3.2.1, 3.2.2 and 3.2.3 shipped — see
 
 **Subsystems (DONE):**
 - **Networking** — TCP/UDP/HTTP server+client/URL/WebSocket/WebDAV; TLS via
-  mbedTLS (`AXL_TLS=1`) incl. `axl_tls_generate_self_signed`; HTTP server
+  mbedTLS incl. `axl_tls_generate_self_signed`; HTTP server
   middleware / static / auth-hook / response-cache / upload-streaming / range.
 - **BMC & platform access** — AxlIpmi (4 transports), AxlSmbus, AxlSpd
   (DDR4/DDR5), AxlAcpi, AxlPci, AxlUsb, AxlBoot, AxlNvstore, AxlMemPhys,
@@ -615,6 +615,220 @@ firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
 - [x] Phase 5 `tools/9p` — one-shot `ls`/`get`/`put`, resident `serve`/`serve-stop` and `mount`/`umount` deploying the embedded `9p-{serve,mount}-dxe.efi` through `AxlService`, plus `status`; `test-9p-tool-qemu.sh` + `test-9p-tool-serve-qemu.sh` gate the launcher on both arches. Pulled Phase 4's deferred `EXDEV` copy-then-unlink fallback into `axl_9p_rename` (bounded: no directories, 32 MiB cap, refuses an existing destination)
 - Deviations from the design doc, recorded in its §12: `--listen-ip`/`--source-ip` not implemented (no library API takes a bind address); `9p` excluded from the busybox multiplexer (it links two embedded driver blobs); the headline `mount -t 9p` proof realized as an equivalent host Python client, with the kernel mount documented as manual and explicitly not claimed as tested
 - Non-goals for v1: 9P-over-TLS, virtio-9p transport, base 9P2000/`.u` dialects, `Tauth`, mount-side read caching
+
+### AxlCrypto — Ed25519 signing/verification — [2026-08-21-ed25519-design.md](superpowers/specs/2026-08-21-ed25519-design.md)
+Fills in `AXL_PK_ED25519`, reserved since `axl-crypto.h` was written because
+mbedTLS 3.6.3 has no twisted-Edwards curve at all — not a config flag away,
+a vendoring project. Phased E1-E5; the fast ref10 implementation costs ~30 KB
+of resident `.rodata`, so it must stay opt-in at link time (a weak-symbol
+seam following `axl-log-dispatch.h`) rather than land in every image.
+- [x] **E1** `AXL_CHECKSUM_SHA512` — a thin adapter over `mbedtls_sha512_*`
+      behind the existing `axl-digest-internal.h` prototypes; `AxlHmac`
+      gained the matching 128-byte block. FIPS 180-4 + RFC 4231 vectors pass
+      both arches. Measured cost: **2,301 B** of mbedTLS in any image
+      touching any checksum algorithm — accepted deliberately, not a
+      regression to chase (spec §3b/§10)
+- [x] **E2a** `AxlPkKey` is a tagged union behind an `AxlPkProvider` vtable,
+      carrying only ECDSA and RSA. It used to *be* an `mbedtls_pk_context`,
+      which Ed25519 cannot be. No behaviour changed — every existing vector
+      passes unchanged, verified by moving ten helpers and both crypto cores
+      byte-identical. Added `axl_pk_key_from_raw_public` /
+      `_get_raw_public` / `axl_pk_alg_available`. **Measured cost: +8,976 B
+      `.text`** on a verify/sign-only consumer, because the provider object
+      holds strong references to all eleven operations and `--gc-sections`
+      can no longer separate keygen and the DER writers from what a consumer
+      calls (spec §10). That is E5's floor and it is the one number worth
+      revisiting before E5 relies on it
+- [ ] **E2b** ref10 vendored + RFC 8410 DER behind the finished seam —
+      **planned, not started**:
+      [2026-08-23-ed25519-e2b-ref10.md](superpowers/plans/2026-08-23-ed25519-e2b-ref10.md).
+      Done when RFC 8032 positive and negative vectors pass. **Parked
+      2026-08-23** — its only consumer is E5, and AxlSsh is itself a
+      five-phase project, so finishing it buys the ability to *start* one
+      rather than a working feature. The plan's grounding is durable: source
+      pinned at openssh-portable `V_10_5_P1` (`b3f73442`), vectors generated
+      against two independent implementations, DER structure established.
+      Nothing is half-built — E2b has zero code, so there is nothing on a
+      branch to rebase
+- [ ] **E3** `check-ed25519-linkage` + the `check-no-avx.py` ADCX/ADOX
+      extension, both proven able to fail
+- [ ] **E4** ADX/BMI2 field backend + aa64 `FEAT_SHA512` detection via
+      `MBEDTLS_SHA512_PROCESS_ALT`. **The ADX half is now an open question**,
+      not a plan: current OpenSSH ships one amalgamated `ed25519.c` with every
+      field operation `static`, so a second field backend cannot be a
+      link-time substitution. Spec §6b records the three options and their
+      costs; §10's own note that the SSH workload is one signature per
+      connection argues that dropping it costs nothing
+- [ ] **E5** Consumed by `AxlSsh` — `AXL_PK_ED25519` host key; unblocks
+      AxlSsh P1 Task 6
+
+### `AxlSsh` — an SSH server, built here, consumed by SoftBMC  *(P1 Tasks 1-5 SHIPPED; Task 6 blocked on Ed25519)*
+Same relationship AxlHttp and AxlTls already have with SoftBMC: the protocol
+lives in axl-sdk, the product consumes it. The lineage argues for it — this
+project began as **TelCon/Netcon**, a *telnet* console server, and telnet is the
+one link in that chain with no confidentiality and no authentication. There is
+no SSH-**server** prior art to port from SoftBMC: its remote-management design
+uses `ssh` only as a client-side `ssh -L` tunnel to the HTTPS API.
+
+**Why not a third-party library — license decides it before architecture does.**
+
+| | license | fits an Apache-2.0 SDK? | architecture |
+|---|---|---|---|
+| **wolfSSH** | **GPLv3** or commercial, and requires wolfSSL/wolfCrypt on the same terms | **NO** | good — embedded-oriented, shell optional |
+| **Dropbear** | MIT + permissive bundles (LibTom, TweetNaCl PD, 2-clause BSD) | yes | **bad** — `fork`/`forkpty`/`select` IS its structure |
+| **libssh** (server-capable) | LGPL-2.1 | poorly — static-only firmware linking makes the relink clause awkward | medium |
+| **AxlSsh** | ours, Apache-2.0 | yes | native `AxlTcp` + `AxlLoop` |
+
+axl-sdk is Apache-2.0 and **every dep LINKED INTO our binaries is permissive** —
+mbedtls Apache, libvterm MIT, freetype FTL, LZMA public domain, stb and sdefl
+public-domain-or-MIT. wolfSSH would be the first GPL code *linked* into an SDK
+that ships `.deb`/`.rpm`, and would relicense the combined work. The distinction
+is linking, not shipping: the tools tarball already carries iPXE's GPL
+`ipxe-all.efidrv` as **mere aggregation** (GPL-2.0 §3), linked into nothing of
+ours. wolfSSH could not be handled that way. Dropbear's licence is fine and its *architecture* is the problem: porting
+it means rewriting `svr-main`, `svr-chansession`, the `select` session loop and
+auth — most of the server — to land somewhere worse-fitting than our own
+primitives. UEFI has no processes; `src/service/README.md` says so outright.
+
+**Most of the crypto is already done and permissively licensed — but not all
+of it, and this table said otherwise until 2026-08-23.** `AxlCrypto` (over
+vendored mbedtls) carries most of what a default `ssh(1)` negotiates:
+
+| SSH needs | AXL has | state |
+|---|---|---|
+| `curve25519-sha256` kex | `AXL_ECDH_X25519` (also `AXL_ECDH_P256`) | ready |
+| `ssh-ed25519` host key | `AXL_PK_ED25519` | **RESERVED, NOT IMPLEMENTED** — mbedTLS has no twisted-Edwards curve at all, so it is a vendoring project. E2b is planned and **parked**; see the Ed25519 track above. `ECDSA_P256/P384` and `RSA` host keys *are* ready |
+| `chacha20-poly1305@openssh.com` | ~~`AXL_AEAD_CHACHA20_POLY1305`~~ | **NOT the same construction.** OpenSSH's is raw ChaCha20 with a two-key split and a separately encrypted length field; ours is the RFC 8439 AEAD. `AxlCrypto` has no entry point for OpenSSH's variant |
+| `aes256-gcm@openssh.com` | `AXL_AEAD_AES_256_GCM` | ready — and it is OpenSSH's own documented fallback, enabled by default, so P1 can negotiate it and skip the row above entirely |
+| transport / event loop | `AxlTcp`, `AxlLoop`, `AXL_SERVICE_DRIVER` | ready |
+
+So the work is **mostly framing and a state machine — plus one real crypto
+dependency (Ed25519) that is planned but parked**. P1's transport phase does
+not need it; P1 Task 6 (key exchange) does, which is where the track currently
+stops.
+
+**The precedent is measured.** `Axl9p` is **4,512 lines for client AND server,
+built in three days** (2026-07-19 → 07-22), on the identical primitives:
+`axl_tcp_listen` / `_accept_async` / `_recv_async` / `_send_async` over
+`AxlLoop`. `AxlTls` is 1,065 lines over vendored mbedtls; AxlHttp's server core
+is 594. Server-only SSH with a narrow algorithm set should sit in the same
+range — call it ~3–4k lines, at a materially higher correctness bar.
+
+**OpenSSH is the conformance oracle.** `ssh(1)` from the host against a QEMU
+guest via `--hostfwd` gives a real second implementation to test against, which
+most of our protocols never get.
+
+Scope for v1 — the non-goals are the security argument, not paperwork:
+- [ ] Server only; **publickey auth ONLY** (no password, no keyboard-interactive)
+- [ ] **One algorithm per slot** (curve25519-sha256 / ssh-ed25519 /
+      chacha20-poly1305). Negotiation is a classic downgrade surface and we do
+      not need the matrix
+- [ ] **No pty and no shell exec** — there is nothing to exec on UEFI anyway. A
+      session channel driving a REGISTERED COMMAND TABLE is simpler and far safer
+- [ ] No port forwarding, no SFTP/SCP subsystem, no agent forwarding
+- [ ] Rekeying is not optional (RFC 4253 wants it by ~1 GB / 1 h): implement it
+      or cap the session and say so
+- [ ] Host key persistence via `AxlNvstore`
+- [ ] **Security review is a GATE, not a phase.** This is network-facing crypto
+      protocol code in firmware, before ExitBootServices, with no OS isolation
+      beneath it. The mitigation is the narrowing above plus the fact that the
+      primitives are audited mbedtls rather than hand-rolled
+
+New protocol work: binary packet protocol (RFC 4253), version exchange, KEXINIT
++ key derivation, userauth publickey (RFC 4252), channels (RFC 4254).
+
+**Spec:** [`superpowers/specs/2026-08-21-axl-ssh-design.md`](superpowers/specs/2026-08-21-axl-ssh-design.md)
+— phased P1-P5, each phase its own plan, following the Axl9p pattern.
+**P1 plan (transport):**
+[`superpowers/plans/2026-08-21-axl-ssh-p1-transport.md`](superpowers/plans/2026-08-21-axl-ssh-p1-transport.md).
+Five of its six tasks are shipped — `src/net/axl-ssh-{buf,packet,kex}.c` and
+`axl-ssh-internal.h`, 90 assertions:
+
+- [x] **Task 1** SSH wire codec, attacker-controlled lengths checked (`2d2cea7a`)
+- [x] **Task 2** version exchange, `AXL_INCOMPLETE` distinct from malformed (`0e978806`)
+- [x] **Task 3** binary packet protocol, both length fields bounded (`3e58042c`)
+- [x] **Task 4** KEXINIT, one algorithm per slot, refusing rather than downgrading (`6c2427a6`)
+- [x] **Task 5** RFC 4253 key derivation, pinned to independently computed bytes (`4c005264`)
+- [ ] **Task 6** key exchange — **BLOCKED on Ed25519 (E2b, parked).** Task 4
+      already advertises `ssh-ed25519` in KEXINIT with nothing behind it, so
+      this is where the track stops. It could instead be unblocked by
+      negotiating an ECDSA host key, which *is* ready — an option worth
+      weighing against finishing E2b, since it needs no vendored crypto
+
+The plan was materially wrong in places and was corrected while implementing:
+a census over its `axl_*`/`AXL_*` tokens found **12 symbols that do not
+exist** (`AxlStrBuf`, `axl_digest_*`, `AXL_INCOMPLETE` — the last was *added*
+to `AxlStatus` as −11 rather than renamed), and it named two registration
+points for a new test binary where there are three. Worth knowing before
+writing P2's plan.
+
+### Persistent-guest test runner — *(proposed 2026-08-21; NOT started)*
+**This does NOT want SSH**, and that separation is deliberate: the harness needs
+a command channel, not an authenticated remote shell. `run-qemu.sh` already has
+every piece (`--background`, `--serial-socket`, `--serial-log`, `--mount`), so
+the transport costs nothing and adds no attack surface. `AxlSsh` above is a
+product feature; this is a test tool. Keep them apart.
+
+**As a speed play this is DEAD — measured, do not re-open it as one.** Profiled
+uncached X64 run, 172 tests / **220 boots** / 3473 s, every test classified by
+whether a shared guest could absorb its boots:
+
+| class | tests | boots | secs |
+|---|---|---|---|
+| **CANDIDATE** (shareable) | 18 | 21 | 198 |
+| isolation-requiring | 86 | 112 | 1908 |
+| **topology-pinned** | 44 | 87 | 1212 |
+| no-boot | 24 | 0 | 155 |
+
+A shared guest absorbing every candidate saves **~140 s of 3473 s = 4.0%**. The
+absurd ceiling — every non-topology boot sharing one guest, pretending isolation
+is free — is 26.6%. The blocker is **topology, not isolation**: 44 tests are
+pinned to a specific machine shape (`--gpu`, `--net`, `--bridges`,
+`--nic-model`, `--cpu`, `--mac`, `--reboot`, `--boot-target`,
+`--screenshot`/`--sendkey`, `--qemu-arg`) and a shared guest has one shape.
+Compare the `AXL_SHELL_LAUNCHER` item above: **29% for one environment
+variable**, against 4% for retrofitting two launch paths.
+
+**As a COVERAGE play it is worth building, and that is the reason to do it.**
+Every test today starts from a virgin image, so *"app B misbehaves only after
+app A ran"* is not merely untested — it is unexpressible in this suite. The
+`test_check_leaks` gate cannot see it either: it asserts at per-binary teardown,
+so a leak that appears only on the third load has nowhere to surface. This tree
+has shipped exactly that class:
+
+- the console-device restore path, where a stale ConSplitter fan-out entry made
+  *the next* `OutputString` jump through a freed vtable and hang
+- `mEventCloseRing`, which exists solely to skip a **second** `CloseEvent` that
+  would `#GP` inside DxeCore
+- the driver image leak; driver ctors registered and never run; the never-freed
+  `AXL_PROTOCOL_NAME_MAX` allocation
+
+Every one was found by hand or by a consumer, never by the suite. 27 tests
+already stage 3+ artifacts into one image, so multi-app images exist; what does
+not exist is **asserting after a sequence**.
+
+**Shape — every part already exists, and there is no guest-side code:**
+`run-qemu.sh --background --serial-socket S --serial-log L --mount <artifacts>`
+boots one guest; a host driver writes `fsN:\app.efi args` to the socket, reads
+to a sentinel, and repeats. The UEFI shell is already the command interpreter.
+`--mount` is what makes it practical — a freshly built `.efi` appears at `fsN:`
+with no disk re-stage and no reboot. `--serial-socket` injection is already
+proven by `test-console-readline-qemu.sh`.
+
+- [ ] **Scope it as ADDITIVE**: a handful of new soak scenarios, migrating
+      nothing. For coverage you add tests; only the (dead) speed goal would have
+      required moving the existing 172.
+- [ ] Assert on **accumulated** state after a sequence — leak report, handle
+      count, protocol registrations, free-memory delta across N load/unload
+      cycles. That is the assertion no current test can make.
+- [ ] **Design against the known failure mode, which this tree already
+      documents**: `test-axl.sh` runs ~40 unit binaries in one boot and
+      "a hang starves every later binary". Per-command timeouts and naming the
+      wedged command are requirements, not polish.
+- [ ] Keep fresh-boot the DEFAULT and the shared guest opt-in per test. A
+      virgin image is what catches state-dependent bugs, and this tree has been
+      bitten repeatedly (stale staged SDK, stale `.efi` surviving a rebuild,
+      `.bss` not zeroed).
 
 ### Local gate wall time — [AXL-CI-Release-Speed-Design.md](AXL-CI-Release-Speed-Design.md) §12
 The pre-commit gate a human waits on is 15m04s, and that document had spent
@@ -714,10 +928,107 @@ never by path.
   locally. CI's ratio is reversed, but by less than this line used to claim:
   re-measured 2026-08-20, the job is **2 m 38 s** of an 813 s run, of which
   `lint.sh` is 77 s — so scoping attacks 77 s, not ~7 min (§9)
-- Deliberately NOT on this list: **making boots cheaper.** At a ~7 s floor it
-  would beat everything above, but `run-qemu.sh` already skips the Boot Manager
-  countdown and ~7 s is close to what an OVMF boot costs. Recorded in §12.12 so
-  it is not re-proposed as an obvious win without a measurement
+- ~~Deliberately NOT on this list: **making boots cheaper.**~~ **RE-OPENED
+  2026-08-21, and it is now the LARGEST measured win available.** The parking
+  note said "`run-qemu.sh` already skips the Boot Manager countdown and ~7 s is
+  close to what an OVMF boot costs" — and then asked that it not be re-proposed
+  "without a measurement". The measurement was never taken, and the premise
+  conflated two different timers: the **Boot Manager** countdown (which is
+  skipped) and the **UEFI Shell's `startup.nsh` skip prompt** (which is not).
+  Every default boot prints `Press ESC in 5…1 seconds` and pays it.
+
+  | | X64 boot | AARCH64 boot | countdown lines |
+  |---|---|---|---|
+  | default | 6.14–6.34 s | 10.77 s | `Press ESC in 5…1` |
+  | `AXL_SHELL_LAUNCHER=1` | **1.48–1.67 s** | **6.13 s** | **0** |
+
+  **~4.6 s per boot, both arches**, app reached correctly and leak report clean
+  in each case. Against the profiled X64 suite (172 tests, **220 boots**,
+  3473 s) that is **~1012 s ≈ 29%** — larger than every other item on this list
+  and larger than the shared-guest idea below by 7x.
+
+  **The mechanism already exists and is already built**: `stage_boot_shell` in
+  `axl-common.sh` stages an AXL launcher that chains the Shell with `-delay 0`.
+  It **was opt-in at the time this was re-opened** (`AXL_SHELL_LAUNCHER=1`,
+  default `0`) for a stated reason — it "has been observed to hang some
+  firmware (the guest loads `\EFI\BOOT\BOOTX64.EFI` but never chains to the
+  Shell)". It is **on by default now**; see the final sub-item.
+
+  - [x] **Diagnosed 2026-08-21, and the answer inverts the premise: THE CODE
+        WAS NEVER THE VARIABLE.** The launcher works at commit `1ae66ccd`
+        itself — the commit that disabled it — verified by building that tree
+        in a worktree and running its own `test-shell-launcher-qemu.sh`, which
+        PASSES. It also works across three OVMF builds, both arches, and a full
+        uncached 172-test suite. The first hypothesis (that `24c6c529`'s
+        double-`FreePool` fix had repaired it) is therefore WRONG: the launcher
+        is fine two days *before* that fix landed.
+
+        What changed is the **machine's firmware**. The custom OVMF of that era
+        is gone from this box — the installed one is distro stock — and the
+        hang's trigger went with it. **So it is not repaired, it is
+        unreproducible**, and the latent risk is real for any other firmware.
+  - [x] **Taken for the SUITE, left alone for consumers** (`run-integration.sh`
+        sets `AXL_SHELL_LAUNCHER=1`; a standalone `run-qemu.sh` is unchanged).
+        The reward is ours, on firmware we test daily; the risk is a consumer's,
+        on firmware we cannot test, and `run-qemu.sh` ships to them in
+        host-tools. Splitting them takes all of the win and none of the risk.
+
+        Measured back-to-back, uncached, one machine, all runs green:
+
+        | arch | OFF | ON | saving |
+        |---|---|---|---|
+        | X64 (172 tests) | 489 s | **368 s** | 121 s = **24.7%** |
+        | AARCH64 (73 tests) | 322 s | **188 s** | 134 s = **41.6%** |
+
+        Combined integration gate **811 s -> 556 s = 31.4%**. The whole suite is
+        now the regression guard, where before it was one opt-in test.
+  - [x] **DONE 2026-08-21 — the CONSUMER default is now ON, and safe because
+        it VERIFIES ITSELF rather than being verified in advance.** The
+        premise of the previous entry ("needs the firmware that hung") assumed
+        safety meant fixing the fault, which needs a repro. It does not: the
+        default can check, on whatever firmware it actually meets, whether the
+        launcher worked — and undo itself when it did not. We never need to
+        know why a given OVMF hangs.
+
+        The oracle already existed and was already emitted on every affected
+        run: the staged `startup.nsh` echoes `___AXL_APP_OUTPUT_BEGIN___`
+        BEFORE the app line, so the sentinel can only be missing when the
+        Shell never ran `startup.nsh` at all — never for an app-level
+        failure. `run-qemu.sh` now records a negative memo against
+        (arch, firmware, launcher) and re-runs itself without the launcher.
+
+        **Only failures are recorded**, which is what makes the cache safe:
+        working firmware needs no entry and pays nothing, and a stale,
+        unwritable or corrupt memo can only cost the saving, never
+        correctness. (Borrowed from glibc's syscall fallbacks, which memoize
+        `ENOSYS` and never success.)
+
+        **Two corrections this measured, both of which had been assumed:**
+
+        - **The stated consumer risk was overstated.** "`run-qemu.sh` ships to
+          them in host-tools" is true, but the package is scripts ONLY — no
+          `axl-shell-launcher.efi`, no Makefile, no `libaxl.a` (zero hits in
+          `release.yml`). `find_shell_launcher` returns 1 in that layout, so
+          packaged consumers could not get the launcher before this change and
+          still cannot. The population affected is source-tree users.
+        - **The failure space has two shapes and only one needed a retry.** A
+          launcher that RETURNS is already self-healed by firmware: BdsDxe
+          falls through to `Boot0002 "EFI Internal Shell"`, which runs
+          `startup.nsh` anyway (measured: run exits 0, sentinel present, user
+          pays only the countdown). A launcher that HANGS never returns
+          control — that is the reported shape, and the one the retry handles.
+
+        **The fault is now reproducible without the firmware**, which is what
+        actually unblocked this: `AXL_SHELL_LAUNCHER_BIN` stages any PE as the
+        launcher, and `kbprobe` (blocks forever in
+        `axl_console_read_key(UINT64_MAX)`) puts the guest in exactly the
+        reported state — loads `BOOTX64.EFI`, never reaches the Shell.
+        `test-shell-launcher-fallback-qemu.sh` asserts the whole contract and
+        was verified by four sabotages, each tripping only its own assertion.
+
+        `AXL_SHELL_LAUNCHER=1` still means "always, no fallback, stay loud",
+        which is what `run-integration.sh` and `test-shell-launcher-qemu.sh`
+        rely on; `=0` still bisects.
 - **Doc rule for this project:** each phase updates §12 with what it MEASURED,
   not what it intended, and ROADMAP ticks only after `verify.sh` and both
   integration arches are green
@@ -772,7 +1083,7 @@ Grouped, terse; **detail lives in the linked design doc or
   | JOSE (`src/net/axl-jose.c`) | HS256/RS256/ES256 all hash the payload | SHA2 | SHA-NI |
   | AES-GCM / AES-CTR | **TLS only, and network-bound** — the least valuable of the set here | AESE + PMULL | AES-NI |
 
-  Load-bearing detail: the core hashing APIs are **not** `AXL_TLS`-gated.
+  Load-bearing detail: the core hashing APIs do not use mbedTLS at all.
   `axl-digest.c`, `axl-digest-sha256.c`, `axl-digest-crc.c`, `axl-hmac.c` and
   `axl-pbkdf2.c` are unconditional in `LIB_SOURCES`, and the SHA-256 round
   constants live in `axl-digest-sha256.c` — this is AXL's own code, not
@@ -984,11 +1295,18 @@ Grouped, terse; **detail lives in the linked design doc or
   design's own acceptance test (§6 step 2), it is RED today, and `verify.sh`
   does not run it (only `run-integration.sh` does), so nothing in the fast loop
   observes either the red or a later regression.
-- **Networking layering — POSIX-shaped substrate (revisit; DEFERRED to the
-  C++/newlib toolchain work, 2026-08-12):** deliberately sequenced AFTER the
-  substrate/toolchain track, which carries its own layering changes (see
+- **Networking layering — POSIX-shaped substrate (revisit; DEFERRAL CLEARED
+  2026-08-21, still NOT scheduled):** it was deferred (2026-08-12) behind the
+  C++/newlib substrate track, which carries its own layering changes (see
   `docs/AXL-Libc-Substrate-Design.md`) — settling both at once avoids two
-  independent refactors of the same boundary disagreeing. Explicitly NOT a
+  independent refactors of the same boundary disagreeing. **That track is
+  COMPLETE** (all of P1'-P5 landed 2026-08-17; its status header said
+  "P4-P5 not started" until 2026-08-21 while its own `P4-RESULT` section and a
+  ✅ P5 row sat 800 lines below, which is why this looked blocked longer than it
+  was). So the gate is open — and the trigger below still has not fired: no
+  consumer needs the veneer. **`AxlSsh` must not become that trigger by
+  accident**: build it on `AxlTcp`/`AxlLoop` as HTTP and 9P are, and this stays
+  a deliberate decision rather than drift. Explicitly NOT a
   prerequisite for the token queues above: `AXL-Tcp-Queue-Design.md` §4 keeps
   the queue free of new public API precisely so it does not prejudge this, and
   the queue fixes the `AXL_BUSY` defect class that this item would not touch.
@@ -1042,13 +1360,18 @@ Grouped, terse; **detail lives in the linked design doc or
   frame deeper than it looks, since a status can be checked by the immediate
   caller and discarded by its caller.
 
-- **`AXL_TLS` gets its own build tree** (2026-08-15) — `PREFIX` now carries a
-  `-tls` suffix. `AXL_TLS` is in the build-state signature, and `test-axl.sh`
-  builds it off while `run-integration.sh` exports it on, so one shared prefix
-  wiped and rebuilt ~300 objects on every alternation (measured 321 one way,
-  270 back; now 0). The Makefile change is one line; the work was the **98
-  hand-composed `out/native-$arch` paths across 66 scripts** that had to start
-  asking `scripts/build-prefix.sh` instead.
+- ~~**`AXL_TLS` gets its own build tree** (2026-08-15)~~ — **SUPERSEDED
+  2026-08-21: the flag is GONE.** `PREFIX` carried a `-tls` suffix because
+  `AXL_TLS` was in the build-state signature and toggling it wiped ~300 objects
+  (measured 321 one way, 270 back). mbedTLS is compiled unconditionally now, so
+  there is one tree and nothing to toggle — measured, `hello.efi` is
+  byte-identical by sha256 across the old non-TLS build, the old TLS build and
+  the new one. See `docs/superpowers/specs/2026-08-21-axl-tls-flag-removal-design.md`.
+
+  What survives is the rule the split forced: **ask `scripts/build-prefix.sh`,
+  never compose `out/native-$arch` by hand.** That was 98 paths across 66
+  scripts when the suffix appeared, and it is why REMOVING the suffix needed no
+  corresponding sweep.
 
 - **`cut-release.sh` refuses a breaking change under a non-major**
   (2026-08-15) — `## Unreleased` is branch-wide state and a release is a commit

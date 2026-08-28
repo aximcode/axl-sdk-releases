@@ -11,7 +11,7 @@ Headers:
 - `<axl/axl-ntree.h>` — N-ary tree (GLib GNode-style hierarchy, public node fields)
 - `<axl/axl-tree.h>` — Balanced sorted map (GLib GTree, AVL; ordered iteration + range queries)
 - `<axl/axl-ring-buf.h>` — Ring buffer (circular byte buffer, zero-copy, overwrite mode)
-- `<axl/axl-digest.h>` — Message digest checksums (MD5, SHA-1, SHA-256) + PBKDF2-HMAC-SHA256 (RFC 8018) + rolling CRC-32 / Adler-32
+- `<axl/axl-digest.h>` — Message digest checksums (MD5, SHA-1, SHA-256, SHA-512) + PBKDF2-HMAC-SHA256 (RFC 8018) + rolling CRC-32 / Adler-32
 - `<axl/axl-compress.h>` — DEFLATE / gzip / zlib / LZMA-alone compression (one-shot + AxlStream filters; LZMA encode+decode backed by the vendored LZMA SDK)
 - `<axl/axl-sidecar.h>` — Common JSON5 sidecar loader (used by
   AxlPciIds / AxlPciClassDb / AxlSpdIds / AxlUsbIds; see its

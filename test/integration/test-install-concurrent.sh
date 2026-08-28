@@ -3,14 +3,14 @@
 # test-install-concurrent.sh — two install.sh runs do not build into one tree
 # at the same time.
 #
-# THE DEFECT. install.sh always builds into out/native-<arch>-release (plus
-# -tls when AXL_TLS is set), REGARDLESS of --prefix: --prefix says where to
-# stage, not where to build. Three integration tests invoke install.sh
-# (test-jose-cc-qemu, test-install-idempotent, test-pkg-deps-minimal) and
-# run-integration.sh exports AXL_TLS=1 suite-wide, so under -j8 all three
-# aim `make -j$(nproc)` at the SAME tree. Two makes writing one target set is
-# not safe: the observed symptoms are a partial archive and
-# "the input file ... is empty" from objcopy.
+# THE DEFECT. install.sh always builds into out/native-<arch>-release,
+# REGARDLESS of --prefix: --prefix says where to stage, not where to build.
+# Three integration tests invoke install.sh (test-jose-cc-qemu,
+# test-install-idempotent, test-pkg-deps-minimal), so under -j8 all three aim
+# `make -j$(nproc)` at the SAME tree. There is now exactly ONE tree -- the
+# AXL_TLS suffix is gone -- which makes that collision MORE likely, not less.
+# Two makes writing one target set is not safe: the observed symptoms are a
+# partial archive and "the input file ... is empty" from objcopy.
 #
 # It is not theoretical and it is not rare enough to ignore: test-jose-cc
 # passed in two suite runs and failed in the third on the same night, on a
@@ -80,30 +80,34 @@ fi
 
 mkdir -p "$(dirname "$LOCKPATH")"
 
-# 1b. A TLS install and a non-TLS install must resolve DIFFERENT trees.
-#     install.sh passes PREFIX on make's command line, which OVERRIDES the
-#     Makefile's own rule -- so hardcoding it here (as this script did) silently
-#     defeated d8ab47ee, the split that gives an AXL_TLS build its own tree.
-#     Both configurations landed in out/native-<arch>-release, and because
-#     AXL_TLS is in the build-state SIGNATURE, each alternation WIPED the
-#     other's objects rather than reusing them.
+# 1b. AXL_TLS must NOT influence the build tree -- INVERTED from what this
+#     once asserted, and kept rather than deleted.
+#
+#     It used to require that a TLS and a non-TLS install resolve DIFFERENT
+#     trees: mbedTLS was optional, AXL_TLS was in the build-state signature,
+#     and each alternation WIPED the other's objects instead of reusing them.
+#     mbedTLS is unconditional now, so there is one tree and one signature.
+#
+#     The assertion is inverted rather than removed because the failure it
+#     guards against is still reachable: a stray AXL_TLS left in someone's
+#     environment -- or a prefix rule that grows a suffix again -- would
+#     silently re-split the tree and resurrect the wipe-and-rebuild cycle this
+#     whole file exists to prevent.
 #
 #     Asserted through the lock path because that is derived from the same
-#     query the build uses, so this cannot pass while the build disagrees.
-#     BOTH states are named explicitly. An earlier version compared the
-#     ambient environment against AXL_TLS=1 and passed standalone while
-#     FAILING in the suite -- run-integration.sh exports AXL_TLS=1 for every
-#     test, so the "non-TLS" side inherited it and both resolved -tls. The
-#     property under test is a property of the two configurations, not of
-#     whatever the caller happened to export.
+#     query the build uses, so it cannot pass while the build disagrees. BOTH
+#     states are still named explicitly: an earlier version compared the
+#     ambient environment against AXL_TLS=1 and passed standalone while FAILING
+#     in the suite, because run-integration.sh exported AXL_TLS=1 for every
+#     test and the "non-TLS" side inherited it.
 notls_lock="$(env -u AXL_TLS "$PROJECT_DIR/scripts/install.sh" \
                --print-build-lock --arch x64 2>/dev/null)"
 tls_lock="$(AXL_TLS=1 "$PROJECT_DIR/scripts/install.sh" --print-build-lock \
              --arch x64 2>/dev/null)"
-if [[ -n "$tls_lock" && -n "$notls_lock" && "$tls_lock" != "$notls_lock" ]]; then
-    pass "TLS and non-TLS installs resolve separate build trees"
+if [[ -n "$tls_lock" && -n "$notls_lock" && "$tls_lock" == "$notls_lock" ]]; then
+    pass "a stray AXL_TLS does not split the build tree ($tls_lock)"
 else
-    fail "TLS and non-TLS installs share a tree ($notls_lock)"
+    fail "AXL_TLS still splits the build tree: '$notls_lock' vs '$tls_lock'"
 fi
 
 # 2. Hold the lock, then start an install and prove it does NOT get past the

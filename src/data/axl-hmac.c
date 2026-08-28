@@ -5,8 +5,9 @@
     HMAC (RFC 2104) over the AxlChecksum digest engine.
 
     HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)), where K' is the
-    key padded to the hash block size (keys longer than the block are
-    hashed first). MD5, SHA-1, and SHA-256 all use a 64-byte block.
+    key padded to the hash's BLOCK size (longer keys are hashed
+    first). MD5, SHA-1 and SHA-256 use a 64-byte block; SHA-512 uses
+    128. The block is a property of the hash, not of its digest width.
 **/
 
 #include <axl/axl-hmac.h>
@@ -14,13 +15,14 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 
-#define HMAC_BLOCK      64   // block size of MD5/SHA-1/SHA-256
-#define HMAC_MAX_DIGEST 32   // SHA-256 is the widest supported digest
+#define HMAC_MAX_BLOCK  128  // SHA-512's block; MD5/SHA-1/SHA-256 use 64
+#define HMAC_MAX_DIGEST 64   // SHA-512 is the widest supported digest
 
 struct AxlHmac {
     AxlChecksumType type;
     AxlChecksum    *inner;                     // H((K^ipad) || message)
-    uint8_t         opad[HMAC_BLOCK];          // K ^ opad, applied at finalize
+    size_t          block;                     // block size for `type`
+    uint8_t         opad[HMAC_MAX_BLOCK];      // K ^ opad, applied at finalize
     bool            finalized;
     uint8_t         digest[HMAC_MAX_DIGEST];   // cached result bytes
     size_t          digest_len;                // 0 after a failed finalize
@@ -37,6 +39,28 @@ secure_zero(void *p, size_t n)
     while (n-- > 0) {
         *v++ = 0;
     }
+}
+
+// HMAC's block size is the *hash's* block, not its digest width, and
+// the two do not track each other: SHA-512 has a 64-byte digest and a
+// 128-byte block. Returns 0 for an algorithm we cannot MAC with, which
+// axl_hmac_new turns into a NULL -- failing closed beats MACing with
+// the wrong block and producing a plausible, wrong answer.
+static size_t
+hmac_block_size(AxlChecksumType type)
+{
+    switch (type) {
+    case AXL_CHECKSUM_MD5:
+    case AXL_CHECKSUM_SHA1:
+    case AXL_CHECKSUM_SHA256:
+        return 64;
+    case AXL_CHECKSUM_SHA512:
+        return 128;
+    }
+    // No default: label -- an out-of-range cast falls through to this
+    // return, but a fifth enumerator left unhandled here fails the
+    // build with -Wswitch instead of silently returning 0 for it.
+    return 0;
 }
 
 static void
@@ -62,7 +86,7 @@ hmac_finalize(AxlHmac *h)
     }
 
     axl_checksum_get_digest(h->inner, idig, &ilen);
-    axl_checksum_update(outer, h->opad, HMAC_BLOCK);
+    axl_checksum_update(outer, h->opad, h->block);
     axl_checksum_update(outer, idig, ilen);
 
     size_t dlen = sizeof(h->digest);
@@ -80,11 +104,12 @@ hmac_finalize(AxlHmac *h)
 AxlHmac *
 axl_hmac_new(AxlChecksumType type, const void *key, size_t key_len)
 {
-    uint8_t  k[HMAC_BLOCK];
-    uint8_t  ipad[HMAC_BLOCK];
+    uint8_t  k[HMAC_MAX_BLOCK];
+    uint8_t  ipad[HMAC_MAX_BLOCK];
     AxlHmac *h;
 
-    if (axl_checksum_type_get_length(type) == 0) {
+    size_t block = hmac_block_size(type);
+    if (block == 0) {
         return NULL;  // unsupported algorithm
     }
     if (key == NULL && key_len > 0) {
@@ -94,14 +119,14 @@ axl_hmac_new(AxlChecksumType type, const void *key, size_t key_len)
     // K' = key padded to the block with zeros; keys longer than the
     // block are hashed down first (RFC 2104).
     axl_memset(k, 0, sizeof(k));
-    if (key_len > HMAC_BLOCK) {
+    if (key_len > block) {
         AxlChecksum *kc = axl_checksum_new(type);
-        size_t       klen = sizeof(k);
+        size_t       klen = block;
         if (kc == NULL) {
             return NULL;
         }
         axl_checksum_update(kc, key, key_len);
-        axl_checksum_get_digest(kc, k, &klen);  // writes digest_len bytes; rest stay 0
+        axl_checksum_get_digest(kc, k, &klen);  // writes klen bytes; rest stay 0
         axl_checksum_free(kc);
     } else if (key_len > 0) {
         axl_memcpy(k, key, key_len);
@@ -113,6 +138,7 @@ axl_hmac_new(AxlChecksumType type, const void *key, size_t key_len)
         return NULL;
     }
     h->type  = type;
+    h->block = block;
     h->inner = axl_checksum_new(type);
     if (h->inner == NULL) {
         secure_zero(k, sizeof(k));
@@ -120,11 +146,11 @@ axl_hmac_new(AxlChecksumType type, const void *key, size_t key_len)
         return NULL;
     }
 
-    for (size_t i = 0; i < HMAC_BLOCK; i++) {
+    for (size_t i = 0; i < block; i++) {
         ipad[i]    = k[i] ^ 0x36;
         h->opad[i] = k[i] ^ 0x5C;
     }
-    axl_checksum_update(h->inner, ipad, HMAC_BLOCK);
+    axl_checksum_update(h->inner, ipad, block);
 
     // Scrub the key-derived stack material — the pads reveal the key.
     secure_zero(k, sizeof(k));
@@ -162,7 +188,12 @@ axl_hmac_get_digest(AxlHmac *h, uint8_t *buf, size_t *len)
 
     size_t n = (*len < h->digest_len) ? *len : h->digest_len;
     axl_memcpy(buf, h->digest, n);
-    *len = h->digest_len;  // 0 signals a failed (OOM) finalize
+    /* Report what was WRITTEN -- same reasoning as
+       axl_checksum_get_digest(). Note *len == 0 remains the
+       failed-finalize signal: a successful call with a zero-size
+       buffer also reports 0, which is degenerate and which no caller
+       does. */
+    *len = n;
 }
 
 void

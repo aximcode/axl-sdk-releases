@@ -4,7 +4,7 @@
 /** @file http-plain-selftest.c
     Plain-HTTP-only client fixture. References the HTTP client but NEVER TLS.
 
-    Built with AXL_TLS=1, the resulting binary must contain NO mbedTLS — that
+    libaxl always contains mbedTLS; this binary must contain NONE of it — that
     is the test (see test-tls-strippable.sh): it proves the client's TLS path
     is reachable only through the ops indirection (axl-http-client-tls.h), so a
     consumer that never calls axl_tls_init() lets --gc-sections drop mbedTLS.

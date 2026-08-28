@@ -52,6 +52,7 @@ typedef enum {
     AXL_NO_RESOURCES = -8,  ///< out of memory / handles / capacity
     AXL_IO_ERROR     = -9,  ///< underlying device / transport I/O failure
     AXL_BUSY         = -10, ///< resource temporarily unavailable (e.g. a prior async op still in flight) — retry later
+    AXL_INCOMPLETE   = -11, ///< input ended mid-item: well-formed so far, but more bytes are needed to decide
 } AxlStatus;
 
 // ---------------------------------------------------------------------------

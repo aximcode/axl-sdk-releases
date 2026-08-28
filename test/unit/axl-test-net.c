@@ -2753,7 +2753,7 @@ static int
 run_serve_tls_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         return -1;
     }
 
@@ -2825,7 +2825,7 @@ static int
 run_serve_tls_driver_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         return -1;
     }
 
@@ -2899,7 +2899,7 @@ static int
 run_serve_tls_ws_driver_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         return -1;
     }
 
@@ -3003,7 +3003,7 @@ static int
 run_serve_tls_ws_close_pendtx_driver_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         return -1;
     }
 
@@ -3080,7 +3080,7 @@ static int
 run_serve_hazard_driver_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         return -1;
     }
 
@@ -3292,7 +3292,7 @@ static int
 run_serve_tls_shell_coexist_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         axl_printf("NO_TLS\n");
         return -1;
     }
@@ -4048,7 +4048,7 @@ run_serve_davfs_common(bool tls)
     size_t  cert_len = 0, key_len = 0;
     if (tls) {
         if (!axl_tls_available()) {
-            axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+            axl_printf("ERROR: TLS not available\n");
             return -1;
         }
         if (axl_tls_init() != AXL_OK) {
@@ -4154,7 +4154,7 @@ static int
 run_serve_multi_tls_mode(void)
 {
     if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("ERROR: TLS not available\n");
         return -1;
     }
     axl_net_auto_init(SIZE_MAX, 10);
@@ -6049,7 +6049,7 @@ run_http_async_mode(const char *method, const char *url, const char *body)
     bool https = axl_strncmp(url, "https://", 8) == 0;
     if (https) {
         if (!axl_tls_available() || axl_tls_init() != AXL_OK) {
-            axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+            axl_printf("ERROR: TLS not available\n");
             return 1;
         }
     }
@@ -6174,7 +6174,7 @@ run_get_size_mode(const char *url)
 
     if (axl_strncmp(url, "https://", 8) == 0) {
         if (!axl_tls_available() || axl_tls_init() != AXL_OK) {
-            axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+            axl_printf("ERROR: TLS not available\n");
             return 1;
         }
     }

@@ -969,7 +969,7 @@ req_begin_hop(HttpAsyncReq *req)
     req_drop_connection(req);
 
     if (req->https && tls_ops() == NULL) {
-        axl_error("https requires axl_tls_init() at startup (build AXL_TLS=1)");
+        axl_error("https requires axl_tls_init() at startup");
         req_fail(req, AXL_ERR);
         return;
     }

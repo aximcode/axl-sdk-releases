@@ -6,9 +6,9 @@
 # or for producing packages on machines that can't reach GitHub
 # Actions.
 #
-# The library is built with TLS (mbedtls) compiled in — matches CI.
-# Users who want a smaller libaxl.a can run scripts/install.sh
-# directly with AXL_TLS=0.
+# The library is built with mbedtls compiled in, which is now the only
+# configuration: --gc-sections keeps it out of any binary that does not
+# reference axl_tls_*, so there is nothing to opt out of.
 #
 # Usage:
 #   ./scripts/build-packages.sh                 # default
@@ -35,7 +35,6 @@ source "$SCRIPT_DIR/axl-common.sh"
 PKG_NAME="axl-sdk"
 PKG_VERSION=$(cat "$PROJECT_ROOT/VERSION")
 OUTDIR="$PROJECT_ROOT/out/packages"
-TLS_ENV="1"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -74,10 +73,10 @@ STAGE=$(mktemp -d -t axl-pkg-stage-XXXXXX)
 VERIFY=$(mktemp -d -t axl-pkg-verify-XXXXXX)
 trap 'rm -rf "$STAGE" "$VERIFY"' EXIT
 
-log_info "Building $PKG_NAME $PKG_VERSION (with TLS / mbedtls)"
+log_info "Building $PKG_NAME $PKG_VERSION (mbedtls included)"
 log_info "Staging SDK tree under $STAGE/usr ..."
 
-AXL_TLS="$TLS_ENV" "$SCRIPT_DIR/install.sh" \
+"$SCRIPT_DIR/install.sh" \
     --arch all --prefix "$STAGE/usr" > /dev/null
 
 mkdir -p "$STAGE/usr/share/doc/axl-sdk"
@@ -90,14 +89,44 @@ find "$STAGE/usr/share/doc/axl-sdk/examples" -type f \
     ! -name '*.md' ! -name 'CMakeLists.txt' \
     -delete
 
+# NOTICE ships too: Apache-2.0 4(d) requires a distribution that
+# includes a NOTICE file to carry its attribution notices into
+# derivative works, and NOTICE is where the FreeType credit clause and
+# the libvterm MIT notice are stated. The host-tools tarball already
+# shipped it; this package did not.
 cp "$PROJECT_ROOT/CHANGELOG.md" "$PROJECT_ROOT/README.md" \
-   "$PROJECT_ROOT/LICENSE" "$PROJECT_ROOT/THIRD_PARTY.md" \
+   "$PROJECT_ROOT/LICENSE" "$PROJECT_ROOT/NOTICE" \
+   "$PROJECT_ROOT/THIRD_PARTY.md" \
    "$STAGE/usr/share/doc/axl-sdk/"
 # mbedtls is statically linked into libaxl.a; Apache-2.0 §4(a)
 # requires the LICENSE be carried with any binary redistribution.
 mkdir -p "$STAGE/usr/share/doc/axl-sdk/third_party/mbedtls"
 cp "$PROJECT_ROOT/deps/mbedtls/LICENSE" \
    "$STAGE/usr/share/doc/axl-sdk/third_party/mbedtls/"
+# DejaVu Sans subset ships inside libaxl.a (axl_ttf_default); the
+# Bitstream Vera license requires its notice accompany any binary
+# redistribution. release.yml staged this and this script did not --
+# the two package paths had drifted.
+mkdir -p "$STAGE/usr/share/doc/axl-sdk/third_party/dejavu"
+cp "$PROJECT_ROOT/third_party/dejavu/LICENSE" \
+   "$STAGE/usr/share/doc/axl-sdk/third_party/dejavu/"
+# libvterm is statically linked into libaxl.a (AxlVterm) and is MIT,
+# which requires its copyright and permission notice accompany "all
+# copies or substantial portions of the Software". Unlike stb/sdefl/LZMA
+# it offers no public-domain election, so this one is an obligation, not
+# documentation.
+mkdir -p "$STAGE/usr/share/doc/axl-sdk/third_party/libvterm"
+cp "$PROJECT_ROOT/deps/libvterm/LICENSE" \
+   "$STAGE/usr/share/doc/axl-sdk/third_party/libvterm/"
+# FreeType's ftgrays is compiled into every libaxl.a. The FTL carries a
+# CREDIT clause -- a product shipping the path-filling APIs must
+# acknowledge FreeType in its documentation -- so carry both licence
+# files. FTL.TXT is the FreeType License proper; LICENSE.TXT is the
+# dual-licence statement naming it and GPLv2.
+mkdir -p "$STAGE/usr/share/doc/axl-sdk/third_party/freetype"
+cp "$PROJECT_ROOT/deps/freetype/FTL.TXT" \
+   "$PROJECT_ROOT/deps/freetype/LICENSE.TXT" \
+   "$STAGE/usr/share/doc/axl-sdk/third_party/freetype/"
 # RamDiskDxe.efi (BSD-2-Clause-Patent) is embedded into mkrd.efi —
 # carry its LICENSE/README too. Doesn't affect libaxl.a, only the
 # tools tarball, but the SDK package documents the full third-party
@@ -199,10 +228,10 @@ for arch in x64 aa64; do
     # `make tools` alone doesn't bring in the CRT0 / reloc /
     # debug-info objects the tool .efi links against; build `all`
     # first so those exist.
-    make -C "$PROJECT_ROOT" ARCH="$arch" BUILD=RELEASE AXL_TLS=1 all tools > /dev/null
+    make -C "$PROJECT_ROOT" ARCH="$arch" BUILD=RELEASE all tools > /dev/null
     # Each BUILD has its own output tree, so ask make where this one landed
     # rather than duplicating the naming rule.
-    arch_prefix=$(make -C "$PROJECT_ROOT" -s ARCH="$arch" BUILD=RELEASE AXL_TLS=1 print-prefix)
+    arch_prefix=$(make -C "$PROJECT_ROOT" -s ARCH="$arch" BUILD=RELEASE print-prefix)
 
     TOOLS_STAGE=$(mktemp -d -t axl-tools-XXXXXX)
     cp "$PROJECT_ROOT/$arch_prefix/tools/"*.efi "$TOOLS_STAGE/"

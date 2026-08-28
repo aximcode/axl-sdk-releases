@@ -12,39 +12,6 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 
-#ifndef AXL_HAVE_TLS
-
-// ===================================================================
-// Stub implementations (TLS not compiled in)
-// ===================================================================
-
-bool axl_tls_available(void) { return false; }
-int  axl_tls_init(void) { return AXL_ERR; }
-void axl_tls_cleanup(void) {}
-int  axl_tls_generate_self_signed(const char *cn,
-    const AxlIPv4Address *ips, size_t ip_count,
-    void **cert, size_t *cert_len, void **key, size_t *key_len)
-{ (void)cn;(void)ips;(void)ip_count;(void)cert;(void)cert_len;(void)key;(void)key_len; return AXL_ERR; }
-int  axl_tls_server_set_cert(const void *c, size_t cl, const void *k, size_t kl)
-{ (void)c;(void)cl;(void)k;(void)kl; return AXL_ERR; }
-AxlTlsContext *axl_tls_accept(AxlTcp *s) { (void)s; return NULL; }
-AxlTlsContext *axl_tls_connect(AxlTcp *s, const char *h) { (void)s;(void)h; return NULL; }
-AxlTlsStatus axl_tls_handshake(AxlTlsContext *c) { (void)c; return AXL_TLS_ERR; }
-AxlTlsStatus axl_tls_handshake_async(AxlTlsContext *c, AxlLoop *l)
-{ (void)c; (void)l; return AXL_TLS_ERR; }
-AxlTlsStatus axl_tls_read(AxlTlsContext *c, void *b, size_t s, size_t *o)
-{ (void)c;(void)b;(void)s;(void)o; return AXL_TLS_ERR; }
-int  axl_tls_write(AxlTlsContext *c, const void *d, size_t l)
-{ (void)c;(void)d;(void)l; return AXL_ERR; }
-int  axl_tls_write_async(AxlTlsContext *c, const void *d, size_t l,
-    AxlLoop *loop, AxlTcpCallback cb, void *data)
-{ (void)c;(void)d;(void)l;(void)loop;(void)cb;(void)data; return AXL_ERR; }
-void axl_tls_free(AxlTlsContext *c) { (void)c; }
-void axl_tls_stage_data(AxlTlsContext *c, const void *d, size_t l)
-{ (void)c;(void)d;(void)l; }
-bool axl_tls_pending(AxlTlsContext *c) { (void)c; return false; }
-
-#else /* AXL_HAVE_TLS */
 
 // ===================================================================
 // Full TLS implementation via mbedTLS
@@ -1062,4 +1029,3 @@ axl_tls_pending(
         || mbedtls_ssl_get_bytes_avail(&ctx->ssl) > 0;
 }
 
-#endif /* AXL_HAVE_TLS */

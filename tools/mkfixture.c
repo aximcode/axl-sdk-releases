@@ -327,7 +327,7 @@ fixture_finish(
        redirect (the client's TLS path is otherwise strippable — see
        axl-http-client-tls.h). Bail only when the dest is already https. */
     if (axl_tls_init() != AXL_OK && axl_strncmp(dest, "https://", 8) == 0) {
-        axl_printerr("mkfixture: https dest needs an AXL_TLS=1 build\n");
+        axl_printerr("mkfixture: https dest needs TLS; axl_tls_init() failed\n");
         axl_free(gz);
         return -1;
     }

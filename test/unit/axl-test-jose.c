@@ -4,14 +4,13 @@
 /** @file axl-test-jose.c
     Unit tests for axl-jose (JWS / JWT / JWK).
 
-    Two layers, mirroring axl-test-crypto.c:
-      - Allow-list / argument validation runs in every build: those checks
-        precede any crypto, and the non-TLS build fails them closed anyway.
-      - The real signing/verification outcomes (KATs, round-trips, the
-        rejection matrix, JWT claims, JWK parse/export) require an
-        AXL_TLS=1 build and are guarded by AXL_HAVE_TLS. The non-TLS build
-        asserts the fail-closed contract instead. Exercise the real path
-        via test/integration/test-jose-qemu.sh (AXL_TLS=1).
+    Allow-list / argument validation and the real signing and
+    verification outcomes (KATs, round-trips, the rejection matrix, JWT
+    claims, JWK parse/export) all run here.
+
+    They used to be two layers, mirroring axl-test-crypto.c: the real
+    outcomes needed an AXL_TLS=1 build and sat behind AXL_HAVE_TLS.
+    mbedTLS is unconditional now, so there is one layer.
 
     The ES256 (RFC 7515 A.3) and HS256 (RFC 7515 A.1) verification KATs are
     cross-checked against an independent implementation before embedding,
@@ -25,7 +24,6 @@
 // RFC 7515 known-answer vectors.
 // ---------------------------------------------------------------------------
 
-#ifdef AXL_HAVE_TLS
 /* A.1 / A.3 share this payload (base64url decodes to the bytes below,
    CRLF and all). Only the TLS build verifies against it. */
 static const char RFC7515_PAYLOAD[] =
@@ -42,7 +40,6 @@ static const char A1_HS256_TOKEN[] =
 static const char A1_HS256_KEY_B64URL[] =
     "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0i"
     "PS4hcgUuTwjAzZr1Z9CAow";
-#endif /* AXL_HAVE_TLS */
 
 /* A.3 — ES256 (P-256). Referenced in both builds (the TLS build verifies
    it; the non-TLS build asserts the call fails closed). */
@@ -60,7 +57,6 @@ static const char A3_ES256_JWK[] =
     "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
     "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
 
-#ifdef AXL_HAVE_TLS
 /* A.3 `x` with a `y` of 32 zero bytes — a valid 43-char base64url
    coordinate, but (x, 0) is not on P-256, so curve-membership validation
    must reject it. */
@@ -101,7 +97,6 @@ static const char PS256_JWK[] =
     "Y84Bngf6nmTxi9SwVj21fTkyD1uXQH-pwWiV31fbUYunQdBCTk-wXiM_ecPOL2E1"
     "n0pgnjGmTIo6CxYAn6_VQju6H1s57OFqdLdlh2ud-Zq4Z7_B3laa_707bzQhYf8b"
     "bcDrzpek0dBFPUrg7aya4Q\"}";
-#endif /* AXL_HAVE_TLS */
 
 // ---------------------------------------------------------------------------
 // Allow-list / argument validation — holds in every build.
@@ -141,7 +136,6 @@ test_jose_argval(void)
                "jws_sign: NULL token_out -> AXL_ERR");
 }
 
-#ifdef AXL_HAVE_TLS
 
 // ---------------------------------------------------------------------------
 // Helpers.
@@ -171,7 +165,7 @@ static void
 test_jws_kat(void)
 {
     test_check(axl_jose_available() == true,
-               "jose_available: true in AXL_TLS build");
+               "jose_available: true");
 
     /* ---- A.3 ES256: verify against the JWK-parsed public key. ---- */
     AxlJoseAlg alg_out = (AxlJoseAlg)0;
@@ -985,39 +979,6 @@ test_jwk(void)
     }
 }
 
-#else  /* AXL_HAVE_TLS */
-
-static void
-test_jose_fail_closed(void)
-{
-    AxlJoseKey k = { 0 };
-    const AxlJoseAlg es256[] = { AXL_JOSE_ES256 };
-    uint8_t *payload = NULL;
-    size_t   plen = 0;
-    char    *tok = NULL;
-
-    test_check(axl_jose_available() == false,
-               "jose_available: false without AXL_TLS");
-    test_check(axl_jws_sign(&k, AXL_JOSE_HS256, (const uint8_t *)"x", 1, &tok)
-                   == AXL_ERR,
-               "jws_sign: fails closed without AXL_TLS");
-    test_check(axl_jws_verify(A3_ES256_TOKEN, axl_strlen(A3_ES256_TOKEN),
-                              &k, es256, 1, &payload, &plen) == AXL_ERR,
-               "jws_verify: fails closed without AXL_TLS");
-    test_check(axl_jwt_verify(A3_ES256_TOKEN, axl_strlen(A3_ES256_TOKEN),
-                              &k, es256, 1, NULL, &payload, &plen, NULL)
-                   == AXL_ERR,
-               "jwt_verify: fails closed without AXL_TLS");
-    test_check(axl_jwk_parse(A3_ES256_JWK, axl_strlen(A3_ES256_JWK), NULL, NULL)
-                   == NULL,
-               "jwk_parse: fails closed without AXL_TLS");
-    test_check(axl_jwks_parse("{\"keys\":[]}", 11) == NULL,
-               "jwks_parse: fails closed without AXL_TLS");
-    test_check(axl_jwk_export_public(NULL, NULL) == NULL,
-               "jwk_export_public: fails closed without AXL_TLS");
-}
-
-#endif /* AXL_HAVE_TLS */
 
 static int
 test_jose_main(int argc, char **argv)
@@ -1028,28 +989,12 @@ test_jose_main(int argc, char **argv)
     test_print_header("AxlJose");
 
     test_jose_argval();
-#ifdef AXL_HAVE_TLS
     test_jws_kat();
     test_jws_kat_es384_ps256();
     test_jws_rejections();
     test_jws_roundtrip();
     test_jwt();
     test_jwk();
-#else
-    /* Fail-closed behavior is the ONLY thing testable without TLS, and it is
-       worth testing -- but it is ~7 assertions standing in for ~95. Name each
-       group that did not run, so the footer says "SKIPPED" and the harness can
-       refuse the run under TEST_REQUIRE_TLS=1. Without this the binary reports
-       "13 passed, 0 failed" and reads as a complete pass. */
-    test_jose_fail_closed();
-    test_skip("jose: JWS ES256/RS256/HS256 known-answer vectors (needs AXL_TLS=1)");
-    test_skip("jose: JWS ES384/PS256 recognized-but-unimplemented (needs AXL_TLS=1)");
-    test_skip("jose: JWS rejection matrix — alg confusion, mixed allow-list (needs AXL_TLS=1)");
-    test_skip("jose: JWS sign/verify round-trip (needs AXL_TLS=1)");
-    test_skip("jose: JWT claims policy — exp/nbf/iss/aud, non-object payload, "
-              "strict-dialect intake (needs AXL_TLS=1)");
-    test_skip("jose: JWK/JWKS parse, export, strict-dialect intake (needs AXL_TLS=1)");
-#endif
 
     return test_print_results();
 }

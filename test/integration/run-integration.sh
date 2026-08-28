@@ -22,6 +22,39 @@
 # test-*.sh in it verbatim — the host-only self-test seam (no QEMU).
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# THE -delay 0 SHELL LAUNCHER, ON FOR THE SUITE AND OFF FOR CONSUMERS.
+#
+# Every guest boot otherwise pays the EDK2 Shell's "Press ESC in 5...1 seconds
+# to skip startup.nsh" countdown -- five gBS->Stall(1s) busy-waits. Measured
+# 2026-08-21, back-to-back uncached X64 runs on one machine, both 172 passed /
+# 0 failed:  launcher OFF 489 s, launcher ON 368 s -- 121 s, 24.7%. Per boot it
+# is ~4.6 s on BOTH arches (X64 6.2 -> 1.6 s, AARCH64 10.8 -> 6.1 s).
+#
+# WHY IT IS SET HERE AND NOT AS THE DEFAULT IN axl-common.sh. The launcher was
+# made opt-in by 1ae66ccd because it "hangs some firmware": the Shell loads,
+# starts, then produces no output. That is NOT fixed -- investigated 2026-08-21
+# and the code was never the variable. The launcher works at 1ae66ccd itself
+# (built that tree, ran its own test: passes), across three OVMF builds and
+# both arches, and through a full uncached 172-test suite. What changed is the
+# MACHINE's firmware: the custom OVMF of that era is gone and the box now runs
+# distro stock. The trigger is absent, not repaired.
+#
+# That split (suite yes, standalone run-qemu.sh no) is no longer why this is
+# set: run-qemu.sh's default is now ON and self-healing -- it notices a firmware
+# that never reaches the Shell, records it, and retries without the launcher.
+#
+# =1 is kept here for a DIFFERENT reason: it means "always, ignore the cache,
+# no fallback", so a genuine launcher regression fails LOUDLY across the suite
+# instead of being absorbed into a slow-but-green run. If you would rather the
+# suite self-heal on a box whose firmware cannot take the launcher, unset this
+# -- the first test to hit it records the verdict and the rest skip it, while
+# test-shell-launcher-qemu.sh (which forces =1 itself) stays the loud guard.
+#
+# Assignment-if-unset, so an explicit outer value still wins in both
+# directions: AXL_SHELL_LAUNCHER=0 to bisect a suspected launcher fault.
+: "${AXL_SHELL_LAUNCHER:=1}"
+export AXL_SHELL_LAUNCHER
+
 source "$SCRIPT_DIR/lib/discover.sh"
 # shellcheck source=lib/test-cache.sh
 source "$SCRIPT_DIR/lib/test-cache.sh"
@@ -102,16 +135,15 @@ if [[ "$JOBS" -le 0 ]]; then
     if [[ "$_ncpu" -ge 3 ]]; then JOBS=$(( _ncpu - 2 )); else JOBS=1; fi
 fi
 
-# Standardize the whole suite on AXL_TLS=1. The Makefile WIPES .o/libaxl.a/all
-# .efi whenever AXL_TLS toggles between builds (Makefile "AXL_TLS state-change
-# detection"); with ~64 plain tests and 5 TLS tests sharing one prefix, that
-# wipe fires constantly and — run concurrently — clobbers other tests'
-# artifacts mid-run. Forcing AXL_TLS on for every test subprocess keeps the
-# flags consistent, so the wipe never triggers and concurrent makes stay
-# no-ops. (A TLS-enabled lib is a strict superset; plain-http tests just don't
-# exercise TLS. The non-TLS *build* is still covered by CI's build job, and the
-# strip contract by test-tls-strippable, which itself builds AXL_TLS=1.)
-export AXL_TLS=1
+# This used to `export AXL_TLS=1` for every test subprocess, and had to: the
+# Makefile WIPED every object whenever the flag toggled, so ~64 plain tests and
+# 5 TLS tests sharing one prefix made the wipe fire constantly and -- run
+# concurrently -- clobber each other's artifacts mid-run. Forcing one value was
+# the fix.
+#
+# mbedTLS is unconditional now, so there is one configuration, nothing to
+# toggle and nothing to standardise. The strip contract that made this safe is
+# still enforced, by test-tls-strippable.sh.
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MAKE_ARCH=x64; [[ "$ARCH" == "AARCH64" ]] && MAKE_ARCH=aa64
 
@@ -211,8 +243,8 @@ fi
 # per-test makes that follow are consistent-flag no-ops instead of a thundering
 # herd of concurrent first-builds. --no-build skips it (CI builds in a prior job).
 if [[ -z "${RUN_INTEGRATION_DIR:-}" && "${RUN_NO_BUILD:-0}" != "1" ]]; then
-    echo "pre-building once (ARCH=$MAKE_ARCH AXL_TLS=1 all tests tools axl-busybox)..."
-    if ! make -C "$PROJECT_DIR" ARCH="$MAKE_ARCH" AXL_TLS=1 all tests tools axl-busybox \
+    echo "pre-building once (ARCH=$MAKE_ARCH all tests tools axl-busybox)..."
+    if ! make -C "$PROJECT_DIR" ARCH="$MAKE_ARCH" all tests tools axl-busybox \
             > "$LOGDIR/_prebuild.log" 2>&1; then
         echo "pre-build FAILED — see $LOGDIR/_prebuild.log"; exit 1
     fi

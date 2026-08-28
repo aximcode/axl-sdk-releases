@@ -3,7 +3,7 @@
 
 /** @file axl-consttime.c
     Constant-time buffer comparison for secret-dependent data.
-    Always compiled (no AXL_TLS dependency).
+    Depends on nothing but the compiler; usable from any module.
 **/
 
 #include <stdint.h>

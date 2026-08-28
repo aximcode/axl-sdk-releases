@@ -482,9 +482,9 @@ run_rfbrowse(AxlArgs *a)
        http->https redirect (the client's TLS path is otherwise strippable —
        see axl-http-client-tls.h). Bail only when the resolved URL is already
        https: a plain http:// target (e.g. a mock) must still work in an
-       AXL_TLS=0 build, where axl_tls_init() fails. */
+       build where axl_tls_init() fails at runtime. */
     if (axl_tls_init() != AXL_OK && axl_strncmp(base_url, "https://", 8) == 0) {
-        axl_printf("rfbrowse: https requires an AXL_TLS=1 build.\n");
+        axl_printf("rfbrowse: https requires TLS; axl_tls_init() failed.\n");
         return 1;
     }
 

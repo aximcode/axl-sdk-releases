@@ -7,17 +7,28 @@ page is the map.
 
 Two tiers:
 
-- **Standalone** primitives have no external dependency and are
-  available in every build — hashing, HMAC, randomness, and Authenticode
-  image verification.
-- **mbedTLS-backed** primitives require an ``AXL_TLS=1`` build (which
-  links the vendored mbedTLS): TLS and public-key signature
-  verification. Without ``AXL_TLS=1`` they fail closed (see
-  ``axl_pk_available()`` / ``axl_tls_available()``).
+- **Standalone** primitives are AXL's own implementations — with one
+  exception: SHA-512 forwards to mbedTLS (see the table below), because
+  wrapping mbedTLS's SHA-512 costs the same bytes as a fourth
+  hand-written compressor and adds no new cryptographic code to audit.
+  "Standalone" in the table's *Backend* column names which code computes
+  the result, not what an image links: ``axl-digest.c``'s dispatcher
+  strongly references every algorithm, so any image touching *any*
+  checksum — even MD5 alone — links the mbedTLS SHA-512 object too.
+- **mbedTLS-backed** primitives — TLS and public-key signature
+  verification — use the vendored mbedTLS, which is compiled into every
+  build. ``axl_pk_available()`` / ``axl_tls_available()`` remain, and
+  remain the right thing to check: they report what this *image*
+  linked. ``--gc-sections`` drops the **TLS stack** — the handshake,
+  X.509 and the cipher suites — from an image that never calls
+  ``axl_tls_init()``; it does not drop the SHA-512 adapter above, which
+  the digest dispatcher references unconditionally.
 
 ``<axl/axl-crypto.h>`` is the home for mbedTLS-backed primitives beyond
-TLS; it grows on demand as consumers need them (today: public-key
-signature verification).
+TLS; it has grown well past the original public-key signature
+verification: AEAD (AES-GCM, ChaCha20-Poly1305), ECDH (P-256,
+X25519), AES-CTR, and the ``AxlPkKey`` handle API (keygen, DER
+import/export, sign/verify) all live here now too.
 
 .. list-table:: Primitives at a glance
    :header-rows: 1
@@ -27,13 +38,13 @@ signature verification).
      - Header
      - Backend
      - Reference
-   * - Hashing & checksums (MD5, SHA-1, SHA-256, CRC-32, Adler-32)
+   * - Hashing & checksums (MD5, SHA-1, SHA-256, SHA-512, CRC-32, Adler-32)
      - ``<axl/axl-digest.h>``
-     - standalone
+     - standalone (SHA-512: mbedTLS)
      - :doc:`data`
    * - HMAC (RFC 2104)
      - ``<axl/axl-hmac.h>``
-     - standalone
+     - standalone (SHA-512: mbedTLS)
      - :doc:`data`
    * - PBKDF2-HMAC-SHA256 (RFC 8018)
      - ``<axl/axl-digest.h>``
@@ -61,15 +72,15 @@ signature verification).
      - :doc:`image`
    * - TLS 1.2 server / client
      - ``<axl/axl-tls.h>``
-     - needs ``AXL_TLS=1``
+     - mbedTLS-backed
      - :doc:`tls`
    * - Public-key signature verification (ECDSA-P256)
      - ``<axl/axl-crypto.h>``
-     - needs ``AXL_TLS=1``
+     - mbedTLS-backed
      - below
    * - JOSE — JWS / JWT / JWK signed tokens
      - ``<axl/axl-jose.h>``
-     - needs ``AXL_TLS=1``
+     - mbedTLS-backed
      - :doc:`jose`
 
 Public-key signature verification
@@ -84,8 +95,11 @@ offline by the vendor and never ships).
 ``AXL_PK_ECDSA_P256`` (ECDSA over NIST P-256 with SHA-256) is supported:
 the public key is a DER ``SubjectPublicKeyInfo``, the signature is a DER
 ECDSA signature, and the message is hashed with SHA-256 internally.
-``AXL_PK_ED25519`` is reserved but unsupported by the current mbedTLS
-build (which does not enable PSA crypto) and returns ``AXL_ERR``.
+``AXL_PK_ED25519`` is reserved but unsupported and ``axl_pk_verify()``
+returns ``AXL_ERR`` for it: mbedTLS 3.6.3 has no twisted-Edwards curve
+at all, so no build configuration can supply it today. Use
+``axl_pk_alg_available()`` to check which algorithms a given image
+actually has, rather than assuming from the enum alone.
 
 Any non-``AXL_OK`` result means "not verified, untrusted" — fail closed.
 Use ``axl_pk_available()`` to distinguish "verification not compiled in"

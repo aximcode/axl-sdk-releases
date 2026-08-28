@@ -331,7 +331,7 @@ axl_http_server_use_tls(
     }
 
     if (!axl_tls_available()) {
-        axl_debug("TLS not available (build with AXL_TLS=1)");
+        axl_debug("TLS not available: axl_tls_available() reported false");
         return AXL_ERR;
     }
 

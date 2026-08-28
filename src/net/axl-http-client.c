@@ -338,8 +338,7 @@ ensure_connected(
     if (c->tls_enabled) {
         if (g_http_tls_ops == NULL) {
             axl_error("https requires TLS: call axl_tls_init() once at startup "
-                      "(and build with AXL_TLS=1) before issuing https:// "
-                      "requests");
+                      "before issuing https:// requests");
             axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
             c->sock = NULL;
             return -1;
@@ -671,8 +670,8 @@ do_streaming_request(
     if (axl_strcmp(parsed->scheme, "https") == 0) {
         if (g_http_tls_ops == NULL) {
             axl_url_free(parsed);
-            axl_error("https requires TLS: build with AXL_TLS=1 and call "
-                      "axl_tls_init() once at startup");
+            axl_error("https requires TLS: call axl_tls_init() once at "
+                      "startup");
             return -1;
         }
         c->tls_enabled = true;

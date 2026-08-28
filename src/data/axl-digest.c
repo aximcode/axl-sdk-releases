@@ -3,11 +3,13 @@
 
 /** @file axl-digest.c
     Message digest checksums: MD5 (RFC 1321), SHA-1 (RFC 3174),
-    SHA-256 (FIPS 180-4). Standalone — no mbedTLS dependency.
+    SHA-256 and SHA-512 (FIPS 180-4).
 
     This file is the public dispatcher. Per-algorithm implementations
     live in axl-digest-md5.c, axl-digest-sha1.c, axl-digest-sha256.c
-    and are reached via the prototypes in axl-digest-internal.h.
+    and axl-digest-sha512.c and are reached via the prototypes in
+    axl-digest-internal.h. The first three are AXL's own; SHA-512
+    forwards to mbedTLS (see that file, and design spec §3).
 **/
 
 #include <axl/axl-digest.h>
@@ -21,8 +23,8 @@
 
 AXL_LOG_DOMAIN("data");
 
-#define MAX_DIGEST_LEN 32  /* SHA-256 */
-#define MAX_HEX_LEN   65  /* SHA-256 hex + NUL */
+#define MAX_DIGEST_LEN 64  /* SHA-512 */
+#define MAX_HEX_LEN   129  /* SHA-512 hex + NUL */
 
 struct AxlChecksum {
     AxlChecksumType type;
@@ -31,6 +33,7 @@ struct AxlChecksum {
         Md5State    md5;
         Sha1State   sha1;
         Sha256State sha256;
+        Sha512State sha512;
     };
     uint8_t  digest[MAX_DIGEST_LEN];
     char     hex[MAX_HEX_LEN];
@@ -43,8 +46,9 @@ axl_checksum_type_get_length(AxlChecksumType type)
     case AXL_CHECKSUM_MD5:    return 16;
     case AXL_CHECKSUM_SHA1:   return 20;
     case AXL_CHECKSUM_SHA256: return 32;
-    default:                  return 0;
+    case AXL_CHECKSUM_SHA512: return 64;
     }
+    return 0;  /* out-of-range cast, or an enumerator -Wswitch just named */
 }
 
 AxlChecksum *
@@ -101,6 +105,9 @@ axl_checksum_update(AxlChecksum *cs, const void *data, size_t len)
         case AXL_CHECKSUM_SHA256:
             sha256_update(&cs->sha256, p, chunk);
             break;
+        case AXL_CHECKSUM_SHA512:
+            sha512_update(&cs->sha512, p, chunk);
+            break;
         }
         p      += chunk;
         remain -= chunk;
@@ -128,6 +135,9 @@ checksum_finalize(AxlChecksum *cs)
         break;
     case AXL_CHECKSUM_SHA256:
         sha256_final(&cs->sha256, cs->digest);
+        break;
+    case AXL_CHECKSUM_SHA512:
+        sha512_final(&cs->sha512, cs->digest);
         break;
     }
 
@@ -166,7 +176,13 @@ axl_checksum_get_digest(AxlChecksum *cs, uint8_t *buf, size_t *len)
         dlen = *len;
     }
     axl_memcpy(buf, cs->digest, dlen);
-    *len = axl_checksum_type_get_length(cs->type);
+    /* Report what was WRITTEN, not what the algorithm produces. A
+       caller that passed a short buffer and got back the full digest
+       length would happily read past its own array -- axl-hmac.c did,
+       and it only stayed harmless while no algorithm exceeded 32
+       bytes. Use axl_checksum_type_get_length() to size a buffer
+       before the call. */
+    *len = dlen;
 }
 
 void
@@ -187,6 +203,9 @@ axl_checksum_reset(AxlChecksum *cs)
         break;
     case AXL_CHECKSUM_SHA256:
         sha256_init(&cs->sha256);
+        break;
+    case AXL_CHECKSUM_SHA512:
+        sha512_init(&cs->sha512);
         break;
     }
 }

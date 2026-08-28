@@ -10,36 +10,6 @@
 
 #include <axl/axl-crypto.h>
 
-#ifndef AXL_HAVE_TLS
-
-int
-axl_aead_seal(AxlAeadAlg alg, const uint8_t *key, size_t key_len,
-              const uint8_t *nonce, size_t nonce_len,
-              const uint8_t *aad, size_t aad_len,
-              const uint8_t *plaintext, size_t pt_len,
-              uint8_t *ciphertext, uint8_t *tag, size_t tag_len)
-{
-    (void)alg; (void)key; (void)key_len; (void)nonce; (void)nonce_len;
-    (void)aad; (void)aad_len; (void)plaintext; (void)pt_len;
-    (void)ciphertext; (void)tag; (void)tag_len;
-    return AXL_ERR;
-}
-
-int
-axl_aead_open(AxlAeadAlg alg, const uint8_t *key, size_t key_len,
-              const uint8_t *nonce, size_t nonce_len,
-              const uint8_t *aad, size_t aad_len,
-              const uint8_t *ciphertext, size_t ct_len,
-              const uint8_t *tag, size_t tag_len,
-              uint8_t *plaintext)
-{
-    (void)alg; (void)key; (void)key_len; (void)nonce; (void)nonce_len;
-    (void)aad; (void)aad_len; (void)ciphertext; (void)ct_len;
-    (void)tag; (void)tag_len; (void)plaintext;
-    return AXL_ERR;
-}
-
-#else /* AXL_HAVE_TLS */
 
 #include <mbedtls/gcm.h>
 #include <mbedtls/chachapoly.h>
@@ -155,4 +125,3 @@ axl_aead_open(AxlAeadAlg alg, const uint8_t *key, size_t key_len,
     return (rc == 0) ? AXL_OK : AXL_ERR;
 }
 
-#endif /* AXL_HAVE_TLS */

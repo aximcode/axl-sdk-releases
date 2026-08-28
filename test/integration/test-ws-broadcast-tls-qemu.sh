@@ -17,7 +17,7 @@
 #   (a) all 8 frames arrive in order, byte-exact (intact TLS stream), and
 #   (b) a fresh HTTPS GET still returns 200 (loop not wedged).
 #
-# Requires: AXL_TLS=1 build. Usage: ./test/integration/test-ws-broadcast-tls-qemu.sh
+# Usage: ./test/integration/test-ws-broadcast-tls-qemu.sh
 
 source "$(dirname "$0")/common-test.sh"
 
@@ -32,7 +32,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
 make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 

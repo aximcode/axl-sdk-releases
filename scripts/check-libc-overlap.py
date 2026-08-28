@@ -100,6 +100,15 @@ REPO = Path(__file__).resolve().parent.parent
 # to link() + unlink() when the target has no _rename syscall, and AXL provides
 # no link(). There the winner still matters.
 MUST_WIN: dict[str, str] = {
+    "time": (
+        "mbedTLS calls time() to decide CERTIFICATE VALIDITY. AXL's reads the "
+        "firmware RTC via axl_clock_gettime(AXL_CLOCK_REALTIME); newlib's "
+        "reaches gettimeofday, which has no backend under UEFI -- so newlib's "
+        "would silently make every certificate's notBefore/notAfter check "
+        "meaningless. Became visible only when mbedTLS stopped being optional: "
+        "axl-mbedtls-platform.c used to compile only under AXL_TLS, so this "
+        "gate never saw the overlap"
+    ),
     "__cxa_atexit": (
         "newlib registers into its own table, drained by exit(); nothing calls "
         "newlib's exit() under UEFI, so C++ static dtors would never run"

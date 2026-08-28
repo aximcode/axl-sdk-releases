@@ -2,21 +2,22 @@
 # test-meta: arch=x64 needs= est=11 local-only=0
 # test-jose-qemu.sh — axl-jose (JWS/JWT/JWK) against a real mbedTLS.
 #
-# Auxiliary single-binary test (opt out of the test-axl.sh ratchet). The
-# default unit suite builds without AXL_TLS, so AxlTestJose takes its
-# fail-closed "not compiled in" branch. The real signing/verification
-# outcomes — the RFC 7515 ES256/HS256 KATs, the sign/verify round-trips,
-# the rejection matrix, JWT claim validation, and JWK parse/export — only
-# run with mbedTLS linked. This builds AxlTestJose with AXL_TLS=1 and
-# asserts the cryptographic branch passes.
+# Auxiliary single-binary test (opt out of the test-axl.sh ratchet).
+#
+# It used to REBUILD AxlTestJose with AXL_TLS=1 into a segregated prefix,
+# because the default unit suite built without mbedTLS and this binary took a
+# fail-closed "not compiled in" branch. mbedTLS is unconditional now, so
+# test-axl.sh already runs these assertions on both arches and the rebuild is
+# gone.
+#
+# WHAT THIS STILL ADDS over the ratchet: the ratchet is a COUNT, and a count
+# cannot tell you WHICH assertion vanished. This names each standards KAT, each
+# round-trip and each rejection outcome, so silently dropping one is a failure
+# here rather than an off-by-N nobody reads.
 #
 # x64 only: the outcomes are pure computations over fixed vectors (plus
-# generated keys), so x64 validation suffices. The fail-closed branch is
-# covered on both arches by test-axl.sh; the AXL_TLS path on aa64 can be
-# spot-checked with:
-#   AXL_TLS=1 ARCH=aa64 make tests && \
-#   TEST_APPS_ONLY=AxlTestJose TEST_SKIP_RATCHET=1 AXL_TLS=1 ARCH=aa64 \
-#     ./test/integration/test-axl.sh
+# generated keys), so x64 validation suffices, and test-axl.sh covers both
+# arches by count.
 #
 # Usage: ./test/integration/test-jose-qemu.sh
 
@@ -27,14 +28,10 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 export TEST_SKIP_RATCHET=1
 
-# Build the AXL_TLS=1 variant into a segregated prefix (see the rationale
-# in test-pk-verify-qemu.sh: toggling AXL_TLS changes per-TU CFLAGS but not
-# .c timestamps, so a dedicated prefix keeps the ratcheted suite clean).
-TLS_PREFIX="$(AXL_TLS=1 "$PROJECT_DIR/scripts/build-prefix.sh" x64)"
-EFI="$PROJECT_DIR/$TLS_PREFIX/AxlTestJose.efi"
-rm -f "$EFI"
-make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 all tests 2>&1 | tail -1
-[[ -f "$EFI" ]] || { echo "FAIL: AXL_TLS build did not produce $EFI"; exit 1; }
+PREFIX_DIR="$("$PROJECT_DIR/scripts/build-prefix.sh" x64)"
+EFI="$PROJECT_DIR/$PREFIX_DIR/AxlTestJose.efi"
+make -C "$PROJECT_DIR" ARCH=x64 all tests 2>&1 | tail -1
+[[ -f "$EFI" ]] || { echo "FAIL: build did not produce $EFI"; exit 1; }
 
 LOG="$(mktemp)"
 cleanup() { rm -f "$LOG"; }
@@ -51,7 +48,7 @@ fail=0
 # The real mbedTLS-backed branches must have run and passed: the standards
 # KATs, the round-trips, the rejection matrix, JWT claims, and JWK I/O.
 expect=(
-    "jose_available: true in AXL_TLS build"
+    "jose_available: true"
     "jws_verify: RFC 7515 A.3 ES256 KAT -> AXL_OK"
     "jws_verify: A.3 tampered signature -> AXL_ERR"
     "jws_verify: RFC 7515 A.1 HS256 KAT -> AXL_OK"
@@ -75,9 +72,6 @@ for line in "${expect[@]}"; do
         || { echo "  MISS: PASS: $line"; fail=1; }
 done
 
-# The fail-closed branch must NOT have run (would mean mbedTLS was absent).
-grep -qF "fails closed without AXL_TLS" "$LOG" \
-    && { echo "  HIT: AxlTestJose took the fail-closed branch (no mbedTLS?)"; fail=1; }
 # Any failed check, a leak, or a missing/non-zero Results footer fails.
 grep -qE "^[[:space:]]*FAIL:" "$LOG" && { echo "  HIT: a check FAILED"; fail=1; }
 grep -qiE "leak report" "$LOG" && { echo "  HIT: memory leak reported"; fail=1; }

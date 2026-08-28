@@ -29,9 +29,11 @@
 #
 #   covered      every staged artifact (by SOURCE path + sha256), the firmware
 #                (FW_CODE/FW_VARS are recorded like any other input), the test
-#                script, common-test.sh, run-qemu.sh, every lib/*.sh, the arch,
-#                and AXL_TLS. A toolchain change is covered TRANSITIVELY: it
-#                changes the artifacts.
+#                script, common-test.sh, run-qemu.sh, every lib/*.sh, and the
+#                arch. A toolchain change is covered TRANSITIVELY: it changes
+#                the artifacts. AXL_TLS was here too, when it selected which
+#                sources compiled; mbedTLS is unconditional now, so keying on
+#                it would only let a stray variable cause pointless misses.
 #   NOT covered  the host environment -- nproc, /dev/shm, network reachability,
 #                the version of python/tar/socat a test shells out to. A test
 #                whose result depends on those is not a pure function of the
@@ -83,9 +85,9 @@ cache_key() {
 
     local dir; dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     {
-        # The fixed parts. ARCH and AXL_TLS select which artifacts get built at
-        # all, so two arches never share a key.
-        printf 'arch=%s tls=%s\n' "${ARCH:-}" "${AXL_TLS:-}"
+        # The fixed part. ARCH selects which artifacts get built at all, so
+        # two arches never share a key.
+        printf 'arch=%s\n' "${ARCH:-}"
         printf 'script %s\n' "$(_tc_sha "$dir/$test")"
         printf 'harness %s\n' "$(_tc_sha "$dir/common-test.sh")"
         printf 'harness %s\n' "$(_tc_sha "$dir/../../scripts/run-qemu.sh")"

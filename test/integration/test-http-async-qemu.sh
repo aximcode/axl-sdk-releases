@@ -34,7 +34,7 @@ fi
 PLAIN_PORT=$(test_port 0)   # plain-http server
 TLS_PORT=$(test_port 1)     # https server
 
-make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     all tests 2>&1 | tail -3
 test_add_efi "$(test_build_dir x64)/AxlTestNet.efi"
 

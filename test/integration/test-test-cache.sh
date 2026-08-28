@@ -39,7 +39,7 @@ printf 'x\n' > "$FIX/../../scripts/run-qemu.sh"
 printf 'x\n' > "$FIX/test-fixture.sh"
 
 export AXL_TEST_CACHE="$WORK/cache"; mkdir -p "$AXL_TEST_CACHE"
-export ARCH=X64 AXL_TLS=1
+export ARCH=X64
 # shellcheck source=lib/test-cache.sh
 source "$FIX/lib/test-cache.sh"
 
@@ -95,11 +95,15 @@ if cache_is_fresh "$T"; then fail "a different ARCH still read FRESH — the arc
 else pass "a different arch busts the key"; fi
 ARCH=X64
 
-# --- a different AXL_TLS -----------------------------------------------------
+# --- a stray AXL_TLS must NOT bust the key ------------------------------------
+# INVERTED. AXL_TLS used to select which sources compiled, so it belonged in
+# the key. mbedTLS is unconditional now: keying on it would mean a leftover
+# variable in someone's environment silently re-ran the whole suite from cold
+# for no reason at all.
 AXL_TLS=0
-if cache_is_fresh "$T"; then fail "a different AXL_TLS still read FRESH"
-else pass "a different AXL_TLS busts the key"; fi
-AXL_TLS=1
+if cache_is_fresh "$T"; then pass "a stray AXL_TLS does not bust the key"
+else fail "a stray AXL_TLS still busts the cache key"; fi
+unset AXL_TLS
 
 # --- a VANISHED input --------------------------------------------------------
 # "cannot prove unchanged" must read as a miss, never as a hit.

@@ -15,11 +15,12 @@
       4. round-trip every supported algorithm (ES256, ES384, RS256, PS256,
          HS256) so the demo dogfoods each signer/verifier.
 
-    Build (needs an AXL_TLS=1 SDK):
-        AXL_TLS=1 ./scripts/install.sh --arch x64
+    Build:
+        ./scripts/install.sh --arch x64
         ./out/bin/axl-cc sdk/examples/jose-demo.c -o jose-demo.efi
-    then run jose-demo.efi under run-qemu.sh. Without AXL_TLS the library
-    fails closed and the demo says so and exits.
+    then run jose-demo.efi under run-qemu.sh. JOSE is compiled into every
+    build; the axl_jose_available() check below is kept because a consumer
+    should still branch on it rather than assume.
 **/
 
 #include <axl.h>
@@ -70,7 +71,7 @@ main(void)
     axl_printf("axl-jose demo\n");
 
     if (!axl_jose_available()) {
-        axl_printf("JOSE not compiled in (build the SDK with AXL_TLS=1).\n");
+        axl_printf("JOSE not available in this build.\n");
         return 1;
     }
 

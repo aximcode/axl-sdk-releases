@@ -3,11 +3,12 @@
 
 /** @file axl-mbedtls-platform.c
     mbedTLS platform shim — bridges mbedTLS to AXL runtime.
-    Only compiled when AXL_TLS=1.
+    Compiled into every build: mbedTLS is unconditional since the
+    AXL_TLS flag was removed.
 
-    Standard C functions (memcpy, strlen, etc.) are provided by
-    src/mem/axl-intrinsics.c. This file only handles mbedTLS-specific
-    platform hooks: memory allocator, printf, fprintf, time, and entropy.
+    Standard C functions (memcpy, strlen, etc.) come from newlib. This
+    file only handles mbedTLS-specific platform hooks: memory
+    allocator, printf, fprintf, time, and entropy.
 **/
 
 #include <stddef.h>

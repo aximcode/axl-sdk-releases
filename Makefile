@@ -51,34 +51,20 @@ endif
 # The default build keeps the historical path, so every script and doc that
 # names out/native-<arch> is unaffected; `make print-prefix` reports it for
 # anything that needs to find the other one.
-# AXL_TLS splits the tree too, for the same reason BUILD does and with a
-# sharper edge. It is in the build-state SIGNATURE (see TLS_STATE), so a toggle
-# WIPES $(BUILDDIR)/*.o, libaxl.a and every .efi under the prefix. The toggle
-# is not hypothetical: test-axl.sh builds with AXL_TLS off, run-integration.sh
-# exports AXL_TLS=1, and a developer's bare `make` is off again. Sharing one
-# prefix therefore wiped and rebuilt on every alternation -- measured at 321
-# objects one way and 270 back -- and made running two of them CONCURRENTLY
-# corrupt both, same prefix, two writers.
-#
-# The suffix derives from the same `$(if $(AXL_TLS),...)` predicate that feeds
-# TLS_STATE and LIB_SOURCES, not a second spelling of it: a prefix that could
-# disagree with which sources compiled would be worse than sharing one. Note
-# `ifdef`/`$(if ...)` treat AXL_TLS=0 as ON; that is pre-existing semantics,
-# and deriving from the same expression keeps them consistent.
-#
-# out/native-x64-tls already existed by hand, in two integration scripts that
-# had worked this out locally and set PREFIX= themselves; their comments gave
-# the same rationale. This generalises it and those overrides are now gone.
+# PREFIX once had a THIRD input, AXL_TLS, which gave a TLS build its own tree
+# because toggling the flag wiped and rebuilt every object. mbedTLS is now
+# compiled unconditionally, so there is no toggle and no second tree.
 #
 # Every consumer must ASK for the prefix rather than compose it --
 # `make -s print-prefix`, or test_build_dir/test_build_prefix in
-# common-test.sh. A first attempt at this split shipped without that and broke
-# 48 integration suites on paths like "$PROJECT_DIR/out/native-x64/tools/...".
-AXL_TLS_SUFFIX := $(if $(AXL_TLS),-tls,)
+# common-test.sh. That rule outlived the TLS suffix and is why removing it was
+# a contained change: when the suffix was ADDED, 98 hand-composed
+# "out/native-$arch" paths across 66 scripts silently pointed at a tree nothing
+# had built.
 ifeq ($(BUILD),DEBUG)
-  PREFIX   ?= out/native-$(ARCH)$(AXL_TLS_SUFFIX)
+  PREFIX   ?= out/native-$(ARCH)
 else
-  PREFIX   ?= out/native-$(ARCH)-$(shell echo $(BUILD) | tr '[:upper:]' '[:lower:]')$(AXL_TLS_SUFFIX)
+  PREFIX   ?= out/native-$(ARCH)-$(shell echo $(BUILD) | tr '[:upper:]' '[:lower:]')
 endif
 HOSTCC     ?= gcc
 AXL_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
@@ -767,15 +753,25 @@ INCLUDES   = -Iinclude -Isrc/backend \
              -Ideps/libvterm/include
 
 # ===================================================================
-# Optional TLS support (AXL_TLS=1)
+# TLS support (mbedTLS) -- unconditional
 # ===================================================================
 
-ifdef AXL_TLS
-CFLAGS += -DAXL_HAVE_TLS -Ideps/mbedtls/include \
-          -DMBEDTLS_CONFIG_FILE='<axl-mbedtls-config.h>' \
-          -Isrc/net -Wno-redundant-decls \
+# AXL_HAVE_TLS is still DEFINED, and now always is. It reaches public headers,
+# so a consumer may test it in their own code; undefining it would silently
+# take their false branch and disable their TLS path. Its meaning -- "TLS is
+# available here" -- stays true, it is simply no longer conditional.
+# -isystem, not -I, for the VENDORED headers. They are third-party code we do
+# not style-check: with -I, clang-tidy sees them as user code, and
+# WarningsAsErrors promotes findings inside mbedtls's own headers into build
+# failures. That stayed hidden while these includes lived behind #ifdef
+# AXL_HAVE_TLS -- lint never defined it, so it never parsed them. Making TLS
+# unconditional exposed it immediately (bugprone-macro-parentheses in
+# chacha20.h, chachapoly.h, cipher.h). -isystem is also why -Wno-redundant-decls
+# is no longer needed here: it existed to silence those same headers.
+CFLAGS += -DAXL_HAVE_TLS -isystem deps/mbedtls/include \
+          -DMBEDTLS_CONFIG_FILE='"axl-mbedtls-config.h"' \
+          -Isrc/net \
           -U_WIN32 -U_WIN64
-endif
 
 # ===================================================================
 # Library sources (all modules)
@@ -833,6 +829,7 @@ LIB_SOURCES = \
     src/data/axl-digest-md5.c \
     src/data/axl-digest-sha1.c \
     src/data/axl-digest-sha256.c \
+    src/data/axl-digest-sha512.c \
     src/data/axl-digest-crc.c \
     src/data/axl-compress.c \
     src/data/axl-compress-lzma.c \
@@ -905,8 +902,10 @@ LIB_SOURCES = \
     src/acpi/axl-acpi-mcfg.c \
     src/acpi/axl-acpi-madt.c \
     src/acpi/axl-acpi-fadt.c \
+    src/acpi/axl-acpi-aml.c \
     src/pci/axl-pci.c \
     src/pci/axl-pci-cap.c \
+    src/pci/axl-pci-slot.c \
     src/pci/axl-pci-ids.c \
     src/pci/axl-pci-class.c \
     src/usb/axl-usb.c \
@@ -972,10 +971,14 @@ LIB_SOURCES = \
     src/net/axl-http-ws.c \
     src/net/axl-http-webdav.c \
     src/net/axl-http-serve-fs.c \
+    src/net/axl-ssh-buf.c \
+    src/net/axl-ssh-packet.c \
+    src/net/axl-ssh-kex.c \
     src/net/axl-http-client.c \
     src/net/axl-http-client-async.c \
     src/net/axl-tls.c \
     src/net/axl-pk-verify.c \
+    src/net/axl-pk-mbedtls.c \
     src/net/axl-jose.c \
     src/net/axl-crypto-rng.c \
     src/net/axl-consttime.c \
@@ -1049,7 +1052,6 @@ LIB_SOURCES = \
 # Layer 2, and Layer 3 maintains a cell grid the consuming widget already owns.
 # It is vendored (see deps/libvterm/README.md) but never compiled.
 
-ifdef AXL_TLS
 MBEDTLS_SOURCES = \
     deps/mbedtls/library/aes.c \
     deps/mbedtls/library/asn1parse.c \
@@ -1104,7 +1106,6 @@ MBEDTLS_SOURCES = \
 
 LIB_SOURCES += src/net/axl-mbedtls-platform.c
 LIB_SOURCES += $(MBEDTLS_SOURCES)
-endif
 
 BUILDDIR   = $(PREFIX)/build
 LIB_OBJS   = $(patsubst %.c,$(BUILDDIR)/%.o,$(notdir $(LIB_SOURCES)))
@@ -1170,41 +1171,41 @@ LIBAXL_CXXRT_TARGET =
 endif
 
 # ===================================================================
-# AXL_TLS state-change detection
+# Build-state change detection
 # ===================================================================
 #
-# Toggling AXL_TLS between builds changes which .c files end up in
-# LIB_SOURCES (mbedtls files are appended only when AXL_TLS=1). Naive
-# `make` is unsafe across the toggle for two reasons:
+# This began as AXL_TLS toggle detection: flipping the flag changed which .c
+# files were in LIB_SOURCES, and naive `make` was unsafe across it in two ways
+# that both produced a SILENTLY WRONG build rather than an error --
+#   1. libaxl.a's mtime was newer than its .o files, so `ar rcs` was skipped
+#      and the newly-compiled mbedtls objects were never archived: a
+#      "TLS-enabled" libaxl.a missing every TLS symbol.
+#   2. tool .efis were newer than the OLD libaxl.a, so make computed them
+#      up-to-date at startup and never re-linked them against the new one.
+#      Observed 2026-05-04: fetch.efi 22:23, libaxl.a 22:25.
 #
-#   1. libaxl.a from a previous AXL_TLS=0 run has its mtime AFTER all
-#      its .o files, so make sees it as up-to-date and skips the
-#      `ar rcs` step — the new mbedtls .o files never get archived.
-#      Result: a "TLS-enabled" libaxl.a that's missing every TLS
-#      symbol, silently produces non-TLS tool binaries.
+# THE TOGGLE IS GONE -- mbedTLS compiles unconditionally -- BUT THE MECHANISM
+# STAYS, because the same two failure modes follow from the inputs that remain:
+# a change in CFLAGS/CXXFLAGS/INCLUDES (how objects compile) or in CC/CXX
+# (which compiler emits them). Objects do not depend on the Makefile, so
+# editing CFLAGS_BASE used to rebuild NOTHING; that produced four wrong
+# readings while the stack protector was added, including "0 objects
+# instrumented" on a build whose command line plainly carried the flag.
+# CC/CXX joined after `AXL_X64_GXX=... AXL_CPP=1 make` reused host-g++ objects
+# and a full suite "with the bare-metal toolchain" silently measured the host
+# one.
 #
-#   2. Tool .efi files from a previous run can be NEWER than the old
-#      libaxl.a. With AXL_TLS=1 added, libaxl.a will be rebuilt
-#      mid-make to a later mtime, but make computed dep freshness at
-#      startup using OLD libaxl.a mtime — so it concluded the tools
-#      were up-to-date and never re-linked them. End state: tool
-#      .efis older than the libaxl.a they're "linked against." Real
-#      symptom observed 2026-05-04: `fetch.efi` 22:23, libaxl.a 22:25.
-#
-# Both are fixed by detecting the toggle at parse time (before any
-# rule fires) and wiping the artifacts that would be stale. Subsequent
-# rules see a clean build tree and rebuild correctly. A make-time
-# state change is rare enough that the wipe cost is acceptable.
+# Detection happens at parse time, before any rule fires, and wipes what would
+# be stale. A state change is rare enough that the wipe cost is acceptable.
 # Only act on the toggle when the user is actually building something.
 # `make clean*` and `make help` shouldn't trip the state-change wipe,
 # nor write the state file (we don't want a clean-tools call to alter
 # the recorded state and confuse the next real build).
 # The pure-lint gates build no libaxl.a and leave no binary that could go stale
-# against its ABI, but they run WITHOUT AXL_TLS — so a bare `make <gate>` after
-# an AXL_TLS=1 build reads TLS_STATE=off, sees the toggle, and WIPES the TLS
-# tree (out/native-<arch>), forcing a full rebuild. Exclude them (like
-# clean/help) so a lint neither wipes the tree nor rewrites the recorded state
-# to confuse the next real build.
+# against its ABI. They are still excluded (like clean/help) so a lint neither
+# wipes the tree nor rewrites the recorded state to confuse the next real
+# build: a gate invoked with different flags than the neighbouring build would
+# otherwise read as a state change.
 #
 # Missing one of these is not a slow rebuild, it is a DATA RACE: verify.sh runs
 # its make job CONCURRENTLY with both arch builds, so an unexcluded gate deletes
@@ -1256,7 +1257,7 @@ print-lint-gates-artifact:
 # it can stop once anything else needs a second copy.
 #
 # `$(info)`, not `@echo '$($*)'`, and NOT a style choice: the value goes
-# straight to stdout without a shell seeing it. Under AXL_TLS=1, CFLAGS carries
+# straight to stdout without a shell seeing it. CFLAGS carries
 # -DMBEDTLS_CONFIG_FILE='<axl-mbedtls-config.h>', whose embedded quotes CLOSE
 # the echo argument and leave `<axl-mbedtls-config.h>` as a redirect --
 # `print-CFLAGS` then died with "No such file or directory" and named neither
@@ -1365,10 +1366,25 @@ NONCLEAN_GOALS := $(filter-out clean clean-all clean-tools help check-version \
     print-% $(LINT_GATES),\
     $(or $(MAKECMDGOALS),all))
 
-# The recorded state is a SIGNATURE, not just the AXL_TLS toggle, because two
-# different things invalidate the objects and only one of them was covered:
+# mbedTLS is a git submodule and is now REQUIRED. It used to be optional, so a
+# clone without --recursive still built -- without TLS -- and the missing
+# submodule went unnoticed until something needed it. Fail with the one command
+# that fixes it, rather than with a hundred missing-header errors from a
+# pattern rule that cannot say what is actually wrong.
 #
-#   AXL_TLS  changes WHICH sources compile (mbedtls joins LIB_SOURCES).
+# Gated on NONCLEAN_GOALS, and placed after it for that reason: `make clean`
+# and `make help` must still work in a fresh clone, which is exactly the state
+# someone hitting this will be in.
+ifneq ($(NONCLEAN_GOALS),)
+ifeq ($(wildcard deps/mbedtls/library/aes.c),)
+$(error deps/mbedtls is empty -- mbedTLS is a REQUIRED submodule. Run: git submodule update --init --recursive)
+endif
+endif
+
+# The recorded state is a SIGNATURE. It began as the AXL_TLS toggle alone, and
+# grew because that covered only one of the things that invalidate objects.
+# The toggle itself is gone (mbedTLS is unconditional); what it signs now is:
+#
 #   CFLAGS   changes HOW they compile -- and an object does NOT depend on the
 #            Makefile, so editing CFLAGS_BASE rebuilds NOTHING. `make` prints
 #            the new flags on the one file it happens to recompile and leaves
@@ -1390,9 +1406,10 @@ NONCLEAN_GOALS := $(filter-out clean clean-all clean-tools help check-version \
 # protector was being added, including "0 objects instrumented" on a build
 # whose command line plainly carried -fstack-protector-strong, and a sabotage
 # that looked UNDETECTED because the restored source was never rebuilt. It is
-# the same failure mode as the AXL_TLS toggle -- stale objects that make
-# believes are current -- so it gets the same treatment rather than a second
-# mechanism.
+# the same failure mode the AXL_TLS toggle used to cause -- stale objects that
+# make believes are current -- so it gets the same treatment rather than a
+# second mechanism. That shared failure mode is why removing the toggle did not
+# remove the wipe.
 #
 # BUILD (DEBUG/RELEASE) is already isolated: it selects its own PREFIX, so the
 # two never share objects. ARCH likewise.
@@ -1455,27 +1472,30 @@ endif
 $(shell mkdir -p $(BUILDDIR))
 $(file >$(BUILDDIR)/.axl-flags,$(CC) $(CXX) $(AXL_CXXRT_CC) $(CROSS) $(CFLAGS) $(CXXFLAGS) $(INCLUDES))
 BUILD_FLAG_SIG := $(shell sha256sum $(BUILDDIR)/.axl-flags | cut -c1-12)
-TLS_STATE := tls=$(if $(AXL_TLS),on,off) flags=$(BUILD_FLAG_SIG)
-TLS_STATE_FILE := $(BUILDDIR)/.axl-build-state
-PREV_TLS_STATE := $(shell cat $(TLS_STATE_FILE) 2>/dev/null)
+# Was `tls=on/off flags=...`. mbedTLS is unconditional now, so the TLS input is
+# gone -- but THE WIPE ITSELF STAYS. It still signs the two inputs that made it
+# worth building: which FLAGS an object was compiled with, and which COMPILER
+# emitted it. Both have produced wrong readings before (see the notes above).
+BUILD_STATE := flags=$(BUILD_FLAG_SIG)
+BUILD_STATE_FILE := $(BUILDDIR)/.axl-build-state
+PREV_BUILD_STATE := $(shell cat $(BUILD_STATE_FILE) 2>/dev/null)
 
-ifneq ($(TLS_STATE),$(PREV_TLS_STATE))
-ifneq ($(PREV_TLS_STATE),)
-$(info build state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, libaxl.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage and stale-flag objects)
+ifneq ($(BUILD_STATE),$(PREV_BUILD_STATE))
+ifneq ($(PREV_BUILD_STATE),)
+$(info build state changed: $(PREV_BUILD_STATE) -> $(BUILD_STATE); wiping .o, libaxl.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage and stale-flag objects)
 # Wipe everything that links against libaxl.a. The earlier targeted
 # wipe missed test binaries (which live at $(PREFIX)/AxlTest*.efi —
 # root of PREFIX, not tools/) AND example binaries (hello.efi,
 # driver.efi, etc., also root of PREFIX). A test-binary built
-# against the old AXL_TLS state links OK against the new libaxl.a
-# (no undefined symbols — axl_tls_* has stub fallbacks) but its
-# struct ABI (fence sizes, debug fill, struct layout for
-# TLS-aware structs like AxlHttpServer) mismatches the library's,
+# against different FLAGS links OK against the new libaxl.a
+# (no undefined symbols) but its struct ABI (fence sizes, debug
+# fill, struct layout) mismatches the library's,
 # producing baffling failures like "alloc fill 0xDA" tripping on
 # freshly-malloced memory. Blanket-wipe everything that could
 # reference the libaxl.a ABI; rebuilds are cheap.
 $(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/lib/libaxl-cxxrt.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.efi $(PREFIX)/drivers/*.so)
 endif
-$(shell mkdir -p $(BUILDDIR) && echo $(TLS_STATE) > $(TLS_STATE_FILE))
+$(shell mkdir -p $(BUILDDIR) && echo $(BUILD_STATE) > $(BUILD_STATE_FILE))
 endif
 endif
 
@@ -2424,10 +2444,8 @@ $(BUILDDIR)/axl-compress-lzma.o: INCLUDES += -Ideps/lzma
 $(BUILDDIR)/%.o: deps/libvterm/src/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -Ideps/libvterm -Ideps/libvterm/src -c $< -o $@
 
-ifdef AXL_TLS
 $(BUILDDIR)/%.o: deps/mbedtls/library/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
-endif
 
 # Host tool: pe-set-debug (built with host compiler, not cross-compiler)
 $(PE_SET_DEBUG): scripts/pe-set-debug.c | $(BUILDDIR)
@@ -3035,7 +3053,8 @@ $(BUILDDIR)/time-settime-selftest.o: test/integration/time-settime-selftest.c | 
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # Build http-plain-selftest.efi — a plain-HTTP-only client that references no
-# TLS. With AXL_TLS=1 it must link WITHOUT mbedTLS (test-tls-strippable.sh).
+# TLS. It must link WITHOUT mbedTLS (test-tls-strippable.sh) -- the invariant
+# that lets mbedTLS be compiled unconditionally.
 http-plain-selftest: $(PREFIX)/http-plain-selftest.efi
 	@echo "  Built: $(PREFIX)/http-plain-selftest.efi"
 
@@ -4047,7 +4066,7 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
         AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart \
         AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p \
-        AxlTestJsonConformance AxlTestJsonCorpus
+        AxlTestJsonConformance AxlTestJsonCorpus AxlTestSsh
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -4104,13 +4123,14 @@ $(eval $(call BUILD_TEST,AxlTestAuth,axl-test-auth))
 $(eval $(call BUILD_TEST,AxlTestFw,axl-test-fw))
 $(eval $(call BUILD_TEST,AxlTest9p,axl-test-9p))
 $(eval $(call BUILD_TEST,AxlTestJsonConformance,axl-test-json-conformance))
+$(eval $(call BUILD_TEST,AxlTestSsh,axl-test-ssh))
 $(eval $(call BUILD_TEST,AxlTestJsonCorpus,axl-test-json-corpus))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool axbench kbtune netload lsproto cut tr
+TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool axbench kbtune netload lsproto cut tr lsacpi
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: all $(TOOL_EFIS) $(PREFIX)/tools/kbtune-drv.efi $(PREFIX)/tools/fbcon.efi $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi $(PREFIX)/tools/9p.efi

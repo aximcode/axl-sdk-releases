@@ -19,7 +19,8 @@ Headers:
 - `<axl/axl-http-core.h>` — Low-level HTTP/1.1 parsing (shared by server + client)
 - `<axl/axl-http-server.h>` — HTTP server
 - `<axl/axl-http-client.h>` — HTTP client
-- `<axl/axl-tls.h>` — TLS support (optional, requires `AXL_TLS=1`)
+- `<axl/axl-tls.h>` — TLS support (compiled into every build; call
+  `axl_tls_init()` to activate it)
 
 ## Overview
 
@@ -810,7 +811,8 @@ if (axl_http_get(c, "http://192.168.1.1:8080/api/status", &resp) == 0) {
 }
 ```
 
-HTTPS URLs are automatically detected when built with `AXL_TLS=1`.
+HTTPS URLs are detected automatically; call `axl_tls_init()` once at
+startup so the client has a TLS backend to use.
 
 ### Async HTTP client
 
@@ -845,12 +847,15 @@ remain available and unchanged.
 
 ## TLS (HTTPS)
 
-Optional TLS 1.2 support using [mbedTLS](https://github.com/Mbed-TLS/mbedtls)
-3.6. Provides HTTPS server/client, self-signed certificate generation,
-and transparent TCP encryption.
+TLS 1.2 support using [mbedTLS](https://github.com/Mbed-TLS/mbedtls) 3.6.
+Provides HTTPS server/client, self-signed certificate generation, and
+transparent TCP encryption.
 
-**Build requirement**: `make AXL_TLS=1` (adds ~200KB to the binary).
-Without this flag, all TLS functions return -1/NULL/false.
+**Compiled into every build.** There is no build flag: mbedTLS is an
+unconditional dependency, and `--gc-sections` keeps the TLS stack out of
+any image that never calls `axl_tls_init()`. What activates TLS is that
+call, not a compile-time toggle — a client or server that never makes it
+refuses `https://` at runtime.
 
 Header: `<axl/axl-tls.h>`
 
@@ -929,3 +934,32 @@ AXL provides entropy via:
 - The software entropy fallback is **not cryptographically strong**.
   For production use on hardware without an RNG, consider providing
   your own entropy source.
+
+## Public-Key Cryptography (AxlCrypto)
+
+Header: `<axl/axl-crypto.h>`
+
+`axl_pk_key_new` / `_sign` / `_verify` / `_load_private` / `_load_public`
+generate, sign, and verify keys for ECDSA P-256 (SHA-256), ECDSA P-384
+(SHA-384), and RSA (PKCS#1 v1.5 over SHA-256). ECDSA signatures use
+either fixed-width raw `r||s` (what SSH/JWS/COSE expect) or ASN.1 DER;
+RSA has a single encoding, so the format selector is ignored for it.
+`axl_pk_verify` is a lower-level, one-shot form that verifies a
+detached signature straight from a DER public key, with no key handle
+involved.
+
+### Provider seam
+
+Internally, `AxlPkKey` dispatches through a per-algorithm vtable
+(`AxlPkProvider`, `src/net/axl-pk-provider.h`) instead of assuming
+every key is an mbedTLS one — mbedTLS 3.6.3 has no Ed25519 support at
+all, so a future Ed25519 provider cannot share the same
+`mbedtls_pk_context` the ECDSA/RSA algorithms use.
+
+One provider (`src/net/axl-pk-mbedtls.c`) serves ECDSA P-256, ECDSA
+P-384, and RSA — they differ only by curve/key type, which the key
+itself carries. Ed25519 is reached through a **weak symbol**: an image
+that never links an Ed25519 provider pays nothing for it, because the
+symbol resolves to a NULL address rather than pulling in the
+provider's ~30 KB precomputed base-point table. `axl_pk_alg_available`
+reports which algorithms are actually linked into the current image.

@@ -42,8 +42,10 @@ SHA=$(git rev-parse "${TARGET}^{commit}" 2>/dev/null) || {
 }
 
 # Which workflows must appear AND succeed before we render a verdict.
-# A MAJOR tag push triggers Release + Docs (a minor/patch tag triggers only
-# Release); CI is NOT triggered by tags — it is dispatched + watched on main
+# EVERY `v*` tag triggers Release + Docs -- docs.yml's trigger is
+# `push: tags: ['v*']` with no version filter. (This said "a MAJOR tag push
+# triggers Release + Docs, a minor/patch only Release", which meant a minor
+# release never WAITED for Docs at all.) CI is NOT triggered by tags — it is dispatched + watched on main
 # BEFORE tagging (see docs/RELEASING.md §4b). Their check suites are created at
 # slightly different times, so an early snapshot can contain only the
 # fast/finished one (e.g. Docs) while Release is still spinning up. If we judged
@@ -102,8 +104,29 @@ while [[ $terminal -eq 0 ]]; do
     [[ ${#missing[@]} -gt 0 ]] && echo "  waiting for: ${missing[*]}"
     echo
 
+    # ONLY THE EXPECTED WORKFLOWS GATE. Others on this SHA are reported and
+    # ignored, and the distinction is worth 69% of a cut: measured on v4.3.1,
+    # Release finished at 4m02s and Docs at 5m02s, then this loop sat on CI for
+    # another 11m05s of a 16m07s run.
+    #
+    # CI is not started by the tag -- it is started by the `git push origin
+    # main` cut-release.sh performs two steps earlier -- and it re-runs the same
+    # integration suite the LOCAL uncached gate already certified on that exact
+    # commit. It also finishes long after the tag is pushed and the release is
+    # published, so blocking on it cannot prevent anything; it only delays the
+    # human and, when red, mislabels a successful release (v4.3.0 published all
+    # 8 assets and reported RELEASE_VERDICT: FAIL for a CI container defect).
+    gating=$(printf '%s\n' "$res" | awk -F'\t' -v ws="${EXPECTED[*]}" '
+        BEGIN { n = split(ws, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        NF && ($1 in want)')
+    other=$(printf '%s\n' "$res" | awk -F'\t' -v ws="${EXPECTED[*]}" '
+        BEGIN { n = split(ws, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        NF && !($1 in want)')
+    [[ -n "$other" ]] && printf '  (not gating this cut: %s)\n' \
+        "$(printf '%s\n' "$other" | awk -F'\t' '{printf "%s=%s ", $1, ($3=="-"?$2:$3)}')"
+
     running=false
-    echo "$res" | grep -qE "QUEUED|IN_PROGRESS" && running=true
+    [[ -n "$gating" ]] && grep -qE "QUEUED|IN_PROGRESS" <<<"$gating" && running=true
 
     if ! $running && [[ ${#missing[@]} -eq 0 ]]; then
         terminal=1
@@ -127,11 +150,17 @@ done
 # than rely on $?. Use `set -o pipefail` in the caller's shell if
 # you want the original exit to propagate through pipelines.
 echo
-if echo "$res" | awk -F'\t' '{print $3}' | grep -qvE "^SUCCESS$"; then
-    echo "FAIL — at least one workflow did not succeed."
+if printf '%s\n' "$gating" | awk -F'\t' 'NF {print $3}' | grep -qvE "^SUCCESS$"; then
+    echo "FAIL — a workflow this tag is responsible for did not succeed."
     echo "RELEASE_VERDICT: FAIL"
     exit 1
 fi
-echo "All workflows green."
+if [[ -n "$other" ]]; then
+    echo "Not gating this cut (reported only, does not gate the release):"
+    printf '%s\n' "$other" | column -ts $'\t' | sed 's/^/  /'
+    echo "  These are not started by the tag. A red one is worth reading —"
+    echo "  'gh run list' — but it cannot un-publish a release that is already out."
+fi
+echo "Expected workflows green: ${EXPECTED[*]}."
 echo "RELEASE_VERDICT: PASS"
 exit 0

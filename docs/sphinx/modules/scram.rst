@@ -28,8 +28,8 @@ agt, or a test driver — including verifying the server's signature for
 mutual authentication. It holds the password only for the exchange and
 never sends it.
 
-Built on the dependency-free digest / HMAC / PBKDF2 / base64 / RNG
-primitives — available in every build (no ``AXL_TLS`` required).
+Built on the digest / HMAC / PBKDF2 / base64 / RNG primitives, all of
+which compute using AXL's own SHA-256 implementation.
 
 API Reference
 -------------

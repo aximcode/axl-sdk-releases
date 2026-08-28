@@ -3,9 +3,10 @@
 
 /** @file axl-digest.h
  *
- * Message digest checksums: MD5, SHA-1, SHA-256. Mirrors GLib's
- * GChecksum API. Standalone implementations with no external
- * dependencies (works without AXL_TLS=1).
+ * Message digest checksums: MD5, SHA-1, SHA-256, SHA-512. Mirrors
+ * GLib's GChecksum API. MD5/SHA-1/SHA-256 are standalone
+ * implementations with no external dependencies; SHA-512 forwards to
+ * mbedTLS, which compiles into every build.
  *
  * One-shot:
  * @code
@@ -41,7 +42,8 @@ extern "C" {
 typedef enum {
     AXL_CHECKSUM_MD5    = 0,  /**< MD5 (128-bit / 16-byte digest) */
     AXL_CHECKSUM_SHA1   = 1,  /**< SHA-1 (160-bit / 20-byte digest) */
-    AXL_CHECKSUM_SHA256 = 2   /**< SHA-256 (256-bit / 32-byte digest) */
+    AXL_CHECKSUM_SHA256 = 2,  /**< SHA-256 (256-bit / 32-byte digest) */
+    AXL_CHECKSUM_SHA512 = 3   /**< SHA-512 (512-bit / 64-byte digest) */
 } AxlChecksumType;
 
 typedef struct AxlChecksum AxlChecksum;
@@ -97,14 +99,19 @@ axl_checksum_get_string(
  * @brief Get the raw digest bytes.
  *
  * Writes the binary digest into @p buf. On entry, @p *len is the
- * buffer size; on return, it is set to the digest length. After
- * this call, axl_checksum_update() must not be called.
+ * buffer size; on return, it is the number of bytes actually
+ * written — `min(buffer size, digest length)`. A buffer shorter
+ * than the digest receives a truncated prefix and @p *len reports
+ * that shorter count, so the caller never sees a length it did not
+ * receive. Size the buffer with axl_checksum_type_get_length() to
+ * get the whole digest. After this call, axl_checksum_update() must
+ * not be called.
  */
 void
 axl_checksum_get_digest(
     AxlChecksum *cs,   ///< checksum context
     uint8_t     *buf,  ///< output buffer
-    size_t      *len   ///< [in/out] buffer size / digest length
+    size_t      *len   ///< [in/out] buffer size / bytes written
 );
 
 /**
@@ -175,9 +182,10 @@ axl_compute_checksum_digest(
  * @ref axl-scram.h) or deriving a key from a passphrase: a high
  * @p iterations makes brute-forcing the stored value expensive.
  *
- * Layered on the dependency-free @ref axl-hmac.h, so it works in every
- * build (no AXL_TLS required). The output is deterministic and
- * RFC-conformant regardless of how the library was configured.
+ * Layered on HMAC-SHA256 (@ref axl-hmac.h), which computes using only
+ * AXL's own SHA-256 implementation. The output is deterministic and
+ * RFC-conformant regardless of how the library was configured, and
+ * identical byte-for-byte across every build.
  *
  * @return AXL_OK on success; AXL_INVALID if @p iterations is 0,
  *     @p out_len is 0, @p out is NULL, or a length argument is non-zero

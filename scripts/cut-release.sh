@@ -221,6 +221,13 @@ tag_and_publish() {
         --json name,tagName,isDraft,assets \
         --jq '.name, .tagName, ("draft=" + (.isDraft|tostring)), ("assets=" + (.assets|length|tostring))'
     say "$TAG is live on $RELEASES_REPO. Done."
+    # The bump changed include/axl/axl-version.h, so the staged SDK under
+    # ./stage is now stale BY CONSTRUCTION -- every cut does this. Say it here,
+    # because otherwise the next `run-integration.sh` discovers it ~30 s in,
+    # refuses, and costs a round trip that nobody chose.
+    note ""
+    note "NOTE: the version bump makes the staged SDK stale. Before the next"
+    note "      suite run:  ./scripts/install.sh --arch all --cpp"
 }
 
 # --------------------------------------------------------------------------

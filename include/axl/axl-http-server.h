@@ -719,7 +719,7 @@ axl_http_accepts(
  *
  * After this call, all accepted connections use TLS. The cert and
  * key can be generated with axl_tls_generate_self_signed().
- * Requires AXL_TLS=1 at build time.
+ * Requires axl_tls_init() to have succeeded at startup.
  *
  * @return AXL_OK on success, AXL_ERR if TLS not available or cert/key invalid.
  */

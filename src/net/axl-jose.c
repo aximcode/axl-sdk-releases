@@ -24,84 +24,9 @@
 bool
 axl_jose_available(void)
 {
-#ifdef AXL_HAVE_TLS
     return true;
-#else
-    return false;
-#endif
 }
 
-#ifndef AXL_HAVE_TLS
-
-// ===================================================================
-// Stub — JOSE not compiled in (fail-closed).
-// ===================================================================
-
-int
-axl_jws_sign(const AxlJoseKey *key, AxlJoseAlg alg,
-             const uint8_t *payload, size_t payload_len, char **token_out)
-{
-    (void)key; (void)alg; (void)payload; (void)payload_len; (void)token_out;
-    return AXL_ERR;
-}
-
-int
-axl_jws_verify(const char *token, size_t token_len, const AxlJoseKey *key,
-               const AxlJoseAlg *allowed, size_t n_allowed,
-               uint8_t **payload_out, size_t *payload_len_out)
-{
-    (void)token; (void)token_len; (void)key; (void)allowed; (void)n_allowed;
-    (void)payload_out; (void)payload_len_out;
-    return AXL_ERR;
-}
-
-int
-axl_jwt_verify(const char *token, size_t token_len, const AxlJoseKey *key,
-               const AxlJoseAlg *allowed, size_t n_allowed,
-               const AxlJwtPolicy *policy,
-               uint8_t **payload_out, size_t *payload_len_out,
-               AxlJsonReader *claims_out)
-{
-    (void)token; (void)token_len; (void)key; (void)allowed; (void)n_allowed;
-    (void)policy; (void)payload_out; (void)payload_len_out; (void)claims_out;
-    return AXL_ERR;
-}
-
-AxlPkKey *
-axl_jwk_parse(const char *json, size_t len, char **kid_out, AxlJoseAlg *alg_out)
-{
-    (void)json; (void)len; (void)kid_out; (void)alg_out;
-    return NULL;
-}
-
-AxlJwks *
-axl_jwks_parse(const char *json, size_t len)
-{
-    (void)json; (void)len;
-    return NULL;
-}
-
-const AxlPkKey *
-axl_jwks_find(const AxlJwks *set, const char *kid)
-{
-    (void)set; (void)kid;
-    return NULL;
-}
-
-void
-axl_jwks_free(AxlJwks *set)
-{
-    (void)set;
-}
-
-char *
-axl_jwk_export_public(const AxlPkKey *key, const char *kid)
-{
-    (void)key; (void)kid;
-    return NULL;
-}
-
-#else  /* AXL_HAVE_TLS */
 
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -897,4 +822,3 @@ axl_jwk_export_public(const AxlPkKey *key, const char *kid)
     return json;
 }
 
-#endif /* AXL_HAVE_TLS */

@@ -35,8 +35,8 @@
  * is initialized in two binaries (foreground app + driver image),
  * the option struct's layout must match across both. Build both
  * from the same source tree with identical compile flags
- * (AXL_TLS, AXL_MEM_DEBUG, arch). The Makefile's AXL_TLS state
- * detection only catches AXL-internal struct shifts; it cannot
+ * (AXL_MEM_DEBUG, arch, anything reaching CFLAGS). The Makefile's
+ * build-state signature only catches AXL-internal shifts; it cannot
  * see consumer struct shifts caused by toggling the consumer's
  * own conditional fields.
  */
