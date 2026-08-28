@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=40 local-only=0
+# test-meta: arch=both needs= est=110 local-only=0
 # test-crashhandler.sh -- end-to-end test for the CrashHandler DXE driver
 # (drivers/crashhandler) + CrashTest app (tools/crashtest.c).
 #
@@ -7,9 +7,24 @@
 # reboots, and verifies the crash record round-trips: NVRAM capture on
 # boot 1 -> crash-report.txt written on boot 2 -> idempotent re-load.
 #
-# x64 AND aa64. Auxiliary: opt out of the test-axl.sh pass-count ratchet
-# (it boots QEMU several times with its own PASS/FAIL accounting, not the
-# guest-emitted PASS:/FAIL: lines the ratchet counts).
+# x64 AND aa64 -- and the `arch=` above said x64 for as long as the header has
+# existed. It was set by the bulk commit that introduced the parallel runner
+# and never revisited, while this file's per-arch branches (WANT_EXC / PC_REG,
+# and the aa64 register spellings they select) only make sense if the aa64 leg
+# runs. So aa64 was written for, documented, and then never scheduled.
+#
+# Measured before flipping it, on this box, three runs: x64 41s / 23 passed,
+# aa64 108s and 109s / 23 passed each. `est=` now carries the aa64 number
+# because it is the one that unbalances a shard when it is wrong, and the
+# figure is a single field shared by both legs.
+#
+# No CI cost: ci.yml runs the integration suite `--arch X64` only, so this
+# schedules the aa64 leg for local runs (`run-integration.sh --arch AARCH64`)
+# and nothing else. The default --timeout is 900s, comfortably above 110.
+#
+# Auxiliary: opt out of the test-axl.sh pass-count ratchet (it boots QEMU
+# several times with its own PASS/FAIL accounting, not the guest-emitted
+# PASS:/FAIL: lines the ratchet counts).
 #
 # IMPORTANT: this test must run QEMU WITHOUT KVM. CrashHandler installs a
 # UEFI exception handler that only fires under software emulation (TCG);
@@ -246,6 +261,140 @@ fi
 grep -q "Loaded Images:" "$LOG2" \
     && pass "Crash report contains loaded image table" \
     || fail "Loaded image table not in crash report"
+
+# --- Test 2b: the report decodes with rsod-decode.py -----------------------
+#
+# The report's LAST LINE is a rsod-decode.py command line for the reader to
+# run. That makes the writer and the decoder a pair, and nothing checked the
+# pair: rsod-decode could not read this format at all -- it took the registers
+# and the faulting PC, then ignored the `Image:` line stating the load base,
+# the whole `Loaded Images:` table, and every frame of the `Stack Trace:`
+# section. The advice printed at the bottom of every crash report was for a
+# decoder that had to be told the base by hand and then answered with one
+# frame.
+#
+# This is also the only place in the tree where the decoder meets a REAL
+# crash: real registers from a real exception, real frames, and a .so with
+# real DWARF, on whichever arch is under test. The host-only suite
+# (test-rsod-decode-pe-map.sh) has to synthesize all of that.
+echo "Test 2b: Decode the crash report"
+REPORT="$TEST_TMPDIR/crash-report.txt"
+# The report is `type`d between these two markers by the boot-2 startup.nsh.
+report_text | sed -n '/^REPORT_FOUND/,/^=== DONE ===/p' | sed -e '1d' -e '$d'     > "$REPORT"
+
+DEBUG_SO="$(test_build_dir "$ARCH_LC")/tools/crashtest.so"
+DECODED="$TEST_TMPDIR/decoded.txt"
+if [[ ! -s "$REPORT" ]]; then
+    fail "crash report extracted from the boot log" "$LOG2"
+elif [[ ! -f "$DEBUG_SO" ]]; then
+    fail "crashtest.so (DWARF) present at $DEBUG_SO"
+else
+    pass "crash report extracted from the boot log"
+    # NO :BASE and no --base. The report states the load base three times over
+    # (the `Image:` line, the `Loaded Images:` table, the printed command) and
+    # having to supply it by hand is the defect, not the interface.
+    # Strip ANSI before asserting: the report is decoded for a terminal, and a
+    # `^Image 0:` anchor does not match a line that starts with a colour escape.
+    if timeout 120 python3 "$PROJECT_DIR/scripts/rsod-decode.py" \
+            --image "$DEBUG_SO" --rsod "$REPORT" --detail \
+            > "$DECODED.raw" 2>"$DECODED.err"; then
+        pass "rsod-decode.py exits 0 on the report"
+    else
+        fail "rsod-decode.py failed on the report" "$DECODED.err"
+    fi
+    sed -e 's/\x1b\[[0-9;]*m//g' "$DECODED.raw" > "$DECODED"
+
+    # The crash is a deliberate #UD in trigger_invalid_opcode(); resolving the
+    # faulting frame to that name is the end-to-end claim -- the report's base,
+    # the decoder's arithmetic and the .so's DWARF all have to agree for it.
+    if grep -q 'trigger_invalid_opcode' "$DECODED"; then
+        pass "faulting frame resolves to trigger_invalid_opcode"
+    else
+        fail "faulting frame not resolved to trigger_invalid_opcode" "$DECODED"
+    fi
+
+    # The base must come from the report, not from a guess.
+    if grep -qE '^Image 0:.*base=0x[0-9a-f]+' "$DECODED"; then
+        pass "load base inferred from the report (no :BASE given)"
+    else
+        fail "load base not inferred from the report" "$DECODED"
+    fi
+
+    # More than the seeded faulting PC: the report carries a real frame list,
+    # so the decoder must render it rather than fall back to a one-frame trace.
+    DFRAMES=$(grep -cE '^  #[0-9]+ ' "$DECODED" || true)
+    if [[ "$DFRAMES" -ge 5 ]]; then
+        pass "decoded backtrace has $DFRAMES frames"
+    else
+        fail "decoded backtrace: $DFRAMES frames, want >= 5" "$DECODED"
+    fi
+
+    # Every register the report prints must survive into the decode. report.c
+    # padded short names for column alignment (`R8 =`, and `X0 =`..`X9 =`,
+    # `FP =` on aa64) while every consumer scans for NAME=VALUE, so those were
+    # dropped silently -- ten of the X registers on aa64. Producer and consumer
+    # are both in this tree, and nothing compared them until now.
+    case "$TEST_ARCH" in
+        X64)     WANT_REGS="R8 R9 RAX RIP" ;;
+        AARCH64) WANT_REGS="X0 X8 FP LR ELR" ;;
+    esac
+    MISSING=""
+    for r in $WANT_REGS; do
+        grep -qE "(^| )$r 0x" "$DECODED" || MISSING="$MISSING $r"
+    done
+    if [[ -z "$MISSING" ]]; then
+        pass "every padded register name survives the decode ($WANT_REGS)"
+    else
+        fail "registers dropped by the decoder:$MISSING" "$DECODED"
+    fi
+
+    # The image the report describes IS the image we handed over, so the
+    # wrong-image gates must stay silent. A validator that cries wolf on the
+    # correct binary is worse than none.
+    if grep -q 'IMAGE DOES NOT MATCH' "$DECODED"; then
+        fail "correct image wrongly flagged as mismatched" "$DECODED"
+    else
+        pass "correct image raises no mismatch warning"
+    fi
+
+    # RUN THE COMMAND THE REPORT PRINTS, rather than a command that happens to
+    # work. The last line of every crash report is advice, and advice that was
+    # never executed is how it came to name a flag (`--file`) and an artifact
+    # (`<build>/<name>`, the stripped .efi) that would not have got the reader
+    # where they were going. Substituting the build directory for the
+    # `<build>/` placeholder is the only edit a reader would not have to make.
+    HINT=$(sed -n 's|^  rsod-decode\.py |&|p' "$REPORT" | head -1)
+    if [[ -z "$HINT" ]]; then
+        fail "report prints a rsod-decode.py command" "$REPORT"
+    else
+        pass "report prints a rsod-decode.py command"
+        # It must name the ELF that HAS the DWARF, and must not have pasted
+        # `.so` onto a name that already ends in `.efi`.
+        if grep -qE -- '--image <build>/[A-Za-z0-9_-]+\.so( |$)' <<<"$HINT"; then
+            pass "printed command names a .so, not the stripped .efi"
+        else
+            fail "printed command names the wrong artifact: $HINT"
+        fi
+
+        # Now RUN it. Only the image path is substituted -- that is the single
+        # edit a reader must make, since `<build>/` is a placeholder and the
+        # loaded name need not match the build artifact's. Everything else
+        # (the flag spellings, the ordering) is executed exactly as printed,
+        # which is what would have caught `--file` had it ever been run.
+        HINT_ARGS=$(sed -E "s#--image <build>/[A-Za-z0-9_.-]+#--image $DEBUG_SO#" \
+                    <<<"${HINT#  rsod-decode.py }")
+        HINT_OUT="$TEST_TMPDIR/hint.txt"
+        # shellcheck disable=SC2086  # deliberate: the printed line IS the argv
+        if ( cd "$TEST_TMPDIR" \
+             && timeout 120 python3 "$PROJECT_DIR/scripts/rsod-decode.py" $HINT_ARGS ) \
+                > "$HINT_OUT" 2>&1 \
+             && grep -q 'trigger_invalid_opcode' "$HINT_OUT"; then
+            pass "the command the report prints actually decodes it"
+        else
+            fail "the printed command did not decode the report" "$HINT_OUT"
+        fi
+    fi
+fi
 
 # --- Test 3: idempotency (fresh NVRAM, double load) ------------------------
 echo "Test 3: Idempotency"

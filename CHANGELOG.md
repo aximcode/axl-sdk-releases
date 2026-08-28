@@ -3,6 +3,188 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.3.2 — 2026-08-27
+### Fixed
+
+- **`rsod-decode.py` could not do the MSVC PE + `.map` workflow, and said
+  nothing about it.** A consumer decoding a real crash — a UEFI application
+  built with MSVC, shipped as a PE with a linker map beside it, no ELF, no
+  `.debug`, no PDB, arriving as a whole PuTTY capture — hit eight separate gaps
+  in one afternoon. Symbol resolution was never the problem: given the right
+  image the tool resolved the faulting function from the map alone and
+  annotated the argument registers to the exact globals. Everything below is
+  the tool getting to that answer on its own.
+
+  - **`--detail` printed no disassembly at all, with no warning.** It drove
+    `nm`/`objdump` against `Image.elf`, which is `""` for a PE with no sibling
+    `.debug`, so both ran on an empty path and the function printed nothing.
+    The faulting instruction *was* the answer — `mov %gs:0x58,%rax` — and
+    `objdump` reads the PE perfectly well. It now falls back to the PE, takes
+    the function start from the map, cuts the listing on an instruction
+    boundary instead of a byte count, and when it genuinely cannot decode
+    anything it says why. `--dump` had the same empty-path defect and now
+    lists map symbols; `--markdown` had it too.
+
+  - **Nothing checked that the image belonged to the dump.** Handed a
+    *different build of the same source*, the tool emitted specific,
+    confident, entirely fictional symbols with no signal anywhere in the
+    output. Two gates now run before any symbol is printed, and a failure is a
+    banner above the report (`image_warnings` in `--json`, a blockquote in
+    `--markdown`): `SizeOfImage` against the size the dump's own loaded-image
+    list records at that base, and whether the faulting PC and each branch
+    record decode to an instruction boundary. On the reported capture all four
+    fire.
+
+  - **`SizeOfImage` was never read from the PE.** The size was hard-coded to
+    `0x20000`, so on a 2 MB image every address past 128 KB was reported as
+    "outside all known images".
+
+  - **Each artifact now stands alone.** A `.map` is accepted as a symbol
+    source (`--map`, or `--image`) — it holds every symbol *and* the preferred
+    load address — and an image alone still disassembles. The load base no
+    longer has to be given: it is inferred from the dump's loaded-image list,
+    the map's `Preferred load address` and the PE `ImageBase`, in that order,
+    so a relocated image resolves against where the firmware actually put it.
+
+  - **The offset printed was the RVA repeated.** Frames, branch records,
+    register annotations and the stack scan now read `Func + 0xA` — how far
+    into the function the fault landed, which is what makes it findable.
+
+  - **The frame-pointer walk guarded only `fp == 0`.** The reported capture's
+    `BP` was *odd*; the walk followed it anyway and printed a fabricated frame
+    under the heading "Stack trace", above the stack scan that had the correct
+    and complete chain. The pointer is now rejected as unusable, and the scan
+    is no longer hidden behind `--detail` when the firmware printed no frame
+    list.
+
+  - **Branch records were parsed and never resolved** — used only to detect
+    the dump format and to OCR-correct their own digits. They are exact and
+    free: on the reported crash the target *was* the faulting function's
+    entry, proving the fault happened on its first call, in the prologue, and
+    the source named the caller with no stack walking at all. Both ends are now
+    resolved and printed.
+
+  Found along the way and fixed: an ELF with a sibling `.map` — what an EDK2
+  build leaves behind — had the map's `Preferred load address` added to an
+  already-absolute ELF address, so the binutils fallback decoded empty space
+  (`gdb` handles that case itself, which is what hid it); an extensionless
+  image registered itself as its own `.map`; absolute map symbols (`__AbsoluteZero` at address 0) sorted
+  ahead of every real symbol and printed as negative RVAs; a map file was
+  re-read and re-parsed once per address (~30 times for one dump); and
+  `--dump` blocked forever reading stdin from any script, since stdin is not a
+  tty there.
+
+- **`rsod-decode.py` read AXL's own crash reports worst of all.**
+  `drivers/crashhandler/report.c` writes a report whose last line tells the
+  reader to run this script — and the script took only the registers and the
+  faulting PC from it (they look like the Dell `REG=VALUE` shape). It ignored
+  the `Image:` line stating the load base, the whole `Loaded Images:` table,
+  and every frame of the `Stack Trace:` section, so the advice printed at the
+  bottom of every crash report was for a decoder that had to be told the base
+  by hand and then answered with a single frame. All three are parsed now: on
+  a real captured crash the same report decodes to a 17-frame backtrace with
+  source lines, base inferred, no `:BASE` given.
+
+  The report's own advice was wrong in two more ways, neither of which anything
+  checked: it named `--file` (renamed below) and it pointed at `<build>/<name>`
+  — the stripped `.efi`, not the `.so` that carries the DWARF. It now prints
+  the `.so`, drops the `:BASE` it no longer needs, and `test-crashhandler.sh`
+  **runs the command the report prints** rather than a command that happens to
+  work. (Appending `.so` to a name that already ends in `.efi` produced
+  `CrashTest.efi.so`, a path that exists nowhere — caught by running it.)
+
+- **A PDB could only be discovered, never named — and the failure was
+  silent.** On MSVC the PDB is the *only* route to source lines
+  (`/MAPINFO:LINES` is `LNK1117: syntax error` on 14.36, so a map cannot carry
+  them). 4.3.2 resolved PDB lines already, but only where `llvm-addr2line`
+  found the file itself, under the absolute build-host path the PE records —
+  in practice its basename, beside the image. Archived release artifacts are
+  renamed per version, so the PDB routinely sat right there, matched and
+  unused, and the report showed `fn + 0x1a` with no line and no reason.
+
+  - **`--pdb FILE`** names one outright, and a `.pdb` is accepted wherever a
+    symbol source is (`--image`, and alone). It overrides discovery.
+  - **A renamed PDB is now found unaided**, by matching the CodeView GUID/age
+    from the PE's debug directory against the PDB's own info stream — an
+    identity that survives renaming, where the filename does not. Both are
+    read directly, so this needs no `llvm-pdbutil`.
+  - **A PDB from a different build is refused and reported**, not trusted. It
+    is the same class of gate as 4.3.2's image/dump validation, and a worse
+    failure to leave open: a mismatched PDB produces specific *source lines*,
+    which are believed precisely because they are specific.
+  - **The report names the symbol sources it used**, and says why line numbers
+    are missing when they are. The three cases — no PDB, PDB present but
+    unmatched, PDB used — were previously distinguishable only by noticing
+    that no line number had appeared.
+
+- **Review pass before the cut, 15 findings, all fixed.** The ones that
+  changed behaviour: a duplicated loaded-image list (a reboot loop writes one
+  per boot) made base inference reject its own answer; a map with no
+  `Preferred load address` sized the image at 5 GB, so `SP` and the flags
+  register were annotated as code; the instruction-boundary gate decoded the
+  PE while computing addresses in ELF space, so it could never fire for an
+  image having both; the tightened map-entry regex dropped every entry
+  carrying MSVC's `i` (import) flag, attributing addresses inside them to the
+  preceding function; AXL's own crash reports produced no exception type and
+  no cause, because the diagnosis engine only speaks EDK2's `0e(#PF)`
+  spelling; and `report.c` padded short register names (`R8 =`, and `X0 =`…
+  `X9 =`, `FP =` on aa64) while every consumer scans for `NAME=VALUE`, so ten
+  aa64 registers were silently dropped from every decode. A `.pdb` given
+  without its image is now refused with a reason rather than accepted and
+  producing an empty report — LLVM cannot symbolize a PDB alone.
+
+### Changed
+
+- **`--file` is now spelled `--rsod`.** `--file` still works everywhere, so
+  existing scripts and muscle memory are unaffected. The help text also states
+  what was never obvious: the argument may be a whole console capture with the
+  dump buried in it, not a pre-trimmed dump.
+
+### Added
+
+- **`test-crashhandler.sh` now decodes the report it produces.** The crash
+  handler and the decoder are a pair — the report ends by naming the decoder —
+  and nothing had ever run the two together. It is also the only place in the
+  tree where the decoder meets a *real* crash: real registers from a real
+  exception, real frames, and a `.so` with real DWARF.
+
+  **Its aa64 leg is now actually scheduled.** The `# test-meta:` header said
+  `arch=x64` from the day it was added — set by the bulk commit that
+  introduced the parallel runner and never revisited — while the file's own
+  comment said "x64 AND aa64" and its per-arch branches only make sense if the
+  aa64 leg runs. It is `arch=both` now, with `est=` corrected from 40 to the
+  measured 110 (x64 41s, aa64 108s and 109s, 23 passed every time). No CI
+  cost: `ci.yml` runs the integration suite `--arch X64` only.
+
+- **`test/integration/test-rsod-decode-pe-map.sh` — 94 host-only checks over a
+  script that had none.** The captured data that exposed all of the above is
+  vendor firmware and cannot live in this repo, so `lib/make-rsod-fixture.py`
+  synthesizes an equivalent: a real PE32+ `objdump` can disassemble, an
+  MSVC-shaped map, and a whole PuTTY capture. Its geometry is chosen to
+  discriminate — the faulting function sits past the old 128 KB guess, the
+  fault lands at entry + 0xA behind a real prologue, `BP` is odd, and the
+  `wrong-build` variant is a genuine near-miss with a different `SizeOfImage`
+  and one byte shifted into the prologue. Every new detector is
+  sabotage-verified. A real MSVC PE+PDB pair cannot be built in this tree, so
+  the synthetic `.pdb` is a valid MSF carrying a CodeView identity and *no line
+  table at all* — enough to exercise every decision about which PDB to use, and
+  deliberately not enough to appear to resolve a line. Line resolution is
+  covered by an opt-in check (`RSOD_PDB_FIXTURE` / `RSOD_PDB_EXPECT`) against a
+  real MSVC corpus, which skips silently when unset rather than baking in a
+  path that exists on one machine only. Every detector is
+  sabotage-verified — including each of the three places a crash report states
+  its load base, where isolating one source needs a fixture with the other two
+  absent, and until that existed two of them passed with the parser
+  deliberately broken. The ELF/DWARF path — which this change did not target and
+  which also had no test — is guarded too, on **both** architectures: an
+  AArch64 `.so` built with the cross gcc, resolved and disassembled through
+  `aarch64-linux-gnu-nm` / `-objdump`, since the decoder names those by prefix
+  and an x64-only suite proves nothing about whether it names them correctly.
+  Those runs hide `gdb` behind a failing shim, which is load-bearing twice
+  over: gdb masks the ELF-plus-`.map` defect entirely, and a gdb that answers
+  nothing is what proves the objdump fallback is reached at all — which a bare
+  `return` used to prevent.
+
 ## 4.3.1 — 2026-08-20
 ### Fixed
 

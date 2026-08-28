@@ -159,7 +159,12 @@ append_single_crash_report(uint8_t *record, size_t record_size)
         REPORT_PRINT("  RCX=%016lX  RDX=%016lX\r\n", (unsigned long)r->rcx, (unsigned long)r->rdx);
         REPORT_PRINT("  RSI=%016lX  RDI=%016lX\r\n", (unsigned long)r->rsi, (unsigned long)r->rdi);
         REPORT_PRINT("  RBP=%016lX  RSP=%016lX\r\n", (unsigned long)r->rbp, (unsigned long)r->rsp);
-        REPORT_PRINT("  R8 =%016lX  R9 =%016lX\r\n", (unsigned long)r->r8, (unsigned long)r->r9);
+        /* `R8=` not `R8 =`: a space before the `=` is not how any register
+           dump spells an assignment, and every consumer that scans for
+           NAME=VALUE -- rsod-decode.py included -- silently dropped these two.
+           The column stays square because the name is padded on the RIGHT of
+           the value instead. */
+        REPORT_PRINT("  R8=%016lX   R9=%016lX\r\n", (unsigned long)r->r8, (unsigned long)r->r9);
         REPORT_PRINT("  R10=%016lX  R11=%016lX\r\n", (unsigned long)r->r10, (unsigned long)r->r11);
         REPORT_PRINT("  R12=%016lX  R13=%016lX\r\n", (unsigned long)r->r12, (unsigned long)r->r13);
         REPORT_PRINT("  R14=%016lX  R15=%016lX\r\n", (unsigned long)r->r14, (unsigned long)r->r15);
@@ -169,10 +174,12 @@ append_single_crash_report(uint8_t *record, size_t record_size)
         AxlCrashRegsAarch64 *r = (AxlCrashRegsAarch64 *)(record + sizeof(AxlCrashRecordHeader));
 
         REPORT_PRINT("  ELR=%016lX   SP=%016lX\r\n", (unsigned long)r->elr, (unsigned long)r->sp);
-        REPORT_PRINT("  FP =%016lX   LR=%016lX\r\n", (unsigned long)r->fp, (unsigned long)r->lr);
+        REPORT_PRINT("  FP=%016lX   LR=%016lX\r\n", (unsigned long)r->fp, (unsigned long)r->lr);
         for (idx = 0; idx < 29; idx += 2) {
             uint64_t *xn = &r->x0;
-            REPORT_PRINT("  X%-2u=%016lX  X%-2u=%016lX\r\n",
+            /* See the x64 note above: `X0 =` cost ten of these registers plus
+               FP on every decoded aa64 report. */
+            REPORT_PRINT("  X%u=%016lX  X%u=%016lX\r\n",
                 idx, (unsigned long)xn[idx],
                 idx + 1, (unsigned long)((idx + 1 < 29) ? xn[idx + 1] : 0));
         }
@@ -222,12 +229,31 @@ append_single_crash_report(uint8_t *record, size_t record_size)
 
     report_append("\r\nDecode with debug symbols:\r\n");
     if (fault_image->base != 0) {
-        REPORT_PRINT("  rsod-decode.py --image <build>/%s:0x%lX "
-                     "--file crash-report.txt\r\n",
-                     fault_image->name, (unsigned long)fault_image->base);
+        /* No :BASE. This report states the load base on the Image: line above
+           and again in the loaded-image table, and rsod-decode reads both --
+           so requiring the reader to copy it back in is make-work. The
+           unattributed branch below still asks for one, because there it is
+           the one thing we genuinely could not determine.
+
+           `.so`, not `.efi`: the ELF beside the image is where the DWARF is.
+           The .efi is stripped. The name here is the LOADED name, which
+           carries its extension -- appending blindly printed
+           `CrashTest.efi.so`, a path that exists nowhere. */
+        {
+            char   stem[sizeof(fault_image->name)];
+            size_t n;
+
+            axl_strlcpy(stem, fault_image->name, sizeof(stem));
+            n = axl_strlen(stem);
+            if (n >= 4 && axl_strncasecmp(stem + n - 4, ".efi", 4) == 0) {
+                stem[n - 4] = '\0';
+            }
+            REPORT_PRINT("  rsod-decode.py --image <build>/%s.so "
+                         "--rsod crash-report.txt\r\n", stem);
+        }
     } else {
-        report_append("  rsod-decode.py --image <build>/<image>:<base> "
-                      "--file crash-report.txt\r\n");
+        report_append("  rsod-decode.py --image <build>/<image>.so:<base> "
+                      "--rsod crash-report.txt\r\n");
     }
     report_append("\r\n");
 
