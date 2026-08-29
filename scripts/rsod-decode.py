@@ -122,9 +122,46 @@ no `.debug`, no PDB. Each artifact is independently sufficient, and each
 enables a different half of the job:
 
     given       yields
-    .map only   symbols, function + offset, preferred load address
-    image only  disassembly, image bounds, image/dump validation
-    both        everything
+    .map only   symbols, function + offset, preferred load address,
+                a ONE-DIRECTIONAL wrong-map check (see below)
+    image only  disassembly, image bounds, full image/dump validation
+    both        everything, plus a map-vs-image bound
+
+VALIDATION IS NOT EQUAL ACROSS THOSE ROWS, and the difference matters
+because the failure mode is silence, not an error. Handed the wrong
+build, this script produces coherent, confident, entirely fictional
+symbols -- plausible names and a plausible call chain, because .text
+often does not move between builds of the same source even when the
+data does.
+
+    image only  SizeOfImage against the dump's own record, in BOTH
+                directions. Any difference is caught.
+    .map only   a symbol cannot live beyond the end of its image, so a
+                highest symbol offset at or past the size the dump
+                records is a proven contradiction. This catches a map
+                too BIG for the dump and CANNOT catch one that is too
+                small. It is a real check, not the equal of the image
+                one.
+    both        the same symbol bound, measured against the image's OWN
+                SizeOfImage. This is the only check that catches a stale
+                .map sitting beside a CORRECT .efi -- where the image
+                passes its own size check, the dump-side bound does not
+                run because a PE supplied the size, and the map still
+                wins symbol resolution, so every signal reports healthy
+                while the symbols are fiction.
+
+A map and an image also each carry a link stamp -- the map's
+`Timestamp is` and the PE's TimeDateStamp are written from the same
+value. A difference is reported, but as a NOTE rather than a mismatch,
+because it is evidence and not proof: the PE's copy does not survive
+every build flow. Every .efi in this tree carries TimeDateStamp 0,
+written by the ELF-to-PE conversion, and a flow that rewrote it to some
+other value would make an inequality accuse a correct pair. Zero is
+ignored outright.
+
+A map-only run prints its link stamp under `Symbol sources:` precisely
+because the machine cannot close the gap: it is the fingerprint a human
+can check against the build that produced the crash.
 
 The load base need not be given. It is stated by the PE optional header,
 by the map's "Preferred load address", and by the firmware's own
@@ -346,6 +383,17 @@ class Image:
     efi_path: str = ""     # original PE path (disassembly, PE DWARF, bounds)
     pe_base: int = 0       # preferred load address from .map or PE header
     pe_size: int = 0       # SizeOfImage from the PE header (0 = not a PE)
+    # Map-side identity. `map_max_rva` is the highest symbol offset the map
+    # declares: a lower bound on the image it was linked from, and the only
+    # size-like fact a map yields without guessing at section alignment.
+    # `map_timestamp` is the link stamp the map header prints, identical to
+    # the PE's TimeDateStamp for the same link.
+    map_max_rva: int = 0
+    map_timestamp: int = 0
+    # A link-stamp difference between map and image: evidence, not proof, so
+    # it is a note rather than a mismatch warning. Kept separate from
+    # `sym_note`, which explains missing LINE NUMBERS and would be clobbered.
+    stamp_note: str = ""
     base_source: str = ""  # how `base` was decided, for the --detail line
     # Two different claims, kept apart: `warnings` says the IMAGE cannot be the
     # one the dump came from (every symbol is then suspect); `pdb_warnings`
@@ -755,6 +803,7 @@ class PeHeader:
     machine: str = ""
     image_base: int = 0
     size_of_image: int = 0
+    timestamp: int = 0     # COFF TimeDateStamp; a linker map states the same value
     pdb_path: str = ""
     pdb_guid: str = ""
     pdb_age: int = 0
@@ -773,25 +822,34 @@ def _read_pe_header(path: str) -> Optional[PeHeader]:
             if f.read(4) != b"PE\x00\x00":
                 return None
             machine = struct.unpack("<H", f.read(2))[0]
+            # TimeDateStamp is COFF offset 4: Machine(2) NumberOfSections(2)
+            # then the stamp. A linker map prints the SAME value in its
+            # header, which is what lets a map be checked against an image.
+            coff_rest = f.read(6)
+            timestamp = (struct.unpack("<I", coff_rest[2:6])[0]
+                         if len(coff_rest) == 6 else 0)
 
             # Skip the rest of the COFF header (18 bytes after Machine) to the
             # optional header; its Magic says which width ImageBase has.
             f.seek(pe_offset + 4 + 20)
             opt = f.read(64)
             if len(opt) < 64:
-                return PeHeader(machine=_PE_MACHINE.get(machine, ""))
+                return PeHeader(machine=_PE_MACHINE.get(machine, ""),
+                                timestamp=timestamp)
             magic = struct.unpack("<H", opt[0:2])[0]
             if magic == 0x20B:        # PE32+
                 image_base = struct.unpack("<Q", opt[24:32])[0]
             elif magic == 0x10B:      # PE32
                 image_base = struct.unpack("<I", opt[28:32])[0]
             else:
-                return PeHeader(machine=_PE_MACHINE.get(machine, ""))
+                return PeHeader(machine=_PE_MACHINE.get(machine, ""),
+                                timestamp=timestamp)
             # SizeOfImage sits at optional-header offset 56 in both widths.
             size_of_image = struct.unpack("<I", opt[56:60])[0]
             hdr = PeHeader(machine=_PE_MACHINE.get(machine, ""),
                            image_base=image_base,
-                           size_of_image=size_of_image)
+                           size_of_image=size_of_image,
+                           timestamp=timestamp)
 
             f.seek(0)
             _read_pe_codeview(f.read(), pe_offset, magic, hdr)
@@ -1235,9 +1293,22 @@ def register_image(spec: str, tc: Toolchain, quiet: bool = False,
         if 0 < est <= 256 * 1024 * 1024:
             size = max(size, est)
 
+    # Map-side identity, recorded whether or not a PE is also present. The
+    # size estimate above runs only when there is NO PE, so reusing it would
+    # have left the map unchecked in exactly the case where both artifacts are
+    # available and the strongest check is possible.
+    map_max_rva = 0
+    map_timestamp = 0
+    if map_file:
+        map_ents = _map_entries(map_file)
+        if map_ents:
+            map_max_rva = map_ents[-1][0] - pe_base   # entries are sorted
+        map_timestamp = _map_timestamp(map_file)
+
     img = Image(elf=elf, base=base, name=name, size=size,
                 map_file=map_file, efi_path=efi_path, pe_base=pe_base,
                 pe_size=pe_size,
+                map_max_rva=map_max_rva, map_timestamp=map_timestamp,
                 base_source="--image :BASE" if base is not None else "")
     _resolve_pdb(img, pe_hdr, named_pdb, quiet)
     return img
@@ -1562,12 +1633,69 @@ def validate_image(tc: Toolchain, img: Image, rsod: RsodData) -> None:
         return
 
     # Gate 1: SizeOfImage against the firmware's own record for that base.
+    #
+    # Gate 1b covers the case Gate 1 cannot see. `pe_size` is 0 when the
+    # symbols came from a .map with no PE beside it, so for years --map
+    # skipped this check entirely and answered a wrong map with confident,
+    # fully-formatted fiction while --image refused the same build. A map has
+    # no SizeOfImage, but it does carry a fact the dump can contradict:
+    #
+    #     a symbol cannot live beyond the end of its own image.
+    #
+    # So a highest symbol offset at or past the size the firmware recorded is
+    # a hard contradiction, not a heuristic -- reported with the same
+    # confidence as the PE mismatch, worded to blame the map rather than an
+    # image that was never supplied.
+    #
+    # KNOWN LIMIT, and it must not be oversold: this is ONE-DIRECTIONAL. It
+    # catches a map too BIG for the dump. A wrong map that happens to be
+    # smaller still resolves silently, so map-only remains weaker than
+    # --image, which compares an exact size in both directions.
     for base, size, _name in rsod.loaded_images:
-        if base == img.base and img.pe_size and size != img.pe_size:
+        if base != img.base:
+            continue
+        if img.pe_size and size != img.pe_size:
             img.warnings.append(
                 f"SizeOfImage is 0x{img.pe_size:x}, but the dump's "
                 f"loaded-image list records 0x{size:x} at base 0x{base:x}")
-            break
+        elif not img.pe_size and img.map_max_rva and img.map_max_rva >= size:
+            img.warnings.append(
+                f"the map's highest symbol is at +0x{img.map_max_rva:x}, past "
+                f"the end of the 0x{size:x} image the dump records at base "
+                f"0x{base:x} -- this map is not for this dump "
+                f"(a map that is too SMALL cannot be caught this way)")
+        break
+
+    # Gate 1c: a map and an image supplied together. Same invariant as 1b --
+    # a symbol cannot live beyond the end of its own image -- measured
+    # against the image's OWN SizeOfImage rather than the dump's record, so
+    # it holds even when the dump has no entry for this base.
+    #
+    # This is the case NEITHER other gate can see: a stale .map beside a
+    # CORRECT .efi. Gate 1 passes because the image really is the dump's, and
+    # 1b does not run because a PE supplied the size -- yet the map wins
+    # symbol resolution, so every symbol is fiction while all other signals
+    # report healthy.
+    if img.map_max_rva and img.pe_size and img.map_max_rva >= img.pe_size:
+        img.warnings.append(
+            f"the map's highest symbol is at +0x{img.map_max_rva:x}, past the "
+            f"end of this 0x{img.pe_size:x} image -- the map and the image are "
+            f"not from the same build")
+
+    # A link-stamp difference is EVIDENCE, not proof, and is reported as a
+    # note rather than a mismatch. The map's `Timestamp is` and the PE's COFF
+    # TimeDateStamp are written from the same value by the linker -- but the
+    # PE's copy does not survive every build flow. This very tree's images all
+    # carry TimeDateStamp 0, because the ELF-to-PE conversion writes no stamp;
+    # a flow that rewrites it to some other non-zero value would make an
+    # inequality here accuse a perfectly good pair. Zero is skipped outright.
+    if img.map_timestamp and img.efi_path:
+        pe_hdr = _read_pe_header(img.efi_path)
+        if pe_hdr and pe_hdr.timestamp and pe_hdr.timestamp != img.map_timestamp:
+            img.stamp_note = (
+                f"map linked 0x{img.map_timestamp:x}, image stamped "
+                f"0x{pe_hdr.timestamp:x} -- different builds, or the image's "
+                f"stamp was rewritten after linking")
 
     # Gate 2: the recorded addresses must decode to instruction boundaries.
     # Against the wrong image all three landed mid-instruction.
@@ -1657,6 +1785,7 @@ def _resolve_address_pe_dwarf(efi_path: str, offset_hex: str,
 # with a register annotation set and a stack scan.
 _map_cache: Dict[str, list[tuple[int, str, str]]] = {}
 _map_base_cache: Dict[str, int] = {}
+_map_ts_cache: Dict[str, int] = {}
 
 
 def _map_entries(map_file: str) -> list[tuple[int, str, str]]:
@@ -1705,6 +1834,36 @@ def _map_entries(map_file: str) -> list[tuple[int, str, str]]:
     entries.sort(key=lambda e: e[0])
     _map_cache[map_file] = entries
     return entries
+
+
+def _map_timestamp(map_file: str) -> int:
+    """The map's own `Timestamp is <hex>` link stamp, or 0 if it states none.
+
+    MSVC and lld-link both print this, and it is the SAME value the PE stores
+    in the COFF TimeDateStamp. The RSOD dump never records a timestamp, so
+    this cannot be checked against a dump -- but it identifies a link exactly,
+    which makes it the one hard check available when a map and an image are
+    supplied together, and a fingerprint a human can verify by hand when only
+    a map is.
+    """
+    if map_file in _map_ts_cache:
+        return _map_ts_cache[map_file]
+    ts = 0
+    try:
+        with open(map_file, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.search(r"Timestamp is\s+([0-9a-fA-F]+)", line)
+                if m:
+                    ts = int(m.group(1), 16)
+                    break
+                # The stamp sits in the first few header lines; stop before
+                # walking a 20 MB symbol table looking for one that is absent.
+                if re.match(r"\s+\w+:\w+\s+\S+\s+[0-9a-fA-F]{16}", line):
+                    break
+    except OSError:
+        pass
+    _map_ts_cache[map_file] = ts
+    return ts
 
 
 def _map_preferred_base(map_file: str) -> int:
@@ -2771,7 +2930,14 @@ def _symbol_sources(img: Image) -> list[str]:
     if img.elf:
         out.append(f"{os.path.basename(img.elf)} (ELF/DWARF)")
     if img.map_file:
-        out.append(f"{os.path.basename(img.map_file)} (map)")
+        # The link stamp, when the map states one. A map-only decode has no
+        # other build fingerprint a human can check by hand, and the size
+        # bound in validate_image only catches a map that is too BIG -- so
+        # printing this is what lets someone confirm the artifact themselves
+        # in the cases the machine cannot.
+        stamp = (f", linked 0x{img.map_timestamp:x}"
+                 if img.map_timestamp else "")
+        out.append(f"{os.path.basename(img.map_file)} (map{stamp})")
     if img.pdb_file:
         out.append(f"{os.path.basename(img.pdb_file)} (PDB, {img.pdb_source})")
     return out
@@ -2810,6 +2976,8 @@ def _emit_image_warnings(images: List[Image]):
         sources = _symbol_sources(img)
         if sources:
             print(dim(f"Symbol sources{tag}: " + ", ".join(sources)))
+        if img.stamp_note:
+            print(dim(f"  note{tag}: {img.stamp_note}"))
         if img.sym_note:
             print(yellow(f"{img.sym_note}"))
     if any(_symbol_sources(i) or i.sym_note for i in images):

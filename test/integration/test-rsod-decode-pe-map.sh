@@ -129,6 +129,20 @@ refute_line() {
     fi
 }
 
+# assert_match <file> <grep -E pattern> <label>  -- for a line of this SHAPE.
+# Used where an exact line would pin formatting that is not the point (a
+# warning that embeds several hex numbers, say); assert_line stays the default
+# so a reworded banner still fails loudly.
+assert_match() {
+    _have_output "$1" "$3" || return
+    if grep -qE -- "$2" "$1"; then
+        test_host_pass "$3"
+    else
+        test_host_fail "$3"
+        echo "      wanted match: $2"
+    fi
+}
+
 # refute_match <file> <grep -E pattern> <label>  -- for "no line of this SHAPE"
 refute_match() {
     _have_output "$1" "$3" || return
@@ -358,7 +372,7 @@ fi
 OUTB="$WORK/out-pdb-beside.txt"
 run_decode "$OUTB" "PDB beside the image, embedded name" \
     --image "$PAPP" --rsod "$PLOG" --detail
-assert_line "$OUTB" "Symbol sources: app.map (map), app.pdb (PDB, beside the image)" \
+assert_line "$OUTB" "Symbol sources: app.map (map, linked 0x6a8f3db9), app.pdb (PDB, beside the image)" \
     "P3 a PDB under the embedded name is found by name, not by scan"
 
 # P2/B: the PDB is present under a DIFFERENT name. 4.3.2 resolved nothing and
@@ -369,7 +383,7 @@ mv "$PD/app.pdb" "$PD/app-1.2.3.efi.pdb"
 OUTP="$WORK/out-pdb-named.txt"
 run_decode "$OUTP" "--pdb names a PDB" \
     --image "$PAPP" --pdb "$PD/app-1.2.3.efi.pdb" --rsod "$PLOG" --detail
-assert_line "$OUTP" "Symbol sources: app.map (map), app-1.2.3.efi.pdb (PDB, named)" \
+assert_line "$OUTP" "Symbol sources: app.map (map, linked 0x6a8f3db9), app-1.2.3.efi.pdb (PDB, named)" \
     "P1 the named PDB is reported as the symbol source"
 
 # P3/C: with no --pdb, a renamed PDB is still found -- by CodeView GUID/age,
@@ -377,7 +391,7 @@ assert_line "$OUTP" "Symbol sources: app.map (map), app-1.2.3.efi.pdb (PDB, name
 OUTD="$WORK/out-pdb-guid.txt"
 run_decode "$OUTD" "renamed PDB run completes" \
     --image "$PAPP" --rsod "$PLOG" --detail
-assert_line "$OUTD" "Symbol sources: app.map (map), app-1.2.3.efi.pdb (PDB, matched by GUID)" \
+assert_line "$OUTD" "Symbol sources: app.map (map, linked 0x6a8f3db9), app-1.2.3.efi.pdb (PDB, matched by GUID)" \
     "P3 a renamed PDB is found by its CodeView GUID"
 
 # P3/C: a PDB from a DIFFERENT build must be refused, not trusted. Same class
@@ -397,7 +411,7 @@ OUTN="$WORK/out-pdb-absent.txt"
 run_decode "$OUTN" "no-PDB run completes" --image "$PAPP" --rsod "$PLOG" --detail
 assert_line "$OUTN" "No PDB: image embeds 'app.pdb', not found beside the image - no line numbers" \
     "P2 an absent PDB is explained, not silent"
-assert_line "$OUTN" "Symbol sources: app.map (map)" \
+assert_line "$OUTN" "Symbol sources: app.map (map, linked 0x6a8f3db9)" \
     "P2 the sources actually used are named"
 
 # A .pdb is NOT self-sufficient the way a .map is -- it carries no section
@@ -883,5 +897,79 @@ EOF
         fi
     fi
 fi
+
+# ═══════════════════════════════════════════════════════════════
+# S9 -- the mismatch gate in MAP-ONLY mode.
+#
+# The gate that catches a wrong image was conditioned on SizeOfImage, which a
+# .map does not have, so --map skipped it entirely: the same wrong build that
+# --image refused produced a confident, fully-formatted decode with no banner
+# at all. That cost a day of debugging on a real ePSA RSOD, twice, because the
+# fiction is coherent -- plausible function names and a plausible call chain,
+# since .text did not move between the builds even though the data did.
+#
+# The map-side bound is sound rather than heuristic: a symbol cannot live
+# beyond the end of its own image, so a highest symbol offset at or past the
+# size the dump records is a contradiction.
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "-- map-only: correct map (negative control) --"
+WRONGMAP="$WORK/wrong-build.map"
+OUTMC="$WORK/out-map-correct.txt"
+run_decode "$OUTMC" "map-only correct run completes" --map "$MAP" --rsod "$LOG"
+
+# The control matters more than usual here: without it, "no banner" on the
+# wrong map would be indistinguishable from a gate that never fires at all.
+refute_match "$OUTMC" 'DOES NOT MATCH' \
+    "S9 correct map raises no mismatch warning"
+assert_line "$OUTMC" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x14002100a + 0x2100a]" \
+    "S9 correct map still resolves the faulting frame"
+
+echo ""
+echo "-- map-only: WRONG map -- the bug --"
+OUTMW="$WORK/out-map-wrong.txt"
+run_decode "$OUTMW" "map-only wrong run completes" --map "$WRONGMAP" --rsod "$LOG"
+
+assert_line "$OUTMW" "!! IMAGE DOES NOT MATCH THE DUMP - symbols below are probably fiction:" \
+    "S9 wrong map is announced, where it used to be silent"
+assert_match "$OUTMW" "the map's highest symbol is at \+0x38000, past the end of the 0x30000 image" \
+    "S9 map-size gate names the symbol offset and the recorded size"
+# Degraded output is fine; silence is not. The tool must still answer.
+assert_line "$OUTMW" "#0 ?WrongFunc@@YAXXZ + 0xa [0x14002100a + 0x2100a]" \
+    "S9 wrong map still produces a decode rather than dying"
+
+echo ""
+echo "-- a stale map sitting beside a CORRECT image --"
+# Neither of the other gates sees this: the image is right so its size check
+# passes, and the dump-side map bound does not run when a PE supplied the
+# size. But the map wins symbol resolution, so the decode is fiction while
+# every other signal says the artifacts are fine.
+#
+# Caught by the SAME invariant applied to the image instead of the dump: a
+# symbol past the image's own SizeOfImage cannot belong to it. Deliberately
+# NOT by the link stamp -- a PE's TimeDateStamp does not survive every build
+# flow (every .efi in this very tree carries 0, written by the ELF-to-PE
+# conversion), so a stamp difference is evidence and is reported as a note,
+# while the gate itself stays proof.
+STALE="$WORK/stale"; mkdir -p "$STALE"
+cp "$APP" "$STALE/app.efi"; cp "$WRONGMAP" "$STALE/app.map"
+OUTST="$WORK/out-stale.txt"
+run_decode "$OUTST" "stale-map run completes" --image "$STALE/app.efi" --rsod "$LOG"
+assert_match "$OUTST" "the map's highest symbol is at \+0x38000, past the end of this 0x30000 image" \
+    "S9 stale map beside a correct image is caught by size, which is proof"
+assert_match "$OUTST" "note: map linked 0x6a8f812a, image stamped 0x6a8f3db9" \
+    "S9 the link-stamp difference is reported as a note, not as proof"
+refute_match "$OUTST" "different builds$" \
+    "S9 the stamp note does not claim different builds outright"
+
+cp "$MAP" "$STALE/app.map"
+OUTSM="$WORK/out-stale-ok.txt"
+run_decode "$OUTSM" "matching-map run completes" --image "$STALE/app.efi" --rsod "$LOG"
+refute_match "$OUTSM" 'DOES NOT MATCH' \
+    "S9 a matching map beside the image stays silent"
+
+# The build fingerprint a map-only user has nothing else to check by hand.
+assert_match "$OUTMC" "app.map \(map, linked 0x6a8f3db9\)" \
+    "S9 the map's link stamp is surfaced in Symbol sources"
 
 test_host_summary "rsod-decode-pe-map"

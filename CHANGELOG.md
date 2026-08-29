@@ -3,6 +3,43 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.3.4 — 2026-08-28
+### Fixed
+
+- **`rsod-decode.py`'s wrong-artifact gate was dead in `--map` mode.** The
+  check that refuses an image not matching the dump was conditioned on
+  `SizeOfImage`, which a linker map does not have — so `--map wrong.map`
+  produced a full, confident decode with plausible names and a plausible call
+  chain and **no warning of any kind**, while `--image` refused the same build.
+  This cost a real ePSA RSOD investigation a day, twice, sending it into a
+  module whose bug did not exist.
+
+  Map-only mode now checks a bound that needs no new parsing: a symbol cannot
+  live beyond the end of its own image, so a highest symbol offset at or past
+  the size the dump records is a proven contradiction. **It is one-directional
+  and the tool says so** — it catches a map too *big* for the dump and cannot
+  catch one too small. Map-only is now checked; it is not the equal of
+  `--image`, which compares an exact size in both directions.
+
+  Supplying a map *and* an image applies the same bound against the image's
+  **own** `SizeOfImage`. That catches a case no previous gate could see — **a
+  stale `.map` beside a correct `.efi`**, where the image passes its own size
+  check, the dump-side bound does not run because a PE supplied the size, and
+  the map still wins symbol resolution. Every signal said the artifacts were
+  healthy while the decode was fiction.
+
+  A map and an image also each carry a link stamp, and a difference between
+  them is now **reported as a note, not as a mismatch** — deliberately. The
+  two are written from the same value by the linker, but the PE's copy does
+  not survive every build flow: every `.efi` this SDK produces carries
+  `TimeDateStamp` 0, written by the ELF-to-PE conversion. A flow that rewrote
+  it to some other value would make an inequality accuse a correct pair, so
+  the stamp informs and the size bound decides.
+
+  A map's link stamp is now printed under `Symbol sources:`, because the
+  machine provably cannot close the remaining gap and a map-only user has no
+  other build fingerprint to check by hand.
+
 ## 4.3.3 — 2026-08-28
 ### Changed
 

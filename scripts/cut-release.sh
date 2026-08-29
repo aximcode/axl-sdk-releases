@@ -283,9 +283,22 @@ say "Will release $TAG — commits since ${PREV_TAG:-the beginning}"
 git --no-pager log --oneline "${PREV_TAG:+$PREV_TAG..}HEAD" | sed 's/^/  /'
 
 if ! $ASSUME_YES && ! $DRY_RUN; then
+    # Refuse up front when there is nobody to ask. Without this the `read`
+    # below hits EOF, `reply` stays empty, and the run dies with "aborted by
+    # user" -- naming a user who was never prompted, on a terminal that never
+    # existed. A caller then has to distinguish "someone declined" from "this
+    # cannot prompt", and the two need different fixes.
+    if [[ ! -t 0 ]]; then
+        die "stdin is not a terminal, so the confirmation prompt cannot be
+       answered. Nothing was pushed and no tag was created. Re-run with
+       --yes to cut without prompting:
+
+           scripts/cut-release.sh ${VERSION} --yes"
+    fi
     printf '\nCut and publish %s? This pushes main and creates a public tag. [y/N] ' "$TAG"
     read -r reply
-    [[ "$reply" == "y" || "$reply" == "Y" ]] || die "aborted by user"
+    [[ "$reply" == "y" || "$reply" == "Y" ]] \
+        || die "declined at the prompt. Nothing was pushed and no tag was created."
 fi
 
 say "Bumping version + dating CHANGELOG"

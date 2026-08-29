@@ -50,6 +50,20 @@ TEXT_SIZE = 0x2000
 SIZE_OF_IMAGE = 0x30000
 SIZE_OF_IMAGE_WRONG = 0x40000
 
+# The two builds' link stamps. A linker map prints the SAME value the PE
+# stores in TimeDateStamp, so an inequality between a map and an image proves
+# they came from different links -- the one check that catches a wrong map
+# SMALLER than the dump's image, which the map-size bound cannot see.
+TIMESTAMP = 0x6A8F3DB9
+TIMESTAMP_WRONG = 0x6A8F812A
+
+# The wrong build's last symbol sits PAST the size the dump records, which is
+# what makes it provably not the dump's image: a symbol cannot live beyond the
+# end of its own image. Modelled on the real corpus, where the wrong build's
+# highest symbol is 0x20AC28 against a recorded 0x1E92A0.
+GLOBAL_RVA = 0x22000
+GLOBAL_RVA_WRONG = 0x38000
+
 # The CodeView identity the PE claims, and the path it embeds. A PE records an
 # ABSOLUTE build-host path; only the basename can be looked for on the machine
 # doing the decoding, which is why a renamed PDB goes unfound.
@@ -117,6 +131,7 @@ def build_text(wrong: bool) -> bytes:
 
 def build_pe(wrong: bool) -> bytes:
     """A minimal but genuinely well-formed PE32+ that objdump can disassemble."""
+    stamp = TIMESTAMP_WRONG if wrong else TIMESTAMP
     text = build_text(wrong)
     size_of_image = SIZE_OF_IMAGE_WRONG if wrong else SIZE_OF_IMAGE
 
@@ -135,7 +150,8 @@ def build_pe(wrong: bool) -> bytes:
         "<HHIIIHH",
         0x8664,          # Machine = AMD64
         2,               # NumberOfSections (.text, .rdata)
-        0x6A8F3DB9,      # TimeDateStamp (fixed -- the fixture is deterministic)
+        stamp,           # TimeDateStamp -- differs per build, as real links do
+                         # (the map prints this same value; see build_map)
         0, 0,            # symbol table (none)
         opt_size,
         0x022E,          # EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | ...
@@ -175,7 +191,7 @@ def build_pe(wrong: bool) -> bytes:
           + PDB_EMBEDDED_PATH.encode() + b"\x00")
     debug_dir = struct.pack(
         "<IIHHIII",
-        0, 0x6A8F3DB9,   # Characteristics, TimeDateStamp
+        0, stamp,        # Characteristics, TimeDateStamp
         0, 0,            # Major/MinorVersion
         2,               # IMAGE_DEBUG_TYPE_CODEVIEW
         len(cv),
@@ -267,10 +283,12 @@ def build_map(wrong: bool) -> str:
     callee = "?WrongFunc@@YAXXZ" if wrong else "?TestFaulty@@YAPEAXPEAI@Z"
     caller = "?WrongCaller@@YAHH@Z" if wrong else "?TestCaller@@YAHH@Z"
     size = SIZE_OF_IMAGE_WRONG if wrong else SIZE_OF_IMAGE
+    stamp = TIMESTAMP_WRONG if wrong else TIMESTAMP
+    global_rva = GLOBAL_RVA_WRONG if wrong else GLOBAL_RVA
     return f"""\
  test
 
- Timestamp is 6a8f3db9 (Wed Aug 26 14:25:45 2026)
+ Timestamp is {stamp:08x} (Wed Aug 26 14:25:45 2026)
 
  Preferred load address is {IMAGE_BASE:016x}
 
@@ -282,7 +300,7 @@ def build_map(wrong: bool) -> str:
 
  0001:00000000       {caller:<26} {IMAGE_BASE + CALLER_RVA:016x} f   TestLib.obj
  0001:00001000       {callee:<26} {IMAGE_BASE + CALLEE_RVA:016x} f   TestLib.obj
- 0002:00000000       ?gTestGlobal@@3HA          {IMAGE_BASE + 0x22000:016x}     TestLib.obj
+ 0002:00000000       ?gTestGlobal@@3HA          {IMAGE_BASE + global_rva:016x}     TestLib.obj
 
  entry point at        0001:00000000
 """

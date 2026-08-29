@@ -7,9 +7,29 @@ helper, has burned us before.
 ## TL;DR — the fast path
 
 ```sh
-scripts/cut-release.sh X.Y.Z            # do it
+scripts/cut-release.sh X.Y.Z            # do it (prompts before pushing)
 scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
+scripts/cut-release.sh X.Y.Z --yes      # skip the prompt (non-interactive)
 ```
+
+**It stops and asks before it pushes anything.** After printing the commit
+list it prompts `Cut and publish vX.Y.Z? [y/N]` and reads stdin. That is right
+for a human at a terminal and wrong everywhere else: run from a script, a CI
+step, an agent, or anything without a TTY, `read` sees EOF, the answer defaults
+to **no**, and the script aborts having done nothing — correctly, and with exit
+status 1. Pass `--yes` when there is nobody to answer.
+
+> Check what actually happened before believing either outcome, and check the
+> **script's** exit status rather than your shell's. `cut-release.sh X.Y.Z; echo $?`
+> reports the script; `cut-release.sh X.Y.Z > log 2>&1; tail log` reports
+> `tail`, which succeeds whether the release happened or not. The three facts
+> that settle it, and none of them can be faked by a stray zero:
+>
+> ```sh
+> cat VERSION                       # bumped?
+> git tag -l vX.Y.Z                 # tag exists?
+> git log --oneline @{u}..HEAD | wc -l   # 0 == main was pushed
+> ```
 
 `scripts/cut-release.sh` automates the cut: it bumps the version, dates the
 CHANGELOG, commits + pushes `main`, tags, and watches Release/Docs to the
