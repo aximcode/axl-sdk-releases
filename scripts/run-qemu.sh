@@ -1,4 +1,5 @@
 #!/bin/bash
+# axl-desc: boot a .efi under QEMU + OVMF (-i, --mount, --gdb, --net)
 # Run a .efi binary in QEMU and show its output.
 #
 # Uses the project's QEMU/firmware discovery infrastructure from

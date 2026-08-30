@@ -296,7 +296,7 @@ else
     # Strip ANSI before asserting: the report is decoded for a terminal, and a
     # `^Image 0:` anchor does not match a line that starts with a colour escape.
     if timeout 120 python3 "$PROJECT_DIR/scripts/rsod-decode.py" \
-            --image "$DEBUG_SO" --rsod "$REPORT" --detail \
+            --syms "$DEBUG_SO" --rsod "$REPORT" --detail \
             > "$DECODED.raw" 2>"$DECODED.err"; then
         pass "rsod-decode.py exits 0 on the report"
     else
@@ -370,7 +370,7 @@ else
         pass "report prints a rsod-decode.py command"
         # It must name the ELF that HAS the DWARF, and must not have pasted
         # `.so` onto a name that already ends in `.efi`.
-        if grep -qE -- '--image <build>/[A-Za-z0-9_-]+\.so( |$)' <<<"$HINT"; then
+        if grep -qE -- '--syms <build>/[A-Za-z0-9_-]+\.so( |$)' <<<"$HINT"; then
             pass "printed command names a .so, not the stripped .efi"
         else
             fail "printed command names the wrong artifact: $HINT"
@@ -381,7 +381,7 @@ else
         # loaded name need not match the build artifact's. Everything else
         # (the flag spellings, the ordering) is executed exactly as printed,
         # which is what would have caught `--file` had it ever been run.
-        HINT_ARGS=$(sed -E "s#--image <build>/[A-Za-z0-9_.-]+#--image $DEBUG_SO#" \
+        HINT_ARGS=$(sed -E "s#--syms <build>/[A-Za-z0-9_.-]+#--syms $DEBUG_SO#" \
                     <<<"${HINT#  rsod-decode.py }")
         HINT_OUT="$TEST_TMPDIR/hint.txt"
         # shellcheck disable=SC2086  # deliberate: the printed line IS the argv

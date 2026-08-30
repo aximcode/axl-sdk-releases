@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# axl-desc: recover module load addresses from QEMU debugcon output
 """Generate `add-symbol-file` lines from an OVMF debugcon log.
 
 OVMF DEBUG builds print one line per loaded image to the QEMU

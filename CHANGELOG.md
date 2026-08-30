@@ -3,6 +3,314 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.4.0 — 2026-08-30
+
+### Added
+
+- **The host-side tools now ship inside `axl-sdk`; the standalone
+  `axl-sdk-host-tools.deb` / `.rpm` are retired.** They are at `libexec/axl/`
+  behind the `axl` dispatcher, so `axl run-qemu` and `axl rsod-decode` work
+  from a package install with nothing extra to fetch. `axl-sdk` declares
+  `Replaces`/`Conflicts` (deb) and `Obsoletes` (rpm) for the old package, so
+  **installing `axl-sdk` removes it** rather than leaving two copies of every
+  script — the package manager does that, never us deleting files it owns.
+
+  **Nothing is taken away from anyone who does not ask for it.** We publish no
+  apt/dnf repository; every install is `apt install ./axl-sdk.deb` by explicit
+  path, so no `apt upgrade` sees these packages and an existing
+  `axl-sdk-host-tools` install keeps working untouched. What changes is that no
+  *new* host-tools packages are published: migrate to the tarball, or to
+  `axl-sdk`, which now carries the same scripts.
+
+  **QEMU, OVMF, virtiofsd, mtools and dosfstools are `Recommends`, not
+  `Depends`.** They are needed to *run* a `.efi`, not to build one, and making
+  every `axl-cc` user pull a QEMU stack was the reason these were a separate
+  package. `apt` and `dnf` install recommends by default and both allow
+  declining them.
+
+  **The host-tools tarball is kept.** `README.md` names a real audience for it
+  — consumers who want `run-qemu.sh` and friends without the build-side SDK —
+  and a tarball serves them with no package metadata, no dependency graph and
+  no root. Retiring the packages removed a duplicate install path; it was not a
+  reason to strand that audience. Its release smoke test moved from installing
+  the `.deb` to extracting the tarball, which needs no `sudo` and tests the
+  artifact that still ships.
+
+- **`axl prune` — bound what accumulates, on both axes.** Policy: **current +
+  one previous**, `--keep N` to change it, `--dry-run` to see first.
+
+  The numbers that set it: **7.1 GB across eight pinned SDK versions** in one
+  `$HOME`, every one a source checkout whose `out/` is ~85% of it. The new
+  tarball drops a pinned version to **42 MB extracted / 7.2 MB downloaded** —
+  a 35× cut — so SDK roots are cheap now. **The toolchains are not**: 500 MB
+  for ARM's and 239 MB for ours, **739 MB per generation**, and `--prefix`
+  just made them installable in more places. At 12 tags in 17 days, "it will
+  not add up" is not an argument.
+
+  One previous *toolchain* generation is kept too, deliberately: an SDK root
+  kept for rollback was built against the toolchain of its day, so discarding
+  that toolchain would break the rollback the policy exists for.
+
+  Three things are never removed — the running prefix (the one removal that
+  cannot be undone by re-downloading, since it takes the tool that would do
+  it), whatever `current` resolves to, and anything not identifiably ours. The
+  last needs a version after the name (`^axl-sdk-[0-9]`): `^axl-sdk-` alone
+  would match a consumer's `axl-sdk-workspace`, and `/opt` is shared with
+  everything else on the machine. Toolchain families are read from the staged
+  manifest, so a relocated toolchain is pruned and an unrelated directory is
+  not.
+
+- **An SDK prefix is now a stated contract: it writes nothing outside itself,
+  so `rm -rf <prefix>` is a complete uninstall.** The single exception is the
+  bare-metal cross toolchains, which live outside on purpose — 739 MB shared
+  across every SDK version and installed separately.
+
+  This underpins every pruning policy: a versioned install root you cannot
+  safely delete is worse than no versioning. It was believed true and asserted
+  **nowhere**, which is how it would have stopped being true — one
+  `install … "$HOME/.config/…"` in `install.sh` and the guarantee is gone with
+  every other test still green. `test-sdk-selfcontained.sh` installs with a
+  HOME of its own and checks it stays empty, and checks the generated
+  path-encoding files name nothing absolute beyond the prefix, the manifest's
+  toolchain roots and ordinary system directories. Both halves
+  sabotage-verified.
+
+- **The SDK now ships as a relocatable tarball:
+  `axl-sdk-<version>-linux-x86_64.tar.gz`.** `AXL-SDK-Design.md` documented
+  this workflow in the present tense for years and **nothing ever built it** —
+  the release published `axl-sdk-tools-<arch>.tar.gz` (target `.efi`
+  utilities) and `axl-sdk-host-tools.tar.gz` (helper scripts), but nothing
+  containing the SDK prefix itself. Arch, Alpine, NixOS, SUSE, CI containers
+  and locked-down corporate hosts had **no supported install path**, and a
+  version could only be pinned by keeping a whole source checkout.
+
+  ```
+  tar xf axl-sdk-<ver>-linux-x86_64.tar.gz -C /opt
+  /opt/axl-sdk-<ver>/bin/axl-cc hello.c        # -> hello.efi, no root
+  ```
+
+  One archive carries **both target arches** and is named for the *host*,
+  since the bundled crosses are x86_64-hosted. Its single top-level directory
+  is `axl-sdk-<version>/`, which is also the versioned root of
+  `AXL-Distribution-Design.md` §12.2 — extracting into `/opt` needs no rename
+  step. The archive is built with a fixed owner and mtime and a sorted member
+  order, so two builds of the same tree are byte-identical and a consumer
+  pinning by SHA256 can distinguish "the SDK changed" from "the tarball was
+  rebuilt".
+
+  Built by `scripts/make-sdk-tarball.sh` rather than assembled inline in the
+  workflow, so the release and `test-sdk-tarball.sh` run the same code — the
+  host-tools tarball *is* assembled inline and is exactly the kind of thing
+  that then has no local reproduction. The test proves the archive the only
+  way that means anything: it extracts it somewhere it has never been and
+  **compiles a real PE32+ EFI application with the `axl-cc` inside it**.
+
+- **`install-toolchain.sh --prefix DIR`, and privilege only where it is
+  needed.** The installer hard-failed with *"extracting to /opt needs root, and
+  this is not root and has no sudo"*, so a user without `sudo` could not
+  install a cross toolchain at all — and without one `axl-cc` cannot compile
+  anything, which made a root-free SDK install a compiler driver with no
+  compiler. `/opt` was written into the extract, the usage banner and the
+  refusal.
+
+  A prefix the user owns now needs **no `sudo` at all**: privilege is requested
+  against the destination rather than against `/opt`, and the refusal names the
+  directory that could not be written instead of a path the reader never chose.
+  The run also prints the `AXL_<ARCH>_TOOLCHAIN_DIR` / `_GCC` / `_GXX` /
+  `_BINUTILS_PREFIX` exports for a non-default prefix, because the manifest's
+  defaults still name `/opt` and the installer is the only party that knows
+  which prefix was picked — succeeding silently would leave ~96 MB on disk and
+  a build that still cannot find a compiler.
+
+  **Nothing else needed to change.** *Using* a relocated toolchain already
+  worked: `axl-cc`, the `Makefile` and `install.sh` all resolve
+  `AXL_<ARCH>_GCC` / `_GXX` / `_BINUTILS_PREFIX` through the `_DEFAULT`
+  convention, and `axl-toolchains.conf`'s header already named this case. The
+  per-arch directory keeps its manifest name under the chosen root and each
+  tool path is the manifest's own with that prefix rewritten, so the
+  "directory prefixes the compiler" invariant `check-toolchain-conf` asserts
+  stays true of what is installed.
+
+- **`axl` — one command on `PATH` for every host-side SDK tool.** Twelve host
+  scripts ship with the SDK and **ten reached a user at a full path and on no
+  `PATH` at all**: packaging gave `/usr/bin` wrappers to `run-qemu` and
+  `axl-emulate` only. That is why a crash report printed
+  `rsod-decode.py --syms …` as the command to run, which for anyone who
+  installed a package is `command not found` — and why consumers reach for
+  `~/axl-sdk-host-tools/scripts/…`, a path `README.md` prescribes because no
+  better one was offered.
+
+  `axl run-qemu`, `axl rsod-decode`, `axl emulate`, `axl profile-qemu`,
+  `axl gdb-syms`, `axl extract-fv-shell`, and `axl --help` as the discovery
+  surface. Also `axl --print-prefix` and `axl --print-version`, which
+  `AXL-Distribution-Design.md` §6 lists as missing and names the cost of:
+  "why axl-utils hardcodes `/usr/include/axl-sdk`".
+
+  **Files keep their real names in `libexec/axl/`; only the command drops the
+  extension.** These scripts locate each other by filename from their own
+  directory — `run-qemu.sh` sources `axl-common.sh`, `profile-qemu.sh` runs
+  `$SCRIPT_DIR/gdb-syms.py`, `axl-emulate` execs from
+  `Path(__file__).resolve().parent` — so staging them renamed would leave
+  every one correct and unable to find the others.
+
+  **A shebang decides what is a command.** `axl` offers exactly the executable
+  files, so staging keys on whether a file can be run at all. That hides both
+  non-commands from the file itself: `axl-common.sh` is sourced, and
+  `gdb-sample.py` is loaded *inside* gdb — it opens with a docstring and is
+  755 in the tree, so a rule keyed on the mode bit would have offered a
+  command that cannot run.
+
+  **`axl-cc`, `axl-c++` and `axl-install-toolchain` are deliberately NOT
+  subcommands.** "Tool" is overloaded four ways here — these host commands,
+  the host's own gcc (which AXL does not use for target code), AXL's
+  bare-metal cross toolchain under `/opt`, and the target `.efi` utilities.
+  Listing the compiler drivers beside `run-qemu` would imply the dispatcher
+  fronts the compiler too, so `axl --help` states the distinction in three
+  lines instead. See `AXL-Distribution-Design.md` §13.1.
+
+### Changed
+
+- **`rsod-decode.py`: `--image` is now `--syms`, and `--image` / `--debug` /
+  `--map` are removed.** No alias is kept, deliberately. The flag accepted six
+  file types — `.efi`, `.dll`, `.debug`, `.so`, `.map`, `.pdb` — and **only one
+  of them is an image**; what it has always named is the *symbol source* for
+  one module. `--map` and `--debug` were never modes, only two more spellings
+  appending to the same list: `--image app.map` and `--map app.map` were
+  byte-identical runs.
+
+  That misnaming distorted a real bug report. The 4.3.4 defect was described
+  by everyone, this project included, as *"the gate is skipped in `--map`
+  mode"*. **There was no map mode.** The condition was "no PE header
+  available", reachable through either flag — and a spelling kept alive as a
+  silent alias keeps that reading alive with it. `--syms` under-describes
+  exactly one case (a *stripped* `.efi` supplies no symbols, only disassembly
+  and image bounds); `--image` mis-described five.
+
+  `--syms` is repeatable, once per module, and still takes an optional
+  `:BASE`. **Two `--syms` for the same module do not combine** — each
+  registers a separate image; the way to get a PE and its map on one image is
+  to pass the PE and let the `.map` beside it be discovered. The help now says
+  so, and leads with the two cases that actually turn up: an x64 linker map
+  and an AArch64 unstripped ELF, each against a raw PuTTY capture.
+
+  The crash handler's own printed hint (`drivers/crashhandler/report.c`) moves
+  with it, so the command a crash report tells you to run still runs.
+
+- **`lsacpi` was missing from the devkit image, and the release's tool-set
+  guard was blind to seven tools.** `lsacpi` shipped into `TOOL_NAMES` on
+  2026-08-28 and reached the tools tarball and the `axl` busybox automatically
+  — both **derive** from that variable (`cp tools/*.efi`, and `BUSYBOX_OBJS`
+  is a patsubst over it). It never reached uefi-devkit's bootable image,
+  because `devkit.conf` is a hand-written list and nothing read it.
+
+  A census of `TOOL_NAMES` against every delivery channel found the same drift
+  in `release.yml`'s tarball sanity list, which covered **27 of 34** tools —
+  `axbench`, `cut`, `kbtune`, `lsacpi`, `lsproto`, `netload` and `tr` were all
+  absent, while its own comment said "keep this list in sync with TOOL_NAMES".
+  It could not have noticed any of the seven vanishing.
+
+  That list is now **derived** — `make -s print-TOOL_NAMES`, with a refusal on
+  a suspiciously short answer, the same shape `verify.sh` already uses for
+  `print-lint-gates`. `devkit.conf` cannot be derived (it carries per-tool
+  display names and descriptions only a human can write), so it gets
+  **`make check-devkit-conf`** instead: every `TOOL_NAMES` entry must have a
+  `binary` line *and* a `desc:` line, the second because a tool staged without
+  one lands on the image with no `startup.nsh` listing or alias — delivered
+  and invisible. Entries with no `TOOL_NAMES` counterpart are allowed: the
+  image also stages drivers and apps that are deliberately not busybox verbs.
+
+- **Every `.efi` this SDK produces now carries a build identity.** Surveyed
+  2026-08-28, ours had none of any kind: `TimeDateStamp` is 0 on every image,
+  and `src/crt0/axl-debug-info.S` emitted the CodeView RSDS record with sixteen
+  literal zero bytes. Two builds of the same tool were indistinguishable, so an
+  image of ours landing in RSOD triage could not be matched to the build it
+  came from — the exact failure the 4.3.4 wrong-artifact gate catches in the
+  MSVC corpus and could not catch in ours.
+
+  `pe-set-debug` now fills that GUID with a deterministic 128-bit FNV-1a over
+  the whole image, hashed **with the GUID field itself zeroed** — the id is
+  written *into* the image, so hashing it as-is would hash a file containing
+  its own hash and never reach a fixed point. Verified deterministic across a
+  real relink, and it changes when one byte does. It is an identity, not a
+  signature: it distinguishes builds, it does not authenticate them.
+
+  No new section, no new flag and no new format — the field was already there,
+  already carried through `objcopy` in `.dbgdir`, and `rsod-decode.py` already
+  read it. `pe-set-debug --print-build-id <file.efi>` reports it without
+  modifying anything, and `rsod-decode --detail` shows `id=…` on the image
+  line and in `--json`.
+
+  **It is reported, never required.** Images from other toolchains carry no
+  CodeView record at all — the real MSVC corpus PE has none — so a tool that
+  demanded one would refuse exactly the artifacts it exists to decode. A new
+  `--no-codeview` fixture pins that: such an image still decodes, exit 0, with
+  no `id=` invented for it.
+
+### Fixed
+
+- **`rsod-decode.py` said nothing about an AArch64 exception when the firmware
+  printed `ESR` but not its own decode of it.** Two parsers reach the AArch64
+  diagnosis. The Dell/vendor one derived `EC`/`IL`/`ISS` from the raw `ESR`
+  register; the EDK2 one only ever read a pre-decoded
+  `ESR : EC 0x.. IL .. ISS ..` line, so a dump carrying the register and not
+  that line produced **no `Cause:` line at all** — which reads as "there was
+  nothing to say about this exception", not "this reader never looked at the
+  register it had already parsed into its own dict".
+
+  The derivation now lives in one place that both parsers call, and it
+  **outranks** a pre-decoded line where both are present: the register is the
+  raw fact and that line is a rendering of it.
+
+- **An AArch64 exception class with no table entry was swallowed instead of
+  reported.** A missing `EC` appended nothing, so the decode dropped the one
+  line that names what went wrong and read as "nothing to say about this
+  exception". It now renders `Unrecognised exception class (EC 0xNN)` — which
+  is what makes an honestly incomplete table safe, rather than a reason to
+  guess at rows. It **adds to** the firmware's own description rather than
+  replacing it: the placeholder is worth strictly less than a dump that says
+  what actually happened, and outside `--detail` that text appears nowhere
+  else.
+
+  Two entries were genuinely missing and are added. `EC 0x2F` (SError) most
+  deserves naming: it is **asynchronous**, so the reported PC is not the
+  faulting instruction, and a reader who takes it at face value looks in the
+  wrong function. `EC 0x07` (SVE/Advanced SIMD/FP access trap) in firmware is
+  nearly always FP/SIMD reached before `CPACR_EL1`/`CPTR_EL2` enabled it,
+  which makes the name the fix.
+
+  Checked against QEMU 10.0.0 `target/arm/syndrome.h`. The rest of the table
+  was already correct, and rows whose firmware relevance could not be
+  justified were deliberately left out rather than guessed at — the
+  unrecognised-EC line covers them.
+
+- **`rsod-decode.py` treated an all-zero CodeView GUID as an identity.** A PE
+  that records no build identity formats as `{00000000-...-000000000000}`,
+  which is a non-empty string and therefore truthy — so "this image records
+  nothing" was carried around as though it were something, and then *compared*.
+  Both directions were wrong: a real PDB sitting beside such an image was
+  accused of belonging to a different build and dropped, and two artifacts that
+  both recorded nothing "matched by GUID", asserting a pairing from the absence
+  of evidence on both sides.
+
+  Same class as the wrong-artifact gate fixed in 4.3.4 — a comparison that
+  cannot discriminate is worse than none, because it still prints a verdict.
+  An all-zero GUID recorded by the **image** now reads as *absent*, so the
+  tool falls back to name discovery instead of accusing or claiming a match.
+
+  **The two sides are deliberately not treated alike.** When the image names a
+  GUID, that GUID came from the PDB its toolchain generated, so the PDB it was
+  built against records the same one and a PDB recording all zeros is a
+  *different artifact* — an inference, not an absence of evidence. That
+  refusal is kept. Nulling the identity in the shared GUID formatter would
+  collapse both directions and silently accept such a PDB, handing the reader
+  line numbers from the wrong build; the guard therefore sits where the
+  image's identity is decided, not in the formatter both readers share.
+
+  This was latent rather than live: AXL produces no `.pdb` files, and MSVC
+  images carry real GUIDs. It is exactly the shape our own images have,
+  though — **every `.efi` this SDK produces records an all-zero GUID with age
+  1** — so anything that ever pairs one with a PDB would have met it.
+
 ## 4.3.4 — 2026-08-28
 ### Fixed
 

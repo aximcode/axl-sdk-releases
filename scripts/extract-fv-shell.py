@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# axl-desc: extract the UEFI Shell from a firmware volume image
 # extract-fv-shell.py -- pull the UEFI Shell PE32 out of an OVMF/AAVMF
 # firmware image, with zero external dependencies (Python stdlib only).
 #

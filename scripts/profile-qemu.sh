@@ -1,4 +1,5 @@
 #!/bin/bash
+# axl-desc: sample a booting .efi and report where it spends CPU
 # profile-qemu.sh — sampling profiler for an axl-sdk app running under QEMU.
 #
 # "perf record/report" for a UEFI app: it boots the app under QEMU with the

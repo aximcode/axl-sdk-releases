@@ -920,6 +920,45 @@ install -C -m 755 "$LIBAXL_DIR/scripts/install-toolchain.sh" \
 log_info "Installed axl-cc + axl-c++ + axl-install-toolchain"
 
 # ---------------------------------------------------------------------------
+# The `axl` dispatcher and the host-side tools it fronts
+# (AXL-Distribution-Design.md SS13).
+#
+# Ten of these scripts reach a package user at a full path and on no PATH at
+# all, which is why a crash report prints a `rsod-decode.py ...` line that is
+# `command not found` for them. One name on PATH makes the install location
+# stop mattering to every printed hint and README.
+#
+# A SHEBANG IS THE MANIFEST. `axl` offers exactly the EXECUTABLE files as
+# commands, so what decides is whether a file can be run at all: one with a
+# shebang is staged 755 and becomes a command, one without is staged 644 and
+# is present only for its siblings to find. That classifies both non-commands
+# correctly from the file itself -- axl-common.sh is SOURCED by run-qemu.sh,
+# and gdb-sample.py is loaded INSIDE gdb (it opens with a docstring, and is
+# 755 in the tree despite having no shebang, so the mode bit alone would have
+# offered it as a command that cannot run). No second list of "which of these
+# are commands" to drift from this one.
+#
+# REAL FILENAMES, deliberately: these scripts locate each other by name from
+# their own directory (`source "$(dirname "$0")/axl-common.sh"`,
+# `$SCRIPT_DIR/gdb-syms.py`, axl-emulate's `Path(__file__).resolve().parent`).
+# Staging them under stripped names would leave each one correct and unable to
+# find the others; `axl` maps names instead.
+mkdir -p "$PREFIX/libexec/axl"
+for _tool in run-qemu.sh axl-common.sh axl-emulate rsod-decode.py \
+             gdb-syms.py gdb-sample.py profile-qemu.sh extract-fv-shell.py \
+             axl-prune.sh; do
+    _src="$LIBAXL_DIR/scripts/$_tool"
+    [[ -f "$_src" ]] || { log_error "missing host tool: scripts/$_tool"; exit 1; }
+    if head -c2 "$_src" | grep -q '#!'; then
+        install -C -m 755 "$_src" "$PREFIX/libexec/axl/$_tool"
+    else
+        install -C -m 644 "$_src" "$PREFIX/libexec/axl/$_tool"
+    fi
+done
+install -C -m 755 "$LIBAXL_DIR/scripts/axl" "$PREFIX/bin/axl"
+log_info "Installed axl dispatcher + host tools"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

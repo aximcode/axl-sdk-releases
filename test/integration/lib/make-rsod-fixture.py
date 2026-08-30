@@ -75,6 +75,11 @@ PDB_GUID = bytes.fromhex("11223344556677889900aabbccddeeff")
 PDB_AGE = 1
 # A different build's identity, for the PDB that must be REFUSED.
 PDB_GUID_WRONG = bytes.fromhex("0123456789abcdef0123456789abcdef")
+# NOT an identity at all: a CodeView record whose GUID is 16 zero bytes. This
+# is what every .efi this SDK produces actually carries, so it is the shape the
+# reader meets in the field -- and as a formatted string it is truthy, which is
+# how "records nothing" came to be compared as though it were something.
+PDB_GUID_ZERO = bytes(16)
 
 CALLER_RVA = 0x20000        # TestCaller
 CALLEE_RVA = 0x21000        # TestFaulty
@@ -129,7 +134,8 @@ def build_text(wrong: bool) -> bytes:
     return bytes(text)
 
 
-def build_pe(wrong: bool) -> bytes:
+def build_pe(wrong: bool, pdb_guid: bytes = PDB_GUID,
+             codeview: bool = True) -> bytes:
     """A minimal but genuinely well-formed PE32+ that objdump can disassemble."""
     stamp = TIMESTAMP_WRONG if wrong else TIMESTAMP
     text = build_text(wrong)
@@ -187,8 +193,13 @@ def build_pe(wrong: bool) -> bytes:
     # it -- where MSVC puts them. Its raw data follows .text's in the file.
     rdata_rva = TEXT_RVA + TEXT_SIZE
     rdata_raw_off = size_of_headers + raw_size
-    cv = (b"RSDS" + PDB_GUID + struct.pack("<I", PDB_AGE)
+    cv = (b"RSDS" + pdb_guid + struct.pack("<I", PDB_AGE)
           + PDB_EMBEDDED_PATH.encode() + b"\x00")
+    # An image with NO debug directory at all. Not a corner case: the real
+    # MSVC PE in the corpus has no CodeView record, so anything that requires
+    # one would refuse exactly the artifacts this tool exists to decode.
+    if not codeview:
+        cv = b""
     debug_dir = struct.pack(
         "<IIHHIII",
         0, stamp,        # Characteristics, TimeDateStamp
@@ -390,6 +401,14 @@ def main() -> int:
     ap.add_argument("--pdb", action="store_true",
                     help="also emit app.pdb (identity matching the PE) and "
                          "mismatched.pdb (a different build's identity)")
+    ap.add_argument("--no-codeview", action="store_true",
+                    help="emit app.efi with NO CodeView record at all, as the "
+                         "real MSVC corpus PE has -- nothing may require one")
+    ap.add_argument("--zero-guid", action="store_true",
+                    help="give app.efi an all-zero CodeView GUID -- an image "
+                         "that records NO identity, as AXL's own do. With "
+                         "--pdb, also emit renamed-zero.pdb, which records "
+                         "none either")
     ap.add_argument("--relocated", metavar="HEX",
                     help="also emit console-reloc.log, a capture of the SAME "
                          "image loaded at a base other than its preferred one")
@@ -398,15 +417,24 @@ def main() -> int:
     out = Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
 
-    (out / "app.efi").write_bytes(build_pe(wrong=False))
+    (out / "app.efi").write_bytes(build_pe(
+        wrong=False, pdb_guid=PDB_GUID_ZERO if args.zero_guid else PDB_GUID,
+        codeview=not args.no_codeview))
     (out / "app.map").write_text(build_map(wrong=False))
     (out / "console.log").write_text(build_console_log())
     if args.wrong:
-        (out / "wrong-build.efi").write_bytes(build_pe(wrong=True))
+        (out / "wrong-build.efi").write_bytes(build_pe(
+            wrong=True, pdb_guid=PDB_GUID_ZERO if args.zero_guid else PDB_GUID))
         (out / "wrong-build.map").write_text(build_map(wrong=True))
     if args.pdb:
         (out / "app.pdb").write_bytes(build_pdb())
         (out / "mismatched.pdb").write_bytes(build_pdb(guid=PDB_GUID_WRONG))
+        if args.zero_guid:
+            # Under a name the PE does not embed, so it is reachable only by
+            # the GUID scan -- which is the path that must NOT pair two
+            # artifacts on the strength of both recording nothing.
+            (out / "renamed-zero.pdb").write_bytes(
+                build_pdb(guid=PDB_GUID_ZERO))
     if args.relocated:
         (out / "console-reloc.log").write_text(
             build_console_log(int(args.relocated, 16)))

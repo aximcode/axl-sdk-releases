@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# axl-desc: decode a UEFI crash dump (RSOD) to source locations
 from __future__ import annotations
 
 """
@@ -96,9 +97,9 @@ Binutils fallback:
 
 Symbol results are cached per-ELF to avoid redundant subprocess calls.
 
-IMAGE FILE TYPES
-----------------
-The --image flag accepts any of these file types:
+SYMBOL SOURCES
+--------------
+The --syms flag accepts any of these file types:
 
     .debug  ELF with full DWARF debug info (best)
     .dll    ELF with gnu_debuglink to .debug (EDK2 intermediate)
@@ -107,10 +108,21 @@ The --image flag accepts any of these file types:
             and follows gnu_debuglink to find the .debug ELF; failing
             that it reads SizeOfImage / ImageBase straight from the
             optional header and disassembles the PE itself
-    .map    MSVC / lld-link linker map (also spelled --map) — function
-            names and the preferred load address, no image required
-    .pdb    MSVC program database (also spelled --pdb) — the ONLY route
-            to source lines on MSVC; see below
+    .map    MSVC / lld-link linker map — function names and the
+            preferred load address, no image required
+
+Only one of those five is an image, which is why the flag names the
+SYMBOL SOURCE for a module rather than an image. The one imprecision
+runs the other way: a STRIPPED .efi carries no symbols at all, and
+supplies only disassembly and image bounds.
+
+A .pdb is NOT among them and --syms refuses one, with a message
+naming the flag it belongs to. It carries no section table and
+llvm-symbolizer rejects it as an object outright, so it resolves
+nothing without the image it was built from:
+
+    .pdb    MSVC program database, passed with --pdb alongside that
+            image — the ONLY route to source lines on MSVC; see below
 
 Architecture is auto-detected from ELF/PE magic bytes (no external
 `file` command needed — works on Windows).
@@ -241,7 +253,7 @@ SOURCE PATH REMAPPING
 Debug ELFs contain absolute paths from the build machine. When the
 source is at a different location locally, use --source-root:
 
-    rsod-decode.py --source-root ~/projects/edk2 --image app.debug ...
+    rsod-decode.py --source-root ~/projects/edk2 --syms app.debug ...
 
 The script tries progressively shorter suffixes of the DWARF path
 against the source root until it finds a matching file. Results are
@@ -278,12 +290,12 @@ human-readable cause. Examples:
 
 MULTI-IMAGE SUPPORT
 -------------------
-Real crashes often span multiple UEFI modules. Pass --image multiple
-times, optionally with per-image base addresses:
+Real crashes often span multiple UEFI modules. Pass --syms once per
+module, optionally with per-image base addresses:
 
-    rsod-decode.py --image App.debug \\
-                   --image Shell.debug:0x7E212000 \\
-                   --image DxeCore.debug:0x47683000 \\
+    rsod-decode.py --syms App.debug \\
+                   --syms Shell.debug:0x7E212000 \\
+                   --syms DxeCore.debug:0x47683000 \\
                    --rsod rsod.txt
 
 AARCH64 RSODs include per-frame module names and bases, which the
@@ -294,31 +306,31 @@ EXAMPLES
 --------
 Parse an RSOD from a serial log file. --rsod takes a WHOLE console
 capture — the dump does not have to be extracted from it first:
-    rsod-decode.py --image IpmiTool.efi --rsod rsod_log.txt
+    rsod-decode.py --syms IpmiTool.efi --rsod rsod_log.txt
 
 MSVC-built PE with a sibling linker map, base inferred:
-    rsod-decode.py --image app.efi --detail --rsod putty-session.log
+    rsod-decode.py --syms app.efi --detail --rsod putty-session.log
 
 Symbols from the map alone, no image available:
-    rsod-decode.py --map app.map --rsod console.log
+    rsod-decode.py --syms app.map --rsod console.log
 
 Pipe RSOD text from clipboard:
-    pbpaste | rsod-decode.py --image IpmiTool.debug
+    pbpaste | rsod-decode.py --syms IpmiTool.debug
 
 Detailed output with disassembly:
-    rsod-decode.py --image app.debug --detail --rsod rsod.txt
+    rsod-decode.py --syms app.debug --detail --rsod rsod.txt
 
 Markdown report with GitHub links:
-    rsod-decode.py --image app.debug --markdown --rsod rsod.txt > crash.md
+    rsod-decode.py --syms app.debug --markdown --rsod rsod.txt > crash.md
 
 Manual address decode:
-    rsod-decode.py --image app.debug --base 0x6A3C0000 --addr 0x6A3C02EB
+    rsod-decode.py --syms app.debug --base 0x6A3C0000 --addr 0x6A3C02EB
 
 JSON output:
-    rsod-decode.py --image app.debug --json --rsod rsod.txt
+    rsod-decode.py --syms app.debug --json --rsod rsod.txt
 
 Remap build paths to local source:
-    rsod-decode.py --image app.debug --source-root ~/projects/edk2 --rsod rsod.txt
+    rsod-decode.py --syms app.debug --source-root ~/projects/edk2 --rsod rsod.txt
 
 (--file is still accepted everywhere --rsod is, so existing scripts and
 muscle memory keep working.)
@@ -390,6 +402,11 @@ class Image:
     # the PE's TimeDateStamp for the same link.
     map_max_rva: int = 0
     map_timestamp: int = 0
+    # The image's own build identity, when it records one. INFORMATIONAL
+    # ONLY and never gated on: images built by other toolchains carry no
+    # CodeView record at all (the real MSVC corpus has none), so requiring
+    # it would refuse exactly the artifacts this tool exists to decode.
+    build_id: str = ""
     # A link-stamp difference between map and image: evidence, not proof, so
     # it is a note rather than a mismatch warning. Kept separate from
     # `sym_note`, which explains missing LINE NUMBERS and would be clobbered.
@@ -415,7 +432,7 @@ class StackFrame:
     addr: int = 0
     offset: int = 0
     image_idx: int = -1
-    module_name: str = ""  # from RSOD text, used when no --image matches
+    module_name: str = ""  # from RSOD text, used when no --syms matches
     resolve: ResolveResult = field(default_factory=ResolveResult)
 
 
@@ -806,6 +823,12 @@ class PeHeader:
     timestamp: int = 0     # COFF TimeDateStamp; a linker map states the same value
     pdb_path: str = ""
     pdb_guid: str = ""
+    # The same sixteen bytes as `pdb_guid`, in FILE order and unadorned. Two
+    # renderings because they answer different questions: the braced form is
+    # the PDB identity a symbol server matches on, and this one is what
+    # `pe-set-debug --print-build-id` prints, so a human comparing an image
+    # against a build log is comparing identical strings.
+    pdb_guid_raw: str = ""
     pdb_age: int = 0
 
 
@@ -911,9 +934,21 @@ def _read_pe_codeview(data: bytes, pe_offset: int, magic: int,
         if cv[:4] != b"RSDS":       # NB10 (PDB 2.0) carries no GUID
             continue
         hdr.pdb_guid = _guid_str(cv[4:20])
+        raw = cv[4:20]
+        # All-zero means "records no identity" here exactly as it does for
+        # pdb_guid -- see _guid_str.
+        if any(raw):
+            hdr.pdb_guid_raw = "".join(f"{b:02x}" for b in raw)
         hdr.pdb_age = struct.unpack("<I", cv[20:24])[0]
         hdr.pdb_path = cv[24:].split(b"\x00")[0].decode("utf-8", "replace")
         return
+
+
+# A CodeView record whose GUID is 16 zero bytes -- the ABSENCE of an identity,
+# not an identity that happens to be zero. Every .efi this SDK produces carries
+# one. Formatted it is a non-empty string and therefore truthy, so `if guid:`
+# reads it as an identity and then compares it.
+_NULL_GUID = "{00000000-0000-0000-0000-000000000000}"
 
 
 _MSF_MAGIC = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00"
@@ -981,7 +1016,7 @@ def _looks_like_linker_map(path: str) -> bool:
 
     A map is a first-class symbol source, not a stray text file: it carries
     every public symbol AND the preferred load address. Recognizing one by
-    content rather than by extension means `--image foo.map` works, which is
+    content rather than by extension means `--syms foo.map` works, which is
     what a user reaches for when the map is all they have.
     """
     try:
@@ -1071,7 +1106,7 @@ def resolve_image_file(path: str, quiet: bool = False) -> str:
         return ""          # symbols come from the map itself
     elif btype == "pdb":
         print(f"Error: a PDB resolves lines only alongside its image: "
-              f"pass --image <file>.efi --pdb {path}", file=sys.stderr)
+              f"pass --syms <file>.efi --pdb {path}", file=sys.stderr)
         sys.exit(1)
     else:
         print(f"Error: unrecognized file type: {path}", file=sys.stderr)
@@ -1122,7 +1157,18 @@ def _resolve_pdb(img: Image, hdr: Optional[PeHeader], named_pdb: str,
     if not img.efi_path or hdr is None:
         return
     embedded = os.path.basename(hdr.pdb_path.replace("\\", "/")) if hdr.pdb_path else ""
-    want = (hdr.pdb_guid, hdr.pdb_age) if hdr.pdb_guid else None
+    # The check belongs HERE and not in _guid_str, which both readers share.
+    # The two sides are not symmetric. An IMAGE recording nothing leaves the
+    # question unaskable, so nothing may be concluded either way. A PDB
+    # recording nothing, against an image that names a GUID, is a different
+    # matter: that GUID came from the PDB the toolchain generated, so the PDB
+    # this image was built against records the same one and an all-zero PDB is
+    # a DIFFERENT artifact. Nulling the identity in the shared formatter
+    # collapsed the two and silently accepted that PDB, handing the reader
+    # line numbers from the wrong build -- believed precisely because they are
+    # so specific.
+    want = ((hdr.pdb_guid, hdr.pdb_age)
+            if hdr.pdb_guid and hdr.pdb_guid != _NULL_GUID else None)
     directory = os.path.dirname(os.path.abspath(img.efi_path))
 
     candidate, source = "", ""
@@ -1230,7 +1276,7 @@ def register_image(spec: str, tc: Toolchain, quiet: bool = False,
 
     # Look for a .map file alongside the image. The candidate has to be a
     # DIFFERENT file that actually reads as a linker map: `re.sub` on an
-    # extensionless image (`--image elfprobe`) substitutes nothing, so the
+    # extensionless image (`--syms elfprobe`) substitutes nothing, so the
     # image matched itself and was registered as its own map -- announced as
     # "Found map file: elfprobe", which is nearly convincing.
     if not map_file:
@@ -1309,7 +1355,8 @@ def register_image(spec: str, tc: Toolchain, quiet: bool = False,
                 map_file=map_file, efi_path=efi_path, pe_base=pe_base,
                 pe_size=pe_size,
                 map_max_rva=map_max_rva, map_timestamp=map_timestamp,
-                base_source="--image :BASE" if base is not None else "")
+                build_id=(pe_hdr.pdb_guid_raw if pe_hdr else ""),
+                base_source="--syms :BASE" if base is not None else "")
     _resolve_pdb(img, pe_hdr, named_pdb, quiet)
     return img
 
@@ -1635,9 +1682,10 @@ def validate_image(tc: Toolchain, img: Image, rsod: RsodData) -> None:
     # Gate 1: SizeOfImage against the firmware's own record for that base.
     #
     # Gate 1b covers the case Gate 1 cannot see. `pe_size` is 0 when the
-    # symbols came from a .map with no PE beside it, so for years --map
-    # skipped this check entirely and answered a wrong map with confident,
-    # fully-formatted fiction while --image refused the same build. A map has
+    # symbols came from a .map with no PE beside it, so for years a map-only
+    # run skipped this check entirely and answered a wrong map with confident,
+    # fully-formatted fiction while a run given the PE refused the same build
+    # -- the two were never modes, only different artifacts. A map has
     # no SizeOfImage, but it does carry a fact the dump can contradict:
     #
     #     a symbol cannot live beyond the end of its own image.
@@ -1649,8 +1697,8 @@ def validate_image(tc: Toolchain, img: Image, rsod: RsodData) -> None:
     #
     # KNOWN LIMIT, and it must not be oversold: this is ONE-DIRECTIONAL. It
     # catches a map too BIG for the dump. A wrong map that happens to be
-    # smaller still resolves silently, so map-only remains weaker than
-    # --image, which compares an exact size in both directions.
+    # smaller still resolves silently, so a map alone remains weaker than a
+    # PE, whose SizeOfImage is compared in both directions.
     for base, size, _name in rsod.loaded_images:
         if base != img.base:
             continue
@@ -2101,6 +2149,9 @@ _X64_EXCEPTIONS: Dict[int, Tuple[str, str]] = {
 _AARCH64_EC: Dict[int, str] = {
     0x00: "Unknown reason",
     0x01: "Trapped WFI/WFE",
+    # In firmware this is nearly always one thing: FP/SIMD reached before
+    # CPACR_EL1/CPTR_EL2 enabled it. Naming the register IS the fix.
+    0x07: "Trapped SVE/Advanced SIMD/FP access — FP not enabled in CPACR/CPTR",
     0x0E: "Illegal execution state",
     0x15: "SVC in AArch64",
     0x18: "Trapped MSR/MRS/system instruction",
@@ -2111,6 +2162,10 @@ _AARCH64_EC: Dict[int, str] = {
     0x25: "Data abort from same EL",
     0x26: "SP alignment fault",
     0x2C: "Trapped FP exception",
+    # Worth naming loudly: an SError is ASYNCHRONOUS, so ELR does not point at
+    # the instruction that caused the underlying error. A reader who takes the
+    # reported PC at face value spends the day in the wrong function.
+    0x2F: "SError interrupt — asynchronous, so the reported PC is not the faulting instruction",
     0x30: "Breakpoint from lower EL",
     0x31: "Breakpoint from same EL",
     0x32: "Software step from lower EL",
@@ -2135,6 +2190,26 @@ _AARCH64_DFSC: Dict[int, str] = {
     0x0E: "Permission fault, level 2",   0x0F: "Permission fault, level 3",
     0x10: "Synchronous external abort",  0x21: "Alignment fault",
 }
+
+
+def _esr_decode_str(esr: int) -> str:
+    """Render an ESR value as the "EC 0x.. IL .. ISS .." line the rest reads.
+
+    Both AArch64 parsers land in _diagnose_aarch64, and both have the register
+    in hand -- but only the Dell one derived the fields from it. The EDK2 one
+    read a pre-decoded "ESR : EC .. IL .. ISS .." line that the firmware may
+    simply not print, and when it did not, the decode produced NO Cause line at
+    all. That reads as "there was nothing to say about this exception" rather
+    than "this reader did not look at the register it had already parsed".
+    Deriving it in one place means neither parser can drift silent again.
+
+    This OUTRANKS a pre-decoded "ESR : ..." line the firmware printed, where
+    both are present. The register is the raw fact; that line is a rendering of
+    it, and reading a rendering as the data is a mistake this tree has already
+    paid for elsewhere.
+    """
+    return (f"EC 0x{(esr >> 26) & 0x3F:02x}  IL 0x{(esr >> 25) & 0x1:x}  "
+            f"ISS 0x{esr & 0x1FFFFFF:07x}")
 
 
 def _diagnose_fault_addr(addr_str: str) -> str:
@@ -2207,6 +2282,24 @@ def _diagnose_aarch64(data: RsodData) -> str:
             desc = _AARCH64_EC.get(ec)
             if desc:
                 parts.append(desc)
+            else:
+                # An EC with no entry is REPORTED, not swallowed: appending
+                # nothing dropped the only line naming what went wrong, and a
+                # decode with no cause reads as "nothing to say" rather than
+                # "not in my table" -- so the table could never be honestly
+                # incomplete. Saying so is what makes it safe to leave out
+                # rows whose firmware relevance cannot be justified.
+                #
+                # It must ADD to the firmware's own description, never replace
+                # it. Appending unconditionally made the abort_desc fallback
+                # below unreachable, so a dump whose firmware said exactly
+                # what happened had that sentence swapped for this placeholder
+                # -- and outside --detail it appears nowhere else. Our "I do
+                # not know this class" is worth strictly less than their
+                # "here is what it was".
+                parts.append(f"Unrecognised exception class (EC 0x{ec:02x})")
+                if data.abort_desc:
+                    parts.append(data.abort_desc)
 
             # Data/instruction abort — decode the fault status code (why it
             # faulted) from ISS[5:0], then interpret FAR.
@@ -2471,6 +2564,9 @@ def _parse_aarch64(text: str, data: RsodData):
     if m:
         data.fault_addr = m.group(1)
 
+    # The firmware's own decode, used only as a FALLBACK: the register sweep
+    # below overrides it whenever ESR itself was captured. The register is the
+    # raw fact and this line is somebody's rendering of it.
     m = re.search(r"ESR : (EC 0x[0-9a-fA-F]+\s+IL 0x[0-9a-fA-F]+\s+ISS 0x[0-9a-fA-F]+)", text)
     if m:
         data.esr_decode = m.group(1)
@@ -2497,6 +2593,9 @@ def _parse_aarch64(text: str, data: RsodData):
     # Registers
     for m in re.finditer(r"(X\d+|FP|LR|SP|ELR|SPSR|FPSR|ESR|FAR)\s+0x([0-9a-fA-F]+)", text):
         data.registers[m.group(1)] = int(m.group(2), 16)
+
+    if "ESR" in data.registers:
+        data.esr_decode = _esr_decode_str(data.registers["ESR"])
 
     # Stack dump
     for m in re.finditer(r"^\s*>?\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{16}\s*)+)", text, re.M):
@@ -2576,11 +2675,7 @@ def _parse_dell_bios(text: str, data: RsodData):
 
     # ESR decode (AARCH64 only)
     if "ESR" in data.registers:
-        esr = data.registers["ESR"]
-        ec = (esr >> 26) & 0x3F
-        il = (esr >> 25) & 0x1
-        iss = esr & 0x1FFFFFF
-        data.esr_decode = f"EC 0x{ec:02x}  IL 0x{il:x}  ISS 0x{iss:07x}"
+        data.esr_decode = _esr_decode_str(data.registers["ESR"])
 
     # Faulting PC: "-->RIP ADDR" or "--> PC ADDR" — prepend as frame #0
     m = re.search(r"-->\s*(?:RIP|PC|IP)\s+([0-9a-fA-F]+)", text)
@@ -2816,8 +2911,9 @@ def emit_human(
         for i, img in enumerate(images):
             base_str = f"  base=0x{img.base:x}" if img.base is not None else ""
             src = f" ({img.base_source})" if img.base_source else ""
+            bid = f"  id={img.build_id}" if img.build_id else ""
             print(dim(f"Image {i}: {img.name}  "
-                      f"{img.elf or img.efi_path or img.map_file}{base_str}{src}"))
+                      f"{img.elf or img.efi_path or img.map_file}{base_str}{src}{bid}"))
     print()
 
     _emit_image_warnings(images)
@@ -3078,7 +3174,7 @@ def disasm_lines(tc: Toolchain, img: Image,
 
     binary = img.elf or img.efi_path
     if not binary:
-        return [], "no image file for this module -- pass --image"
+        return [], "no image file for this module -- pass --syms <image>"
     if not _which(tc.objdump):
         return [], f"{tc.objdump} not on PATH"
 
@@ -3205,6 +3301,7 @@ def emit_json(
             {"name": img.name,
              "base": f"0x{img.base:x}" if img.base is not None else None,
              "base_source": img.base_source or None,
+             "build_id": img.build_id or None,
              "size": f"0x{img.size:x}",
              "size_of_image": f"0x{img.pe_size:x}" if img.pe_size else None,
              "debug_elf": img.elf,
@@ -3645,64 +3742,69 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
+  # x64 MSVC build - the linker map is usually all you have
+  rsod-decode.py --syms app.map --rsod putty.txt
+
+  # AArch64 GCC/clang build - the unstripped ELF
+  rsod-decode.py --syms app.so --rsod putty.txt
+
   # PE with a sibling linker map - no ELF, no PDB
   # (the MSVC workflow; the load base is inferred from the PE header,
   #  the map's preferred load address and the dump's own image list)
-  rsod-decode.py --image app.efi --rsod console.log
+  # Naming the PE picks up the .map beside it automatically, which adds
+  # disassembly and an image-vs-dump size check a map alone cannot make.
+  # Naming both files instead registers two separate images, not one.
+  rsod-decode.py --syms app.efi --rsod putty.txt
 
   # Same, with the faulting instruction disassembled
-  rsod-decode.py --image app.efi --detail --rsod console.log
-
-  # Symbols from the map alone (no image available)
-  rsod-decode.py --map app.map --rsod console.log
+  rsod-decode.py --syms app.efi --detail --rsod console.log
 
   # MSVC line numbers come from the PDB -- a map cannot carry them.
   # A PDB beside the image is found on its own, even if it has been
   # renamed (matched on the CodeView GUID, not the filename).
   # Name one explicitly when it lives somewhere else:
-  rsod-decode.py --image app.efi --pdb archive/app-1.2.3.efi.pdb --rsod console.log
+  rsod-decode.py --syms app.efi --pdb archive/app-1.2.3.efi.pdb --rsod console.log
 
   # Raw terminal capture: the dump is embedded in unrelated console output
   # (login noise, a register block, a stack dump, a loaded-image list).
   # --rsod takes the WHOLE capture; it does not need trimming first.
-  rsod-decode.py --image app.efi --rsod putty-session.log
+  rsod-decode.py --syms app.efi --rsod putty-session.log
 
   # Image not loaded at its preferred base
-  rsod-decode.py --image app.efi:0x7E120000 --rsod console.log
+  rsod-decode.py --syms app.efi:0x7E120000 --rsod console.log
 
   # ELF with DWARF, detailed output with disassembly and source context
-  rsod-decode.py --image IpmiTool.debug --detail --rsod rsod.txt
+  rsod-decode.py --syms IpmiTool.debug --detail --rsod rsod.txt
 
   # Multi-image (AARCH64 cross-module stack trace)
-  rsod-decode.py --image App.debug --image DxeCore.debug:0x47683000 --rsod rsod.txt
+  rsod-decode.py --syms App.debug --syms DxeCore.debug:0x47683000 --rsod rsod.txt
 
   # Markdown report with GitHub links
-  rsod-decode.py --image App.debug --markdown --rsod rsod.txt > crash.md
-  rsod-decode.py --image App.debug --markdown --repo org/repo --rsod rsod.txt
+  rsod-decode.py --syms App.debug --markdown --rsod rsod.txt > crash.md
+  rsod-decode.py --syms App.debug --markdown --repo org/repo --rsod rsod.txt
 
   # Remap build-machine paths to local source
-  rsod-decode.py --image App.debug --source-root ~/projects/edk2 --rsod rsod.txt
+  rsod-decode.py --syms App.debug --source-root ~/projects/edk2 --rsod rsod.txt
 
   # Manual address decode
-  rsod-decode.py --image App.debug --base 0x6A3C0000 --addr 0x6A3C02EB
+  rsod-decode.py --syms App.debug --base 0x6A3C0000 --addr 0x6A3C02EB
 
   # JSON output / pipe from clipboard
-  rsod-decode.py --image App.debug --json --rsod rsod.txt
-  cat serial.log | rsod-decode.py --image App.debug
+  rsod-decode.py --syms App.debug --json --rsod rsod.txt
+  cat serial.log | rsod-decode.py --syms App.debug
 
   # Dump all symbols
-  rsod-decode.py --image App.debug --dump
+  rsod-decode.py --syms App.debug --dump
 
 For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
 """,
     )
-    parser.add_argument("--image", "--debug", action="append", dest="images", metavar="FILE[:BASE]",
-                        help="EFI image (.debug, .dll, .so, .efi), a linker .map, "
-                             "or a .pdb. Repeatable. Optional :BASE suffix "
-                             "(inferred if omitted).")
-    parser.add_argument("--map", action="append", dest="images", metavar="FILE[:BASE]",
-                        help="Linker .map file — symbols and the preferred load "
-                             "address, with no image needed. Same list as --image.")
+    parser.add_argument("--syms", action="append", dest="images", metavar="FILE[:BASE]",
+                        help="Where this module's symbols come from: a linker "
+                             ".map, an ELF (.so, .debug, .dll) or a PE (.efi). "
+                             "Repeatable, once per module. Optional :BASE "
+                             "suffix (inferred if omitted). A .pdb goes to "
+                             "--pdb; it is not a symbol source on its own.")
     parser.add_argument("--pdb", metavar="FILE",
                         help="PDB providing line numbers. Overrides discovery; "
                              "needed when the PDB has been renamed, since the "
@@ -3736,10 +3838,10 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
         # company with the image it was built from, so ask for that rather
         # than accepting the run and producing an empty report.
         print("Error: --pdb needs the image it belongs to; add "
-              "--image <file>.efi", file=sys.stderr)
+              "--syms <file>.efi", file=sys.stderr)
         sys.exit(1)
     if not args.images and not args.ocr and not args.rsod_file and not args.addr:
-        parser.error("--image, --map, --pdb, --ocr, --rsod, or --addr is required")
+        parser.error("--syms, --pdb, --ocr, --rsod, or --addr is required")
 
     # Detect arch from first image (if provided)
     elf_arch = ""
@@ -3760,7 +3862,7 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
     elif not args.addr and not args.dump and not sys.stdin.isatty():
         # --dump lists an image's symbols and reads no crash text, so waiting on
         # stdin for some is a hang, not a fallback: run from any script (stdin
-        # is not a tty there) `--map foo.map --dump` blocked forever with no
+        # is not a tty there) `--syms foo.map --dump` blocked forever with no
         # output. Found by a test that hung on exactly that.
         rsod_text = sys.stdin.read()
 
@@ -3772,7 +3874,7 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
     if not arch and args.images:
         # A linker map states no architecture, and a map-only run needs none:
         # nothing shells out to a prefixed nm/objdump for it. Refusing here
-        # would make `--map foo.map --dump` impossible, which is precisely the
+        # would make `--syms foo.map --dump` impossible, which is precisely the
         # case where the map is all anyone has. The value only picks a tool
         # prefix, so it is inert on this path.
         specs = [re.sub(r":0x[0-9a-fA-F]+$", "", spec, flags=re.IGNORECASE)

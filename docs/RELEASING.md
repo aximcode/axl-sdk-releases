@@ -725,7 +725,17 @@ gh release view vX.Y.Z --repo aximcode/axl-sdk-releases
 
 Should show the release page with `axl-sdk.deb`, `axl-sdk.rpm`,
 `axl-sdk-tools-{x64,aa64}.tar.gz`,
-`axl-sdk-host-tools.{tar.gz,deb}`, and `SHA256SUMS` attached.
+`axl-sdk-host-tools.{tar.gz,deb}`, `axl-sdk-<ver>-linux-x86_64.tar.gz`
+(the relocatable SDK prefix — it keeps its versioned name, unlike the
+packages, because the version IS the directory inside it and a stable
+filename would make two pinned versions indistinguishable on disk), and
+`SHA256SUMS` attached.
+
+> **This artifact set is changing.** [AXL-Distribution-Design.md](AXL-Distribution-Design.md)
+> §12–§13 add an SDK **prefix** tarball (P1/P6 — the one artifact a root-free
+> install needs and which has never been built), fold `axl-sdk-host-tools`
+> into the SDK package (P7), and put an `axl` dispatcher on `PATH` (P5).
+> Update this list with each phase rather than after all of them.
 
 The `.deb` / `.rpm` packages include the full C and C++ surface
 when CI builds with BOTH bare-metal toolchains cached

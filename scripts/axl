@@ -1,0 +1,157 @@
+#!/bin/bash
+# axl — one name on PATH for every host-side SDK tool.
+#
+# WHY THIS EXISTS. Twelve host-side scripts ship with the SDK and ten of them
+# land on no PATH at all: the packaging gives `/usr/bin` wrappers to run-qemu
+# and axl-emulate only, and everything else sits at a full path under
+# `/usr/share/axl-sdk-host-tools/scripts/`. So the crash handler prints
+#
+#     rsod-decode.py --syms <build>/X.so --rsod crash-report.txt
+#
+# as the command to run, and for a package user that is `command not found`.
+# Consumers then invent their own answer -- `~/axl-sdk-host-tools/scripts/...`,
+# which README.md prescribes and axl-utils implements -- and every README,
+# printed hint and consumer script has to name a path that depends on how the
+# SDK was installed.
+#
+# `axl <command>` makes the install location stop mattering. See
+# AXL-Distribution-Design.md §13; the UEFI-side `axl.efi` busybox is the same
+# idiom, so this is its host-side sibling rather than a new concept.
+#
+# NOT a wrapper per tool. The command list IS the contents of libexec/axl/, so
+# adding a tool to install.sh's staging list adds a subcommand and there is no
+# second list to drift from it -- the failure mode `check-flag-parity` exists
+# for elsewhere in this tree.
+#
+# The FILES keep their real names and only the COMMAND drops the extension.
+# That is not cosmetic: these scripts locate each other by filename from their
+# own directory -- run-qemu.sh does `source "$(dirname "$0")/axl-common.sh"`,
+# profile-qemu.sh runs `$SCRIPT_DIR/gdb-syms.py`, axl-emulate execs run-qemu.sh
+# from `Path(__file__).resolve().parent`. Staging them under stripped names
+# would leave every one of them correct and unable to find the others.
+set -uo pipefail
+
+# `cd -P` resolves symlinks physically. Same reason axl-cc does it: on a
+# usrmerge distro /bin is a symlink to /usr/bin, and a logical `cd` would
+# resolve the prefix to `/` instead of `/usr`. It also makes a `current`
+# symlink (AXL-Distribution-Design.md §12.2) resolve to the versioned root it
+# points at, which is what a printed diagnostic should name.
+SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
+PREFIX="$(dirname "$SCRIPT_DIR")"
+LIBEXEC="$PREFIX/libexec/axl"
+VERSION_FILE="$PREFIX/share/axl/version"
+
+# The one-line summary a command carries for `axl --help`, read from the
+# command itself rather than from a table here: a table would be a second
+# source of truth for a fact the file already states.
+cmd_desc() {
+    local d
+    d=$(sed -n 's/^#[[:space:]]*axl-desc:[[:space:]]*//p' "$1" 2>/dev/null | head -1)
+    printf '%s' "$d"
+}
+
+# basename -> command name: drop a .sh/.py extension and a leading `axl-`, so
+# `rsod-decode.py` is `axl rsod-decode` and `axl-emulate` is `axl emulate`
+# rather than `axl axl-emulate`.
+cmd_name() {
+    local n="${1##*/}"
+    n="${n%.sh}"; n="${n%.py}"
+    printf '%s' "${n#axl-}"
+}
+
+list_commands() {
+    [[ -d "$LIBEXEC" ]] || return 0
+    local f
+    for f in "$LIBEXEC"/*; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        printf '%s\n' "$(cmd_name "$f")"
+    done | sort
+}
+
+# command name -> the file that provides it. A scan rather than a table, for
+# the same reason the listing is: a table would be a second source of truth.
+resolve_command() {
+    local want="$1" f
+    [[ -d "$LIBEXEC" ]] || return 1
+    for f in "$LIBEXEC"/*; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        if [[ "$(cmd_name "$f")" == "$want" ]]; then
+            printf '%s' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+usage() {
+    # stdout, not stderr, and exit 0: a bare `axl` is someone looking for the
+    # command list, which is the entire point of this program. Treating it as
+    # a usage error would hide the discovery surface behind a redirect.
+    echo "usage: axl <command> [args ...]"
+    echo "       axl --print-prefix | --print-version | --help"
+    echo ""
+    echo "host commands:"
+    local c d f
+    while read -r c; do
+        [[ -n "$c" ]] || continue
+        f=$(resolve_command "$c") || continue
+        d=$(cmd_desc "$f")
+        if [[ -n "$d" ]]; then
+            printf '  %-18s %s\n' "$c" "$d"
+        else
+            printf '  %s\n' "$c"
+        fi
+    done < <(list_commands)
+    echo ""
+    echo "Run 'axl <command> --help' for a command's own options."
+    echo ""
+    # "Tool" is overloaded four ways here -- these host-side helper scripts,
+    # the HOST's own gcc/binutils (which AXL deliberately does not use for
+    # target code), AXL's bare-metal CROSS toolchain under /opt, and the
+    # target .efi utilities. A bare command list invites the reader to assume
+    # this one program fronts all of them. Naming the compiler drivers and
+    # where their toolchain comes from is three lines and removes the guess.
+    echo "These commands run on the HOST."
+    echo "To compile for UEFI use axl-cc / axl-c++, which build with AXL's bare-metal"
+    echo "cross toolchain, NOT the host's gcc. Install it with axl-install-toolchain."
+}
+
+case "${1-}" in
+    ""|-h|--help)
+        usage
+        exit 0
+        ;;
+    --print-prefix)
+        # AXL-Distribution-Design.md §6 lists this as MISSING and names the
+        # cost: it is why a consumer hardcodes /usr/include/axl-sdk. Bare
+        # value, no banner -- it is a machine interface.
+        printf '%s\n' "$PREFIX"
+        exit 0
+        ;;
+    --print-version|--version)
+        if [[ -r "$VERSION_FILE" ]]; then
+            # `cat` rather than echoing a compiled-in string: the staged file
+            # is written from the tree's VERSION by install.sh, so there is
+            # nothing here that can disagree with what was installed.
+            cat "$VERSION_FILE"
+            exit 0
+        fi
+        echo "axl: no version file at $VERSION_FILE" >&2
+        exit 1
+        ;;
+esac
+
+CMD="$1"; shift
+
+if ! TARGET=$(resolve_command "$CMD"); then
+    # Name the command back rather than printing usage: the user typed
+    # something specific and the useful information is which word failed.
+    echo "axl: unknown command '$CMD'" >&2
+    echo "Run 'axl --help' for the list of commands." >&2
+    exit 2
+fi
+
+# exec, so the subcommand inherits this process: its exit status is ours
+# without forwarding, signals reach it directly, and `axl run-qemu` under a
+# timeout kills QEMU rather than a shell that is waiting on it.
+exec "$TARGET" "$@"

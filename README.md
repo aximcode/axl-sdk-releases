@@ -308,22 +308,37 @@ names the command that removes it.
 
 ### Host-side QEMU testing tooling
 
-For **downstream consumers** who want `run-qemu.sh` and friends
-to test their UEFI apps under QEMU but don't need the build-side
-SDK (no `axl-cc`, no library), there's a separate tarball
-and `.deb`:
+**If you install the SDK you already have these.** `axl-sdk` ships
+them at `libexec/axl/` behind the `axl` dispatcher, so they are on
+`PATH` by name:
 
 ```bash
-# Debian/Ubuntu (.deb pulls system QEMU + OVMF + virtiofsd):
-curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-host-tools.deb
-sudo apt install ./axl-sdk-host-tools.deb
-run-qemu my-app.efi
+axl --help              # the full list
+axl run-qemu my-app.efi
+axl rsod-decode --syms my-app.map --rsod putty.txt
+```
 
-# Any distro (tarball — install QEMU/OVMF separately):
+QEMU and OVMF are **Recommends**, not hard dependencies — they are
+needed to *run* a `.efi`, not to build one, so `apt`/`dnf` install
+them by default and you can decline them.
+
+For **downstream consumers** who want `run-qemu.sh` and friends but
+don't need the build-side SDK (no `axl-cc`, no library), there is a
+standalone tarball:
+
+```bash
 curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-host-tools.tar.gz
 mkdir -p ~/axl-sdk-host-tools && tar xf axl-sdk-host-tools.tar.gz -C ~/axl-sdk-host-tools
 ~/axl-sdk-host-tools/scripts/run-qemu.sh my-app.efi
 ```
+
+> The standalone `axl-sdk-host-tools.deb` / `.rpm` are **retired** —
+> their contents ship inside `axl-sdk`, which `Replaces`/`Obsoletes`
+> them, so installing `axl-sdk` removes the old copies instead of
+> leaving two of every script on disk. An existing host-tools install
+> is not disturbed on its own (we publish no apt/dnf repo, so nothing
+> auto-upgrades); it simply stops receiving new versions. The tarball
+> is unaffected and remains the no-SDK path.
 
 Discovery falls through `$QEMU_DIR` → `$PATH` → legacy custom
 build, so the tarball Just Works against the system QEMU/OVMF

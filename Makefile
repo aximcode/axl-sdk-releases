@@ -1226,7 +1226,7 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-fuzz-link check-examples check-json-dialect check-flag-parity \
     check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
     check-log-levels check-handle-exclusions check-libc-overlap check-build-mode \
-    check-awk-portability
+    check-awk-portability check-devkit-conf
 
 # Gates that need BUILT IMAGES, and therefore CANNOT be in LINT_GATES.
 #
@@ -2289,6 +2289,15 @@ check-toolchain-conf:
 .PHONY: check-uefi-scope
 check-uefi-scope:
 	@python3 scripts/check-uefi-scope.py
+
+# check-devkit-conf -- devkit.conf is a HAND-WRITTEN list while TOOL_NAMES is
+# the canonical set, so the two drift silently. lsacpi shipped into TOOL_NAMES
+# on 2026-08-28 and reached the tools tarball and the busybox automatically
+# (both DERIVE from TOOL_NAMES) but never reached the devkit image, because
+# nobody added the line. Nothing read that file, so nothing could notice.
+.PHONY: check-devkit-conf
+check-devkit-conf:
+	@python3 scripts/check-devkit-conf.py
 
 check-version:
 	@file_ver=$$(cat VERSION); \

@@ -163,7 +163,7 @@ echo ""
 # ═══════════════════════════════════════════════════════════════
 echo "-- PE + map, base inferred, --detail --"
 OUT="$WORK/out-detail.txt"
-run_decode "$OUT" "PE + map + --detail run completes" --image "$APP" --rsod "$LOG" --detail
+run_decode "$OUT" "PE + map + --detail run completes" --syms "$APP" --rsod "$LOG" --detail
 
 # S4: the base is stated by the PE header, the map and the dump's image list.
 # Requiring :BASE when all three agree is the tool refusing to read its inputs.
@@ -224,7 +224,7 @@ refute_match "$OUT" 'IMAGE DOES NOT MATCH' "S3 correct image raises no mismatch 
 echo ""
 echo "-- same dump, no --detail --"
 OUTP="$WORK/out-plain.txt"
-run_decode "$OUTP" "plain run completes" --image "$APP" --rsod "$LOG"
+run_decode "$OUTP" "plain run completes" --syms "$APP" --rsod "$LOG"
 assert_line "$OUTP" "Stack scan (return addresses found in the stack dump):" \
     "S6b stack scan leads without --detail when there is no frame list"
 assert_line "$OUTP" "?TestCaller@@YAHH@Z + 0x53 [0x140020053] (stack scan)" \
@@ -236,7 +236,7 @@ assert_line "$OUTP" "?TestCaller@@YAHH@Z + 0x53 [0x140020053] (stack scan)" \
 echo ""
 echo "-- wrong-but-plausible image --"
 OUTW="$WORK/out-wrong.txt"
-run_decode "$OUTW" "wrong-image run completes" --image "$WRONG:0x140000000" --rsod "$LOG"
+run_decode "$OUTW" "wrong-image run completes" --syms "$WRONG:0x140000000" --rsod "$LOG"
 
 assert_line "$OUTW" "!! IMAGE DOES NOT MATCH THE DUMP - symbols below are probably fiction:" \
     "S3 mismatch is announced loudly at the top"
@@ -257,7 +257,7 @@ echo ""
 echo "-- SizeOfImage read from the PE (no map) --"
 NOMAP="$WORK/nomap"; mkdir -p "$NOMAP"; cp "$APP" "$NOMAP/app.efi"
 OUTN="$WORK/out-nomap.txt"
-run_decode "$OUTN" "image-only run completes" --image "$NOMAP/app.efi:0x140000000" --rsod "$LOG" --detail
+run_decode "$OUTN" "image-only run completes" --syms "$NOMAP/app.efi:0x140000000" --rsod "$LOG" --detail
 
 refute_match "$OUTN" 'faulting PC .. invalid address|outside all known images' \
     "S2 PC past 128 KB is inside the image"
@@ -271,23 +271,16 @@ assert_line "$OUTN" ">>> 14002100a: mov %gs:0x58,%rax" \
 echo ""
 echo "-- map alone --"
 OUTM="$WORK/out-map.txt"
-run_decode "$OUTM" "map-only run completes" --map "$MAP" --rsod "$LOG"
+run_decode "$OUTM" "map-only run completes" --syms "$MAP" --rsod "$LOG"
 
 assert_line "$OUTM" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x14002100a + 0x2100a]" \
     "S4 map-only run resolves the frame"
 refute_match "$OUTM" 'unrecognized file type' "S4 a .map is not rejected"
 
-# A .map handed to --image must work too -- the report named --image as the
-# thing a user reaches for, and rejecting the file outright is the failure.
-OUTMI="$WORK/out-map-image.txt"
-run_decode "$OUTMI" "map-as---image run completes" --image "$MAP" --rsod "$LOG"
-assert_line "$OUTMI" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x14002100a + 0x2100a]" \
-    "S4 a .map is accepted as --image too"
-
 # A map-only run cannot disassemble; say so rather than printing nothing.
 OUTMD="$WORK/out-map-detail.txt"
-run_decode "$OUTMD" "map-only --detail run completes" --map "$MAP" --rsod "$LOG" --detail
-assert_line "$OUTMD" "Disassembly: unavailable (no image file for this module -- pass --image)" \
+run_decode "$OUTMD" "map-only --detail run completes" --syms "$MAP" --rsod "$LOG" --detail
+assert_line "$OUTMD" "Disassembly: unavailable (no image file for this module -- pass --syms <image>)" \
     "S1 --detail explains an absent disassembly instead of staying silent"
 
 # ═══════════════════════════════════════════════════════════════
@@ -300,7 +293,7 @@ assert_line "$OUTMD" "Disassembly: unavailable (no image file for this module --
 echo ""
 echo "-- relocated image (dump base overrides the PE header) --"
 OUTR="$WORK/out-reloc.txt"
-run_decode "$OUTR" "relocated run completes" --image "$APP" --rsod "$RELOG"
+run_decode "$OUTR" "relocated run completes" --syms "$APP" --rsod "$RELOG"
 
 assert_line "$OUTR" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x7e14100a + 0x2100a]" \
     "S4 relocated image resolves at the dump's base, not the PE header's"
@@ -311,18 +304,18 @@ refute_match "$OUTR" 'IMAGE DOES NOT MATCH' \
 # through the preferred base; get that wrong and objdump decodes empty space.
 OUTRD="$WORK/out-reloc-detail.txt"
 run_decode "$OUTRD" "relocated --detail run completes" \
-    --image "$APP" --rsod "$RELOG" --detail
+    --syms "$APP" --rsod "$RELOG" --detail
 assert_line "$OUTRD" ">>> 14002100a: mov %gs:0x58,%rax" \
     "S1 relocated image disassembles at its LINK address"
 
 # --dump had the same shape of bug as the disassembler: it drove nm with
 # `img.elf`, so a map-only image dumped an empty section instead of the symbols
 # it plainly holds. A map-only run also needs no architecture, and refusing to
-# pick one made `--map x.map --dump` impossible.
+# pick one made `--syms x.map --dump` impossible.
 echo ""
 echo "-- --dump from a map alone --"
 DUMPO="$WORK/dump.txt"
-if timeout 60 python3 "$DECODE" --map "$MAP" --dump > "$DUMPO.raw" 2>"$DUMPO.err"; then
+if timeout 60 python3 "$DECODE" --syms "$MAP" --dump > "$DUMPO.raw" 2>"$DUMPO.err"; then
     norm < "$DUMPO.raw" > "$DUMPO"
     test_host_pass "map-only --dump completes with no --arch"
     assert_line "$DUMPO" "0x0000000000021000 ?TestFaulty@@YAPEAXPEAI@Z" \
@@ -358,7 +351,7 @@ PAPP="$PD/app.efi"
 PLOG="$PD/console.log"
 
 # The PE must actually carry the CodeView record the rest of this depends on.
-if "$DECODE" --image "$PAPP" --rsod "$PLOG" --detail 2>&1 >/dev/null \
+if "$DECODE" --syms "$PAPP" --rsod "$PLOG" --detail 2>&1 >/dev/null \
         | grep -q 'app.pdb'; then
     test_host_pass "the PE's embedded PDB name is read"
 else
@@ -371,7 +364,7 @@ fi
 # quietly found the same file, so the fast path was untested.
 OUTB="$WORK/out-pdb-beside.txt"
 run_decode "$OUTB" "PDB beside the image, embedded name" \
-    --image "$PAPP" --rsod "$PLOG" --detail
+    --syms "$PAPP" --rsod "$PLOG" --detail
 assert_line "$OUTB" "Symbol sources: app.map (map, linked 0x6a8f3db9), app.pdb (PDB, beside the image)" \
     "P3 a PDB under the embedded name is found by name, not by scan"
 
@@ -382,7 +375,7 @@ mv "$PD/app.pdb" "$PD/app-1.2.3.efi.pdb"
 # P1/A: --pdb names it explicitly.
 OUTP="$WORK/out-pdb-named.txt"
 run_decode "$OUTP" "--pdb names a PDB" \
-    --image "$PAPP" --pdb "$PD/app-1.2.3.efi.pdb" --rsod "$PLOG" --detail
+    --syms "$PAPP" --pdb "$PD/app-1.2.3.efi.pdb" --rsod "$PLOG" --detail
 assert_line "$OUTP" "Symbol sources: app.map (map, linked 0x6a8f3db9), app-1.2.3.efi.pdb (PDB, named)" \
     "P1 the named PDB is reported as the symbol source"
 
@@ -390,7 +383,7 @@ assert_line "$OUTP" "Symbol sources: app.map (map, linked 0x6a8f3db9), app-1.2.3
 # not by filename. This is the case that makes --pdb unnecessary in practice.
 OUTD="$WORK/out-pdb-guid.txt"
 run_decode "$OUTD" "renamed PDB run completes" \
-    --image "$PAPP" --rsod "$PLOG" --detail
+    --syms "$PAPP" --rsod "$PLOG" --detail
 assert_line "$OUTD" "Symbol sources: app.map (map, linked 0x6a8f3db9), app-1.2.3.efi.pdb (PDB, matched by GUID)" \
     "P3 a renamed PDB is found by its CodeView GUID"
 
@@ -399,7 +392,7 @@ assert_line "$OUTD" "Symbol sources: app.map (map, linked 0x6a8f3db9), app-1.2.3
 # which are believed precisely because they are so specific.
 OUTM="$WORK/out-pdb-mismatch.txt"
 run_decode "$OUTM" "mismatched PDB run completes" \
-    --image "$PAPP" --pdb "$PD/mismatched.pdb" --rsod "$PLOG" --detail
+    --syms "$PAPP" --pdb "$PD/mismatched.pdb" --rsod "$PLOG" --detail
 assert_line "$OUTM" "!! PDB DOES NOT MATCH THE IMAGE - ignoring it for line numbers:" \
     "P3 a mismatched PDB is refused loudly"
 refute_match "$OUTM" 'mismatched\.pdb \(PDB' \
@@ -408,7 +401,7 @@ refute_match "$OUTM" 'mismatched\.pdb \(PDB' \
 # P2/B: with no PDB at all, say so and say why -- the silent case.
 rm -f "$PD/app-1.2.3.efi.pdb" "$PD/mismatched.pdb"
 OUTN="$WORK/out-pdb-absent.txt"
-run_decode "$OUTN" "no-PDB run completes" --image "$PAPP" --rsod "$PLOG" --detail
+run_decode "$OUTN" "no-PDB run completes" --syms "$PAPP" --rsod "$PLOG" --detail
 assert_line "$OUTN" "No PDB: image embeds 'app.pdb', not found beside the image - no line numbers" \
     "P2 an absent PDB is explained, not silent"
 assert_line "$OUTN" "Symbol sources: app.map (map, linked 0x6a8f3db9)" \
@@ -420,7 +413,7 @@ assert_line "$OUTN" "Symbol sources: app.map (map, linked 0x6a8f3db9)" \
 # with no symbols in it, which is what "accept a .pdb like a .map" first did.
 python3 "$MAKE_FIXTURE" "$PD" --pdb >/dev/null 2>&1
 POERR="$WORK/pdb-only.err"
-if timeout 60 python3 "$DECODE" --image "$PD/app.pdb" --rsod "$PLOG" \
+if timeout 60 python3 "$DECODE" --syms "$PD/app.pdb" --rsod "$PLOG" \
         >/dev/null 2>"$POERR"; then
     test_host_fail "a .pdb alone is refused, not silently useless"
 else
@@ -434,12 +427,68 @@ fi
 POERR2="$WORK/pdb-flag-only.err"
 if timeout 60 python3 "$DECODE" --pdb "$PD/app.pdb" --rsod "$PLOG" \
         >/dev/null 2>"$POERR2"; then
-    test_host_fail "--pdb with no --image is refused"
+    test_host_fail "--pdb with no --syms is refused"
 elif grep -q 'needs the image it belongs to' "$POERR2"; then
-    test_host_pass "--pdb with no --image is refused"
+    test_host_pass "--pdb with no --syms is refused"
 else
-    test_host_fail "--pdb with no --image is refused with a useful message"
+    test_host_fail "--pdb with no --syms is refused with a useful message"
 fi
+
+# ── an all-zero CodeView GUID is NOT an identity ──────────────
+#
+# AXL's own images record exactly this: a CodeView record whose GUID is 16 zero
+# bytes, age 1. Formatted, that is a non-empty string and therefore truthy, so
+# "this image records no identity" was carried around as though it WERE one --
+# and then used both to accuse a PDB and to acquit one. Same class as the
+# wrong-artifact gate fixed in 4.3.4: a comparison that cannot discriminate is
+# worse than no comparison, because it still prints a verdict.
+echo ""
+echo "-- an image that records no identity --"
+ZG="$WORK/zeroguid"; mkdir -p "$ZG"
+python3 "$MAKE_FIXTURE" "$ZG" --pdb --zero-guid >/dev/null 2>&1 \
+    || test_host_fail "zero-GUID fixture builds"
+
+# A real PDB sits beside a zero-GUID image, under the name the PE embeds. The
+# two identities cannot be compared, and "the question could not be asked" is
+# not a refutation -- so the PDB must be USED, not refused.
+OUTZ1="$WORK/out-zeroguid-beside.txt"
+run_decode "$OUTZ1" "zero-GUID image + PDB beside it" \
+    --syms "$ZG/app.efi" --rsod "$ZG/console.log" --detail
+assert_line "$OUTZ1" "Symbol sources: app.map (map, linked 0x6a8f3db9), app.pdb (PDB, beside the image)" \
+    "Z1 a PDB beside an image that records no GUID is used, not accused"
+refute_line "$OUTZ1" "!! PDB DOES NOT MATCH THE IMAGE - ignoring it for line numbers:" \
+    "Z1 an unrecorded identity is not reported as a mismatch"
+
+# The other direction. Take the by-name candidate away so only the GUID scan is
+# left, and leave a renamed PDB that also records nothing. Two artifacts that
+# both record no identity must not "match" -- that asserts a pairing from the
+# absence of evidence on both sides.
+rm -f "$ZG/app.pdb"
+OUTZ2="$WORK/out-zeroguid-scan.txt"
+run_decode "$OUTZ2" "zero-GUID image + zero-GUID renamed PDB" \
+    --syms "$ZG/app.efi" --rsod "$ZG/console.log" --detail
+assert_line "$OUTZ2" "No PDB: image embeds 'app.pdb', not found beside the image - no line numbers" \
+    "Z2 two absent identities do not match each other"
+refute_match "$OUTZ2" 'matched by GUID' \
+    "Z2 no PDB is claimed as matched by GUID"
+
+# Z3 -- and NOT the other way round. "Records nothing" is only unanswerable
+# when it is the IMAGE that records nothing. When the image names a GUID, that
+# GUID came from the PDB its toolchain generated, so the PDB it was built
+# against records the same one; a PDB recording all zeros is therefore a
+# DIFFERENT artifact, and that is an inference, not an absence of evidence.
+# Treating both sides alike accepts it silently and hands the reader line
+# numbers from the wrong build -- believed precisely because they are specific.
+ZGX="$WORK/zeroguid-pdb"; mkdir -p "$ZGX"
+python3 "$MAKE_FIXTURE" "$ZGX" --pdb >/dev/null 2>&1
+cp "$ZG/renamed-zero.pdb" "$ZGX/app.pdb"      # real-GUID image, identity-less PDB
+OUTZ3="$WORK/out-zeroguid-pdb.txt"
+run_decode "$OUTZ3" "real-GUID image + zero-GUID PDB" \
+    --syms "$ZGX/app.efi" --rsod "$ZGX/console.log" --detail
+assert_line "$OUTZ3" "!! PDB DOES NOT MATCH THE IMAGE - ignoring it for line numbers:" \
+    "Z3 a PDB recording no identity is refused by an image that records one"
+refute_match "$OUTZ3" 'app\.pdb \(PDB' \
+    "Z3 the refused PDB is not then used as a symbol source"
 
 # ═══════════════════════════════════════════════════════════════
 # Real MSVC PE + PDB, opt-in.
@@ -475,7 +524,7 @@ else
 
         # (i) discovered under the name the PE embeds.
         OUTR1="$WORK/out-realpdb-1.txt"
-        run_decode "$OUTR1" "real PDB, discovered" --image "$R_EFI" --rsod "$R_LOG"
+        run_decode "$OUTR1" "real PDB, discovered" --syms "$R_EFI" --rsod "$R_LOG"
         if grep -qF -- "$RSOD_PDB_EXPECT" "$OUTR1"; then
             test_host_pass "real PDB resolves $RSOD_PDB_EXPECT"
         else
@@ -488,7 +537,7 @@ else
         # and silently unused. Found by CodeView identity, not by filename.
         mv "$R_PDB" "$RF/renamed-9.9.9.efi.pdb"
         OUTR2="$WORK/out-realpdb-2.txt"
-        run_decode "$OUTR2" "real PDB, renamed" --image "$R_EFI" --rsod "$R_LOG"
+        run_decode "$OUTR2" "real PDB, renamed" --syms "$R_EFI" --rsod "$R_LOG"
         if grep -qF -- "$RSOD_PDB_EXPECT" "$OUTR2"; then
             test_host_pass "a renamed real PDB still resolves, unaided"
         else
@@ -499,7 +548,7 @@ else
         # (iii) named explicitly.
         OUTR3="$WORK/out-realpdb-3.txt"
         run_decode "$OUTR3" "real PDB, named" \
-            --image "$R_EFI" --pdb "$RF/renamed-9.9.9.efi.pdb" --rsod "$R_LOG"
+            --syms "$R_EFI" --pdb "$RF/renamed-9.9.9.efi.pdb" --rsod "$R_LOG"
         if grep -qF -- "$RSOD_PDB_EXPECT" "$OUTR3"; then
             test_host_pass "--pdb resolves the renamed real PDB"
         else
@@ -512,7 +561,7 @@ else
         cp "$RF"/*.map "$RF/nopdb/" 2>/dev/null || true
         OUTR4="$WORK/out-realpdb-4.txt"
         run_decode "$OUTR4" "real image, no PDB" \
-            --image "$RF/nopdb/$(basename "$R_EFI")" \
+            --syms "$RF/nopdb/$(basename "$R_EFI")" \
             --rsod "$RF/nopdb/$(basename "$R_LOG")"
         refute_match "$OUTR4" "$(printf '%s' "$RSOD_PDB_EXPECT" | sed 's/[].[^$\\*]/\\&/g')" \
             "no PDB means no line numbers"
@@ -534,15 +583,40 @@ timeout 60 python3 "$DECODE" --help 2>/dev/null | norm > "$HELP"
 
 assert_line "$HELP" "# PE with a sibling linker map - no ELF, no PDB" \
     "S8 help shows the PE + map workflow"
-assert_line "$HELP" "rsod-decode.py --map app.map --rsod console.log" \
-    "S8 help shows a map-only run"
+assert_line "$HELP" "rsod-decode.py --syms app.map --rsod putty.txt" \
+    "S8 help leads with the x64 linker-map case"
+assert_line "$HELP" "rsod-decode.py --syms app.so --rsod putty.txt" \
+    "S8 help leads with the AArch64 unstripped-ELF case"
 assert_line "$HELP" "# Raw terminal capture: the dump is embedded in unrelated console output" \
     "S8 help states --rsod may be a whole console capture"
+
+assert_line "$HELP" "# Naming both files instead registers two separate images, not one." \
+    "S8 help states that two --syms for one module do not combine"
+
+# The old spellings are GONE, and that is the point of the change rather than a
+# side effect of it. `--image` accepted a .map, a .pdb and three flavours of
+# ELF -- five of the six things it took were not images -- while `--map` and
+# `--debug` were aliases into the same list, not modes. Keeping any of them as
+# a silent alias would keep that reading alive in every script and every bug
+# report, which is how "the gate is skipped in --map mode" came to be written
+# about a condition that was never about a mode.
+for dead in --image --map --debug; do
+    DERR="$WORK/dead$dead.err"
+    if timeout 60 python3 "$DECODE" "$dead" "$APP" --rsod "$LOG" \
+            >/dev/null 2>"$DERR"; then
+        test_host_fail "$dead is refused, not silently accepted"
+    elif grep -q -- "unrecognized arguments: $dead" "$DERR"; then
+        test_host_pass "$dead is refused, not silently accepted"
+    else
+        test_host_fail "$dead is refused with argparse's own error"
+        sed 's/^/      /' "$DERR" | head -2
+    fi
+done
 
 # `--rsod` is the name now; `--file` keeps working so existing scripts do not
 # break on a patch release.
 OUTF="$WORK/out-file-alias.txt"
-run_decode "$OUTF" "--file alias run completes" --image "$APP" --file "$LOG"
+run_decode "$OUTF" "--file alias run completes" --syms "$APP" --file "$LOG"
 assert_line "$OUTF" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x14002100a + 0x2100a]" \
     "--file still accepted as an alias for --rsod"
 
@@ -553,7 +627,7 @@ assert_line "$OUTF" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x14002100a + 0x2100a]"
 echo ""
 echo "-- json --"
 JSONW="$WORK/wrong.json"
-timeout 60 python3 "$DECODE" --image "$WRONG:0x140000000" --rsod "$LOG" --json 2>/dev/null > "$JSONW"
+timeout 60 python3 "$DECODE" --syms "$WRONG:0x140000000" --rsod "$LOG" --json 2>/dev/null > "$JSONW"
 if python3 -c "
 import json,sys
 d = json.load(open('$JSONW'))
@@ -597,7 +671,7 @@ CR2 - 0000000000000000
 EOF
         OUTE="$WORK/out-elf.txt"
         run_decode "$OUTE" "ELF run completes" \
-            --image "$WORK/elfprobe:0x0" --rsod "$WORK/elf-rsod.txt" --detail
+            --syms "$WORK/elfprobe:0x0" --rsod "$WORK/elf-rsod.txt" --detail
 
         # DWARF gives what a map never can: the exact source line.
         # The path is rendered shortened and lives under a mktemp dir, so it is
@@ -645,7 +719,7 @@ EOF
 EOF
         OUTEM="$WORK/out-elfmap.txt"
         PATH="$WORK/nogdb:$PATH" timeout 60 python3 "$DECODE" \
-            --image "$ELFMAP/probe.so:0x0" --rsod "$WORK/elf-rsod.txt" --detail \
+            --syms "$ELFMAP/probe.so:0x0" --rsod "$WORK/elf-rsod.txt" --detail \
             > "$OUTEM.raw" 2>"$OUTEM.err"
         norm < "$OUTEM.raw" > "$OUTEM"
         if grep -q '^RSOD Decoder' "$OUTEM"; then
@@ -722,12 +796,12 @@ Loaded Images:
   0x0000000047683000 0x0D2000  DxeCore
 
 Decode with debug symbols:
-  rsod-decode.py --image <build>/probelow.so --rsod crash-report.txt
+  rsod-decode.py --syms <build>/probelow.so --rsod crash-report.txt
 EOF
             # No :BASE and no --base -- the report states the base twice over.
             OUTCR="$WORK/out-crashreport.txt"
             PATH="$WORK/nogdb:$PATH" timeout 60 python3 "$DECODE" \
-                --image "$WORK/probelow" --rsod "$WORK/crash-report.txt" --detail \
+                --syms "$WORK/probelow" --rsod "$WORK/crash-report.txt" --detail \
                 > "$OUTCR.raw" 2>"$OUTCR.err"
             norm < "$OUTCR.raw" > "$OUTCR"
             if grep -q '^RSOD Decoder' "$OUTCR"; then
@@ -767,7 +841,7 @@ EOF
             decode_variant() {   # <file>; sets $VOUT
                 VOUT="$1.out"
                 PATH="$WORK/nogdb:$PATH" timeout 60 python3 "$DECODE" \
-                    --image "$WORK/probelow" --rsod "$1" --detail \
+                    --syms "$WORK/probelow" --rsod "$1" --detail \
                     > "$VOUT.raw" 2>"$VOUT.err"
                 norm < "$VOUT.raw" > "$VOUT"
             }
@@ -872,7 +946,7 @@ EOF
             # cross-prefixed binutils the aa64 path actually depends on.
             OUTA="$WORK/out-aa64.txt"
             PATH="$WORK/nogdb:$PATH" timeout 60 python3 "$DECODE" \
-                --image "$WORK/aaprobe.so:0x0" --rsod "$WORK/aa-rsod.txt" --detail \
+                --syms "$WORK/aaprobe.so:0x0" --rsod "$WORK/aa-rsod.txt" --detail \
                 > "$OUTA.raw" 2>"$OUTA.err"
             norm < "$OUTA.raw" > "$OUTA"
             if grep -q '^RSOD Decoder — aaprobe (AARCH64)$' "$OUTA"; then
@@ -899,11 +973,119 @@ EOF
 fi
 
 # ═══════════════════════════════════════════════════════════════
+# AARCH64 ESR decode, driven by the REGISTER rather than a pre-decoded line.
+#
+# Two parsers reach _diagnose_aarch64. The Dell/vendor one derives EC/IL/ISS
+# from the raw ESR register; the EDK2 one only ever read a pre-decoded
+# "ESR : EC 0x.. IL .. ISS .." line the firmware may or may not print. Same
+# register, same dict, and one of them said NOTHING about the exception --
+# no Cause line at all, which reads as "there was nothing to say" rather than
+# "this reader did not look". Exactly the shape of the silent --detail
+# disassembly this file was written for.
+#
+# Needs no toolchain and no image: an RSOD text and --rsod are the whole
+# input, so this runs everywhere rather than behind the cross-gcc guard.
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "-- AARCH64 ESR decoded from the register --"
+
+# esr_case <esr-hex> <far-hex> <expected Cause line> <label>
+esr_case() {
+    local esr="$1" far="$2" want="$3" label="$4"
+    local f="$WORK/esr-$esr.txt" o="$WORK/esr-$esr.out"
+    cat > "$f" <<EOF
+Synchronous Exception at 0x0000000040001234
+X0 0x0000000000000000  X1 0x0000000000000000
+FP 0x0000000000000000  LR 0x0000000040001200
+SP 0x00000000401FFF00  ELR 0x0000000040001234
+ESR 0x00000000$esr  FAR 0x00000000$far
+EOF
+    timeout 60 python3 "$DECODE" --rsod "$f" > "$o.raw" 2>"$o.err"
+    norm < "$o.raw" > "$o"
+    assert_line "$o" "$want" "$label"
+}
+
+# EC 0x25 / DFSC 0x04 / FAR 0 -- the same exception the toolchain-gated block
+# above asserts from a pre-decoded line. Identical verdict from the register
+# alone is the whole point.
+esr_case 96000004 00000000 \
+    "Cause: Data abort from same EL — Translation fault, level 0 — NULL pointer dereference" \
+    "ESR register alone yields the same cause as a pre-decoded ESR line"
+
+# EC 0x2F. Named because an SError is ASYNCHRONOUS: the reported PC is not the
+# faulting instruction, and a reader who does not know that spends the day in
+# the wrong function. Silence here is worse than for most ECs, not better.
+esr_case BE000000 00000000 \
+    "Cause: SError interrupt — asynchronous, so the reported PC is not the faulting instruction" \
+    "EC 0x2f (SError) is named"
+
+# EC 0x07. In firmware this is nearly always one thing: FP/SIMD used before
+# CPACR_EL1/CPTR_EL2 enabled it. Saying so IS the fix.
+esr_case 1E000000 00000000 \
+    "Cause: Trapped SVE/Advanced SIMD/FP access — FP not enabled in CPACR/CPTR" \
+    "EC 0x07 (FP/SIMD access trap) is named"
+
+# An EC with no table entry must be REPORTED as unnamed, not swallowed. This
+# is what makes it safe to stop at the two entries above rather than guessing
+# at rows whose firmware relevance nobody could justify: an unrecognised class
+# says so and gives the reader a number to look up, instead of producing a
+# decode that silently omits the one line naming what went wrong. EC 0x1E
+# (granule protection check) stands in for "anything not in the table".
+esr_case 7A000000 00000000 \
+    "Cause: Unrecognised exception class (EC 0x1e)" \
+    "an EC with no table entry is reported, not swallowed"
+
+# An unrecognised EC must ADD to the firmware's own description, never replace
+# it. Reporting the unnamed class was the right call, but appending it
+# unconditionally made the abort_desc fallback below unreachable -- so a Dell
+# dump whose firmware said exactly what happened had that sentence swapped for
+# our placeholder, and without --detail the text appears nowhere else. The
+# tool's "I don't know this class" is worth strictly less than the firmware's
+# "here is what it was".
+ESRS="$WORK/esr-syndrome.txt"
+cat > "$ESRS" <<'EOF'
+UEFI Exception
+ELR=00000000401FF200  ESR=000000005E000000  FAR=0000000000000000
+SP=00000000401FFF00
+Syndrome: SMC trapped from EL1 by the secure monitor
+EOF
+ESRSO="$WORK/esr-syndrome.out"
+timeout 60 python3 "$DECODE" --rsod "$ESRS" > "$ESRSO.raw" 2>"$ESRSO.err"
+norm < "$ESRSO.raw" > "$ESRSO"
+assert_line "$ESRSO" \
+    "Cause: Unrecognised exception class (EC 0x17) — SMC trapped from EL1 by the secure monitor" \
+    "an unrecognised EC keeps the firmware's own description alongside it"
+
+# The REGISTER wins over the firmware's own pre-decoded line, and this pins
+# which. Both are present in a real EDK2 dump; the register is the raw fact and
+# the line is somebody's rendering of it. This tree has already paid for
+# reading a rendering as the data (dmidecode omitting an `ID:` line produced a
+# phantom "missing _SUN" and a wrong count of the server's Type 9 records), so
+# the precedence is asserted rather than left to whichever branch runs first.
+ESRD="$WORK/esr-disagree.txt"
+cat > "$ESRD" <<'EOF'
+Synchronous Exception at 0x0000000040001234
+X0 0x0000000000000000  X1 0x0000000000000000
+FP 0x0000000000000000  LR 0x0000000040001200
+SP 0x00000000401FFF00  ELR 0x0000000040001234
+ESR 0x0000000096000004  FAR 0x0000000000000000
+ESR : EC 0x21  IL 0x1  ISS 0x0000000
+EOF
+ESRDO="$WORK/esr-disagree.out"
+timeout 60 python3 "$DECODE" --rsod "$ESRD" > "$ESRDO.raw" 2>"$ESRDO.err"
+norm < "$ESRDO.raw" > "$ESRDO"
+assert_line "$ESRDO" \
+    "Cause: Data abort from same EL — Translation fault, level 0 — NULL pointer dereference" \
+    "the ESR register outranks the firmware's pre-decoded line"
+refute_match "$ESRDO" 'Instruction abort' \
+    "the pre-decoded line does not override the register it was rendered from"
+
+# ═══════════════════════════════════════════════════════════════
 # S9 -- the mismatch gate in MAP-ONLY mode.
 #
 # The gate that catches a wrong image was conditioned on SizeOfImage, which a
-# .map does not have, so --map skipped it entirely: the same wrong build that
-# --image refused produced a confident, fully-formatted decode with no banner
+# .map does not have, so a map-only run skipped it entirely: the same wrong
+# build that a PE run refused produced a confident, fully-formatted decode
 # at all. That cost a day of debugging on a real ePSA RSOD, twice, because the
 # fiction is coherent -- plausible function names and a plausible call chain,
 # since .text did not move between the builds even though the data did.
@@ -916,7 +1098,7 @@ echo ""
 echo "-- map-only: correct map (negative control) --"
 WRONGMAP="$WORK/wrong-build.map"
 OUTMC="$WORK/out-map-correct.txt"
-run_decode "$OUTMC" "map-only correct run completes" --map "$MAP" --rsod "$LOG"
+run_decode "$OUTMC" "map-only correct run completes" --syms "$MAP" --rsod "$LOG"
 
 # The control matters more than usual here: without it, "no banner" on the
 # wrong map would be indistinguishable from a gate that never fires at all.
@@ -928,7 +1110,7 @@ assert_line "$OUTMC" "#0 ?TestFaulty@@YAPEAXPEAI@Z + 0xa [0x14002100a + 0x2100a]
 echo ""
 echo "-- map-only: WRONG map -- the bug --"
 OUTMW="$WORK/out-map-wrong.txt"
-run_decode "$OUTMW" "map-only wrong run completes" --map "$WRONGMAP" --rsod "$LOG"
+run_decode "$OUTMW" "map-only wrong run completes" --syms "$WRONGMAP" --rsod "$LOG"
 
 assert_line "$OUTMW" "!! IMAGE DOES NOT MATCH THE DUMP - symbols below are probably fiction:" \
     "S9 wrong map is announced, where it used to be silent"
@@ -954,7 +1136,7 @@ echo "-- a stale map sitting beside a CORRECT image --"
 STALE="$WORK/stale"; mkdir -p "$STALE"
 cp "$APP" "$STALE/app.efi"; cp "$WRONGMAP" "$STALE/app.map"
 OUTST="$WORK/out-stale.txt"
-run_decode "$OUTST" "stale-map run completes" --image "$STALE/app.efi" --rsod "$LOG"
+run_decode "$OUTST" "stale-map run completes" --syms "$STALE/app.efi" --rsod "$LOG"
 assert_match "$OUTST" "the map's highest symbol is at \+0x38000, past the end of this 0x30000 image" \
     "S9 stale map beside a correct image is caught by size, which is proof"
 assert_match "$OUTST" "note: map linked 0x6a8f812a, image stamped 0x6a8f3db9" \
@@ -964,7 +1146,7 @@ refute_match "$OUTST" "different builds$" \
 
 cp "$MAP" "$STALE/app.map"
 OUTSM="$WORK/out-stale-ok.txt"
-run_decode "$OUTSM" "matching-map run completes" --image "$STALE/app.efi" --rsod "$LOG"
+run_decode "$OUTSM" "matching-map run completes" --syms "$STALE/app.efi" --rsod "$LOG"
 refute_match "$OUTSM" 'DOES NOT MATCH' \
     "S9 a matching map beside the image stays silent"
 

@@ -248,11 +248,11 @@ append_single_crash_report(uint8_t *record, size_t record_size)
             if (n >= 4 && axl_strncasecmp(stem + n - 4, ".efi", 4) == 0) {
                 stem[n - 4] = '\0';
             }
-            REPORT_PRINT("  rsod-decode.py --image <build>/%s.so "
+            REPORT_PRINT("  rsod-decode.py --syms <build>/%s.so "
                          "--rsod crash-report.txt\r\n", stem);
         }
     } else {
-        report_append("  rsod-decode.py --image <build>/<image>.so:<base> "
+        report_append("  rsod-decode.py --syms <build>/<image>.so:<base> "
                       "--rsod crash-report.txt\r\n");
     }
     report_append("\r\n");

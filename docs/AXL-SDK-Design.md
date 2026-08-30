@@ -11,7 +11,7 @@ halves, and each fact below is owned by exactly one of them:
 | doc | answers | owns |
 |---|---|---|
 | **this one** | what is in the SDK | the toolchain requirement, C++ support, the layout of what ships |
-| [AXL-Distribution-Design.md](AXL-Distribution-Design.md) | how it REACHES and is USED by a consumer | packaging, `find_package` discovery, version pinning, the `out/` vs `stage/` split (§4), P1–P4 |
+| [AXL-Distribution-Design.md](AXL-Distribution-Design.md) | how it REACHES and is USED by a consumer | packaging, `find_package` discovery, version pinning, the `out/` vs `stage/` split (§4), **install layout and the `axl` dispatcher (§12–§13)**, P1–P7 |
 | [AXL-Build-System-Design.md](AXL-Build-System-Design.md) | how WE build it | the CMake port, the port surface measurements (§8.2a), `axl-cc`'s exclusion from the port, `axl-config.cmake`'s extraction (§8.4) |
 
 **One owner per shared fact, everyone else links.** That rule exists because
@@ -336,23 +336,36 @@ No EDK2. No Python. No Java. No Make.
 
 ## Distribution Model
 
-**No binaries in git.** All build artifacts are produced by
-`install.sh` into `out/`, which is gitignored.
+**No binaries in git.** `install.sh` stages an install **prefix** into
+`stage/`; `out/` holds the object trees and `out/docs/`. Those are different
+things with different lifetimes — see
+[AXL-Distribution-Design.md](AXL-Distribution-Design.md) §4, which owns the
+split. (This paragraph said "into `out/`" until 2026-08-29, contradicting the
+`stage/` paths three lines below it.)
 
-**Two ways to get the SDK:**
+**Ways to get the SDK:**
 
-1. **Build from source** (developer workflow):
+1. **Distro package** (the supported consumer path today):
+   ```
+   sudo dnf install ./axl-sdk.rpm      # or: apt install ./axl-sdk.deb
+   axl-cc hello.c                      # -> hello.efi
+   ```
+
+2. **Build from source** (developer workflow):
    ```
    git clone axl-sdk
    ./scripts/install.sh --arch x64
    # produces stage/bin/axl-cc, stage/lib/axl/<arch>/libaxl.a, stage/include/
    ```
 
-2. **Download a release tarball** (consumer workflow):
+3. **Download a release tarball** (root-free, any distro):
    ```
-   tar xf axl-sdk-x64-linux.tar.gz
+   tar xf axl-sdk-<ver>-linux-x86_64.tar.gz
    ./bin/axl-cc hello.c -o hello.efi
    ```
-
-Release tarballs are built by GitHub Actions on tagged commits
-and attached to GitHub Releases.
+   **Shipped 2026-08-29.** This doc promised the workflow in the present
+   tense for years while nothing built it; it is real now, produced by
+   `scripts/make-sdk-tarball.sh` and published as a release asset. The
+   archive unpacks to a single `axl-sdk-<version>/` directory, so extracting
+   into `/opt` gives the versioned root of
+   AXL-Distribution-Design.md §12.2 with nothing to rename.

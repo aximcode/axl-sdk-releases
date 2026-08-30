@@ -402,6 +402,25 @@ Library / SDK foundations:
 - [AXL-Distribution-Design.md](AXL-Distribution-Design.md) — DRAFT: how the SDK is
   packaged, installed, discovered and version-pinned; the missing tarball and
   CMake toolchain file; consuming an unreleased checkout
+- **Install layout, versioned roots and the `axl` dispatcher** — ACCEPTED
+  2026-08-29; **P5 (the dispatcher) and P8 (root-free toolchain install) SHIPPED**, P1's SDK tarball SHIPPED too (it was P6's prerequisite), as did P6's pruning half (`axl prune`, current + one previous, both axes) and the self-containment contract it rests on. P6's "change install.sh's default prefix" was WRONG and is retracted -- `stage/` is right for a source checkout and the tarball's top-level dir already is the versioned root. P7 SHIPPED (its content half had already ridden in with P5). P8 was twice scoped larger than it was -- no conf change and no CMake port were needed, because only the INSTALLER could not target a user prefix; building against one already worked. Folded into
+  [AXL-Distribution-Design.md](AXL-Distribution-Design.md) **§12–§13** rather
+  than a fourth doc: that set states "one owner per shared fact", and a
+  separate doc would have opened a second `P1`..`P4` namespace meaning
+  different things. Packages keep `/usr`; the installer gains a VERSIONED
+  `/opt/axl-sdk-<ver>` + `current` symlink, or `~/.local` when not root;
+  host-tools folds in behind weak deps; a host-side **`axl` dispatcher** makes
+  the install location stop mattering to every doc line and printed hint.
+  Closes O1 and O4. Measured in-session: `/opt` IS a default CMake prefix and
+  `find_package(axl)` already resolves from `/opt/axl-sdk*`, and a `--prefix`
+  user install already compiles — so this is defaults + packaging, not
+  relocation. New phases P5 (dispatcher, first), P6 (versioned root; needs
+  P1's unshipped tarball and P8), P7 (package merge), P8 (root-free toolchain
+  install). P8 was first scoped to ride with the CMake port and that was
+  wrong: the `_DEFAULT` override convention is already make- and sh-safe for
+  six keys, so it needs no port — which matters, because the port has ZERO
+  implementation and its branch is fully merged into main with 0 unique
+  commits
 - [AXL-Float-Conversion-Design.md](AXL-Float-Conversion-Design.md) — IMPLEMENTED 2026-07-31
   (21 commits on `3be79c4a`): correctly-rounded string <-> double, the integer reverse,
   `%f/%e/%g` in `axl_sscanf`, and one truncation convention across the renderers ·

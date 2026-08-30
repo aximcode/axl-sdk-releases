@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# axl-desc: replay a captured hardware fixture under QEMU
 # axl-emulate -- replay a captured hardware fixture under QEMU.
 #
 # Phase HF3 of the Hardware Fixture Capture & Replay design (see

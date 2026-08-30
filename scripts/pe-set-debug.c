@@ -51,6 +51,8 @@
 
 /* RSDS layout */
 #define RSDS_SIG_OFF            0
+#define RSDS_GUID_OFF           4    /* the 16-byte CodeView GUID */
+#define RSDS_GUID_LEN           16
 #define RSDS_NAME_OFF           24   /* after signature(4) + guid(16) + age(4) */
 
 static uint16_t
@@ -81,12 +83,69 @@ w16(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)(v >> 8);
 }
 
+/* build_id -- a deterministic 128-bit identity for the image.
+ *
+ * WHY THE CODEVIEW GUID. Our .efi files carried NO build identity at all:
+ * TimeDateStamp is 0 on every image this SDK produces, and axl-debug-info.S
+ * emits the RSDS record with sixteen literal zero bytes. So two builds of the
+ * same tool were indistinguishable, and an .efi of ours landing in RSOD triage
+ * could not be matched to the build it came from. The GUID field is already
+ * there, already carried through objcopy in .dbgdir, and rsod-decode.py
+ * already reads it -- so filling it in costs no new section, no new flag and
+ * no format.
+ *
+ * FNV-1a over the whole file with the GUID field itself ZEROED. Zeroing is
+ * what makes it idempotent: the id is written INTO the image, so hashing the
+ * file as-is would hash a file containing its own hash and give a different
+ * answer on every run -- `make` would never reach a fixed point.
+ *
+ * FNV-1a, not a cryptographic digest, and the distinction is deliberate: this
+ * identifies a build, it does not authenticate one. Nothing here resists an
+ * adversary choosing colliding images, and nothing should rely on it to. What
+ * it does guarantee is that the same bytes always give the same id and that a
+ * one-byte change gives a different one, which is the whole job.
+ */
+static void
+build_id(const uint8_t *data, size_t len, size_t guid_off, uint8_t out[16])
+{
+    /* FNV-1a 128-bit: offset basis and prime from the FNV spec. */
+    unsigned __int128 h = ((unsigned __int128)0x6c62272e07bb0142ULL << 64)
+                          | 0x62b821756295c58dULL;
+    const unsigned __int128 prime = ((unsigned __int128)1 << 88)
+                                    | ((unsigned __int128)1 << 8) | 0x3b;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = data[i];
+        if (i >= guid_off && i < guid_off + RSDS_GUID_LEN) {
+            b = 0;      /* the field we are about to fill -- see above */
+        }
+        h ^= (unsigned __int128)b;
+        h *= prime;
+    }
+    for (int i = 0; i < 16; i++) {
+        out[i] = (uint8_t)(h >> (8 * (15 - i)));   /* big-endian */
+    }
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr, "Usage: pe-set-debug <file.efi> [module-name]\n");
         return 1;
+    }
+
+    /* Read-only query: print the id an image already carries and change
+     * nothing. Kept separate from the patching path so the build stays silent
+     * -- 34 tools x 2 arches means a line per link is noise, but being unable
+     * to ask "which build is this .efi?" is the problem being fixed. */
+    int print_only = 0;
+    if (strcmp(argv[1], "--print-build-id") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: pe-set-debug --print-build-id <file.efi>\n");
+            return 1;
+        }
+        print_only = 1;
+        argv++; argc--;
     }
 
     const char *path = argv[1];
@@ -235,6 +294,16 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (print_only) {
+        const uint8_t *g = rsds + RSDS_GUID_OFF;
+        for (int i = 0; i < RSDS_GUID_LEN; i++) {
+            printf("%02x", g[i]);
+        }
+        printf("\n");
+        free(data);
+        return 0;
+    }
+
     /* Write module name into RSDS filename field */
     uint8_t *name_field = rsds + RSDS_NAME_OFF;
     uint32_t name_space = debug_raw_size - DDE_SIZE - RSDS_NAME_OFF;
@@ -244,6 +313,16 @@ main(int argc, char **argv)
     }
     memset(name_field, 0, name_space);
     memcpy(name_field, mod_name, name_len);
+
+    /* The build identity, LAST: it must cover the module name written just
+     * above and every other patch this tool makes, or two images differing
+     * only in a patched field would share an id. */
+    {
+        uint8_t id[RSDS_GUID_LEN];
+        size_t guid_off = (size_t)(rsds - data) + RSDS_GUID_OFF;
+        build_id(data, (size_t)file_size, guid_off, id);
+        memcpy(rsds + RSDS_GUID_OFF, id, RSDS_GUID_LEN);
+    }
 
     /* Write back */
     f = fopen(path, "wb");

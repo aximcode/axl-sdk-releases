@@ -14,7 +14,7 @@ doc covers how it *reaches and is used by* a consumer.
 | doc | answers | owns |
 |---|---|---|
 | [AXL-SDK-Design.md](AXL-SDK-Design.md) | what the SDK CONTAINS | toolchain requirement, C++ support, shipped layout |
-| [AXL-Distribution-Design.md](AXL-Distribution-Design.md) | how it REACHES and is USED by a consumer | packaging, `find_package` discovery, version pinning, `out/` vs `stage/` (§4), P1–P4 |
+| [AXL-Distribution-Design.md](AXL-Distribution-Design.md) | how it REACHES and is USED by a consumer | packaging, `find_package` discovery, version pinning, `out/` vs `stage/` (§4), **install layout and the `axl` dispatcher (§12–§13)**, P1–P7 |
 | [AXL-Build-System-Design.md](AXL-Build-System-Design.md) | how WE build it | the CMake port, port-surface measurements (§8.2a), why `axl-cc` is excluded, `axl-config.cmake` extraction (§8.4) |
 
 **One owner per shared fact, everyone else links** — see AXL-SDK-Design.md for
@@ -48,7 +48,8 @@ add_executable(hello hello.c)
 target_link_libraries(hello PRIVATE axl::axl)
 ```
 
-**Flavour 1 already works today** and is verified: this machine has
+**Flavour 1 already works today** and is verified (as of the 3.1.0 era when
+this was written; the tree is on 4.3.4 as of 2026-08-29): this machine had
 `/usr/bin/axl-cc 3.1.0` from the .rpm, and a bare `axl-cc hello.c` in an empty
 directory produces `hello.efi`. That is worth stating up front so we do not
 re-solve it. Flavours 2 and 3 do not exist.
@@ -100,9 +101,16 @@ differently.
 
 ## 4. Layout: a build directory is not an install prefix
 
-The single change that makes the SDK stop *reading* like a build-tree hack.
+> **THE HEADLINE OF THIS SECTION SHIPPED (re-measured 2026-08-29).**
+> `scripts/install.sh:18` is now `PREFIX="$SDK_DIR/stage"` — the install
+> prefix left `out/` in 4.1.0, which is the one change this section leads
+> with and the one its "Proposed" block asks for. What remains in `out/` is
+> object trees plus `out/docs/`, a materially weaker complaint than the four-
+> way overloading described below. **O1 is also partly answered by fact:**
+> there IS a default `--prefix` and it is `stage/`. Read the rest as history
+> plus the still-open `build/<arch>-<mode>/` half.
 
-`out/` currently holds four unrelated things:
+`out/` held four unrelated things when this was written:
 
 ```
 out/native-x64/          Make's object tree (BUILD=DEBUG)
@@ -172,8 +180,8 @@ entirely the shared surface, and the surface is gone.
 | Artifact | Status | Rationale |
 |---|---|---|
 | `axl-sdk.deb`, `axl-sdk.rpm` | **have** | Distro-native path; installs to `/usr`; `Provides: axl-sdk-devel` |
-| **`axl-sdk-<version>-linux-<arch>.tar.gz`** | **MISSING** | The gap. Root-free, distro-agnostic. Arch / Alpine / NixOS / SUSE / CI containers / locked-down corp hosts have no supported path today. Also what turns `~/axl-sdk-3.1.0/` into a real prefix instead of a source copy |
-| `axl-sdk-host-tools.{deb,rpm,tar.gz}` | have | run-qemu.sh + helpers. Correctly separate — different audience, different deps (QEMU, OVMF, virtiofsd) |
+| **`axl-sdk-<version>-linux-<host>.tar.gz`** | **SHIPPED 2026-08-29** | Was "the gap": root-free, distro-agnostic, and the only path for Arch / Alpine / NixOS / SUSE / CI containers / locked-down corp hosts. Built by `scripts/make-sdk-tarball.sh` (the same code the release and the test both run), one archive for both target arches, named for the HOST since the bundled crosses are x86_64-hosted. Its single top-level directory is `axl-sdk-<version>/` — §12.2's versioned root, so `tar xf -C /opt` needs no rename. Turns `~/axl-sdk-3.1.0/` into a real prefix instead of a source copy |
+| `axl-sdk-host-tools.{deb,rpm,tar.gz}` | have | run-qemu.sh + helpers. **"Correctly separate" was SUPERSEDED 2026-08-29** — §12's D3 folds it into the SDK package. The objection recorded here (different deps) is real and is answered in §12.6 by demoting QEMU/OVMF to weak deps; without that answer the merge is a regression |
 | `axl-sdk-tools-{x64,aa64}.tar.gz` | have | Pre-built `.efi` utilities for USB-stick use. Correctly separate — these are *target* binaries, not SDK material |
 | `SHA256SUMS` | have | |
 | `axl-sdk-doc` | absent | See §5.4 |
@@ -212,6 +220,11 @@ Measured payload:
 | `share/axl/` + `bin/` | ~130 KB |
 | **installed total** | ~40 MB |
 
+> **Re-measured 2026-08-29 (v4.3.4): 42 MB staged — aa64 20 MB, x64 19 MB,
+> include 3.0 MB, bin 132 KB, share 84 KB.** So it is now **39 of 42 MB** in
+> per-arch libraries and the saving for a single-arch consumer is ~20 MB, not
+> 16. The conclusion below is unchanged; only its magnitude moved.
+
 **32 of 33 MB staged is per-arch libraries.** A consumer targeting only x64
 carries 16 MB of AArch64 archives they will never link. So the meaningful axis
 is target arch, not runtime/devel:
@@ -232,7 +245,11 @@ Flagging rather than recommending.
 
 ### 5.4 Docs package — blocked on a real problem
 
-Sphinx currently emits **372 MB of HTML and 314 MB of man pages.** That is not
+> **Re-measured 2026-08-29: 139 MB of HTML and 67 MB of man pages** — 62% and
+> 79% smaller than the figures below. The argument still stands; it is now
+> roughly a third the size it was stated at. Do not quote the original numbers.
+
+Sphinx emitted **372 MB of HTML and 314 MB of man pages** when this was written. That is not
 a packaging decision, that is a bug — almost certainly per-symbol man page
 explosion and duplicated assets. Packaging docs is cheap and desirable, but it
 is gated on finding out why the output is three orders of magnitude larger than
@@ -436,6 +453,54 @@ while keeping Make/CMake bit-parity.
 
 **P4 — Meson cross-file.** Small, follows P3's shape.
 
+**P5 — the `axl` dispatcher (§13).** `scripts/axl`, `libexec/axl/` staging in
+`install.sh`, `--print-prefix` / `--print-version`. A shell script plus
+staging; touches no build system. **Do this first of the new phases** — it
+fixes a defect live today for every package user, it is purely additive so no
+existing invocation changes, and Build-System §3 puts `axl-cc` and its
+siblings outside the port, so it need not wait for one.
+
+**P6 — versioned install root + pruning (§12.2, §12.4).** **Partly SHIPPED
+2026-08-29; and its first sentence was wrong.** It read *"install.sh's default
+prefix becomes /opt/axl-sdk-<ver> (root) or ~/.local (not root)"* — but
+`stage/` is the RIGHT default for a source checkout, is what §4's shipped
+change made it, and `verify.sh`, the integration runner and dozens of tests
+depend on it. Changing it would have broken the tree to serve a case that has
+another answer.
+
+The versioned root does not need a new default: **the tarball's top-level
+directory already is one**, so `tar xf -C /opt` yields `/opt/axl-sdk-<ver>`.
+What was actually missing is the part that keeps it bounded, and that shipped
+as **`axl prune`** — see §12.4. Still open: whether anything should manage the
+`current` symlink for the user, or whether creating it stays theirs (`axl
+prune` already honours it either way). `install.sh`'s
+default prefix becomes `/opt/axl-sdk-<ver>` (root) or `~/.local` (not root),
+plus the `current` symlink and an install manifest for §12.4's pruning.
+**P1's tarball bullet is its prerequisite**, not a parallel item: until
+`axl-sdk-<ver>-linux-<arch>.tar.gz` exists there is no artifact a non-package
+user can install, so a `~/.local` default serves nobody. Sequence the tarball
+*after* P5 so the first one ever published already contains `bin/axl` and
+`libexec/`, rather than changing shape between two releases.
+
+**P7 — package merge + old-location cleanup (§12.5–12.6). SHIPPED
+2026-08-29.** Most of it turned out to be **already done**: P5's `install.sh`
+change stages the host tools to `libexec/axl/` with the dispatcher in `bin/`,
+and the `.deb`/`.rpm` are built from that same `install.sh --prefix`, so the
+CONTENT merged as a side effect of shipping `axl`. What remained was metadata
+— weak deps and the retirement of the old package — plus deleting 92 lines of
+release workflow that built a layout nothing consumes any more.
+
+**P8 — root-free toolchain install (§12.7).** `_DEFAULT` twins for the two
+`*_TOOLCHAIN_DIR` keys, and `install-toolchain.sh --prefix` requiring root
+only when the prefix does. **Prerequisite for P6's `~/.local` half**: without
+it that root gets a compiler driver that cannot compile. Independent of the
+port — see §12.7's correction.
+
+**Rides with the CMake port, not before it:** `axl-config-version.cmake`, which
+AXL-Build-System-Design.md §8.4 already assigns to the port and which is the
+actual blocker on `find_package(axl <ver>)` — a versioned root lets a consumer
+*hold* two versions, not *request* one.
+
 **Deliberately out of scope:** switching axl-sdk's own build from GNU Make to
 Meson/ninja. It is a legitimate question, but it would not fix a single item in
 §2 — those are all consumer-facing. Decide it separately, on its own merits.
@@ -448,11 +513,13 @@ Meson/ninja. It is a legitimate question, but it would not fix a single item in
 > hand-rolled build-state signature IS a re-configure) and it needs no major
 > version. **Two items here interact with it and are NOT independent:**
 >
-> - **P2 touches the same surface.** 157 files invoke `make`, 50 of the
->   integration scripts among them sourcing nothing shared — the same
->   `out/`-path sweep this phase describes as "wide; do it in one sweep".
->   Running P2 and the port separately pays for that sweep twice, so the port
->   proposes absorbing P2 (its §8.2). Open; scope call not yet taken.
+> - ~~**P2 touches the same surface.** 157 files invoke `make` … so the port
+>   proposes absorbing P2 (its §8.2). Open; scope call not yet taken.~~
+>   **WITHDRAWN — and this bullet contradicted P2's own paragraph three above,
+>   which already said "never wide … 7 files, not 149 … no longer has to be
+>   paired with the port."** AXL-Build-System-Design.md **§8.2a** formally
+>   withdrew it on 2026-08-16: the measured shared surface is **seven files**.
+>   The scope call is not open. (Caught 2026-08-29 while auditing this doc.)
 > - **P3 does not come free with it.** The in-tree build drives the bare-metal
 >   crosses directly and never puts `axl-cc` in a compiler slot, which is the
 >   entire difficulty of §6.1. An in-tree `compile_commands.json` is not
@@ -462,15 +529,327 @@ Meson/ninja. It is a legitimate question, but it would not fix a single item in
 
 ## 11. Open questions
 
-- **O1.** Keep a default `--prefix`, or require it explicitly? Requiring it kills
-  the wrong mental model permanently but breaks every existing invocation.
+- **O1.** ~~Keep a default `--prefix`, or require it explicitly?~~ **PARTLY
+  ANSWERED BY FACT, then decided 2026-08-29.** A default already exists and is
+  `stage/` (`install.sh:18`), so the "require it" option was foreclosed
+  without being chosen. §12's D1 settles the rest: keep a default, and make it
+  root-dependent — `/opt/axl-sdk-<ver>` or `~/.local` — chosen by a flag with
+  a sensible default, never guessed.
 - **O2.** Per-target-arch package split (§5.3) — worth 16 MB, or not yet?
 - **O3.** Tarball granularity: one per host+target combination, or a single
   fat tarball with both target arches (~40 MB)?
-- **O4.** Does the tarball need a `bin/axl-env.sh` (prepend `PATH`, set
-  `AXL_SDK`) the way most SDKs do, or is `PATH` alone enough given everything
-  is `$0`-relative?
+- **O4.** ~~Does the tarball need a `bin/axl-env.sh`?~~ **ANSWERED 2026-08-29:
+  no** — §13's dispatcher puts one binary on `PATH`, which beats an env script
+  the user must remember to source.
 - **O5.** Windows/WSL: axl-utils builds under "VS 2022 CMake → WSL". Is a
   native-Windows story ever in scope, or is WSL the permanent answer?
 - **O6.** Do we care about distro inclusion (Fedora/EPEL/Debian)? Only that
   would justify the real-`.spec` work in §5.5.
+
+---
+
+## 12. Install layout — one root per method
+
+**Decided 2026-08-29.** This section owns *where the bytes go*; §13 owns
+*what is on `PATH`*. Together they answer **O1** and **O4**.
+
+| | decision |
+|---|---|
+| **D1** | One root per install method. Packages keep `/usr`; the installer defaults to a **versioned** `/opt/axl-sdk-<ver>`, or `~/.local` when not root. |
+| **D2** | **Versioned root** with a `current` symlink, so a pinned consumer can hold two versions at once. |
+| **D3** | **Host-tools folds into the SDK package** (superseding §5.1's "correctly separate"), with old locations cleaned up subject to §12.5. |
+| **D4** | A host-side **`axl` dispatcher** — §13. |
+
+The direction is **not** "detect sudo and fork the layout". It is one shape
+varying only the root, which is what rustup, Homebrew, ESP-IDF and ARM's GNU
+toolchain all do. The root is **chosen by a flag with a sensible default,
+never guessed**: a layout that varies by an invisible condition gives every
+doc line, error message and consumer script two possible answers. This tree
+has paid that twice — the crash-handler hint prints a command that is not on
+`PATH` for a package user, and the no-root path runs through
+`~/axl-sdk-host-tools/`, which **`README.md` itself prescribes**
+(`mkdir -p ~/axl-sdk-host-tools && tar xf … -C ~/axl-sdk-host-tools`) and
+axl-utils' `install-axl-sdk.sh` then implements. *That is ours, not a
+consumer's invention* — an earlier draft of this section said axl-utils
+invented it, which was wrong and let the fix look like someone else's problem.
+It exists because no root-free SDK root was ever offered, so the README had to
+name one.
+
+### 12.1 Two measurements that removed the main objections
+
+- **`find_package(axl)` already works from `/opt/axl-sdk*`.** *Measured
+  2026-08-29:* `/opt` is in CMake's default `CMAKE_SYSTEM_PREFIX_PATH`
+  (with `/usr/local`, `/usr`, `/`, `/usr/X11R6`, `/usr/pkg`), and CMake's
+  `<prefix>/<name>*/` rule matches a directory named `axl-sdk*`. A real
+  `find_package(axl REQUIRED)` resolved against a simulated
+  `<prefix>/axl-sdk/lib/cmake/axl/`. **The standing objection to `/opt` —
+  that it breaks discovery — is false.**
+- **A user-prefix install already works end to end.** *Measured:*
+  `install.sh --arch x64 --prefix <scratch>` produced `{bin,include,lib,share}`
+  and the relocated `axl-cc` compiled a 37,376-byte PE32+ EFI application.
+
+**Consequence: D1/D2 are defaults-and-packaging work, not relocation work.**
+§3 already recorded that everything is relocatable; these confirm it reaches
+the two roots we actually want.
+
+**Documents that change when this lands**, listed so they are not rediscovered
+mid-phase: [RELEASING.md](RELEASING.md) (its artifact list and the
+`SHA256SUMS` set — P1's tarball and P7's merge both alter it),
+[AXL-SDK-Design.md](AXL-SDK-Design.md) (owns *what* ships, and its
+Distribution Model section already carries the unbuilt-tarball promise), and
+`README.md`, whose "Any distro (tarball)" block is the origin of
+`~/axl-sdk-host-tools/` and is what P5/P6 replace.
+
+### 12.2 Target layout
+
+```
+/opt/axl-sdk-4.3.5/          versioned root (root install)
+/opt/axl-sdk  -> axl-sdk-4.3.5   `current` symlink
+    bin/      axl, axl-cc, axl-c++, axl-install-toolchain, pe-set-debug
+    include/  axl/ ...
+    lib/      libaxl.a, cmake/axl/, pkgconfig/axl.pc, axl/*.lds
+    libexec/  axl/   <- host-tools scripts, reached via `axl <cmd>`
+    share/    axl/, doc/
+
+~/.local/                    non-root install; identical shape
+/usr/                        .deb / .rpm only; unchanged
+```
+
+`libexec/axl/` rather than `share/axl/scripts/`: these are executables the
+dispatcher invokes, not architecture-independent data. The `current` symlink
+is what makes D2 useful — a consumer pins `/opt/axl-sdk-4.3.2` while `current`
+moves on, and both are present.
+
+**Not in scope: moving the `.deb`/`.rpm` off `/usr`.** It gains nothing now
+that both roots work for CMake, and would discard the usrmerge handling
+`axl-cc` was specifically patched for (§3).
+
+### 12.3 A prefix is self-contained — the contract every prune rests on
+
+**Stated as a contract, and asserted, since 2026-08-29** (`test-sdk-selfcontained.sh`).
+
+> **An SDK prefix writes nothing outside itself, so `rm -rf <prefix>` is a
+> complete uninstall.** The single exception is the bare-metal cross
+> toolchains, which live outside on purpose: 739 MB shared across every SDK
+> version, installed separately by `axl-install-toolchain`.
+
+Everything below depends on it — a versioned root you cannot safely delete is
+worse than no versioning at all — and it was believed true while asserted
+nowhere, which is exactly how it would stop being true: one
+`install ... "$HOME/.config/..."` and the guarantee is silently gone with every
+other test still green. The test installs with a HOME of its own and checks it
+stays empty, and checks that the generated path-encoding files
+(`axl-config.cmake`, `axl.pc`, the staged manifest) name nothing absolute
+beyond the prefix, the manifest's toolchain roots, and ordinary system
+directories. Both halves are sabotage-verified.
+
+### 12.4 Bounding what accumulates — `axl prune`
+
+**SHIPPED 2026-08-29.** Policy: **current + one previous**, on both axes.
+
+The numbers that set it, measured 2026-08-29: **7.1 GB across eight pinned SDK
+versions** in one `$HOME`, every one a source checkout whose `out/` is ~85% of
+it. The tarball drops a pinned version to **42 MB extracted / 7.2 MB
+downloaded** — a 35x cut — so SDK roots are now cheap. **The toolchains are
+not**: 500 MB for ARM's and 239 MB for ours, **739 MB per generation**, and
+`--prefix` (P8) just made them installable in more places. At 12 tags in 17
+days, "it will not add up" is not an argument that survives contact.
+
+Why one previous rather than none: the value of an old root is a **fast
+rollback** when a version bump breaks a build. Beyond one, a pinned checksum
+plus a 7.2 MB download is cheaper than storage.
+
+**One previous *toolchain* generation is kept too, and that is deliberate** —
+an SDK root kept for rollback was built against the toolchain of its day, so
+discarding that toolchain would break the rollback the policy exists to
+provide.
+
+Three things are never removed, and they are the whole design:
+
+1. **The running prefix.** The one removal that cannot be undone by
+   re-downloading, because it takes the tool that would do the re-download.
+2. **Whatever `current` resolves to.** Something else on the machine points at
+   it.
+3. **Anything not identifiably ours.** The root is shared — `/opt` has other
+   people's software in it — so a candidate must match a name we generate,
+   anchored, *with a version after it*: `^axl-sdk-[0-9]`. `^axl-sdk-` alone
+   would match a consumer's `axl-sdk-workspace`. Toolchain families are read
+   from the staged manifest rather than hardcoded to `/opt`, so a relocated
+   toolchain is still pruned and an unrelated directory still is not.
+
+`--dry-run` prints what it would remove and removes nothing. All of it rests
+on §12.3: deleting a prefix is a complete uninstall.
+
+### 12.5 Cleanup of old locations — two of three must NOT be deleted
+
+| location | owner | action |
+|---|---|---|
+| `/usr/share/axl-sdk-host-tools/`, `/usr/bin/{run-qemu,axl-emulate}` | **dpkg / rpm** | **Package metadata, never `rm`.** deb `Replaces:`+`Breaks:`, rpm `Obsoletes:` (fpm: `--replaces`/`--conflicts`). Deleting files another package owns leaves the package database describing files that are gone. |
+| `~/axl-sdk-host-tools/` | **the consumer** — axl-utils' own `install-axl-sdk.sh` creates it and tracks it with its own `.installed-version` | **Do not touch.** Ours removing it breaks their idempotency check and reaches into a user's home. They migrate when they bump their pin. |
+| `/opt/axl-sdk-<older>/`, stale `/opt/<toolchain>-<older>/` | **us** | Prune, `--keep N` (default: keep one previous), never the version `current` points at, and **only roots recorded in a manifest we wrote**. A glob over `/opt` that grows a character deletes someone's IDE. |
+
+### 12.6 The merge, and the dependency objection it has to answer
+
+§5.1 called host-tools "correctly separate — different audience, different
+deps (QEMU, OVMF, virtiofsd)". That objection is real: `axl-sdk-host-tools`
+hard-depends on `qemu-system-x86`, `qemu-system-arm`, `ovmf`,
+`qemu-efi-aarch64`, `virtiofsd`, `mtools`, `dosfstools`, and dragging those
+onto every `axl-cc` user is a regression. It is **why axl-utils bypasses that
+package today** in favour of the tarball.
+
+**Resolution: demote them to weak dependencies** — deb `Recommends:`, rpm
+`Recommends:` (RPM >= 4.12). `axl-sdk` keeps its hard `curl`/`xz`, which
+`axl-install-toolchain` genuinely needs.
+
+**VERIFIED 2026-08-29, by building throwaway packages and reading them back
+rather than from `fpm --help`:**
+
+| | flag | result |
+|---|---|---|
+| deb | `--deb-recommends` | `Recommends: qemu-system-x86, ovmf` in the control file |
+| rpm | `--rpm-tag 'Recommends: X'` | real weak dep — `rpm -qp --recommends` lists both |
+| both | `--replaces` (+ `--conflicts` on deb) | deb `Replaces:`+`Conflicts:`, rpm `Obsoletes:` |
+
+fpm 1.17.0 has no `--rpm-recommends`, but `--rpm-tag` writes a spec tag
+verbatim and RPM >= 4.12 honours `Recommends:` as weak.
+
+A trap worth recording: `dpkg-deb -f` printed **nothing** on this AlmaLinux
+box, which reads identically to "the package has no such fields". `dpkg-deb`
+was simply not installed. The control file had to be pulled out with `ar` +
+`tar` to see the fields — "the tool could not run" and "the tool ran and found
+nothing" are the same empty output and opposite facts.
+
+**SHIPPED.** `axl-sdk` now carries `Replaces`/`Conflicts`/`Obsoletes` for
+`axl-sdk-host-tools` and the QEMU stack as `Recommends`; the standalone
+host-tools `.deb`/`.rpm` are retired. **The tarball is kept** — `README.md`
+names a real audience for it (people who want `run-qemu` without the
+build-side SDK), and a tarball serves them with no package metadata, no
+dependency graph and no root. Retiring the packages removed a duplicate
+install path; it was not a reason to strand that audience.
+
+`test-pkg-deps-minimal.sh` (debian:stable-slim, no toolchain) is the gate for
+this. The release smoke test **cannot** be: it runs on a runner that already
+ships gcc, g++ and binutils, which is exactly the blindness that let a missing
+`g++` dependency ship.
+
+### 12.7 The toolchain is the real blocker on a root-free install
+
+Mechanism owned by [AXL-Build-System-Design.md](AXL-Build-System-Design.md);
+recorded here only as the consumer-facing consequence.
+
+`install-toolchain.sh` **hard-fails without root** ("extracting to /opt needs
+root, and this is not root and has no sudo") and has no `--prefix`. So a
+`~/.local` SDK today yields a compiler driver that cannot compile.
+
+**SHIPPED 2026-08-29 as P8, and it was smaller than two earlier drafts of this
+paragraph claimed.** Recording both wrong turns, because each was a plausible
+reading of the same file:
+
+1. *"Rides with the CMake port"* — on the grounds that `axl-toolchains.conf`
+   cannot express `${VAR:-default}` (true; its `KEY=VALUE` must parse as both
+   `sh` and `make`) and that the port deletes the `make` half. **Wrong**: the
+   conf never had to express it. The override resolves in the *consumer*, a
+   convention already in production for six keys — `$(or $(AXL_X64_GCC),
+   $(AXL_X64_GCC_DEFAULT))` in make, `"${AXL_X64_GCC:-$AXL_X64_GCC_DEFAULT}"`
+   in `install.sh`, and the documented `AXL_<ARCH>_GCC` / `_GXX` /
+   `_BINUTILS_PREFIX` in `axl-cc`.
+2. *"Add `_DEFAULT` twins for the two `*_TOOLCHAIN_DIR` keys"* — **also
+   unnecessary.** Those keys are read by `install-toolchain.sh` (as its
+   install target), `.github/workflows/ci.yml` (as cache keys) and two
+   integration tests. **No build path reads them**: `axl-cc` and the `Makefile`
+   locate compilers through the `GCC`/`GXX`/`BINUTILS_PREFIX` locators, which
+   already relocate. The conf's own header says exactly that — "set them to
+   build against a toolchain installed somewhere other than /opt — a per-user
+   prefix, a CI cache, or a locally built tree".
+
+So **using** a relocated toolchain already worked. Only **installing** one did
+not: `install-toolchain.sh` wrote `/opt` into the extract, the usage banner and
+the refusal, and hard-failed with *"extracting to /opt needs root"*.
+
+What shipped:
+
+- **`--prefix DIR`**. The per-arch directory keeps its manifest name under the
+  chosen root, and each tool path is the manifest's own with that directory's
+  prefix rewritten — so "the directory prefixes the compiler", which
+  `check-toolchain-conf` asserts of the manifest, stays true of what is
+  installed.
+- **Privilege follows the destination, not `/opt`.** A prefix the user owns
+  needs no `sudo` at all; the refusal names the directory that could not be
+  written and suggests `--prefix $HOME/.local/opt`.
+- **The run prints the `AXL_<ARCH>_*` exports** for a non-default prefix. The
+  manifest's defaults still name `/opt`, and the installer is the only party
+  that knows which prefix was chosen — succeeding silently would leave a user
+  with ~96 MB on disk and a build that still cannot find a compiler.
+
+`test-toolchain-prefix.sh` shims `curl`/`sha256sum`/`tar`/`sudo` on `PATH` so
+the real control flow runs with no 739 MB download, with the control
+`test-hermetic-toolchain.sh` established: prove the shims shadow the real tools
+before asserting anything, then clear the call log so the control does not
+pollute the "never escalated" assertion it exists to make trustworthy.
+
+---
+
+## 13. The `axl` dispatcher — answers O4
+
+One name on `PATH`; everything else is a subcommand. The same idiom the
+project already uses for `axl.efi` (the UEFI busybox), so it introduces no new
+concept — only a host-side sibling.
+
+```sh
+axl rsod-decode --syms app.map --rsod putty.txt
+axl run-qemu -i --mount . app.efi
+axl emulate <fixture> app.efi
+axl --help                      # the discovery surface
+axl --print-prefix              # §6 lists this as MISSING
+axl --print-version             # §7 wants this for plain-Make consumers
+```
+
+**Why this is the answer to the actual problem.** The install *location* stops
+mattering to every doc line, README and printed hint. Ten of the twelve
+host-tools scripts are on no `PATH` at all today — only `run-qemu` and
+`axl-emulate` have `/usr/bin` wrappers — which is why a crash report tells its
+reader to run `rsod-decode.py`, a command that does not exist for a package
+user.
+
+### 13.1 What `axl` does NOT front, and why that is stated out loud
+
+**"Tool" is overloaded four ways in this project**, and a flat command list
+invites a reader to assume one program fronts all four:
+
+| | what it is | where |
+|---|---|---|
+| **host commands** | the helper scripts — run-qemu, rsod-decode, emulate | `libexec/axl/`, via `axl <cmd>` |
+| **the host's own toolchain** | the distro's gcc / binutils | **deliberately not used for target code** — AXL-Libc-Substrate-Design.md §4.1d: "no compiler, no assembler, no linker from the distro" |
+| **AXL's bare-metal cross toolchain** | what actually compiles a `.efi` — `aarch64-none-elf-*`, `x86_64-elf-*` | `/opt/…`, per `axl-toolchains.conf`; driven by `axl-cc` / `axl-c++`, installed by `axl-install-toolchain` |
+| **target tools** | the `.efi` utilities (lspci, dmidecode, …) | `axl-sdk-tools-<arch>.tar.gz`, and `axl.efi` — the UEFI busybox this dispatcher is named after |
+
+So **`axl-cc`, `axl-c++` and `axl-install-toolchain` stay their own `bin/`
+commands and are deliberately NOT subcommands.** They belong to the third row,
+not the first: putting `axl install-toolchain` beside `axl run-qemu` would
+imply the dispatcher fronts the compiler as well, which is the exact
+conflation this table exists to prevent. `axl --help` says so in three lines
+rather than leaving it to be inferred.
+
+*(An earlier draft of this section listed `axl install-toolchain aa64` as an
+example. It was never implemented, and on this reasoning it should not be —
+the same "documents a thing that does not exist" defect as §5.1's tarball
+promise, caught 2026-08-29.)*
+
+**This answers O4 with *no*:** one binary on `PATH` beats a `bin/axl-env.sh`
+the user must remember to source.
+
+`axl` resolves `libexec/axl/<cmd>` from its own `$0` with `cd -P`, exactly as
+`axl-cc` already resolves `SDK_DIR` — the relocatability §3 records and §12.1
+re-measured. No env var, no compiled-in prefix.
+
+When this lands, `README.md`'s host-tools block and
+[RELEASING.md](RELEASING.md)'s artifact list both need the `axl <cmd>` form,
+and the crash handler's printed hint (`drivers/crashhandler/report.c`) can
+drop its full path.
+
+**`axl-cc` and `axl-c++` keep their own names in `bin/`.** They are the two
+commands consumers have wired into build systems; breaking them buys nothing.
+Per §3 of the Build-System doc, `axl-cc` is the consumer driver and is
+explicitly outside the CMake port — the dispatcher is its sibling and sits
+outside the port for the same reason.
+
