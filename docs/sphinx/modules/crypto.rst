@@ -17,9 +17,11 @@ Two tiers:
   checksum — even MD5 alone — links the mbedTLS SHA-512 object too.
 - **mbedTLS-backed** primitives — TLS and public-key signature
   verification — use the vendored mbedTLS, which is compiled into every
-  build. ``axl_pk_available()`` / ``axl_tls_available()`` remain, and
-  remain the right thing to check: they report what this *image*
-  linked. ``--gc-sections`` drops the **TLS stack** — the handshake,
+  build. ``axl_pk_available()`` / ``axl_tls_available()`` remain public
+  API but are guaranteed true and report nothing worth branching on.
+  The predicate that can still answer no is ``axl_pk_alg_available()``,
+  which reports whether this *image* linked a given algorithm.
+  ``--gc-sections`` drops the **TLS stack** — the handshake,
   X.509 and the cipher suites — from an image that never calls
   ``axl_tls_init()``; it does not drop the SHA-512 adapter above, which
   the digest dispatcher references unconditionally.
@@ -102,7 +104,8 @@ at all, so no build configuration can supply it today. Use
 actually has, rather than assuming from the enum alone.
 
 Any non-``AXL_OK`` result means "not verified, untrusted" — fail closed.
-Use ``axl_pk_available()`` to distinguish "verification not compiled in"
-from "signature invalid".
+Use ``axl_pk_alg_available()`` to distinguish "this image did not link
+that algorithm" from "signature invalid"; ``axl_pk_available()`` cannot
+make that distinction, because it is always true.
 
 .. doxygenfile:: axl-crypto.h

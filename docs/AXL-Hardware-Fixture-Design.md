@@ -281,16 +281,17 @@ validation (e.g. "warn-and-skip IPMI/SPD on AArch64") lives in
 
 **Why this boundary** (it reverses an earlier "run-qemu.sh owns the
 HF primitives" design): `run-qemu.sh` is a *released, multi-project*
-CLI — it ships in the host-tools `.deb`/`.rpm`/tarball and the sibling
+CLI — it ships in the host-tools tarball and the sibling
 projects (AGT, axl-webfs, uefi-devkit) invoke it by path as a black
 box. Those consumers use **only** the generic launch/display/net/
 plumbing flags and **zero** HF flags; the entire HF concern has a
 single real consumer (`axl-emulate`) plus axl-sdk's own tests. Keeping
 platform-emulation knowledge out of `run-qemu.sh` keeps that public CLI
 small and stable, and confines fixture knowledge to the one tool whose
-job it is. `axl-emulate` **must ship in the host-tools `.deb`/`.rpm`/
-tarball** alongside `run-qemu.sh` (with a `/usr/bin/axl-emulate`
-wrapper) so released consumers get fixture replay — as of 2026-06-08
+job it is. `axl-emulate` **must ship in the host-tools tarball**
+alongside `run-qemu.sh` (reached as `axl emulate` through the
+dispatcher; the host-tools `.deb`/`.rpm` this once named retired with
+D2) so released consumers get fixture replay — as of 2026-06-08
 the `build-host-tools` job in `release.yml` does NOT yet include it
 (the `SCRIPTS=(...)` list omits `axl-emulate`); adding it is part of
 this migration.

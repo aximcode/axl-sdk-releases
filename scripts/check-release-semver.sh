@@ -87,7 +87,25 @@ LEVEL="$(bump_level "$PREV" "$VERSION")"
 # say it had. That is this script's own incident one layer in: the information
 # sits in the file and never reaches the person deciding --allow-breaking, who
 # sees a short list and reads it as a complete one.
-if grep -q '^### Breaking' <<<"$SECTION" && [[ "$LEVEL" != major ]]; then
+# TWO KINDS OF BREAK, and only one of them is what semver means.
+#
+# Semver mandates MAJOR for incompatible API changes. Renaming a release asset,
+# or ceasing to publish one, breaks a consumer's BUILD SCRIPTS while their code
+# still compiles and links against unchanged headers. That is a real break and
+# it must be announced -- but demanding a MAJOR for it means the version number
+# stops describing the API, which is the thing consumers actually read it for.
+# D2 hit this exactly: every asset renamed, the packages retired, and axl.h
+# untouched.
+#
+# So "### Breaking (packaging)" is its own heading, permitted below a major and
+# NEVER silent -- the NOTE below lists it, and the release notes carry the
+# section verbatim. The heading is the author's claim about which kind it is;
+# nothing here can check that claim, which is exactly why RELEASING.md states
+# the rule in one line: does a consumer's CODE stop working, or their SCRIPT?
+PACKAGING_BREAK=false
+grep -qE '^### Breaking \(packaging\)[[:space:]]*$' <<<"$SECTION" && PACKAGING_BREAK=true
+
+if grep -qE '^### Breaking[[:space:]]*$' <<<"$SECTION" && [[ "$LEVEL" != major ]]; then
     if $ALLOW_BREAKING; then
         echo "check-release-semver: '### Breaking' present and $PREV -> $VERSION is a" \
              "$LEVEL bump — allowed by --allow-breaking"
@@ -97,7 +115,7 @@ ERROR: CHANGELOG '## Unreleased' has a '### Breaking' section, but
        $PREV -> $VERSION is a $LEVEL bump.
 
        Breaking entries under it:
-$(awk '/^### Breaking/{inb=1;next} /^### /{inb=0} inb && /^- /' <<<"$SECTION" | sed 's/^/         /' | cut -c1-78)
+$(awk '/^### Breaking[[:space:]]*$/{inb=1;next} /^### /{inb=0} inb && /^- /' <<<"$SECTION" | sed 's/^/         /' | cut -c1-78)
 
        "## Unreleased" is branch-wide state; a release is a commit range.
        They agree only when the release is everything on this branch since
@@ -117,4 +135,15 @@ if grep -q '^### Added' <<<"$SECTION" && [[ "$LEVEL" == patch ]]; then
          "Not refused, but semver would call new functionality a minor."
 fi
 
+if $PACKAGING_BREAK; then
+    cat <<EOF
+NOTE: '### Breaking (packaging)' is present and $PREV -> $VERSION is a $LEVEL bump.
+      That is ALLOWED -- packaging breaks do not force a major -- but consumers
+      pin asset names, so this release breaks their scripts even though their
+      code still compiles. Entries:
+$(awk '/^### Breaking \(packaging\)/{inb=1;next} /^### /{inb=0} inb && /^- /' <<<"$SECTION" | sed 's/^/        /' | cut -c1-78)
+      Make sure the release notes say what to change. RELEASING.md §"Two kinds
+      of breaking change".
+EOF
+fi
 echo "check-release-semver: OK — $PREV -> $VERSION ($LEVEL) is consistent with the section"

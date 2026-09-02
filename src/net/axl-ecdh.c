@@ -4,9 +4,9 @@
 /** @file axl-ecdh.c
     Ephemeral elliptic-curve Diffie-Hellman (P-256 and X25519).
 
-    When AXL_HAVE_TLS is defined, key agreement over mbedTLS using the
-    low-level ecp/ecdh primitives (no struct internals). Otherwise the
-    constructor returns NULL and operations return AXL_ERR (fail-closed).
+    Key agreement over mbedTLS using the low-level ecp/ecdh primitives
+    (no struct internals). mbedTLS is an unconditional dependency:
+    there is no fail-closed stub build.
 **/
 
 #include <axl/axl-crypto.h>

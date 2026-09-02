@@ -60,11 +60,18 @@ typedef enum {
 } AxlTlsStatus;
 
 /**
- * @brief Check if TLS support was compiled in.
- * @return always true — mbedTLS is compiled into every build. Kept as
- *     public API; what a caller usually wants to know is whether
- *     axl_tls_init() succeeded, which is what gates https:// at
- *     runtime.
+ * @brief Whether TLS is present in this build.
+ *
+ * Always true, guaranteed. mbedTLS is an unconditional dependency and
+ * no build omits it, so this cannot answer no — do not branch on it.
+ * It stays public API only so existing consumer source keeps compiling.
+ *
+ * The question worth asking at runtime is whether axl_tls_init()
+ * succeeded; that is what gates https://. Note this predicate also does
+ * not report whether the TLS stack survived `--gc-sections` in a given
+ * image, and never did.
+ *
+ * @return always true.
  */
 bool
 axl_tls_available(void);

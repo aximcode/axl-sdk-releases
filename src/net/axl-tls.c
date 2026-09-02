@@ -4,8 +4,8 @@
 /** @file axl-tls.c
     TLS support — ported from SoftBMC TlsShim.c.
 
-    When AXL_HAVE_TLS is defined, provides full TLS 1.2 via mbedTLS.
-    Otherwise, all functions return -1/NULL/false (stubs).
+    Full TLS 1.2 via mbedTLS, which is an unconditional dependency:
+    there is no stub build, and axl_tls_available() is a guaranteed true.
 **/
 
 #include <axl/axl-net.h>

@@ -441,8 +441,10 @@ make tests                                  # build test EFIs
 ./scripts/install.sh --arch x64
 ./out/bin/axl-cc sdk/examples/hello.c -o hello.efi
 
-# Distro packages are the preferred install for end users — release.yml
-# ships .deb and .rpm artifacts for each tag via fpm. See README.md.
+# `packaging/install.sh` is the install path for end users — release.yml
+# publishes it plus VERSION, SHA256SUMS and three versioned tarballs.
+# The .deb/.rpm RETIRED with D2 (AXL-Distribution-Design.md §17/§19);
+# scripts/build-packages.sh survives only until D7. See README.md.
 ```
 
 **A CFLAGS change forces a rebuild.** Objects do not depend on the Makefile,

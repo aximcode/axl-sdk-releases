@@ -4,9 +4,9 @@
 /** @file axl-cipher.c
     AES-CTR keystream cipher.
 
-    When AXL_HAVE_TLS is defined, a stateful AES-CTR context over mbedTLS
-    whose counter advances across calls. Otherwise the constructor
-    returns NULL and xcrypt returns AXL_ERR (fail-closed).
+    A stateful AES-CTR context over mbedTLS whose counter advances
+    across calls. mbedTLS is an unconditional dependency: there is no
+    fail-closed stub build.
 **/
 
 #include <axl/axl-crypto.h>

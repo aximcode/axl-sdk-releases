@@ -21,6 +21,16 @@
 set -euo pipefail
 
 HERE="$(cd -P "$(dirname "$0")" && pwd)"
+# axl-common.sh sits beside this script in a checkout, but this file is the
+# one host tool staged into bin/ rather than libexec/axl/, so in a staged
+# prefix the neighbour is one directory over. One path cannot serve both.
+for _axl_common in "$HERE/axl-common.sh" "$HERE/../libexec/axl/axl-common.sh"; do
+    [[ -r "$_axl_common" ]] && { source "$_axl_common"; break; }
+done
+
+# Answered before anything else parses argv, so `--version` never has to
+# survive a positional-hungry option loop. See axl-common.sh.
+axl_handle_version "axl-install-toolchain" "$@" && exit 0
 
 # ONE script-level EXIT trap, not a per-function RETURN trap. A RETURN trap
 # does NOT fire when `set -e` aborts the script, so a curl or sha256sum failure

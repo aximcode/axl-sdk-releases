@@ -66,11 +66,11 @@ test_host_pass "make-sdk-tarball.sh succeeds"
 # The name carries the HOST platform, not the target: one archive holds both
 # target arches, per §5.3's lean that a per-target split is not worth its
 # packaging cost on its own.
-TARBALL="$OUT/axl-sdk-${VERSION}-linux-x86_64.tar.gz"
+TARBALL="$OUT/axl-sdk-linux-${VERSION}-x86_64.tar.gz"
 if [[ -f "$TARBALL" ]]; then
-    test_host_pass "produces axl-sdk-${VERSION}-linux-x86_64.tar.gz"
+    test_host_pass "produces axl-sdk-linux-${VERSION}-x86_64.tar.gz"
 else
-    test_host_fail "produces axl-sdk-${VERSION}-linux-x86_64.tar.gz"
+    test_host_fail "produces axl-sdk-linux-${VERSION}-x86_64.tar.gz"
     ls -la "$OUT" 2>/dev/null | sed 's/^/      /'
     test_host_summary "sdk-tarball"
     exit 1
@@ -109,13 +109,62 @@ for want in \
     "axl-sdk-${VERSION}/lib/cmake/axl/axl-config.cmake" \
     "axl-sdk-${VERSION}/lib/pkgconfig/axl.pc" \
     "axl-sdk-${VERSION}/libexec/axl/rsod-decode.py" \
-    "axl-sdk-${VERSION}/share/axl/version" ; do
+    "axl-sdk-${VERSION}/libexec/axl/install.sh" \
+    "axl-sdk-${VERSION}/share/axl/version" \
+    "axl-sdk-${VERSION}/VERSION" ; do
     if grep -qxF -- "$want" "$LISTING"; then
         test_host_pass "contains ${want#axl-sdk-${VERSION}/}"
     else
         test_host_fail "contains ${want#axl-sdk-${VERSION}/}"
     fi
 done
+
+# ── the licence payload the .deb/.rpm used to carry ───────────
+#
+# The packages staged 75 doc files, including five third-party licence sets,
+# and D2 retires the packages. These are OBLIGATIONS, not documentation:
+# mbedTLS, DejaVu and edk2 are Apache-2.0 / Bitstream / BSD-2-Clause-Patent
+# §4(a)-style "carry the licence with any binary redistribution"; libvterm is
+# MIT and offers no public-domain election; FreeType's FTL carries a CREDIT
+# clause for products shipping the path-filling APIs. All five are compiled
+# INTO libaxl.a, so the archive that ships libaxl.a is the one that owes them.
+#
+# NOTICE is Apache-2.0 4(d) and was itself once omitted from the package.
+for want in \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/LICENSE" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/NOTICE" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/THIRD_PARTY.md" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/CHANGELOG.md" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/README.md" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/examples/hello.c" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/examples/hello.cpp" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/examples/containers.cpp" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/examples/embed-asset.txt" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/mbedtls/LICENSE" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/dejavu/LICENSE" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/libvterm/LICENSE" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/freetype/FTL.TXT" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/freetype/LICENSE.TXT" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/edk2/LICENSE" ; do
+    if grep -qxF -- "$want" "$LISTING"; then
+        test_host_pass "carries ${want#axl-sdk-${VERSION}/share/doc/axl-sdk/}"
+    else
+        test_host_fail "carries ${want#axl-sdk-${VERSION}/share/doc/axl-sdk/}"
+    fi
+done
+
+# embed-asset.txt above is not source but is an INPUT: embed-asset.c documents
+# it as the file its `--embed` flag bundles, so the example does not build
+# without it. The keep-list is deny-by-default, and it dropped this one.
+#
+# The examples ship as SOURCE. A dirty checkout leaves .efi and .o files in
+# sdk/examples, and shipping build output from the maintainer's machine in a
+# licence directory is how a staging path escapes into a release.
+if grep -E "^axl-sdk-${VERSION}/share/doc/axl-sdk/examples/.*\.(efi|o|a|so)$" "$LISTING" > /dev/null; then
+    test_host_fail "the examples carry no build artifacts"
+else
+    test_host_pass "the examples carry no build artifacts"
+fi
 
 # ── the assertion that actually means something ───────────────
 #

@@ -56,13 +56,15 @@ extern "C" {
 #endif
 
 /**
- * @brief Whether the JOSE module is available.
+ * @brief Whether the JOSE module is present in this build.
  *
- * @return always true — JOSE is compiled into every build. Kept as
- *     public API so a consumer's existing fail-closed branch still
- *     compiles and still reads correctly.
+ * Always true, guaranteed. JOSE compiles into every build, so this
+ * cannot answer no — do not branch on it. A fail-closed guard written
+ * against a predicate that cannot fail is decoration, not a security
+ * property. It stays public API only so existing consumer source keeps
+ * compiling.
  *
- * @return true if JOSE operations can run.
+ * @return always true.
  */
 bool
 axl_jose_available(void);

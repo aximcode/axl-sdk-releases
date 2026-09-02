@@ -134,7 +134,7 @@ check "$rc" "a C++ axl_add_app configures with no mode flag (rc=$rc)"
 # 5. It actually BUILDS -- C, a driver, EMBEDS, multi-source, C++, exceptions.
 # ---------------------------------------------------------------------
 # The PE machine word without `file`: e_lfanew at 0x3c points at "PE\0\0"
-# followed by the machine. Same trick test-pkg-deps-minimal.sh uses.
+# followed by the machine. Same trick test-host-deps-minimal.sh uses.
 pe_machine() {
     local off
     off=$(od -An -tu4 -j60 -N4 "$1" | tr -d " ")

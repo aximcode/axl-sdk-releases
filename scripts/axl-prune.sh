@@ -38,6 +38,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"      # <prefix>/libexec/axl
+
+# GUARDED: test-axl-prune.sh stages this script on its own, with no
+# axl-common.sh beside it. An unguarded source printed two errors per
+# invocation there and was survived only by the absence of `set -e`.
+[[ -r "$SCRIPT_DIR/axl-common.sh" ]] && source "$SCRIPT_DIR/axl-common.sh"
+
+# Answered before anything else parses argv, so `--version` never has to
+# survive a positional-hungry option loop. See axl-common.sh.
+axl_handle_version "axl-prune" "$@" && exit 0
 PREFIX="$(dirname "$(dirname "$SCRIPT_DIR")")"
 ROOT="$(dirname "$PREFIX")"
 CONF="$PREFIX/share/axl/axl-toolchains.conf"
@@ -121,10 +130,24 @@ prune_family() {
 echo "[axl prune] root: $ROOT   keep: $KEEP$( [[ $DRY -eq 1 ]] && echo '   (dry run)')"
 
 # --- SDK roots -------------------------------------------------------------
-# Anchored, and a DIGIT must follow the dash: `axl-sdk-4.3.2` matches while a
-# consumer's `axl-sdk-workspace` does not. That one character is the difference
-# between pruning our own versions and deleting somebody's project.
-prune_family "$ROOT" '^axl-sdk-[0-9]' "$PREFIX" "$CURRENT"
+# ONLY when the running prefix is itself a versioned root. A package install
+# puts us under /usr, so ROOT resolves to `/` -- the anchored pattern below
+# finds nothing there and the run is harmless, but the banner above has just
+# announced "root: /" and a user should not have to reason about an anchor to
+# know that is safe. Say which half ran instead of leaving it to inference.
+#
+# The pattern is anchored, and a DIGIT must follow the dash: `axl-sdk-4.3.2`
+# matches while a consumer's `axl-sdk-workspace` does not. That one character
+# is the difference between pruning our own versions and deleting somebody's
+# project.
+if [[ "$(basename "$PREFIX")" =~ ^axl-sdk-[0-9] ]]; then
+    prune_family "$ROOT" '^axl-sdk-[0-9]' "$PREFIX" "$CURRENT"
+else
+    echo "  SDK roots:    not applicable -- $PREFIX is not a versioned root"
+    echo "                Something else placed this tree, so pruning beside it"
+    echo "                could delete files this script does not own. Whatever"
+    echo "                installed it manages its versions."
+fi
 
 # --- toolchain roots -------------------------------------------------------
 # The families come from the staged manifest: the directory that is CURRENT is

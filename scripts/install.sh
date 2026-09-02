@@ -944,9 +944,14 @@ log_info "Installed axl-cc + axl-c++ + axl-install-toolchain"
 # Staging them under stripped names would leave each one correct and unable to
 # find the others; `axl` maps names instead.
 mkdir -p "$PREFIX/libexec/axl"
-for _tool in run-qemu.sh axl-common.sh axl-emulate rsod-decode.py \
-             gdb-syms.py gdb-sample.py profile-qemu.sh extract-fv-shell.py \
-             axl-prune.sh; do
+# axl_version.py has no shebang, so it stages 0644 and `axl`'s command list
+# (executables in libexec/axl/) correctly does NOT pick it up as a subcommand.
+# Read from the Makefile rather than restated here: this set and release.yml's
+# host-tools tarball must not drift, and they did.
+_host_tools=$(make -C "$LIBAXL_DIR" -s print-HOST_TOOL_FILES) || {
+    log_error "could not read HOST_TOOL_FILES from the Makefile"; exit 1; }
+[[ -n "$_host_tools" ]] || { log_error "HOST_TOOL_FILES is empty"; exit 1; }
+for _tool in $_host_tools; do
     _src="$LIBAXL_DIR/scripts/$_tool"
     [[ -f "$_src" ]] || { log_error "missing host tool: scripts/$_tool"; exit 1; }
     if head -c2 "$_src" | grep -q '#!'; then
@@ -955,8 +960,42 @@ for _tool in run-qemu.sh axl-common.sh axl-emulate rsod-decode.py \
         install -C -m 644 "$_src" "$PREFIX/libexec/axl/$_tool"
     fi
 done
+# The installer ships INSIDE the install, so `axl self-update` and
+# `axl uninstall` work without re-fetching it. QtIFW's MaintenanceTool idea
+# (AXL-Distribution-Design.md §18.6): the install knows its own version,
+# prefix and links; a script on a web server knows none of them.
+#
+# 0644 DELIBERATELY. `axl` lists the EXECUTABLES in libexec/axl as commands,
+# so a mode bit is what keeps this from also appearing as `axl install` --
+# a third way to reach the same thing. Same reason axl_version.py is 0644.
+install -C -m 644 "$LIBAXL_DIR/packaging/install.sh" "$PREFIX/libexec/axl/install.sh"
+
 install -C -m 755 "$LIBAXL_DIR/scripts/axl" "$PREFIX/bin/axl"
 log_info "Installed axl dispatcher + host tools"
+
+# ---------------------------------------------------------------------------
+# `current` symlink (AXL-Distribution-Design.md §12.2)
+#
+# axl-prune.sh has always PROTECTED whatever <root>/axl-sdk resolves to, and
+# nothing has ever created it -- so that protection was unreachable unless a
+# user made the link by hand, and consumers had no stable path to pin.
+#
+# GUARDED to a versioned root. install.sh's default prefix is ./stage in a
+# checkout, and a bare `install.sh` must not start dropping symlinks into the
+# parent of the source tree. Only a prefix that is itself `axl-sdk-<version>`
+# gets one, which is exactly the layout the SDK tarball extracts to.
+# ---------------------------------------------------------------------------
+_prefix_base="$(basename "$PREFIX")"
+if [[ "$_prefix_base" =~ ^axl-sdk-[0-9] ]]; then
+    _root="$(dirname "$PREFIX")"
+    # -n so an existing symlink is REPLACED rather than followed into the
+    # directory it points at, which would nest axl-sdk/axl-sdk-<ver>.
+    if ln -sfn "$_prefix_base" "$_root/axl-sdk" 2>/dev/null; then
+        log_info "current -> $_root/axl-sdk -> $_prefix_base"
+    else
+        log_warning "could not update $_root/axl-sdk (not writable?)"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

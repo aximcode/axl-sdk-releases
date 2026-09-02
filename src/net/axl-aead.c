@@ -4,8 +4,8 @@
 /** @file axl-aead.c
     Authenticated encryption (AEAD): AES-GCM and ChaCha20-Poly1305.
 
-    When AXL_HAVE_TLS is defined, one-shot seal/open via mbedTLS.
-    Otherwise the functions return AXL_ERR (fail-closed).
+    One-shot seal/open via mbedTLS, which is an unconditional
+    dependency: there is no fail-closed stub build.
 **/
 
 #include <axl/axl-crypto.h>

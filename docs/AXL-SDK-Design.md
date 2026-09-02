@@ -207,16 +207,20 @@ and `scripts/axl-cc`.  Two pieces live together:
 
 **AArch64 needs the ARM bare-metal toolchain**
 (`aarch64-none-elf-g++`, ARM developer.arm.com, pinned to
-14.3.Rel1).  Run `scripts/install-arm-toolchain.sh` to fetch +
-verify + extract the ~96 MB tarball to `/opt/`.
+14.3.Rel1).  Run `scripts/install-toolchain.sh aa64` to fetch +
+verify + extract the ~96 MB tarball to `/opt/`.  X64 has its own
+pinned bare-metal cross as well — `install-toolchain.sh all` does
+both, and `scripts/axl-toolchains.conf` pins each.
 `scripts/install.sh` auto-detects the toolchain at standard paths
 and builds C++ support when present (no `--cpp` opt-in required).
 The Linux-ABI cross (`aarch64-linux-gnu-g++`) is NOT viable —
 its libstdc++ headers pull hosted typedefs.
 
-**Single package.**  The C++ glue objects + `axl-c++` + the C++
-headers ship in the regular `axl-sdk.deb` / `.rpm` (no `-cpp`
-subpackage).  The package conveys NO libstdc++ — `axl-cc`
+**Single artifact.**  The C++ glue objects + `axl-c++` + the C++
+headers ship in the one SDK tarball (there was never a `-cpp`
+split, and the `.deb`/`.rpm` this named retired with D2 —
+[`AXL-Distribution-Design.md`](AXL-Distribution-Design.md) §17).
+The archive conveys NO libstdc++ — `axl-cc`
 resolves the consumer's own installed copy through
 `-print-file-name`, which is what keeps the GCC Runtime Library
 Exception's one restriction out of scope (see
@@ -345,9 +349,12 @@ split. (This paragraph said "into `out/`" until 2026-08-29, contradicting the
 
 **Ways to get the SDK:**
 
-1. **Distro package** (the supported consumer path today):
+1. **The installer** (the supported consumer path today — one
+   command on every distribution; the `.deb`/`.rpm` that stood
+   here retired with D2):
    ```
-   sudo dnf install ./axl-sdk.rpm      # or: apt install ./axl-sdk.deb
+   curl -fsSLO .../releases/latest/download/install.sh
+   sh install.sh --toolchain x64
    axl-cc hello.c                      # -> hello.efi
    ```
 

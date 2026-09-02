@@ -43,18 +43,38 @@ immediately below. Three of the last three releases used the other one.
 
 ### The gate is LOCAL — run the suite before you cut
 
-**CI is no longer a per-push gate, and release tags do NOT trigger it.** `ci.yml`
-runs **only** on a manual `workflow_dispatch` — a rare cross-OS backstop, to keep
-Actions minutes for the runs that matter. (A release tag used to re-run CI on the
-exact commit already validated on `main` — pure duplication, ~38 min for an
-identical result — so that trigger was removed.) The **authoritative pre-release
-gate is the full suite run locally**, which is fast in parallel:
+**Release tags do NOT trigger CI.** (A tag used to re-run CI on the exact
+commit already validated on `main` — pure duplication, ~38 min for an identical
+result — so that trigger was removed.) `ci.yml` *does* run on every push to
+`main`, plus `workflow_dispatch`; the trigger table above is authoritative.
+This paragraph said "manual `workflow_dispatch` only" long after the push
+trigger came back, which is the same staleness the table carried.
+
+The **authoritative pre-release gate is still the full suite run locally** —
+because a tag is not a push to `main`, so nothing runs CI on the commit you are
+about to publish. It is fast in parallel:
 
 ```sh
 make ARCH=x64 all tests tools axl-busybox   # one build for the whole gate
-./test/integration/run-integration.sh --no-cache -j"$(nproc)"   # 0 failures required
-scripts/lint.sh                                        # clang-tidy exactly as CI runs it
+./test/integration/run-integration.sh --no-cache        # 0 failures required
+scripts/lint.sh                                         # clang-tidy exactly as CI runs it
 ```
+
+**Do not pass `-j"$(nproc)"` here.** That was this command's advice until
+2026-09-02, and it contradicts the runner's own default of `nproc - 2`, which
+exists because these are timing-sensitive QEMU guests and a saturated host
+starves them. Measured on the 4.5.0 gate, on 8 cores:
+
+| workers | wall | result |
+|---|---|---|
+| `-j8` (`nproc`) | 474s | **FAILED** — `test-task-pool-mp-qemu.sh`, `slot reclaim: workers=2 expected=3` |
+| default (`nproc-2`) | 477s | 188 passed, 0 failed |
+
+**Three seconds, and a false red.** The MP test needs three vCPUs actually
+scheduled; at `-j8` it does not get them, and it failed twice — the harness's
+own retry does not help when the starvation is sustained. A release gate that
+cries wolf is worse than a slower one, because the next red gets triaged as
+"probably contention" and one day it will not be.
 
 `run-integration.sh` discovers every `test-*.sh` (including the patched-QEMU /
 real-pointer `local-only` tests, which your dev box CAN run) and runs each in
@@ -189,9 +209,9 @@ you like — zero Actions minutes. The triggers are baked into the workflow file
 
 | Workflow | What | Triggers on |
 |---|---|---|
-| **ci.yml** | build + QEMU integration + lint | **manual only** (`workflow_dispatch`) — dispatch on `main` before tagging |
+| **ci.yml** | build + QEMU integration + lint | **every push to `main`**, plus `workflow_dispatch`. NOT on release tags (the tagged commit was already tested on `main`). The push trigger came back on 2026-08-18; this row said "manual only" long afterwards, which is how a full uncached local suite came to be run right before every push — duplicating CI's identical run on the same self-hosted box |
 | **docs.yml** | Doxygen/Sphinx → Cloudflare Pages | major tag `vX.0.0`, or manual |
-| **release.yml** | build + publish `.deb`/`.rpm`/tarballs | **every** release tag `v*` (it's the publish step), or manual |
+| **release.yml** | build + publish `install.sh`, `VERSION`, `SHA256SUMS` and the three tarballs | **every** release tag `v*` (it's the publish step), or manual |
 
 So: a normal push runs nothing; **no** release tag runs CI (it was validated on
 `main` before the cut); a **patch/minor** release tag runs only `release.yml`
@@ -429,6 +449,44 @@ number against the content. It was deleted (zero downloads) and re-cut from the
 It is a backstop, not a substitute for picking the right flow: it catches a
 mislabelled *version*, not unrelated work that happens to be non-breaking.
 
+### Two kinds of breaking change
+
+Semver mandates MAJOR for incompatible **API** changes. Not every break is an
+API break, and treating them as one makes the version number stop describing
+the thing consumers read it for. So the CHANGELOG has two headings, and
+picking between them is a one-line test:
+
+> **Does a consumer's CODE stop working, or their SCRIPT?**
+
+| heading | means | version |
+|---|---|---|
+| `### Breaking` | their **code** breaks — a removed or changed function, a struct field, an ABI change. It no longer compiles, or no longer runs correctly | **MAJOR**, and the guard refuses anything less |
+| `### Breaking (packaging)` | their **scripts** break — a renamed release asset, a retired install channel, a changed extraction layout. Their code compiles and links unchanged | **any level.** The guard allows it and prints a NOTE listing the entries |
+
+**Both are real breaks and both must be announced.** The difference is only
+which number has to move. A packaging break is never silent: the guard lists
+it on every cut, and the release notes carry the section verbatim, because a
+consumer pinning an asset name has to act on it before their next bump.
+
+**The heading is your claim, and nothing can check it.** No script can tell
+whether a removed symbol was public. If you are unsure, use `### Breaking` —
+the cost of an unnecessary major is a number; the cost of a missed one is a
+consumer whose build breaks on what their tooling told them was a safe bump.
+
+**Worked example — 4.4.0 → 4.5.0 (D2).** Every release asset was renamed, the
+`.deb`/`.rpm` were retired, and two tarballs stopped being tarbombs. Every
+consumer that fetched or installed the SDK had to change something. And
+`axl.h` was untouched: source and ABI compatibility were total, so a consumer
+who vendored the headers and libs noticed nothing. That is
+`### Breaking (packaging)` on a minor — and it is why the heading exists,
+because the first draft of that CHANGELOG forced a 5.0.0 for a release in
+which no API changed.
+
+**`--allow-breaking` is still the escape hatch for a real API break** below a
+major, and it should stay rare. If you find yourself reaching for it, check
+first whether the entries belong under `### Breaking (packaging)` instead —
+that is a re-classification, not a bypass.
+
 ### Cutting from a tag — what differs
 
 Steps 1, 2, 3, 5, 6 and 7 below are **identical**. Only the branch handling
@@ -572,10 +630,13 @@ The tag push triggers **two** workflows (and on a minor/patch, one):
 > re-running CI on a commit already validated on `main` was pure duplication,
 > and that trigger was removed. This paragraph outlived it.
 
-- **Release** (`.github/workflows/release.yml`) — builds .deb +
-  .rpm via `fpm` (both x64 and aa64), pulls iPXE from upstream
-  for the host-tools tarball, attaches everything to a GitHub
-  Release on `aximcode/axl-sdk-releases`.
+- **Release** (`.github/workflows/release.yml`) — builds the SDK,
+  host-tools and UEFI-tools tarballs (both arches), pulls iPXE
+  from upstream for the UEFI-tools tarball, and attaches
+  everything plus `install.sh`, `VERSION` and `SHA256SUMS` to a
+  GitHub Release on `aximcode/axl-sdk-releases`. **No `.deb` or
+  `.rpm`** — they retired with D2
+  ([AXL-Distribution-Design.md](AXL-Distribution-Design.md) §17).
 - **Docs** (`.github/workflows/docs.yml`) — Doxygen + Sphinx
   build + Cloudflare Pages deploy.
 
@@ -723,35 +784,44 @@ The Release is published on the public sibling repo
 gh release view vX.Y.Z --repo aximcode/axl-sdk-releases
 ```
 
-Should show the release page with `axl-sdk.deb`, `axl-sdk.rpm`,
-`axl-sdk-tools-{x64,aa64}.tar.gz`,
-`axl-sdk-host-tools.{tar.gz,deb}`, `axl-sdk-<ver>-linux-x86_64.tar.gz`
-(the relocatable SDK prefix — it keeps its versioned name, unlike the
-packages, because the version IS the directory inside it and a stable
-filename would make two pinned versions indistinguishable on disk), and
-`SHA256SUMS` attached.
+Should show exactly **six** assets:
 
-> **This artifact set is changing.** [AXL-Distribution-Design.md](AXL-Distribution-Design.md)
-> §12–§13 add an SDK **prefix** tarball (P1/P6 — the one artifact a root-free
-> install needs and which has never been built), fold `axl-sdk-host-tools`
-> into the SDK package (P7), and put an `axl` dispatcher on `PATH` (P5).
-> Update this list with each phase rather than after all of them.
+| asset | name |
+|---|---|
+| the installer | `install.sh` |
+| the version it resolves | `VERSION` |
+| checksums over the other five | `SHA256SUMS` |
+| host SDK prefix | `axl-sdk-linux-<ver>-x86_64.tar.gz` |
+| host tooling, no compiler | `axl-sdk-host-tools-<ver>.tar.gz` |
+| TARGET firmware binaries | `axl-sdk-uefi-tools-<ver>-{x64,aa64}.tar.gz` |
 
-The `.deb` / `.rpm` packages include the full C and C++ surface
-when CI builds with BOTH bare-metal toolchains cached
+Three names are stable and three carry the version, and only the first
+two need to be stable — they are the only ones fetched by a reader who
+does not yet know the version (§14.1a). `<arch>` means the **host** on
+the SDK tarball and the **target firmware** on the uefi-tools ones.
+
+The release job itself asserts the count, and `make check-asset-names`
+holds these spellings equal to the ones `packaging/install.sh`
+constructs, so a rename that misses one place fails before the tag.
+
+The SDK tarball includes the full C and C++ surface when CI builds
+with BOTH bare-metal toolchains cached
 (`scripts/install-toolchain.sh all` — C and C++ compile
 bare-metal on both arches, so neither is optional any more).
-Specifically, each package contains:
+Specifically, it contains:
 
 - C bits (always): `axl-cc` driver, `libaxl.a` per arch,
   `axl.h` + `axl/*.h` headers, CRT0 objects, linker scripts,
   CMake config, pkg-config, JSON5 sidecars.  The `axl-c++` driver
   is here too — it is a dependency-free `exec axl-cc -x c++`
   wrapper, so it ships unconditionally; without the C++ glue it
-  simply reports which install step is missing.
+  simply reports which install step is missing. Since D2 the
+  archive also carries `share/doc/axl-sdk/` — LICENSE, NOTICE,
+  THIRD_PARTY.md, the examples, and the five third-party licence
+  sets the retired packages used to carry.
 - C++ bits (when toolchain present at build time): the four
   `axl-cxxrt-*.o` glue objects per arch, plus the C++ headers.
-  The package conveys no libstdc++ — `axl-cc` names the
+  The archive conveys no libstdc++ — `axl-cc` names the
   consumer's installed copy — so there is no runtime-dependency
   escalation; pure-C consumers can ignore the extra files.
 
@@ -760,14 +830,14 @@ CI cache invalidation: both toolchain tarballs are keyed on
 manifest forces a re-fetch of both — which is also why a
 toolchain version bump must be PUBLISHED before the commit that
 bumps it lands, or every CI job downloads a URL that 404s.
-Verify both packages contain the C++ glue after a release build.
+Verify the tarball contains the C++ glue after a release build.
 `axl-cxxrt-terminate.o` is the one to grep for: it is the only
 member that is C++-only, so its absence means exactly "no C++
-half".
+half". The release job already asserts both arches, so this is
+for checking a published artifact by hand:
 
 ```sh
-dpkg-deb -c axl-sdk_*_amd64.deb | grep axl-cxxrt
-rpm -qpl axl-sdk-*.x86_64.rpm | grep axl-cxxrt
+tar tzf axl-sdk-linux-*-x86_64.tar.gz | grep axl-cxxrt
 ```
 
 If `axl-cxxrt-terminate.o` is missing, the build host either didn't have

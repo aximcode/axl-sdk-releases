@@ -519,7 +519,7 @@ ones:
   **The package now depends on NO part of the distro's toolchain** -- no
   compiler, no assembler, no linker. `binutils` went first; `g++` was the last
   one and went with T2, when x64 C++ moved to our own `x86_64-elf-g++`. Proven
-  by `test/integration/test-pkg-deps-minimal.sh`: only the declared deps
+  by `test/integration/test-host-deps-minimal.sh`: only the declared deps
   installed, on an image with no toolchain, building x64 C, x64 C++, aa64 C and
   aa64 C++ to correct PE machine words.
 

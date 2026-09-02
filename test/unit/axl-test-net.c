@@ -469,6 +469,17 @@ test_http_parse_headers(void)
 // Network Tests (require networking in QEMU)
 // ---------------------------------------------------------------------------
 
+/* axl_tls_available() is documented as a guaranteed true, not a
+   build-dependent value. A guarantee with no assertion behind it is a
+   comment, so pin it -- as axl-test-jose.c and axl-test-crypto.c already
+   pin axl_jose_available() and axl_pk_available(). */
+static void
+test_tls_available(void)
+{
+    test_check(axl_tls_available() == true,
+               "tls_available: true");
+}
+
 static void
 test_net_available(void)
 {
@@ -2752,11 +2763,6 @@ run_serve_mode(void)
 static int
 run_serve_tls_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        return -1;
-    }
-
     axl_net_auto_init(SIZE_MAX, 10);
 
     if (axl_tls_init() != AXL_OK) {
@@ -2824,11 +2830,6 @@ run_serve_tls_mode(void)
 static int
 run_serve_tls_driver_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        return -1;
-    }
-
     axl_net_auto_init(SIZE_MAX, 10);
     if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
@@ -2898,11 +2899,6 @@ run_serve_tls_driver_mode(void)
 static int
 run_serve_tls_ws_driver_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        return -1;
-    }
-
     axl_net_auto_init(SIZE_MAX, 10);
     if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
@@ -3002,11 +2998,6 @@ on_ws_pendtx(
 static int
 run_serve_tls_ws_close_pendtx_driver_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        return -1;
-    }
-
     axl_net_auto_init(SIZE_MAX, 10);
     if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
@@ -3079,11 +3070,6 @@ on_get_srv2(AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
 static int
 run_serve_hazard_driver_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        return -1;
-    }
-
     axl_net_auto_init(SIZE_MAX, 10);
     if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
@@ -3291,12 +3277,6 @@ tls_coexist_sink(const char *bytes, size_t len, void *user)
 static int
 run_serve_tls_shell_coexist_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        axl_printf("NO_TLS\n");
-        return -1;
-    }
-
     axl_net_auto_init(SIZE_MAX, 10);
     if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
@@ -4047,10 +4027,6 @@ run_serve_davfs_common(bool tls)
     void   *cert = NULL, *key = NULL;
     size_t  cert_len = 0, key_len = 0;
     if (tls) {
-        if (!axl_tls_available()) {
-            axl_printf("ERROR: TLS not available\n");
-            return -1;
-        }
         if (axl_tls_init() != AXL_OK) {
             axl_printf("ERROR: TLS init failed\n");
             return -1;
@@ -4153,10 +4129,6 @@ run_serve_davfs_tls_mode(void)
 static int
 run_serve_multi_tls_mode(void)
 {
-    if (!axl_tls_available()) {
-        axl_printf("ERROR: TLS not available\n");
-        return -1;
-    }
     axl_net_auto_init(SIZE_MAX, 10);
     if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
@@ -6048,8 +6020,8 @@ run_http_async_mode(const char *method, const char *url, const char *body)
 
     bool https = axl_strncmp(url, "https://", 8) == 0;
     if (https) {
-        if (!axl_tls_available() || axl_tls_init() != AXL_OK) {
-            axl_printf("ERROR: TLS not available\n");
+        if (axl_tls_init() != AXL_OK) {
+            axl_printf("ERROR: TLS init failed\n");
             return 1;
         }
     }
@@ -6173,8 +6145,8 @@ run_get_size_mode(const char *url)
     axl_net_auto_init(SIZE_MAX, 10);
 
     if (axl_strncmp(url, "https://", 8) == 0) {
-        if (!axl_tls_available() || axl_tls_init() != AXL_OK) {
-            axl_printf("ERROR: TLS not available\n");
+        if (axl_tls_init() != AXL_OK) {
+            axl_printf("ERROR: TLS init failed\n");
             return 1;
         }
     }
@@ -8699,6 +8671,7 @@ test_net_main(
     // Network tests
     //
     axl_printf("\n--- Network ---\n");
+    test_tls_available();
     test_net_available();
     test_tcp_echo();
     test_tcp_recv_async_rearm();

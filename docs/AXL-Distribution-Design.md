@@ -28,15 +28,22 @@ because each was internally consistent).
 The whole design serves one sentence, in three flavours:
 
 ```sh
-sudo dnf install ./axl-sdk.rpm        # or: apt install ./axl-sdk.deb
-axl-cc hello.c                        # → hello.efi
+curl -fsSLO .../releases/latest/download/install.sh
+sh install.sh --toolchain x64
+axl-cc hello.c                        # → hello.efi   (no root, any distro)
 ```
 
 ```sh
-tar xf axl-sdk-3.1.0-linux-x86_64.tar.gz -C ~/opt
-export PATH=~/opt/axl-sdk-3.1.0/bin:$PATH
-axl-cc hello.c                        # → hello.efi   (no root, any distro)
+tar xf axl-sdk-linux-4.4.0-x86_64.tar.gz -C ~/opt
+export PATH=~/opt/axl-sdk-4.4.0/bin:$PATH
+axl-cc hello.c                        # → hello.efi   (no installer at all)
 ```
+
+> **The `.deb`/`.rpm` flavour that stood here first is GONE (D2, §17).** The
+> packages retired once `install.sh` proved out; §5.1's artifact matrix, §12.6's
+> weak-dependency argument and everything else below that discusses them is the
+> RECORD of why they existed and why they stopped, not a description of what
+> ships. The published asset set is §14.1a's six.
 
 ```cmake
 # CMake consumer — plain, idiomatic CMake
@@ -727,7 +734,7 @@ build-side SDK), and a tarball serves them with no package metadata, no
 dependency graph and no root. Retiring the packages removed a duplicate
 install path; it was not a reason to strand that audience.
 
-`test-pkg-deps-minimal.sh` (debian:stable-slim, no toolchain) is the gate for
+`test-host-deps-minimal.sh` (debian:stable-slim, no toolchain) is the gate for
 this. The release smoke test **cannot** be: it runs on a runner that already
 ships gcc, g++ and binutils, which is exactly the blindness that let a missing
 `g++` dependency ship.
@@ -852,4 +859,1181 @@ commands consumers have wired into build systems; breaking them buys nothing.
 Per §3 of the Build-System doc, `axl-cc` is the consumer driver and is
 explicitly outside the CMake port — the dispatcher is its sibling and sits
 outside the port for the same reason.
+
+
+## 14. Release assets — naming, contents, and the lists that drift
+
+Measured against **v4.4.0**, by downloading all six assets and listing them.
+Everything below is what is in the files, not what the names suggest.
+
+| asset | size | payload | runs on |
+|---|---|---|---|
+| `axl-sdk.deb` / `axl-sdk.rpm` | 13.7 / 13.8 MB | 315 files into `/usr` — 182 headers, 27 libs, 9 `libexec/axl` scripts, 5 `bin`, 75 doc | host |
+| `axl-sdk-4.4.0-linux-x86_64.tar.gz` | 13.5 MB | the same tree under a versioned root `axl-sdk-4.4.0/` | host |
+| `axl-sdk-host-tools.tar.gz` | 0.36 MB | 13 files under `scripts/` | host |
+| `axl-sdk-tools-{x64,aa64}.tar.gz` | 2.6 MB each | **38 `.efi`** + 6 third-party `drivers/` + `pci-ids.json5` + licenses | **target** |
+| `SHA256SUMS` | — | pins the six above; does not list itself | — |
+
+### 14.1 The naming rule: name by where the payload RUNS
+
+Four assets begin `axl-sdk-`, and **two of them contain no SDK**.
+`axl-sdk-tools-<arch>` is 38 UEFI binaries that execute on the machine under
+test; `axl-sdk-host-tools` is eight host scripts. The prefix that is supposed
+to identify the product is instead the one thing every asset shares, so it
+carries no information, while the distinction that actually matters — host
+versus target — is nowhere in the name.
+
+**Decision: name by execution target, and version every asset.**
+
+(The concrete list is below, after the versioning question is settled.)
+
+`axl-uefi-tools` is the load-bearing rename: it is the only asset whose
+contents do not run on the machine that downloaded them, and the old name said
+the opposite.
+
+**Versions in filenames: RETRACTED.** An earlier draft of this section wanted
+one in every asset name, on the grounds that a downloaded `axl-sdk.deb` is
+anonymous. Reading `release.yml` says why it is anonymous, and the reason is
+load-bearing:
+
+> "Drop the version out of filenames so the GitHub
+> `/releases/latest/download/<file>` redirect produces a stable URL across
+> releases."
+
+That redirect requires an exact, unchanging asset name, and **nine documented
+install commands depend on it** — six in `README.md`, two in
+`getting-started.rst`, one more for `SHA256SUMS`. Versioning the names would
+break every one of them with nothing to replace them, because no `latest` URL
+can exist for a name that changes each release. The version is also not
+actually lost: `dpkg -l` / `rpm -qi` carry it, and both tarballs ship a
+`VERSION` file. Meanwhile the consumer that pins a specific release
+(`install-axl-sdk.sh`) uses the **versioned tag** URL
+(`releases/download/v<ver>/<asset>`), so it never needed the filename to say
+so.
+
+**The real defect is the one asset that already breaks the convention.**
+`axl-sdk-<ver>-linux-x86_64.tar.gz` carries its version, therefore has no
+stable URL, therefore **cannot be documented as a `latest` download — and is
+not mentioned in `README.md` at all.** v4.4.0's headline artifact, the one that
+cut a pinned version from 7.1 GB of source checkouts to 42 MB, is absent from
+the install instructions because its own name locked it out.
+
+Fix it the same way the layout already works: name it
+`axl-sdk-linux-x86_64.tar.gz` and let the version live where it already lives
+— in the `axl-sdk-<ver>/` directory the archive extracts to, which §12.2's
+versioned-root layout and `axl prune` both key on. The filename gets a stable
+URL; the payload keeps the version.
+
+**How other projects resolve the same tension.** A first survey here sampled
+ripgrep, bat, gh and Neovim and concluded that stable names are a legitimate
+choice. That was true but badly weighted: two of the four are tarball-first, so
+the sample under-represented the case that is actually ours. Re-run against
+**GitHub projects that ship `.deb`/`.rpm` from their releases** (live asset
+lists, 2026-09-01):
+
+| project | packages | versioned | example |
+|---|---|---|---|
+| goreleaser | 14 | 14 | `goreleaser-2.18.0-1.aarch64.rpm` |
+| cosign | 12 | 12 | `cosign-3.1.3-1.aarch64.rpm` |
+| syft | 10 | 10 | `syft_1.51.1_linux_amd64.deb` |
+| caddy | 8 | 8 | `caddy_2.11.4_linux_amd64.deb` |
+| dive | 6 | 6 | `dive_0.13.1_linux_amd64.deb` |
+| pandoc | 2 | 2 | `pandoc-3.11-1-amd64.deb` |
+| **k9s** | 10 | **0** | `k9s_linux_amd64.deb` |
+
+**Six of seven version the filename.** The convention is near-universal among
+our actual peers, not merely a repo-tooling artifact — and the earlier claim
+that the tag namespace makes it unnecessary explains why it is *possible* to
+skip, not why almost nobody does.
+
+What the versioned six give up, and how they buy it back, varies: **caddy**
+runs an apt/dnf repo; **syft** publishes a stable `install.sh` (verified live)
+so the one-liner survives as `curl … | sh`; the rest expect the reader to
+substitute a version. **k9s** is the one that keeps a raw stable URL, and it
+does work — `releases/latest/download/k9s_linux_amd64.deb` returns 200 — so the
+status quo is defensible, just unusual.
+
+**The trade, stated plainly.** Versioned names cost us nine documented
+one-liners; they buy a file that says what it is in `~/Downloads`, two versions
+that can coexist, and the shape every `.deb` user expects. Two mechanisms make
+the cost small, both borrowable and neither large:
+
+```sh
+# kubectl's: a stable one-line asset naming the current version.
+V=$(curl -fsSL .../releases/latest/download/VERSION)
+curl -LO ".../releases/download/v$V/axl-sdk_${V}-1_amd64.deb"
+
+# syft's: a stable installer that resolves and fetches. One line again.
+curl -sSfL .../releases/latest/download/install.sh | sh
+```
+
+**Recommendation: version the `.deb`/`.rpm`, keep stable names for the
+tarballs, and publish a `VERSION` asset.** The packages are where the
+convention is strongest and where a self-identifying filename actually helps a
+human. The tarballs are fetched by scripts that already pin a versioned tag URL
+(`install-axl-sdk.sh`, `test-sed-corpus.sh`), so their names buy nothing by
+carrying a version — and stable names keep the `latest` convenience for the
+one audience that types these by hand. That also leaves
+`axl-sdk-linux-x86_64.tar.gz` documentable, which is the defect that started
+this.
+
+### 14.1a The settled scheme
+
+`install.sh` (§17) changes the constraint that drove every earlier draft of
+this section. Once the installer is the front door, **only two assets need a
+stable name** — `install.sh` itself and the `VERSION` it resolves against.
+Everything else is fetched by a script that already knows the version and can
+use the versioned tag URL. The nine hand-typed `latest/download` commands that
+forced stable names are the thing being replaced.
+
+With that constraint gone, versioned filenames win uncontested: a download that
+says what it is, two versions that coexist, and the convention six of seven
+peers follow.
+
+```
+install.sh                               stable   the front door
+VERSION                                  stable   one line
+SHA256SUMS                               stable
+axl-sdk-linux-<ver>-x86_64.tar.gz        host binaries + headers + libs
+axl-sdk-host-tools-<ver>.tar.gz          scripts only
+axl-sdk-uefi-tools-<ver>-<arch>.tar.gz   target firmware binaries
+```
+
+Three things about that shape are deliberate:
+
+**One format string builds all of them.**
+`axl-sdk-${component}-${ver}${arch:+-$arch}.tar.gz` — no special case for the
+base tarball. `install.sh` constructs these names, `release.yml` emits them and
+`SHA256SUMS` lists them, so a single expression in three places beats a
+special case in each. The cost, recorded rather than hidden: it splits
+`linux-x86_64`, which is a recognisable platform token elsewhere
+(`gh_2.98.0_linux_amd64`). Uniformity wins because `uefi-tools` has no OS
+component, so there is no platform token consistent across the family to
+preserve.
+
+**`<arch>` means the HOST in one name and the TARGET FIRMWARE in the others.**
+`x86_64` on the SDK tarball is the machine that runs `axl-cc`; `x64`/`aa64` on
+the uefi-tools tarballs are the firmware the `.efi` files boot on. They now sit
+in the same field position, so this is written down: `release.yml` already
+carries a comment defending the boundary, and it would be easy to "fix"
+wrongly later.
+
+**host-tools carries no `<arch>` because it has none.** Its payload is shell
+and Python — verified, zero compiled artifacts. An arch field there would
+either be a lie or force two byte-identical uploads.
+
+The SDK tarball keeps `x86_64` for the opposite reason: `bin/pe-set-debug` is
+an `ELF 64-bit x86-64` binary, so the archive genuinely is host-specific, and
+dropping the label would leave no name for an aarch64-Linux build.
+
+### 14.1b The toolchain is not one of these, and should not be
+
+The cross toolchain ships as its own release — tag
+`toolchain-x86_64-elf-<ver>`, one 55.5 MB `x86_64-elf-gcc-<ver>.tar.xz` — and
+the AArch64 one is not ours at all: `install-toolchain.sh` fetches it from
+`developer.arm.com`. Three reasons that stays true:
+
+- **Cadence.** 18 SDK releases against 4 toolchain releases. Bundling
+  republishes 55 MB on every patch release for a payload that changed 4 times.
+- **Size.** ~739 MB installed per generation against 42 MB for the SDK.
+- **Licensing.** Already recorded: bundling ARM's tarball "would mean owning
+  the toolchain's release cycle and license redistribution."
+
+Its asset name stays as it is. `x86_64-elf-gcc-<ver>.tar.xz` is self-describing,
+it is a GCC build rather than an AXL artifact, and it sits on its own tag so it
+never competes for sort order with the SDK assets.
+
+**One external single point of failure is worth naming**: the AArch64
+toolchain URL is ARM's. The pinned SHA256 protects integrity, not
+availability — if ARM reorganises that path, `axl-install-toolchain aa64`
+breaks and nothing on our side fixes it short of re-hosting.
+
+### 14.1c Two of three tarballs are tarbombs
+
+Measured on the v4.4.0 assets — top-level entries after extraction:
+
+| tarball | top-level entries | |
+|---|---|---|
+| `axl-sdk-4.4.0-linux-x86_64.tar.gz` | **1** (`axl-sdk-4.4.0/`) | correct |
+| `axl-sdk-host-tools.tar.gz` | **6** | scatters |
+| `axl-sdk-tools-x64.tar.gz` | **43** | scatters |
+
+The SDK tarball, being newest, got it right. The other two extract their
+contents straight into the working directory, which is why the consumer's
+README has to say `mkdir -p ~/axl-sdk-host-tools && tar xf … -C` — the caller
+creates the directory because the archive will not.
+
+Each should extract to a single versioned directory matching its own name:
+`axl-sdk-host-tools-<ver>/`, `axl-sdk-uefi-tools-<ver>-<arch>/`. That makes an
+extracted tree self-identifying and lets two versions coexist, the same way
+`axl-sdk-<ver>/` already does — which is what §12.2's versioned roots and
+`axl prune` are built on.
+
+Tarballs create no symlinks. `<root>/axl-sdk -> axl-sdk-<ver>` is written by
+`install.sh`, which is the only thing that knows which version should be
+current.
+
+### 14.2 `axl-host-tools` — keep it, but fix what is in it
+
+Two defects, both verified against the tarball:
+
+- **Four files no host tool uses.** `pe-set-debug.c` (C *source*),
+  `elf_x86_64_efi.lds`, `elf_aarch64_efi.lds`, `uefi-manifest.json5`. Grepping
+  the bundle's own scripts for each returns **zero references**. They are SDK
+  build internals — linker scripts for `axl-cc`, input to the header generator
+  — shipped in a bundle that contains no compiler.
+- **No `bin/axl`.** Eight of its scripts are the same files the SDK tarball
+  installs to `libexec/axl/`; the SDK tarball additionally carries
+  `axl-prune.sh` and the dispatcher. So the one channel whose users *cannot*
+  reach `axl` is the channel whose users are therefore forced to hardcode
+  `~/axl-sdk-host-tools/scripts/...` — which is exactly what §13 exists to
+  stop, and exactly what the flagship consumer still does in 28 places.
+
+**Keep the asset.** 0.36 MB against 13.5 MB is a 37x difference, and a CI job
+that only needs `run-qemu` should not pull 182 headers to get it. But ship
+`bin/axl` + `axl-prune.sh` and drop the four build inputs, so the bundle is a
+coherent "host side, no compiler" set rather than a subset plus debris.
+
+### 14.3 The tool list has four owners, and two of them have drifted
+
+The set of shipped UEFI tools is stated in four places. Two are derived or
+gated and are correct for free; two are hand-maintained and are wrong:
+
+| owner | documents | status |
+|---|---|---|
+| `release.yml` sanity list | derived from `make -s print-TOOL_NAMES` | correct |
+| `devkit.conf` | gated by `make check-devkit-conf` | correct |
+| **`README.md` tool table** | **21 of 38** | **17 missing** |
+| **`axl-uefi-tools` `README.txt`** | **13 of 38** | **25 missing** |
+
+Missing from `README.md`, of which fourteen are plain `TOOL_NAMES` tools:
+`ata`, `axbench`, `fwtool`, `i2c`, `kbtune`, `lsacpi`, `mkfixture`, `netload`,
+`nvme`, `rndisfix`, `scsi`, `smart`, `tar`, `timetest`. (The other three —
+`crashtest`, `fbcon`, `kbtune-drv` — are a fault fixture, a console app and a
+driver, and their omission is defensible.) `lsacpi` shipped in 4.3.3 and is
+absent from both prose lists.
+
+**`README.md` is the releases-site README.** The `aximcode/axl-sdk-releases`
+README is byte-identical to this repo's, so it is published from here and one
+fix covers both — and one omission is visible in both.
+
+**Decision: derive both.** `devkit.conf` already carries a `desc:` line per
+tool and `check-devkit-conf` already requires one, so the description text has
+an owner with a gate on it. Generate the `README.md` table and the tarball
+`README.txt` from `TOOL_NAMES` + those descriptions. This is the same fix
+v4.4.0 applied to `release.yml`'s list, applied to the two lists that were
+missed; the pattern is established, not new.
+
+**DONE 2026-09-01, and the two halves went opposite ways — on purpose.**
+Deriving assumed both lists want the same content, and they do not:
+
+- **`README.md`'s table is NOT derived.** Its rows are hand-written prose up
+  to ~320 characters describing real flags and behaviour; `devkit.conf`'s
+  descriptions are ~40-character labels for an on-screen menu. Generating from
+  those would have replaced documentation with labels. What is checkable there
+  is COMPLETENESS, so `make check-tool-docs` checks that instead — a shipped
+  tool with no row, a row for a tool that no longer ships, and a duplicate row.
+  Same goal, better mechanism.
+- **The tarball `README.txt` IS derived**, by
+  `scripts/make-uefi-tools-readme.py`, because its entries *are* flat labels —
+  precisely what `devkit.conf` holds. It had drifted furthest (13 of 38) and,
+  being an inline heredoc in `release.yml`, could not be looked at without
+  cutting a release. `check-tool-docs` also asserts the workflow still
+  delegates to the generator, so the heredoc cannot grow back.
+
+One thing that move had to be careful about: those 92 lines carry mbedTLS's
+Apache-2.0 election, EDK2's BSD-2-Clause-Patent notice, iPXE's
+GPL-2.0-or-later notice and a **GPL-2.0 §3(b) written offer**. They are
+obligations, so `test-uefi-tools-readme.sh` asserts each survives
+regeneration; a refactor that silently drops one is a licence violation, not
+a typo.
+
+### 14.4 Sequencing — renames break consumers that pin filenames
+
+Consumers pin asset names literally. axl-utils' `.axl-sdk-checksums` names
+`axl-sdk-host-tools.tar.gz` and `axl-sdk-tools-x64.tar.gz`, and its
+`test/test-sed-corpus.sh` builds a download URL from that string. A rename
+breaks them at their next pin bump.
+
+So the renames, the `axl-host-tools` content fix, and the consumer's migration
+onto `axl <cmd>` want to be **one coordinated release**, not three. Shipping
+the rename separately makes a consumer bump twice and take the breakage alone;
+shipping it with the migration means they change the pin once and land on both.
+
+
+## 15. What the public snapshot publishes — and the gate it needs
+
+`aximcode/axl-sdk-releases` is public; this repo is private. Each release
+pushes a squashed **source snapshot** there (`Release vX.Y.Z — source
+snapshot`), so the released source is public by design while development
+history is not. That model is deliberate and is not in question here.
+
+**What is in question is the selection rule.** `release.yml`'s publish step is:
+
+```sh
+git archive --format=tar HEAD | tar -xC "$SRC"
+rm -rf "$SRC/.github"
+```
+
+So the rule is **everything tracked, minus `.github/`**. There is exactly one
+exclusion, and it exists for a mechanical reason (a fine-grained PAT without
+`workflow` scope cannot push workflow files), not an editorial one.
+
+That rule is why `test/fixtures/` is correctly absent — it is gitignored, so
+`git archive` never sees it, which is the same mechanism that keeps a captured
+MSDM's Windows product key out of a public repo. It is also why **every tracked
+document is public**, including ones written as internal working notes.
+
+### 15.1 Two categories that should not be publishing
+
+**Personal infrastructure.** The house rule is that home-server hostnames, LAN
+IPs and personal machine names never appear in committed code or docs — every
+repo, every subtree. Two tracked files break it and are public today:
+
+- `docs/HW-Testing-Workflow.md` — names the dev box repeatedly and diagrams the
+  reverse-tunnel topology between it, the tunnel host and the laptop, including
+  the port and the `~/.ssh/config` block.
+- `docs/AXL-Session-Handoff-2026-08-28.md` — one line identifying the dev box
+  and its virtualization.
+
+Two other pattern matches were checked and are **not** violations: an
+RFC1918 literal inside an `axl_ipv4_parse_cidr()` test case, and the same
+address range in a demo SVG. Example addresses are fine; naming the box is not.
+
+> This section deliberately describes those files without reproducing the
+> strings. A doc that explains the rule by quoting the thing the rule forbids
+> publishes it again on the next snapshot.
+
+**Internal working notes.** 15 `AXL-Session-Handoff-*.md` and 37 files under
+`docs/superpowers/{plans,specs}` are tracked, therefore public. They are
+working documents: dead ends, design arguments settled and reversed, and
+consumer specifics. Counting published docs, `delldiags` appears in 14, `Dell`
+in 16, `iDRAC` in 10, and a named customer server model in 2.
+
+Nobody decided to publish those; they are public because the selection rule has
+no opinion. **The decision to make is which doc CLASSES are public**, roughly:
+
+| class | example | publish? |
+|---|---|---|
+| API / guide | `AXL-Coding-Style.md`, `AXL-Driver-Authoring-Guide.md` | yes — consumers need them |
+| design records | this file, `AXL-Design.md` | probably — but see below |
+| session handoffs | `AXL-Session-Handoff-*.md` | no — working notes |
+| plans / specs | `docs/superpowers/**` | no — working notes |
+| infra runbooks | `HW-Testing-Workflow.md` | no — names personal infrastructure |
+
+If design records stay public, they inherit the consumer-naming question: the
+rule barring downstream consumer names covers code and comments, and §14.4 of
+this very document names one. That is defensible when the document is
+internal and needs revisiting if it is not — which is the point of deciding by
+class rather than file by file.
+
+### 15.2 The fix: an exclusion list is not enough on its own
+
+Adding paths beside `rm -rf "$SRC/.github"` is one line each and is the right
+mechanism — the machinery already exists.
+
+**But an exclusion list is exactly the shape that has drifted three times in
+this tree** (§14.3: the devkit conf, the release sanity list, two tool
+READMEs). A list with no check is a list that is correct until someone adds a
+file, and here the failure lands in a public repo and cannot be recalled.
+
+**So the exclusion list gets a gate, and the gate runs on the ASSEMBLED
+snapshot, not on the source tree.** After `$SRC` is built and pruned, grep it
+for the forbidden patterns — the dev box and tunnel hostnames, RFC1918 and
+CGNAT literals outside test and asset files, the admin account name — and fail
+the release on a hit. Checking `$SRC` rather than the repo is what makes it a
+real gate: it asserts the property that actually matters ("what we are about to
+push is clean"), not a proxy for it.
+
+Two properties it must have, both learned the hard way here:
+
+- **It must be shown to fail.** A gate that has never caught anything is a gate
+  nobody has proven can see. Add a control that plants a forbidden string in a
+  scratch `$SRC` and asserts the check fires.
+- **It must distinguish "found nothing" from "could not run."** A grep over a
+  path that does not exist and a grep that matched nothing both print nothing.
+  Capture the exit status and assert the snapshot was non-empty first.
+
+### 15.3 Repo-metadata discrepancies
+
+Cheap, and the first one is worth more than it sounds:
+
+- ~~**Neither repo shows a license.**~~ **WRONG — checked 2026-09-02.**
+  `gh api repos/<r>/license` returns **Apache-2.0 for both**. The claim came
+  from GraphQL's `licenseInfo` being null, which is a different field and not
+  what the sidebar reads. The two pieces of evidence offered for it do not
+  hold either: the canonical text *also* opens with a blank line, and the
+  19-byte difference is entirely the appendix's
+  `[yyyy] [name of copyright owner]` being filled in — which is what that
+  placeholder is for. `diff` against
+  `https://www.apache.org/licenses/LICENSE-2.0.txt` shows one changed line, and
+  the body through `END OF TERMS AND CONDITIONS` is byte-identical.
+
+  The underlying fix had already been made (commit `c448187`, 2026-04-24, after
+  two clauses had genuinely drifted). Nothing to do. **Use the REST `/license`
+  endpoint to check this, not GraphQL `licenseInfo`.**
+- ~~**Wiki is enabled on the public repo**~~ — **DONE 2026-09-02**,
+  `has_wiki=false` on `axl-sdk-releases`. It was an empty tab on the public
+  face.
+- ~~**This repo has no homepage URL**~~ — **DONE 2026-09-02**, both repos now
+  point at `https://axl.aximcode.com`. Description and all ten topics already
+  matched.
+
+**`AXL_SNAPSHOT_FORBIDDEN` is set** (2026-09-02, 7 patterns). Its value was
+derived from the files D5 excludes — ssh-config identifiers from the infra
+runbook, the tailnet address from the excluded handoff, and the lab IPs and
+service tag redacted from the archived roadmap, which belong in it precisely
+because they are still in the public repo's *history* and must never be
+re-added.
+
+Two things that exercise taught, worth keeping:
+
+- **A candidate that appears in the surviving snapshot is not a secret.** The
+  first extraction produced 9 strings; 4 were common words, one appearing in
+  724 files (`sysinfo`-class noise from grepping prose for `ssh <word>`).
+  Filtering to "appears ONLY in excluded files" is self-validating and left 5.
+- **The gate's own test had planted the real lab IP as its control string**,
+  putting it straight back into a tracked file and undoing the redaction it was
+  testing. Controls must use synthetic values. (Which the gate then proved
+  again from the other side: an earlier draft of THIS bullet quoted the
+  replacement address literally, and the check failed the suite for a private
+  address in prose. A doc explaining the rule by quoting what the rule forbids
+  is the thing §15.1 already warned about.)
+
+
+## 16. Nothing tests the artifacts the way a consumer receives them
+
+Every check we have runs **before publication, on locally built files**:
+
+| check | what it proves | what it cannot |
+|---|---|---|
+| `build-packages.sh` | `rpm2cpio \| cpio` the fresh `.rpm`, run `axl-cc --version`, compile `hello.c` to PE32+ | the package manager never runs |
+| `release.yml` per-artifact smoke tests | each tarball extracts and its commands run | the built file, not the published one |
+| a person, at v4.4.0 | the published SDK tarball downloaded, hash-checked, and compiled a `.efi` | not repeatable, not automatic |
+
+Nothing in the tree fetches `releases/download/...`. The only such URL is a
+link in the release notes.
+
+### 16.1 What that leaves unchecked
+
+- **The package manager never runs.** `rpm2cpio` bypasses `dnf`/`dpkg`
+  entirely, so nothing exercises file conflicts, the `Replaces`/`Obsoletes`
+  that retire the old host-tools package, scriptlets, or the weak QEMU
+  dependency — all of which §12.6 added deliberately, and none of which cpio
+  can see. "The files are in the archive" is a weaker claim than "the package
+  installs."
+- **The published bytes are never verified.** A truncated upload, a missing
+  asset or a `SHA256SUMS` that does not match would be found by a consumer
+  first. That exposure rises the moment §14.1's renames land, because the
+  failure mode becomes "one asset kept its old name" — which every local check
+  passes and no local check can see.
+- **Nothing starts from a clean machine.** The builder already has the cross
+  toolchain under `/opt` and the mbedTLS submodule checked out. A consumer
+  begins with neither and has to get through `axl-install-toolchain` first.
+- **aa64 consumption is never exercised end to end**, only aa64 *production*.
+
+### 16.2 Two jobs, because one cannot do both
+
+**A gate cannot run after publication, and an upload cannot be verified before
+it.** So this is two things, and conflating them gets one of them wrong.
+
+**1. Pre-publish, containerized — the gate.** In clean `debian:stable` and a
+Fedora/RHEL-family image, install the built `.deb`/`.rpm` with the real package
+manager, then assert the consumer's first hour works: `axl --version`,
+`axl-cc hello.c -o hello.efi` produces a PE32+, every `axl <cmd> --version`
+answers, and both tarballs extract and do the same. Catches everything above
+except upload integrity, and can block the release.
+
+**2. Post-publish, small.** Fetch `SHA256SUMS` and every asset from the tag
+URL; verify each hash, and that the asset set is exactly what was meant to
+ship. It cannot gate — the release is already out — but it turns "a consumer
+finds it" into "we find it in minutes", and it is the only check that can see
+a rename that missed one asset.
+
+### 16.2a DONE 2026-09-02 — and job 1 had to be re-aimed
+
+**Job 1 is `test/integration/test-consumer-install.sh`.** §16.2 wrote it as
+"install the built `.deb`/`.rpm` with the real package manager". D2 retired the
+packages, so the gate now `curl`s `install.sh` out of a release directory and
+runs it, which is what README's three commands actually say.
+
+**The two distributions survived the re-aim for a different reason.** Debian
+and Fedora were chosen because one takes `.deb` and the other `.rpm`;
+`install.sh` is distribution-agnostic, so that reason is gone. The replacement
+is better: **Debian's `/bin/sh` is dash and Fedora's is bash**, and
+`install.sh` is `#!/bin/sh`. A bashism there is invisible on one image and
+fatal on the other, and it is the likeliest way that script breaks.
+
+**It found a real defect on its first run, of exactly the class §16.1
+predicted** ("nothing starts from a clean machine"): neither
+`debian:stable-slim` nor `fedora:latest` ships `python3`, and **four shipped
+commands are Python** — `axl rsod-decode`, `axl gdb-syms`,
+`axl extract-fv-shell`, `axl emulate`. `install.sh` never mentioned it, so a
+user following `axl-cc`'s own crash diagnostics to `rsod-decode` got
+`python3: command not found` with nothing pointing at the cause. Fixed by
+`advise_python()`, which detects and advises exactly as `advise_qemu()` does —
+it must not *refuse*, because `axl-cc` needs no interpreter. The test asserts
+both halves: the advice appears, and every command works once it is followed.
+
+A second, smaller find: a mirror that REGENERATES its checksums writes `./name`
+entries, and `install.sh` refused them with "this release publishes none of:
+…" about a directory that plainly held the asset. `sums_line()` now strips the
+prefix.
+
+**Job 2 is `scripts/check-published-release.sh`**, run from `release.yml`
+after publication. It carries **no list of expected asset names** — a list here
+would be a fifth copy of §14.1a's and would go stale exactly when it mattered.
+It cross-checks the release against itself: every name `SHA256SUMS` lists is
+attached, every attached asset is checksummed, every one downloads and matches,
+`VERSION` agrees with the tag, and the two stable `latest/download/` URLs
+resolve. A rename that missed one place is a set difference in whichever
+direction it went. Being version-agnostic, it runs against a release cut
+*before* the rename — verified live against v4.4.0, 6 assets, all hashes good.
+
+`test-published-release-check.sh` injects each failure it exists for over
+`file://` and requires it to be named: a corrupted asset, one listed but not
+downloadable, one attached but unsummed, one summed but unattached, a wrong
+`VERSION`, and no `SHA256SUMS` at all.
+
+### 16.3 What it would not have caught, stated honestly
+
+The host-tools tarball regression that shipped four Python tools with a
+missing import would have been caught by job 1 — but it is *already* caught,
+earlier and cheaper, by running each command in the tarball smoke test.
+Container testing earns its keep on the **install path**: package-manager
+behaviour, a clean machine, and the toolchain bootstrap. It is not a
+replacement for testing artifact contents where they are built, and adding it
+is not a reason to weaken those.
+
+
+## 17. `install.sh` replaces the packages
+
+**Decision: a stable `install.sh` becomes the install path, and the `.deb` and
+`.rpm` retire once it is proven.** Not coexistence — the point is to stop
+maintaining two package layouts, `fpm`, `rpmbuild`, `Replaces`/`Obsoletes`
+metadata and a release job, for benefits a script can provide.
+
+This is what Claude Code, uv and rustup do, and both of the first two install
+to `~/.local/bin` (read from their live installers). The relevant thing is not
+fashion: it is that **we already built the machinery** and the packages are now
+the part that does not fit.
+
+| piece | status |
+|---|---|
+| relocatable, self-contained prefix | §12.3, asserted by `test-sdk-selfcontained.sh` |
+| versioned roots side by side | §12.2, and the tarball extracts to one |
+| `current` symlink | created by `install.sh` since this cycle |
+| `axl prune` — keep current + N | §12.4 |
+| `axl --print-prefix` | a machine interface for "where am I installed" |
+| removal | `rm -rf <prefix>`, already the contract |
+
+### 17.1 What the packages actually did for us
+
+Three things, and only one is hard to replace:
+
+- **Weak dependencies.** §12.6 declares the QEMU/OVMF stack as
+  `Recommends`/weak so `apt`/`dnf` install it by default and let a consumer
+  decline. **A script cannot declare a dependency**; it can only detect and
+  advise. This is the one genuine capability loss, and the honest replacement
+  is: probe for `qemu-system-x86_64` and OVMF at install time and print the
+  distro-appropriate command if absent. `run-qemu.sh` already has the
+  three-tier discovery and the install hints — they exist as strings in
+  `release.yml` today.
+- **`Replaces`/`Obsoletes`.** These retired the standalone host-tools package.
+  That migration is spent; nothing else needs it.
+- **A version in a package database.** `dpkg -l` / `rpm -qi` answered "which
+  version is this". So does `axl --version`, and so does the prefix's own name.
+
+### 17.2 What it must do
+
+**Download it, then run it — the pipe is the fallback, not the headline.**
+
+```sh
+curl -fsSLO https://.../releases/latest/download/install.sh
+sh install.sh --help
+sh install.sh --toolchain x64          # SDK + host tools + the x64 cross toolchain
+sh install.sh --host-tools             # run-qemu and friends, no compiler
+```
+
+Two reasons, and the first is the stronger:
+
+- **The install is options-driven, and the piped form makes options ugly.**
+  `curl … | sh -s -- --host-tools --toolchain aa64` against
+  `sh install.sh --host-tools --toolchain aa64`. Once a script takes flags,
+  piping it stops being the simple option.
+- **It can be read before it is run**, which matters more here than usual:
+  installing a toolchain under `/opt` asks for `sudo`, and a good share of this
+  audience works somewhere that forbids piping a URL into a shell outright.
+
+The piped form keeps working for the zero-option default, because it is the
+same script. It is documented second.
+
+
+1. Resolve the version — from the stable `VERSION` asset (§14.1), or `--version X.Y.Z`.
+2. Download the SDK tarball and verify it against `SHA256SUMS`. **Verifying is
+   not optional**: a piped installer that skips the hash is strictly worse than
+   the package manager it replaces, which checks signatures.
+3. Extract to `<prefix>/axl-sdk-<ver>/`, defaulting to
+   `${XDG_DATA_HOME:-$HOME/.local/share}` and honouring `--prefix`.
+4. Point `<root>/axl-sdk` at it (§12.2) and link the entry points into
+   `${XDG_BIN_HOME:-$HOME/.local/bin}`.
+5. Probe for the QEMU stack; print the install command for the detected distro
+   if it is missing. Never install it silently.
+6. Say whether that bin directory is on `PATH`, and how to add it if not.
+7. Offer the cross toolchain (`axl-install-toolchain`) rather than assuming it.
+
+Upgrade is the same command: a new versioned root beside the old, the symlink
+moves, `axl prune` bounds what accumulates. Removal is `rm -rf` plus the links,
+which `--uninstall` should do so nobody has to know which links exist.
+
+**Symlinking into `~/.local/bin` did not work until this cycle.** All three
+entry points resolved their prefix with `cd -P "$(dirname "$0")"`, which never
+follows a symlink on `$0`, so a link on `PATH` made the prefix resolve to
+`~/.local` and `axl-cc --version` answer `unknown`. Fixed by resolving `$0`
+through `readlink -f` first. An installer of this shape was impossible before
+that, which is why this section could not have been written earlier.
+
+### 17.3 Retiring the packages — the sequence that does not break a consumer
+
+The flagship consumer's `install-axl-sdk.sh` installs the `.deb`/`.rpm` today,
+and it has already absorbed one migration this week (onto the `axl`
+dispatcher). §14.4's lesson applies: do not make it take two breaks in a row
+without the second being ready.
+
+1. Ship `install.sh`; keep publishing the packages. Document the script as the
+   install path. Nothing breaks.
+2. Move the consumer to `install.sh` — for it this is a simplification, because
+   it currently detects deb-vs-rpm families and shells out to `apt`/`dnf` with
+   `sudo`, all of which the script removes.
+3. Drop the packages once nothing installs them. That deletes `build-packages.sh`,
+   the `fpm` and `rpmbuild` dependencies, the `build-packages` release job and
+   both package layouts.
+
+**Step 3 needs one thing step 1 should already do:** detect an
+existing package install (`dpkg -s axl-sdk` / `rpm -q axl-sdk`) and say so,
+because a user who installed the `.deb` and then runs `install.sh` would
+otherwise have two copies with `/usr/bin/axl` winning on `PATH`. Telling them
+to remove the package is a two-line check, and it is the difference between a
+migration and a confusing afternoon.
+
+### 17.4 What this does not solve
+
+- **System-wide, multi-user installs.** `install.sh --prefix /opt/...` works,
+  but nothing makes the tools appear on every user's `PATH`. No one has asked.
+- **Environments that mandate signed packages.** If a consumer's policy
+  requires an `.rpm`, the answer is to keep building one for them specifically,
+  not to keep it for everyone.
+- **`curl | sh` as a trust model.** It is what the ecosystem does, and the
+  hash check in step 2 is what makes it defensible rather than customary.
+
+
+## 18. Prior art for the installer — what exists, and what we copy
+
+§17 decided to write an installer. This section is the survey that should have
+come first: what already exists, why none of it fits, and which specific
+mechanisms to take from the ones that got it right.
+
+### 18.1 There is no off-the-shelf installer that fits
+
+Nine candidates, checked against their live repositories:
+
+| tool | ⭐ | what it is | why not |
+|---|---|---|---|
+| `eget` | 2.1k | installs a prebuilt **binary** from a GitHub release | we are a 42 MB tree — 182 headers, target libs for two arches, a compiler driver, nine host scripts. There is no "the binary" |
+| `ubi` | 591 | same idea, "Universal **Binary** Installer" | same |
+| `godownloader` | 447 | goreleaser's `install.sh` **generator** — the closest fit | **archived, last pushed 2021-07-17.** No maintained successor |
+| `mise` | 33k | dev-tool version manager | right shape, but the **consumer** must adopt it |
+| `asdf` | 25k | the older same model; mise is plugin-compatible | same, and see §18.3 |
+| `aqua` | 1.8k | declarative CLI version manager | same |
+| `proto` | 1.4k | pluggable multi-language version manager | same |
+| SDKMAN! | 6.8k | literally an SDK manager | JVM-centric; a non-JVM SDK in their registry is a stretch |
+| webi | 3k | hosted installer service, per-package scripts | not a library we can vendor, but see §18.2 |
+
+So: writing one is legitimate. **Inventing its structure is not** — the
+generator that would have written it for us is dead, which means the
+ecosystem's answer is "hand-write it, from a known-good template."
+
+### 18.2 The three mechanisms worth taking
+
+**From rustup — the structure, which is load-bearing.** `rustup-init.sh` is
+930 lines and 25 functions and ends with `main "$@" || exit 1`. Nothing
+executes until that last line. That is the guard against a truncated
+`curl | sh`: a dropped connection leaves `sh` a *prefix* of the file, and a
+prefix of a file that only defines functions does nothing.
+
+Our first draft failed this exactly. It was linear, with
+`rm -rf "$PREFIX_ROOT/$DIR"` at top level and the `tar` that refills it on the
+next line — so a cut in between deleted an existing install and did not
+replace it. Fixed by restructuring: 16 functions, zero top-level side effects,
+`main "$@"` last.
+
+Also from rustup: `need_cmd` (name the missing tool) and `ensure` (never let a
+failed command pass for a completed step).
+
+**From webi — the ordering, and the layout.** webi verifies a checksum before
+touching the destination (`fn_checksum` against `WEBI_CHECKSUM`), and installs
+into versioned directories with a `current` pointer. We arrived at the same
+layout independently, which is worth recording as corroboration rather than
+coincidence: `~/.local/share/axl-sdk-<ver>` plus `<root>/axl-sdk`.
+
+**From the version managers — the idea that this is a solved category, and the
+SHAPE of their verbs.** What was taken is the model, not a dependency: D1a's
+`axl update` / `use <version>` / `list` / `uninstall` / `prune` are mise's verb
+set, with `use` subsuming `install` for mise's reason. The plugin §18.3
+proposed on top of that was built and declined — see the note there. So this
+line reads "we implemented their design in `axl`", NOT "we integrate with
+them", and the difference is the whole of §18.3's outcome.
+
+### 18.3 Version management: we built the manager, and declined the plugin
+
+The install/upgrade/switch/clean-up cycle is exactly what mise, asdf, aqua and
+proto exist for, and rebuilding it would be the reinvention this survey was
+meant to prevent. But they cannot be *required*: a consumer who does not use
+mise still has to install AXL.
+
+The cheap correct move is an **asdf-compatible plugin** — four small scripts
+(`list-all`, `download`, `install`, `latest-stable`) — which mise consumes too.
+Consumers who already run a version manager then get `mise use axl-sdk@4.4.0`
+and per-project pinning for free, and everyone else uses `install.sh`.
+
+> **BUILT, THEN DECLINED — 2026-09-02. Do not re-propose without new
+> information.** The plugin was written, tested (18/18) and reverted the same
+> day. Three reasons, and the middle one is the one this section missed:
+>
+> - **We already have the version manager.** D1a put `update`, `use <version>`,
+>   `list`, `uninstall` and `prune` in `axl` — which is what "borrow from asdf"
+>   was supposed to mean (§18.2 takes its *plugin contract* as a shape, not as
+>   a dependency). The plugin is a SECOND manager over the same tree.
+> - **Our own verbs cannot manage what it installs, and this was measured.**
+>   In an asdf-managed prefix: `axl list` declines ("not placed by
+>   install.sh"); `axl update` would write a versioned root INTO asdf's own
+>   installs directory, so two managers own one tree; `axl prune` correctly
+>   declines the SDK roots but still offers to delete the shared `/opt`
+>   toolchains. Every one of those is a support conversation we would own.
+> - **It cannot be used at all without a new repo.** asdf resolves a plugin
+>   from a git root, so `packaging/asdf/` needed mirroring to
+>   `aximcode/asdf-axl-sdk` — permanent maintenance surface for a consumer
+>   nobody has named.
+>
+> What would change the answer: a real consumer who runs mise and asks for it.
+> Then the first bullet still stands, so the work is not "ship the plugin" but
+> "make `axl` detect an externally-managed prefix and decline cleanly" first.
+>
+> One real bug came out of it and was kept: `axl prune` told a non-versioned
+> prefix "a distro package owns its files; upgrade with apt/dnf", which has
+> been wrong since D2 retired the packages.
+
+**`axl prune` still does not go away, and no version manager would replace
+it.** Those tools manage per-user *tool* versions. Our cross toolchain is a
+shared `/opt` resource — 739 MB per generation, used by every SDK version at
+once. `axl prune` prunes both axes; a version manager models neither the
+sharing nor the second axis.
+
+### 18.4 Why `install.sh` does not absorb `axl prune`
+
+`axl prune` is a **command in the SDK**: discoverable from `axl --help`,
+runnable at any time, with `--dry-run` and `--keep N`. Folding its policy into
+the installer would make it reachable only at install time and only with
+whatever the installer hardcoded. So `install.sh --prune` *offers* it —
+showing the dry run, and running it only with `--yes` — and the command stays
+where a user can find it later.
+
+### 18.5 The property that has to stay true
+
+Structural safety is invisible: nothing about reading a correct script tells
+you it is still correct after an edit. `test-installer-truncation.sh` feeds
+`sh` **every prefix** of `install.sh` with a populated install present, and
+requires the tree to be byte-identical afterwards at every one — 264 points
+today.
+
+It carries two controls, because a test that has never failed has not been
+shown to see anything. A synthetic linear installer with the same destructive
+step at top level *is* destroyed by truncation, proving the harness detects
+that shape; and a sabotage that inserts one top-level `rm -rf` into the real
+`install.sh` is caught and named.
+
+### 18.6 CPack and the Qt Installer Framework, evaluated
+
+Both are real installer frameworks and both were tried against this problem
+rather than dismissed from memory.
+
+**CPack (CMake).** Available here, works, and generates
+`STGZ / DEB / RPM / TGZ / IFW / NSIS / …`. `STGZ` is the self-extracting shell
+archive — the makeself equivalent, built in. Generated one and read it:
+
+```
+Usage: axl-sdk-4.4.0-Linux.sh [options]
+  --help  --version  --prefix=dir  --include-subdir  --exclude-subdir  --skip-license
+```
+
+Grepping that script for `uninstall`, `upgrade`, `sha256`, `checksum` and
+`verify` returns **zero** for all five. CPack STGZ is a *packer*: it extracts a
+tree at a prefix, optionally into a versioned subdirectory, and shows a
+licence. It has no upgrade path, no uninstall, no integrity check, no `current`
+pointer, no dependency advice. Against `install.sh` it is strictly less.
+
+It is also not reachable from here. CPack packages what **CMake installs**, and
+this project has no top-level `CMakeLists.txt`, no `cmake/` directory, and no
+tracked `.cmake` outside vendored gcc sources. Our install layout is 999 lines
+of `scripts/install.sh` — 15 `install` invocations plus arch selection, the C++
+variant, the toolchain manifest and symlink management. Expressing that in
+CMake is the CMake port, which has zero implementation.
+
+**Verdict: no.** It would replace `fpm` for `.deb`/`.rpm`, which §17 is
+retiring anyway. *If* the CMake port ever lands, CPack becomes the natural way
+to emit the tarballs and should replace `make-sdk-tarball.sh` then — worth
+recording, not worth doing first.
+
+**Qt Installer Framework.** None of its tooling (`binarycreator`, `repogen`,
+`installerbase`, `archivegen`) is installed, and it is **not in the distro
+repositories** — adopting it means vendoring or fetching Qt's own binaries, a
+heavyweight new CI dependency. It is GUI-first by design; headless operation
+exists but is the secondary path, and our users install on headless servers,
+WSL, containers and CI runners. Licensing is Qt's LGPL/GPL-plus-commercial.
+
+**Verdict: no** — but it contributes the best single idea in this survey.
+
+**The MaintenanceTool pattern is worth stealing.** QtIFW installs an updater
+*into the installation*: a tool that lives beside the product and knows how to
+update, repair or remove it, so the user never needs the original installer
+again. Ours currently requires re-fetching `install.sh` to uninstall, which is
+backwards — the install knows its own version, prefix and links; the script on
+a web server knows none of it.
+
+So: **ship `install.sh` into the prefix** (`libexec/axl/`) and expose it as
+`axl self-update` and `axl uninstall`. Both then become discoverable from
+`axl --help` alongside `axl prune`, which already handles the versioned-root
+half of maintenance. That costs a staging line and two dispatcher verbs, and it
+is the same conclusion §18.3 reached from the version managers: the
+maintenance surface belongs *in* the SDK, not in the thing that fetched it.
+
+**Three surveys, one answer.** Binary installers, installer generators, version
+managers, CPack and QtIFW have now all been checked. None fits a 42 MB tree
+with a shared `/opt` toolchain and headless enterprise consumers. Every one of
+them contributed a mechanism worth copying — rustup's structure, webi's
+verify-before-touch, QtIFW's in-install maintenance tool, asdf's plugin
+contract. That pattern is the finding: this class of tool is assembled from
+known-good mechanisms rather than adopted whole.
+
+### 18.7 Zero Install (0install.net) — the best candidate, blocked by a different problem
+
+Raised because Windows users may matter one day, and 0install is the only
+thing surveyed with a real cross-platform answer.
+
+**It is alive and serious.** 2.29.3 released 2026-08-06, pushes within weeks;
+an OCaml core (575 stars, ~20 years old) and a .NET implementation that is the
+Windows one. Not a dormant project.
+
+**What it would genuinely give us**, and this is the strongest list any
+candidate has produced:
+
+- **One feed serving Linux, Windows and macOS.** Exactly the future being asked
+  about.
+- **Content-addressed identity.** An implementation is named by its digest
+  (`sha256new=RB425FJGG2VCK…`), so the hash *is* the identity rather than a
+  `SHA256SUMS` side file that can drift from the assets it describes. That is
+  strictly stronger than what we do.
+- **Dependency solving.** The cross toolchain could be its own feed that
+  `axl-sdk` depends on, instead of the SDK shelling out to
+  `axl-install-toolchain`. Architecturally that is cleaner than what we have:
+  a declared dependency rather than an imperative second step.
+- **No root, versions side by side, a shared cache**, and GPG-signed feeds.
+- **`0bootstrap`** produces a self-contained installer, so users do not need
+  0install first — the obvious chicken-and-egg objection is already answered.
+
+**What it costs.** A second tool between the user and the SDK; niche adoption
+(575 stars after two decades — our firmware audience will not have it, while
+everyone has `curl`); not in this box's distro repositories; and a third
+channel to maintain beside the tarballs.
+
+**But none of that is what blocks it.** The blocker is that **our host side is
+POSIX shell**:
+
+```
+11,774 lines of bash and Python across the host tools
+  axl-cc alone            1,940 lines of bash
+  axl, axl-c++            bash
+  run-qemu, profile-qemu, axl-prune, axl-common   bash
+  rsod-decode, gdb-syms, extract-fv-shell, axl-emulate   Python
+  pe-set-debug            an ELF x86-64 binary
+```
+
+0install can *deliver* that to a Windows machine. Nothing there would run.
+Windows support today means WSL — which already works, unchanged, and is how
+the flagship consumer's own laptop uses the SDK.
+
+**So the sequencing matters more than the choice.** "What runs on Windows?" is
+unanswered, and it is a much larger question than packaging: rewrite `axl-cc`
+in something portable, ship a Windows `pe-set-debug`, decide whether the QEMU
+harness is in scope at all. Picking a distribution mechanism now would be
+answering the second question while the first is open — and the answer to the
+first may make the second obvious (a native Windows port that produces `.exe`
+tools has different options than a pile of bash).
+
+**Verdict: not now, and revisit deliberately if Windows becomes real** — at
+which point 0install is the first thing to re-examine, not the last. Two ideas
+are worth carrying regardless: the digest *as* identity rather than beside it,
+and the toolchain as a declared dependency rather than an imperative step.
+
+
+## 19. Phasing for §14–§18
+
+§10's P1–P8 predate this work and are unrelated to it. These are the phases for
+the installer, the asset reshape and the verification that proves them.
+
+**D1 — `axl self-update` / `axl uninstall`. SHIPPED 2026-09-01.** Stage `install.sh` into
+`libexec/axl/` and expose two dispatcher verbs (§18.6). **First, because it
+changes what D2 has to publish**, and because it is the piece that makes the
+install maintain itself rather than depending on a script the user has to
+re-fetch. Staged at mode 0644 so `axl`'s command list — executables in
+`libexec/axl/` — does not offer it as a third way to reach the same thing; the
+`axl_version.py` precedent. Small, self-contained, testable without a release.
+
+**D1a — the five maintenance verbs. SHIPPED 2026-09-01.** `update`, `use <version>`, `list`,
+`uninstall`, `prune`. Settled after asking what `install` and `update` each
+mean:
+
+| verb | meaning |
+|---|---|
+| `axl update` | move to the newest release. **Refuses `--version`** — that would be a downgrade wearing the word update |
+| `axl use <ver>` | make that version current. Instant and offline when it is already on disk; downloads only if not |
+| `axl list` | installed versions, `*` marking current |
+| `axl uninstall` | remove a version, its links and its `current` marker |
+| `axl prune` | bound what accumulates (§12.4) |
+
+**Why `use` rather than a separate `install`:** they would differ only in
+whether the version happens to be downloaded already, which is not a
+distinction a user should have to make. One verb that downloads when it must is
+`mise use`'s shape.
+
+**Why a selection verb is not optional:** `axl prune` already keeps *current +
+one previous*, deliberately, so a rollback target exists. Without a way to
+activate it, that retention policy pays disk for nothing. The policy implied
+the verb; we had simply never written it.
+
+**Where this stops, against §18.3:** no per-project pinning, no shims, no
+dependency solving, no multi-tool support. That is where mise begins and where
+we defer. These five only expose the versioned-root layout `axl prune` already
+requires.
+
+**D2 — `release.yml` publishes the new shape. SHIPPED 2026-09-01.**
+`install.sh` and `VERSION` as assets; the settled names from §14.1a; the two
+tarbomb fixes from §14.1c; the `.deb`/`.rpm` build retired per §17. The largest
+step and the one that cannot be split usefully — a half-renamed release is
+worse than either end state.
+
+**The §19/§17.3 fork, resolved.** This paragraph says the packages retire here;
+§17.3 step 1 says "ship `install.sh`; keep publishing the packages", and D7 is
+"retire the packages for real". The reading taken: **D2 stops PUBLISHING them**
+(the fpm steps and both package smoke suites leave `release.yml`), and D7
+deletes `scripts/build-packages.sh` and moves the flagship consumer. Keeping
+them *built but unpublished* between the two would be worse than either end.
+The consumer therefore takes the rename and the package removal in one bump,
+which is exactly what §14.4 argues for — but it means **axl-utils must move to
+`install.sh` before its next pin bump**, not after.
+
+**Four things D2 turned up that the plan did not have:**
+
+- **The SDK tarball carried no licences.** The `.deb`/`.rpm` staged 75 doc
+  files including five third-party licence sets; the tarball staged none. Four
+  of the five (mbedTLS, DejaVu, libvterm, edk2 — plus FreeType's credit clause)
+  are obligations that attach to redistributing `libaxl.a`, so retiring the
+  packages without moving them was a compliance regression, not a doc one.
+  `make-sdk-tarball.sh` now stages the whole payload plus the examples.
+- **`install.sh` had to stop guessing the asset name.** It now fetches
+  `SHA256SUMS` first — stable-named across every release ever cut — and takes
+  the first candidate that file lists. A 404 and an unreachable mirror are the
+  same failed `curl`, so choosing by which download fails cannot distinguish
+  "this release predates the rename" from "the network is down".
+- **A legacy tarbomb had to be safe to extract.** `axl use <older>` reaches
+  archives that unpack six or forty-three entries into the CWD. The installer
+  now extracts into a staging directory inside the prefix root and renames it
+  into place, which both contains that blast radius and makes the final step a
+  same-filesystem rename.
+- **`test-pkg-deps-minimal.sh` read its dependency list out of the fpm block.**
+  Renamed to `test-host-deps-minimal.sh` and repointed at
+  `packaging/install.sh`'s `need_cmd` calls — a better owner, because the
+  installer enforces that list at run time. D4 is where it grows a Fedora row.
+
+Anti-drift: `make check-asset-names` holds the names equal across
+`install.sh`, the two producer scripts and `release.yml`. It compares
+**computed** names — it asks the producers (`--print-name`) and runs
+`asset_candidates()` — so it cannot be fooled by a renamed variable.
+
+**D3 — Collapse the documentation. SHIPPED 2026-09-01.** The install path is
+one `curl` (was eight), README's install prose is 185 lines (was 243), and
+`getting-started.rst` no longer mirrors it — it links to README for the
+variants and keeps the tutorial. `### Pinning, mirrors and air-gapped
+installs` and `### Building axl-sdk from source` became their own sections;
+both had been sitting *inside* `### Using your own toolchain`.
+
+**What D3 turned up, and it was not length.** `getting-started.rst` told
+readers to `apt install gcc-aarch64-linux-gnu` — the exact advice README says
+is obsolete — and its C++ section listed exceptions, RTTI, `<string>`,
+`<vector>`, `<unordered_map>`, `<stdexcept>`, `thread_local` and `<format>`
+as **forbidden**. All of that stopped being true at P4, when every C++ link
+started carrying libstdc++/libsupc++. Compiled and linked each to check:
+containers on both arches with no flag, `throw`/`catch` under `-fexceptions`,
+`typeid`/`dynamic_cast` under `-frtti`. `AXLMM-Design.md` repeats the same
+list and is published, so it got correction banners in the two places a
+reader would act on — it already used that convention for `libaxl-cxx.a`.
+`--hosted` is likewise documented in three places as a "warned no-op"; it is
+an **error** (exit 1).
+
+The lesson for D4-D7: prose staleness is not found by counting lines. The
+capability claims were wrong for two weeks in a file whose install commands
+were the only thing anyone had looked at.
+
+**D3's original brief.** README's install surface was 243 lines
+across four sections with eight `curl` invocations; `getting-started.rst`
+mirrors it. After D2 it is three commands. **Must follow D2**, because the
+names it documents have to be the names that exist.
+
+**D4 — Consumer-side verification (§16). SHIPPED 2026-09-02.** Pre-publish
+containerized install-and-build on clean Debian and Fedora — the gate.
+Post-publish hash and asset-set check — the thing that catches a rename which
+missed one asset, and the only check that sees the published bytes. Proves D2
+and D3. Job 1 had to be re-aimed from "install the package" to "run
+`install.sh`", and the distro pair kept for dash-vs-bash rather than
+deb-vs-rpm; it found an undeclared `python3` dependency on its first run. See
+§16.2a.
+
+**D5 — Snapshot exclusions and their gate (§15.2). SHIPPED 2026-09-02.**
+Independent of D1–D4 and can land at any point. Kept separate because it is
+about what the *public repo* carries, not about installation.
+
+`scripts/make-source-snapshot.sh` assembles and prunes; `check-snapshot-clean.py`
+gates the ASSEMBLED tree; `test-source-snapshot.sh` plants each forbidden class
+and requires the gate to fire, and requires a missing or near-empty snapshot to
+be REFUSED rather than reported clean.
+
+**It found a leak §15.1's own inventory had missed.** That inventory named two
+files. A third, `docs/ROADMAP-Archive.md`, carried two real lab IPs, a service
+tag and an iDRAC credential line — and no exclusion class covered it, so
+excluding working notes would not have helped. Redacted at source.
+
+**Two design points worth keeping:**
+
+- **The committed rules name nothing.** A tracked file listing the hostnames it
+  forbids publishes them on the next snapshot — the exact failure it exists to
+  prevent. So the committed patterns are structural (private/CGNAT ranges, ssh
+  tunnel directives) and the specific strings arrive as
+  `AXL_SNAPSHOT_FORBIDDEN`, a CI secret. The test asserts the secret is never
+  echoed into the output, since a public build log would publish it just as
+  well as the snapshot would.
+- **Prose is scanned strictly; fixtures and vendored code are not.** A private
+  address in mbedTLS's x509 test data or in `axl_ipv4_parse_cidr()`'s docstring
+  is an input or an example — the first draft flagged 64 of those. A private
+  address in *prose* is where a real machine gets written down, which is
+  exactly where the missed leak was. This is not the file-allowlist §15.2 warns
+  about: prose gets the strictest rule, not an exemption. 169.254/16 is out of
+  scope entirely — link-local is auto-assigned and identifies no machine.
+
+**D6 — asdf/mise plugin (§18.3). BUILT AND DECLINED 2026-09-02.** Written,
+tested and reverted the same day; see the note in §18.3 for the reasoning and
+for what would change the answer. The short version: D1a already put the
+version manager in `axl`, and an asdf-managed install is a layout `axl update`
+and `axl prune` cannot manage — measured, not assumed. D6 is **closed**, not
+pending.
+
+**D7 — Retire the packages for real (§17.3).** Move the flagship consumer onto
+`install.sh`, then delete `build-packages.sh`, the `fpm`/`rpmbuild`
+dependencies and the `build-packages` job. **Last**, and gated on D4 passing:
+the consumer has already absorbed one migration this week, and this is the step
+that cannot be walked back by re-running a script.
+
+Sequencing rule for the whole set: **D1 → D2 → D3 → D4 → D7**, with D5
+free-floating and D6 closed. The only hard couplings are that D2 consumes D1's staging, D3
+documents D2's names, and D7 must not precede the verification that would catch
+its breakage.
+
+
+## 20. The manager is not the managed
+
+**Decided 2026-09-02.** `axl` is currently installed *by* the SDK and *from
+inside* the SDK, so the thing that manages versions is itself one of the
+versioned things. That is the defect this section removes.
+
+### 20.1 The defect, measured
+
+`link_tree` symlinks every executable in `<prefix>/bin/` into the bin
+directory — including `axl` itself. So switching versions switches the
+manager:
+
+```
+after install:          axl -> …/axl-sdk-9.9.9/bin/axl
+after `axl use 4.0.0`:  axl -> …/axl-sdk-4.0.0/bin/axl      ← moved too
+```
+
+Run against a prefix predating D1, which staged no `libexec/axl/install.sh`:
+
+```
+$ axl update      → axl: no installer at …/axl-sdk-4.0.0/libexec/axl/install.sh
+$ axl use 9.9.9   → the same
+```
+
+**A rollback strands the user.** Neither verb works and the only escape is
+re-fetching `install.sh` from a web page — which is exactly the dependency
+D1 existed to remove. A rollback to a *post*-D1 version is milder but still
+wrong: it runs that version's installer, which cannot know asset names
+introduced later. And `axl prune` deliberately retains a previous version so
+that rollback is possible (§12.4), so we ship the retention policy together
+with the trap it walks into.
+
+### 20.2 What "you only interact with axl" already means
+
+The change is **not** justified by "after installing, the user only uses
+`axl`". D1a already delivered that: every verb `exec`s the STAGED
+`libexec/axl/install.sh` and re-fetches nothing. Selling the change on that
+would be selling something we have. What it buys is the separation below.
+
+### 20.3 Prior art: nobody lets the managed replace the manager
+
+| | shape | mechanism taken |
+|---|---|---|
+| rustup | `rustup-init` installs `rustup`; `rustup` installs toolchains | `rustup self update` — the manager updates on its own axis |
+| ghcup | closest in shape: large per-version toolchains | the manager root sits deliberately OUTSIDE the versioned tree |
+| uv | one binary that also manages Python versions | a second managed axis distinct from the tool's own version — our `/opt` toolchains |
+| pyenv | shims in the bin dir rather than symlinks into a version | a shim is what keeps the manager put while the managed thing moves |
+
+### 20.4 The decision, in two steps
+
+**M1 — stop the manager being downgraded.** `axl` is forward-only: linking
+never replaces an `axl` in the bin directory with one from an older prefix,
+and `axl`'s installer lookup falls back to the newest installed prefix that
+carries a staged `install.sh`. Small, no new roots, and it removes the
+stranding outright.
+
+**M2 — separate the manager from the managed.** `install.sh` becomes a
+bootstrap that installs the host-tools component — which *is* `axl` plus
+`libexec/` — into a manager root that `axl prune` never touches; `axl` then
+installs and switches SDK versions. rustup's shape, and it already fits the
+second axis (`/opt` toolchains) we manage today.
+
+### 20.5 The bootstrap does not choose a target architecture
+
+`--toolchain` selects the **target firmware** — `x64`, `aa64` or `all` — which
+is a statement of what the user is building *for*. The host cannot infer it,
+and guessing costs a 239 MB (x64) or 500 MB (aa64) download of the wrong
+compiler.
+
+So the bootstrap installs **no toolchain by default** — which is already
+`install.sh`'s behaviour; `maybe_toolchain()` returns early when `--toolchain`
+is absent, and `axl-cc` then fails naming `axl-install-toolchain`. What
+changes is the DOCUMENTATION, which presents `--toolchain x64` as though it
+were the norm. It is an example, and an x86-64-centric one: someone targeting
+ARM firmware wants `aa64` and nothing else.
+
+This also keeps M2 honest for a future non-x86-64 *host*. The asset format
+string already carries the host arch (`axl-sdk-linux-<ver>-x86_64`, from
+`uname -m`), so an aarch64-hosted SDK needs no naming change — only a build.
+A bootstrap that hardcoded a target arch would have to be unpicked first.
+
+### 20.6 No new verb
+
+M2 leaves a machine with a manager and no SDK, so something must install the
+first one. That is `axl update` — "move to the newest release" is exactly what
+installing from nothing means — and `axl use <ver>` for a specific one. The
+five verbs stand, and D1a's rule that `use` subsumes `install` is what makes
+this fall out rather than needing a sixth name.
 

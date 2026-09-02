@@ -161,76 +161,112 @@ C++ consumer.
 - **Nothing from the distro's toolchain.** `axl-cc` compiles and
   links with bare-metal crosses that `scripts/install-toolchain.sh`
   fetches to `/opt` — ARM's `aarch64-none-elf` and AXL's own
-  `x86_64-elf` — so the `.deb` and `.rpm` need no compiler, assembler
-  or linker from the distro (only `curl` and `xz`, to fetch those
-  toolchains). A host GCC is needed only to build axl-sdk itself from
-  source.
+  `x86_64-elf` — so an installed SDK needs no compiler, assembler or
+  linker from the distro (only `curl`, `tar`, `sha256sum`, `awk`,
+  `tr` and `xz`, to install itself and fetch those toolchains;
+  `test-host-deps-minimal.sh` proves that set is sufficient on a
+  toolchain-free Debian image). A host GCC is needed only to build
+  axl-sdk itself from source.
 - No EDK2, no gnu-efi, no external UEFI SDK.
 
 ### Install the SDK
 
-Binary packages are published on each
-[release](https://github.com/aximcode/axl-sdk-releases/releases/latest).
-Each package bundles both x64 and aa64 UEFI target libs.
-
-**Debian / Ubuntu:**
+Three commands, the same on every distribution:
 
 ```bash
-curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk.deb
-sudo apt install ./axl-sdk.deb
+curl -fsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/install.sh
+sh install.sh --help
+sh install.sh                      # the SDK and the host tools
 ```
 
-**Fedora / RHEL:**
+Then add the cross toolchain for the firmware you are **building for** — this
+is your choice, not the host's, and the wrong one is a 239 MB (x64) or 500 MB
+(aa64) download:
 
 ```bash
-curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk.rpm
-sudo dnf install ./axl-sdk.rpm
+axl-install-toolchain x64          # or: aa64, or: all
 ```
 
-Packages ship with mbedtls compiled in, so apps that use
-`https://` URLs link and run without extra setup. Apps that
-don't reference TLS don't incur any binary-size cost — the
-linker only pulls in mbedtls .o files when actually used, which
-`test-tls-strippable.sh` asserts.
+`sh install.sh --toolchain x64` does both in one command if you already know
+which you want.
 
-**Windows (WSL):** install the Debian or RHEL package inside
-Ubuntu / Debian / Fedora WSL — the `.deb` / `.rpm` paths above
-work unchanged. `axl-cc` runs in the WSL shell; point your
-Windows editor at the WSL filesystem (`\\wsl$\Ubuntu\...`) and
-the resulting `.efi` is a real PE32+ that boots on any UEFI
-system. This is the path we recommend — no separate packaging,
-no parallel toolchain to maintain.
+It resolves the latest release, verifies the download against
+`SHA256SUMS` — not optional — and unpacks into a versioned
+directory under `~/.local/share`, linking the commands into
+`~/.local/bin`. One archive carries both x64 and aa64 UEFI target
+libs. Read it before running it: the install takes options, so
+piping buys nothing, and `--toolchain` asks for `sudo` to write
+under `/opt`.
 
-**macOS and native Windows (MSYS2 / MinGW-w64): not supported
-today.** Building AXL needs a **bare-metal** GNU cross-toolchain
-(`x86_64-elf` / `aarch64-none-elf`), and we publish those for
-Linux x86-64 hosts only — `axl-install-toolchain` has nothing to
-fetch on a Mac or under MSYS2. **Use WSL on Windows** (above);
-on macOS, run the Linux package in a container or VM.
+The install then maintains itself:
 
-Earlier revisions of this file documented a Homebrew
-`x86_64-unknown-linux-gnu` cross plus `make CROSS=<prefix>-`.
-**That does not work, and cannot.** Two independent reasons, both
-measured:
+```bash
+axl update            # move to the newest release
+axl use 4.4.0         # switch to a version; downloads it only if absent
+axl list              # installed versions, * marking current
+axl uninstall         # remove a version, its links and its current marker
+```
 
-- `CROSS=` selects **binutils only**. It stopped selecting the
-  compiler when C moved to the bare-metal cross on both arches;
-  `CC` comes from `AXL_X64_GCC` / `AXL_AA64_GCC`, so the
-  documented command left the compiler pointing at a toolchain
-  that does not exist on those hosts.
-- A **glibc-targeted** cross cannot build the tree at all. The
-  `linux-gnu` triple was fine when `include/compat/` shimmed the
-  libc headers; that is gone, and `deps/` now needs genuine
-  bare-metal newlib headers. It fails on the first `<stdlib.h>`.
+Useful flags: `--version X.Y.Z` to pin, `--host-tools` for the
+QEMU tooling without the compiler, `--prefix` / `--bin-dir` to
+relocate, `--base-url` to install from a mirror or a local
+directory.
 
-Native Apple Clang cannot produce the ELF intermediates AXL needs
-either (`gcc → ld -T linker.lds → objcopy --target pei-*`).
+> **The `.deb` and `.rpm` are retired.** The installer covers what
+> they did. The one thing a script cannot do is *declare* a
+> dependency, so it probes for the QEMU stack and prints your
+> distribution's install command instead of pulling it in. If your
+> policy requires a signed package, ask — that is better than
+> keeping two package layouts for everyone.
 
-If you have a bare-metal cross for your host, you can point AXL
-at it — see **Using your own toolchain** below. Supporting these
-hosts properly means publishing bare-metal toolchains for them,
-which is a standing build-and-host commitment (Zephyr maintains a
-whole `sdk-ng` repo to do it) rather than a flag.
+**Windows:** use WSL. The installer is distribution-agnostic, so
+there is nothing different to do inside Ubuntu / Debian / Fedora
+WSL; `axl-cc` runs in the WSL shell, and the `.efi` it produces is
+a real PE32+ that boots on any UEFI system.
+
+**macOS and native Windows (MSYS2 / MinGW-w64) are not supported.**
+AXL needs a **bare-metal** cross-toolchain (`x86_64-elf` /
+`aarch64-none-elf`) and we publish those for Linux x86-64 hosts
+only, so `axl-install-toolchain` has nothing to fetch. Run the
+Linux SDK in a container or VM. Two things that look like
+workarounds are not: a **glibc-targeted** cross (`*-linux-gnu`)
+cannot build the tree — `deps/` needs genuine bare-metal newlib
+headers and it fails on the first `<stdlib.h>` — and `make
+CROSS=<prefix>-` selects **binutils only**, so it leaves the
+compiler pointing at nothing. Apple Clang cannot produce the ELF
+intermediates either (`gcc → ld -T linker.lds → objcopy --target
+pei-*`). If you already have a bare-metal cross for your host, see
+**Using your own toolchain** below.
+
+### Pinning, mirrors and air-gapped installs
+
+**Pin a specific version:** `sh install.sh --version 4.4.0`, or
+`axl use 4.4.0` from an existing install. Every asset carries its
+version in the filename and lives at
+`https://github.com/aximcode/axl-sdk-releases/releases/download/v<version>/<file>`;
+only `install.sh`, `VERSION` and `SHA256SUMS` keep a stable name,
+because they are the only ones fetched by someone who does not yet
+know the version.
+
+**Air-gapped / corporate MITM:** the installer verifies every
+download against `SHA256SUMS` itself — that check is not optional,
+and it is what makes fetching over a MITM proxy defensible. No
+`git clone` over HTTPS is required. `--base-url` points it at an
+internal mirror or a local directory holding the assets:
+
+```bash
+sh install.sh --base-url file:///mnt/mirror/axl-sdk
+```
+
+To verify by hand instead:
+
+```bash
+V=$(curl -kfsSL https://github.com/aximcode/axl-sdk-releases/releases/latest/download/VERSION)
+B=https://github.com/aximcode/axl-sdk-releases/releases/download/v$V
+curl -kfsSLO "$B/axl-sdk-linux-$V-x86_64.tar.gz"
+curl -kfsSLO "$B/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+```
 
 ### Using your own toolchain
 
@@ -258,53 +294,30 @@ than falling back — a silent fallback is what made the old
 `CROSS=` path fail deep in a recipe instead of at the point you
 stated your intent.
 
-**Pin a specific version:** use the versioned URL pattern
-`https://github.com/aximcode/axl-sdk-releases/releases/download/v<version>/<file>`.
-Each release publishes a `SHA256SUMS` alongside the packages.
+### Building axl-sdk from source
 
-**Air-gapped / corporate MITM:** the binary tarballs verify
-against `SHA256SUMS` with `curl -kfsSLO`, no `git clone` over
-HTTPS required:
-
-```bash
-curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk.deb
-curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/SHA256SUMS
-sha256sum --ignore-missing -c SHA256SUMS && sudo apt install ./axl-sdk.deb
-```
-
-**Build from source (power-user):** for working on the SDK
-itself, or platforms without a binary package:
-`git clone https://github.com/aximcode/axl-sdk-releases.git`
-(checkout a `v*` tag for a specific release), or download the
-**Source code (tar.gz)** archive linked on each
-[release page](https://github.com/aximcode/axl-sdk-releases/releases),
-then run `./scripts/install.sh --prefix /opt/axl-sdk` for the
-same FHS layout under `/opt/axl-sdk/`.
-
-`./scripts/install.sh` is the entry point even for an in-tree
-build: it compiles the library and stages a complete SDK under
-`./stage` by default (`stage/bin/axl-cc`, `stage/lib/axl/<arch>/`,
-`stage/include/`), so the driver to invoke is **`./stage/bin/axl-cc`**.
-`out/` holds build trees and Sphinx output only — a build directory is
-not an install prefix.
-`scripts/axl-cc` is not a standalone driver — run from a checkout
-it refuses by name, because it resolves its SDK root to the repo
-top, which is a source tree rather than an install prefix. It used
-to fail only incidentally, with `no SDK libraries ... lib/axl/<arch>`
-— and only on a *clean* checkout: a tree that had ever been
-installed in-tree (`install.sh --prefix .`) still had `bin/ lib/
-share/axl/` sitting there, all gitignored, and the source script
-quietly served those instead. Stage first, then use
-`stage/bin/axl-cc` (or add it to `PATH`):
+For working on the SDK itself. Note this is a *different*
+`install.sh` from the one above — `scripts/install.sh` builds and
+stages a prefix from a checkout; `packaging/install.sh` is the
+downloader that end users run.
 
 ```bash
+git clone https://github.com/aximcode/axl-sdk-releases.git   # or a v* tag
+cd axl-sdk-releases
+./scripts/install-toolchain.sh all     # bare-metal crosses into /opt
 ./scripts/install.sh --arch x64        # stages ./stage
 ./stage/bin/axl-cc hello.c -o hello.efi
 ```
 
-`install.sh` also warns about a staged SDK left at either historical
-prefix — `./out` (the pre-O1 default) or the source root itself — and
-names the command that removes it.
+`--prefix /opt/axl-sdk` puts the same layout anywhere you like.
+
+**Use `stage/bin/axl-cc`, not `scripts/axl-cc`.** The latter is not
+a standalone driver and refuses by name from a checkout, because it
+resolves its SDK root to the repo top — a source tree, not an
+install prefix. `out/` holds build trees and Sphinx output only; a
+build directory is not an install prefix, and `install.sh` warns
+about an SDK left staged at either historical location (`./out`, or
+the source root itself) and names the command that removes it.
 
 ### Host-side QEMU testing tooling
 
@@ -318,49 +331,47 @@ axl run-qemu my-app.efi
 axl rsod-decode --syms my-app.map --rsod putty.txt
 ```
 
-QEMU and OVMF are **Recommends**, not hard dependencies — they are
-needed to *run* a `.efi`, not to build one, so `apt`/`dnf` install
-them by default and you can decline them.
+QEMU and OVMF are needed to *run* a `.efi`, not to build one. The
+installer probes for them and prints the install command for your
+distribution if they are absent; it never installs them silently.
 
-For **downstream consumers** who want `run-qemu.sh` and friends but
-don't need the build-side SDK (no `axl-cc`, no library), there is a
-standalone tarball:
+For **downstream consumers** who want `run-qemu` and friends but
+don't need the build-side SDK (no `axl-cc`, no library), install
+the host-tools component instead — 0.36 MB against 13.5 MB:
 
 ```bash
-curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-host-tools.tar.gz
-mkdir -p ~/axl-sdk-host-tools && tar xf axl-sdk-host-tools.tar.gz -C ~/axl-sdk-host-tools
-~/axl-sdk-host-tools/scripts/run-qemu.sh my-app.efi
+sh install.sh --host-tools
+axl run-qemu my-app.efi
 ```
 
-> The standalone `axl-sdk-host-tools.deb` / `.rpm` are **retired** —
-> their contents ship inside `axl-sdk`, which `Replaces`/`Obsoletes`
-> them, so installing `axl-sdk` removes the old copies instead of
-> leaving two of every script on disk. An existing host-tools install
-> is not disturbed on its own (we publish no apt/dnf repo, so nothing
-> auto-upgrades); it simply stops receiving new versions. The tarball
-> is unaffected and remains the no-SDK path.
+Every command is reached as `axl <verb>` (`axl --help` lists them),
+so nothing needs a hardcoded path into the install.
 
 Discovery falls through `$QEMU_DIR` → `$PATH` → legacy custom
-build, so the tarball Just Works against the system QEMU/OVMF
-package on Debian, Ubuntu, Fedora, RHEL, Alma, and Arch. Missing
-dependencies print actionable `apt`/`dnf`/`pacman`/`brew`
-install commands.
+build, so it Just Works against the system QEMU/OVMF package on
+Debian, Ubuntu, Fedora, RHEL, Alma, and Arch. Missing dependencies
+print actionable `apt`/`dnf`/`pacman`/`brew` install commands.
 
 ### Pre-built UEFI tools (USB-stick use)
 
 For quick UEFI-shell troubleshooting without installing the SDK,
-download a flat tarball of the tool `.efi` binaries:
+download a tarball of the tool `.efi` binaries. These are the one
+asset that does **not** run on the machine downloading it, which
+is what `uefi-tools` in the name says — `x64` / `aa64` here is the
+target firmware, not your host:
 
 ```bash
-# x86_64
-curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-tools-x64.tar.gz
-# AArch64
-curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-tools-aa64.tar.gz
+V=$(curl -fsSL https://github.com/aximcode/axl-sdk-releases/releases/latest/download/VERSION)
+B=https://github.com/aximcode/axl-sdk-releases/releases/download/v$V
+curl -LO "$B/axl-sdk-uefi-tools-$V-x64.tar.gz"     # x86_64 firmware
+curl -LO "$B/axl-sdk-uefi-tools-$V-aa64.tar.gz"    # AArch64 firmware
+tar xf "axl-sdk-uefi-tools-$V-x64.tar.gz"
 ```
 
-Extract to a FAT-formatted USB stick, boot to the UEFI Shell, and
-run any tool with `-h` / `--help` for its option list. The tarball
-ships these `.efi` binaries:
+It extracts to a single `axl-sdk-uefi-tools-<ver>-<arch>/`
+directory. Copy its contents to a FAT-formatted USB stick, boot to
+the UEFI Shell, and run any tool with `-h` / `--help` for its
+option list. The tarball ships these `.efi` binaries:
 
 | Tool       | Description |
 |------------|-------------|
@@ -385,6 +396,20 @@ ships these `.efi` binaries:
 | `paste`    | Print the AXL clipboard to stdout (`pbpaste`-style) — `paste > file`, `--mime` prints the MIME type. Reads what a separate `clip` stored in the same boot. |
 | `rfbrowse` | Redfish browser — connects to a BMC over HTTPS and walks resources interactively (shortcut verbs for `/Systems`, `/Managers`, etc., plus arbitrary paths). |
 | `sysinfo`  | System inventory summary — compact `cpu`, `mem`, `fw`, `smbios`, `arch` subsections. Use `dmidecode` for the full per-record dump. |
+| `lsacpi`   | ACPI table browser — inventory with every header field (address, length, revision, OEM strings, creator + revisions, checksum) in the dmesg shape, `<SIG>` to decode every table with that signature through its typed reader or a hexdump, `--at <addr>` to name one when several share a signature, `-n` to walk the DSDT/SSDT namespace, `-s` to correlate slots across SMBIOS Type 9/41, the namespace and PCIe Slot Capabilities. `--json` in every mode. |
+| `smart`    | Unified storage inventory and health across NVMe, ATA and SCSI — `smartctl --scan -H` for UEFI, with normalized identity and a single health verdict per device whatever the transport. |
+| `nvme`     | NVMe controllers with identity, SMART/health and namespaces — capacity, temperature, wear indicators, self-test results, plus raw admin pass-through. |
+| `ata`      | ATA/SATA devices with IDENTIFY data and SMART health — model, serial, firmware, capacity and attribute-backed health, in a smartctl-style view. |
+| `scsi`     | SCSI/SAS logical units with INQUIRY identity, READ CAPACITY geometry and health. |
+| `fwtool`   | Firmware image inspector — `list`, `extract` and `find` over a raw `.fd` or SPI dump, walking firmware volumes, FFS files and sections with on-demand LZMA decompression. Works offline on an image file; no live `EFI_FIRMWARE_VOLUME2_PROTOCOL` needed. |
+| `i2c`      | I2C/SMBus explorer — the `i2c-tools` surface (`detect`, `get`, `set`, `dump`) over AxlSmbus, for FRU EEPROMs, fan and voltage controllers, temperature sensors, TCPCs and retimers. |
+| `netload`  | Load a NIC driver, bring the link up and try DHCP, reporting each step — the breadcrumb tool for "which stage does networking die at" on unfamiliar firmware. Static addressing, ping, DNS resolve and `--json` too. |
+| `rndisfix` | Sends the `REMOTE_NDIS_SET_MSG` packet filter that EDK2's `UsbRndis` driver stubs out — without it an RNDIS USB NIC shows link UP and delivers no inbound frames. |
+| `tar`      | Create, list and extract ustar archives with gzip (`-c`/`-t`/`-x`, `-z`, `-f`, `-C`, `-v`). |
+| `mkfixture`| Captures a running platform's ACPI, SMBIOS and configuration tables into a fixture directory that `axl emulate` replays under QEMU — how real-hardware behaviour gets a reproducible test. |
+| `kbtune`   | Keyboard debounce tuner with an on-screen GOP UI, for KVMs that emit key bounce. |
+| `timetest` | Verifies the monotonic microsecond timer against known sleep intervals on real firmware. |
+| `axbench`  | Benchmarks the AP task pool against BSP-only execution across eight scenarios. |
 
 `lspci`, `lsusb`, and `memspd` consult JSON5 sidecar databases
 auto-discovered next to the `.efi` (or via explicit `--ids-file` /
@@ -487,10 +512,13 @@ axl-cc --type driver mydriver.c -o mydriver.efi
 ### TLS
 
 TLS support uses [mbedTLS](https://github.com/Mbed-TLS/mbedtls)
-(v3.6.3) as a **required** git submodule — clone with
+(v3.6.3), always compiled in, so an app using `https://` URLs
+links and runs with no extra setup. An app that never calls
+`axl_tls_init` pays nothing for it — `--gc-sections` drops every
+mbedTLS object, which `test-tls-strippable.sh` asserts.
+
+Building from source needs it as a git submodule: clone with
 `--recursive`, or run `git submodule update --init --recursive`.
-It is always compiled in; an app that never calls `axl_tls_init`
-links none of it.
 
 ## Built with AXL
 

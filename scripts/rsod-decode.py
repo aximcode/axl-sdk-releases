@@ -367,6 +367,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# axl_version.py is staged beside this script. These tools are run by
+# absolute path from the `axl` dispatcher rather than imported as a
+# package, so their own directory is not already on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from axl_version import version_string  # noqa: E402
+
 # ═══════════════════════════════════════════════════════════════
 # Data model
 # ═══════════════════════════════════════════════════════════════
@@ -3799,6 +3805,9 @@ examples:
 For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
 """,
     )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"rsod-decode {version_string()}")
     parser.add_argument("--syms", action="append", dest="images", metavar="FILE[:BASE]",
                         help="Where this module's symbols come from: a linker "
                              ".map, an ELF (.so, .debug, .dll) or a PE (.efi). "

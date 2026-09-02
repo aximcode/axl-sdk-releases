@@ -1226,7 +1226,8 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-fuzz-link check-examples check-json-dialect check-flag-parity \
     check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
     check-log-levels check-handle-exclusions check-libc-overlap check-build-mode \
-    check-awk-portability check-devkit-conf
+    check-awk-portability check-devkit-conf check-tool-version check-tool-docs \
+    check-asset-names
 
 # Gates that need BUILT IMAGES, and therefore CANNOT be in LINT_GATES.
 #
@@ -2298,6 +2299,20 @@ check-uefi-scope:
 .PHONY: check-devkit-conf
 check-devkit-conf:
 	@python3 scripts/check-devkit-conf.py
+
+check-tool-version:
+	@python3 scripts/check-tool-version.py
+
+check-tool-docs:
+	@python3 scripts/check-tool-docs.py
+
+# The release asset names, held equal across the three places that spell them
+# and cannot share code (AXL-Distribution-Design.md §14.1a). packaging/
+# install.sh is why they cannot: it runs on a machine with nothing of ours
+# installed, so it constructs the names itself, and a rename on either side is
+# invisible until a user's `axl update` cannot find its download.
+check-asset-names:
+	@python3 scripts/check-asset-names.py
 
 check-version:
 	@file_ver=$$(cat VERSION); \
@@ -4140,10 +4155,35 @@ $(eval $(call BUILD_TEST,AxlTestJsonCorpus,axl-test-json-corpus))
 # ===================================================================
 
 TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool axbench kbtune netload lsproto cut tr lsacpi
+# Applications built from tools/ that are NOT in TOOL_NAMES: each has a custom
+# entry point (an embedded driver, a deliberate fault, a subcommand tree) so it
+# calls axl_version_handle() directly instead of going through AXL_TOOL_MAIN.
+# Named here rather than only in the `tools:` recipe so check-tool-version can
+# see them -- walking TOOL_NAMES alone left three shipped applications
+# unchecked, and the gate reported clean over a tools/fbcon.c with no
+# AXL_TOOL_MAIN in it at all.
+TOOL_EXTRA_APPS = fbcon crashtest 9p
+
+# The host-side scripts that ship to consumers, in BOTH layouts: install.sh
+# stages them to <prefix>/libexec/axl, and release.yml packs the same set into
+# the host-tools tarball. They were two hand-written lists until adding
+# axl_version.py to one and not the other shipped a tarball whose four Python
+# tools all died with ModuleNotFoundError -- and whose smoke test could not see
+# it, because it ran `test -x rsod-decode.py` rather than running the tool.
+#
+# The line between this and SDK-internal tooling: runtime and debug aids a
+# consumer needs to test a .efi. Header generation, packaging, version-bump and
+# the docs build stay behind. Linker scripts and pe-set-debug.c are BUILD
+# inputs and deliberately absent -- nothing in this set references them, and
+# the bundle carries no compiler to use them with.
+HOST_TOOL_FILES = run-qemu.sh axl-common.sh axl-emulate rsod-decode.py \
+                  gdb-syms.py gdb-sample.py profile-qemu.sh \
+                  extract-fv-shell.py axl-prune.sh axl_version.py
+
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
-tools: all $(TOOL_EFIS) $(PREFIX)/tools/kbtune-drv.efi $(PREFIX)/tools/fbcon.efi $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi $(PREFIX)/tools/9p.efi
-	@echo "  Built $(words $(TOOL_NAMES)) tools + kbtune-drv + fbcon + crashtest + crashhandler driver + 9p"
+tools: all $(TOOL_EFIS) $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_EXTRA_APPS)) $(PREFIX)/tools/kbtune-drv.efi $(PREFIX)/drivers/crashhandler.efi
+	@echo "  Built $(words $(TOOL_NAMES)) tools + $(TOOL_EXTRA_APPS) + kbtune-drv + crashhandler driver"
 
 # tool-sizes — print per-tool .efi size, sorted ascending.
 # Surfaces the selective-linking benefit: a tool that uses 5% of

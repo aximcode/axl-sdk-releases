@@ -1,10 +1,18 @@
 #!/bin/bash
 # build-packages.sh — build .deb and .rpm packages locally.
 #
-# Mirrors what .github/workflows/release.yml does. Intended for
-# smoke-testing the packaging pipeline before cutting a release tag,
-# or for producing packages on machines that can't reach GitHub
-# Actions.
+# RETIRED, AND PENDING DELETION IN D7. AXL-Distribution-Design.md §17 replaced
+# the packages with packaging/install.sh, and D2 removed them from
+# .github/workflows/release.yml -- so this no longer mirrors the release, and
+# the asset names it emits (axl-sdk-tools-<arch>.tar.gz) are the pre-rename
+# ones. `make check-asset-names` deliberately does not police them: they are
+# not published. §19 keeps the file until D7, which is gated on D4's
+# consumer-side verification and on the flagship consumer moving to
+# install.sh -- deleting it earlier would remove the only local way to build a
+# package for a consumer whose policy still mandates one (§17.4).
+#
+# For the artifacts the release actually publishes, use
+# scripts/make-sdk-tarball.sh and scripts/make-host-tools-tarball.sh.
 #
 # The library is built with mbedtls compiled in, which is now the only
 # configuration: --gc-sections keeps it out of any binary that does not

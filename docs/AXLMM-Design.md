@@ -153,6 +153,13 @@ Consumers cannot opt in to exceptions, RTTI, or thread-safe statics
 — the link won't satisfy libsupc++ symbols (validated in CPP1.3/1.4;
 matches every freestanding-UEFI C++ project's experience).
 
+> **NO LONGER TRUE (P4, 2026-08-17)** — see the banner at the top of
+> this file. Since every C++ link carries the toolchain's own
+> `libstdc++`/`libsupc++`, those symbols resolve. `-fexceptions` and
+> `-frtti` are per-TU opt-ins that WORK on both arches; they stay off
+> by DEFAULT because of cost, not capability. The paragraph above is
+> the record of what was true under the old link shape.
+
 **Link flags:** `-nostdlib --no-undefined`.
 
 **Required C++ standard: C++20** (for `<span>`, `<concepts>`,
@@ -175,6 +182,17 @@ plus P0829 freestanding subset):
   (compile-time heavy)
 
 **What doesn't work** (require libsupc++ / libstdc++.a):
+
+> **THE WHOLE OF THIS LIST NOW WORKS (P4, 2026-08-17).** It was
+> accurate when the SDK linked `-nostdlib` without libstdc++; the
+> current link carries it, so every entry below resolves. Verified by
+> compiling and linking each: `std::vector`/`string`/`unordered_map`
+> with no flag on both arches, `throw`/`catch` under `-fexceptions`,
+> `typeid`/`dynamic_cast` under `-frtti`. What remains true is the
+> COST — exceptions measured +28-36% of `.efi` on four real x64 tools
+> — which is why the defaults did not change with the capability.
+> Read this list as the reason each default is what it is, not as a
+> statement of what the toolchain can do.
 
 - Exceptions (`throw`/`catch`) — `__cxa_throw`, `_Unwind_Resume`,
   `__gxx_personality_v0` unresolvable
@@ -200,6 +218,12 @@ plus P0829 freestanding subset):
   `axl_malloc` / `axl_free`, so C++ heap memory comes from the UEFI
   `EfiBootServicesData` pool and is tracked by the same leak detector as
   `axl_malloc`.  `axl-cc` auto-appends `libaxl-cxx.a` when it sees a `.cpp`.
+
+  > **SUPERSEDED (P4).** Neither the archive nor that source file
+  > exists. `operator new` is **libstdc++'s** and calls newlib
+  > `malloc`, so it is NOT visible to `axl_mem_fail_next_alloc()` —
+  > a C++ OOM fixture must request an unsatisfiable size instead of
+  > arming the injector.
 - **The throwing `new` returns NULL on failure — it does not throw.**  Built
   `-fno-exceptions`, the allocating operators are `noexcept`, so there is no
   `std::bad_alloc`; `new T` yields NULL when the pool is exhausted.  **Check
@@ -515,7 +539,7 @@ individual functions can split to `src/axlmm/X.cpp` and join
 - **`make tests` requires `AXL_CPP=1`.**  The ratchet is an
   SDK-development concern, not a consumer concern.  SDK developers
   have the C++ toolchain installed (per
-  `scripts/install-arm-toolchain.sh`) — that's the canonical dev
+  `scripts/install-toolchain.sh`) — that's the canonical dev
   environment.
 
 - **First tests:** `axlmm-test-handle.cpp` (Handle template:
@@ -527,8 +551,12 @@ individual functions can split to `src/axlmm/X.cpp` and join
 
 ### Packaging
 
-**Single `axl-sdk.deb`/`.rpm` per arch per release.**  C and C++
-surface ship together.
+**Single artifact per release.**  C and C++ surface ship together.
+
+> **Was "single `axl-sdk.deb`/`.rpm` per arch".** The packages retired
+> with D2 ([`AXL-Distribution-Design.md`](AXL-Distribution-Design.md)
+> §17); the point survives unchanged in the SDK tarball, which carries
+> both arches and both languages.
 
 The build-time `AXL_CPP` gate stays for the source-from-scratch
 case (developer building axl-sdk on a machine without the ARM
@@ -556,8 +584,9 @@ Rationale (revised from the original ROADMAP's two-package plan):
 existing helpful error when you feed `.cpp` to a no-libaxl-cxx.a
 install.
 
-**ARM bare-metal toolchain stays out of the package.**
-`scripts/install-arm-toolchain.sh` is a separate user-invoked step
+**Bare-metal toolchains stay out of the package.**
+`scripts/install-toolchain.sh` (staged as `axl-install-toolchain`)
+is a separate user-invoked step
 — bundling a 96MB tarball into a deb would mean owning the
 toolchain's release cycle and license redistribution.
 

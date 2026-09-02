@@ -184,7 +184,7 @@ The appealing version of this project is "CMake replaces the Makefile *and*
   one arch.
 - **Specs files have no post-link hook**, so `pe-set-debug` cannot fold into
   the compiler driver.
-- `axl-cc` is the **consumer** driver — what a `.deb` user runs. It must keep
+- `axl-cc` is the **consumer** driver — what an installed-SDK user runs. It must keep
   working regardless of how the SDK builds itself.
 
 **Consequence for the pitch.** ROADMAP calls "three build paths → one" the
@@ -241,7 +241,7 @@ never SHIPPED a Makefile — we use one"*, therefore the port is not
 consumer-breaking and needs no major.
 
 Every one of those measurements is accurate. **The conclusion does not
-follow, because they measure the `.deb`/`.rpm` payload and the shipped
+follow, because they measure the shipped SDK-tarball payload and the shipped
 surface is larger than the payload.** Counting one shape and treating it as
 the thing — §6's first trap, committed by the doc that teaches it.
 
@@ -257,10 +257,10 @@ What was missed:
   and GitHub's automatic "Source code (tar.gz/zip)" links on every release
   page are that tree.
 - **`README.md` documents building with it, and README.md ships inside the
-  `.deb`/`.rpm`** (`release.yml` copies it to
-  `usr/share/doc/axl-sdk/`). For **macOS** and **native Windows/MSYS2** —
-  platforms with *no binary package at all* — it is the ONLY documented build
-  path:
+  SDK tarball** (`make-sdk-tarball.sh` stages it to
+  `share/doc/axl-sdk/`; it used to be the `.deb`/`.rpm`, which retired with
+  D2). For **macOS** and **native Windows/MSYS2** — platforms with *no
+  published build at all* — it is the ONLY documented build path:
 
       git clone https://github.com/aximcode/axl-sdk-releases.git
       cd axl-sdk-releases

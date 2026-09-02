@@ -40,6 +40,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/axl-common.sh"
+
+# Answered before anything else parses argv, so `--version` never has to
+# survive a positional-hungry option loop. See axl-common.sh.
+axl_handle_version "profile-qemu" "$@" && exit 0
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 RUN_QEMU="$SCRIPT_DIR/run-qemu.sh"
 GDB_SYMS="$SCRIPT_DIR/gdb-syms.py"

@@ -71,13 +71,8 @@ echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for HTTPS server + Shell launch..."
 
 if ! test_wait_for "READY" 60; then
-    # No-TLS build is a hard config error, not a SKIP.
     test_clean_log
-    if grep -qa "NO_TLS" "$TEST_CLEAN_LOG"; then
-        echo "FAIL: built without mbedTLS"
-    else
-        echo "FAIL: server did not reach READY within 60 seconds"
-    fi
+    echo "FAIL: server did not reach READY within 60 seconds"
     echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
 fi

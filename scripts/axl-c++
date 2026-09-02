@@ -5,7 +5,18 @@
 # alias; axl-cc itself dispatches by file extension.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
+# `readlink -f` first, so a symlink INTO this prefix resolves to the real
+# file. `cd -P` alone resolves the DIRECTORY physically but never follows a
+# symlink on $0 itself, so `ln -s <prefix>/bin/axl ~/.local/bin/axl` made the
+# prefix resolve to ~/.local and every lookup under it fail. That is exactly
+# the shape a `curl | sh` installer produces.
+#
+# It still does what `cd -P` was here for: on a usrmerge distro /bin is a
+# symlink to /usr/bin, and a `current` symlink (AXL-Distribution-Design.md
+# §12.2) still resolves to the versioned root it points at -- readlink -f
+# resolves the whole chain, directories included.
+_axl_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd -P "$(dirname "$_axl_self")" && pwd)"
 # Pass our own name through: exec leaves $0 as axl-cc's path (a #! script takes
 # argv from the kernel, so `exec -a` cannot rename it), and without this the
 # help, --version and error messages all name axl-cc instead of what the user

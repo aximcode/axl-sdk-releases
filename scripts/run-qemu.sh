@@ -110,6 +110,10 @@ set -euo pipefail
 
 source "$(dirname "$0")/axl-common.sh"
 
+# Answered before anything else parses argv, so `--version` never has to
+# survive a positional-hungry option loop. See axl-common.sh.
+axl_handle_version "run-qemu" "$@" && exit 0
+
 ARCH="X64"
 TIMEOUT=15
 RAW=false

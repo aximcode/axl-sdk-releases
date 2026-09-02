@@ -31,6 +31,12 @@ import uuid
 from pathlib import Path
 from typing import Iterator
 
+# axl_version.py is staged beside this script. These tools are run by
+# absolute path from the `axl` dispatcher rather than imported as a
+# package, so their own directory is not already on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from axl_version import version_string  # noqa: E402
+
 # EFI Shell file GUID (gUefiShellFileGuid) -- same across EDK2 builds.
 SHELL_GUID = uuid.UUID("7C04A583-9E3E-4F1C-AD65-E05268D0B4D1")
 # LZMA_CUSTOM_DECOMPRESS_GUID -- GUIDED-section codec OVMF uses for DXEFV.
@@ -179,6 +185,9 @@ def extract_shell(firmware: Path) -> bytes | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version", action="version",
+        version=f"extract-fv-shell {version_string()}")
     parser.add_argument("firmware", type=Path, help="OVMF/AAVMF firmware .fd image")
     parser.add_argument("-o", "--output", type=Path, required=True, help="write Shell.efi here")
     args = parser.parse_args()

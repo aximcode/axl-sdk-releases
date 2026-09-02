@@ -6,7 +6,7 @@
 # THE DEFECT. install.sh always builds into out/native-<arch>-release,
 # REGARDLESS of --prefix: --prefix says where to stage, not where to build.
 # Three integration tests invoke install.sh (test-jose-cc-qemu,
-# test-install-idempotent, test-pkg-deps-minimal), so under -j8 all three aim
+# test-install-idempotent, test-host-deps-minimal), so under -j8 all three aim
 # `make -j$(nproc)` at the SAME tree. There is now exactly ONE tree -- the
 # AXL_TLS suffix is gone -- which makes that collision MORE likely, not less.
 # Two makes writing one target set is not safe: the observed symptoms are a

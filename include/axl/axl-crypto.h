@@ -12,12 +12,11 @@
  * ships. There is no signing side: signing is done offline by the
  * vendor and the private key never ships in the binary.
  *
- * Compiled into every build — mbedTLS is an unconditional dependency.
- * axl_pk_available() reports whether the layer is present at all (it
- * is); axl_pk_alg_available() answers the question that can still be
- * no, which is whether THIS IMAGE linked a given algorithm. Use
- * to distinguish "verification not compiled in" from "signature
- * invalid".
+ * Compiled into every build — mbedTLS is an unconditional dependency,
+ * so axl_pk_available() is a guaranteed true and not worth branching
+ * on. axl_pk_alg_available() answers the question that can still be
+ * no — whether THIS IMAGE linked a given algorithm. Use it to
+ * distinguish "algorithm not linked" from "signature invalid".
  *
  * @code
  * // pubkey: DER SubjectPublicKeyInfo baked into the image at build time.
@@ -123,18 +122,19 @@ typedef enum {
 } AxlPkSigFormat;
 
 /**
- * @brief Whether public-key signature verification was compiled in.
+ * @brief Whether public-key signature verification is present in this build.
  *
- * Always true: mbedTLS is compiled into every build. Kept because it
- * is public API and because axl_pk_verify() documents a fail-closed
- * contract against it. For the question that can still answer no —
- * whether this image linked a particular algorithm — use
- * axl_pk_alg_available(). When false, axl_pk_verify() returns AXL_ERR
- * regardless of
- * input — callers that must fail closed on a missing crypto backend
- * can branch on this to log the distinction.
+ * Always true, guaranteed. mbedTLS is an unconditional dependency, so
+ * this cannot answer no — do not branch on it. It stays public API
+ * only so existing consumer source keeps compiling.
  *
- * @return true if axl_pk_verify() can verify signatures.
+ * The question that CAN still answer no is whether this image linked a
+ * particular algorithm: use axl_pk_alg_available(). When THAT is
+ * false, axl_pk_verify() returns AXL_ERR regardless of input, so a
+ * caller that must fail closed on a missing algorithm branches on
+ * axl_pk_alg_available() — never on this.
+ *
+ * @return always true.
  */
 bool
 axl_pk_available(void);
@@ -162,13 +162,14 @@ axl_pk_available(void);
  * parse or verify failure is reported uniformly as AXL_ERR — a caller
  * must treat every non-AXL_OK result as "not verified, untrusted" and
  * fail closed. Do NOT branch security decisions on the *reason* for
- * failure; the only distinction the API offers is axl_pk_available(),
- * which separates "verification not compiled in" from "invalid".
+ * failure; the only distinction the API offers is
+ * axl_pk_alg_available(), which separates "this image did not link that
+ * algorithm" from "invalid".
  *
  * @return AXL_OK if the signature is valid for @p msg under @p pubkey;
  *     AXL_ERR otherwise — invalid signature, malformed key/signature,
- *     NULL/zero-length key or signature, unsupported algorithm, or
- *     verification not compiled in (see axl_pk_available()).
+ *     NULL/zero-length key or signature, unsupported algorithm, or an
+ *     algorithm this image did not link (see axl_pk_alg_available()).
  */
 AXL_WARN_UNUSED int
 axl_pk_verify(
@@ -446,7 +447,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlPkKey, axl_pk_key_free)
 // (key, nonce) pair is ever reused) — typically a counter or random
 // value the caller manages; this API does not generate nonces.
 //
-// Compiled into every build (mbedTLS). See axl_pk_available().
+// Compiled into every build (mbedTLS).
 
 /**
  * @brief AEAD algorithm selector.

@@ -41,6 +41,75 @@ log_warning() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 # --------------------------------------------------------------------------
+# axl_version_string / axl_handle_version — one answer to `--version`
+#
+#   axl_handle_version <prog> "$@" && exit 0
+#
+# Every AXL command answers `--version` in the same shape the target-side
+# tools do -- "<prog> <version>", from AXL_TOOL_MAIN via axl_version_handle()
+# in axl-version.h. Before this, 8 of the 11 host commands answered `rc=2,
+# unknown argument` while all 37 target tools answered correctly.
+#
+# WHERE THE VERSION COMES FROM is the part with a history. A checkout answers
+# from its OWN VERSION file; a staged or installed prefix answers from
+# share/axl/version beside it. Never the other way round: axl-cc once printed
+# a six-week-old staged version while running out of a tree that had just
+# built something else, because `install.sh --prefix .` had left a
+# share/axl/version at the repo root. That string gets pasted into reports as
+# evidence of which build was measured, so the checkout's own VERSION wins
+# whenever there is one.
+# --------------------------------------------------------------------------
+
+axl_version_string() {
+    local d
+
+    # A checkout: the tree's own VERSION is the truth, even if a stale
+    # staged prefix was installed on top of it.
+    if [[ -r "$AXL_DIR/VERSION" ]]; then
+        cat "$AXL_DIR/VERSION"
+        return 0
+    fi
+
+    # A staged/installed prefix: share/axl/version sits above this file.
+    d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    while [[ "$d" != "/" ]]; do
+        if [[ -r "$d/share/axl/version" ]]; then
+            cat "$d/share/axl/version"
+            return 0
+        fi
+        d="$(dirname "$d")"
+    done
+
+    # Say so rather than inventing one. A wrong version is worse than none.
+    echo "unknown"
+    return 1
+}
+
+# ONLY the first argument, which is where this DIVERGES from the target-side
+# axl_version_handle() on purpose. That one scans all of argv, which is safe
+# for a tool whose argv is entirely its own -- but these host commands WRAP
+# another command line. run-qemu.sh forwards everything after the .efi to the
+# guest, so a full scan makes `run-qemu.sh lsacpi.efi --version` print
+# run-qemu's version and never boot; profile-qemu.sh shadows APP_ARGS the same
+# way. Both were live regressions caught in review.
+#
+# Scanning to the first NON-option instead would not work either: without
+# knowing which options take arguments, `--timeout 90 --version` stops at the
+# 90. Position 1 is the only rule that cannot be ambiguous, and it is what
+# `axl` itself already does with its `case "${1-}"`.
+axl_handle_version() {
+    local prog="$1"; shift
+
+    case "${1-}" in
+        --version|-V)
+            printf '%s %s\n' "$prog" "$(axl_version_string)"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# --------------------------------------------------------------------------
 # axl_warn_stale_sdk_prefix — report a staged SDK that nothing refreshes
 #
 #   axl_warn_stale_sdk_prefix <installed-prefix> <sdk-source-root>

@@ -4,14 +4,14 @@
 /** @file axl-jose.c
     JOSE — JWS Compact (RFC 7515), JWT (RFC 7519), JWK/JWK-Set (RFC 7517).
 
-    Built on the AxlCrypto key-handle API (ES256/RS256), AxlHmac (HS256),
-    AxlStr base64url, and the AxlJson reader/writer. The whole module is
-    gated on AXL_HAVE_TLS: without it axl_jose_available() returns false
-    and every entry point fails closed (AXL_ERR / NULL).
+    Built on the AxlCrypto key-handle API (ES256/ES384/RS256/PS256),
+    AxlHmac (HS256), AxlStr base64url, and the AxlJson reader/writer.
+    mbedTLS is an unconditional dependency, so the module is in every
+    build and axl_jose_available() is a guaranteed true.
 
-    v1 algorithms: ES256, RS256, HS256. ES384 and PS256 are recognized
-    names but not yet implemented — they are rejected (fail closed), never
-    silently downgraded.
+    All five algorithms are implemented: ES256, ES384, RS256, PS256 and
+    HS256. An algorithm outside the caller's allow-list is rejected
+    (fail closed), never silently downgraded.
 
     Security model lives in the header: verification is allow-list-driven
     (never header-`alg`-driven), `none` is unrepresentable, and the key is
@@ -20,14 +20,6 @@
 **/
 
 #include <axl/axl-jose.h>
-
-bool
-axl_jose_available(void)
-{
-    return true;
-}
-
-
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-string.h>
@@ -38,6 +30,12 @@ axl_jose_available(void)
 #define JOSE_SHA256_LEN   32u   /* HS256 digest / HMAC tag size. */
 #define JOSE_EC_COORD_MAX 48u   /* widest EC affine coordinate (P-384). */
 #define JOSE_RSA_N_MAX    512u  /* modulus cap: 4096-bit RSA = 512 bytes. */
+
+bool
+axl_jose_available(void)
+{
+    return true;
+}
 
 // -------------------------------------------------------------------
 // JSON intake — strict, and always a JSON object.

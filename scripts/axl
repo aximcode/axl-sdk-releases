@@ -1,22 +1,40 @@
 #!/bin/bash
-# axl — one name on PATH for every host-side SDK tool.
+# axl — the SDK's front door: run its host-side tools, and manage the install.
 #
-# WHY THIS EXISTS. Twelve host-side scripts ship with the SDK and ten of them
-# land on no PATH at all: the packaging gives `/usr/bin` wrappers to run-qemu
-# and axl-emulate only, and everything else sits at a full path under
-# `/usr/share/axl-sdk-host-tools/scripts/`. So the crash handler prints
+# TWO JOBS, and the second arrived later than this file did.
+#
+# 1. A COMMAND DISPATCHER. `axl run-qemu`, `axl rsod-decode`, `axl gdb-syms`,
+#    `axl emulate` ... — every host-side script the SDK ships, reachable by
+#    name from wherever the SDK happens to be installed.
+#
+# 2. A VERSION MANAGER. `axl update`, `axl use <version>`, `axl list`,
+#    `axl uninstall`, `axl prune` — the install maintains itself, without the
+#    user re-fetching anything from a web page.
+#
+# WHY (1) EXISTS. The host-side scripts used to land on no PATH at all: a
+# couple got wrappers and the rest sat at a full path that depended on how the
+# SDK had been installed. So the crash handler printed
 #
 #     rsod-decode.py --syms <build>/X.so --rsod crash-report.txt
 #
-# as the command to run, and for a package user that is `command not found`.
-# Consumers then invent their own answer -- `~/axl-sdk-host-tools/scripts/...`,
-# which README.md prescribes and axl-utils implements -- and every README,
-# printed hint and consumer script has to name a path that depends on how the
-# SDK was installed.
+# as the command to run, and for most users that was `command not found`.
+# Consumers then invented their own answer -- a hardcoded path into someone's
+# home directory -- and every README, printed hint and consumer script had to
+# name a location it could not know. `axl <command>` makes the install location
+# stop mattering. AXL-Distribution-Design.md §13; the UEFI-side `axl.efi`
+# busybox is the same idiom, so this is its host-side sibling rather than a new
+# concept.
 #
-# `axl <command>` makes the install location stop mattering. See
-# AXL-Distribution-Design.md §13; the UEFI-side `axl.efi` busybox is the same
-# idiom, so this is its host-side sibling rather than a new concept.
+# WHY (2) LIVES HERE TOO, rather than in a second program. The five verbs are
+# spelled out in this file instead of being staged as commands, because they
+# are the ONE thing that cannot be a script in libexec/axl: they drive
+# `libexec/axl/install.sh`, which is staged mode 0644 precisely so the command
+# scan below does NOT offer it as `axl install` (§18.6 -- the install knows its
+# own version, prefix and links; a script on a web server knows none of them).
+# One name each, deliberately: no `self-update` alias, no separate `install`
+# verb. `use` subsumes `install` because they would differ only in whether the
+# version happens to be downloaded already, which is not a distinction a user
+# should have to make. See §19's D1a.
 #
 # NOT a wrapper per tool. The command list IS the contents of libexec/axl/, so
 # adding a tool to install.sh's staging list adds a subcommand and there is no
@@ -31,12 +49,21 @@
 # would leave every one of them correct and unable to find the others.
 set -uo pipefail
 
-# `cd -P` resolves symlinks physically. Same reason axl-cc does it: on a
-# usrmerge distro /bin is a symlink to /usr/bin, and a logical `cd` would
-# resolve the prefix to `/` instead of `/usr`. It also makes a `current`
-# symlink (AXL-Distribution-Design.md §12.2) resolve to the versioned root it
-# points at, which is what a printed diagnostic should name.
-SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
+# `readlink -f` FIRST, then `cd -P`. Both halves are load-bearing:
+#
+#   - readlink -f follows a symlink on $0 itself. `cd -P` alone resolves the
+#     DIRECTORY physically but never $0, so `ln -s <prefix>/bin/axl
+#     ~/.local/bin/axl` resolved the prefix to ~/.local and every lookup under
+#     it failed -- which is exactly the shape install.sh produces, so this file
+#     could not be reached through a link until it was fixed.
+#   - cd -P keeps what it was here for, the same reason axl-cc does it: on a
+#     usrmerge distro /bin is a symlink to /usr/bin, and a logical `cd` would
+#     resolve the prefix to `/` instead of `/usr`.
+#
+# Together they also make the `current` symlink (§12.2) resolve to the
+# versioned root it points at, which is what a printed diagnostic should name.
+_axl_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd -P "$(dirname "$_axl_self")" && pwd)"
 PREFIX="$(dirname "$SCRIPT_DIR")"
 LIBEXEC="$PREFIX/libexec/axl"
 VERSION_FILE="$PREFIX/share/axl/version"
@@ -88,6 +115,7 @@ usage() {
     # command list, which is the entire point of this program. Treating it as
     # a usage error would hide the discovery surface behind a redirect.
     echo "usage: axl <command> [args ...]"
+    echo "       axl update | use <version> | list | uninstall"
     echo "       axl --print-prefix | --print-version | --help"
     echo ""
     echo "host commands:"
@@ -121,6 +149,99 @@ case "${1-}" in
         usage
         exit 0
         ;;
+    list)
+        # Reads the filesystem only, so this also works in a package install
+        # (where it will correctly find nothing to list).
+        _root="$(dirname "$PREFIX")"
+        _cur=""
+        [[ -L "$_root/axl-sdk" ]] && _cur="$(cd -P "$_root/axl-sdk" 2>/dev/null && pwd)"
+        _any=0
+        for _d in "$_root"/axl-sdk-[0-9]*; do
+            [[ -d "$_d" ]] || continue
+            _any=1
+            if [[ "$_d" == "$_cur" ]]; then
+                printf '* %s\n' "$(basename "$_d")"
+            else
+                printf '  %s\n' "$(basename "$_d")"
+            fi
+        done
+        if [[ "$_any" -eq 0 ]]; then
+            echo "no versioned SDK roots under $_root"
+            echo "(this prefix was not placed by install.sh -- see 'axl --print-prefix')"
+        else
+            echo ""
+            echo "* = current.  'axl use <version>' switches;  'axl prune' removes old ones."
+        fi
+        exit 0
+        ;;
+    update|use|uninstall)
+        # Maintenance runs from the copy INSIDE this prefix, so it works
+        # without the original download and always matches what is installed.
+        # Not commands in libexec/axl (install.sh stages 0644 there, so the
+        # command scan skips it) -- they are spelled out here because
+        # "update" and "uninstall" are the words people reach for, and
+        # `axl install` would be a confusing third spelling of the same thing.
+        #
+        # ONE name each. rustup and uv say "self update" because they manage
+        # OTHER things and must distinguish updating themselves from updating
+        # what they installed. `axl` manages nothing else -- the SDK IS the
+        # product -- so that distinction does not exist here, and a
+        # `self-update` alias would be the same second spelling this comment
+        # just refused for `install`.
+        # SELF-HEAL BEFORE GIVING UP (§20). install.sh now pins `axl` to the
+        # newest prefix that carries a staged installer -- but a user who is
+        # ALREADY stranded cannot run install.sh to get that fix, because
+        # fetching it is the very thing they lost. So look sideways: any
+        # sibling prefix under the same root will do, newest first.
+        _inst="$LIBEXEC/install.sh"
+        if [[ ! -r "$_inst" ]]; then
+            _root="$(dirname "$PREFIX")"
+            while read -r _cand; do
+                [[ -r "$_cand" ]] || continue
+                _inst="$_cand"; break
+            done < <(ls -d "$_root"/axl-sdk-*/libexec/axl/install.sh 2>/dev/null \
+                     | sort -V -r)
+        fi
+        if [[ ! -r "$_inst" ]]; then
+            echo "axl: no installer at $LIBEXEC/install.sh, and no other" >&2
+            echo "     version under $(dirname "$PREFIX") has one either." >&2
+            echo "     This SDK was not placed by install.sh (a source-tree" >&2
+            echo "     stage, or an unpacked tarball). Re-run install.sh from" >&2
+            echo "     the releases page:" >&2
+            echo "       curl -fsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/install.sh" >&2
+            exit 1
+        fi
+        _verb="$1"; shift
+        _root="$(dirname "$PREFIX")"
+        _bin="${AXL_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+        case "$_verb" in
+            uninstall)
+                exec sh "$_inst" --uninstall --prefix "$_root" --bin-dir "$_bin" "$@"
+                ;;
+            use)
+                [[ $# -ge 1 ]] || { echo "axl: use needs a version (try 'axl list')" >&2; exit 2; }
+                _v="$1"; shift
+                exec sh "$_inst" --use "$_v" --prefix "$_root" --bin-dir "$_bin" "$@"
+                ;;
+            update)
+                # NO --version here, deliberately. "update" means go to the
+                # newest; `axl update --version 4.3.0` would be a downgrade
+                # wearing the word update. Selecting a version is `axl use`,
+                # which is instant when that version is already on disk -- and
+                # `axl prune` keeps one previous precisely so it usually is.
+                for _a in "$@"; do
+                    case "$_a" in
+                        --version|--version=*)
+                            echo "axl: 'update' always moves to the newest release." >&2
+                            echo "     To select a version:  axl use <version>" >&2
+                            exit 2
+                            ;;
+                    esac
+                done
+                exec sh "$_inst" --prefix "$_root" --bin-dir "$_bin" "$@"
+                ;;
+        esac
+        ;;
     --print-prefix)
         # AXL-Distribution-Design.md §6 lists this as MISSING and names the
         # cost: it is why a consumer hardcodes /usr/include/axl-sdk. Bare
@@ -129,15 +250,37 @@ case "${1-}" in
         exit 0
         ;;
     --print-version|--version)
-        if [[ -r "$VERSION_FILE" ]]; then
-            # `cat` rather than echoing a compiled-in string: the staged file
-            # is written from the tree's VERSION by install.sh, so there is
-            # nothing here that can disagree with what was installed.
-            cat "$VERSION_FILE"
-            exit 0
+        # TWO callers, two shapes. --print-version is a machine interface, like
+        # --print-prefix beside it: a bare value, no banner. --version is the
+        # human one and matches every other AXL command -- "<prog> <version>",
+        # the shape AXL_TOOL_MAIN gives all 37 target tools. Answering both
+        # with a bare string made `axl` the one command whose --version output
+        # you could not tell from a stray line of build noise.
+        # Staged: `cat` the file install.sh wrote from the tree's VERSION, so
+        # nothing here can disagree with what was installed. Run from a
+        # CHECKOUT there is no such file, and the source copy used to answer
+        # "no version file at .../share/axl/version" and exit 1 -- the one AXL
+        # command that could not say what it was.
+        # CHECKOUT FIRST. A staged prefix has no top-level VERSION file, so
+        # this only fires in a source tree -- where it must win, because
+        # `install.sh --prefix .` leaves a share/axl/version at the repo root
+        # that then answers for whatever build was last installed there. That
+        # inversion is the exact wrong answer axl-cc refuses outright, and
+        # reading VERSION_FILE first reintroduced it here.
+        if [[ -r "$PREFIX/VERSION" ]]; then
+            AXL_VER="$(cat "$PREFIX/VERSION")"
+        elif [[ -r "$VERSION_FILE" ]]; then
+            AXL_VER="$(cat "$VERSION_FILE")"
+        else
+            echo "axl: no version file at $VERSION_FILE" >&2
+            exit 1
         fi
-        echo "axl: no version file at $VERSION_FILE" >&2
-        exit 1
+        if [[ "$1" == "--version" ]]; then
+            printf 'axl %s\n' "$AXL_VER"
+        else
+            printf '%s\n' "$AXL_VER"
+        fi
+        exit 0
         ;;
 esac
 

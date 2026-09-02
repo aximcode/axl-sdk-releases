@@ -330,11 +330,6 @@ axl_http_server_use_tls(
         return AXL_ERR;
     }
 
-    if (!axl_tls_available()) {
-        axl_debug("TLS not available: axl_tls_available() reported false");
-        return AXL_ERR;
-    }
-
     if (axl_tls_init() != AXL_OK) {
         return AXL_ERR;
     }

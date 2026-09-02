@@ -37,6 +37,12 @@ import struct
 import sys
 from pathlib import Path
 
+# axl_version.py is staged beside this script. These tools are run by
+# absolute path from the `axl` dispatcher rather than imported as a
+# package, so their own directory is not already on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from axl_version import version_string  # noqa: E402
+
 LOAD_RE = re.compile(
     r"Loading\s+(?:driver|PEIM)\s+at\s+0x([0-9A-Fa-f]+)\s+"
     r"EntryPoint=0x[0-9A-Fa-f]+\s+(\S+)\.efi",
@@ -79,6 +85,9 @@ def elf_text_vma(elf_path: Path) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--version", action="version",
+        version=f"gdb-syms {version_string()}")
     p.add_argument("debugcon_log", type=Path,
                    help="OVMF debugcon log (from `--debugcon FILE`)")
     p.add_argument("--build-dir", type=Path, required=True,

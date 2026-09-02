@@ -90,6 +90,28 @@ check "refuses a MINOR carrying '### Breaking'"        3.3.0 1
 check "allows a MAJOR carrying '### Breaking'"         4.0.0 0
 check "--allow-breaking overrides the patch refusal"   3.2.3 0 --allow-breaking
 
+# --- packaging breaks are a DIFFERENT bucket ------------------------------
+#
+# Semver's MAJOR rule is about incompatible API changes. Renaming a release
+# asset, or ceasing to publish one, breaks a consumer's BUILD SCRIPTS while
+# their code still compiles and links unchanged -- a real break, and not the
+# one semver mandates a major for. Conflating the two forced 4.5.0 to become
+# 5.0.0 for a release in which axl.h did not change.
+#
+# So "### Breaking (packaging)" is permitted below a major. It is NOT silent:
+# the guard must still list the entries, because the whole doctrine here is
+# that the exceptional case says so out loud.
+fixture 4.4.0 "$(printf '### Breaking (packaging)\n- every release asset is renamed\n- the .deb and .rpm are retired\n')"
+check "allows a MINOR carrying '### Breaking (packaging)'"   4.5.0 0
+check "allows a MAJOR carrying '### Breaking (packaging)'"   5.0.0 0
+check "allows a PATCH carrying '### Breaking (packaging)'"   4.4.1 0
+check_names "a packaging break is still LISTED, not passed silently" 4.5.0 \
+      "every release asset is renamed" "the .deb and .rpm are retired"
+
+# ...and the plain heading is unaffected by the new one existing.
+fixture 4.4.0 "$(printf '### Breaking\n- axl_foo() is removed\n\n### Breaking (packaging)\n- an asset is renamed\n')"
+check "an API break still forces a major even beside a packaging one" 4.5.0 1
+
 # --- it must not fire on the ordinary case -------------------------------
 fixture 3.2.2 "$(printf '### Changed\n- a log sweep\n\n### Fixed\n- a bug\n')"
 check "allows a PATCH with no breaking entries"        3.2.3 0

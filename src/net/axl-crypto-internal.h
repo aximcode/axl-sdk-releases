@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-crypto-internal.h
-    Internal shared crypto helpers (AXL_HAVE_TLS only).
+    Internal shared crypto helpers over the vendored mbedTLS.
 **/
 
 #ifndef AXL_CRYPTO_INTERNAL_H

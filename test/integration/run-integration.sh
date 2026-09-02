@@ -113,6 +113,10 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -z "$LOGDIR" ]] && LOGDIR=$(mktemp -d)
 mkdir -p "$LOGDIR"
+# Wall-clock origin for the totals line at the end. $SECONDS is shell
+# uptime, so this is taken once, here, rather than inferred later.
+_RUN_T0=$SECONDS
+: > "$LOGDIR/_durations.txt"
 # The two tally files exist from the start, EMPTY, because their readers count
 # them with `wc -l < FILE 2>/dev/null`. That 2>/dev/null is on `wc`, but the `<`
 # redirect is performed by the SHELL, so a missing file prints
@@ -295,6 +299,11 @@ fi
 # totals for all 164 tests to derive seconds-per-boot for the ones instrumented
 # by count only (see scripts/run-qemu.sh).
 _prof_test_total() {
+    # Always recorded, profile or not: the totals line at the end reports how
+    # much test work the run actually did, and that number is what makes the
+    # difference between "the suite is slow" and "there are 47 minutes of work
+    # in it" a measurement rather than an argument. One append per test.
+    printf '%s\n' "$2" >> "$LOGDIR/_durations.txt"
     [[ -n "${AXL_TEST_PROFILE:-}" ]] || return 0
     printf 'test|%s|%s\n' "$1" "$2" >> "$AXL_TEST_PROFILE"
 }
@@ -553,6 +562,25 @@ if [[ "$_nskip" -gt 0 ]]; then
 else
     echo "integration: $pass passed, $failc failed ($ARCH)"
 fi
+
+# WALL TIME, WORKERS, and the work that was actually done. Without these the
+# suite's cost is invisible and every conversation about it is a guess: the
+# honest shape is ~47 minutes of test work packed into $JOBS workers, so the
+# floor is (summed work / JOBS), not the slowest test. Printing all three shows
+# which one you are up against, and whether the cache is doing its job.
+#
+# JOBS defaults to nproc-2 deliberately -- these are timing-sensitive QEMU
+# guests, and a saturated host makes them flake. That is a correctness choice,
+# not a tuning oversight; raise it only for a run whose failures you are
+# prepared to re-triage.
+_wall=$(( SECONDS - _RUN_T0 ))
+_work=$(awk '{ s += $1 } END { print s + 0 }' "$LOGDIR/_durations.txt" 2>/dev/null || echo 0)
+printf 'integration: %ss wall, %s worker(s), %ss of test work' \
+       "$_wall" "$JOBS" "$_work"
+if [[ "$_work" -gt 0 && "$_wall" -gt 0 ]]; then
+    printf ' (%sx packing)' "$(( (_work + _wall / 2) / _wall ))"
+fi
+echo ""
 # A filtered run NEVER reports as though it were a full one. Same rule
 # verify.sh --only follows, and for the same reason: the failure this tree
 # keeps meeting is a gate that could not see the change reporting the same
@@ -562,10 +590,18 @@ _nc=$(wc -l < "$LOGDIR/_cached.txt" 2>/dev/null | tr -d ' ' || echo 0)
 # Only when something was ACTUALLY skipped. Printed on every run -- which is
 # what a default-on cache would do -- it stops carrying information, and this
 # tree already has the rule that a banner which always fires is not a banner.
+# NOT "re-run with --no-cache for a pre-push gate", which this said until
+# 2026-09-02. ci.yml runs the full uncached suite on EVERY push to main, on a
+# self-hosted runner on this same machine, so a --no-cache run immediately
+# before pushing is the same tests twice on the same hardware -- several
+# minutes of duplicated wall time that also contend with each other.
+# --no-cache belongs to a RELEASE cut (docs/RELEASING.md), where the tagged
+# commit must be certified locally before the tag exists.
 if [[ -n "$CACHE_DIR" && "$_nc" -gt 0 ]]; then
     echo "integration: PARTIAL -- cache: $_nc test(s) SKIPPED as unchanged" \
          "since their last green run. Inputs only; the host environment is not" \
-         "in the key. Re-run with --no-cache for a pre-push gate."
+         "in the key. Pushing? CI re-runs the whole suite uncached anyway --" \
+         "--no-cache here is for cutting a release."
 fi
 if [[ $ONLY_LOCAL -eq 1 ]]; then
     echo "integration: PARTIAL -- only-local: ran the $(printf %d "${#TESTS[@]}") test(s) CI cannot," \

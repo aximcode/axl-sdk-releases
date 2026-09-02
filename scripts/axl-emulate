@@ -32,6 +32,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# axl_version.py is staged beside this script. These tools are run by
+# absolute path from the `axl` dispatcher rather than imported as a
+# package, so their own directory is not already on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from axl_version import version_string  # noqa: E402
+
 # ACPI tables we drop by default on replay. Two categories,
 # both for the same underlying reason: replaying them on top of
 # OVMF's auto-generated tables breaks the guest. See
@@ -502,6 +508,9 @@ def parse_argv(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"axl-emulate {version_string()}")
     parser.add_argument(
         "fixture_dir",
         nargs="?",

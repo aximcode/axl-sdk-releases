@@ -4,8 +4,7 @@
 /** @file axl-crypto-rng.c
     Lazy process-global DRBG shared by the mbedTLS-backed crypto modules.
 
-    Compiles to nothing without AXL_HAVE_TLS (the consumers only call
-    axl_crypto_rng() from their own AXL_HAVE_TLS paths).
+    Compiled into every build — mbedTLS is an unconditional dependency.
 **/
 
 #include <axl/axl-crypto.h>

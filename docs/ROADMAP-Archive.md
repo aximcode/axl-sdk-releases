@@ -2984,7 +2984,7 @@ during code review and refactor work, not during original planning.
 
 ## Real-hardware findings — Dell PowerEdge XE7745 (iDRAC10), May 2026
 
-Empirical session against actual hardware (svc tag KCH0TD1) shook out a
+Empirical session against actual hardware (svc tag <svc-tag>) shook out a
 number of discoveries and followups that would never have surfaced in
 QEMU. Tracked as a single section so the cross-cutting fixes don't get
 lost in per-phase backlogs.
@@ -3221,7 +3221,7 @@ loop (`docs/HW-Testing-Workflow.md`). Catalog of new findings:
       Resolved 2026-05-05: `axl_net_list_interfaces` now enumerates
       IP4Config2 handles separately and correlates to SNP by MAC,
       so it picks up Dell's child-handle binding correctly. HW-
-      validated on XE7745 — eth0 (DHCP) now shows 10.9.177.98 with
+      validated on XE7745 — eth0 (DHCP) now shows <host-eth0-ip> with
       netmask 255.255.254.0; eth1 shows static 169.254.1.2 with
       gateway 169.254.1.1.
 
@@ -3255,12 +3255,12 @@ loop (`docs/HW-Testing-Workflow.md`). Catalog of new findings:
       are built before any tool tries to link.
 
 - [ ] **HTTPS to iDRAC eth0 routed address times out cleanly.**
-      `https://10.215.120.97/` from the host's RTL8153 NIC stalls
-      ~10s then "request failed". `http://10.215.120.97/`, ICMP, and
+      `https://<idrac-ip>/` from the host's RTL8153 NIC stalls
+      ~10s then "request failed". `http://<idrac-ip>/`, ICMP, and
       `https://169.254.1.1/` (same iDRAC, different NIC) all work —
       so axl-sdk's TLS path is healthy. Strongly suggests corp
       network policy blocks 443/tcp on the segment between the host
-      eth0 and 10.215.120.97. Captured here so a future investigator
+      eth0 and <idrac-ip>. Captured here so a future investigator
       doesn't waste time chasing it as an axl-sdk bug.
 
 ### Confirmed-still-working on real hardware (2026-05-05/06 sweep)
@@ -3546,8 +3546,8 @@ End-to-end re-tested via the axl-webfs PUT loop. All passed
       PLT-stubbed symbol whose GOT slot held the link-time RVA
       (0x56D00) rather than a runtime address. **Empirically
       confirmed working on real hardware 2026-05-05** against XE7745
-      (svc tag KCH0TD1, iDRAC10 at 10.215.120.97):
-      `rfbrowse.efi -v -u root -p calvin -b 10.215.120.97` returned
+      (svc tag <svc-tag>, iDRAC10 at <idrac-ip>):
+      `rfbrowse.efi -v -u root -p calvin -b <idrac-ip>` returned
       HTTP 200 with full Redfish service-root JSON (1805 bytes,
       RedfishVersion 1.22.0). TLS handshake completed (`tls:
       initialized (mbedTLS)`); SNP came up via core drivers in 4s,
@@ -3558,7 +3558,7 @@ End-to-end re-tested via the axl-webfs PUT loop. All passed
 - [x] **`axl_http_client` does not decode `Transfer-Encoding:
       chunked` response bodies.** Surfaced + RESOLVED 2026-05-05 on
       XE7745, **empirically validated end-to-end** against iDRAC10:
-      `RfBrowse.efi -v -u root -p calvin -b 10.215.120.97
+      `RfBrowse.efi -v -u root -p calvin -b <idrac-ip>
       /redfish/v1/Systems/System.Embedded.1` returns the full
       multi-KB chunked Dell ComputerSystem JSON (PCIe device list,
       DIMM topology, OEM Dell extensions, etc.). The fix landed in
@@ -3928,7 +3928,7 @@ fine-grained thermal data from UEFI on these platforms.
       specific listening interface.** `axl_tcp_listen` currently
       auto-picks via `tcp_find_service_binding(NULL, NULL, ...)`
       which lands on the first non-zero handle. On a multi-NIC
-      host (laptop curl path needs eth0 = 10.9.177.98; in-band
+      host (laptop curl path needs eth0 = <host-eth0-ip>; in-band
       BMC path needs eth1 = 169.254.1.2), the user has no way to
       pick. The TCP layer already plumbs a source-IP through
       `axl_tcp_connect_via`; the listen path needs a sibling.

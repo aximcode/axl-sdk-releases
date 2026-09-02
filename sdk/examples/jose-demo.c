@@ -19,8 +19,8 @@
         ./scripts/install.sh --arch x64
         ./out/bin/axl-cc sdk/examples/jose-demo.c -o jose-demo.efi
     then run jose-demo.efi under run-qemu.sh. JOSE is compiled into every
-    build; the axl_jose_available() check below is kept because a consumer
-    should still branch on it rather than assume.
+    build and axl_jose_available() is a guaranteed true, so there is no
+    availability branch for a consumer to write.
 **/
 
 #include <axl.h>
@@ -69,11 +69,6 @@ int
 main(void)
 {
     axl_printf("axl-jose demo\n");
-
-    if (!axl_jose_available()) {
-        axl_printf("JOSE not available in this build.\n");
-        return 1;
-    }
 
     // -----------------------------------------------------------------
     // 1. Mint an ES256 key, sign a JWT, verify it against a claim policy.

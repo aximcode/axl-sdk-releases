@@ -102,7 +102,17 @@ if want make && (( ${#MAKE_CHECKS[@]} < 5 )); then
     exit 2
 fi
 
-run() { local name="$1"; shift; ( "$@" ) >"$OUT/$name.log" 2>&1; echo $? >"$OUT/$name.rc"; }
+# Each leg records its own wall time. Without this the table said only WHICH
+# leg failed, never which one you were waiting for -- and "verify takes about
+# ten minutes" is not a number you can act on. The TIME column turns the next
+# optimisation into a measurement instead of a guess.
+run() {
+    local name="$1"; shift
+    local t0=$SECONDS
+    ( "$@" ) >"$OUT/$name.log" 2>&1
+    echo $? >"$OUT/$name.rc"
+    echo $(( SECONDS - t0 )) >"$OUT/$name.sec"
+}
 
 want x64  && run x64  env timeout 900 ./test/integration/test-axl.sh &
 want aa64 && run aa64 env TEST_SKIP_RATCHET=1 timeout 900 ./test/integration/test-axl.sh --arch AARCH64 &
@@ -136,7 +146,7 @@ if want makeimg; then
 fi
 
 fail=0
-printf '%-6s %-4s %s\n' JOB RC DETAIL
+printf '%-6s %-4s %6s %s\n' JOB RC TIME DETAIL
 for j in "${JOBS[@]}"; do
     rc=$(cat "$OUT/$j.rc" 2>/dev/null || echo '?')
     case "$j" in
@@ -151,7 +161,8 @@ for j in "${JOBS[@]}"; do
         make)     detail="$(grep -c ': clean' "$OUT/$j.log") gate lines clean" ;;
         makeimg)  detail="$(grep -c ': clean\|: OK' "$OUT/$j.log") image gate(s) clean (serial: they build)" ;;
     esac
-    printf '%-6s %-4s %s\n' "$j" "$rc" "${detail:-see $OUT/$j.log}"
+    _sec=$(cat "$OUT/$j.sec" 2>/dev/null || echo '?')
+    printf '%-6s %-4s %5ss %s\n' "$j" "$rc" "$_sec" "${detail:-see $OUT/$j.log}"
     [[ "$rc" == "0" ]] || fail=1
 done
 

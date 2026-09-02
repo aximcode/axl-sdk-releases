@@ -2,7 +2,7 @@
 
 This AXL SDK distribution statically links the following third-party
 components into `libaxl.a` and into the pre-built tool `.efi` binaries
-shipped in the `axl-sdk-tools-*.tar.gz` tarballs. Each component retains
+shipped in the `axl-sdk-uefi-tools-*.tar.gz` tarballs. Each component retains
 its original copyright and license. The full license text of each
 component is included in the `third_party/<component>/` subdirectory
 next to this file.
@@ -247,7 +247,7 @@ recipe. See `third_party/edk2/README.md`.
 - **Full license texts:** `third_party/ipxe/COPYING.GPLv2`,
   `third_party/ipxe/COPYING.UBDL`
 
-`axl-sdk-tools-{x64,aa64}.tar.gz` ships
+`axl-sdk-uefi-tools-*-{x64,aa64}.tar.gz` ships
 `drivers/<arch>/ipxe-all.efidrv` — an unmodified upstream iPXE build
 of `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB) — as a universal NIC driver
 fallback. Covers Intel (e1000 / e1000e / i219 / i225), Broadcom

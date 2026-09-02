@@ -2,60 +2,51 @@ Getting Started
 ===============
 
 Build and run your first UEFI application with the AXL SDK. No EDK2
-source tree needed — just a C compiler and a linker.
-
-Prerequisites
--------------
-
-- **GCC** (native for x64, cross-compiler ``aarch64-linux-gnu-gcc`` for AARCH64)
-- **binutils** (``ld``, ``objcopy``, ``ar``)
-- **QEMU** + **OVMF** for testing (optional but recommended)
-
-On Fedora/RHEL::
-
-    dnf install gcc binutils qemu-system-x86 edk2-ovmf
-    # For AARCH64 cross-builds:
-    dnf install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-
-On Ubuntu/Debian::
-
-    apt install gcc binutils qemu-system-x86 ovmf
-    # For AARCH64 cross-builds:
-    apt install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+source tree needed, and nothing from your distribution's toolchain.
 
 Install the SDK
 ---------------
 
-The quickest path is a prebuilt package from the
-`latest release <https://github.com/aximcode/axl-sdk-releases/releases/latest>`_.
-On Debian/Ubuntu::
+Three commands, the same on every distribution::
 
-    curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk.deb
-    sudo apt install ./axl-sdk.deb
+    curl -fsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/install.sh
+    sh install.sh --help
+    sh install.sh
 
-On Fedora/RHEL::
+The installer resolves the latest version, verifies the download
+against ``SHA256SUMS``, unpacks into a versioned directory under
+``~/.local/share`` and links the commands into ``~/.local/bin``.
+One archive carries both x64 and aa64 UEFI target libraries.
+Afterwards ``axl update``, ``axl use <version>``, ``axl list`` and
+``axl uninstall`` maintain the install from inside it.
 
-    curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk.rpm
-    sudo dnf install ./axl-sdk.rpm
+Then add the cross toolchain for the firmware you are **building
+for**::
 
-Each package bundles both x64 and aa64 UEFI target libraries and
-installs ``axl-cc`` to ``/usr/bin/axl-cc``.
+    axl-install-toolchain x64          # or: aa64, or: all
 
-Build from source
-^^^^^^^^^^^^^^^^^
+That is a choice about your TARGET, not about your host, so the
+installer does not guess it -- the wrong one is a 239 MB (x64) or
+500 MB (aa64) download. ``sh install.sh --toolchain x64`` does both
+in one command once you know which you want.
 
-Clone the release repo and run the installer to produce the
-same FHS layout under a prefix of your choice::
+**AXL builds no target code with your host's gcc** -- both arches
+use pinned bare-metal crosses (AXL's ``x86_64-elf`` and ARM's
+``aarch64-none-elf``) under ``/opt``, which is why there is no
+``apt install gcc-aarch64-linux-gnu`` step here and why a
+glibc-targeted cross cannot build against these headers.
 
-    git clone https://github.com/aximcode/axl-sdk-releases.git
-    cd axl-sdk-releases
-    git checkout v0.1.3   # or any tagged release
-    ./scripts/install.sh --arch x64 --prefix "$PWD/out"
-    export PATH="$PWD/stage/bin:$PATH"
+The only host commands the SDK needs are ``curl``, ``tar``,
+``sha256sum``, ``awk``, ``tr`` and ``xz``.
 
-For a tarball instead of a clone, use the **Source code
-(tar.gz)** link on each
-`release page <https://github.com/aximcode/axl-sdk-releases/releases>`_.
+QEMU and OVMF are needed to *run* a ``.efi``, not to build one.
+The installer probes for them and prints your distribution's
+install command if they are absent; it never installs them
+silently.
+
+See the `README <https://github.com/aximcode/axl-sdk-releases#install-the-sdk>`_
+for pinning a version, installing from a mirror with
+``--base-url``, and the host-tools-only install.
 
 Write a Hello World
 -------------------
@@ -86,12 +77,15 @@ That's it — one command, 11KB binary, zero external dependencies.
 Run in QEMU
 ------------
 
-The ``run-qemu.sh`` script creates a FAT32 disk image, copies your
-EFI binary, and boots QEMU with OVMF::
+``run-qemu`` creates a FAT32 disk image, copies your EFI binary,
+and boots QEMU with OVMF::
 
-    ./scripts/run-qemu.sh hello.efi
+    axl run-qemu hello.efi
 
-You should see ``Hello from UEFI!`` on the QEMU console.
+You should see ``Hello from UEFI!`` on the QEMU console. Every
+host-side tool is reached as ``axl <verb>``; ``axl --help`` lists
+them. From a source checkout the same script is
+``./scripts/run-qemu.sh``.
 
 C++ Quickstart
 --------------
@@ -119,40 +113,64 @@ Build::
     # or equivalently:
     axl-cc hello.cpp -o hello.efi
 
-The C++ toolchain bakes in the freestanding-UEFI flag set:
+The C++ driver bakes in the freestanding-UEFI flag set:
 ``-std=c++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics``
 plus per-arch additions (``-ffixed-x18`` on AArch64,
-``-mno-red-zone`` on X64).  These are hard defaults — consumers
-can't opt in to exceptions or RTTI because the freestanding link
-won't satisfy libsupc++ symbols.
+``-mno-red-zone`` on X64).  These are *defaults*, not hard limits.
 
-**AArch64 needs the ARM bare-metal toolchain**
-(``aarch64-none-elf-g++``).  axl-sdk ships an installer::
+**The standard containers work, with no flag.**  ``std::vector``,
+``std::string``, ``std::map`` and ``std::unordered_map`` link on
+both arches, because every C++ link carries the toolchain's own
+``libstdc++`` / ``libsupc++``::
 
-    ./scripts/install-arm-toolchain.sh
+    axl-c++ app.cpp -o app.efi        # <vector>, <string>, <map>, ...
 
-Fetches + sha256-verifies + extracts the pinned tarball to
-``/opt/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf/``.
-Idempotent — re-running on an already-installed system exits
-cleanly.  ``install.sh`` auto-detects this path and builds C++
-support when the toolchain is present.
+**Exceptions and RTTI are a per-TU opt-in**, not forbidden::
 
-**Usable libstdc++ subset** (all header-only — no link dependency):
+    axl-c++ -fexceptions app.cpp -o app.efi
+    axl-c++ -frtti       app.cpp -o app.efi
 
-- Always-freestanding: ``<type_traits>``, ``<utility>``,
-  ``<initializer_list>``, ``<new>``, ``<bit>``, ``<concepts>``,
-  ``<compare>``, ``<source_location>``, ``<cstddef>``,
-  ``<cstdint>``, ``<limits>``
-- Practically usable: ``<array>``, ``<span>``, ``<string_view>``,
-  ``<tuple>``, ``<optional>``, ``<variant>``, ``<expected>``
-  (C++23), header-only subsets of ``<algorithm>`` /
-  ``<numeric>`` / ``<functional>``
+They are off by default because they are not free: measured on
+four real x64 tools, enabling exceptions cost **+153,886 to
++178,118 bytes (+28-36%)** of ``.efi``.  ``<iostream>``,
+``<sstream>`` and ``<fstream>`` work too and cost roughly 734 KB of
+``.text`` — which is why ``axl::cout`` (about 700 bytes over
+``axl_printf``) remains the default way to print.
 
-**Forbidden** (require libsupc++/libstdc++ symbols we don't have):
-exceptions (``throw`` / ``catch``), RTTI (``typeid`` /
-``dynamic_cast``), ``<string>`` / ``<vector>`` / ``<unordered_map>``
-/ ``<stdexcept>``, ``thread_local``, ``<format>``.  See
-:doc:`axlmm-design` for the full constraint list + rationale.
+Because ``-fno-exceptions`` is the default, **every AXL C++ header
+must compile in both modes**, which is why errors are reported as
+``axl::result`` and nothing in the library throws.
+
+.. note::
+
+   ``--hosted`` no longer exists.  The thing it switched on is now
+   unconditional, so ``axl-c++`` **refuses** the flag rather than
+   accepting it as a no-op — delete it from your build; the output
+   is unchanged.
+
+``axl::string`` is kept alongside ``std::string`` deliberately:
+under ``-fno-exceptions`` ``std::string`` *halts* on allocation
+failure, while ``axl::string`` sets ``bad()``, which is what lets
+``axl::cin`` report ``AXL_NO_RESOURCES``.  It is also smaller —
+564 bytes against 1045.
+
+**Both arches need a bare-metal cross toolchain** — AArch64
+``aarch64-none-elf-g++`` and X64 ``x86_64-elf-g++``.  AXL does not
+build target code with the host's gcc.  One installer covers both::
+
+    axl-install-toolchain all              # from an installed SDK
+    ./scripts/install-toolchain.sh all     # from a checkout
+
+Takes ``aa64``, ``x64`` or ``all``.  Fetches + sha256-verifies +
+extracts each pinned tarball under ``/opt``; the versions and exact
+paths are in ``scripts/axl-toolchains.conf``, which is the single
+source of truth for both.  Idempotent — re-running on an
+already-installed system reports it and exits 0 without touching
+anything.
+
+``docs/AXL-Cxx-Design.md`` in the source tree covers the rest of the
+C++ layer: ``axl::result``, ``axl::arena_allocator``,
+``axl::unique_handle`` and the seam headers over the C containers.
 
 Mixed C/C++ projects work naturally — pass any combination of
 ``.c`` and ``.cpp`` sources to ``axl-cc`` and the right compiler
