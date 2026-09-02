@@ -71,5 +71,50 @@ release_gate_covers "$REL" >/dev/null 2>&1
 check "stamp from an unrelated commit -> refuses" "$?" "1"
 
 echo ""
+
+# --- the release commit must skip ci.yml, and only ci.yml ------------------
+#
+# cut-release.sh pushes the release commit to main BEFORE tagging, and ci.yml
+# triggers on push -- so a release ran the full integration suite twice on this
+# box: once as the local pre-release gate, once from that push, for a commit
+# whose content is a version string and a date. release.yml then builds and
+# tests it a third time on the tag.
+#
+# The marker is spelled in two files that cannot import each other, which is
+# the drift shape this tree keeps paying for. Hold them equal here.
+MARK='[release-cut]'
+CUT="$PROJECT_DIR/scripts/cut-release.sh"
+CI="$PROJECT_DIR/.github/workflows/ci.yml"
+
+grep -qF -- "$MARK" "$CUT"
+check "cut-release.sh writes the skip marker" "$?" "0"
+
+n_guard=$(grep -cF -- "!contains(github.event.head_commit.message, '$MARK')" "$CI")
+# Job keys are the 2-space-indented mappings under `jobs:`, and nothing else --
+# an anchored `^  name:` regex over the whole file also catches step keys and
+# matrix entries, which is how this first read "3 of 5".
+n_jobs=$(awk '/^jobs:/{inj=1;next} /^[^[:space:]]/{inj=0}
+              inj && /^  [A-Za-z][A-Za-z0-9_-]*:[[:space:]]*$/{n++}
+              END{print n+0}' "$CI")
+[[ "$n_guard" -eq "$n_jobs" && "$n_guard" -gt 0 ]]
+check "every ci.yml job is guarded by it ($n_guard of $n_jobs)" "$?" "0"
+
+# NOT `[skip ci]`: GitHub honours that natively by inspecting the pushed HEAD
+# commit, and the TAG push carries the same commit -- it would skip release.yml
+# and docs.yml too and publish nothing at all.
+#
+# Comments stripped first. The comment in cut-release.sh explaining why we do
+# NOT use `[skip ci]` contains the string, so scanning the raw file finds it
+# and fails -- a check that cannot survive its own subject being discussed.
+! sed 's/#.*//' "$CUT" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'
+check "the marker is OURS, not a GitHub-native skip string" "$?" "0"
+
+# ...and the publish workflows must carry no such guard, or a release would
+# silently not publish.
+for _wf in release docs; do
+    ! grep -qF -- "$MARK" "$PROJECT_DIR/.github/workflows/$_wf.yml"
+    check "$_wf.yml does NOT skip on the marker" "$?" "0"
+done
+
 echo "release-gate: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

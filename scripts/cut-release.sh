@@ -326,7 +326,7 @@ make check-version >/dev/null && note "check-version OK"
 if $DRY_RUN; then
     say "DRY RUN — release-metadata diff that WOULD be committed"
     git --no-pager diff -- VERSION include/axl/axl-version.h CHANGELOG.md
-    note "DRY RUN — would: git commit -m 'release: $TAG' && git push origin main"
+    note "DRY RUN — would: git commit -m 'release: $TAG' (+ [release-cut]) && git push origin main"
     note "DRY RUN — would: wait for CI green, then tag + push + watch + confirm"
     restore_metadata
     trap - EXIT INT TERM HUP
@@ -336,7 +336,23 @@ fi
 
 say "Committing release metadata + pushing main"
 git add VERSION include/axl/axl-version.h CHANGELOG.md
-git commit -q -m "release: $TAG"
+# THE MARKER IS WHY CI DOES NOT RUN ON THIS COMMIT.
+#
+# ci.yml triggers on every push to main, and cut-release.sh pushes this commit
+# before tagging -- so a release ran the whole integration suite twice on the
+# same box: once as the LOCAL pre-release gate (which is the authoritative one,
+# see RELEASING.md) and again from this push, minutes later, for a commit whose
+# entire content is a version string and a date. The tag then builds and tests
+# everything a third time in release.yml.
+#
+# NOT `[skip ci]`. GitHub honours that natively, but it inspects the pushed
+# HEAD commit -- and the TAG push carries this same commit, so it would very
+# likely skip release.yml and docs.yml too and silently publish nothing. This
+# marker is ours, GitHub gives it no meaning, and only ci.yml looks for it.
+git commit -q -m "release: $TAG
+
+[release-cut] ci.yml skips this commit: the local suite gated it before the
+cut, and release.yml builds and tests it again on the tag. See RELEASING.md."
 # The bump is committed — there is nothing left to restore, and a later failure
 # (e.g. the push) must NOT roll the working tree back over the commit.
 trap - EXIT INT TERM HUP

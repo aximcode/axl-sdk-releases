@@ -28,6 +28,28 @@ set -eu
 REPO="aximcode/axl-sdk-releases"
 BASE="https://github.com/${REPO}/releases"
 
+# AXL_INSECURE_FETCH=1 -- skip TLS verification on the downloads below.
+#
+# FOR A CORPORATE MITM PROXY. Dell (and others) intercept HTTPS org-wide with a
+# CA a fresh machine does not trust, so these fetches die at TLS on a host that
+# is otherwise fine. Requiring every such user to install a corporate CA chain
+# is per-machine setup we can avoid.
+#
+# WHAT IT ACTUALLY COSTS, stated precisely because the honest answer differs by
+# script. `scripts/install-toolchain.sh` verifies against a SHA256 that SHIPS IN
+# THE SDK (axl-toolchains.conf) -- pre-shared, out-of-band, and no attacker can
+# forge an artifact to match it, so `-k` there costs nothing at all.
+#
+# HERE IT IS WEAKER. This script verifies against SHA256SUMS, which it fetches
+# from the SAME base URL as the assets -- so with TLS off, whoever can substitute
+# an asset can substitute the sums that vouch for it. The guarantee drops from
+# AUTHENTICATED to CORRUPTION-RESISTANT. It is still worth having (a truncated
+# or mangled download is caught), and it is genuinely sound for a caller that
+# pinned the hashes out-of-band -- which the flagship consumer does. But it is
+# not "the hash is the trust anchor", and main() says so out loud when the flag
+# is on rather than letting the weaker guarantee read as the stronger one.
+INSECURE=""
+
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
 warn() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -56,6 +78,15 @@ usage: sh install.sh [options]
   --force             reinstall even if that version is already present
   --prune             after installing, offer to remove superseded versions
   --base-url URL      fetch from here instead of GitHub (mirror, or a local dir)
+
+Environment:
+  AXL_INSECURE_FETCH=1  skip TLS verification when downloading. For a host
+                      behind a corporate MITM proxy whose CA is not installed.
+                      Downloads are still checked against SHA256SUMS -- but
+                      SHA256SUMS is fetched over the same connection, so this
+                      protects against corruption, NOT against a substitution
+                      by whoever is intercepting. Sound if you pinned the
+                      hashes yourself, out of band.
   -y, --yes           do not prompt
   -h, --help          this
 
@@ -147,7 +178,7 @@ do_uninstall() {
 resolve_version() {
     [ -n "$VERSION" ] && return 0
     _vurl="${BASE_URL:-$BASE/latest/download}/VERSION"
-    VERSION="$(curl -fsSL "$_vurl" 2>/dev/null | tr -d ' \t\r\n')" \
+    VERSION="$(curl $INSECURE -fsSL "$_vurl" 2>/dev/null | tr -d ' \t\r\n')" \
         || die "could not resolve the latest version from $_vurl"
     [ -n "$VERSION" ] || die "the VERSION asset at $_vurl was empty"
 }
@@ -222,7 +253,7 @@ fetch_and_verify() {
     # download 404s -- a 404 and an unreachable mirror are the same failed
     # curl. It also stops 13 MB being spent before we learn there is nothing
     # to check it against.
-    curl -fsSL -o "$WORK/SHA256SUMS" "$DL/SHA256SUMS" \
+    curl $INSECURE -fsSL -o "$WORK/SHA256SUMS" "$DL/SHA256SUMS" \
         || die "could not download $DL/SHA256SUMS"
 
     ASSET=""; _tried=""
@@ -232,7 +263,7 @@ fetch_and_verify() {
     done
     [ -n "$ASSET" ] || die "release $VERSION publishes none of:$_tried"
 
-    curl -fsSL -o "$WORK/$ASSET" "$DL/$ASSET" || die "could not download $DL/$ASSET"
+    curl $INSECURE -fsSL -o "$WORK/$ASSET" "$DL/$ASSET" || die "could not download $DL/$ASSET"
     sums_line "$WORK/SHA256SUMS" "$ASSET" > "$WORK/want.sha256"
     ( cd "$WORK" && sha256sum -c want.sha256 >/dev/null 2>&1 ) \
         || die "SHA256 mismatch for $ASSET -- refusing to install"
@@ -324,6 +355,22 @@ link_tree() {
 # are per-version TOOLS and must follow the active SDK -- that is the whole
 # point of switching.
 link_manager() {
+    # THE MANAGER IS THE HOST-TOOLS COMPONENT (§20 M2). It is preferred over
+    # every SDK prefix, and it needs no new root to be safe: `axl prune` prunes
+    # `^axl-sdk-[0-9]` and this is `axl-sdk-host-tools-<ver>`, so it is already
+    # outside what prune walks, and `axl use` only ever moves the SDK marker.
+    #
+    # Linked through the `current` marker rather than the versioned directory,
+    # so upgrading the manager does not have to relink anything.
+    _mgr="$PREFIX_ROOT/axl-sdk-host-tools"
+    if [ -x "$_mgr/bin/axl" ] && [ -f "$_mgr/libexec/axl/install.sh" ]; then
+        ensure ln -sfn "$_mgr/bin/axl" "$BIN_DIR/axl"
+        return 0
+    fi
+
+    # No manager installed: fall back to the newest SDK prefix that can still
+    # self-update (§20 M1). That is what stops a rollback stranding an install
+    # that predates M2.
     _best=""; _best_v=""
     for _p in "$PREFIX_ROOT"/axl-sdk-*; do
         [ -x "$_p/bin/axl" ] || continue
@@ -363,6 +410,53 @@ do_use() {
         link_tree
     fi
     printf '\n  now using %s %s\n' "$LABEL" "$VERSION"
+}
+
+# INSTALL THE MANAGER ALONGSIDE THE SDK (§20 M2).
+#
+# The SDK prefix carries `axl` too, so this is ~0.36 MB of duplication -- and
+# it is what buys a manager that does not move when the SDK does. Without it,
+# `axl` lives inside a versioned tree that `axl use` repoints and `axl prune`
+# can remove, which is the defect §20.1 measured.
+#
+# Skipped when installing --host-tools (that IS the manager), and skipped when
+# one is already present: re-fetching it on every SDK install would make
+# `axl update` slower for no gain.
+ensure_manager() {
+    [ "$COMPONENT" = "sdk" ] || return 0
+    _m="$PREFIX_ROOT/axl-sdk-host-tools"
+    [ -x "$_m/bin/axl" ] && [ -f "$_m/libexec/axl/install.sh" ] && return 0
+
+    # DOES THIS RELEASE EVEN HAVE ONE? Checked against the SHA256SUMS already
+    # downloaded for the SDK -- same release, so it is the authority. Without
+    # this the manager install would reach fetch_and_verify, which `die`s
+    # rather than returning, and a release or mirror carrying no host-tools
+    # asset would kill an SDK install that used to work. `if
+    # fetch_and_verify` cannot catch that: die() exits the script.
+    if [ -f "${WORK:-}/SHA256SUMS" ] \
+       && ! sums_line "$WORK/SHA256SUMS" "axl-sdk-host-tools-$VERSION.tar.gz" >/dev/null \
+       && ! sums_line "$WORK/SHA256SUMS" "axl-sdk-host-tools.tar.gz" >/dev/null; then
+        info "this release publishes no host-tools component -- skipping the manager"
+        return 0
+    fi
+
+    info "installing the host tools as the manager"
+    # Save and restore the SDK's own state: this reuses the same fetch and
+    # extract path, and leaving COMPONENT flipped would make every later step
+    # -- toolchain, prune, the closing banner -- describe the wrong component.
+    _sdk_dir="$DIR"; _sdk_stem="$STEM"; _sdk_cur="$CURRENT"
+    _sdk_label="$LABEL"; _sdk_asset="${ASSET:-}"; _sdk_ver="$VERSION"
+    COMPONENT="host-tools"; STEM="axl-sdk-host-tools"
+    CURRENT="axl-sdk-host-tools"; LABEL="AXL host tools"
+    if fetch_and_verify && extract_tree; then
+        link_tree
+    else
+        warn "could not install the host tools; the SDK is installed and usable,"
+        warn "  but 'axl update' will fall back to the SDK's own copy."
+    fi
+    COMPONENT="sdk"; DIR="$_sdk_dir"; STEM="$_sdk_stem"; CURRENT="$_sdk_cur"
+    LABEL="$_sdk_label"; ASSET="$_sdk_asset"; VERSION="$_sdk_ver"
+    return 0
 }
 
 # QEMU is the one thing the packages did that a script cannot: a script cannot
@@ -444,6 +538,19 @@ main() {
     WORK=""; STAGE=""
     trap cleanup EXIT INT TERM
     parse_args "$@"
+
+    if [ "${AXL_INSECURE_FETCH:-0}" = "1" ]; then
+        INSECURE="-k"
+        # Said out loud, every time. The doctrine this tree already follows for
+        # log levels and the semver guard: make the exceptional case announce
+        # itself, so nobody discovers later that a build was fetching without
+        # TLS and assumed the hash covered it.
+        warn "AXL_INSECURE_FETCH=1 -- TLS verification is OFF for downloads."
+        warn "  Assets are still checked against SHA256SUMS, but SHA256SUMS is"
+        warn "  fetched over the same connection: this protects against a"
+        warn "  corrupted download, not against substitution by whoever is"
+        warn "  intercepting. Sound only if you pinned the hashes out of band."
+    fi
     need_cmd curl
     need_cmd tar
     need_cmd sha256sum
@@ -475,6 +582,8 @@ main() {
     fetch_and_verify
     extract_tree
     link_tree
+    ensure_manager
+    link_manager
     check_package_install
     advise_qemu
     advise_python

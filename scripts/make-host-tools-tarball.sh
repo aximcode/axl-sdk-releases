@@ -87,6 +87,17 @@ install -m 0755 "$SDK_DIR/scripts/axl" "$STAGE/bin/axl"
 # EXECUTABLES in libexec/axl) does not offer it as a verb.
 chmod 0644 "$STAGE/libexec/axl/axl_version.py"
 
+# THE INSTALLER SHIPS INSIDE IT (§20's M2). This component is the MANAGER:
+# `axl prune` never removes it (it prunes `^axl-sdk-[0-9]`, and this is not
+# that), and `axl use` never repoints it, so it is the one tree that can still
+# self-update after any rollback. That only works if it carries the installer
+# its verbs exec.
+#
+# 0644 DELIBERATELY, the same as the SDK prefix: `axl` lists the EXECUTABLES in
+# libexec/axl as commands, so a mode bit here would offer `axl install` as a
+# third way to reach the same thing.
+install -m 0644 "$SDK_DIR/packaging/install.sh" "$STAGE/libexec/axl/install.sh"
+
 # `axl --print-version` and axl_version.py both read this; install.sh's
 # already_installed check reads it too.
 echo "$VERSION" > "$STAGE/share/axl/version"

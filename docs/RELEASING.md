@@ -449,6 +449,28 @@ number against the content. It was deleted (zero downloads) and re-cut from the
 It is a backstop, not a substitute for picking the right flow: it catches a
 mislabelled *version*, not unrelated work that happens to be non-breaking.
 
+### The release commit skips CI, on purpose
+
+`cut-release.sh` pushes a `release: vX.Y.Z` commit to `main` before it tags,
+and `ci.yml` triggers on every push to `main`. So a release used to run the
+full integration suite **twice on this box** — once as the local pre-release
+gate, and again from that push, for a commit whose entire content is a version
+string and a date — before `release.yml` built and tested everything a third
+time on the tag.
+
+The release commit therefore carries a `[release-cut]` marker, and every
+`ci.yml` job is conditioned on **not** seeing it.
+
+**It is deliberately not `[skip ci]`.** GitHub honours that string natively —
+by inspecting the pushed HEAD commit — and the **tag** push carries the same
+commit. Using it would very likely skip `release.yml` and `docs.yml` too, and
+publish nothing at all while reporting success. Our marker means nothing to
+GitHub; only `ci.yml` looks for it.
+
+`test-release-gate.sh` holds the two spellings equal (they live in files that
+cannot import each other), asserts every `ci.yml` job is guarded, and asserts
+that `release.yml` and `docs.yml` carry no such guard.
+
 ### Two kinds of breaking change
 
 Semver mandates MAJOR for incompatible **API** changes. Not every break is an

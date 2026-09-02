@@ -3,6 +3,52 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.6.0 — 2026-09-02
+
+### Added
+
+- **`AXL_INSECURE_FETCH=1` — skip TLS verification on the SDK's own downloads.**
+  Opt-in, default off. For a host behind a corporate MITM proxy whose CA is not
+  installed: a coworker on a fresh WSL image could install the SDK and then had
+  `axl-install-toolchain` die at `curl: (60) SSL certificate problem`.
+  Interception is org-wide, so it reaches every consumer behind the proxy.
+
+  **The two sites it affects are not equally safe, and the docs say which is
+  which.** `install-toolchain.sh` verifies against a SHA256 that *ships in the
+  SDK* (`axl-toolchains.conf`) — pre-shared and out-of-band, so no interceptor
+  can forge a tarball matching it, and `-k` there costs nothing.
+  `packaging/install.sh` verifies against a `SHA256SUMS` it fetches from the
+  *same base URL* as the assets, so whoever can substitute one can substitute
+  the other: its guarantee drops from **authenticated** to
+  **corruption-resistant**. That is still useful, and genuinely sound for a
+  caller that pinned hashes out of band — which the flagship consumer does —
+  but it is not "the hash is the trust anchor", and `install.sh` prints exactly
+  that whenever the flag is on.
+
+  A failed toolchain fetch now names both ways out — install the CA, or set the
+  flag — *before* the x64 path falls back to a ~30-minute source build.
+
+### Changed
+
+- **The manager is now its own component (§20 M2).** `install.sh` installs the
+  host-tools component alongside the SDK and links `axl` from *it*, so the
+  thing that manages versions is no longer one of the versioned things.
+  `axl use` and `axl prune` cannot move or remove it: `prune` walks
+  `^axl-sdk-[0-9]` and the manager is `axl-sdk-host-tools-<ver>`, so it needed
+  no new root. `axl-cc`, `axl-c++` and `axl-install-toolchain` still come from
+  the SDK prefix — following the active version is the point of switching it.
+  The host-tools tarball now carries the installer (mode 0644) so the manager
+  can self-update.
+
+### Fixed
+
+- **`axl --print-prefix` named the wrong tree after `axl use`.** It printed the
+  prefix `axl` itself lives in, which was right only while `axl` was always
+  inside the active SDK. It now resolves the `current` SDK marker and follows
+  `axl use`, falling back to its own prefix for a source-tree stage or a
+  host-tools-only install. Every path a consumer wants from it — headers,
+  libs, `share/axl/pci-ids.json5` — is SDK content.
+
 ## 4.5.0 — 2026-09-02
 
 ### Breaking (packaging)

@@ -82,6 +82,16 @@ make_legacy_host_tools() {  # make_legacy_host_tools <dir> <version>
     echo "$v" > "$d/VERSION"
 }
 
+# The MANAGER component as it really ships: bin/axl, libexec (with the staged
+# installer), share/axl/version. No axl-cc -- that is SDK content.
+make_manager_tree() {  # make_manager_tree <dir> <version>
+    local d="$1" v="$2"
+    mkdir -p "$d/bin" "$d/share/axl" "$d/libexec/axl"
+    install -m 0755 "$PROJECT_DIR/scripts/axl" "$d/bin/axl"
+    install -m 0644 "$INSTALLER" "$d/libexec/axl/install.sh"
+    echo "$v" > "$d/share/axl/version"
+}
+
 # publish <reldir> <asset> <root|-> <version> [maker]
 #   <root> archives the tree under that single top-level directory.
 #   '-'    archives its CONTENTS at top level -- a tarbomb, the legacy shape.
@@ -142,7 +152,10 @@ tree_hash() {  # tree_hash <dir>
 # ---------------------------------------------------------------------------
 NEW_REL="$WORK/rel-new"
 publish "$NEW_REL" "axl-sdk-linux-$NEW_VER-x86_64.tar.gz"  "axl-sdk-$NEW_VER"            "$NEW_VER"
-publish "$NEW_REL" "axl-sdk-host-tools-$NEW_VER.tar.gz"    "axl-sdk-host-tools-$NEW_VER" "$NEW_VER"
+# The real host-tools component carries bin/axl and NOTHING else executable --
+# a fixture with bin/axl-cc in it would let the manager shadow the SDK's own
+# tools, and then assert that it does.
+publish "$NEW_REL" "axl-sdk-host-tools-$NEW_VER.tar.gz"    "axl-sdk-host-tools-$NEW_VER" "$NEW_VER" make_manager_tree
 seal    "$NEW_REL" "$NEW_VER"
 
 OLD_REL="$WORK/rel-old"
@@ -310,5 +323,60 @@ grep -q "usage: sh install.sh" "$WORK/heal.log"
 check $? "a stranded axl finds a sibling prefix's installer instead of dying"
 ! grep -q "no installer at" "$WORK/heal.log"
 check $? "...and does not report the old dead end"
+
+# --print-prefix must name the SDK, not whatever tree `axl` happens to live in.
+# §6 gives its purpose as stopping a consumer hardcoding /usr/include/axl-sdk,
+# and every path a consumer wants from it -- headers, libs,
+# share/axl/pci-ids.json5 -- is SDK content. Under §20's M2 `axl` moves into a
+# manager root that holds none of that, so a self-referential answer would send
+# the flagship consumer's PCI_IDS lookup somewhere with no sidecars in it.
+run_installer "$WORK/pp.log" --use "$NEW_VER" --base-url "file://$NEW_REL" \
+    --prefix "$PREFIX" --bin-dir "$BIN"
+_pp="$("$BIN/axl" --print-prefix 2>/dev/null)"
+[[ "$_pp" == "$PREFIX/axl-sdk-$NEW_VER" ]]
+check $? "--print-prefix names the current SDK (got '${_pp:-<empty>}')"
+
+# ...and it follows `axl use`, because that is what "current" means.
+run_installer "$WORK/pp2.log" --use "$OLD_SDK" --base-url "file://$EMPTY_REL" \
+    --prefix "$PREFIX" --bin-dir "$BIN"
+_pp="$("$BIN/axl" --print-prefix 2>/dev/null)"
+[[ "$_pp" == "$PREFIX/axl-sdk-$OLD_SDK" ]]
+check $? "--print-prefix follows \`axl use\` (got '${_pp:-<empty>}')"
+
+echo "=== M2: the manager is its own component ==="
+
+# A clean prefix, so this is the bootstrap's behaviour and not a leftover.
+M2P="$WORK/m2/share"; M2B="$WORK/m2/bin"; mkdir -p "$M2P" "$M2B"
+run_installer "$WORK/m2.log" --base-url "file://$NEW_REL" --prefix "$M2P" --bin-dir "$M2B"
+rc=$?
+
+[[ "$rc" -eq 0 && -d "$M2P/axl-sdk-host-tools-$NEW_VER" ]]
+check $? "installing the SDK also installs the host-tools manager (rc=$rc)" "$WORK/m2.log"
+
+# `axl` comes from the MANAGER, not from the versioned SDK tree.
+_t="$(readlink -f "$M2B/axl" 2>/dev/null)"
+[[ "$_t" == "$(readlink -f "$M2P/axl-sdk-host-tools")/bin/axl" ]]
+check $? "axl resolves to the manager, not the SDK prefix"
+
+# ...while the per-version TOOLS still come from the SDK, which is the whole
+# point of switching versions.
+_c="$(readlink -f "$M2B/axl-cc" 2>/dev/null)"
+[[ "$_c" == "$M2P/axl-sdk-$NEW_VER/bin/axl-cc" ]]
+check $? "axl-cc still resolves into the SDK prefix"
+
+# The manager survives a rollback -- the §20.1 defect, from the other side.
+run_installer "$WORK/m2-use.log" --use "$OLD_SDK" --base-url "file://$OLD_REL" \
+    --prefix "$M2P" --bin-dir "$M2B"
+_t2="$(readlink -f "$M2B/axl" 2>/dev/null)"
+[[ "$_t2" == "$_t" ]]
+check $? "\`axl use <older>\` does not move the manager at all"
+[[ "$(readlink "$M2P/axl-sdk")" == "axl-sdk-$OLD_SDK" ]]
+check $? "...while the SDK marker does follow it"
+
+# And `axl prune` must never remove the manager: it prunes ^axl-sdk-[0-9],
+# which axl-sdk-host-tools-<ver> is not. Asserted, not assumed.
+"$M2B/axl" prune --dry-run > "$WORK/m2-prune.log" 2>&1 || true
+! grep -qE "would remove.*axl-sdk-host-tools" "$WORK/m2-prune.log"
+check $? "axl prune never proposes removing the manager"
 
 test_host_summary "installer asset resolution ($TEST_ARCH)"

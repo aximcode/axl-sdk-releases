@@ -183,6 +183,49 @@ AA64_URL="https://developer.arm.com/-/media/Files/downloads/gnu/${AXL_AA64_TOOLC
 # The checksum comes from the manifest alongside the version it belongs to.
 # Kept apart, a version bump changes the URL but not the sha, and the install
 # fails at `sha256sum -c` with a mismatch that names neither cause.
+# AXL_INSECURE_FETCH=1 -- skip TLS verification for these downloads.
+#
+# SOUND HERE, unlike almost anywhere else, and the reason is worth stating: the
+# expected SHA256 comes from scripts/axl-toolchains.conf, which SHIPS IN THE
+# SDK. It is pre-shared and out-of-band, so it does not travel with the
+# artifact and an interceptor cannot forge a tarball to match it. TLS is
+# authenticating a channel; the pinned hash authenticates the BYTES, which is
+# what we actually care about for a fixed known artifact.
+#
+# It exists because Dell (and others) intercept HTTPS org-wide with a CA a
+# fresh machine does not trust, so this fetch dies at TLS on a host that is
+# otherwise perfectly able to install. Measured: against a store that does not
+# trust the presented cert, plain curl gets http=000 and `curl -k` gets a 302,
+# and the proxy relays the file bytes unchanged so the pinned hash still
+# matches -- and would still fail if it did not.
+#
+# packaging/install.sh honours the same variable but its guarantee is WEAKER:
+# it verifies against a SHA256SUMS it fetches over the same connection. Its
+# warning says so.
+INSECURE_CURL=()
+if [[ "${AXL_INSECURE_FETCH:-0}" == "1" ]]; then
+    INSECURE_CURL=(-k)
+    echo "[install-toolchain] AXL_INSECURE_FETCH=1 -- TLS verification OFF." >&2
+    echo "[install-toolchain]   The tarball is still verified against the SHA256" >&2
+    echo "[install-toolchain]   pinned in axl-toolchains.conf, which ships with the" >&2
+    echo "[install-toolchain]   SDK rather than travelling with the download." >&2
+fi
+
+# Name BOTH ways out. `set -e` used to abort on the failed curl with nothing but
+# curl's own message, and the only guidance a user saw ("install the corporate
+# CA") lived in a downstream consumer's wrapper -- so a direct SDK user got
+# none at all.
+fetch_hint() {
+    echo "" >&2
+    echo "[install-toolchain] download failed. If this is a TLS/certificate error," >&2
+    echo "  the usual cause is a corporate proxy intercepting HTTPS. Two ways out:" >&2
+    echo "    1. install your organisation's CA chain (per machine), or" >&2
+    echo "    2. AXL_INSECURE_FETCH=1 $0 $* " >&2
+    echo "       -- skips TLS verification. The tarball is still checked against" >&2
+    echo "       the SHA256 pinned in scripts/axl-toolchains.conf, which ships" >&2
+    echo "       with the SDK, so tampering is still caught." >&2
+}
+
 AA64_SHA256="${AXL_AA64_TOOLCHAIN_SHA256:-}"
 
 install_aa64() {
@@ -214,7 +257,8 @@ install_aa64() {
     tmp="$(new_tmpdir_dl)"
 
     echo "[install-toolchain] downloading $AA64_TARBALL (~96 MB) ..."
-    curl -fL --progress-bar -o "$tmp/$AA64_TARBALL" "$AA64_URL"
+    curl "${INSECURE_CURL[@]}" -fL --progress-bar -o "$tmp/$AA64_TARBALL" "$AA64_URL" \
+        || { fetch_hint "$@"; return 1; }
 
     echo "[install-toolchain] verifying sha256 ..."
     echo "${AA64_SHA256}  $tmp/$AA64_TARBALL" | sha256sum -c -
@@ -259,7 +303,7 @@ install_x64() {
         local tarball="${url##*/}"
 
         echo "[install-toolchain] downloading $tarball (~55 MB) ..."
-        if curl -fL --progress-bar -o "$tmp/$tarball" "$url"; then
+        if curl "${INSECURE_CURL[@]}" -fL --progress-bar -o "$tmp/$tarball" "$url"; then
             echo "[install-toolchain] verifying sha256 ..."
             if echo "${sha}  $tmp/$tarball" | sha256sum -c -; then
                 echo "[install-toolchain] extracting to /opt/ ..."
@@ -280,8 +324,13 @@ install_x64() {
                 return 1
             fi
         else
+            # The fallback here is a ~30 MINUTE source build of GCC, so the
+            # hint has to come BEFORE it, not after. A TLS failure that silently
+            # turns into a half-hour compile is the worst version of this bug.
+            fetch_hint "$@"
             echo "[install-toolchain] download failed; falling back to a" \
-                 "source build" >&2
+                 "source build (this takes ~30 minutes -- Ctrl-C if one of" \
+                 "the two fixes above is what you wanted)" >&2
         fi
     fi
 

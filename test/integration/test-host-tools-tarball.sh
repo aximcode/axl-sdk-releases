@@ -93,7 +93,8 @@ else
 fi
 
 for want in bin/axl libexec/axl/axl-common.sh libexec/axl/run-qemu.sh \
-            libexec/axl/axl_version.py share/axl/version VERSION LICENSE; do
+            libexec/axl/axl_version.py libexec/axl/install.sh \
+            share/axl/version VERSION LICENSE; do
     grep -qx "axl-sdk-host-tools-${VERSION}/${want}" "$LISTING"
     if [[ $? -eq 0 ]]; then
         test_host_pass "carries $want"
@@ -122,6 +123,15 @@ check $? "axl --print-version says $VERSION (got '$got')"
 perm="$(stat -c '%a' "$ROOT/libexec/axl/axl_version.py")"
 [[ "$perm" == "644" ]]
 check $? "axl_version.py is mode 0644, not a subcommand (got $perm)"
+
+# Same reason for the mode, and a bigger reason for its presence: carrying the
+# installer is what makes this component the MANAGER (§20 M2). `axl prune`
+# never removes it and `axl use` never repoints it, so it is the one tree that
+# can still self-update after any rollback -- but only if the installer its
+# verbs exec is actually in it.
+perm="$(stat -c '%a' "$ROOT/libexec/axl/install.sh")"
+[[ "$perm" == "644" ]]
+check $? "the staged install.sh is mode 0644, not a subcommand (got $perm)"
 
 # Every command the dispatcher offers must RUN and know its version. A command
 # reports its PROGRAM name, which is not always the verb -- `axl`'s listing

@@ -977,6 +977,56 @@ one audience that types these by hand. That also leaves
 `axl-sdk-linux-x86_64.tar.gz` documentable, which is the defect that started
 this.
 
+### 14.0a `AXL_INSECURE_FETCH` — when the hash is the anchor, and when it is not
+
+§14 and §17.4 both say the pinned SHA256 is what makes fetching over a hostile
+network defensible. `AXL_INSECURE_FETCH=1` acts on that: it drops TLS
+verification from the SDK's own downloads, for a host behind a corporate MITM
+proxy whose CA is not installed. Opt-in, default off.
+
+It exists because a real coworker on a fresh WSL image could install the SDK
+(the consumer fetches assets with `curl -k` against hashes pinned in its own
+repo) and then had `axl-install-toolchain` die at `curl: (60) SSL certificate
+problem: self-signed certificate in certificate chain`. Dell intercepts HTTPS
+org-wide, so this reaches every consumer behind the proxy, not one machine.
+
+**The two sites it affects are NOT equally safe, and conflating them would be
+the mistake:**
+
+| site | expected hash comes from | with `-k` |
+|---|---|---|
+| `scripts/install-toolchain.sh` | `scripts/axl-toolchains.conf`, **shipped in the SDK** | **costs nothing.** Pre-shared and out-of-band; no interceptor can forge a tarball matching it |
+| `packaging/install.sh` | `SHA256SUMS`, fetched from the **same base URL** as the assets | **weaker.** Whoever can substitute an asset can substitute the sums vouching for it |
+
+So for `install.sh` the guarantee drops from *authenticated* to
+*corruption-resistant* — still worth having, and genuinely sound for a caller
+that pinned hashes out of band, which the flagship consumer does in
+`.axl-sdk-checksums`. It is **not** "the hash is the trust anchor", and
+`install.sh` prints exactly that whenever the flag is on rather than letting
+the weaker guarantee be read as the stronger one.
+
+Measured, not assumed: against a store that does not trust the presented
+certificate, plain `curl` returns `http=000` and `curl -k` returns `302`, and
+the proxy relays the file bytes unchanged so the pinned hash still matches —
+and still fails if the bytes change.
+
+A failed toolchain fetch now names both ways out (install the CA, or set the
+flag), including before the x64 path falls back to a ~30-minute source build.
+
+**It is dormant for anyone who already has the toolchain**, which is most
+existing users. `install-toolchain.sh` short-circuits when the binary exists
+*and* reports the pinned version — measured with a stub `curl` on `PATH`:
+**zero** fetches for either arch on a machine that has them. So the TLS failure
+only reaches a host that does not yet have the toolchain, which is exactly the
+fresh-WSL case that prompted this.
+
+**Dormant is not gone.** The gate is a VERSION match, so the next toolchain
+bump in `axl-toolchains.conf` correctly makes every user download again — and
+every user behind the proxy would hit the TLS failure at once, on the same day.
+That is the argument for landing the flag before the next bump rather than
+after it. `test-insecure-fetch.sh` pins the no-fetch path, because if it
+regressed the cost is silent: every run re-downloading 239 MB or 500 MB.
+
 ### 14.1a The settled scheme
 
 `install.sh` (§17) changes the constraint that drove every earlier draft of
@@ -1936,6 +1986,16 @@ version manager in `axl`, and an asdf-managed install is a layout `axl update`
 and `axl prune` cannot manage — measured, not assumed. D6 is **closed**, not
 pending.
 
+**D7 — Retire the packages for real (§17.3). THE ONLY PHASE LEFT, and now
+unblocked.** v4.5.0 published the new asset shape on 2026-09-02, so the
+consumer can finally pin it — that was the hard gate, not D4. The consumer's
+own handoff is
+`~/work/dell/delldiags/source/src/axl-utils/doc/axl-sdk-migration-handoff.md`;
+the axl-sdk half is deleting `scripts/build-packages.sh` and the `fpm`/
+`rpmbuild` mentions, and it goes LAST because that script is the only
+remaining way to build a package for a consumer whose policy demands one
+(§17.4).
+
 **D7 — Retire the packages for real (§17.3).** Move the flagship consumer onto
 `install.sh`, then delete `build-packages.sh`, the `fpm`/`rpmbuild`
 dependencies and the `build-packages` job. **Last**, and gated on D4 passing:
@@ -1947,6 +2007,35 @@ free-floating and D6 closed. The only hard couplings are that D2 consumes D1's s
 documents D2's names, and D7 must not precede the verification that would catch
 its breakage.
 
+
+## 19a. Shipped: v4.5.0, 2026-09-02
+
+The first release carrying the shape §14–§18 designed. Verified beyond the
+workflow's own verdict: `check-published-release.sh v4.5.0` is 6/6 against
+published bytes, and a `curl`-and-run install from the live release yields
+`axl 4.5.0` / `axl-cc 4.5.0`.
+
+```
+install.sh   VERSION   SHA256SUMS                    (stable names)
+axl-sdk-linux-4.5.0-x86_64.tar.gz
+axl-sdk-host-tools-4.5.0.tar.gz
+axl-sdk-uefi-tools-4.5.0-{x64,aa64}.tar.gz
+```
+
+No `.deb`, no `.rpm`. D4's post-publish check and D5's snapshot gate both ran
+inside a real release for the first time and both passed.
+
+**It went out as a MINOR, not a major**, because the entries are filed under
+`### Breaking (packaging)`: every asset was renamed and the packages retired,
+and `axl.h` did not change — source and ABI compatibility were total. See
+`RELEASING.md` §"Two kinds of breaking change"; the distinction was added for
+this release and is the reason 4.5.0 was available at all.
+
+**Two runbook defects surfaced while cutting it**, both now fixed: the
+pre-release gate said to run at `-j$(nproc)`, which contradicts the runner's
+deliberate `nproc-2` and produced a false red (`test-task-pool-mp-qemu.sh`,
+twice, for three seconds of wall time); and the release commit re-ran the whole
+suite on the same box, since `ci.yml` fires on the push that precedes the tag.
 
 ## 20. The manager is not the managed
 
@@ -1998,17 +2087,45 @@ would be selling something we have. What it buys is the separation below.
 
 ### 20.4 The decision, in two steps
 
-**M1 — stop the manager being downgraded.** `axl` is forward-only: linking
+**M1 — stop the manager being downgraded. SHIPPED 2026-09-02** (`64f3cd9a`). `axl` is forward-only: linking
 never replaces an `axl` in the bin directory with one from an older prefix,
 and `axl`'s installer lookup falls back to the newest installed prefix that
 carries a staged `install.sh`. Small, no new roots, and it removes the
 stranding outright.
 
-**M2 — separate the manager from the managed.** `install.sh` becomes a
+**M2 — separate the manager from the managed. SHIPPED 2026-09-02.** `install.sh` becomes a
 bootstrap that installs the host-tools component — which *is* `axl` plus
 `libexec/` — into a manager root that `axl prune` never touches; `axl` then
 installs and switches SDK versions. rustup's shape, and it already fits the
 second axis (`/opt` toolchains) we manage today.
+
+### 20.4a How M2 landed, and the two things it turned up
+
+**The manager IS the host-tools component**, and it needed no new root. `axl
+prune` prunes `^axl-sdk-[0-9]`; `axl-sdk-host-tools-<ver>` is not that, so the
+manager already sat outside what prune walks, and `axl use` only ever moves
+the SDK marker. So M2 is: host-tools carries the installer (0644, like the SDK
+prefix), `install.sh` installs it alongside the SDK, and `link_manager`
+prefers it — through the `current` marker, so upgrading the manager relinks
+nothing. `axl-cc`, `axl-c++` and `axl-install-toolchain` still come from the
+SDK prefix, which is the point of switching versions.
+
+**`--print-prefix` had to change first, and M1 had already broken it.** It
+printed the prefix `axl` lives in — correct only while `axl` was always inside
+the active SDK. M1 pins `axl` to the newest prefix carrying an installer, so
+after `axl use <older>` it named the *newer* tree; M2 would have made it name
+a manager root with no headers in it at all. Since every path a consumer wants
+from it is SDK content — headers, libs, `share/axl/pci-ids.json5` — it now
+resolves the `current` SDK marker, falling back to its own prefix for a
+source-tree stage or a host-tools-only install. The flagship consumer is about
+to use it for exactly that sidecar lookup.
+
+**A release with no host-tools asset would have killed the SDK install.**
+`ensure_manager` reached `fetch_and_verify`, which `die`s rather than
+returning, so `if fetch_and_verify` could not catch it — `die` exits the
+script. It now checks the SHA256SUMS already downloaded for the SDK (same
+release, so it is the authority) and skips the manager with a note. Caught by
+the `./`-prefixed-mirror fixture, which publishes no host-tools.
 
 ### 20.5 The bootstrap does not choose a target architecture
 

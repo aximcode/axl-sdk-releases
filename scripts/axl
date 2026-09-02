@@ -246,7 +246,27 @@ case "${1-}" in
         # AXL-Distribution-Design.md §6 lists this as MISSING and names the
         # cost: it is why a consumer hardcodes /usr/include/axl-sdk. Bare
         # value, no banner -- it is a machine interface.
-        printf '%s\n' "$PREFIX"
+        #
+        # IT NAMES THE CURRENT SDK, NOT WHERE THIS SCRIPT LIVES. Every path a
+        # consumer wants from it -- headers, libs, share/axl/pci-ids.json5 --
+        # is SDK content, so it has to follow `axl use`. Answering with $PREFIX
+        # was right only while `axl` was always inside the active SDK, and it
+        # stopped being true the same day: §20's M1 pins `axl` to the newest
+        # prefix carrying an installer, so after `axl use <older>` this
+        # reported the NEWER tree. M2 breaks it further by moving `axl` into a
+        # manager root that holds no headers at all.
+        #
+        # Falls back to $PREFIX when there is no `current` marker -- a
+        # source-tree stage, an unpacked tarball, or a host-tools-only install
+        # all land there, and naming your own tree beats naming nothing.
+        _pp_root="$(dirname "$PREFIX")"
+        if [[ -L "$_pp_root/axl-sdk" ]] \
+           && _pp="$(cd -P "$_pp_root/axl-sdk" 2>/dev/null && pwd)" \
+           && [[ -n "$_pp" ]]; then
+            printf '%s\n' "$_pp"
+        else
+            printf '%s\n' "$PREFIX"
+        fi
         exit 0
         ;;
     --print-version|--version)
