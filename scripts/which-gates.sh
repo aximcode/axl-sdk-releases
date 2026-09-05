@@ -115,7 +115,8 @@ fi
 
 if [[ -n "$covering" ]]; then
     echo "    # covering tests (they NAME a file you changed) — run these directly,"
-    echo "    # not the whole suite: run-integration.sh has no --only=<test>."
+    echo "    # not the whole suite. Either run them directly, or name them:"
+    echo "    #   ./test/integration/run-integration.sh --only=a.sh,b.sh"
     printf '%s\n' "$covering" | sed 's|^|    ./|'
 fi
 

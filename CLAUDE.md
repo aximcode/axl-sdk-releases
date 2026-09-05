@@ -193,7 +193,10 @@ so it cannot be mistaken for a full one.
 Sphinx TWICE. Its own header says so at `:29`.
 
 **Run ONE test by executing it directly** — `./test/integration/test-foo.sh`.
-`run-integration.sh` has no `--only=<test>`; its filters are `--ci`
+`run-integration.sh` takes **`--only=a.sh,b.sh`** — an EXPLICIT list, named by
+you; it refuses a name discovery did not find rather than running nothing, and
+a filtered run is announced PARTIAL and cannot write the release stamp. It
+chooses nothing itself, deliberately (§12.5). Its other filters are `--ci`
 (drops `local-only=1`, cache OFF), `--only-local` (the inverse),
 `--shard i/K` and `--no-build`. The suite is 201 tests; the ten dearest
 declare ~1,260s between them, led by `test-cpu-spike-qemu.sh` (233s),

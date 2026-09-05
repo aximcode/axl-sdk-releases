@@ -141,18 +141,34 @@ assert_line "$HELP" "These commands run on the HOST." \
     "--help says these are host-side commands"
 assert_line "$HELP" "To compile for UEFI use axl-cc / axl-c++, which build with AXL's bare-metal" \
     "--help names the compiler drivers rather than implying axl fronts them"
-assert_line "$HELP" "cross toolchain, NOT the host's gcc. Install it with axl-install-toolchain." \
-    "--help distinguishes the cross toolchain from the host's own gcc"
+# THIS LINE USED TO SAY "NOT the host's gcc", which v4.7.0 made false in the
+# release that shipped it: AXL_TOOLCHAIN=auto is the x64 default, so a C build
+# on a box with no bare-metal toolchain uses the host's own gcc. The C-only
+# consumer that feature exists for was the exact reader being told they needed
+# the 239 MB install. C++ genuinely still requires it, on both arches.
+assert_line "$HELP" "cross toolchain. On x64, C falls back to the host's own gcc when that" \
+    "--help states the x64 host-gcc fallback rather than denying it"
+assert_line "$HELP" "toolchain is absent; C++ always needs it." \
+    "--help says C++ still requires the cross toolchain"
+assert_line "$HELP" "Run 'axl toolchain list' to see which compiler each arch will use, and" \
+    "--help points at the verb that answers which compiler builds"
+assert_line "$HELP" "'axl toolchain install' to fetch one." \
+    "--help points at the manager verb, not the lower-level installer"
 
-# A bare `axl` is a discovery moment, not a usage error -- putting the command
-# list one keystroke away is the entire point of the dispatcher.
+# A bare `axl` PRINTS the discovery surface and RETURNS non-zero, and those
+# two halves answer different questions. The text goes to stdout, undimmed and
+# not behind a redirect, because putting the command list one keystroke away
+# is the entire point of the dispatcher. The status is 2, matching `axl use`
+# with no version and `axl <unknown>`, because a caller that reached here
+# supplied no command -- and `axl "$cmd"` with an empty $cmd used to succeed,
+# reporting nothing wrong while doing nothing at all.
 BARE="$WORK/bare.txt"
 "$AXL" > "$BARE.raw" 2>&1; BARE_RC=$?
 norm < "$BARE.raw" > "$BARE"
-if [[ $BARE_RC -eq 0 ]]; then
-    test_host_pass "bare axl exits 0"
+if [[ $BARE_RC -eq 2 ]]; then
+    test_host_pass "bare axl exits 2, like every other missing-argument case"
 else
-    test_host_fail "bare axl exits 0 (got $BARE_RC)"
+    test_host_fail "bare axl exits 2 (got $BARE_RC)"
 fi
 if diff -q "$HELP" "$BARE" >/dev/null; then
     test_host_pass "bare axl prints exactly what --help prints"
@@ -271,6 +287,40 @@ else
             test_host_pass "axl $cmd resolves and runs"
         else
             test_host_fail "axl $cmd resolves and runs"
+        fi
+    done
+
+    # ── REACHED THROUGH A SYMLINK, which is how they are actually run ──
+    #
+    # install.sh links its bin/ tools into --bin-dir (~/.local/bin by
+    # default), so the normal invocation is through a symlink and NOT through
+    # the staged path. A tool that reads $0 without resolving it computes a
+    # prefix of ~/.local, one directory that holds none of its siblings and no
+    # share/axl -- so `axl-install-toolchain` failed with
+    # "axl_handle_version: command not found" followed by "axl-toolchains.conf
+    # not found", while the same binary run by its real path worked. It was
+    # the only tool in bin/ not calling `readlink -f "$0"`; axl, axl-cc and
+    # axl-c++ all did. And it is the command `axl --help` tells you to run.
+    #
+    # --version is the cheapest probe that reaches it: the failing line WAS
+    # the axl_handle_version call, so this needs no network and no toolchain.
+    LNKDIR="$WORK/linkbin"; mkdir -p "$LNKDIR"
+    for t in axl axl-install-toolchain axl-cc axl-c++; do
+        # A MISSING TOOL IS A FAILURE, not a skipped assertion. install.sh
+        # stages all four unconditionally, so `|| continue` here would only
+        # ever hide a staging regression -- and it would hide it by making the
+        # count of assertions silently smaller, which is the shape
+        # feedback_balancer_count exists for.
+        if [[ ! -e "$IPFX/bin/$t" ]]; then
+            test_host_fail "install.sh stages bin/$t"
+            continue
+        fi
+        ln -sf "$IPFX/bin/$t" "$LNKDIR/$t"
+        if "$LNKDIR/$t" --version >"$WORK/lnk-$t.txt" 2>&1; then
+            test_host_pass "$t works through a bin-dir symlink"
+        else
+            test_host_fail "$t works through a bin-dir symlink"
+            sed 's/^/      /' "$WORK/lnk-$t.txt" | head -4
         fi
     done
 

@@ -111,12 +111,17 @@ resolve_command() {
 }
 
 usage() {
-    # stdout, not stderr, and exit 0: a bare `axl` is someone looking for the
-    # command list, which is the entire point of this program. Treating it as
-    # a usage error would hide the discovery surface behind a redirect.
+    # STDOUT, NOT STDERR -- and the exit status is a separate question, decided
+    # at the call site. A bare `axl` is someone looking for the command list,
+    # which is the entire point of this program, so the text must not be behind
+    # a redirect. That argument is about the STREAM; it was also used to return
+    # 0, which made `axl "$cmd"` with an empty $cmd report success for having
+    # done nothing, while `axl use` with no version and `axl <unknown>` both
+    # exit 2 for the same class of mistake.
     echo "usage: axl <command> [args ...]"
     echo "       axl update | use <version> | list | uninstall"
-    echo "       axl toolchain list | install [aa64|x64|all] | uninstall [--dry-run|-n] <aa64|x64>"
+    echo "       axl toolchain list [--porcelain] | install [aa64|x64|all]"
+    echo "                      | uninstall [--dry-run|-n] <aa64|x64>"
     echo "                      (list names which compiler each arch builds with)"
     echo "                      ('axl update' re-installs the toolchains you"
     echo "                       ALREADY have, at the version the new SDK pins;"
@@ -142,14 +147,25 @@ usage() {
     echo "Run 'axl <command> --help' for a command's own options."
     echo ""
     # "Tool" is overloaded four ways here -- these host-side helper scripts,
-    # the HOST's own gcc/binutils (which AXL deliberately does not use for
-    # target code), AXL's bare-metal CROSS toolchain under /opt, and the
-    # target .efi utilities. A bare command list invites the reader to assume
-    # this one program fronts all of them. Naming the compiler drivers and
-    # where their toolchain comes from is three lines and removes the guess.
+    # the HOST's own gcc/binutils, AXL's bare-metal CROSS toolchain under
+    # /opt, and the target .efi utilities. A bare command list invites the
+    # reader to assume this one program fronts all of them. Naming the
+    # compiler drivers and where their toolchain comes from removes the guess.
+    #
+    # THIS TEXT USED TO END "NOT the host's gcc", and v4.7.0 made that false in
+    # the release that shipped it: AXL_TOOLCHAIN=auto became the x64 default,
+    # so a C build with no bare-metal toolchain installed uses the host's own
+    # gcc. The reader most likely to hit that line -- a C-only x64 consumer --
+    # was exactly the one the feature exists for, and the help told them they
+    # needed the 239 MB install. C++ is refused under host mode on both arches
+    # (axl-cc's axl_cc_refuse_cxx_under_host), so that half stays true and is
+    # now said separately instead of by implication.
     echo "These commands run on the HOST."
     echo "To compile for UEFI use axl-cc / axl-c++, which build with AXL's bare-metal"
-    echo "cross toolchain, NOT the host's gcc. Install it with axl-install-toolchain."
+    echo "cross toolchain. On x64, C falls back to the host's own gcc when that"
+    echo "toolchain is absent; C++ always needs it."
+    echo "Run 'axl toolchain list' to see which compiler each arch will use, and"
+    echo "'axl toolchain install' to fetch one."
 }
 
 # THE CURRENT SDK, which is not necessarily this script's own prefix. Since
@@ -245,6 +261,24 @@ tc_resolve() {   # tc_resolve <arch>
     return 0
 }
 
+# IS THIS A USABLE TOOLCHAIN ROOT? Both callers derive a root as
+# dirname(dirname(locator)), which only means anything for an absolute path in
+# the <root>/bin/<cc> layout. A bare name on PATH -- which tc_have_compiler
+# accepts, deliberately -- gives "."; /usr/bin/x86_64-elf-g++, an entirely
+# ordinary distro cross-gcc, gives "/usr"; and a locator one component short
+# gives "/". None of those is a toolchain root, and each is an answer that
+# reads as true: `axl update` would offer to install into the filesystem root,
+# and `axl toolchain list` printed /usr as the location and then measured it
+# with `du -sh` -- 11G reported as the size of a toolchain.
+#
+# TWO components, minimum, and absolute. That is the same condition the update
+# arm spelled inline as `$_r == /* && $_r != "/" && $(dirname $_r) == /* &&
+# $(dirname $_r) != "/"` -- said once here so the two cannot drift, since they
+# are the same question about the same derived value.
+tc_root_usable() {   # tc_root_usable <path>
+    [[ "$1" == /?*/?* ]]
+}
+
 # WHICH ARCHES ACTUALLY HAVE A TOOLCHAIN -- one arch name per line, nothing at
 # all when none does. `axl update` reads this to decide what to bring along.
 #
@@ -258,9 +292,9 @@ tc_resolve() {   # tc_resolve <arch>
 # located their toolchain with AXL_X64_GCC alone, or whose tree is missing only
 # the C++ driver, read MISSING and was declined SILENTLY: the same class of
 # silence this function exists to remove, reappearing one layer up. `axl
-# toolchain list` still labels its root line `g++:` and probes only that, which
-# is deliberate there (it pairs with a "builds with:" line that asks axl-cc) --
-# so the two can legitimately disagree, and §21a.4 records why.
+# toolchain list` reports both locators in fields of their own since §21c, and
+# still separates them from the "builds with:" line that asks axl-cc -- so the
+# two can legitimately disagree, and §21a.4 records why.
 #
 # There is deliberately NO "but that compiler is not one of ours" refusal.
 # Deciding that would mean inferring provenance from a path or a --version
@@ -361,9 +395,15 @@ tc_installed_arches() {
 }
 
 case "${1-}" in
-    ""|-h|--help)
+    -h|--help)
         usage
         exit 0
+        ;;
+    "")
+        # The same text on the same stream as --help (test-axl-dispatcher.sh
+        # diffs the two), and 2 because no command was given -- see usage().
+        usage
+        exit 2
         ;;
     list)
         # Reads the filesystem only, so this also works in a package install
@@ -375,10 +415,21 @@ case "${1-}" in
         for _d in "$_root"/axl-sdk-[0-9]*; do
             [[ -d "$_d" ]] || continue
             _any=1
-            if [[ "$_d" == "$_cur" ]]; then
-                printf '* %s\n' "$(basename "$_d")"
+            # SIZE, because the very next line of output advises `axl prune`
+            # and this is the number that decides whether that is worth
+            # running. Best-effort: a du that cannot read the tree prints
+            # nothing rather than a zero, since "0" is a claim about disk
+            # rather than an admission that it was not measured.
+            # -x: stay on one filesystem. These are our own install roots, so
+            # a mount inside one is unexpected -- which is the reason not to
+            # follow it into whatever it leads to.
+            _sz="$(du -shx "$_d" 2>/dev/null | awk '{print $1}')"
+            _mark="  "; [[ "$_d" == "$_cur" ]] && _mark="* "
+            # TWO FORMATS, so an unmeasured size leaves no trailing blanks.
+            if [[ -n "$_sz" ]]; then
+                printf '%s%-24s %6s\n' "$_mark" "$(basename "$_d")" "$_sz"
             else
-                printf '  %s\n' "$(basename "$_d")"
+                printf '%s%s\n' "$_mark" "$(basename "$_d")"
             fi
         done
         if [[ "$_any" -eq 0 ]]; then
@@ -683,6 +734,12 @@ case "${1-}" in
                 # form with the directory left to them.
                 tc_decline_override() {   # <arch> <var> <root> <found>
                     local _a="$1" _v="$2" _r="$3" _f="$4" _pfx
+                    # The PARENT of the root -- where a second toolchain would
+                    # be installed beside theirs. Needed by the remedy below,
+                    # not by the validation: tc_root_usable answers the same
+                    # question this used to ask of $_pfx directly ("the root is
+                    # absolute with at least two components"), so the check
+                    # moved to the shared predicate and this stayed.
                     _pfx="$(dirname "$_r")"
                     echo "axl: $_a is located by $_v, outside the root the SDK pins:"
                     # LABELLED. This is the LOCATOR -- the compiler itself --
@@ -693,7 +750,7 @@ case "${1-}" in
                     echo "     <prefix>/<pinned-name> and reads no $_v, so carrying it"
                     echo "     here would install a SECOND toolchain under /opt and leave"
                     echo "     yours where it is."
-                    if [[ "$_r" == /* && "$_r" != "/" && "$_pfx" == /* && "$_pfx" != "/" ]]; then
+                    if tc_root_usable "$_r"; then
                         # ALWAYS QUOTED, and AFTER the validation above -- a
                         # quoted value no longer starts with "/", so quoting
                         # first would fail the `== /*` test and send every such
@@ -871,11 +928,38 @@ case "${1-}" in
         [[ -r "$_sdk/VERSION" ]] && _sdk_v="$(cat "$_sdk/VERSION")"
         printf '%-9s %-10s %s\n' "sdk" "$_sdk_v" "$_sdk"
         if [[ "$_mgr_v" != "$_sdk_v" ]]; then
-            # Not a warning: it is the normal state after `axl use <older>`,
-            # and saying so beats leaving the reader to wonder.
             echo ""
-            echo "The manager is versioned separately and does not follow"
-            echo "'axl use'. 'axl update' moves both."
+            # WHICH WAY ROUND, because the two directions need opposite advice
+            # and this used to give one answer to both.
+            #
+            # Manager NEWER than the SDK is the ordinary state after `axl use
+            # <older>`; nothing is wrong and "axl update moves both" is true.
+            #
+            # Manager OLDER is the state the 4.7.0 release notes tell people to
+            # look for -- and for it, "axl update moves both" is exactly wrong:
+            # a manager from 4.6.0 or earlier predates the code that updates
+            # the manager, so the `axl` being asked cannot carry itself. It
+            # needs one bootstrap. Sending that reader to `axl update` sends
+            # them to the one command that cannot fix it, which is worse than
+            # saying nothing, and it left them comparing two numbers by eye
+            # against a web page to find out which case they were in.
+            if [[ -n "$_mgr_v" && -n "$_sdk_v" \
+                  && "$_mgr_v" != "unknown" && "$_sdk_v" != "unknown" ]] \
+               && [[ "$(printf '%s\n%s\n' "$_mgr_v" "$_sdk_v" | sort -V | head -1)" == "$_mgr_v" ]]; then
+                echo "The manager is OLDER than the SDK. A manager this old cannot"
+                echo "update itself -- it predates the code that does -- so it takes"
+                echo "one bootstrap, once per machine:"
+                echo ""
+                echo "  curl -fsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/install.sh"
+                echo "  sh install.sh --host-tools"
+                echo ""
+                echo "After that, 'axl update' moves both."
+            else
+                # Not a warning: it is the normal state after `axl use <older>`,
+                # and saying so beats leaving the reader to wonder.
+                echo "The manager is versioned separately and does not follow"
+                echo "'axl use'. 'axl update' moves both."
+            fi
         fi
         echo ""
         echo "toolchains:  axl toolchain list"
@@ -920,6 +1004,39 @@ case "${1-}" in
         case "${1-list}" in
             list)
                 shift
+                # --porcelain: THE MACHINE CONTRACT, and the reason the human
+                # layout below could finally be laid out for a human.
+                #
+                # There was no machine form, so every caller parsed the human
+                # one by COLUMN INDEX -- `awk '$1 == "x64" { print $4 }'` for
+                # the root, field 3 compared for equality, field 5 for the C
+                # locator. Twenty-five such sites across two test files. The
+                # cost was not the parsing; it was that the rendering could no
+                # longer move. The C state had to be APPENDED as a fifth column
+                # rather than placed beside its sibling, so the line read
+                # `x64  14.3.0-axl3  g++:installed  /opt/...  gcc:installed`
+                # with the PATH sandwiched between the two compiler states, and
+                # three paragraphs of comment here defended the positions.
+                #
+                # TAB-SEPARATED, not JSON. Every consumer of this is a shell
+                # script, `awk -F'\t'` needs nothing installed, and jq is not
+                # in install.sh's need_cmd set -- test-host-deps-minimal.sh
+                # pins exactly that. One field per fact, and the POSITION is
+                # the label, so the gcc:/g++: prefixes that disambiguated them
+                # in prose are not repeated here:
+                #
+                #   1 arch      aa64 | x64
+                #   2 version   the manifest's pinned version
+                #   3 root      absolute path, or the literal (unset)
+                #   4 gcc       installed | MISSING
+                #   5 g++       installed | MISSING
+                #   6 builds    axl | host | cross | unknown
+                #   7 reason    free text, never empty, never a tab
+                _porcelain=0
+                if [[ "${1-}" == "--porcelain" ]]; then
+                    _porcelain=1
+                    shift
+                fi
                 if [[ $# -gt 0 ]]; then
                     echo "axl toolchain list: takes no arguments (got '$1')" >&2
                     exit 2
@@ -927,7 +1044,7 @@ case "${1-}" in
                 tc_need_conf
                 # shellcheck source=/dev/null
                 . "$_conf"
-                printf 'Toolchains pinned by %s\n\n' "$_sdk"
+                [[ "$_porcelain" -eq 1 ]] || printf 'Toolchains pinned by %s\n' "$_sdk"
                 _missing=""
                 for _a in aa64 x64; do
                     tc_resolve "$_a"
@@ -935,72 +1052,61 @@ case "${1-}" in
                     # extract leaves the directory there and nothing in it,
                     # which is precisely the state worth distinguishing.
                     #
-                    # This root line probes $_g, the C++ (g++) LOCATOR --
-                    # labeled explicitly below rather than left as a bare
-                    # "installed"/"MISSING", because the "builds with:" line
-                    # a few lines down asks axl-cc, which for x64 C-only
-                    # 'auto' resolves off the C compiler (gcc). A stale
-                    # $AXL_X64_GXX or a partial extract missing only g++ makes
-                    # the two lines answer DIFFERENT questions -- unlabeled,
-                    # that reads as one command contradicting itself.
-                    # ONE TOKEN, no embedded space: case 17's preflight check
-                    # (and any other caller) reads the root path out of this
-                    # line with `awk '{print $4}'`, which splits on
-                    # whitespace -- "g++ installed" as two words would shift
-                    # every field after it and hand that assertion the WORD
-                    # "installed" instead of the path.
-                    # THE C LOCATOR TOO, APPENDED AS A FIFTH FIELD. `axl
-                    # update` carries an arch when EITHER locator answers, so a
-                    # line reporting only g++ said MISSING about a tree the
-                    # update was about to refresh -- one command contradicting
-                    # another about the same machine. Appended rather than
-                    # inserted: the root path is read out of FIELD 4
-                    # (test-axl-toolchain-verb.sh case 17) and field 3 is
-                    # compared for equality in several places, so a new column
-                    # anywhere but the end would move or break them.
-                    if tc_have_compiler "$_gc"; then
-                        _cstate="gcc:installed"
-                    else
-                        _cstate="gcc:MISSING"
-                    fi
-                    # ONE TOKEN IN FIELD 4, ALWAYS. An empty
-                    # AXL_<ARCH>_TOOLCHAIN_DIR collapses to nothing between two
-                    # spaces, so awk slides field 5 into field 4 and the root
-                    # reader (test-axl-toolchain-verb.sh case 17) silently gets
-                    # "gcc:installed" instead of a path -- the exact shift the
-                    # comment above warns a new COLUMN would cause, arriving
-                    # from an empty VALUE instead.
-                    _droot="${_d:-(unset)}"
+                    # BOTH LOCATORS, separately. `axl update` carries an arch
+                    # when EITHER answers, and the "builds with" line below
+                    # resolves x64's C-only `auto` off the C compiler -- so a
+                    # machine with gcc and no g++ is a real state that three
+                    # different readers care about differently. Reporting one
+                    # number for both is what made two lines of this command
+                    # look like they contradicted each other.
+                    #
                     # NOTE tc_have_compiler, not `-x`: a locator holding a bare
-                    # name resolved on PATH now counts as installed here too,
-                    # which is what `axl update` has always meant by installed.
-                    # This LINE used to answer a narrower question than the
-                    # command that acts on it.
-                    if tc_have_compiler "$_g"; then
-                        printf '  %-5s %-14s %-13s %s %s\n' \
-                               "$_a" "$_v" "g++:installed" "$_droot" "$_cstate"
-                        printf '        %s\n' "$("$_g" --version 2>/dev/null | head -1)"
+                    # name resolved on PATH counts as installed here too, which
+                    # is what `axl update` has always meant by installed.
+                    if tc_have_compiler "$_gc"; then _cstate="installed"; else _cstate="MISSING"; fi
+                    if tc_have_compiler "$_g";  then _gstate="installed"; else _gstate="MISSING"; fi
+                    # KEYED ON g++ for the install hint, because what a missing
+                    # g++ costs is C++ -- which no amount of gcc replaces.
+                    [[ "$_gstate" == "installed" ]] || _missing="$_missing $_a"
+                    # A USABLE ROOT, or the placeholder -- and `/` is not a
+                    # usable root. tc_resolve derives the root from an override
+                    # as dirname(dirname($_g)), so a malformed
+                    # AXL_X64_GXX=/nonexistent/g++ resolves to `/`: the listing
+                    # printed it as the toolchain location, and the size lookup
+                    # below then ran `du -sh /` and walked the entire
+                    # filesystem to report 389G as the toolchain-s size. Same
+                    # shape the uninstall arm already refuses by name -- an
+                    # empty entry, a relative path or `/` -- because there it
+                    # ends in `rm -rf`. It is worth refusing here too: naming
+                    # `/` as the root is an answer that reads as true.
+                    # A WELL-FORMED root is printable; an EXISTING one can
+                    # also be measured. Two questions, because a toolchain that
+                    # is merely not installed yet has a perfectly good path to
+                    # name ("would install to ..."), while "/usr" or "." has
+                    # none -- and the porcelain contract promises field 3 is an
+                    # absolute path or the (unset) placeholder, never a
+                    # relative one.
+                    if tc_root_usable "$_d"; then
+                        _droot="$_d"
+                        if [[ -d "$_d" ]]; then _root_ok=1; else _root_ok=0; fi
                     else
-                        printf '  %-5s %-14s %-13s %s %s\n' \
-                               "$_a" "$_v" "g++:MISSING" "$_droot" "$_cstate"
-                        # STILL KEYED ON g++: this drives the "install with:"
-                        # hint, and what a missing g++ costs is C++ -- which no
-                        # amount of gcc replaces.
-                        _missing="$_missing $_a"
+                        _droot="(unset)"
+                        _root_ok=0
                     fi
+
                     # WHICH COMPILER WILL ACTUALLY BUILD -- the question a
                     # reader opens this command to answer. CALLS axl-cc
-                    # --print-toolchain (Task 3) rather than re-deriving the
-                    # resolution here: axl-cc's own comment at that flag names
-                    # this verb as the intended caller, and two programs
-                    # computing one fact is the drift check-flag-parity exists
-                    # for, one layer up.
+                    # --print-toolchain rather than re-deriving the resolution
+                    # here: axl-cc's own comment at that flag names this verb
+                    # as the intended caller, and two programs computing one
+                    # fact is the drift check-flag-parity exists for, one layer
+                    # up.
                     #
-                    # Do NOT read $_g (the g++ locator, just above) for this:
-                    # x64's C-only 'auto' resolution probes the GCC locator,
-                    # and a machine with a working C compiler and no C++ one
-                    # would be reported 'host' here -- wrong, and it looks
-                    # right, because $_g really is MISSING on that machine.
+                    # Do NOT read $_g (the g++ locator) for this: x64's C-only
+                    # 'auto' resolution probes the GCC locator, and a machine
+                    # with a working C compiler and no C++ one would be
+                    # reported 'host' here -- wrong, and it looks right,
+                    # because $_g really is MISSING on that machine.
                     _tcw=""
                     _tcrc=0
                     _tcerr=""
@@ -1026,36 +1132,121 @@ case "${1-}" in
                     # 'unknown', never as a silent blank or a confident guess
                     # -- guessing here would be the exact failure this line
                     # exists to prevent, just moved one level up.
+                    #
+                    # ONE decision, TWO renderings. The token and its reason
+                    # are computed once into $_builds/$_why and then printed
+                    # by whichever format was asked for; the human line used to
+                    # BE the decision, which is why nothing else could read it.
+                    _cxx_note=""
                     if [[ ! -x "$_sdk/bin/axl-cc" ]]; then
-                        printf '        builds with: unknown (no axl-cc at %s)\n' "$_sdk/bin/axl-cc"
+                        _builds="unknown"; _why="no axl-cc at $_sdk/bin/axl-cc"
                     elif [[ $_tcrc -ne 0 ]]; then
+                        _builds="unknown"
                         if [[ -n "$_tcerr" ]]; then
-                            printf '        builds with: unknown (axl-cc: %s)\n' "$_tcerr"
+                            _why="axl-cc: $_tcerr"
                         else
-                            printf '        builds with: unknown (axl-cc --print-toolchain exited %s)\n' "$_tcrc"
+                            _why="axl-cc --print-toolchain exited $_tcrc"
                         fi
                     elif [[ -z "$_tcw" ]]; then
-                        printf '        builds with: unknown (axl-cc --print-toolchain produced no output)\n'
+                        _builds="unknown"; _why="axl-cc --print-toolchain produced no output"
                     elif [[ "$_tcw" != "axl" && "$_tcw" != "host" && "$_tcw" != "cross" ]]; then
-                        printf '        builds with: unknown (axl-cc --print-toolchain said %s)\n' "$_tcw"
+                        _builds="unknown"; _why="axl-cc --print-toolchain said $_tcw"
                     elif [[ -n "${AXL_TOOLCHAIN:-}" && "$AXL_TOOLCHAIN" != "auto" ]]; then
-                        printf '        builds with: %s (pinned by $AXL_TOOLCHAIN)\n' "$_tcw"
+                        _builds="$_tcw"
+                        # shellcheck disable=SC2016  # the text NAMES the variable
+                        _why='pinned by $AXL_TOOLCHAIN'
                     elif [[ "$_a" == "aa64" ]]; then
-                        printf '        builds with: axl (aa64 has no host option)\n'
+                        _builds="axl"; _why="aa64 has no host option"
                     elif [[ "$_tcw" == "axl" ]]; then
-                        printf '        builds with: axl (auto -> axl: bare-metal toolchain installed)\n'
+                        _builds="axl"; _why="auto -> axl: bare-metal toolchain installed"
                     else
-                        printf '        builds with: host (auto -> host: no bare-metal toolchain installed)\n'
-                        printf '                     C++ needs the bare-metal toolchain:\n'
-                        printf '                       axl toolchain install x64\n'
+                        _builds="host"; _why="auto -> host: no bare-metal toolchain installed"
+                        _cxx_note="C++ needs the bare-metal toolchain: axl toolchain install x64"
                     fi
+
+                    # FIELD 7 IS FREE TEXT, so it is the one field that can
+                    # carry a tab or a newline and split the row a parser is
+                    # promised. Two of its sources are outside this program:
+                    # axl-cc's stderr, and -- in the branch entered BECAUSE the
+                    # output was not one of the three known words -- axl-cc's
+                    # whole stdout. Folded to spaces rather than rejected: the
+                    # text is a diagnostic, and a mangled diagnostic beats a
+                    # row that does not parse.
+                    _why="${_why//$'\t'/ }"
+                    _why="${_why//$'\n'/ }"
+                    if [[ "$_porcelain" -eq 1 ]]; then
+                        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                               "$_a" "${_v:-(unset)}" "$_droot" \
+                               "$_cstate" "$_gstate" "$_builds" "$_why"
+                        continue
+                    fi
+
+                    # ── the human rendering ───────────────────────────────
+                    #
+                    # ONE FACT PER LINE, in the order a reader asks for them:
+                    # is it there, where is it and how much disk is that, what
+                    # exactly is it, and what will actually compile. The path
+                    # gets its own line because it is 50-60 characters and was
+                    # previously wedged between two status words.
+                    case "$_cstate/$_gstate" in
+                        installed/installed) _state="gcc + g++" ;;
+                        installed/MISSING)   _state="gcc only, no C++" ;;
+                        MISSING/installed)   _state="g++ only" ;;
+                        *)                   _state="not installed" ;;
+                    esac
+                    # SIZE, because `axl toolchain uninstall` exists to reclaim
+                    # it and this is where the decision gets made. Best-effort:
+                    # a du that fails or a root that is not there yet prints
+                    # nothing rather than a zero, since "0" is a claim.
+                    _size=""
+                    if [[ "$_root_ok" -eq 1 ]]; then
+                        _size="$(du -sh "$_d" 2>/dev/null | awk '{print $1}')"
+                    fi
+                    # TWO FORMATS, so an unmeasured size leaves no trailing
+                    # blanks on the line rather than a column of them.
+                    if [[ -n "$_size" ]]; then
+                        printf '\n  %-5s %-14s %-18s %s\n' \
+                               "$_a" "${_v:-(unset)}" "$_state" "$_size"
+                    else
+                        printf '\n  %-5s %-14s %s\n' \
+                               "$_a" "${_v:-(unset)}" "$_state"
+                    fi
+                    if [[ "$_root_ok" -eq 1 ]]; then
+                        printf '        %s\n' "$_droot"
+                    elif [[ "$_droot" == "(unset)" ]]; then
+                        # Neither "here it is" nor "here is where it would go":
+                        # there is no path to name. Saying "would install to
+                        # (unset)" was a sentence built from a placeholder.
+                        printf '        no usable toolchain root -- check the manifest, or an override\n'
+                    else
+                        # NOT the same sentence as an installed root. An absent
+                        # one is a path that does not exist yet, and printing it
+                        # bare reads as a location you could go and look at.
+                        printf '        would install to %s\n' "$_droot"
+                    fi
+                    # The compiler's own --version, from whichever locator
+                    # answered. g++ first: it is the one that decides whether
+                    # C++ is available at all.
+                    if [[ "$_gstate" == "installed" ]]; then
+                        printf '        %s\n' "$("$_g" --version 2>/dev/null | head -1)"
+                    elif [[ "$_cstate" == "installed" ]]; then
+                        printf '        %s\n' "$("$_gc" --version 2>/dev/null | head -1)"
+                    fi
+                    printf '        builds with: %s -- %s\n' "$_builds" "$_why"
+                    [[ -z "$_cxx_note" ]] || printf '        %s\n' "$_cxx_note"
                 done
                 # COLLAPSE TO `all`. install-toolchain.sh parses ONE target
                 # and takes the last, so `install aa64 x64` installs x64 only,
                 # silently -- and printing the arches side by side advised
                 # exactly that, on the fresh-machine path where both are
                 # missing and this is the first command anyone runs.
-                if [[ "$_missing" == " aa64 x64" ]]; then
+                #
+                # HUMAN ONLY: advice is not part of the machine contract, and a
+                # trailing line that is sometimes there and sometimes not is
+                # exactly what a parser must not have to skip.
+                if [[ "$_porcelain" -eq 1 ]]; then
+                    :
+                elif [[ "$_missing" == " aa64 x64" ]]; then
                     printf '\ninstall with:  axl toolchain install all\n'
                 elif [[ -n "$_missing" ]]; then
                     printf '\ninstall with:  axl toolchain install%s\n' "$_missing"
@@ -1230,18 +1421,38 @@ case "${1-}" in
                 # half-deleted toolchain is worse than one still installed --
                 # `list` probes the compiler, so a tree with its bin/ gone
                 # reads as MISSING while the bytes remain.
+                # A DRY RUN MUST NOT FAIL FOR A CONDITION THAT ONLY AFFECTS
+                # THE REAL RUN. This check fires on the ordinary configuration
+                # -- /opt root-owned, the toolchain inside it user-owned -- and
+                # running it before the report meant `uninstall --dry-run`
+                # exited 1 with "cannot remove" and answered none of what was
+                # asked: what would go, how big, how many files. That is the
+                # moment the answer is worth most, because it is what you read
+                # before deciding to type sudo. `axl prune --dry-run` on the
+                # same box previews and exits 0; two dry runs in one program
+                # with opposite contracts is a coin flip for the reader.
+                #
+                # So under --dry-run this becomes part of the REPORT. Every
+                # other guard still refuses a dry run, because each says the
+                # TARGET is wrong (bad arch, unusable path, symlink, missing,
+                # wrong receipt) rather than that the caller lacks a privilege.
                 _parent="$(dirname "$_d")"
+                _needs_root=0
                 if [[ ! -w "$_parent" ]]; then
-                    echo "axl toolchain uninstall: cannot remove $_d --" >&2
-                    echo "     $_parent is not writable by $(id -un)." >&2
-                    _sudo_hint
-                    exit 1
+                    if [[ "$_dry" -eq 1 ]]; then
+                        _needs_root=1
+                    else
+                        echo "axl toolchain uninstall: cannot remove $_d --" >&2
+                        echo "     $_parent is not writable by $(id -un)." >&2
+                        _sudo_hint
+                        exit 1
+                    fi
                 fi
                 # EVERY GUARD ABOVE HAS RUN -- arch, path shape, symlink,
-                # not-installed, receipt KIND+ARCH, parent writability -- and
-                # nothing has been renamed or removed yet. This is the last
-                # point that is true, so it is where --dry-run reports and
-                # stops, same spelling and style as `axl prune --dry-run`.
+                # not-installed, receipt KIND+ARCH -- and nothing has been
+                # renamed or removed yet. This is the last point that is true,
+                # so it is where --dry-run reports and stops, same spelling and
+                # style as `axl prune --dry-run`.
                 if [[ "$_dry" -eq 1 ]]; then
                     _sz="$(du -sh "$_d" 2>/dev/null | awk '{print $1}')"
                     _nf="$(find "$_d" -type f 2>/dev/null | wc -l | tr -d ' ')"
@@ -1250,6 +1461,16 @@ case "${1-}" in
                         echo "     ${_sz}, ${_nf} file(s) -- dry run, nothing removed"
                     else
                         echo "     ${_nf} file(s) -- dry run, nothing removed"
+                    fi
+                    if [[ "$_needs_root" -eq 1 ]]; then
+                        # ON STDOUT, via the hint's own stderr redirected here:
+                        # the same words are an ERROR's remedy in the refusal
+                        # above and part of the ANSWER inside a preview the
+                        # caller asked for, and a preview split across two
+                        # streams reads as half a report plus a warning.
+                        echo "     the real run needs root: $_parent is not writable" \
+                             "by $(id -un)"
+                        _sudo_hint 2>&1
                     fi
                     exit 0
                 fi
@@ -1370,7 +1591,8 @@ case "${1-}" in
                 ;;
             *)
                 echo "axl toolchain: unknown subcommand '$1'" >&2
-                echo "Usage: axl toolchain list | install [aa64|x64|all] | uninstall [--dry-run|-n] <aa64|x64>" >&2
+                echo "Usage: axl toolchain list [--porcelain] | install [aa64|x64|all]" >&2
+                echo "                      | uninstall [--dry-run|-n] <aa64|x64>" >&2
                 exit 2
                 ;;
         esac

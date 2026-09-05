@@ -407,12 +407,25 @@ fi
 # toolchain installed before receipts existed lands in that bucket -- silence
 # there is indistinguishable from "there was nothing to collect", which is how
 # a /opt that stopped being bounded goes unnoticed for months.
-if grep -q "no $(printf '%s' '.axl-receipt') -- not installed by us" "$OWN" \
-   || grep -q "with no .axl-receipt" "$OWN"; then
-    test_host_pass "a real run reports the roots it skipped as not ours"
+# AND IT MUST NOT CLAIM MORE THAN IT KNOWS. The header used to assert "not
+# installed by us, so not ours to remove" and then, three lines down, ask
+# "(ours, but installed before receipts existed?)" -- a fact stated and
+# retracted in one message. On this box the retraction was the true half: the
+# named roots were /opt/x86_64-elf-gcc-14.3.0-axl and -axl2, our own naming.
+# The old remedy could not work either. It said to re-run the installer to
+# re-mark the root, but the installer only ever re-marks the root the MANIFEST
+# names -- never the superseded ones this message is printed about.
+if grep -qF "with no .axl-receipt -- not removing them" "$OWN"; then
+    test_host_pass "a real run reports the roots it skipped, without claiming why"
 else
     test_host_fail "nothing reported about the skipped foreign toolchains"
     sed 's/^/      /' "$OWN" | head -10
+fi
+if grep -q "not installed by us" "$OWN"; then
+    test_host_fail "the skipped-roots header still asserts they are not ours"
+    grep -n "not installed by us" "$OWN" | sed 's/^/      /'
+else
+    test_host_pass "the skipped-roots header no longer asserts they are not ours"
 fi
 # And it must NOT call the manifest's own toolchain foreign: the protected
 # check has to run before the ownership check, or the compiler in use -- named

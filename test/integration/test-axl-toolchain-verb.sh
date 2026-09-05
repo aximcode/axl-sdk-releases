@@ -73,6 +73,26 @@ fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 x64_block()  { awk '/^  x64/{f=1} f && /^$/{exit} f' "$1"; }
 aa64_block() { awk '/^  aa64/{f=1} /^  x64/{f=0} f' "$1"; }
 
+# ── the MACHINE contract ──────────────────────────────────────────────────
+#
+# `toolchain list --porcelain` is one tab-separated row per arch, and its
+# field order is the contract:
+#
+#   1 arch   2 version   3 root   4 gcc   5 g++   6 builds   7 reason
+#
+# EVERY VALUE ASSERTION IN THIS FILE READS IT, and that is the point. They
+# used to read the HUMAN listing by column index -- `$1 == "x64" {print $4}`
+# for the root, $3 for the g++ state, $5 for the C state -- so the rendering
+# could not be changed without breaking them, and it had not been: the path
+# sat between the two compiler states because a new column could only be
+# APPENDED, and three paragraphs of comment in `axl` defended those positions.
+# A human format that a machine parses positionally is a human format that is
+# frozen. Assertions about the RENDERING still read the rendering; assertions
+# about a VALUE read this.
+#
+# tcf <file> <arch> <field>
+tcf() { awk -F'\t' -v a="$2" -v n="$3" '$1 == a { print $n }' "$1"; }
+
 # A realistic install: an SDK prefix carrying the manifest and the installer,
 # a manager root carrying `axl` and NEITHER, and both `current` markers.
 # $1 = "installed" to also create the toolchain directories.
@@ -174,10 +194,26 @@ else
     fail "x64 / 14.3.0-axl3 missing from the listing"
     sed 's/^/      /' "$OUT" | head -8
 fi
-if [[ "$(grep -c 'MISSING' "$OUT")" -eq 2 ]]; then
-    pass "both absent toolchains are marked MISSING"
+# BOTH LOCATORS OF BOTH ARCHES, from the machine contract. Counting the word
+# MISSING in the human transcript was the old shape and it counted LINES, not
+# facts: it could not tell two absent toolchains from one arch printing the
+# word twice, and it broke the moment the human line started saying "not
+# installed" -- which is the wording a reader deserves and a parser must not
+# depend on.
+OUTP="$WORK/list-missing-porcelain.txt"
+AXL toolchain list --porcelain > "$OUTP" 2>&1
+if [[ "$(tcf "$OUTP" aa64 4)" == "MISSING" && "$(tcf "$OUTP" aa64 5)" == "MISSING" \
+   && "$(tcf "$OUTP" x64 4)"  == "MISSING" && "$(tcf "$OUTP" x64 5)"  == "MISSING" ]]; then
+    pass "both absent toolchains report MISSING for gcc and g++"
 else
-    fail "expected exactly 2 MISSING lines, got $(grep -c 'MISSING' "$OUT")"
+    fail "states: aa64 $(tcf "$OUTP" aa64 4)/$(tcf "$OUTP" aa64 5), x64 $(tcf "$OUTP" x64 4)/$(tcf "$OUTP" x64 5)"
+    sed 's/^/      /' "$OUTP" | head -4
+fi
+# ...and the human listing says so in words rather than in a status token.
+if grep -qF 'not installed' "$OUT"; then
+    pass "and the human listing spells that out as 'not installed'"
+else
+    fail "the human listing does not say 'not installed'"
     sed 's/^/      /' "$OUT" | head -8
 fi
 # EXACT, because the wrong hint is a working-looking command that does half
@@ -377,11 +413,131 @@ fi
 # The control: without the override the same tree reports MISSING, so the
 # assertions above cannot be passing on something else.
 OUT12="$WORK/no-override.txt"
+OUT12P="$WORK/no-override-porcelain.txt"
 AXL toolchain list > "$OUT12" 2>&1
-if grep -q 'MISSING' "$OUT12" && ! grep -q 'ALT BUILD' "$OUT12"; then
+AXL toolchain list --porcelain > "$OUT12P" 2>&1
+if [[ "$(tcf "$OUT12P" x64 5)" == "MISSING" ]] && ! grep -q 'ALT BUILD' "$OUT12"; then
     pass "control: without the override the same tree reports MISSING"
 else
-    fail "control failed -- case 9 proves nothing"
+    fail "control failed -- case 9 proves nothing (x64 g++: '$(tcf "$OUT12P" x64 5)')"
+fi
+
+echo
+echo "=== 9b. --porcelain IS the contract, so its shape is pinned ==="
+# WHAT A PARSER IS PROMISED, asserted as a shape rather than assumed by the
+# twenty-odd readers above. Every one of them was previously reading the HUMAN
+# listing by column index, which is why the rendering could not be improved
+# without breaking them; this is the thing that replaced that, so it is the
+# thing that now has to be held still.
+setup installed
+POUT="$WORK/porcelain-shape.txt"
+AXL toolchain list --porcelain > "$POUT" 2>&1
+prc=$?
+if [[ $prc -eq 0 ]]; then
+    pass "--porcelain exits 0"
+else
+    fail "--porcelain exits 0 (got $prc)"
+    sed 's/^/      /' "$POUT" | head -6
+fi
+# EXACTLY two rows, in a fixed order, and NOTHING else -- no banner above and
+# no advice below. A trailing "install with:" line is the sort of thing a
+# parser must not have to learn to skip, and it is emitted only in the human
+# form for exactly that reason.
+if [[ "$(wc -l < "$POUT")" -eq 2 ]] \
+   && [[ "$(awk -F'\t' 'NR==1{print $1}' "$POUT")" == "aa64" ]] \
+   && [[ "$(awk -F'\t' 'NR==2{print $1}' "$POUT")" == "x64" ]]; then
+    pass "two rows, aa64 then x64, with no header and no trailing advice"
+else
+    fail "shape is wrong: $(wc -l < "$POUT") line(s)"
+    sed 's/^/      /' "$POUT" | head -6
+fi
+# SEVEN FIELDS ON EVERY ROW. A field that goes empty -- an unresolvable root,
+# a reason nobody filled in -- silently shortens the row and every index after
+# it moves, which is the whole failure class this format exists to end.
+if [[ "$(awk -F'\t' '{print NF}' "$POUT" | sort -u | tr -d '\n')" == "7" ]]; then
+    pass "every row carries exactly 7 tab-separated fields"
+else
+    fail "field counts seen: $(awk -F'\t' '{print NF}' "$POUT" | sort -u | tr '\n' ' ')"
+    cat -A "$POUT" | sed 's/^/      /' | head -4
+fi
+# NO field may be empty, for the same reason.
+if ! awk -F'\t' '{for (i = 1; i <= NF; i++) if ($i == "") exit 1}' "$POUT"; then
+    fail "a porcelain field is empty -- use a placeholder, never a gap"
+    cat -A "$POUT" | sed 's/^/      /' | head -4
+else
+    pass "no field is empty"
+fi
+# The stray-argument refusal applies after the flag too.
+if AXL toolchain list --porcelain x64 > "$WORK/pstray.txt" 2>&1; then
+    fail "'toolchain list --porcelain x64' accepted a stray argument"
+else
+    pass "'--porcelain' still rejects a stray argument"
+fi
+
+echo
+echo "=== 9c. a MALFORMED override must not resolve the root to / ==="
+# tc_resolve derives an override-s root as dirname(dirname($_g)), so a value
+# one component short -- AXL_X64_GXX=/nonexistent/g++ -- resolves to `/`. The
+# listing printed that as the toolchain location, which is an answer that
+# reads as true, and the size lookup added beside it then ran `du -sh /` and
+# walked the entire filesystem to report the root filesystem-s size as the
+# toolchain-s. Measured: 389G, and seconds of I/O, from a status command.
+#
+# The uninstall arm already refuses exactly this shape by name (empty,
+# relative, or `/`) because there it ends in `rm -rf`. list needs it for a
+# different reason and needed it just as much.
+# THREE SHAPES, because the first guard written here caught only the first of
+# them. `/nonexistent/g++` gives `/`; `/usr/bin/g++` -- a locator the update
+# arm's own comment calls "an entirely ordinary distro cross-gcc" -- gives
+# `/usr`, which IS an absolute existing directory, so it passed and got
+# measured with du (11G, reported as the size of a toolchain); and a bare name
+# on PATH, which tc_have_compiler accepts on purpose, gives `.`, which the
+# placeholder branch printed verbatim and shipped as porcelain field 3, a
+# relative path where the contract promises absolute-or-(unset).
+setup installed
+for _bad in "/nonexistent/g++:/" "/usr/bin/g++:/usr" "g++:."; do
+    _loc="${_bad%%:*}"; _would="${_bad##*:}"
+    OUT9C="$WORK/bad-override.txt"
+    OUT9CP="$WORK/bad-override-porcelain.txt"
+    AXL_X64_GXX="$_loc" AXL_X64_GCC="$_loc" AXL toolchain list > "$OUT9C" 2>&1
+    AXL_X64_GXX="$_loc" AXL_X64_GCC="$_loc" AXL toolchain list --porcelain > "$OUT9CP" 2>&1
+    _got="$(tcf "$OUT9CP" x64 3)"
+    if [[ "$_got" == "(unset)" ]]; then
+        pass "override $_loc: field 3 is the placeholder, not $_would"
+    else
+        fail "override $_loc: field 3 is '$_got' (would have been $_would)"
+        sed 's/^/      /' "$OUT9CP" | head -4
+    fi
+    # THE HUMAN LINE, which is where it was actually printed and measured. A
+    # POSITIVE assertion on the same transcript, not only the negative one: a
+    # crash that renders nothing satisfies "does not print /usr" for free.
+    if x64_block "$OUT9C" | grep -qF 'no usable toolchain root'; then
+        pass "override $_loc: the human listing says there is no usable root"
+    else
+        fail "override $_loc: the human listing does not name the state"
+        sed 's/^/      /' "$OUT9C" | head -10
+    fi
+    if ! x64_block "$OUT9C" | grep -qxE " +(/|/usr|\.)"; then
+        pass "override $_loc: and names no bogus path as a location"
+    else
+        fail "override $_loc: the human listing still prints a bogus root"
+        sed 's/^/      /' "$OUT9C" | head -10
+    fi
+done
+# The control: a WELL-FORMED override on the same fixture still reports its
+# own root, so the guard above rejects malformed values rather than all of
+# them. Without this the assertions pass just as well against a list that
+# stopped resolving overrides at all.
+ALT9="$WORK/alt9/x86_64-elf-gcc-14.3.0-axl3"
+mkdir -p "$ALT9/bin"
+printf '#!/bin/sh\necho "x86_64-elf-g++ (ALT9) 14.3.0"\n' > "$ALT9/bin/x86_64-elf-g++"
+chmod +x "$ALT9/bin/x86_64-elf-g++"
+AXL_X64_GXX="$ALT9/bin/x86_64-elf-g++" AXL toolchain list --porcelain > "$WORK/alt9.txt" 2>&1
+if [[ "$(tcf "$WORK/alt9.txt" x64 3)" == "$ALT9" ]]; then
+    pass "control: a well-formed override still resolves to its own root"
+else
+    fail "control: field 3 is '$(tcf "$WORK/alt9.txt" x64 3)', expected $ALT9"
+    sed 's/^/      /' "$WORK/alt9.txt" | head -4
 fi
 
 echo
@@ -397,17 +553,32 @@ echo
 echo "=== 11. list: names WHICH compiler x64 actually builds with ==="
 setup installed
 OUT13="$WORK/builds-with.txt"
+OUT13P="$WORK/builds-with-porcelain.txt"
 AXL toolchain list > "$OUT13" 2>&1
-if x64_block "$OUT13" | grep -q 'builds with: axl'; then
+AXL toolchain list --porcelain > "$OUT13P" 2>&1
+# THE DECISION, from the machine contract: field 6 is the variant, field 7 the
+# reason. An exact match, not a substring -- `grep -q 'builds with: axl'` on
+# the transcript also matches aa64's fixed line, which is why the block
+# helpers had to exist at all.
+if [[ "$(tcf "$OUT13P" x64 6)" == "axl" ]]; then
     pass "list: names the variant x64 will actually build with"
 else
-    fail "no 'builds with: axl' line for an installed toolchain"
-    sed 's/^/      /' "$OUT13" | head -10
+    fail "porcelain field 6 for x64 is '$(tcf "$OUT13P" x64 6)', expected axl"
+    sed 's/^/      /' "$OUT13P" | head -4
 fi
-if x64_block "$OUT13" | grep -qF 'auto -> axl'; then
+if [[ "$(tcf "$OUT13P" x64 7)" == "auto -> axl: bare-metal toolchain installed" ]]; then
     pass "and names the reason: auto -> axl"
 else
-    fail "the axl resolution did not name its reason"
+    fail "porcelain field 7 for x64 is '$(tcf "$OUT13P" x64 7)'"
+    sed 's/^/      /' "$OUT13P" | head -4
+fi
+# ...and the HUMAN line renders that same decision, which is a separate claim:
+# the two are computed once and printed twice, and this is what holds the
+# second printing honest.
+if x64_block "$OUT13" | grep -qF 'builds with: axl -- auto -> axl: bare-metal toolchain installed'; then
+    pass "and the human listing renders the same decision on one line"
+else
+    fail "the human 'builds with' line does not match the porcelain decision"
     sed 's/^/      /' "$OUT13" | head -10
 fi
 
@@ -417,18 +588,20 @@ setup installed
 OUT14="$WORK/host-fallback.txt"
 # Point the C locator at a path that does not exist -- never touch the real
 # toolchain under /opt, this is a synthetic tree already.
+OUT14P="$WORK/host-fallback-porcelain.txt"
 AXL_X64_GCC=/nonexistent/x86_64-elf-gcc AXL toolchain list > "$OUT14" 2>&1
-if x64_block "$OUT14" | grep -q 'builds with: host'; then
+AXL_X64_GCC=/nonexistent/x86_64-elf-gcc AXL toolchain list --porcelain > "$OUT14P" 2>&1
+if [[ "$(tcf "$OUT14P" x64 6)" == "host" ]]; then
     pass "list: reports host when the bare-metal C compiler is absent"
 else
-    fail "expected 'builds with: host' when AXL_X64_GCC pointed nowhere"
-    sed 's/^/      /' "$OUT14" | head -10
+    fail "porcelain field 6 is '$(tcf "$OUT14P" x64 6)', expected host"
+    sed 's/^/      /' "$OUT14P" | head -4
 fi
-if x64_block "$OUT14" | grep -qF 'auto -> host: no bare-metal toolchain installed'; then
+if [[ "$(tcf "$OUT14P" x64 7)" == "auto -> host: no bare-metal toolchain installed" ]]; then
     pass "and names why: auto -> host: no bare-metal toolchain installed"
 else
-    fail "the host fallback did not name its reason"
-    sed 's/^/      /' "$OUT14" | head -10
+    fail "porcelain field 7 is '$(tcf "$OUT14P" x64 7)'"
+    sed 's/^/      /' "$OUT14P" | head -4
 fi
 if x64_block "$OUT14" | grep -qF 'C++' && x64_block "$OUT14" | grep -q 'needs the bare-metal toolchain'; then
     pass "and says C++ is unavailable under host"
@@ -445,23 +618,32 @@ fi
 # Control: WITHOUT the override, the very same installed tree reports axl --
 # proving the four assertions above are not passing on fixed text.
 OUT15="$WORK/host-fallback-control.txt"
-AXL toolchain list > "$OUT15" 2>&1
-if x64_block "$OUT15" | grep -q 'builds with: axl' && ! x64_block "$OUT15" | grep -q 'builds with: host'; then
+AXL toolchain list --porcelain > "$OUT15" 2>&1
+if [[ "$(tcf "$OUT15" x64 6)" == "axl" ]]; then
     pass "control: without the override, the installed tree says axl"
 else
-    fail "control failed -- case 12 proves nothing"
-    sed 's/^/      /' "$OUT15" | head -10
+    fail "control failed -- case 12 proves nothing (field 6: '$(tcf "$OUT15" x64 6)')"
+    sed 's/^/      /' "$OUT15" | head -4
 fi
 
 echo
 echo "=== 13. list: aa64 always builds with axl -- no host option exists ==="
 setup   # nothing installed at all
 OUT16="$WORK/aa64-always-axl.txt"
+OUT16P="$WORK/aa64-always-axl-porcelain.txt"
 AXL toolchain list > "$OUT16" 2>&1
-if aa64_block "$OUT16" | grep -qF 'builds with: axl (aa64 has no host option)'; then
-    pass "aa64's line states plainly that it has no host option"
+AXL toolchain list --porcelain > "$OUT16P" 2>&1
+if [[ "$(tcf "$OUT16P" aa64 6)" == "axl" \
+   && "$(tcf "$OUT16P" aa64 7)" == "aa64 has no host option" ]]; then
+    pass "aa64's row states plainly that it has no host option"
 else
-    fail "aa64's 'builds with' line never says it has no host option"
+    fail "aa64 reports '$(tcf "$OUT16P" aa64 6)' / '$(tcf "$OUT16P" aa64 7)'"
+    sed 's/^/      /' "$OUT16P" | head -4
+fi
+if aa64_block "$OUT16" | grep -qF 'builds with: axl -- aa64 has no host option'; then
+    pass "and the human listing says so on the aa64 block's own line"
+else
+    fail "aa64's human 'builds with' line never says it has no host option"
     sed 's/^/      /' "$OUT16" | head -10
 fi
 
@@ -469,12 +651,15 @@ echo
 echo "=== 14. list: an explicit AXL_TOOLCHAIN pin overrides auto ==="
 setup installed
 OUT17="$WORK/pinned.txt"
+OUT17P="$WORK/pinned-porcelain.txt"
 AXL_TOOLCHAIN=host AXL toolchain list > "$OUT17" 2>&1
-if x64_block "$OUT17" | grep -qF 'builds with: host (pinned by $AXL_TOOLCHAIN)'; then
+AXL_TOOLCHAIN=host AXL toolchain list --porcelain > "$OUT17P" 2>&1
+if [[ "$(tcf "$OUT17P" x64 6)" == "host" \
+   && "$(tcf "$OUT17P" x64 7)" == 'pinned by $AXL_TOOLCHAIN' ]]; then
     pass "x64: an explicit AXL_TOOLCHAIN=host is reported as pinned, not auto"
 else
-    fail "AXL_TOOLCHAIN=host was not reported as a pin for x64"
-    sed 's/^/      /' "$OUT17" | head -10
+    fail "pin reported as '$(tcf "$OUT17P" x64 6)' / '$(tcf "$OUT17P" x64 7)'"
+    sed 's/^/      /' "$OUT17P" | head -4
 fi
 # Whole-file: NEITHER arch's line may claim an 'auto' resolution while the
 # pin is active -- x64 is pinned and aa64 cannot honor this pin at all
@@ -488,11 +673,11 @@ fi
 # aa64 CANNOT build under AXL_TOOLCHAIN=host (axl-cc refuses it by name,
 # §4.2) -- the probe genuinely cannot answer, and that must read as an
 # honest 'unknown', never as a confident (and wrong) 'axl'.
-if aa64_block "$OUT17" | grep -q 'builds with: unknown'; then
+if [[ "$(tcf "$OUT17P" aa64 6)" == "unknown" ]]; then
     pass "aa64: an impossible pin is reported as unknown, not a silent axl"
 else
-    fail "aa64's line did not flag the impossible AXL_TOOLCHAIN=host pin"
-    sed 's/^/      /' "$OUT17" | head -10
+    fail "aa64 reports '$(tcf "$OUT17P" aa64 6)' under an impossible pin"
+    sed 's/^/      /' "$OUT17P" | head -4
 fi
 
 echo
@@ -512,53 +697,51 @@ chmod +x "$WORK/opt/x86_64-elf-gcc-14.3.0-axl3/bin/x86_64-elf-gcc"
 # option)" regardless of this fixture -- the assertions below are scoped to
 # x64_block specifically, or aa64's constant text would pass them for free.
 OUT18="$WORK/gcc-only.txt"
+OUT18P="$WORK/gcc-only-porcelain.txt"
 AXL toolchain list > "$OUT18" 2>&1
-if x64_block "$OUT18" | grep -q 'builds with: axl'; then
+AXL toolchain list --porcelain > "$OUT18P" 2>&1
+if [[ "$(tcf "$OUT18P" x64 6)" == "axl" ]]; then
     pass "gcc present + g++ absent: x64 still builds with axl"
 else
-    fail "reported host (or nothing) for x64 with a working C compiler present"
-    sed 's/^/      /' "$OUT18" | head -10
+    fail "x64 reports '$(tcf "$OUT18P" x64 6)' with a working C compiler present"
+    sed 's/^/      /' "$OUT18P" | head -4
 fi
-if grep -qE '^  x64.*MISSING' "$OUT18"; then
-    pass "and the EXISTING line still shows x64 MISSING (no C++ compiler)"
+# BOTH LOCATORS, SEPARATELY, and this fixture is the one that needs them
+# apart: `axl update` carries an arch when EITHER resolves, so a listing that
+# reported one number for both said MISSING about a toolchain the update was
+# about to refresh. Fields 4 and 5 are gcc and g++; the position is the label,
+# so the "gcc:"/"g++:" prefixes that disambiguated them in prose are gone.
+if [[ "$(tcf "$OUT18P" x64 4)" == "installed" \
+   && "$(tcf "$OUT18P" x64 5)" == "MISSING" ]]; then
+    pass "and reports gcc installed / g++ MISSING, so list agrees with what update does"
 else
-    fail "the existing installed/MISSING line changed unexpectedly"
-    sed 's/^/      /' "$OUT18" | head -10
+    fail "gcc='$(tcf "$OUT18P" x64 4)' g++='$(tcf "$OUT18P" x64 5)', wanted installed/MISSING"
+    sed 's/^/      /' "$OUT18P" | head -4
 fi
-# THE FIX: the root line and the 'builds with' line answer DIFFERENT
-# questions (g++ presence vs. what axl-cc will actually compile with), and
-# unlabeled they read as one command contradicting itself -- "MISSING"
-# directly above "builds with: axl". The root line now names g++ by name so
-# a reader sees which compiler each line is about instead of two lines that
-# look like they disagree.
-if x64_block "$OUT18" | grep -qF 'g++:MISSING'; then
-    pass "and the MISSING line names g++, so it reads as answering a different question than 'builds with: axl' rather than contradicting it"
+# THE HUMAN RENDERING OF THAT SPLIT, which is the half a reader sees. Two
+# lines that answer different questions (is a C++ compiler present vs. what
+# will actually compile) used to read as one command contradicting itself:
+# a bare "MISSING" directly above "builds with: axl". The state is now spelled
+# as what you HAVE, so the two lines cannot be read as disagreeing.
+if x64_block "$OUT18" | grep -qF 'gcc only, no C++'; then
+    pass "and the human line says 'gcc only, no C++' rather than a bare MISSING"
 else
-    fail "the MISSING line does not name g++ -- still reads as contradicting 'builds with: axl'"
+    fail "the human state line does not distinguish gcc-only from missing"
     sed 's/^/      /' "$OUT18" | head -10
 fi
-# AND THE LINE NOW CARRIES THE C LOCATOR TOO, as an appended FIFTH field.
-# Naming g++ stopped the line reading as a contradiction; it did not stop the
-# line being HALF an answer. `axl update` carries an arch when EITHER locator
-# resolves, so on exactly this fixture `list` reported MISSING about a
-# toolchain the update was about to refresh. Field 5 closes that.
-C15="$(awk '$1 == "x64" { print $5 }' "$OUT18")"
-if [[ "$C15" == "gcc:installed" ]]; then
-    pass "and field 5 reports gcc:installed, so list agrees with what update does"
-else
-    fail "field 5 is '$C15', expected gcc:installed"
-    sed 's/^/      /' "$OUT18" | head -10
-fi
-# APPENDED, NOT INSERTED: case 17 below reads the toolchain ROOT out of field
-# 4 with the same awk. A column added anywhere but the end would hand that
-# assertion -- the one guarding a command that ends in `rm -rf` -- a compiler
-# state string where it expects a path.
-R15="$(awk '$1 == "x64" { print $4 }' "$OUT18")"
+# THE ROOT IS STILL THE ROOT, on the fixture whose state words contain spaces.
+# This assertion used to read field 4 of the human line and existed to prove a
+# newly ADDED column had not shifted it -- a guard that constrained the
+# rendering rather than the contract, and one the human layout could not
+# survive: "gcc only, no C++" alone puts three tokens where a parser wanted
+# one, and the reader that broke is the one deciding where an `rm -rf` points.
+# Tab separation is what makes the value's own spaces a non-question.
+R15="$(tcf "$OUT18P" x64 3)"
 if [[ "$R15" == "$WORK/opt/x86_64-elf-gcc-14.3.0-axl3" ]]; then
-    pass "and field 4 is still the toolchain root, unshifted"
+    pass "and the root is still field 3, unshifted by a state containing spaces"
 else
-    fail "field 4 is '$R15' -- the new column shifted the root reader"
-    sed 's/^/      /' "$OUT18" | head -10
+    fail "field 3 is '$R15' -- expected $WORK/opt/x86_64-elf-gcc-14.3.0-axl3"
+    sed 's/^/      /' "$OUT18P" | head -4
 fi
 
 echo
@@ -609,8 +792,13 @@ echo "=== 17. uninstall: the resolved root, proved BEFORE anything can delete ==
 # thing being guarded against, so this one exits.
 setup installed
 TCROOT="$WORK/opt/x86_64-elf-gcc-14.3.0-axl3"
-AXL toolchain list > "$WORK/preflight.txt" 2>&1
-PRE_ROOT="$(awk '$1 == "x64" { print $4 }' "$WORK/preflight.txt")"
+# THROUGH THE MACHINE CONTRACT, which is what this reader should always have
+# used: it decides whether a command ending in `rm -rf` is pointed at $WORK or
+# at the real /opt, and it used to take field 4 of a space-separated HUMAN
+# line -- a reading that any value containing a space, or any new column,
+# silently moves. Field 3 of a tab-separated row cannot be shifted by either.
+AXL toolchain list --porcelain > "$WORK/preflight.txt" 2>&1
+PRE_ROOT="$(tcf "$WORK/preflight.txt" x64 3)"
 if [[ -n "$PRE_ROOT" && "$PRE_ROOT" == "$TCROOT" ]]; then
     pass "preflight: x64 resolves to the fixture root under \$WORK"
 else
@@ -806,6 +994,61 @@ else
 fi
 
 echo
+echo "=== 23b. --dry-run PREVIEWS an unwritable parent, it does not refuse ==="
+# A DRY RUN MUST NOT FAIL FOR A CONDITION THAT ONLY AFFECTS THE REAL RUN.
+# The writability check ran BEFORE the dry-run report, so on the configuration
+# that makes it fire -- /opt root-owned, which is most machines -- `uninstall
+# --dry-run` exited 1 saying "cannot remove", having answered none of what was
+# asked: what would go, how big it is, how many files. The preview is when you
+# most want that, because it is what you read before deciding to type sudo.
+#
+# `axl prune --dry-run` on the same box previews and exits 0. Two dry runs in
+# one program with opposite contracts is a coin flip for the reader.
+#
+# Still REFUSED under --dry-run: every guard that says the TARGET is wrong
+# (bad arch, unusable path, symlink, no receipt, wrong receipt arch). Those
+# are not about who is running.
+setup installed
+cat > "$TCROOT/.axl-receipt" <<EOF
+AXL_RECEIPT_KIND=toolchain
+AXL_RECEIPT_ARCH=x64
+EOF
+chmod a-w "$WORK/opt"
+UNDW="$WORK/un-dry-nowrite.txt"
+AXL toolchain uninstall --dry-run x64 > "$UNDW" 2>&1; rcdw=$?
+chmod u+w "$WORK/opt"
+if [[ $rcdw -eq 0 ]] && grep -qF "would remove $TCROOT" "$UNDW" \
+   && grep -qF 'dry run, nothing removed' "$UNDW"; then
+    pass "an unwritable parent still previews, and exits 0"
+else
+    fail "dry run on an unwritable parent: rc=$rcdw (expected 0 with a preview)"
+    sed 's/^/      /' "$UNDW" | head -8
+fi
+# ...and it says the real run needs root, because that is the next thing the
+# reader has to know and the refusal was the only place that used to say it.
+#
+# KEYED ON WORDING ONLY THE PREVIEW CAN PRODUCE. Grepping for "is not writable
+# by" or "sudo" would have PASSED against the refusal being replaced -- the
+# text it emits contains both -- so the assertion would have been satisfied by
+# the defect. "the real run needs root" appears in no refusal.
+if grep -qF 'the real run needs root' "$UNDW"; then
+    pass "and names the privilege the real run will need"
+else
+    fail "the preview does not mention the privilege the real run needs"
+    sed 's/^/      /' "$UNDW" | head -8
+fi
+# THE TREE IS UNTOUCHED, which a preview claiming "nothing removed" has to be
+# held to separately -- the claim is text, and text is not evidence. This one
+# is a SAFETY NET, not a discriminator: it passes against the code being
+# replaced too, because that code removed nothing either. It is here to fail
+# the day a dry run starts doing something.
+if [[ -x "$TCROOT/bin/x86_64-elf-g++" ]]; then
+    pass "and the compiler is still there afterwards"
+else
+    fail "the dry run removed something"
+fi
+
+echo
 echo "=== 24. uninstall: the post-removal line RE-PROBES, it does not assume ==="
 # THE BUG THIS CLOSES: the tail used to print a FIXED "x64 now builds with
 # the host compiler (auto -> host)" after every successful x64 removal --
@@ -869,10 +1112,12 @@ echo
 echo "=== 26. uninstall --dry-run: runs every guard, reports, and removes nothing ==="
 # The other destructive verb in this file (axl prune, axl-prune.sh) has had
 # --dry-run since it existed; toolchain uninstall did not, which was the
-# asymmetry closed here. Same spelling, same contract: every guard above
-# still runs -- arch, path shape, symlink, not-installed, receipt KIND+ARCH,
-# parent writability -- and only then does it report instead of renaming or
-# removing.
+# asymmetry closed here. Same spelling, same contract: every guard that says
+# the TARGET is wrong still runs -- arch, path shape, symlink, not-installed,
+# receipt KIND+ARCH -- and only then does it report instead of renaming or
+# removing. Parent writability is NOT in that list any more (case 23b): it
+# says the CALLER lacks a privilege, which is a fact the preview reports
+# rather than a reason to refuse to preview.
 #
 # THE ASSERTION IS A NEGATIVE ONE, and case 18's comment already names the
 # trap: "the root still exists" is satisfied just as well by a crash before
@@ -920,33 +1165,33 @@ else
 fi
 
 echo
-echo "=== 27. list: an EMPTY manifest root still leaves one token in field 4 ==="
-# THE SHIFT ARRIVING FROM A VALUE INSTEAD OF A COLUMN. Case 15 guards the root
-# reader against someone INSERTING a field before it; this guards it against an
-# empty AXL_<ARCH>_TOOLCHAIN_DIR, which collapses to nothing between two spaces
-# so awk slides field 5 into field 4 -- and case 17-s root reader, which guards
-# a command ending in `rm -rf`, silently receives "gcc:installed" for a path.
+echo "=== 27. list: an EMPTY manifest root is a placeholder, not a gap ==="
+# WHY THIS SURVIVES THE MOVE TO --porcelain. It was written against the human
+# listing, where an empty AXL_<ARCH>_TOOLCHAIN_DIR collapsed to nothing between
+# two spaces and awk slid field 5 into field 4 -- so case 17's root reader,
+# which decides where an `rm -rf` points, silently received "gcc:installed"
+# for a path. Tab separation removes that failure MODE (an empty field is
+# still a field), so this now pins the two things still worth pinning: the
+# placeholder is printed rather than an empty field, and the columns after it
+# have not moved. The reader it protects has moved to field 3 with it.
 setup installed
 sed -i 's|^AXL_X64_TOOLCHAIN_DIR=.*|AXL_X64_TOOLCHAIN_DIR=|' \
     "$WORK/opt/axl-sdk-4.6.0/share/axl/axl-toolchains.conf"
 OUT27="$WORK/empty-root.txt"
-AXL toolchain list > "$OUT27" 2>&1
-R27="$(awk '$1 == "x64" { print $4 }' "$OUT27")"
-C27="$(awk '$1 == "x64" { print $5 }' "$OUT27")"
+AXL toolchain list --porcelain > "$OUT27" 2>&1
+R27="$(tcf "$OUT27" x64 3)"
+C27="$(tcf "$OUT27" x64 4)"
 if [[ "$R27" == "(unset)" ]]; then
-    pass "an empty manifest root prints one placeholder token in field 4"
+    pass "an empty manifest root prints the (unset) placeholder, not an empty field"
 else
-    fail "field 4 is '$R27' -- an empty root shifted the columns"
-    sed 's/^/      /' "$OUT27" | head -8
+    fail "field 3 is '$R27', expected (unset)"
+    sed 's/^/      /' "$OUT27" | head -4
 fi
-# THE HALF THAT PROVES THE SHIFT WAS THE BUG: without the placeholder this is
-# exactly where gcc:installed lands, so asserting it is STILL in field 5 says
-# the columns did not move rather than merely that field 4 is non-empty.
-if [[ "$C27" == "gcc:installed" || "$C27" == "gcc:MISSING" ]]; then
-    pass "and the C-locator state is still in field 5"
+if [[ "$C27" == "installed" || "$C27" == "MISSING" ]]; then
+    pass "and the C-locator state is still in field 4"
 else
-    fail "field 5 is '$C27' -- the columns moved"
-    sed 's/^/      /' "$OUT27" | head -8
+    fail "field 4 is '$C27' -- the columns moved"
+    sed 's/^/      /' "$OUT27" | head -4
 fi
 
 echo "axl-toolchain-verb: $PASS passed, $FAIL failed"

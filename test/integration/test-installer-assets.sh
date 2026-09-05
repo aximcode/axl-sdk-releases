@@ -323,4 +323,44 @@ _mgr_cur="$(cd -P "$M2P/axl-sdk-host-tools" 2>/dev/null && pwd)"
 ! grep -qF "would remove      $_mgr_cur" "$WORK/m2-prune.log"
 check $? "axl prune never proposes removing the CURRENT manager"
 
+# ── `axl version` when the two numbers disagree, BOTH WAYS ────────────────
+#
+# The fixture above already left the SDK rolled back and the manager where it
+# was, so this is the manager-NEWER case as it actually arises. It is ordinary
+# and the advice is "axl update moves both".
+"$M2B/axl" version > "$WORK/ver-newer.log" 2>&1
+grep -qF "The manager is versioned separately and does not follow" "$WORK/ver-newer.log"
+check $? "axl version: a NEWER manager is explained as the normal 'axl use' state" \
+      "$WORK/ver-newer.log"
+
+# THE OTHER DIRECTION, which had the same message and needed the opposite
+# advice. A manager older than the SDK is what every install made at 4.6.0 or
+# earlier looks like after an update -- install.sh only ever created a manager
+# when there was none, and that `axl` predates the code that moves the manager,
+# so it CANNOT carry itself. "axl update moves both" points that reader at the
+# one command that cannot fix it, and the release notes were left telling them
+# to compare two numbers by eye against a web page to find out which case they
+# were in.
+#
+# Simulated by writing an older number into the manager root, because the
+# faithful fixture is an actual pre-4.7.0 `axl` binary and the branch under
+# test reads these two files.
+_mgr_root="$(cd -P "$M2P/axl-sdk-host-tools" 2>/dev/null && pwd)"
+printf '0.0.1\n' > "$_mgr_root/share/axl/version"
+[[ -f "$_mgr_root/VERSION" ]] && printf '0.0.1\n' > "$_mgr_root/VERSION"
+# EXACT, not the fragment "cannot": a six-letter substring is satisfied by any
+# future diagnostic that happens to contain it, which is how an assertion comes
+# to pin nothing while still reading like it pins the branch.
+"$M2B/axl" version > "$WORK/ver-older.log" 2>&1
+grep -qF "The manager is OLDER than the SDK. A manager this old cannot" "$WORK/ver-older.log" \
+    && grep -qF "sh install.sh --host-tools" "$WORK/ver-older.log"
+check $? "axl version: an OLDER manager gets the bootstrap, not 'axl update'" \
+      "$WORK/ver-older.log"
+# ...and specifically NOT the other message, which would send them to the one
+# command that cannot help. Asserted separately: the bootstrap text appearing
+# does not by itself mean the wrong advice stopped appearing.
+! grep -qF "The manager is versioned separately and does not follow" "$WORK/ver-older.log"
+check $? "and does not also print the 'axl update moves both' advice" \
+      "$WORK/ver-older.log"
+
 test_host_summary "installer asset resolution ($TEST_ARCH)"

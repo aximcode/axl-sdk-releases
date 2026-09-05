@@ -133,6 +133,55 @@ perm="$(stat -c '%a' "$ROOT/libexec/axl/install.sh")"
 [[ "$perm" == "644" ]]
 check $? "the staged install.sh is mode 0644, not a subcommand (got $perm)"
 
+# THE RULE WAS APPLIED, asserted against every tool rather than against a list
+# of names. `axl` offers exactly the EXECUTABLES in libexec/axl, so the mode
+# bit is not a detail of the copy -- it IS the declaration "this is a command"
+# -- and scripts/stage-host-tools.sh decides it from the file itself: a
+# shebang is the manifest. This archive is the OTHER staging path for the same
+# file list, and it used to install everything 0755 with one hand-written
+# exception, so `axl common` (a sourced library) and `axl gdb-sample` (loaded
+# INSIDE gdb, no shebang at all) both shipped 0755 in v4.7.0 and were offered
+# as commands that cannot run.
+#
+# Naming the two here would have made this test a FOURTH copy of the same list,
+# in the test for a change whose whole thesis is that the second copy is what
+# drifted -- and it would not notice an eleventh tool arriving shebang-less and
+# staged 755. Sourcing the rule and comparing against it is what proves the
+# rule was applied.
+# shellcheck source=../../scripts/stage-host-tools.sh
+source "$PROJECT_DIR/scripts/stage-host-tools.sh"
+mode_bad=""
+mode_n=0
+while read -r _f; do
+    [[ -n "$_f" ]] || continue
+    mode_n=$((mode_n + 1))
+    want="$(axl_host_tool_mode "$PROJECT_DIR/scripts/$_f")"
+    got="$(stat -c '%a' "$ROOT/libexec/axl/$_f" 2>/dev/null)"
+    [[ "$got" == "$want" ]] || mode_bad="$mode_bad $_f($got,want $want)"
+done < <(make -s -C "$PROJECT_DIR" print-HOST_TOOL_FILES | tr ' ' '\n')
+[[ "$mode_n" -gt 5 && -z "$mode_bad" ]]
+check $? "all $mode_n staged tools carry the mode the shebang rule gives them${mode_bad:+ --$mode_bad}"
+
+# ---------------------------------------------------------------------------
+# The dispatcher's listing: every entry described, and every entry runs.
+# ---------------------------------------------------------------------------
+#
+# SCOPED TO THE `host commands:` SECTION and NOT requiring a description.
+# The walk below used to read the listing with `s/^  \([a-z][a-z0-9-]*\) .*/\1/p`
+# -- a regex whose space demands a description. The only entries without one
+# were axl-common.sh and gdb-sample.py, so the two commands that could not run
+# were the exact two this walk could not see, and it reported "all 7 dispatcher
+# commands run" against an archive offering nine. A listing entry with no
+# description is now its own failure, because that is the cheap tell.
+CMDS="$WORK/cmds.txt"
+"$ROOT/bin/axl" --help | sed -n '/^host commands:/,/^$/p' \
+    | sed -n 's/^  \([a-z][a-z0-9-]*\).*/\1/p' > "$CMDS"
+
+nodesc="$("$ROOT/bin/axl" --help | sed -n '/^host commands:/,/^$/p' \
+          | sed -n 's/^  \([a-z][a-z0-9-]*\)[[:space:]]*$/\1/p' | tr '\n' ' ')"
+[[ -z "$nodesc" ]]
+check $? "every listed command carries an axl-desc description${nodesc:+ -- undescribed:$nodesc}"
+
 # Every command the dispatcher offers must RUN and know its version. A command
 # reports its PROGRAM name, which is not always the verb -- `axl`'s listing
 # strips a leading `axl-`, so `axl prune` is axl-prune.sh and answers
@@ -147,9 +196,14 @@ while read -r cmd; do
         "$cmd $VERSION"|"axl-$cmd $VERSION") ;;
         *) bad="$bad $cmd" ;;
     esac
-done < <("$ROOT/bin/axl" --help | sed -n 's/^  \([a-z][a-z0-9-]*\) .*/\1/p')
+done < "$CMDS"
 
-[[ "$n" -gt 5 && -z "$bad" ]]
-check $? "all $n dispatcher commands run and report $VERSION${bad:+ -- failed:$bad}"
+# EXACTLY the executables in libexec/axl, not a floor. `-gt 5` is the shape
+# that let "all 7 dispatcher commands run" stand against an archive offering
+# nine: the two that could not run were invisible to the walk, and a floor
+# cannot tell a shrinking list from a correct one.
+n_exec=$(find "$ROOT/libexec/axl" -maxdepth 1 -type f -perm -u+x | wc -l)
+[[ "$n" -eq "$n_exec" && "$n" -gt 5 && -z "$bad" ]]
+check $? "all $n dispatcher commands run and report $VERSION (${n_exec} executable in libexec)${bad:+ -- failed:$bad}"
 
 test_host_summary "host-tools-tarball"

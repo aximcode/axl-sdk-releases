@@ -1854,6 +1854,41 @@ re-fetch. Staged at mode 0644 so `axl`'s command list — executables in
 `libexec/axl/` — does not offer it as a third way to reach the same thing; the
 `axl_version.py` precedent. Small, self-contained, testable without a release.
 
+#### The mode is a declaration, so it is derived, not listed
+
+Because `axl` offers exactly the **executables** in `libexec/axl/`, the mode bit
+is not a detail of the copy — it *is* the statement "this is a command". So it
+is decided from the file: **a shebang is the manifest.** A file that can be run
+stages 0755 and becomes a command; one that cannot stages 0644 and is present
+only for its siblings to find. Nothing anywhere holds a list of which is which.
+
+That rule was written in `scripts/install.sh` and *approximated* in
+`scripts/make-host-tools-tarball.sh`, which staged everything 0755 with one
+hand-written exception. Both already read the file **list** from the Makefile
+precisely so it could not drift — and the **mode** rule, the copy nobody
+noticed, drifted exactly as a duplicated list would. The v4.7.0 host-tools
+tarball therefore offered `axl common` (`axl-common.sh`, which `run-qemu.sh`
+*sources* — a silent no-op) and `axl gdb-sample` (`gdb-sample.py`, loaded inside
+gdb, no shebang at all — a bash syntax error). Both are commands a user would
+reasonably try.
+
+The rule now lives in `scripts/stage-host-tools.sh`, sourced by both staging
+paths, and — applying itself to itself — that file carries no shebang and is
+mode 0644.
+
+**A third copy existed and was holding the stale answer.**
+`scripts/check-tool-version.py` classifies by the *source* file's exec bit,
+which is a second spelling of the same question, and the two disagreed:
+`gdb-sample.py` was 755 in the tree with no shebang, so the gate carried a
+hand-written `NOT_COMMANDS` exception naming it. The exception is gone; the gate
+now asserts that a source's exec bit and its shebang **agree**, which makes a
+future mismatch a gate failure at the source — one `chmod` to fix — rather than
+an unrunnable command in a published tarball.
+
+`test-host-tools-tarball.sh` asserts the staged mode of every tool against
+`axl_host_tool_mode` rather than against a list of names, because a list there
+would have been a fourth copy in the test for the defect that copies cause.
+
 **D1a — the five maintenance verbs. SHIPPED 2026-09-01.** `update`, `use <version>`, `list`,
 `uninstall`, `prune`. Settled after asking what `install` and `update` each
 mean:
@@ -2437,21 +2472,19 @@ reappearing one layer up. The probe is `[[ -x "$x" ]] || command -v "$x"`,
 matching `axl-cc`'s own presence checks — a locator may legitimately hold a bare
 name resolved on `PATH`.
 
-`axl toolchain list` keeps its `g++:`-labelled field — it pairs with a "builds
-with:" line that asks `axl-cc`, and the two can name different compilers — but
-it no longer *only* reports g++. On a gcc-only tree it used to say MISSING about
-a toolchain `axl update` was about to refresh: one command contradicting another
-about one machine, which is the reporting half of the same silence. It now
-**appends a fifth field**, `gcc:installed` / `gcc:MISSING`.
+`axl toolchain list` reports **both locators**, not only g++. On a gcc-only tree
+it used to say MISSING about a toolchain `axl update` was about to refresh: one
+command contradicting another about one machine, which is the reporting half of
+the same silence.
 
-Appended, not inserted: the toolchain **root** is read out of field 4
-(`test-axl-toolchain-verb.sh` case 17) and field 3 is compared for equality in
-several places, so a column anywhere but the end would shift or break them. Step
-8ib and case 15 assert all three — field 3 still `g++:MISSING`, field 4 still the
-root, field 5 the new `gcc:installed`. Field 4 also gained a `(unset)`
-placeholder, because an empty `AXL_<ARCH>_TOOLCHAIN_DIR` collapses to nothing
-between two spaces and slides field 5 into field 4 — the same shift, arriving
-from a *value* instead of a column (case 27).
+> **Superseded by §21c.** The paragraphs that stood here described the two
+> states as a *fifth column appended* to the human listing, and explained at
+> length why a column could only be appended and never inserted: the toolchain
+> **root** was read out of field 4 by `test-axl-toolchain-verb.sh` case 17, and
+> field 3 was compared for equality in several places. That constraint was real
+> and it was the wrong one to accept — it is what left the path sandwiched
+> between the two compiler states in the line a human reads. `list` now has a
+> machine form (`--porcelain`) and the human rendering is free of it; see §21c.
 
 **A second, quieter change came with it:** `list`'s presence predicate widened
 from `-x "$_g"` to the shared `tc_have_compiler`, so a locator holding a bare
@@ -2717,9 +2750,9 @@ vacuous.
   which is a different directory.
 
 - **8ib — either locator.** g++ removed from the installed root; `axl toolchain
-  list` says `g++:MISSING` (the control) and `axl update` carries it anyway.
-  Also asserts the new field 5 (`gcc:installed`) and that field 4 is still the
-  root path.
+  list --porcelain` reports g++ `MISSING` (the control) and `axl update`
+  carries it anyway. Also asserts the gcc field is `installed` and that the
+  root field is still the root path.
 - **8id — an override-located root is declined, not installed into `/opt`.**
   Control that the override really moves the root `list` reports, then exit 0
   **and** the SDK moved **and** the named decline **and** the exact `--prefix`
@@ -2747,3 +2780,70 @@ anyway fails 8id; dropping `list`'s appended field fails 8ib; announcing from
 `axl` again fails 8j; ignoring `--no-toolchain`, or moving its contradiction
 check below the manager phase, or letting `--no-toolchain=VALUE` and a bad
 `AXL_TOOLCHAIN` fall through, fails 8k; restoring `ensure` fails 8L.
+
+## 21c. `axl toolchain list` has a machine form, so the human one is free
+
+**The problem, stated as a rule.** A human format that a machine parses
+*positionally* is a human format that is frozen. There was no machine form, so
+every consumer read the human listing by column index — `awk '$1 == "x64" {
+print $4 }'` for the toolchain root, field 3 compared for equality, field 5 for
+the C locator. Twenty-five such sites across two test files, one of them
+deciding where a command ending in `rm -rf` points.
+
+The cost was never the parsing. It was that the rendering could no longer move,
+and it had not: §21a's second locator could only be **appended**, so the line
+read
+
+```
+  x64   14.3.0-axl3    g++:installed /opt/x86_64-elf-gcc-14.3.0-axl3 gcc:installed
+```
+
+with the **path sandwiched between the two compiler states**, and three
+paragraphs of comment in `scripts/axl` defending the positions against exactly
+the improvement a reader wanted.
+
+**The split.** `axl toolchain list --porcelain` is one tab-separated row per
+arch and nothing else — no banner above it and no `install with:` advice below,
+because a trailing line that is sometimes present is the thing a parser must not
+learn to skip. Seven fields, and the **position is the label**, so the `gcc:` /
+`g++:` prefixes that disambiguated the two states in prose are not repeated:
+
+| # | field | values |
+|---|---|---|
+| 1 | arch | `aa64`, `x64` |
+| 2 | version | the manifest's pinned version, or `(unset)` |
+| 3 | root | absolute path, or `(unset)` |
+| 4 | gcc | `installed`, `MISSING` |
+| 5 | g++ | `installed`, `MISSING` |
+| 6 | builds | `axl`, `host`, `cross`, `unknown` |
+| 7 | reason | free text, never empty, never containing a tab |
+
+**Tab-separated, not JSON**, and that follows from who reads it: every consumer
+is a shell script, `awk -F'\t'` needs nothing installed, and `jq` is not in
+`install.sh`'s `need_cmd` set — `test-host-deps-minimal.sh` pins exactly that
+list. A JSON form would add a dependency to satisfy a caller that does not
+exist.
+
+**One decision, two renderings.** The variant and its reason are computed once
+and printed by whichever form was asked for; the human line used to *be* the
+decision, which is why nothing else could read it. Case 11 asserts both — the
+porcelain fields and the human line that renders them — so the second printing
+cannot drift from the first.
+
+**What the human form gained once it was free:** one fact per line in the order
+a reader asks for them (is it there, where and how big, what exactly it is, what
+will compile), the path on its own line, the state spelled as what you *have*
+(`gcc + g++`, `gcc only, no C++`, `not installed`) rather than as a status token,
+and the size on disk — which is the number that decides whether
+`axl toolchain uninstall` is worth running, and was the one fact a reader had to
+leave and measure for themselves.
+
+**A guard that arrived with the size.** `tc_resolve` derives an override's root
+as `dirname(dirname($_g))`, so a malformed `AXL_X64_GXX=/nonexistent/g++`
+resolves to `/`. The listing printed that as the toolchain location — an answer
+that reads as true — and the new size lookup then ran `du -sh /` and walked the
+entire filesystem to report **389G** as the toolchain's size, from a status
+command. The uninstall arm already refused that shape by name (empty, relative,
+or `/`) because there it ends in `rm -rf`; `list` needed it for a different
+reason and needed it just as much. Case 9c pins both halves, with a
+well-formed-override control so the guard cannot pass by rejecting everything.

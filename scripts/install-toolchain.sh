@@ -25,13 +25,34 @@
 
 set -euo pipefail
 
-HERE="$(cd -P "$(dirname "$0")" && pwd)"
+# RESOLVE THE SYMLINK FIRST. install.sh links every bin/ tool into --bin-dir
+# (~/.local/bin by default), so the normal invocation is through a symlink --
+# and `dirname "$0"` on that yields the LINK's directory, which holds no
+# sibling of ours and no ../share/axl. This script computed its prefix as
+# ~/.local and then failed with "axl_handle_version: command not found"
+# followed by "axl-toolchains.conf not found", while the same file run by its
+# real path worked. It was the only tool in bin/ that did not resolve $0;
+# axl, axl-cc and axl-c++ all do (see scripts/axl's own _axl_self). `cd -P`
+# stays for the second half of the job: it resolves a symlinked DIRECTORY,
+# which readlink -f on the file does not do for the path above it.
+_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+HERE="$(cd -P "$(dirname "$_self")" && pwd)"
 # axl-common.sh sits beside this script in a checkout, but this file is the
 # one host tool staged into bin/ rather than libexec/axl/, so in a staged
 # prefix the neighbour is one directory over. One path cannot serve both.
+#
+# NOT FINDING IT IS FATAL. The loop used to fall through silently, which left
+# every function it defines undefined and turned the next line into
+# "axl_handle_version: command not found" -- a diagnostic naming a symbol
+# instead of the missing file, printed by a script that then kept running.
+_axl_common_found=""
 for _axl_common in "$HERE/axl-common.sh" "$HERE/../libexec/axl/axl-common.sh"; do
-    [[ -r "$_axl_common" ]] && { source "$_axl_common"; break; }
+    [[ -r "$_axl_common" ]] && { source "$_axl_common"; _axl_common_found=1; break; }
 done
+if [[ -z "$_axl_common_found" ]]; then
+    echo "ERROR: axl-common.sh not found beside $_self or in ../libexec/axl/" >&2
+    exit 1
+fi
 
 # Answered before anything else parses argv, so `--version` never has to
 # survive a positional-hungry option loop. See axl-common.sh.

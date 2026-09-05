@@ -59,6 +59,11 @@ if [[ "$PRINT_NAME" == "1" ]]; then
     exit 0
 fi
 
+# The libexec staging rule, shared with scripts/install.sh so the two staging
+# paths cannot disagree about which of these files are commands.
+# shellcheck source=./stage-host-tools.sh
+source "$SDK_DIR/scripts/stage-host-tools.sh"
+
 # Read the list back from the Makefile rather than restating it here.
 mapfile -t HOST_TOOLS < <(make -s -C "$SDK_DIR" print-HOST_TOOL_FILES | tr ' ' '\n' | grep -v '^$')
 [[ "${#HOST_TOOLS[@]}" -gt 0 ]] || { echo "ERROR: HOST_TOOL_FILES is empty" >&2; exit 1; }
@@ -79,13 +84,19 @@ echo "[make-host-tools-tarball] staging $NAME (${#HOST_TOOLS[@]} tools) ..."
 # `axl` resolves its prefix from its own location, so it finds libexec/axl
 # wherever the archive is extracted.
 mkdir -p "$STAGE/bin" "$STAGE/libexec/axl" "$STAGE/share/axl"
+# THE MODE IS THE DECLARATION "this is a command", so it comes from the shared
+# rule rather than from a blanket 0755 plus a hand-written exception. That
+# exception list held exactly one name (axl_version.py) and missed the other
+# two files that are not commands: axl-common.sh, which run-qemu.sh SOURCES,
+# and gdb-sample.py, which is loaded INSIDE gdb and has no shebang -- both
+# shipped 0755 in v4.7.0 and were offered by `axl --help` as commands that
+# cannot run. scripts/install.sh had the right rule for the same file list all
+# along; this path is why it had to be shared instead of copied.
 for _f in "${HOST_TOOLS[@]}"; do
-    install -m 0755 "$SDK_DIR/scripts/$_f" "$STAGE/libexec/axl/$_f"
+    install -m "$(axl_host_tool_mode "$SDK_DIR/scripts/$_f")" \
+            "$SDK_DIR/scripts/$_f" "$STAGE/libexec/axl/$_f"
 done
 install -m 0755 "$SDK_DIR/scripts/axl" "$STAGE/bin/axl"
-# axl_version.py has no shebang: it stays 0644 so `axl`'s command list (the
-# EXECUTABLES in libexec/axl) does not offer it as a verb.
-chmod 0644 "$STAGE/libexec/axl/axl_version.py"
 
 # THE INSTALLER SHIPS INSIDE IT (§20's M2). This component is the MANAGER:
 # `axl prune` never removes the CURRENT one or the one it is running out of

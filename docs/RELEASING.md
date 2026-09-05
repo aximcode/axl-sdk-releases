@@ -10,6 +10,7 @@ helper, has burned us before.
 scripts/cut-release.sh X.Y.Z            # do it (prompts before pushing)
 scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
 scripts/cut-release.sh X.Y.Z --yes      # skip the prompt (non-interactive)
+scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs (default: hand back a URL)
 ```
 
 **It stops and asks before it pushes anything.** After printing the commit
@@ -41,7 +42,7 @@ does not belong in this release, that is the wrong flow and the script cannot
 do the right one — see [Which flow](#which-flow-from-main-or-from-a-tag)
 immediately below. Three of the last three releases used the other one.
 
-### The gate is LOCAL — run the suite before you cut
+### The gate is CI's green, or a local uncached run — whichever you already have
 
 **Release tags do NOT trigger CI.** (A tag used to re-run CI on the exact
 commit already validated on `main` — pure duplication, ~38 min for an identical
@@ -50,9 +51,32 @@ result — so that trigger was removed.) `ci.yml` *does* run on every push to
 This paragraph said "manual `workflow_dispatch` only" long after the push
 trigger came back, which is the same staleness the table carried.
 
-The **authoritative pre-release gate is still the full suite run locally** —
-because a tag is not a push to `main`, so nothing runs CI on the commit you are
-about to publish. It is fast in parallel:
+**In the common case you do not have to run anything.** `ci.yml` runs the
+identical uncached suite on every push to `main`, on the same self-hosted box,
+and goes green on the commit you are cutting from — so `cut-release.sh` asks
+GitHub for that run and, if it is green, the gate is satisfied with no local
+suite at all. This heading used to read "the gate is LOCAL", and that was the
+whole ~8.5 minutes: the gate could only see a local stamp file, so the only way
+to satisfy it was to run on this hardware a suite that had already run on this
+hardware.
+
+*What counts as green is deliberately narrow:* **every job** in the run must
+have succeeded. A run-level conclusion is not enough — the `release: vX.Y.Z`
+commit carries a `[release-cut]` marker that makes every `ci.yml` job skip, so
+a run exists at it that tested nothing, and accepting that would tag code no
+suite ever ran by the most ordinary path there is. The parent rule below then
+carries the parent's green across the version bump.
+
+**The ancestor walk exists because of the plan job.** A docs-only push skips
+every job, so after one there is no green run at the tip — and without this the
+gate would refuse and send you back to the local suite it just removed. So it
+walks back (bounded, `AXL_CI_WALK_MAX=25`) and accepts the first green ancestor
+whose *entire* diff to the release commit is prose, the version bump, or both.
+"Prose" is `scripts/ci-plan.sh`'s own allowlist, asked via `--list-unsafe`, not
+a second copy of it — and a deletion is never prose.
+
+**Run the local suite when CI cannot answer** — no push yet, a red run, or a
+tree that has moved since. It is fast in parallel:
 
 ```sh
 make ARCH=x64 all tests tools axl-busybox   # one build for the whole gate
@@ -85,6 +109,7 @@ scripts/cut-release.sh X.Y.Z            # cut (no CI wait — local suite was th
 scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
 scripts/cut-release.sh X.Y.Z --ci-gate  # want the CI backstop too (see the stamp, below)
 scripts/cut-release.sh X.Y.Z --force-ci # --ci-gate, and dispatch even if the stamp covers it
+scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs instead of a URL
 ```
 
 **`--ci-gate` no longer always dispatches.** A clean, COMPLETE
@@ -103,12 +128,21 @@ you already hold. A run never dispatched is the only thing that improves both
 turnaround and Actions spend — see `AXL-CI-Release-Speed-Design.md` §10.3.
 
 "Covers" is deliberately narrow, since a false positive here tags code no
-suite ever ran:
+suite ever ran. Both sources — the local stamp and a CI run — are asked the
+same two questions, through the same shared rule
+(`release_gate_release_only`), so they cannot come to disagree about what a
+release commit is allowed to touch:
 
 | situation | gate |
 |---|---|
 | stamp's SHA == the release commit | satisfied |
+| **a green CI run at the release commit** | satisfied |
 | stamp is the release commit's PARENT, and the only diff is `VERSION`, `include/axl/axl-version.h`, `CHANGELOG.md` | satisfied |
+| **a green CI run at that PARENT, same diff rule** | satisfied |
+| **a green CI run at an ANCESTOR, with only prose and/or the version bump since** | satisfied — see below |
+| a CI run whose jobs were SKIPPED (the `[release-cut]` shape) | **refused** |
+| a CI run that does not contain the **suite** job (the docs-only shape) | **refused** |
+| `gh` missing, so CI cannot be consulted at all | **refused** |
 | anything else changed since the stamp | **dispatches** |
 | stamp missing, malformed, or from a failing run | **dispatches** |
 | stamp came from a `--shard` (partial) run | **dispatches** — it never wrote one |
@@ -209,7 +243,7 @@ you like — zero Actions minutes. The triggers are baked into the workflow file
 
 | Workflow | What | Triggers on |
 |---|---|---|
-| **ci.yml** | build + QEMU integration + lint | **every push to `main`**, plus `workflow_dispatch`. NOT on release tags (the tagged commit was already tested on `main`). The push trigger came back on 2026-08-18; this row said "manual only" long afterwards, which is how a full uncached local suite came to be run right before every push — duplicating CI's identical run on the same self-hosted box |
+| **ci.yml** | plan + build + QEMU integration + lint | **every push to `main`**, plus `workflow_dispatch` — but a `plan` job classifies the push first (`scripts/ci-plan.sh`), and a **docs-only** one runs `plan` alone in ~4 s. There is no `paths-ignore` any more; prose is routed, not silently dropped. NOT on release tags (the tagged commit was already tested on `main`). The push trigger came back on 2026-08-18; this row said "manual only" long afterwards, which is how a full uncached local suite came to be run right before every push — duplicating CI's identical run on the same self-hosted box |
 | **docs.yml** | Doxygen/Sphinx → Cloudflare Pages | major tag `vX.0.0`, or manual |
 | **release.yml** | build + publish `install.sh`, `VERSION`, `SHA256SUMS` and the three tarballs | **every** release tag `v*` (it's the publish step), or manual |
 
@@ -643,14 +677,32 @@ git push origin vX.Y.Z
 The annotated tag's body shows up in the GitHub Release page and
 in `gh release view vX.Y.Z`. Worth a few minutes of polish.
 
-### 6. Watch the workflows
+### 6. Watch the workflows — now OPT-IN
+
+**`cut-release.sh` no longer waits by default.** It pushes the tag, prints the
+Actions URL and the verification command, and hands the terminal back. Watching
+to completion cost 4-7 minutes of somebody's attention per release and what it
+returned was a workflow's exit status; `scripts/check-published-release.sh`
+verifies the published **bytes** — which is the stronger claim, catches a
+truncated upload or a missed rename that a green workflow would not, and can be
+run whenever the notification arrives:
+
+```sh
+scripts/check-published-release.sh vX.Y.Z   # when Release + Docs finish
+scripts/cut-release.sh X.Y.Z --watch        # or wait, as before
+```
+
+Nothing here can un-publish a tag, so not watching costs no safety — only the
+latency between a failed publish and your noticing it, which is what the
+verification command above closes.
 
 The tag push triggers **two** workflows (and on a minor/patch, one):
 
 > **CI is NOT one of them**, despite what this section said until 2026-08-18.
-> `ci.yml` is `workflow_dispatch` only — see the trigger table above. A tag
-> re-running CI on a commit already validated on `main` was pure duplication,
-> and that trigger was removed. This paragraph outlived it.
+> A tag re-running CI on a commit already validated on `main` was pure
+> duplication, and that trigger was removed. (This note itself then went stale
+> the other way — it said `ci.yml` is `workflow_dispatch` only, long after the
+> push-to-`main` trigger came back. The trigger table above is authoritative.)
 
 - **Release** (`.github/workflows/release.yml`) — builds the SDK,
   host-tools and UEFI-tools tarballs (both arches), pulls iPXE

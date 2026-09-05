@@ -60,6 +60,7 @@ source "$SCRIPT_DIR/lib/discover.sh"
 source "$SCRIPT_DIR/lib/test-cache.sh"
 
 ARCH="X64"; TIMEOUT=900; LIST_ONLY=0; JOBS=0; SHARD=""; LOGDIR=""  # JOBS=0 => auto
+ONLY_TESTS=""   # --only: an EXPLICIT subset, named by the caller
 # Local-only tests need a capability the GitHub runners lack (a patched QEMU
 # for the SMBus/SPD memdev device, usb-mouse pointer delivery, ...). The dev
 # box HAS those, so the local run includes them by default; --ci drops them.
@@ -85,6 +86,18 @@ while [[ $# -gt 0 ]]; do
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --list)    LIST_ONLY=1; shift ;;
         --shard)   SHARD="$2"; shift 2 ;;   # i/K (0-based)
+        # --only=a,b — run exactly these, named by the caller.
+        #
+        # EXPLICIT, AND THE RUNNER DOES NOT CHOOSE. §12.5 is the reason:
+        # `8af4e530` touched src/log/ and the Makefile, every relevance map
+        # picks "the logging tests", and the real blast radius was every image
+        # in the tree failing at LINK. So this buys the ability to run a subset
+        # and no ability at all to decide which. The caller that matters
+        # (scripts/ci-plan.sh, via the plan job) is itself fixture-tested and
+        # its allowlist is sabotage-verified; the judgement stays there, where
+        # it can be tested, instead of moving in here where it cannot.
+        --only=*)  ONLY_TESTS="${1#--only=}"; shift ;;
+        --only)    ONLY_TESTS="${2:?--only needs a comma-separated list}"; shift 2 ;;
         --logdir)  LOGDIR="$2"; shift 2 ;;  # keep per-test output here
         --no-build) RUN_NO_BUILD=1; shift ;; # skip the one-time pre-build (CI: built in a prior job)
         # --ci also turns the cache OFF. CI is the backstop -- §11.2 records
@@ -162,6 +175,36 @@ if [[ -n "${RUN_INTEGRATION_DIR:-}" ]]; then
     mapfile -t TESTS < <(ls "$TESTDIR"/test-*.sh 2>/dev/null)
 else
     mapfile -t TESTS < <(discover_tests --arch "$ARCH" $INCLUDE_LOCAL)
+fi
+
+# --only selection, before sharding: a caller naming tests wants those tests,
+# not those tests intersected with a shard.
+#
+# AN UNKNOWN NAME IS FATAL. "The tool ran and matched nothing" and "you asked
+# for something that is not here" are the same empty set and opposite facts,
+# and only one of them is safe to run to completion: a CI caller passing a
+# renamed test would otherwise verify NOTHING and report success. The `.sh` is
+# optional because both spellings are what people write.
+if [[ -n "$ONLY_TESTS" ]]; then
+    declare -a _picked=() _missing=()
+    IFS=',' read -r -a _want <<< "$ONLY_TESTS"
+    for _w in "${_want[@]}"; do
+        [[ -n "$_w" ]] || continue
+        _w="${_w##*/}"; _w="${_w%.sh}"
+        _found=""
+        for _t in "${TESTS[@]}"; do
+            _b="$(basename "$_t")"; _b="${_b%.sh}"
+            if [[ "$_b" == "$_w" ]]; then _picked+=("$_t"); _found=1; break; fi
+        done
+        [[ -n "$_found" ]] || _missing+=("$_w")
+    done
+    if [[ ${#_missing[@]} -gt 0 ]]; then
+        echo "run-integration: --only names test(s) that discovery did not find:" >&2
+        printf '                 %s\n' "${_missing[@]}" >&2
+        echo "                 (--arch $ARCH found ${#TESTS[@]} test(s); see --list)" >&2
+        exit 2
+    fi
+    TESTS=("${_picked[@]}")
 fi
 
 # Shard selection: keep only this shard's subset, balanced by est= so each
@@ -610,6 +653,7 @@ elif [[ -z "$INCLUDE_LOCAL" ]]; then
     echo "integration: PARTIAL -- --ci: local-only tests were SKIPPED."
 fi
 [[ -n "$SHARD" ]] && echo "integration: PARTIAL -- shard $SHARD of the suite only."
+[[ -n "$ONLY_TESTS" ]] && echo "integration: PARTIAL -- --only: ran $(printf %d "${#TESTS[@]}") named test(s), not the suite."
 echo "logs: $LOGDIR"
 
 # Stamp a clean, COMPLETE run so a release can skip dispatching CI for an
@@ -621,8 +665,10 @@ echo "logs: $LOGDIR"
 # exactly that reason. --ci was NOT excluded before and could write the stamp
 # having skipped every local-only test -- the same defect this flag would have
 # introduced, one flag earlier.
+# --only joins that list for the same reason: it ran a subset the caller chose,
+# so it cannot certify the tree.
 if [[ $failc -eq 0 && -z "$SHARD" && $ONLY_LOCAL -eq 0 && -n "$INCLUDE_LOCAL" \
-      && -z "$CACHE_DIR" ]]; then
+      && -z "$CACHE_DIR" && -z "$ONLY_TESTS" ]]; then
     # shellcheck source=lib/release-gate.sh
     source "$SCRIPT_DIR/lib/release-gate.sh"
     release_gate_write "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" \

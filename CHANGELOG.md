@@ -3,6 +3,115 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.7.1 — 2026-09-05
+
+### Added
+
+- **`axl toolchain list --porcelain` — the machine form, so the human one could
+  finally be laid out for a human.** One tab-separated row per arch and nothing
+  else: no banner above it, no `install with:` advice below. Seven fields, and
+  the position is the label — `arch`, `version`, `root`, `gcc`, `g++`, `builds`,
+  `reason`.
+
+  There was no machine form before, so everything that needed a value parsed
+  the human listing by column index. The cost was never the parsing; it was
+  that the rendering could not move, and had not: the second compiler state
+  could only be *appended*, which left the path sandwiched between the two
+  states in the line a human reads. Tab-separated rather than JSON because
+  every consumer is a shell script and `jq` is not among the tools `install.sh`
+  requires. See `AXL-Distribution-Design.md` §21c.
+
+### Changed
+
+- **`axl toolchain list` reads like a report.** One fact per line in the order
+  you ask for them — whether it is there, where it lives and how much disk that
+  is, exactly which compiler it is, and what will actually build. The path gets
+  its own line. The state is spelled as what you *have* (`gcc + g++`,
+  `gcc only, no C++`, `not installed`) instead of a status token, and each
+  installed root now reports its **size on disk** — the number that decides
+  whether `axl toolchain uninstall` is worth running.
+
+- **`axl list` shows the size of each SDK root**, for the same reason: the line
+  directly under it advises `axl prune`.
+
+### Breaking (packaging)
+
+- **A bare `axl` exits 2 rather than 0.** The command list still prints on
+  stdout — putting it one keystroke away is the point of the dispatcher — but
+  supplying no command is the same mistake `axl use` with no version and
+  `axl <unknown>` already exit 2 for, and `axl "$cmd"` with an empty `$cmd`
+  reported success for doing nothing.
+
+  Filed here rather than under Changed because an exit status is an interface:
+  no code stops compiling, but `axl && …` in a script now takes the other
+  branch. Nothing in this tree, and nothing in any consumer checked here,
+  depends on it.
+
+### Fixed
+
+- **`axl --help` offered two commands that could not run.** `axl gdb-sample`
+  died with a bash syntax error (it is a gdb `-x` script, loaded inside gdb,
+  with no shebang) and `axl common` was a silent no-op (`axl-common.sh` is
+  *sourced* by `run-qemu.sh`). Both shipped mode 0755 in the v4.7.0 host-tools
+  tarball, and `axl` offers exactly the executables in `libexec/axl`.
+
+  `scripts/install.sh` had the right rule for the same file list all along — a
+  shebang is what decides, so a file that cannot be run is staged 0644 — while
+  `make-host-tools-tarball.sh` staged everything 0755 with one hand-written
+  exception. Both already read the file list from the Makefile so *it* could not
+  drift; the mode rule was the copy that did. It now lives in one place both
+  staging paths source.
+
+- **`axl-install-toolchain` failed when run through its own symlink** — which is
+  how it is normally run, since `install.sh` links every `bin/` tool into
+  `--bin-dir`. It resolved its prefix from an unresolved `$0`, so it looked for
+  its siblings in `~/.local` and reported `axl_handle_version: command not
+  found` followed by `axl-toolchains.conf not found`. It was the only tool in
+  `bin/` not resolving `$0`; `axl`, `axl-cc` and `axl-c++` all did. A missing
+  `axl-common.sh` is now a named, fatal error instead of a silent fall-through.
+
+- **`axl --help` said `axl-cc` never uses the host's gcc**, which 4.7.0 made
+  false in the release that shipped it: `AXL_TOOLCHAIN=auto` is the x64 default,
+  so a C build with no bare-metal toolchain uses the host's own gcc. The reader
+  most likely to hit that line is the C-only x64 consumer the feature exists
+  for. It now states the fallback, says C++ still needs the cross toolchain, and
+  points at `axl toolchain list` / `axl toolchain install` rather than the
+  lower-level installer.
+
+- **`axl prune` asserted that skipped roots were not ours, then asked whether
+  they were.** One message stating a fact and retracting it three lines later —
+  and on a long-lived machine the retraction was the true half. Its remedy could
+  not work either: it said to re-run the installer to re-mark the root, but the
+  installer only ever marks the root the *manifest* names, never the superseded
+  ones the message is printed about.
+
+- **`axl toolchain uninstall --dry-run` refused instead of previewing.** The
+  parent-writability check ran before the report, so on the ordinary
+  configuration — `/opt` root-owned — a dry run exited 1 with "cannot remove"
+  and answered none of what was asked, at the moment the answer is worth most.
+  It now previews and reports that the real run needs root. `axl prune
+  --dry-run` on the same machine already previewed and exited 0; two dry runs
+  with opposite contracts is a coin flip for the reader.
+
+- **`axl version` gave a manager that is *older* than the SDK the one piece of
+  advice that cannot help it.** Both directions printed "`axl update` moves
+  both" — true after `axl use <older>`, and exactly wrong for a manager from
+  4.6.0 or earlier, which predates the code that moves the manager and so
+  cannot carry itself. That case now gets the one-time bootstrap, and the
+  release notes no longer ask you to compare two numbers by eye against a web
+  page to find out which case you are in.
+
+- **`axl toolchain list` could name a directory that is not a toolchain root,
+  and measure it.** A root is derived from its locator as
+  `dirname(dirname(...))`, so `AXL_X64_GXX=/usr/bin/g++` — an ordinary distro
+  cross-gcc — yields `/usr`, and a locator one component short yields `/`. Both
+  were printed as the toolchain's location, and with sizes added both were
+  measured: `du -sh /usr` reported 11G as the size of a toolchain, and `du -sh
+  /` walked the whole filesystem for 389G. A bare name on `PATH` yielded `.`,
+  which reached `--porcelain` as a relative path where the contract promises
+  absolute. `axl update` already declined all three, by a condition written
+  inline; that condition is now one predicate both callers share.
+
 ## 4.7.0 — 2026-09-05
 
 ### Upgrading — one-off steps for an existing install

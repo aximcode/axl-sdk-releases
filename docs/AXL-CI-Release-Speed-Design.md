@@ -1294,3 +1294,331 @@ against x64's 6.8 s.
   The condition stated here has not changed: §12 established the LOCAL gate as
   the long pole, and a 13-minute CI run on free hardware is not what anyone is
   waiting for.
+
+---
+
+## 13. REVISION 2026-09-05 — §4.4 shipped, and it was pointed at the wrong source
+
+The backlog asked to **stop running CI on every push to `main`** and go
+nightly, to "cut a release without spending 15 minutes of a human's attention."
+Two things were wrong with that, and both are visible in the entry's own table.
+
+**It removes none of the 15 minutes.** The measured stages were: the local
+uncached suite (477 s / 509 s, blocking), watching `Release` to completion
+(7m05s / 4m11s), and CI on the release push — which is already **28 s
+(skipped)**, fixed by the `[release-cut]` marker. Push-CI costs machine time on
+a dev box, not attention, and the standing advice after a push is not to wait
+for it.
+
+**And it re-opens what §11.2 measured.** Dispatch-only CI cost five days and
+~40 commits of undetected red, in three places, two of which a dev box
+structurally cannot catch. Nightly bounds that at a day instead of five; it
+does not change the class. §12.9 is titled "CI stays unrestricted on push" for
+this reason.
+
+### 13.1 The duplication was one level over
+
+§4.4 said it in 2026-08: *"If a successful CI run already exists for its
+PARENT, and `git diff --name-only parent..release` is a subset of those three
+[files], the gate is satisfied without dispatching anything."* That shipped —
+but only for a **local stamp**. `release_gate_covers` read
+`test/integration/.last-run-stamp`, which only an uncached LOCAL run writes.
+
+So the actual shape was: CI runs the uncached suite on push, on this box, and
+goes green on the release commit's parent — and the gate could not see it.
+A human then ran the same suite on the same hardware for the same tree
+(~8.5 min, blocking), and `--ci-gate` would dispatch a **third** run.
+
+`release_gate_ci_covers` closes it. Same two-step, same rule: the commit
+itself, then its parent through the now-shared `release_gate_release_only`.
+
+### 13.2 What counts as a green CI run, and why the run conclusion is not it
+
+**Every job in the run must have succeeded.** A run-level `conclusion` is not
+enough, and the counterexample is not hypothetical — it is the most ordinary
+path there is. The `release: vX.Y.Z` commit carries `[release-cut]`, every
+`ci.yml` job is conditioned on not seeing it, so a CI run *does* exist at that
+commit and it tested nothing. Verified against the live v4.7.0 cut: the run at
+`492dd3b2` reports `conclusion: skipped`, the gate refuses it, and then accepts
+the parent `636f596a` where the suite genuinely ran. A gate that read the run
+conclusion alone would have tagged on the strength of a run that skipped
+everything.
+
+A run reporting **no jobs** is refused for the same reason a missing `gh` is:
+"the query could not run" and "the run had none" are the same empty answer and
+opposite facts.
+
+### 13.3 Watching `Release` became opt-in
+
+`cut-release.sh` pushes the tag, prints the Actions URL and
+`check-published-release.sh`, and returns. The watch is `--watch`.
+
+Nothing about this weakens verification — it strengthens it. Watching returned
+a *workflow exit status*; `check-published-release.sh` (§16.2 job 2) verifies
+the published **bytes** against `SHA256SUMS` and the release's own asset list,
+which is what catches a truncated upload or a missed rename. A tag cannot be
+un-published either way, so the only thing the wait bought was latency between
+a failed publish and someone noticing, and that is exactly what the handed-back
+command closes.
+
+### 13.4 Still open: what runs on a push
+
+Measured on `b1c6fde6`: `gcc x64` 74 s, `gcc aa64` 67 s, `clang-tidy` 174 s,
+**`QEMU integration` 481 s**. Splitting by cost — cheap jobs on every push, the
+integration job nightly — would return ~10 minutes of a dev box per push while
+keeping the clean-checkout link failure §11.2 named, which the `build` job is
+what catches.
+
+It is not free, and the entry above is why it is separate: a push would stop
+running the 1450+ unit assertions, `install.sh --arch all --cpp`, and ~180
+integration tests, up to a day late. Decided against the numbers from a release
+cut through the new gate, not against the v4.5.0/v4.6.0 table.
+
+### 13.5 The marker guard could not survive being documented
+
+Found the same day, by the commit that shipped §13.1-§13.4: **CI skipped it.**
+Its message explained the `[release-cut]` mechanism, the guard was
+`!contains(github.event.head_commit.message, '[release-cut]')` — a substring
+test over the WHOLE message, body included — so any commit that *mentions* the
+marker disables the thing it is describing. Silently: the run exists and
+reports `skipped`, which reads like a deliberate skip rather than a lost gate.
+
+`test-release-gate.sh` already carried this exact shape one layer over, and
+said so: its `[skip ci]` check strips comments first, because "the comment in
+cut-release.sh explaining why we do NOT use `[skip ci]` contains the string —
+a check that cannot survive its own subject being discussed." The guard had
+the same defect and nothing was looking.
+
+The guard now requires **both** halves:
+
+```yaml
+if: "${{ !(startsWith(github.event.head_commit.message, 'release: v')
+       && contains(github.event.head_commit.message, '[release-cut]')) }}"
+```
+
+A body is never the start of a message, so prose cannot trigger it; the marker
+stays so a commit hand-titled `release: v...` does not skip on its title
+alone. It must be **double-quoted at the YAML level** — the expression holds
+`release: v`, and a colon-space cannot appear in a plain scalar; unquoted, the
+workflow stops parsing.
+
+Held together by `test-release-gate.sh`: every job carries both halves, no job
+carries the bare form, and `cut-release.sh` writes a subject the guard
+matches — the two live in files that cannot import each other, which is the
+drift that produced this.
+
+**One consequence worth stating.** `d9dc7117` has no CI coverage of its own.
+It is covered by the next push's run over the same tree, which is the ordinary
+recovery and needs no re-tag, because nothing was published.
+
+### 13.6 SHIPPED: a push is classified before it is run
+
+`paths-ignore: ['docs/**.md']` is gone, replaced by a `plan` job that calls
+**`scripts/ci-plan.sh`**. Two reasons it is a script and not a glob:
+
+- **A glob is logic no gate can read.** `which-gates.sh` says it for every
+  workflow edit — a change here runs only on push or tag. This particular
+  decision is *whether the suite runs at all*, and being wrong is silent in the
+  direction that matters. `test-ci-plan.sh` drives every class through a
+  fixture repo, and the allowlist is sabotage-verified: putting the root
+  `README.md` in the safe set fails the run.
+- **The old filter was wrong in both directions.** `docs/**.md` skipped design
+  docs entirely — no gate at all — while a `src/*/README.md` change paid the
+  full ~13 minutes for build, QEMU and lint, *none of which builds the docs*.
+  There is no Sphinx anywhere in `ci.yml`. A module README ran everything
+  except the one thing that could see it.
+
+The allowlist is §11.6's trap list inverted, and it was re-grepped rather than
+inherited. `src/*/README.md` is safe — its only consumer is Sphinx's
+`.. include::`. The root `README.md` is **not**: three things read it, and two
+are tests (`check-tool-docs.py` asserts every shipped tool has a row in its
+table; `test-toolchain-variant.sh` asserts it documents no `make CROSS=`
+build). `docs/sphinx/**` is not, because `check-doc-coverage.py` reads all 104
+`.rst` files in the lint job. And **a deletion is never safe**:
+`test-source-snapshot.sh` asserts the snapshot *contains* `docs/AXL-Design.md`
+— editing cannot break that, removing can, and `--name-only` shows both the
+same way.
+
+### 13.7 The gate had to learn job NAMES, or the split would have broken it
+
+This is the interaction, and it was not visible from either change alone.
+`release_gate_ci_covers` (§13.2) accepted a run in which **every job
+succeeded**. Once a push can produce a *partial* run — a docs-only push runs
+the `plan` job and nothing else — every job in it succeeds, and the gate would
+have read that as "CI is green" and tagged code the suite never touched.
+Reachable by cutting a release straight after a README fix.
+
+So the gate now also requires a job named `AXL_CI_SUITE_JOB` (`QEMU
+integration (full suite)`) to be present and green. That is a second spelling
+of `ci.yml`'s job name, so `test-release-gate.sh` holds the two equal — the
+same treatment the `[release-cut]` marker gets, for the same reason: they live
+in files that cannot import each other.
+
+### 13.8 NOT done: moving the integration job to nightly
+
+§13.4 proposed it. Building §13.6 showed why it does not compose with §13.1:
+**the release gate depends on the integration job having run on the commit
+being released.** Move it to a schedule and a push run can never satisfy the
+gate, so every cut falls back to either a local uncached suite or a dispatch —
+which is the ~8.5 minutes §13.1 just removed, reintroduced.
+
+The measurement stands (`gcc x64` 74 s, `gcc aa64` 67 s, `clang-tidy` 174 s,
+`QEMU integration` 481 s) and so does the appeal of ~10 minutes of a dev box
+per push. What is missing is a way for a release to know the suite covered its
+tree without the suite having run on its push. That is a real design question,
+not a flag flip, and it is left open rather than half-answered.
+
+### 13.9 NOT done: a docs job on push
+
+The plan job classifies a docs-only push, and today nothing then runs — the
+same net effect the old `paths-ignore` had, now auditable and one line from
+being routed somewhere. Routing it at a real Sphinx build was deliberately not
+bundled in: `docs.yml`'s dependency step pins four pip packages and a
+`doxygen`/`nodejs` apt set, and copying that into `ci.yml` is a second copy of
+a pinned toolchain — the drift shape this file keeps paying for. It wants a
+shared step, which is its own change.
+
+So a module README still has no push-time doc gate. It has no *worse* one than
+before, and it no longer costs 13 minutes to get nothing.
+
+### 13.10 OPEN: a class below "docs-only", and what the log actually says
+
+`ci-plan.sh` has two classes: docs-only, or everything. The obvious next one is
+"no C/C++ and no build driver changed" — but it was worth reading a real run
+before designing it, because the guess and the measurement disagree.
+
+Run `33985299331`, a push of shell + tests + workflow YAML and one design doc,
+every step accounted for:
+
+| job | wall | what this push could actually affect |
+|---|---:|---|
+| `plan` | 8 s | the classifier itself |
+| `gcc x64` / `gcc aa64` | 79 s / 77 s | **nothing** — no C changed |
+| `clang-tidy` (20 gates) | 178 s | **2 steps**: the `test-meta` header on the added test, and `check-nul` |
+| `QEMU integration` | 483 s | **the point of the push** — the suite runs the two tests it changed |
+
+**The intuition that the suite is the waste is exactly backwards here.** The
+483-second job is the one with real work; the ~260 s of container build and
+static analysis is what ran for nothing. And because `integration` declares
+`needs: build`, removing the build from the critical path saves roughly **80 s
+of wall clock**, not 260 — the rest is machine load, which matters on a dev box
+but is not a human waiting.
+
+So the class is worth having and is smaller than it looks. Three things it must
+get right, and the third is why this is not written yet:
+
+1. **Shell is the WORST case for relevance-guessing, not the best.**
+   `scripts/axl-cc` is the compiler driver, the `Makefile` drives every gate,
+   `scripts/lint.sh` defines the clang-tidy invocation, and `install.sh` stages
+   the SDK the suite tests. A change to any of those can alter every produced
+   image. §12.5's worked example is precisely this shape: `src/log/` plus the
+   `Makefile` looked like "the logging tests" and the blast radius was every
+   image in the tree, failing at link.
+2. **The unit of skipping is a STEP, not a job.** The lint job earned two of
+   its twenty steps on this push. Skipping the job loses those two; keeping it
+   pays for eighteen. That argues for splitting the image-producing gates away
+   from the file-reading ones, which is a bigger change than a path filter.
+3. **The saving is ~80 s of wall clock.** Against §12's finding that the local
+   loop is the long pole, that is small, and the cost of being wrong is silent.
+   It should be built when someone is feeling the 80 s, not on principle.
+
+### 13.11 The two halves fought, and the newer one had shipped first
+
+§13.6's plan job and §13.1's gate reuse landed an hour apart, and the
+interaction was only visible once both existed: a docs-only push skips every
+job, so **there is no green run at the tip**, and the gate refused the release
+— sending the cut back to the ~8.5-minute local suite §13.1 had just removed.
+Reproduced on the real tree, not reasoned about: after `cd57acf1` the gate
+answered *"tree changed since 3b920e9c"* and listed eight `.md` files.
+
+`release_gate_ci_covers` now walks back through ancestors, bounded
+(`AXL_CI_WALK_MAX=25`), and accepts the first green one whose entire diff to
+the release commit is prose, the version bump, or both. Accepting that range is
+consistent rather than lenient: *"this diff cannot affect the suite"* is
+precisely what `ci-plan.sh` asserts, and `test-ci-plan.sh` sabotage-verifies
+the claim.
+
+**Two lists, composed, neither copied.** `ci-plan.sh --list-unsafe` prints the
+changed paths that are *not* prose (and every removed path, safe or not);
+`release-gate.sh` checks the remainder is a subset of
+`AXL_RELEASE_ONLY_FILES`. Re-stating either list in the other file would put a
+second copy of it in the code that decides whether a tag is verified.
+
+**Three bugs while building it, every one caught by a test rather than by
+review**, and all three are the same shape — a guard that failed for a reason
+unrelated to the question:
+
+- the helper located `ci-plan.sh` with `git rev-parse --show-toplevel`, which
+  during a test is a fixture repo under `/tmp` with no `scripts/` in it. It
+  returned "cannot answer" and the walk silently accepted nothing;
+- the parent step **returned** when the parent's diff was not release-only —
+  so a docs-only push, the entire case the walk exists for, never reached it.
+  The walk starts at the commit itself, so the parent is just its second
+  iteration and the special case is gone rather than patched;
+- unbounded, "walk back until something is green" is a way to tag anything.
+  The bound is a backstop, not the guard: every step still has to pass the
+  inertness check, and sabotaging *that* makes a C file anywhere in the range
+  accepted.
+
+### 13.12 SHIPPED: the ci-only class, and why it is allowed where "shell" is not
+
+Mike said it twice, which is the signal to stop explaining and count. Nine
+pushes on 2026-09-05: **none touched a C file, and eight ran the full QEMU
+suite.** Only one — pure docs, no deletions — took the 4-second path. The
+two-gear classifier almost never engaged.
+
+**`.github/`-only is a different kind of claim from "shell changed", not a
+weaker version of the same one.** §12.5's warning is about *guessing* which
+tests a change can reach; this is not a guess. **Nothing builds from
+`.github`** — grepped, not assumed: no `Makefile`, `build.sh` or `install.sh`
+rule reads it. There is no path from a `.yml` file to a produced artifact, so
+the only things such a change can reach are CI itself and the tests that READ
+those files. Contrast the shell case in §13.10, where `axl-cc` is the compiler
+driver and the `Makefile` drives every gate — there the blast radius genuinely
+is every image.
+
+That reader set is **derived by grep, never written down**: a hand-kept list
+would go stale the first time a test starts reading a workflow, which is the
+defect this script exists to prevent one level up. Over-inclusion is the safe
+direction. Today it derives three, all host-only:
+
+| | |
+|---|---|
+| full run | ~480 s, hundreds of QEMU boots |
+| `--only=test-ci-plan.sh,test-release-gate.sh,test-tools-sidecars-gate.sh` | **11 s, zero QEMU processes** |
+
+An empty derivation falls back to the full run, because "the grep found
+nothing" and "no test reads a workflow" are the same blank line.
+
+**What is NOT skipped, and why.** `lint` still runs: five of its gates read
+workflow files (`check-tool-version`, `check-awk-portability`,
+`check-tool-docs`, `check-tools-sidecars`, `check-toolchain-conf`). `build`
+still runs too, and that one is a DAG constraint rather than a judgement — a
+skipped `needs:` job skips its dependents in GitHub Actions, so skipping
+`build` would take `integration` with it. 74 seconds is not worth the
+`if: always()` contortion that would avoid it.
+
+### 13.13 The self-test wrapper that made the suite go 121/59
+
+Recorded because the failure is more interesting than the feature. Four
+`*-selftest.sh` files check the harness itself and **run nowhere** —
+`lib/discover.sh` excludes them by name, twice, and nothing else invokes them.
+~100 s of correct, dead assertions.
+
+The obvious fix — a discovered wrapper that execs them — took CI to **121
+passed / 59 failed**. Not contention: `test-runner-selftest.sh`'s SIGTERM case
+deliberately drives a hang and reaps it, and inside the suite's own six workers
+the reap did not complete. It left **two `qemu-system` processes running** and
+leaked 108 MB of `/dev/shm`, and those orphans then competed with every
+remaining test.
+
+`lib/discover.sh`'s exclusion comment already said a self-test of the runner
+must not be scheduled BY the runner as a peer of the tests it checks. A wrapper
+is that, with an extra file. **Reverted.**
+
+The finding stands and is now better understood: those four need a **serial**
+home — a dedicated CI step or a Makefile target — and whoever builds it has to
+reckon with a SIGTERM case that has just demonstrated it can fail under load.
+Until then `run-integration.sh --only` is exercised by a self-test that nothing
+runs, which is the honest state rather than a fixed one.
+

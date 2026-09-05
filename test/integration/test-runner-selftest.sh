@@ -233,6 +233,60 @@ STUB
         fail=1
     fi
 }
+# --- --only: an explicit subset, and a LOUD refusal for a name that is not there
+#
+# WHY EXPLICIT AND NOT COMPUTED. §12.5 of AXL-CI-Release-Speed-Design.md is the
+# argument: `8af4e530` touched src/log/ and the Makefile, any relevance map
+# picks "the logging tests", and the real blast radius was every image in the
+# tree failing at link. So the runner gains the ability to run a SUBSET and no
+# ability whatever to decide which -- the caller names them, and the caller
+# that matters (ci-plan.sh) is itself fixture-tested and sabotage-verified.
+echo "-- --only --"
+o=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh --only=test-pass-qemu.sh --list 2>&1)
+[[ "$(echo "$o" | grep -c .)" == "1" ]] && grep -q 'test-pass-qemu.sh' <<<"$o"     || { echo "  FAIL: --only=<name> did not select exactly that test: $o"; fail=1; }
+
+# The `.sh` is optional, because a caller naming tests is a human or a script
+# quoting a test-meta name, and both spellings are what people write.
+o=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh --only=test-pass-qemu --list 2>&1)
+grep -q 'test-pass-qemu.sh' <<<"$o"     || { echo "  FAIL: --only without .sh did not match: $o"; fail=1; }
+
+o=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh --only=test-pass-qemu.sh,test-skip-qemu.sh --list 2>&1)
+[[ "$(echo "$o" | grep -c .)" == "2" ]]     || { echo "  FAIL: --only with two names did not select two: $o"; fail=1; }
+
+# THE ONE THAT MATTERS. A typo must not select nothing and report success --
+# "the tool ran and found nothing" and "you asked for something that is not
+# there" are the same empty set and opposite facts, and a CI caller passing a
+# renamed test would silently verify NOTHING while going green.
+o=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh --only=test-nope-qemu.sh --list 2>&1); rc=$?
+[[ $rc -ne 0 ]] && grep -qi 'test-nope-qemu' <<<"$o"     || { echo "  FAIL: --only with an unknown name did not fail loudly (rc=$rc): $o"; fail=1; }
+
+# A filtered run is PARTIAL and must say so, like --shard and --ci do.
+o=$(RUN_INTEGRATION_DIR="$stub" ./run-integration.sh -j1 --timeout 5 --only=test-pass-qemu.sh 2>&1)
+grep -q 'PARTIAL' <<<"$o"     || { echo "  FAIL: an --only run did not announce itself as PARTIAL: $o"; fail=1; }
+
+# ...and it must NOT write the release stamp. A subset did not test the tree,
+# and the stamp is what lets a release skip its gate: this is the same defect
+# --ci once had, one flag later.
+# THE CONTROL COMES FIRST, and it has to be a stub set that can actually go
+# green: $stub holds a failing test and a hanging one, so NOTHING stamps on it
+# and "the --only run did not stamp" would pass for a reason that has nothing
+# to do with --only. That is the shape this file exists to catch elsewhere.
+stampdir=$(mktemp -d)
+gstub=$(mktemp -d)
+printf '#!/bin/bash\nexit 0\n' > "$gstub/test-green-a-qemu.sh"
+printf '#!/bin/bash\nexit 0\n' > "$gstub/test-green-b-qemu.sh"
+chmod +x "$gstub"/*.sh
+# --no-cache on BOTH: only an uncached run stamps at all, so without it the
+# control fails for that reason and proves nothing about --only.
+AXL_STAMP_FILE="$stampdir/control" RUN_INTEGRATION_DIR="$gstub" ./run-integration.sh -j1 --timeout 5 --no-cache >/dev/null 2>&1
+[[ -f "$stampdir/control" ]] || { echo "  FAIL: control -- an unfiltered green run did NOT stamp, so the next check proves nothing"; fail=1; }
+# ...and now the same green stubs, filtered. A subset did not test the tree,
+# and the stamp is what lets a release skip its gate: this is the defect --ci
+# once had, one flag later.
+AXL_STAMP_FILE="$stampdir/only" RUN_INTEGRATION_DIR="$gstub" ./run-integration.sh -j1 --timeout 5 --no-cache --only=test-green-a-qemu.sh >/dev/null 2>&1
+[[ ! -f "$stampdir/only" ]] || { echo "  FAIL: an --only run wrote the release stamp"; fail=1; }
+rm -rf "$stampdir" "$gstub"
+
 # SIGTERM only, and that is not a gap. SIGTERM is the delivery that actually
 # produced the orphans (a `timeout` wrapper expiring, which signals just the
 # runner), and run-integration.sh routes both signals through one _signal_exit

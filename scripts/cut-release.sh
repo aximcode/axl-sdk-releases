@@ -12,6 +12,8 @@
 #   scripts/cut-release.sh X.Y.Z --yes      # skip the confirmation prompt
 #   scripts/cut-release.sh X.Y.Z --allow-breaking  # cut a documented breaking
 #                                           #   change under a non-major version
+#   scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs instead of
+#                                           #   being handed a URL
 #   scripts/cut-release.sh X.Y.Z --resume   # recovery: main already has the
 #                                           #   release commit + green CI — just
 #                                           #   tag, push, watch, confirm
@@ -58,6 +60,11 @@ RELEASES_REPO="aximcode/axl-sdk-releases"
 ALLOW_BREAKING=""
 # The pre-tag docs gate is ON by default; see where it runs for why.
 RUN_DOCS_CHECK=true
+# Watching Release+Docs to completion is now OPT-IN. It cost 4-7 minutes of a
+# human's attention per release and returned a workflow exit status;
+# check-published-release.sh verifies the published bytes instead, which is
+# both stronger and asynchronous. --watch restores the old behaviour.
+WATCH=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -68,6 +75,7 @@ for arg in "$@"; do
         --force-ci) CI_GATE=true; FORCE_CI=true ;;
         --allow-breaking) ALLOW_BREAKING=1 ;;
         --no-docs-check)  RUN_DOCS_CHECK=false ;;
+        --watch)          WATCH=true ;;
         -*)        echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
         *)
             if [[ -n "$VERSION" ]]; then
@@ -190,8 +198,13 @@ tag_and_publish() {
     say "Tagging $TAG at $sha"
     if $DRY_RUN; then
         note "DRY RUN — would: git tag -a $TAG && git push origin $TAG"
-        note "DRY RUN — would: scripts/watch-release-runs.sh $TAG"
-        note "DRY RUN — would: gh release view $TAG --repo $RELEASES_REPO"
+        if $WATCH; then
+            note "DRY RUN — would: scripts/watch-release-runs.sh $TAG"
+            note "DRY RUN — would: gh release view $TAG --repo $RELEASES_REPO"
+        else
+            note "DRY RUN — would print the Actions URL and NOT wait (--watch to wait)"
+            note "DRY RUN — would suggest: scripts/check-published-release.sh $TAG"
+        fi
         return 0
     fi
     git tag -a "$TAG" -m "$(make_tag_message)"
@@ -211,6 +224,23 @@ tag_and_publish() {
     # release commit. So a CI run on this same SHA is expected and the watcher
     # will see it; it just is not something the tag started.
     local expect="Release Docs"
+    if ! $WATCH; then
+        # HANDING BACK A URL BEATS HOLDING A HUMAN. Watching to completion cost
+        # 4-7 minutes of somebody's attention per release, and what it bought
+        # was a workflow's exit status -- while check-published-release.sh
+        # verifies the published BYTES, which is the stronger claim and the one
+        # that actually catches a truncated upload or a missed rename (§16.2
+        # job 2). The tag is pushed either way; nothing here can un-publish it.
+        say "$TAG pushed. Release + Docs are running:"
+        note "    $(gh repo view --json url --jq .url 2>/dev/null || echo https://github.com/aximcode/axl-sdk)/actions"
+        note ""
+        note "When they finish, verify what consumers will actually receive:"
+        note "    scripts/check-published-release.sh $TAG"
+        note ""
+        note "To watch instead of being handed the link, re-run with --watch."
+        return 0
+    fi
+
     say "Watching $expect for $TAG"
     if ! EXPECT_WORKFLOWS="$expect" scripts/watch-release-runs.sh "$TAG"; then
         die "a release workflow did not succeed — see the output above and 'gh run list'"
@@ -360,7 +390,50 @@ git push origin main
 REL_SHA="$(git rev-parse HEAD)"
 note "pushed release commit $REL_SHA"
 
-if $CI_GATE && ! $FORCE_CI && release_gate_covers "$REL_SHA" >/dev/null 2>&1; then
+# ── the gate, consulted ALWAYS ────────────────────────────────────────────
+#
+# TWO SOURCES OF GREEN, and the second is the one that removes the ~8.5 minutes
+# a human used to wait. `ci.yml` runs the identical uncached suite on every push
+# to main, on the same self-hosted box, and goes green on the commit this
+# release is cut from -- and the stamp reader could not see any of it, because
+# it reads a local file only an uncached LOCAL run writes. So the only way to
+# satisfy the gate was to run that suite a SECOND time here, and --ci-gate
+# would then dispatch a THIRD (AXL-CI-Release-Speed-Design.md §4.4/§10.3).
+#
+# CONSULTED EVEN WITHOUT --ci-gate. The check is free and the answer is the one
+# fact that decides whether this tag is verified; only the DISPATCH is gated by
+# the flag. Reporting nothing when nothing covers the commit is how a release
+# comes to be gated by a human's memory.
+GATE_WHY=""
+GATE_SRC=""
+if ! $FORCE_CI; then
+    if GATE_WHY="$(release_gate_covers "$REL_SHA")"; then
+        GATE_SRC="local suite"
+    elif GATE_WHY="$(release_gate_ci_covers "$REL_SHA")"; then
+        GATE_SRC="CI"
+    else
+        GATE_SRC=""
+    fi
+fi
+if [[ -n "$GATE_SRC" ]]; then
+    say "Gate satisfied by the $GATE_SRC — $GATE_WHY"
+elif ! $CI_GATE; then
+    # NOT a `note`. Nothing certified this tree, and the next line of output is
+    # a public tag that cannot be re-cut.
+    cat >&2 <<EOF
+
+WARNING: nothing has certified $REL_SHA.
+         no local stamp, and no green CI run at it or its parent.
+         Tagging anyway, because --ci-gate was not passed.
+         To certify it, either:
+           ./test/integration/run-integration.sh --no-cache
+           git push          # and let CI go green on main
+         or re-run this with --ci-gate to dispatch and wait.
+
+EOF
+fi
+
+if $CI_GATE && ! $FORCE_CI && [[ -n "$GATE_SRC" ]]; then
     # ALREADY GREEN — skip the dispatch entirely. The local suite is the
     # authoritative gate (RELEASING.md), and it stamped this tree; dispatching
     # CI would run the same tests on the same code for an answer we hold.
@@ -371,7 +444,6 @@ if $CI_GATE && ! $FORCE_CI && release_gate_covers "$REL_SHA" >/dev/null 2>&1; th
     # It reads the stamp against the RELEASE commit, not HEAD-before-the-bump:
     # release_gate_covers accepts a descendant whose whole diff is VERSION,
     # axl-version.h and CHANGELOG.md, which is exactly what the bump touches.
-    say "CI gate satisfied locally — $(release_gate_covers "$REL_SHA")"
     note "skipping the CI dispatch (pass --force-ci to run it anyway)"
 elif $CI_GATE; then
     # No usable stamp. Since 2026-08-19 the commonest reason is not "you did
@@ -380,7 +452,8 @@ elif $CI_GATE; then
     # stamp, because it skipped tests whose inputs merely looked unchanged.
     # Say so before dispatching, or the fix reads as "run it again" and the
     # next run is cached too.
-    say "No uncached local stamp covers $REL_SHA."
+    say "Nothing covers $REL_SHA -- no local stamp, and no green CI run at it"
+    say "or its parent."
     note "a CACHED run cannot stamp -- for the local gate use:"
     note "    ./test/integration/run-integration.sh --no-cache --arch X64"
     note "    ./test/integration/run-integration.sh --no-cache --arch AARCH64"

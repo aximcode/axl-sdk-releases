@@ -158,12 +158,26 @@ prune_family() {
         cands+=("$d")
     done
     if [[ ${#unowned[@]} -gt 0 ]]; then
+        # SAY WHAT WAS DONE, NOT WHY IT WAS DONE. This header used to read
+        # "not installed by us, so not ours to remove" and the note under it
+        # then asked "(ours, but installed before receipts existed?)" -- one
+        # message stating a fact and retracting it three lines later. On a
+        # long-lived box the retraction is the true half: the roots skipped
+        # here were /opt/x86_64-elf-gcc-14.3.0-axl and -axl2, our own naming
+        # convention, installed before receipts existed.
+        #
+        # The old note's remedy could not work either. It said to re-run the
+        # installer to re-mark the root, and the installer does re-mark -- but
+        # only the root the MANIFEST names, which is the CURRENT version. The
+        # roots this message is printed about are the SUPERSEDED ones, and no
+        # invocation of it will ever claim them.
         echo "  skipped ${#unowned[@]} root(s) under $base with no $RECEIPT --" \
-             "not installed by us, so not ours to remove"
+             "not removing them"
         if [[ $DRY -eq 1 ]]; then
             for d in "${unowned[@]}"; do echo "      $d"; done
-            echo "      (ours, but installed before receipts existed?" \
-                 "re-run axl-install-toolchain to re-mark it)"
+            echo "      A root carries no receipt if we did not install it, or if it"
+            echo "      predates receipts (v4.6.0 and earlier). Prune removes only what"
+            echo "      it can prove it installed, so these stay until you remove them."
         fi
     fi
     [[ ${#cands[@]} -gt 0 ]] || return 0

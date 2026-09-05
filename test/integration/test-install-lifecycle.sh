@@ -128,6 +128,12 @@ rc=0
 # LIFECYCLE definition), and several assertions need one: `axl` single-quotes
 # the --prefix it prints. \47 is that byte, built at run time instead.
 SQ=$(printf "\47")
+# `axl toolchain list --porcelain` is tab-separated, and every field read in
+# this file goes through it. The readers used to parse the HUMAN listing by
+# column index -- which is why that listing could not be laid out for a human
+# without breaking them, and had not been. A literal tab cannot be written in
+# an awk -F inside this block, so it is built once here.
+TAB=$(printf "\t")
 ok()   { echo "  PASS $1"; }
 bad()  { echo "  FAIL $1"; rc=1; }
 # Does the front door still work? Asked after every transition.
@@ -184,6 +190,16 @@ for v in '"$V1"' '"$V2"' '"$V3"'; do
 done
 grep -q "^\* axl-sdk-'"$V3"'" /tmp/list.txt \
     && ok "list marks '"$V3"' as current" || { bad "current not marked"; cat /tmp/list.txt; }
+# EVERY ROW CARRIES ITS SIZE ON DISK. The legend directly under this listing
+# advises axl prune, and the size is the number that decides whether that is
+# worth running -- it was the one fact a reader had to leave and measure for
+# themselves. Counted rather than spot-checked: one sized row out of three
+# would satisfy a grep and mean the du had failed for the other two.
+_rows=$(grep -c "axl-sdk-[0-9]" /tmp/list.txt)
+_sized=$(awk "/axl-sdk-[0-9]/ && \$NF ~ /^[0-9]+([.][0-9]+)?[KMGT]?\$/ { n++ } END { print n+0 }" /tmp/list.txt)
+[ "$_rows" -gt 0 ] && [ "$_sized" = "$_rows" ] \
+    && ok "and every one of the $_rows rows carries its size on disk" \
+    || { bad "sizes: $_sized of $_rows rows"; cat /tmp/list.txt; }
 
 echo "--- 5. DOWNGRADE to '"$V1"', offline"
 # An empty mirror: a version already on disk must not need the network.
@@ -376,9 +392,16 @@ echo "--- 8d. every documented option runs on a REAL install"
 axl > /tmp/bare.txt 2>&1;        bare_rc=$?
 axl -h > /tmp/h.txt 2>&1;        h_rc=$?
 axl --help > /tmp/help.txt 2>&1; help_rc=$?
-[ "$bare_rc" = 0 ] && [ "$h_rc" = 0 ] && [ "$help_rc" = 0 ] \
-    && ok "bare, -h and --help all exit 0" \
-    || bad "exit codes: bare=$bare_rc -h=$h_rc --help=$help_rc"
+# THE TEXT IS THE SAME AND THE STATUS IS NOT, on purpose. `-h`/`--help` were
+# ASKED for the listing and got it: 0. A bare `axl` supplied no command, which
+# is the same mistake `axl use` with no version and `axl <unknown>` both exit 2
+# for -- and it used to exit 0, so `axl "$cmd"` with an empty $cmd reported
+# success for doing nothing. The listing still goes to stdout either way,
+# because hiding the discovery surface behind a redirect was never the point of
+# the status.
+[ "$bare_rc" = 2 ] && [ "$h_rc" = 0 ] && [ "$help_rc" = 0 ] \
+    && ok "-h and --help exit 0; a bare axl exits 2" \
+    || bad "exit codes: bare=$bare_rc (want 2) -h=$h_rc --help=$help_rc (want 0)"
 # -h is an ALIAS, so identical output is the contract -- not merely "it also
 # exits 0", which a branch that fell through to usage-by-accident would pass.
 if cmp -s /tmp/h.txt /tmp/help.txt && cmp -s /tmp/bare.txt /tmp/help.txt; then
@@ -448,7 +471,8 @@ AXL_X64_GCC_DEFAULT=$X64_TC/bin/x86_64-elf-gcc
 AXL_X64_BINUTILS_PREFIX_DEFAULT=$X64_TC/bin/x86_64-elf-
 CONF
     axl toolchain list > /tmp/tcreal.txt 2>&1
-    if awk "\$1 == \"x64\" { print \$3 }" /tmp/tcreal.txt | grep -q installed; then
+    axl toolchain list --porcelain > /tmp/tcreal-p.txt 2>&1
+    if [ "$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/tcreal-p.txt)" = installed ]; then
         ok "toolchain list finds the real toolchain and marks it installed"
     else
         bad "the real toolchain was not reported installed"; cat /tmp/tcreal.txt
@@ -570,13 +594,16 @@ fi
 # Task 3 and is pinned by test-axl-toolchain-verb.sh case 12; the axl-cc in
 # this fixture is a stub, so what can be proved here is that the manager
 # probe of the same root now reports it absent.
-axl toolchain list > /tmp/un5.txt 2>&1
-tcstate=$(awk "\$1 == \"x64\" { print \$3 }" /tmp/un5.txt)
-# g++:MISSING, not bare MISSING: the root line names the LOCATOR it probes
+axl toolchain list --porcelain > /tmp/un5.txt 2>&1
+tcstate=$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/un5.txt)
+# THE g++ FIELD, read from --porcelain. The human listing spells this as words
+# a reader can act on (gcc + g++, gcc only no C++, not installed); the machine
+# form keeps installed/MISSING per locator, and which locator it is comes from
+# the field POSITION rather than from a prefix on the value.
 # (g++) since it and the separate "builds with:" line below it can name
 # different compilers -- see AXL-Host-Toolchain-Design.md and the `list`
 # case in scripts/axl.
-[ "$tcstate" = "g++:MISSING" ] && ok "and toolchain list now reports x64 MISSING" \
+[ "$tcstate" = "MISSING" ] && ok "and toolchain list now reports x64 MISSING" \
     || { bad "list says x64 is $tcstate after the uninstall"; cat /tmp/un5.txt; }
 
 echo "--- 8g. uninstall: the rename-first form REFUSES where -w is blind"
@@ -672,10 +699,10 @@ mfdir=$(sed -n "s/^AXL_X64_TOOLCHAIN_DIR=//p" "$mf" 2>/dev/null)
 # CONTROL. A negative assertion proves nothing unless the detector COULD have
 # said yes -- so pin that both arches read MISSING here, through the same probe
 # `axl update` uses.
-axl toolchain list > /tmp/8h-tc.txt 2>&1
-x0=$(awk "\$1 == \"x64\"  { print \$3 }" /tmp/8h-tc.txt)
-a0=$(awk "\$1 == \"aa64\" { print \$3 }" /tmp/8h-tc.txt)
-if [ "$x0" = "g++:MISSING" ] && [ "$a0" = "g++:MISSING" ]; then
+axl toolchain list --porcelain > /tmp/8h-tc.txt 2>&1
+x0=$(awk -F"$TAB" "\$1 == \"x64\"  { print \$5 }" /tmp/8h-tc.txt)
+a0=$(awk -F"$TAB" "\$1 == \"aa64\" { print \$5 }" /tmp/8h-tc.txt)
+if [ "$x0" = "MISSING" ] && [ "$a0" = "MISSING" ]; then
     ok "control: neither arch has a toolchain before the update"
 else
     bad "control: x64=$x0 aa64=$a0 -- the negative below would prove nothing"
@@ -723,10 +750,10 @@ axl use '"$V1"' --base-url file:///rel/empty > /tmp/8i-pre.log 2>&1
 [ "$(axl --print-prefix)" = "$P/axl-sdk-'"$V1"'" ] \
     && ok "fixture: back on '"$V1"' for the positive case" \
     || bad "fixture: --print-prefix = $(axl --print-prefix)"
-axl toolchain list > /tmp/8i-tc.txt 2>&1
-x1=$(awk "\$1 == \"x64\"  { print \$3 }" /tmp/8i-tc.txt)
-a1=$(awk "\$1 == \"aa64\" { print \$3 }" /tmp/8i-tc.txt)
-if [ "$x1" = "g++:installed" ] && [ "$a1" = "g++:MISSING" ]; then
+axl toolchain list --porcelain > /tmp/8i-tc.txt 2>&1
+x1=$(awk -F"$TAB" "\$1 == \"x64\"  { print \$5 }" /tmp/8i-tc.txt)
+a1=$(awk -F"$TAB" "\$1 == \"aa64\" { print \$5 }" /tmp/8i-tc.txt)
+if [ "$x1" = "installed" ] && [ "$a1" = "MISSING" ]; then
     ok "control: x64 installed and aa64 not -- the per-arch case"
 else
     bad "control: x64=$x1 aa64=$a1"; cat /tmp/8i-tc.txt
@@ -795,26 +822,27 @@ axl use '"$V1"' --base-url file:///rel/empty > /tmp/8ib-pre.log 2>&1
 # the g++ locator ONLY -- deliberately, it pairs with a "builds with:" line that
 # asks axl-cc -- so it reports MISSING here. `axl update` must NOT agree with
 # it. If list said installed, this step would prove nothing.
-axl toolchain list > /tmp/8ib-tc.txt 2>&1
-xb=$(awk "\$1 == \"x64\" { print \$3 }" /tmp/8ib-tc.txt)
-[ "$xb" = "g++:MISSING" ] \
-    && ok "control: with g++ gone, toolchain list reports g++:MISSING" \
+axl toolchain list --porcelain > /tmp/8ib-tc.txt 2>&1
+xb=$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/8ib-tc.txt)
+[ "$xb" = "MISSING" ] \
+    && ok "control: with g++ gone, toolchain list reports g++ MISSING" \
     || { bad "control: list says x64 is $xb -- 8ib cannot discriminate"; cat /tmp/8ib-tc.txt; }
 # AND IT NO LONGER CONTRADICTS ITSELF. list used to report the g++ half only,
 # so on this exact tree it said MISSING about a toolchain the update was about
-# to refresh -- one command contradicting another about one machine. The
-# appended fifth field is what closes that.
-cb=$(awk "\$1 == \"x64\" { print \$5 }" /tmp/8ib-tc.txt)
-[ "$cb" = "gcc:installed" ] \
-    && ok "and reports gcc:installed alongside, so list agrees with update" \
-    || { bad "list field 5 is [$cb], expected gcc:installed"; cat /tmp/8ib-tc.txt; }
-# THE FIELD WENT ON THE END, not in the middle: case 17 of the toolchain-verb
-# test reads the toolchain ROOT out of field 4, so a column inserted before it
-# would silently hand that assertion the wrong string.
-rb=$(awk "\$1 == \"x64\" { print \$4 }" /tmp/8ib-tc.txt)
+# to refresh -- one command contradicting another about one machine. Reporting
+# both locators in their own fields is what closes that.
+cb=$(awk -F"$TAB" "\$1 == \"x64\" { print \$4 }" /tmp/8ib-tc.txt)
+[ "$cb" = "installed" ] \
+    && ok "and reports gcc installed alongside, so list agrees with update" \
+    || { bad "porcelain gcc field is [$cb], expected installed"; cat /tmp/8ib-tc.txt; }
+# THE ROOT IS STILL WHERE THE CONTRACT SAYS: case 17 of the toolchain-verb test
+# reads the toolchain ROOT out of porcelain field 3 to decide where a command
+# ending in `rm -rf` points, so a column moved before it would silently hand
+# that assertion a compiler state where it expects a path.
+rb=$(awk -F"$TAB" "\$1 == \"x64\" { print \$3 }" /tmp/8ib-tc.txt)
 [ "$rb" = "/opt/axl-fixture-x64-'"$V1"'" ] \
-    && ok "and field 4 is still the root path" \
-    || { bad "field 4 is [$rb] -- the new column shifted it"; cat /tmp/8ib-tc.txt; }
+    && ok "and porcelain field 3 is still the root path" \
+    || { bad "field 3 is [$rb] -- the columns shifted"; cat /tmp/8ib-tc.txt; }
 axl update --base-url "file:///rel/'"$V3"'" > /tmp/8ib.log 2>&1; u8ib=$?
 [ "$u8ib" = 0 ] && ok "the update exits 0" \
     || { bad "axl update exited $u8ib"; tail -10 /tmp/8ib.log; }
@@ -835,9 +863,9 @@ axl use '"$V1"' --base-url file:///rel/empty > /tmp/8ic-pre.log 2>&1
 # CONTROL: x64 IS installed, so WITHOUT the variable this same update carries
 # it -- 8i proved exactly that on this state. Without this line the absence
 # below is satisfied by there being nothing to carry.
-axl toolchain list > /tmp/8ic-tc.txt 2>&1
-xc=$(awk "\$1 == \"x64\" { print \$3 }" /tmp/8ic-tc.txt)
-[ "$xc" = "g++:installed" ] \
+axl toolchain list --porcelain > /tmp/8ic-tc.txt 2>&1
+xc=$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/8ic-tc.txt)
+[ "$xc" = "installed" ] \
     && ok "control: x64 is installed, so the default WOULD carry it" \
     || { bad "control: x64=$xc -- 8ic cannot prove the variable did anything"; cat /tmp/8ic-tc.txt; }
 AXL_TOOLCHAIN=host axl update --base-url "file:///rel/'"$V3"'" > /tmp/8ic.log 2>&1; u8ic=$?
@@ -874,8 +902,8 @@ axl use '"$V1"' --base-url file:///rel/empty > /tmp/8id-pre.log 2>&1
 # CONTROL: the override really is what resolves -- list reports the overridden
 # root, not the manifest one. Without this the decline below could be firing
 # for some entirely different reason.
-AXL_X64_GXX="$OWN/bin/x86_64-elf-g++" axl toolchain list > /tmp/8id-tc.txt 2>&1
-rd=$(awk "\$1 == \"x64\" { print \$4 }" /tmp/8id-tc.txt)
+AXL_X64_GXX="$OWN/bin/x86_64-elf-g++" axl toolchain list --porcelain > /tmp/8id-tc.txt 2>&1
+rd=$(awk -F"$TAB" "\$1 == \"x64\" { print \$3 }" /tmp/8id-tc.txt)
 [ "$rd" = "$OWN" ] \
     && ok "control: the override moves the root list reports" \
     || { bad "control: list reports root [$rd], expected $OWN"; cat /tmp/8id-tc.txt; }
@@ -1019,8 +1047,8 @@ echo "--- 8if. AXL_TOOLCHAIN=host AND an override: the two declines compose"
 rm -f "/opt/axl-fixture-x64-'"$V3"'/.axl-receipt"
 axl use '"$V1"' --base-url file:///rel/empty > /tmp/8if-pre.log 2>&1
 # CONTROL: the override really is in play for this run.
-AXL_X64_GXX="$OWN/bin/x86_64-elf-g++" axl toolchain list > /tmp/8if-tc.txt 2>&1
-rf=$(awk "\$1 == \"x64\" { print \$4 }" /tmp/8if-tc.txt)
+AXL_X64_GXX="$OWN/bin/x86_64-elf-g++" axl toolchain list --porcelain > /tmp/8if-tc.txt 2>&1
+rf=$(awk -F"$TAB" "\$1 == \"x64\" { print \$3 }" /tmp/8if-tc.txt)
 [ "$rf" = "$OWN" ] \
     && ok "control: the override is what resolves for this run" \
     || { bad "control: list reports root [$rf], expected $OWN"; cat /tmp/8if-tc.txt; }
@@ -1085,10 +1113,10 @@ done
 rm -f "/opt/axl-fixture-x64-'"$V3"'/.axl-receipt" "/opt/axl-fixture-aa64-'"$V3"'/.axl-receipt"
 axl use '"$V1"' --base-url file:///rel/empty > /tmp/8ig-pre.log 2>&1
 # CONTROL, both halves: aa64 installed at the pinned root, x64 override-located.
-AXL_X64_GXX="$OWN/bin/x86_64-elf-g++" axl toolchain list > /tmp/8ig-tc.txt 2>&1
-ag=$(awk "\$1 == \"aa64\" { print \$3 }" /tmp/8ig-tc.txt)
-xg=$(awk "\$1 == \"x64\"  { print \$4 }" /tmp/8ig-tc.txt)
-if [ "$ag" = "g++:installed" ] && [ "$xg" = "$OWN" ]; then
+AXL_X64_GXX="$OWN/bin/x86_64-elf-g++" axl toolchain list --porcelain > /tmp/8ig-tc.txt 2>&1
+ag=$(awk -F"$TAB" "\$1 == \"aa64\" { print \$5 }" /tmp/8ig-tc.txt)
+xg=$(awk -F"$TAB" "\$1 == \"x64\"  { print \$3 }" /tmp/8ig-tc.txt)
+if [ "$ag" = "installed" ] && [ "$xg" = "$OWN" ]; then
     ok "control: aa64 at the pinned root, x64 override-located"
 else
     bad "control: aa64=$ag x64root=$xg -- 8ig cannot show per-arch"
@@ -1131,9 +1159,9 @@ echo "--- 8j. an ALREADY-CURRENT update announces no download, because it does n
 # CONTROL, and 8j was the one step without it: the negative below is equally
 # satisfied by there having been nothing to carry. Assert x64 IS detected
 # installed under the CURRENT manifest, so the silence means what it claims.
-axl toolchain list > /tmp/8j-tc.txt 2>&1
-xj=$(awk "\$1 == \"x64\" { print \$3 }" /tmp/8j-tc.txt)
-[ "$xj" = "g++:installed" ] \
+axl toolchain list --porcelain > /tmp/8j-tc.txt 2>&1
+xj=$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/8j-tc.txt)
+[ "$xj" = "installed" ] \
     && ok "control: x64 is installed, so a non-short-circuiting update WOULD carry it" \
     || { bad "control: x64=$xj -- 8j cannot prove the short-circuit did it"; cat /tmp/8j-tc.txt; }
 axl update --base-url "file:///rel/'"$V3"'" > /tmp/8j.log 2>&1; u8j=$?
@@ -1163,9 +1191,9 @@ axl use '"$V1"' --base-url file:///rel/empty > /tmp/8k-pre.log 2>&1
 # CONTROL: x64 IS installed, so WITHOUT the flag this exact update carries it
 # -- which is what 8i just proved on this exact state. Without this line the
 # absence below is satisfied by there being nothing to carry.
-axl toolchain list > /tmp/8k-tc.txt 2>&1
-xk=$(awk "\$1 == \"x64\" { print \$3 }" /tmp/8k-tc.txt)
-[ "$xk" = "g++:installed" ] \
+axl toolchain list --porcelain > /tmp/8k-tc.txt 2>&1
+xk=$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/8k-tc.txt)
+[ "$xk" = "installed" ] \
     && ok "control: x64 is installed, so the default WOULD carry it" \
     || { bad "control: x64=$xk -- 8k cannot prove the flag did anything"; cat /tmp/8k-tc.txt; }
 # 8i left a receipt at the '"$V3"' root; clear it so the absence below is the
@@ -1267,9 +1295,9 @@ axl use '"$V1"' --base-url file:///rel/empty > /tmp/8L-pre.log 2>&1
 rm -rf "/opt/axl-fixture-x64-'"$V3"'"
 # CONTROL: x64 must still read installed at '"$V1"'-s pin, or the update carries
 # nothing and there is no failure to report.
-axl toolchain list > /tmp/8L-tc.txt 2>&1
-xl=$(awk "\$1 == \"x64\" { print \$3 }" /tmp/8L-tc.txt)
-[ "$xl" = "g++:installed" ] \
+axl toolchain list --porcelain > /tmp/8L-tc.txt 2>&1
+xl=$(awk -F"$TAB" "\$1 == \"x64\" { print \$5 }" /tmp/8L-tc.txt)
+[ "$xl" = "installed" ] \
     && ok "control: x64 is installed, so this update does try to carry it" \
     || { bad "control: x64=$xl -- nothing would be attempted"; cat /tmp/8L-tc.txt; }
 axl update --base-url "file:///rel/'"$V3"'" > /tmp/8L.log 2>&1; u8L=$?
@@ -1355,7 +1383,7 @@ FAILS="$(grep -c '^  FAIL ' "$LOG" 2>/dev/null || true)"
 # at the END OF STEP 6 -- so deleting steps 7 and 8 left rc=0, zero FAILs and
 # a green "ran the whole lifecycle". A count is the only thing standing
 # between "every assertion passed" and "most of them never ran".
-EXPECTED_ASSERTIONS=162
+EXPECTED_ASSERTIONS=163
 if [[ "$PASSES" -ne "$EXPECTED_ASSERTIONS" ]]; then
     test_host_fail "the container ran every assertion ($PASSES of $EXPECTED_ASSERTIONS)"
 else

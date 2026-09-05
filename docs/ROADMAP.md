@@ -12,6 +12,37 @@ Legend: `[x]` done · `[-]` in progress · `[ ]` pending.
 
 ---
 
+## Agreed order of work — decided 2026-09-05
+
+Mike picked this order explicitly, over a recommendation that had the SSH
+track first. It is recorded here rather than in a session note because the
+reasoning is not reconstructable from the individual entries: **1 makes 2
+cheaper, and 3 is what 4 is blocked on**, so the sequence is doing the
+enabling work before the work it enables, in both halves.
+
+1. **Release / CI turnaround** — SHIPPED 2026-09-05, and **not what this line
+   originally said.** It read "move `ci.yml` off the every-push trigger", which
+   is the one thing the work concluded it must NOT do: a scheduled suite means
+   no push run can ever satisfy the release gate, so every cut falls back to a
+   local uncached suite or a dispatch — reintroducing the ~8.5 minutes the same
+   change had just removed (`AXL-CI-Release-Speed-Design.md` §13.8). What
+   shipped instead: the gate accepts CI's own green run (§13.1-13.2), watching
+   `Release` became opt-in (§13.3), and a `plan` job classifies each push so
+   prose no longer pays for the full matrix (§13.6-13.7). Remaining: §13.8,
+   §13.9 and §13.10.
+2. **Cut the release** carrying the `axl` output work (`b1c6fde6`) plus
+   whatever 1 lands. Mike said **4.7.1**; note that `## Unreleased` currently
+   holds an `### Added`, which `check-release-semver.sh` NOTEs as
+   minor-shaped, so the number is worth a second look at cut time.
+3. **Ed25519 E2b** — [AxlCrypto track](#axlcrypto--ed25519-signingverification).
+   Vendor ref10 + RFC 8410 DER behind the finished E2a seam. Chosen over the
+   ECDSA shortcut for Task 6, so `AxlSsh` v1 advertises `ssh-ed25519` rather
+   than `ecdsa-sha2-nistp256`.
+4. **AxlSsh P1 Task 6** — key exchange, which 3 unblocks. Tasks 1-5 are
+   shipped; this is where the track stops today.
+
+---
+
 ## Design & plan docs (index)
 
 Library / SDK foundations:

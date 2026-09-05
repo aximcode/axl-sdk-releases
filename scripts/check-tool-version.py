@@ -53,8 +53,6 @@ HOST_COMMANDS = {
 # fix for a real wrong answer and must not regress into a cheerful reply.
 # Staged and executable, but not a subcommand: gdb-sample.py is invoked BY
 # profile-qemu.sh, never by a user, and stages 0644 so `axl` does not list it.
-NOT_COMMANDS = {"gdb-sample"}
-
 SOURCE_REFUSERS = {
     "axl-cc":  SCRIPTS / "axl-cc",
     "axl-c++": SCRIPTS / "axl-c++",
@@ -214,13 +212,36 @@ def main() -> int:
     # `axl` builds its command list from libexec/axl/ precisely so there is no
     # second list; this is the next best thing for a gate that must also name
     # the expected output of each one.
+    #
+    # THE SOURCE MODE MUST AGREE WITH THE SHEBANG, and that is checked rather
+    # than assumed. `scripts/stage-host-tools.sh` decides what is staged as a
+    # command from the shebang -- a file that cannot be run is not a command --
+    # while this gate reads the source's exec bit. Those are two spellings of
+    # one question, and they disagreed: gdb-sample.py is loaded INSIDE gdb and
+    # has no shebang, yet was 755 in the tree, so this gate needed a
+    # hand-written NOT_COMMANDS exception naming it. That exception was a third
+    # copy of "which of these are commands", and it was the copy holding the
+    # stale answer. Asserting the agreement deletes the exception and makes a
+    # future mismatch a gate failure at its source, where it is one chmod to
+    # fix, instead of a command in the published tarball that cannot run.
     if files:
         for fname in files:
             src = SCRIPTS / fname
-            if not src.is_file() or not src.stat().st_mode & 0o111:
+            if not src.is_file():
+                continue
+            executable = bool(src.stat().st_mode & 0o111)
+            with src.open("rb") as fh:
+                shebang = fh.read(2) == b"#!"
+            if executable != shebang:
+                fail(f"{fname} is mode {src.stat().st_mode & 0o777:o} but "
+                     f"{'has' if shebang else 'has no'} shebang -- the two must "
+                     f"agree, because stage-host-tools.sh stages by the shebang "
+                     f"and this gate reads the mode")
+                errors += 1
+            if not executable:
                 continue          # a library, not a command
             cmd = re.sub(r"\.(sh|py)$", "", fname)
-            if cmd not in HOST_COMMANDS and cmd not in NOT_COMMANDS:
+            if cmd not in HOST_COMMANDS:
                 fail(f"{fname} is staged and executable but is not in "
                      f"HOST_COMMANDS -- its --version goes unchecked")
                 errors += 1

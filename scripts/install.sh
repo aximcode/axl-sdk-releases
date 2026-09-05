@@ -65,6 +65,10 @@ done
 # ---------------------------------------------------------------------------
 
 source "$LIBAXL_DIR/scripts/axl-common.sh"
+# The libexec staging rule, shared with make-host-tools-tarball.sh so the two
+# staging paths cannot disagree about which files are commands.
+# shellcheck source=./stage-host-tools.sh
+source "$LIBAXL_DIR/scripts/stage-host-tools.sh"
 
 # ---------------------------------------------------------------------------
 # Content-preserving installs
@@ -989,11 +993,8 @@ _host_tools=$(make -C "$LIBAXL_DIR" -s print-HOST_TOOL_FILES) || {
 for _tool in $_host_tools; do
     _src="$LIBAXL_DIR/scripts/$_tool"
     [[ -f "$_src" ]] || { log_error "missing host tool: scripts/$_tool"; exit 1; }
-    if head -c2 "$_src" | grep -q '#!'; then
-        install -C -m 755 "$_src" "$PREFIX/libexec/axl/$_tool"
-    else
-        install -C -m 644 "$_src" "$PREFIX/libexec/axl/$_tool"
-    fi
+    install -C -m "$(axl_host_tool_mode "$_src")" \
+            "$_src" "$PREFIX/libexec/axl/$_tool"
 done
 # The installer ships INSIDE the install, so `axl self-update` and
 # `axl uninstall` work without re-fetching it. QtIFW's MaintenanceTool idea
