@@ -88,9 +88,10 @@ install -m 0755 "$SDK_DIR/scripts/axl" "$STAGE/bin/axl"
 chmod 0644 "$STAGE/libexec/axl/axl_version.py"
 
 # THE INSTALLER SHIPS INSIDE IT (§20's M2). This component is the MANAGER:
-# `axl prune` never removes it (it prunes `^axl-sdk-[0-9]`, and this is not
-# that), and `axl use` never repoints it, so it is the one tree that can still
-# self-update after any rollback. That only works if it carries the installer
+# `axl prune` never removes the CURRENT one or the one it is running out of
+# (it does prune superseded generations of this family, which would otherwise
+# accumulate forever), and `axl use` never repoints it, so it is the one tree
+# that can still self-update after any rollback. That only works if it carries the installer
 # its verbs exec.
 #
 # 0644 DELIBERATELY, the same as the SDK prefix: `axl` lists the EXECUTABLES in

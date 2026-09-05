@@ -90,7 +90,29 @@ done
 # --abs: this path is both tested here and MOUNTED into the container
 # below, so a repo-relative answer would depend on the caller's cwd.
 STAGE="$("$DIR/scripts/sdk-prefix.sh" --abs)"
-[[ -x "$STAGE/bin/axl-cc" ]] || { echo "SKIP: SDK not staged (run ./scripts/install.sh --arch all --cpp)"; exit 0; }
+# Check for what this test will actually USE, not just for a marker that a
+# stage exists. It drives FOUR builds -- x64 and aa64, C and C++ -- so an
+# x64-only stage satisfies `bin/axl-cc` and then fails both aa64 builds with
+# "no SDK libraries for arch 'aa64'". That is a red naming a product defect for
+# a half-staged dev box, on the one gate that decides whether to publish; CI
+# never sees it because ci.yml stages `--arch all --cpp`. A partial stage is a
+# normal thing to have locally (a quick x64-only loop leaves one), so it is a
+# SKIP that NAMES what is missing.
+#
+# The regression this deliberately does NOT try to catch -- install.sh silently
+# ceasing to stage an arch -- is caught loudly by test-sdk-tarball.sh, which
+# asserts lib/axl/{x64,aa64}/libaxl.a and libaxl-standin.a in the archive
+# install.sh --arch all produces. A SKIP here cannot hide it.
+_missing=""
+[[ -x "$STAGE/bin/axl-cc" ]] || _missing="bin/axl-cc"
+for _a in x64 aa64; do
+    [[ -f "$STAGE/lib/axl/$_a/libaxl.a" ]] || _missing="$_missing lib/axl/$_a/libaxl.a"
+done
+if [[ -n "$_missing" ]]; then
+    echo "SKIP: SDK not fully staged --$_missing"
+    echo "      (run ./scripts/install.sh --arch all --cpp)"
+    exit 0
+fi
 
 OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 

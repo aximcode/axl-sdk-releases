@@ -401,6 +401,18 @@ fi
 # silently fall back to the default. --verbose echoes each compile, so grep the
 # command lines rather than trusting that a successful build used the flag.
 #
+# COUNT SUB-BUILDS, NOT MENTIONS. --verbose echoes more than one command per
+# pass -- the real compile AND the hermeticity -M pass, which mirrors the
+# compile's language flags on purpose and so carries -std too. A bare count of
+# -std lines therefore reads 4 for two passes, which means `-ge 2` is satisfied
+# by ONE pass and the assertion stops proving what its name claims. Measured:
+# it silently went from 2 to 4 the moment the -M pass started being echoed.
+#
+# The filter is ` -c `, not a raised threshold: only a real compile carries it
+# (the -M pass preprocesses and emits no object, the link is ld). A threshold
+# bumped to 4 would re-break the next time anything else echoes the flag,
+# which is exactly how this got weakened in the first place.
+#
 # Uses the real service example, not a stub: a fixture with no AXL_SERVICE_DRIVER
 # fails pass 1 on an undefined DriverEntry, pass 2 never runs, and the check
 # then proves only half of what its name claims. Two occurrences is the
@@ -417,9 +429,11 @@ if [[ -f "$SVC_SRC" ]]; then
     ( cd "$SD" && "$AXL_CC" --verbose --service service_demo -std=gnu2x "$SVC_SRC" ) \
         >"$SD/svc.log" 2>&1
     svc_rc=$?
-    svc_n=$(grep -c -- "-std=gnu2x" "$SD/svc.log")
+    # `grep -c` exits 1 on no match, so || true -- and the count still comes
+    # from its stdout, which is "0" in that case.
+    svc_n=$(grep -- "-std=gnu2x" "$SD/svc.log" | grep -c -- " -c " || true)
     [[ "$svc_rc" -eq 0 && "$svc_n" -ge 2 ]]
-    check "$?" "--service forwards -std to BOTH sub-builds (rc=$svc_rc, seen ${svc_n}x)"
+    check "$?" "--service forwards -std to BOTH sub-builds (rc=$svc_rc, ${svc_n} compile(s))"
 else
     check 0 "SKIP: sdk/examples/service-demo.c absent — --service -std check not run"
 fi
@@ -548,7 +562,7 @@ else
 fi
 
 # THE PACKAGED-INSTALL CASE, which is why the exemption is on the SDK's include
-# DIR and not on $SDK_DIR. build-packages.sh stages with --prefix /usr, so a
+# DIR and not on $SDK_DIR. `install.sh --prefix /usr` is supported, so a
 # .deb consumer's own headers sit at /usr/include/axl-sdk/. Exempting the
 # PREFIX there would whitelist the entire host tree and silently disable this
 # check exactly where it ships; exempting the prefix was in fact the first fix

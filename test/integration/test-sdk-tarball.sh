@@ -100,12 +100,24 @@ else
 fi
 
 # ── completeness, by path ─────────────────────────────────────
+#
+# libaxl-standin.a is listed for a reason the rest of this loop does not need:
+# the extract-and-compile below proves the archive can build, and that covers
+# everything a normal link reaches -- libaxl.a, the crt0 objects, the specs
+# file. It does NOT reach the stand-in, because it builds with the bare-metal
+# toolchain and the stand-in only ever appears on an AXL_TOOLCHAIN=host link
+# (AXL-Host-Toolchain-Design.md §5.3). So the one artifact the working proof
+# cannot see is the one that needs its own assertion, per arch. That is the
+# shape of the defect this release fixes: install.sh staged all three uefi-tools
+# sidecars, release.yml staged one, and nothing compared them.
 for want in \
     "axl-sdk-${VERSION}/bin/axl" \
     "axl-sdk-${VERSION}/bin/axl-cc" \
     "axl-sdk-${VERSION}/bin/axl-c++" \
     "axl-sdk-${VERSION}/lib/axl/x64/libaxl.a" \
     "axl-sdk-${VERSION}/lib/axl/aa64/libaxl.a" \
+    "axl-sdk-${VERSION}/lib/axl/x64/libaxl-standin.a" \
+    "axl-sdk-${VERSION}/lib/axl/aa64/libaxl-standin.a" \
     "axl-sdk-${VERSION}/lib/cmake/axl/axl-config.cmake" \
     "axl-sdk-${VERSION}/lib/pkgconfig/axl.pc" \
     "axl-sdk-${VERSION}/libexec/axl/rsod-decode.py" \

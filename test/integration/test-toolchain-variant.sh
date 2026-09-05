@@ -81,6 +81,50 @@ expect "unknown variant is refused, naming axl and cross" fail \
 expect "the refusal names the 'axl' variant" fail "\baxl\b" AXL_TOOLCHAIN=bogus
 expect "the refusal names the 'cross' variant" fail "\bcross\b" AXL_TOOLCHAIN=bogus
 
+# 1b. `auto` is the x64 DEFAULT that axl-cc reports and --verbose prints, so a
+#     consumer who exports the default's own name must still be able to build
+#     the SDK. It maps to `axl`: the SDK builds ITSELF bare-metal either way
+#     (AXL-Host-Toolchain-Design.md §8), so this is a spelling the Makefile
+#     accepts, not a second resolution path.
+expect "auto is accepted" ok "" AXL_TOOLCHAIN=auto ARCH=x64
+
+# `|| true` on both: errexit aborts the whole file when a command
+# SUBSTITUTION fails, so without it a refused `auto` kills the run instead of
+# failing this assertion -- an assertion that cannot fail is worth nothing.
+auto_cc="$(cd "$PROJECT_DIR" && AXL_TOOLCHAIN=auto make -s ARCH=x64 \
+    print-cc-libc-include 2>&1)" || true
+axl_cc_only="$(cd "$PROJECT_DIR" && AXL_TOOLCHAIN=axl make -s ARCH=x64 \
+    print-cc-libc-include 2>&1)" || true
+if [[ "$auto_cc" == "$axl_cc_only" && -n "$auto_cc" ]]; then
+    pass "auto and axl resolve the same compiler"
+else
+    fail "auto and axl differ ('$auto_cc' vs '$axl_cc_only')"
+fi
+
+# 1c-1d. `host` is refused HERE even though axl-cc accepts it, and the refusal
+#        has to say why rather than reading as an unknown-variant typo: the
+#        variant governs what a CONSUMER compiles, and libaxl.a is built and
+#        shipped by the bare-metal toolchain regardless (§8). A reader who has
+#        just used `AXL_TOOLCHAIN=host axl-cc` will otherwise assume the same
+#        value builds the SDK.
+#        The first half reads the message and NOT merely the exit status,
+#        because the pre-existing unknown-variant error already contains the
+#        word "host" -- it echoes back whatever you typed. A `\bhost\b` match
+#        alone is therefore satisfied by the typo message this refusal exists
+#        to replace, and would have passed before any of this was written.
+host_mk="$(mk AXL_TOOLCHAIN=host ARCH=x64)" && host_rc=0 || host_rc=$?
+if [[ "$host_rc" -ne 0 ]] && grep -qE '\bhost\b' <<<"$host_mk" \
+   && ! grep -q 'is not a toolchain variant' <<<"$host_mk"; then
+    pass "the Makefile refuses host by name, not as an unknown-variant typo"
+else
+    fail "Makefile host refusal (rc=$host_rc)"
+    printf '%s\n' "$host_mk" | head -4 | sed 's/^/      /'
+fi
+expect "the host refusal says the SDK builds itself bare-metal" fail \
+    "bare-metal" AXL_TOOLCHAIN=host ARCH=x64
+expect "the host refusal points at what host DOES govern" fail \
+    "consumer|axl-cc" AXL_TOOLCHAIN=host ARCH=x64
+
 # 2. `cross` with nothing named. The message must name the VARIABLES to set --
 #    pointing at axl-install-toolchain here would be actively wrong, since the
 #    user has just said they are supplying their own.
@@ -162,6 +206,35 @@ if [[ "$rc" -ne 0 ]] && grep -qE "\bcross\b" <<<"$out"; then
 else
     fail "install.sh unknown variant (rc=$rc)"
     printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
+fi
+
+# 4d. The same two answers from the third build path. `host` refused with the
+#     §8 reason, `auto` accepted -- the packager must not be the one place
+#     where the default's own name is a fatal typo.
+out="$(cd "$PROJECT_DIR" && AXL_TOOLCHAIN=host ./scripts/install.sh \
+        --arch x64 --prefix "$WORK/sdk" 2>&1)" && rc=0 || rc=$?
+if [[ "$rc" -ne 0 ]] && grep -q "bare-metal" <<<"$out" \
+                     && grep -qE "consumer|axl-cc" <<<"$out"; then
+    pass "install.sh refuses host, with the reason not just the refusal"
+else
+    fail "install.sh host refusal (rc=$rc)"
+    printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
+fi
+
+# `auto` must get PAST the variant check. Asserted on the message rather than
+# on a successful install, which would cost a full build: the failure this
+# guards is the variant being rejected as unknown, and a locator pointed at
+# nothing makes the run die immediately afterwards for a reason that is
+# visibly NOT that. "It failed" alone would be satisfied by the very refusal
+# under test, so the assertion reads WHICH failure it was.
+out="$(cd "$PROJECT_DIR" && AXL_TOOLCHAIN=auto AXL_X64_GCC=/nonexistent/gcc \
+        ./scripts/install.sh --arch x64 --prefix "$WORK/sdk" 2>&1)" \
+        && rc=0 || rc=$?
+if grep -q "is not a toolchain variant" <<<"$out"; then
+    fail "install.sh rejects auto as an unknown variant (rc=$rc)"
+    printf '%s\n' "$out" | grep -m2 "not a toolchain variant" | sed 's/^/      /'
+else
+    pass "install.sh accepts auto"
 fi
 
 echo "=== AXL_TOOLCHAIN, axl-cc ==="

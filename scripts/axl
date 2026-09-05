@@ -116,6 +116,14 @@ usage() {
     # a usage error would hide the discovery surface behind a redirect.
     echo "usage: axl <command> [args ...]"
     echo "       axl update | use <version> | list | uninstall"
+    echo "       axl toolchain list | install [aa64|x64|all] | uninstall [--dry-run|-n] <aa64|x64>"
+    echo "                      (list names which compiler each arch builds with)"
+    echo "                      ('axl update' re-installs the toolchains you"
+    echo "                       ALREADY have, at the version the new SDK pins;"
+    echo "                       an arch without one is never downloaded."
+    echo "                       'axl update --no-toolchain' skips that --"
+    echo "                       for an offline box, or one without sudo)"
+    echo "       axl version    (manager + SDK; --version is the program alone)"
     echo "       axl --print-prefix | --print-version | --help"
     echo ""
     echo "host commands:"
@@ -142,6 +150,214 @@ usage() {
     echo "These commands run on the HOST."
     echo "To compile for UEFI use axl-cc / axl-c++, which build with AXL's bare-metal"
     echo "cross toolchain, NOT the host's gcc. Install it with axl-install-toolchain."
+}
+
+# THE CURRENT SDK, which is not necessarily this script's own prefix. Since
+# §20 M2 `axl` is linked out of the MANAGER root, which holds no headers, no
+# manifest and no axl-install-toolchain -- all of that is SDK content and has
+# to follow `axl use`. Extracted from --print-prefix so the toolchain verb
+# cannot resolve it differently; `axl prune` reading the manifest from its own
+# prefix is exactly the bug that duplication produces. NOTE axl-prune.sh is a
+# separate program and still resolves this inline: it only needs the manifest
+# to be readable, so it tests for the FILE rather than for a symlink, and the
+# two answers differ if `<root>/axl-sdk` is ever a real directory.
+#
+# Falls back to $PREFIX when there is no marker -- a source-tree stage, an
+# unpacked tarball, or a host-tools-only install all land there, and naming
+# your own tree beats naming nothing.
+sdk_prefix() {
+    local _root _p
+    _root="$(dirname "$PREFIX")"
+    if [[ -L "$_root/axl-sdk" ]] \
+       && _p="$(cd -P "$_root/axl-sdk" 2>/dev/null && pwd)" \
+       && [[ -n "$_p" ]]; then
+        printf '%s\n' "$_p"
+    else
+        printf '%s\n' "$PREFIX"
+    fi
+}
+
+# THE CROSS TOOLCHAIN, resolved ONCE for every arm that asks about it. The
+# `toolchain` arm's own comment already refused a second copy for its two
+# callers -- `list` would report one root installed while `uninstall` removed a
+# different one, and that command ends in `rm -rf`. `update` is the third
+# caller and its mistake is the mirror image: it decides from this whether to
+# DOWNLOAD a toolchain, so a resolution that disagreed would either fetch ~96 MB
+# nobody asked for or silently leave axl-cc on the host compiler. Hence hoisted
+# here rather than copied there.
+
+# Snapshot the AXL_<ARCH>_GXX overrides BEFORE anything sources
+# axl-toolchains.conf, which defines the neighbouring *_DEFAULT names that the
+# `${AXL_<ARCH>_GXX:-$AXL_<ARCH>_GXX_DEFAULT}` resolution falls back to.
+_env_aa64_gxx="${AXL_AA64_GXX:-}"
+_env_x64_gxx="${AXL_X64_GXX:-}"
+_env_aa64_gcc="${AXL_AA64_GCC:-}"
+_env_x64_gcc="${AXL_X64_GCC:-}"
+
+# BOTH LAYOUTS, the same two install-toolchain.sh has always tried: an INSTALL
+# keeps the manifest in share/axl/, a source checkout keeps it beside the
+# scripts. Checking only the installed path would fail for every developer
+# running this out of a tree, which is the easiest place to reach for it.
+tc_conf_path() {   # tc_conf_path <sdk prefix> -> the manifest path, or status 1
+    local _c
+    _c="$1/share/axl/axl-toolchains.conf"
+    [[ -r "$_c" ]] || _c="$1/scripts/axl-toolchains.conf"
+    [[ -r "$_c" ]] || return 1
+    printf '%s\n' "$_c"
+}
+
+# Sets _v (the pinned version), _o (the AXL_<ARCH>_GXX override, if any), _g
+# (the g++ locator) and _d (the toolchain root) for one arch. Requires the
+# manifest to have been sourced.
+#
+# `${AXL_<ARCH>_GXX:-$AXL_<ARCH>_GXX_DEFAULT}` -- the resolution
+# axl-toolchains.conf documents and which axl-cc, install.sh and the Makefile
+# all use. Reading _DEFAULT alone reported MISSING for anyone who installed
+# with `--prefix $HOME/.local/opt` and exported what the installer's own
+# print_env told them to, then advised re-downloading 55 MB into /opt.
+# _TOOLCHAIN_DIR has no _DEFAULT twin and so no override variable, so when the
+# compiler is overridden the root is derived from it -- <root>/bin/<cc>, the
+# same shape install-toolchain.sh uses.
+# _gc (the C locator) and _oc (its override, if any) are set alongside _g/_o.
+# `uninstall` still derives its target from the g++ override alone -- it must
+# remove ONE root and the g++ half is the one its messages name -- but `list`
+# reports both and tc_installed_arches accepts EITHER.
+tc_resolve() {   # tc_resolve <arch>
+    case "$1" in
+        aa64) _v="${AXL_AA64_TOOLCHAIN_VERSION:-}"
+              _o="$_env_aa64_gxx"
+              _g="${_o:-${AXL_AA64_GXX_DEFAULT:-}}"
+              _oc="$_env_aa64_gcc"
+              _gc="${_oc:-${AXL_AA64_GCC_DEFAULT:-}}"
+              _d="${AXL_AA64_TOOLCHAIN_DIR:-}" ;;
+        x64)  _v="${AXL_X64_TOOLCHAIN_VERSION:-}"
+              _o="$_env_x64_gxx"
+              _g="${_o:-${AXL_X64_GXX_DEFAULT:-}}"
+              _oc="$_env_x64_gcc"
+              _gc="${_oc:-${AXL_X64_GCC_DEFAULT:-}}"
+              _d="${AXL_X64_TOOLCHAIN_DIR:-}" ;;
+        *)    _v=""; _o=""; _oc=""; _g=""; _gc=""; _d="" ;;
+    esac
+    [[ -n "$_o" ]] && _d="$(dirname "$(dirname "$_g")")"
+    # EXPLICIT. A bare `[[ ... ]] && ...` as the last statement makes the
+    # function's status the TEST's, so "no override set" would come back to a
+    # caller as a failure.
+    return 0
+}
+
+# WHICH ARCHES ACTUALLY HAVE A TOOLCHAIN -- one arch name per line, nothing at
+# all when none does. `axl update` reads this to decide what to bring along.
+#
+# ASK THE COMPILER, do not stat the directory: a partial extract leaves the
+# directory there and nothing in it, and `axl toolchain list` distinguishes
+# those two for the same reason. Getting it wrong here is not a cosmetic
+# printout -- a false positive downloads a toolchain onto a consumer who
+# deliberately has none.
+#
+# EITHER LOCATOR COUNTS -- gcc or g++. Probing only g++ meant a consumer who
+# located their toolchain with AXL_X64_GCC alone, or whose tree is missing only
+# the C++ driver, read MISSING and was declined SILENTLY: the same class of
+# silence this function exists to remove, reappearing one layer up. `axl
+# toolchain list` still labels its root line `g++:` and probes only that, which
+# is deliberate there (it pairs with a "builds with:" line that asks axl-cc) --
+# so the two can legitimately disagree, and §21a.4 records why.
+#
+# There is deliberately NO "but that compiler is not one of ours" refusal.
+# Deciding that would mean inferring provenance from a path or a --version
+# string, and a guess is exactly what this tree refuses; the §21 receipt cannot
+# stand in either, because every root installed before receipts existed is
+# unmarked. Detect it, carry it, and let install-toolchain.sh's own
+# already-installed check be the thing that decides whether a fetch happens.
+#
+# `-x` OR `command -v`: a locator may legitimately hold a bare name resolved on
+# PATH rather than an absolute path, which is the shape axl-cc's own presence
+# probes use.
+tc_have_compiler() {   # tc_have_compiler <path or bare name>
+    [[ -n "$1" ]] || return 1
+    [[ -x "$1" ]] && return 0
+    command -v "$1" >/dev/null 2>&1
+}
+
+# WHERE it is installed matters as much as WHETHER, which is why each line
+# carries a classification:
+#
+#     <arch>  default    -      -       -
+#     <arch>  elsewhere  <VAR>  <root>  <found>
+#
+# <found> is the locator VERBATIM and <root> is dirname(dirname(<found>)) --
+# useful only when <found> is an absolute path in the <root>/bin/<cc> layout.
+# tc_have_compiler deliberately accepts a BARE NAME on PATH, for which <root>
+# is "." and means nothing; the caller validates before it prints either.
+#
+# `default` means the compiler sits at the root the manifest names, which is
+# also the only place axl-install-toolchain will ever write. `elsewhere` means
+# an AXL_<ARCH>_GCC/_GXX override points somewhere else -- and that is NOT a
+# carryable state: install-toolchain.sh resolves the manifest's *_DEFAULT
+# paths under INSTALL_ROOT (default /opt) and reads no override at all, so
+# carrying it would sudo-install a SECOND toolchain into a root the consumer
+# did not choose and leave theirs untouched. Detected, declined, and told why.
+#
+# COMPARED AGAINST THE MANIFEST DIR, not against tc_resolve's $_d: with a g++
+# override in play tc_resolve DERIVES $_d from that override, so the two would
+# always compare equal and the case would never fire. The manifest dirs live
+# under /opt, which is install-toolchain.sh's INSTALL_ROOT DEFAULT, so that is
+# the target it would pick here; a manifest naming a root outside /opt would be
+# disagreeing with its own installer, which `make check-toolchain-conf` is the
+# gate for.
+#
+# $INSTALL_ROOT ITSELF IS NOT CONSULTED, deliberately. install-toolchain.sh
+# honours it, so a consumer exporting both INSTALL_ROOT and matching locators
+# would have a carry land correctly and is declined anyway -- the safe
+# direction: a decline costs a printed message, a wrong carry costs a sudo
+# download into someone else's tree. install.sh passes no INSTALL_ROOT through,
+# so reading it here would mean predicting an environment the installer is not
+# guaranteed to see. AXL-Distribution-Design.md 21a.4.
+#
+# A SUBSHELL, because sourcing the manifest defines a dozen AXL_* names and the
+# caller goes on to `exec` install.sh; the update arm must not be reading the
+# manifest's idea of a variable it was given on the command line.
+tc_installed_arches() {
+    local _s _c _a
+    _s="$(sdk_prefix)"
+    _c="$(tc_conf_path "$_s")" || return 0
+    (
+        # stdout REDIRECTED while sourcing. A manifest is KEY=VALUE and emits
+        # nothing -- but this function's stdout IS its return value, and a
+        # tampered or hand-edited file that echoed one line would become an
+        # "arch" name that ends up in an install.sh argument.
+        # shellcheck source=/dev/null
+        . "$_c" >/dev/null 2>&1 || exit 0
+        for _a in aa64 x64; do
+            tc_resolve "$_a"
+            # WHICHEVER LOCATOR ANSWERS FIRST, and whether it was an override.
+            # g++ is asked first only so the reported variable matches the one
+            # `list` and `uninstall` speak about when both are set.
+            _found=""; _fvar=""
+            if tc_have_compiler "$_g"; then
+                _found="$_g"; [[ -n "$_o" ]]  && _fvar="AXL_${_a^^}_GXX"
+            elif tc_have_compiler "$_gc"; then
+                _found="$_gc"; [[ -n "$_oc" ]] && _fvar="AXL_${_a^^}_GCC"
+            fi
+            [[ -n "$_found" ]] || continue
+            _mdir="${_d%/}"
+            [[ -n "$_o" ]] && case "$_a" in
+                aa64) _mdir="${AXL_AA64_TOOLCHAIN_DIR:-}" ;;
+                x64)  _mdir="${AXL_X64_TOOLCHAIN_DIR:-}" ;;
+            esac
+            _mdir="${_mdir%/}"
+            _froot="$(dirname "$(dirname "$_found")")"
+            # AN EMPTY MANIFEST DIR IS NOT A MATCH. Left as "", it compares
+            # equal to nothing and every arch reads `default` -- which is the
+            # carry branch, so the safe reading has to be the other one.
+            if [[ -n "$_fvar" && ( -z "$_mdir" || "$_froot" != "$_mdir" ) ]]; then
+                printf '%s\telsewhere\t%s\t%s\t%s\n' \
+                       "$_a" "$_fvar" "$_froot" "$_found"
+            else
+                printf '%s\tdefault\t-\t-\t-\n' "$_a"
+            fi
+        done
+        exit 0
+    )
 }
 
 case "${1-}" in
@@ -213,7 +429,37 @@ case "${1-}" in
         fi
         _verb="$1"; shift
         _root="$(dirname "$PREFIX")"
-        _bin="${AXL_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+        # THE BIN DIR THIS INSTALL WAS MADE WITH, read from where install.sh
+        # RECORDED it. Recomputing it from the environment ignored
+        # `install.sh --bin-dir` entirely, and the result was silent: `axl use
+        # <older>` relinked into ~/.local/bin while the stale links on PATH
+        # still pointed at the newer SDK, so the rollback path did not roll
+        # back -- axl-cc kept compiling with the version you had just left --
+        # and `axl uninstall` cleaned the other directory.
+        #
+        # NOT INFERRED FROM $0. That was the first fix and it is worse than
+        # the bug: with a second symlink in front (a `sudo ln -s
+        # ~/.local/bin/axl /usr/local/bin/axl`, an ordinary thing to do)
+        # dirname $0 names /usr/local/bin, so `axl use` relinks THERE and
+        # leaves the real PATH links stale -- reproducing the exact failure
+        # while looking fixed. It also misses `<prefix>/bin/axl use ...`
+        # entirely, where $0 is a regular file.
+        #
+        # THREE RUNGS, each meaning something different: an explicit override,
+        # what this install actually recorded, and -- only for a tree
+        # install.sh never placed (a source stage, a hand-unpacked tarball) --
+        # the default. link_tree writes the file into every prefix it links,
+        # the manager included, so a real install always hits rung two.
+        #
+        # No compatibility rung for installs predating the file: every
+        # consumer is re-installed at its next upgrade.
+        if [[ -n "${AXL_BIN_DIR:-}" ]]; then
+            _bin="$AXL_BIN_DIR"
+        elif [[ -r "$PREFIX/share/axl/bin-dir" ]]; then
+            _bin="$(cat "$PREFIX/share/axl/bin-dir")"
+        else
+            _bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
+        fi
         case "$_verb" in
             uninstall)
                 exec sh "$_inst" --uninstall --prefix "$_root" --bin-dir "$_bin" "$@"
@@ -238,7 +484,894 @@ case "${1-}" in
                             ;;
                     esac
                 done
-                exec sh "$_inst" --prefix "$_root" --bin-dir "$_bin" "$@"
+                # ARGS THAT ARE NOT AN UPDATE. These reached install.sh
+                # unfiltered and each one broke something: `--use <older>`
+                # downgraded the manager and re-execed into it; `--uninstall`
+                # deleted the manager root and then the fall-through execed a
+                # path that no longer existed. They are not update options, so
+                # refuse them by name the way `--version` already is.
+                for _a in "$@"; do
+                    case "$_a" in
+                        --use|--use=*|--uninstall|--host-tools)
+                            echo "axl: 'update' does not take $_a." >&2
+                            echo "     Try:  axl use <version> | axl uninstall" >&2
+                            exit 2
+                            ;;
+                    esac
+                done
+                # --no-toolchain IS OURS AND IS NOT FORWARDED. install.sh has
+                # no such option and would `die "unknown option"` on it -- the
+                # default there is already "no toolchain", so the flag has
+                # nothing to say to a first install. It exists because carrying
+                # the toolchain is now the DEFAULT for `axl update`, and that
+                # created a path which fails where it used to succeed: the
+                # toolchain install wants network and (for /opt) sudo, so an
+                # offline or unprivileged box needs a way to update just the
+                # SDK. `--toolchain=` is not that way -- it is undocumented,
+                # and the two-word `--toolchain ""` dies on install.sh's
+                # `${2:?}` before it means anything.
+                #
+                # $_upd_args is what BOTH phases forward, so the flag is
+                # stripped once rather than in each of the two places that
+                # would have to agree.
+                _no_tc=0
+                _user_tc=0
+                _upd_args=()
+                for _a in "$@"; do
+                    case "$_a" in
+                        --no-toolchain)            _no_tc=1 ;;
+                        --no-toolchain=*)
+                            # SILENT FALL-THROUGH IS THE BUG. Unhandled, this
+                            # landed in $_upd_args and install.sh died with
+                            # "unknown option" naming a flag the user had every
+                            # reason to think existed.
+                            echo "axl: --no-toolchain takes no value (got '$_a')." >&2
+                            exit 2
+                            ;;
+                        --toolchain|--toolchain=*) _user_tc=1
+                                                   _upd_args+=("$_a") ;;
+                        *) _upd_args+=("$_a") ;;
+                    esac
+                done
+                # BOTH AT ONCE IS A CONTRADICTION, and silently letting
+                # --toolchain win would install the very thing the other flag
+                # asked to skip. Refused HERE, beside the other arg refusals
+                # and BEFORE the manager phase -- a validation error must not
+                # cost a manager update first.
+                if [[ "$_no_tc" -eq 1 && "$_user_tc" -eq 1 ]]; then
+                    echo "axl: --no-toolchain and --toolchain contradict each other." >&2
+                    echo "     Pick one." >&2
+                    exit 2
+                fi
+                # AN INVALID VARIANT IS AN ERROR, not a silent "carry
+                # anyway": an `axl update` that ignored a typo in AXL_TOOLCHAIN
+                # would fetch the toolchain the user was trying to opt out of.
+                # axl-cc refuses the same value with the same four names. It
+                # exits 1 and this exits 2, matching the other refusals in this
+                # arm -- the TREATMENT matches, the number deliberately does
+                # not.
+                #
+                # HERE, beside the other argument checks and ABOVE the manager
+                # phase, for the same reason the contradiction above is: a
+                # validation error must not first cost a manager self-update
+                # and a re-exec.
+                case "${AXL_TOOLCHAIN:-auto}" in
+                    auto|axl|host|cross) ;;
+                    *)
+                        echo "axl: AXL_TOOLCHAIN=$AXL_TOOLCHAIN is not a toolchain variant." >&2
+                        echo "     Use auto, axl, host or cross -- see axl-cc --help." >&2
+                        exit 2
+                        ;;
+                esac
+                # WHAT THE MANAGER PHASE GETS, as a whitelist rather than
+                # "$@". `--toolchain` is meaningful for the SDK and `die`s on
+                # a --host-tools install -- AFTER link_tree has already moved
+                # the manager, so it produced a false "could not update" and
+                # skipped the re-exec. `--prune` there would prune against the
+                # wrong component.
+                _mgr_args=()
+                _skip_next=0
+                for _a in ${_upd_args[@]+"${_upd_args[@]}"}; do
+                    if [[ "$_skip_next" -eq 1 ]]; then _skip_next=0; continue; fi
+                    case "$_a" in
+                        --toolchain|--prune) [[ "$_a" == --toolchain ]] && _skip_next=1
+                                             continue ;;
+                        --toolchain=*)       continue ;;
+                        *) _mgr_args+=("$_a") ;;
+                    esac
+                done
+
+                # SELF-UPDATE FIRST, then re-exec the new `axl` to do the SDK.
+                #
+                # The manager holds this program AND the install.sh every verb
+                # execs, so updating the SDK with the OLD installer means a fix
+                # to install.sh lands one update later than the release that
+                # carried it. Doing the manager first and re-execing makes the
+                # fix apply to THIS run.
+                #
+                # THE VERSION FILE DECIDES, NOT THE EXIT STATUS. install.sh
+                # does the update in link_tree and then runs five advisory
+                # steps that can each `die` -- a system package check, the
+                # toolchain, prune. Any of those turned a manager that HAD
+                # updated into "could not update" and suppressed the re-exec.
+                if [[ -z "${AXL_SELF_UPDATED:-}" ]]; then
+                    _mgr="$_root/axl-sdk-host-tools"
+                    _mv_before=""
+                    [[ -r "$_mgr/share/axl/version" ]] \
+                        && _mv_before="$(cat "$_mgr/share/axl/version")"
+                    sh "$_inst" --host-tools --prefix "$_root" \
+                       --bin-dir "$_bin" "${_mgr_args[@]}" || _mgr_rc=$?
+                    _mv_after=""
+                    [[ -r "$_mgr/share/axl/version" ]] \
+                        && _mv_after="$(cat "$_mgr/share/axl/version")"
+                    if [[ -n "$_mv_after" && "$_mv_after" != "$_mv_before" \
+                          && -x "$_mgr/bin/axl" ]]; then
+                        echo "axl: updating the manager first: ${_mv_before:-none} -> $_mv_after"
+                        AXL_SELF_UPDATED=1 exec "$_mgr/bin/axl" update "$@"
+                    elif [[ -n "${_mgr_rc:-}" ]]; then
+                        echo "axl: could not update the manager (exit $_mgr_rc);" \
+                             "continuing with the SDK" >&2
+                    fi
+                fi
+                # THE INSTALLER MAY BE GONE. The manager phase can remove the
+                # root $_inst lives in, and exec-ing a deleted path fails with
+                # a raw "cannot open". Re-resolve through the same sibling scan
+                # that un-strands an install above.
+                if [[ ! -r "$_inst" ]]; then
+                    while read -r _cand; do
+                        [[ -r "$_cand" ]] || continue
+                        _inst="$_cand"; break
+                    done < <(ls -d "$_root"/axl-sdk-*/libexec/axl/install.sh 2>/dev/null \
+                             | sort -V -r)
+                fi
+                [[ -r "$_inst" ]] || {
+                    echo "axl: no installer left under $_root after the manager step" >&2
+                    exit 1
+                }
+                # BRING THE TOOLCHAIN ALONG -- but ONLY for arches that
+                # already have one.
+                #
+                # WHY AT ALL. The SDK pins the toolchain: axl-toolchains.conf
+                # ships INSIDE the SDK, so a new SDK naming a newer gcc used to
+                # move the SDK and leave the compiler behind. Since x64
+                # defaults to AXL_TOOLCHAIN=auto that failure is SILENT --
+                # axl-cc quietly falls back to the host gcc for C instead of
+                # saying anything -- so "update" was leaving the install in a
+                # state the user could not see.
+                #
+                # WHY NEVER UNCONDITIONALLY. A C-only consumer with no
+                # toolchain is exactly who `auto` was built for, and handing
+                # them a ~55-96 MB download during a routine update would undo
+                # it. Per-arch for the same reason: an x64-only user must not
+                # receive aa64.
+                #
+                # ORDER IS THE WHOLE TRICK: this runs BEFORE the exec below,
+                # against the manifest of the SDK the user has RIGHT NOW. Ask
+                # afterwards and the manifest names the version they are about
+                # to get, so "is it installed?" answers about the wrong thing
+                # -- it would report every arch missing and fetch nothing, on
+                # precisely the upgrade that needed it.
+                #
+                # It reuses install.sh's own `--toolchain x64|aa64|all`, so
+                # there is no second install path to keep in step.
+                # $_user_tc / $_no_tc were settled with the other argument
+                # checks, above the manager phase.
+                #
+                # PRECEDENCE: AXL-Distribution-Design.md §21a.4a has the
+                # table, and this comment deliberately does NOT restate it.
+                # The restated copy is exactly what drifted -- five rows here
+                # against seven there, with the row numbers in the prose
+                # pointing at different cases in each. One owner.
+                # DECLINED, AND SAID SO. An AXL_<ARCH>_GCC/_GXX override is
+                # an explicit statement, exactly like AXL_TOOLCHAIN=host --
+                # and carrying such an arch would not move their toolchain, it
+                # would sudo-install a SECOND one into a root they never chose
+                # and leave theirs beside it. Declining silently would be the
+                # defect; declining loudly, with a command that actually helps,
+                # is the answer.
+                #
+                # THE PREFIX IS DERIVED, SO IT IS VALIDATED. `_froot` is
+                # dirname(dirname(locator)), which only means anything for an
+                # absolute path in the <root>/bin/<cc> layout. A bare name on
+                # PATH (which tc_have_compiler accepts, deliberately) gives
+                # ".", and /usr/bin/x86_64-elf-g++ -- an entirely ordinary
+                # distro cross-gcc -- gives a PREFIX of "/". Printing either
+                # would be telling someone to install a toolchain into their
+                # working directory or into the root of the filesystem, which
+                # is worse than printing no command at all. When the prefix is
+                # not usable, name the path we found and hand back the generic
+                # form with the directory left to them.
+                tc_decline_override() {   # <arch> <var> <root> <found>
+                    local _a="$1" _v="$2" _r="$3" _f="$4" _pfx
+                    _pfx="$(dirname "$_r")"
+                    echo "axl: $_a is located by $_v, outside the root the SDK pins:"
+                    # LABELLED. This is the LOCATOR -- the compiler itself --
+                    # not the root; unlabelled under a line ending "the root
+                    # the SDK pins:" it read as one.
+                    echo "       compiler: $_f"
+                    echo "     NOT updating it. axl-install-toolchain only ever writes"
+                    echo "     <prefix>/<pinned-name> and reads no $_v, so carrying it"
+                    echo "     here would install a SECOND toolchain under /opt and leave"
+                    echo "     yours where it is."
+                    if [[ "$_r" == /* && "$_r" != "/" && "$_pfx" == /* && "$_pfx" != "/" ]]; then
+                        # ALWAYS QUOTED, and AFTER the validation above -- a
+                        # quoted value no longer starts with "/", so quoting
+                        # first would fail the `== /*` test and send every such
+                        # prefix down the generic branch.
+                        #
+                        # ALWAYS, not "when it contains a space". Quoting only
+                        # spaces fixes the instance and leaves the class: a
+                        # prefix holding a quote, a $ or a backtick still pastes
+                        # broken, and the last of those pastes as a COMMAND. The
+                        # escape below is the standard one -- close, escaped
+                        # quote, reopen -- so the result is safe for any byte.
+                        _pfx="'${_pfx//\'/\'\\\'\'}'"
+                        echo "     Install the newly pinned one beside yours with:"
+                        echo "       axl toolchain install $_a --prefix $_pfx"
+                    else
+                        echo "     That locator is not a <root>/bin/<compiler> path, so there is"
+                        echo "     no prefix to infer. Pick one yourself:"
+                        echo "       axl toolchain install $_a --prefix <dir>"
+                    fi
+                    # NOT "moves yours forward": it does not. It writes a NEW
+                    # root beside theirs and touches neither the old tree nor
+                    # the variable pointing at it.
+                    echo "     That writes a NEW root and does not modify yours -- $_v still"
+                    echo "     points at the old one until you re-export what it prints."
+                }
+                _tc_arg=()
+                if [[ "$_user_tc" -eq 0 && "$_no_tc" -eq 0 ]]; then
+                    _have=(); _seen=()
+                    _el_a=(); _el_v=(); _el_r=(); _el_f=()
+                    # WHITELIST both fields, not "non-empty". What goes into
+                    # $_tc_arg is handed straight to install.sh, which validates
+                    # it and `die`s -- and a routine `axl update` failing on a
+                    # manifest oddity would be a worse bug than the one this
+                    # fixes.
+                    #
+                    # COLLECTED, NOT PRINTED HERE. §21a.4a puts
+                    # AXL_TOOLCHAIN=host ABOVE the override case, and printing
+                    # inside this loop inverted that: a host user with an
+                    # override got the --prefix advice before the variable was
+                    # even consulted. Same outcome, wrong story.
+                    # IFS=TAB, not the default whitespace: the fields are
+                    # tab-separated for a reason -- a toolchain under
+                    # "/home/my dir/..." splits into six on spaces, so $_froot
+                    # became "/home/my" and PASSED the absolute-and-not-"/"
+                    # guard, printing `--prefix /home`. A wrong path that looks
+                    # plausible is worse than an obviously wrong one.
+                    while IFS=$'\t' read -r _a _how _fvar _froot _ffound; do
+                        case "$_a" in aa64|x64) ;; *) continue ;; esac
+                        case "$_how" in
+                            default)   _have+=("$_a"); _seen+=("$_a") ;;
+                            elsewhere) _seen+=("$_a")
+                                       _el_a+=("$_a"); _el_v+=("$_fvar")
+                                       _el_r+=("$_froot"); _el_f+=("$_ffound") ;;
+                        esac
+                    done < <(tc_installed_arches)
+                    if [[ "${#_seen[@]}" -eq 0 ]]; then
+                        # NOTHING INSTALLED, so nothing to carry -- and nothing
+                        # to say. An empty $_tc_arg leaves install.sh's
+                        # maybe_toolchain returning at its first line, which is
+                        # the behaviour every existing consumer already has.
+                        :
+                    elif [[ "${AXL_TOOLCHAIN:-}" == "host" || "${AXL_TOOLCHAIN:-}" == "cross" ]]; then
+                        # DECLINED, AND SAID SO. The user has stated they build
+                        # with another compiler, so a leftover AXL root under
+                        # /opt is not a request to refresh it -- downloading
+                        # tens of MB onto someone who opted out is exactly the
+                        # foisting this feature's hard constraint forbids.
+                        # `cross` is the same case: the caller supplies their
+                        # own locators and the manifest defaults are
+                        # deliberately not consulted.
+                        #
+                        # Asked AFTER the probe, not before, so this narrates a
+                        # real decision instead of announcing one about nothing
+                        # on every update of a machine that has no toolchain at
+                        # all. The outcome is unchanged either way -- intent
+                        # outranks what is on disk.
+                        # $_seen, not $_have: an override-located arch is
+                        # installed too, and naming only the carryable ones
+                        # would print an empty list on a machine where every
+                        # arch is override-located.
+                        echo "axl: AXL_TOOLCHAIN=$AXL_TOOLCHAIN -- NOT updating the ${_seen[*]} cross"
+                        echo "     toolchain, although it is installed: you have said you build"
+                        echo "     with another compiler."
+                        # THE CARRY-ANYWAY ADVICE IS ONLY TRUE FOR AN ARCH AT
+                        # THE PINNED ROOT. Offered unconditionally it told an
+                        # override-located consumer to run --toolchain, which
+                        # installs a SECOND toolchain under /opt -- the exact
+                        # overpromise the override decline was fixed for, on the
+                        # other branch. Only reachable with AXL_TOOLCHAIN=host
+                        # AND an override, which is why it survived until a test
+                        # set both.
+                        if [[ "${#_have[@]}" -gt 0 ]]; then
+                            echo "     Carry it anyway with:"
+                            echo "       axl update --toolchain <aa64|x64|all>"
+                        fi
+                        if [[ "${#_el_a[@]}" -gt 0 ]]; then
+                            echo "     NOTE ${_el_a[*]} is located by an AXL_<ARCH>_GCC/_GXX override,"
+                            echo "     outside the root the SDK pins, so --toolchain would install a"
+                            echo "     SECOND toolchain under /opt rather than update it. For that:"
+                            echo "       axl toolchain install <arch> --prefix <dir>"
+                        fi
+                    else
+                        # THE OVERRIDE DECLINES, printed only now -- below the
+                        # variant check, matching §21a.4a.
+                        _i=0
+                        while [[ "$_i" -lt "${#_el_a[@]}" ]]; do
+                            tc_decline_override "${_el_a[$_i]}" "${_el_v[$_i]}" \
+                                                "${_el_r[$_i]}" "${_el_f[$_i]}"
+                            _i=$((_i + 1))
+                        done
+                        if [[ "${#_have[@]}" -eq 2 ]]; then
+                            _tc_arg=(--toolchain all)
+                        elif [[ "${#_have[@]}" -eq 1 ]]; then
+                            _tc_arg=(--toolchain "${_have[0]}")
+                        fi
+                    fi
+                fi
+                # NOTHING IS ANNOUNCED HERE. install.sh's maybe_toolchain()
+                # carries the whole message, because main() returns at
+                # already_installed() BEFORE reaching it -- so a line printed
+                # here promised a ~55-96 MB download on `axl update` against an
+                # already-current install and then did nothing, which is this
+                # feature's own "say what you are doing" guarantee inverted on
+                # its most common invocation.
+                exec sh "$_inst" --prefix "$_root" --bin-dir "$_bin" \
+                     ${_tc_arg[@]+"${_tc_arg[@]}"} \
+                     ${_upd_args[@]+"${_upd_args[@]}"}
+                ;;
+        esac
+        ;;
+    version)
+        # `axl --version` is the PROGRAM version, which since §20 M2 is the
+        # MANAGER's -- and that is the conventional meaning, so it stays. But
+        # on a real install it answers a different question than the one people
+        # are usually asking, and the two legitimately diverge: `axl use
+        # <older>` moves the SDK and deliberately not the manager. Before this
+        # verb the SDK version was reachable only as a PATH, via
+        # --print-prefix, which a human then had to read a version out of.
+        #
+        # A SUBCOMMAND, not another flag: it is a status report, and the flag
+        # spelling is already taken by the thing it would be confused with.
+        # ONE-WORD LABELS in column 1, so this is greppable without
+        # ambiguity: `axl version | awk '$1=="sdk"{print $2}'`. The first
+        # draft printed "axl (manager)" and a test asserting the version as a
+        # SUBSTRING passed against `unknown`, because the version also appears
+        # inside the prefix path on the same line. Substrings lie.
+        _root="$(dirname "$PREFIX")"
+        _mgr_v="unknown"
+        [[ -r "$PREFIX/share/axl/version" ]] && _mgr_v="$(cat "$PREFIX/share/axl/version")"
+        [[ -r "$PREFIX/VERSION" ]] && _mgr_v="$(cat "$PREFIX/VERSION")"
+        printf '%-9s %-10s %s\n' "manager" "$_mgr_v" "$PREFIX"
+        # NOT INSTALLED is a different fact from "installed at this version".
+        # sdk_prefix() falls back to $PREFIX when there is no marker, which is
+        # right for --print-prefix ("naming your own tree beats naming
+        # nothing") but wrong under a row LABELLED sdk: on a host-tools-only
+        # install it printed the manager's version and path as the SDK's, and
+        # the two then compared equal so nothing flagged it.
+        _sdk="$(sdk_prefix)"
+        # ASK FOR THE COMPILER, not for the marker. sdk_prefix() falls back to
+        # $PREFIX when there is no marker -- right for --print-prefix, wrong
+        # under a row LABELLED sdk, because on a host-tools-only install it
+        # printed the manager's version and path as the SDK's and the two then
+        # compared equal so nothing flagged it. Testing the marker instead
+        # over-corrected: a source checkout has no marker either, and it does
+        # have an SDK. `bin/axl-cc` is what an SDK prefix has and a manager
+        # prefix by definition does not.
+        if [[ ! -x "$_sdk/bin/axl-cc" ]]; then
+            printf '%-9s %s\n' "sdk" "(not installed)"
+            echo ""
+            echo "Install one:  axl update"
+            exit 0
+        fi
+        _sdk_v="unknown"
+        [[ -r "$_sdk/share/axl/version" ]] && _sdk_v="$(cat "$_sdk/share/axl/version")"
+        [[ -r "$_sdk/VERSION" ]] && _sdk_v="$(cat "$_sdk/VERSION")"
+        printf '%-9s %-10s %s\n' "sdk" "$_sdk_v" "$_sdk"
+        if [[ "$_mgr_v" != "$_sdk_v" ]]; then
+            # Not a warning: it is the normal state after `axl use <older>`,
+            # and saying so beats leaving the reader to wonder.
+            echo ""
+            echo "The manager is versioned separately and does not follow"
+            echo "'axl use'. 'axl update' moves both."
+        fi
+        echo ""
+        echo "toolchains:  axl toolchain list"
+        exit 0
+        ;;
+    toolchain)
+        # THREE OPERATIONS: list, install, uninstall. This said "TWO, and there
+        # is deliberately no third" until x64 defaulted to AXL_TOOLCHAIN=auto,
+        # which made the toolchain's PRESENCE the thing that selects the
+        # compiler (AXL-Host-Toolchain-Design.md §6.2). Removing it stopped
+        # being a tidy-up and became how a user chooses host gcc, so it had to
+        # become a managed operation carrying the §21 ownership guard rather
+        # than an `rm -rf` typed by hand at a path read out of a manifest.
+        #
+        # There is still no `update` HERE, and that is the sentence the old
+        # comment was really making: the toolchain is not user-versioned, the
+        # SDK prefix pins it, so an `axl toolchain update` would be a second,
+        # silently divergent way to change what axl-cc compiles with. What
+        # moves a toolchain is moving the SDK, and `axl update` now carries
+        # along the arches that already have one (AXL-Distribution-Design.md
+        # §21a) -- the same fact, spelled by the verb that owns SDK versions.
+        # A third operation is not a fourth.
+        shift
+        _sdk="$(sdk_prefix)"
+        # ONE conf check and ONE resolution for the whole program: tc_conf_path
+        # and tc_resolve are defined at the top of this file, because `axl
+        # update` reads them too. A second copy would not merely disagree in a
+        # printout -- `list` would report one root installed while `uninstall`
+        # removed a different one, and that command ends in `rm -rf`.
+        _conf="$(tc_conf_path "$_sdk")" || _conf=""
+        tc_need_conf() {
+            [[ -n "$_conf" ]] && return 0
+            # BOTH candidates. Naming only the fallback pointed an installed
+            # user at a checkout path that never exists.
+            echo "axl toolchain: no axl-toolchains.conf. Looked in:" >&2
+            echo "     $_sdk/share/axl/axl-toolchains.conf" >&2
+            echo "     $_sdk/scripts/axl-toolchains.conf" >&2
+            echo "     so there is nothing to report. A host-tools-only" >&2
+            echo "     install has no toolchain to pin." >&2
+            exit 1
+        }
+        case "${1-list}" in
+            list)
+                shift
+                if [[ $# -gt 0 ]]; then
+                    echo "axl toolchain list: takes no arguments (got '$1')" >&2
+                    exit 2
+                fi
+                tc_need_conf
+                # shellcheck source=/dev/null
+                . "$_conf"
+                printf 'Toolchains pinned by %s\n\n' "$_sdk"
+                _missing=""
+                for _a in aa64 x64; do
+                    tc_resolve "$_a"
+                    # ASK THE COMPILER, do not stat the directory. A partial
+                    # extract leaves the directory there and nothing in it,
+                    # which is precisely the state worth distinguishing.
+                    #
+                    # This root line probes $_g, the C++ (g++) LOCATOR --
+                    # labeled explicitly below rather than left as a bare
+                    # "installed"/"MISSING", because the "builds with:" line
+                    # a few lines down asks axl-cc, which for x64 C-only
+                    # 'auto' resolves off the C compiler (gcc). A stale
+                    # $AXL_X64_GXX or a partial extract missing only g++ makes
+                    # the two lines answer DIFFERENT questions -- unlabeled,
+                    # that reads as one command contradicting itself.
+                    # ONE TOKEN, no embedded space: case 17's preflight check
+                    # (and any other caller) reads the root path out of this
+                    # line with `awk '{print $4}'`, which splits on
+                    # whitespace -- "g++ installed" as two words would shift
+                    # every field after it and hand that assertion the WORD
+                    # "installed" instead of the path.
+                    # THE C LOCATOR TOO, APPENDED AS A FIFTH FIELD. `axl
+                    # update` carries an arch when EITHER locator answers, so a
+                    # line reporting only g++ said MISSING about a tree the
+                    # update was about to refresh -- one command contradicting
+                    # another about the same machine. Appended rather than
+                    # inserted: the root path is read out of FIELD 4
+                    # (test-axl-toolchain-verb.sh case 17) and field 3 is
+                    # compared for equality in several places, so a new column
+                    # anywhere but the end would move or break them.
+                    if tc_have_compiler "$_gc"; then
+                        _cstate="gcc:installed"
+                    else
+                        _cstate="gcc:MISSING"
+                    fi
+                    # ONE TOKEN IN FIELD 4, ALWAYS. An empty
+                    # AXL_<ARCH>_TOOLCHAIN_DIR collapses to nothing between two
+                    # spaces, so awk slides field 5 into field 4 and the root
+                    # reader (test-axl-toolchain-verb.sh case 17) silently gets
+                    # "gcc:installed" instead of a path -- the exact shift the
+                    # comment above warns a new COLUMN would cause, arriving
+                    # from an empty VALUE instead.
+                    _droot="${_d:-(unset)}"
+                    # NOTE tc_have_compiler, not `-x`: a locator holding a bare
+                    # name resolved on PATH now counts as installed here too,
+                    # which is what `axl update` has always meant by installed.
+                    # This LINE used to answer a narrower question than the
+                    # command that acts on it.
+                    if tc_have_compiler "$_g"; then
+                        printf '  %-5s %-14s %-13s %s %s\n' \
+                               "$_a" "$_v" "g++:installed" "$_droot" "$_cstate"
+                        printf '        %s\n' "$("$_g" --version 2>/dev/null | head -1)"
+                    else
+                        printf '  %-5s %-14s %-13s %s %s\n' \
+                               "$_a" "$_v" "g++:MISSING" "$_droot" "$_cstate"
+                        # STILL KEYED ON g++: this drives the "install with:"
+                        # hint, and what a missing g++ costs is C++ -- which no
+                        # amount of gcc replaces.
+                        _missing="$_missing $_a"
+                    fi
+                    # WHICH COMPILER WILL ACTUALLY BUILD -- the question a
+                    # reader opens this command to answer. CALLS axl-cc
+                    # --print-toolchain (Task 3) rather than re-deriving the
+                    # resolution here: axl-cc's own comment at that flag names
+                    # this verb as the intended caller, and two programs
+                    # computing one fact is the drift check-flag-parity exists
+                    # for, one layer up.
+                    #
+                    # Do NOT read $_g (the g++ locator, just above) for this:
+                    # x64's C-only 'auto' resolution probes the GCC locator,
+                    # and a machine with a working C compiler and no C++ one
+                    # would be reported 'host' here -- wrong, and it looks
+                    # right, because $_g really is MISSING on that machine.
+                    _tcw=""
+                    _tcrc=0
+                    _tcerr=""
+                    if [[ -x "$_sdk/bin/axl-cc" ]]; then
+                        # Capture stderr too, not just the exit status: when
+                        # axl-cc refuses a combination (AXL_TOOLCHAIN=host on
+                        # aa64, §4.2) it already NAMES the reason on stderr --
+                        # discarding it and just saying 'exited 1' would throw
+                        # away a remedy §6.3 says to keep. Falls back to
+                        # /dev/null if mktemp itself fails, so a probe that
+                        # cannot even get a scratch file still degrades to the
+                        # plain 'exited N' message instead of erroring out.
+                        _tcerrf="$(mktemp 2>/dev/null || echo /dev/null)"
+                        _tcw="$("$_sdk/bin/axl-cc" --arch "$_a" --print-toolchain 2>"$_tcerrf")"
+                        _tcrc=$?
+                        _tcerr="$(head -1 "$_tcerrf" 2>/dev/null)"
+                        _tcerr="${_tcerr#ERROR: }"
+                        [[ "$_tcerrf" != /dev/null ]] && rm -f "$_tcerrf"
+                    fi
+                    # An unanswerable probe (no axl-cc, an OLD one that does
+                    # not know --print-toolchain, a refused combination such
+                    # as AXL_TOOLCHAIN=host on aa64) must read as a NAMED
+                    # 'unknown', never as a silent blank or a confident guess
+                    # -- guessing here would be the exact failure this line
+                    # exists to prevent, just moved one level up.
+                    if [[ ! -x "$_sdk/bin/axl-cc" ]]; then
+                        printf '        builds with: unknown (no axl-cc at %s)\n' "$_sdk/bin/axl-cc"
+                    elif [[ $_tcrc -ne 0 ]]; then
+                        if [[ -n "$_tcerr" ]]; then
+                            printf '        builds with: unknown (axl-cc: %s)\n' "$_tcerr"
+                        else
+                            printf '        builds with: unknown (axl-cc --print-toolchain exited %s)\n' "$_tcrc"
+                        fi
+                    elif [[ -z "$_tcw" ]]; then
+                        printf '        builds with: unknown (axl-cc --print-toolchain produced no output)\n'
+                    elif [[ "$_tcw" != "axl" && "$_tcw" != "host" && "$_tcw" != "cross" ]]; then
+                        printf '        builds with: unknown (axl-cc --print-toolchain said %s)\n' "$_tcw"
+                    elif [[ -n "${AXL_TOOLCHAIN:-}" && "$AXL_TOOLCHAIN" != "auto" ]]; then
+                        printf '        builds with: %s (pinned by $AXL_TOOLCHAIN)\n' "$_tcw"
+                    elif [[ "$_a" == "aa64" ]]; then
+                        printf '        builds with: axl (aa64 has no host option)\n'
+                    elif [[ "$_tcw" == "axl" ]]; then
+                        printf '        builds with: axl (auto -> axl: bare-metal toolchain installed)\n'
+                    else
+                        printf '        builds with: host (auto -> host: no bare-metal toolchain installed)\n'
+                        printf '                     C++ needs the bare-metal toolchain:\n'
+                        printf '                       axl toolchain install x64\n'
+                    fi
+                done
+                # COLLAPSE TO `all`. install-toolchain.sh parses ONE target
+                # and takes the last, so `install aa64 x64` installs x64 only,
+                # silently -- and printing the arches side by side advised
+                # exactly that, on the fresh-machine path where both are
+                # missing and this is the first command anyone runs.
+                if [[ "$_missing" == " aa64 x64" ]]; then
+                    printf '\ninstall with:  axl toolchain install all\n'
+                elif [[ -n "$_missing" ]]; then
+                    printf '\ninstall with:  axl toolchain install%s\n' "$_missing"
+                fi
+                exit 0
+                ;;
+            install)
+                shift
+                _inst_tc="$_sdk/bin/axl-install-toolchain"
+                if [[ ! -x "$_inst_tc" ]]; then
+                    echo "axl toolchain: no axl-install-toolchain at $_inst_tc" >&2
+                    echo "     That program is SDK content. This looks like a" >&2
+                    echo "     host-tools-only install, which has no compiler to" >&2
+                    echo "     install a toolchain for." >&2
+                    exit 1
+                fi
+                # NO DEFAULT ARCH HERE. install-toolchain.sh documents its own
+                # (aa64), and restating it would be a second spelling that can
+                # drift from the one that actually runs.
+                exec "$_inst_tc" "$@"
+                ;;
+            uninstall)
+                # THE THIRD OPERATION (AXL-Host-Toolchain-Design.md §6.2). See
+                # the block comment at the top of this arm for why it exists;
+                # what follows is why it is this cautious. It is the only verb
+                # in this file that ends in `rm -rf`, at a path READ OUT OF A
+                # CONFIG FILE, so the whole body is a sequence of things that
+                # must be true before the removal is reached -- and a root it
+                # cannot positively identify is refused rather than guessed at.
+                shift
+                # --dry-run|-n, same spelling `axl prune` uses (axl-prune.sh),
+                # may come before or after the arch. Stripped in one pass so
+                # the positional parsing below still sees exactly the single
+                # arch argument it always expected.
+                _dry=0
+                _rest=()
+                for _arg in "$@"; do
+                    case "$_arg" in
+                        --dry-run|-n) _dry=1 ;;
+                        *) _rest+=("$_arg") ;;
+                    esac
+                done
+                set -- "${_rest[@]}"
+                _a="${1-}"
+                case "$_a" in
+                    aa64|x64) ;;
+                    *)
+                        echo "axl toolchain uninstall: needs an arch (aa64|x64)" >&2
+                        # ONE ARCH AT A TIME, deliberately unlike `install`,
+                        # which takes `all`. `install all` retries a download;
+                        # `uninstall all` would delete two trees from one typo.
+                        echo "     There is no 'all' here: this removes a directory tree." >&2
+                        exit 2 ;;
+                esac
+                shift
+                if [[ $# -gt 0 ]]; then
+                    echo "axl toolchain uninstall: takes one arch (got '$1')" >&2
+                    exit 2
+                fi
+                tc_need_conf
+                # shellcheck source=/dev/null
+                . "$_conf"
+                tc_resolve "$_a"
+                _d="${_d%/}"
+                # The locator that MOVES this target. Named in three messages
+                # below rather than spelled out three times.
+                _gxxvar="AXL_${_a^^}_GXX"
+                # The root remedy, in one place because two branches print it
+                # and they must not drift. sudo SCRUBS the environment, so an
+                # AXL_<ARCH>_GXX that is moving the target right now will not be
+                # set under sudo -- and root would then resolve the MANIFEST's
+                # root, not the one the message just named. Say so, but only
+                # when an override is actually in play.
+                _sudo_hint() {
+                    echo "     Re-run as root:" >&2
+                    echo "       sudo $_axl_self toolchain uninstall $_a" >&2
+                    [[ -n "$_o" ]] || return 0
+                    echo "     NOTE: this target comes from $_gxxvar, which sudo" >&2
+                    echo "     clears -- pass it through, or root will resolve the" >&2
+                    echo "     manifest's root instead:" >&2
+                    echo "       sudo $_gxxvar=$_g $_axl_self toolchain uninstall $_a" >&2
+                }
+                # THE PATH ITSELF, before anything looks inside it. An empty
+                # manifest entry, a relative path or `/` are each one
+                # substitution away from removing something that is not a
+                # toolchain, and `rm -rf --` would carry all three out.
+                if [[ -z "$_d" || "$_d" != /?* ]]; then
+                    echo "axl toolchain uninstall: the manifest names no usable root" >&2
+                    echo "     for $_a (got '${_d:-<empty>}'). Refusing: this removes a" >&2
+                    echo "     directory tree and will not act on a path it cannot" >&2
+                    echo "     identify. Check $_conf" >&2
+                    exit 1
+                fi
+                if [[ -L "$_d" ]]; then
+                    # `rm -rf` on a symlink removes the LINK and leaves the
+                    # tree, so `list` would report MISSING while the bytes
+                    # stayed on disk -- and on x64 that flips the `auto`
+                    # default to host while freeing nothing. An uninstall that
+                    # lies is worse than one that refuses.
+                    echo "axl toolchain uninstall: $_d is a symlink, not a" >&2
+                    echo "     toolchain root. Removing it would delete the link and" >&2
+                    echo "     leave the tree it points at. Refusing; remove the link" >&2
+                    echo "     yourself if that is what you meant." >&2
+                    exit 1
+                fi
+                if [[ ! -d "$_d" ]]; then
+                    # NOT AN ERROR. `uninstall` is asked for an END STATE and
+                    # the end state already holds -- the same reason `rm -f`
+                    # exists. A non-zero exit here would fail every script that
+                    # runs it twice. It still has to SAY so: a silent 0 cannot
+                    # be told from a removal.
+                    echo "axl toolchain uninstall: nothing to remove -- $_a is not"
+                    echo "     installed at $_d"
+                    # WHERE A RELOCATED INSTALL LANDS, and it said nothing here
+                    # before. install-toolchain.sh --prefix installs under
+                    # <prefix>/<manifest basename> while the manifest keeps
+                    # naming /opt, so this is exactly the branch that user
+                    # arrives at -- and `axl toolchain list` is already
+                    # reporting MISSING for the same reason. The installer's own
+                    # print_env tells them to export the locator; this says
+                    # which one moves the target HERE. Deliberately not a
+                    # --prefix flag: that would clone relocated_dir()'s
+                    # semantics into the one command that ends in `rm -rf`, and
+                    # sharing tc_resolve with `list` is what keeps uninstall
+                    # symmetric with the verb a user consults first.
+                    if [[ -z "$_o" ]]; then
+                        echo "     If you installed it somewhere else"
+                        echo "     (axl-install-toolchain --prefix ...), export the"
+                        echo "     locator that install printed: $_gxxvar moves this"
+                        echo "     target, exactly as it moves 'axl toolchain list'."
+                    fi
+                    exit 0
+                fi
+                # OWNERSHIP, NOT A NAME PATTERN (AXL-Distribution-Design.md
+                # §21) -- the same file, the same keys and the same remedy
+                # `axl prune` uses in axl-prune.sh's prune_family(). A
+                # toolchain we did not install is outside the policy, so it is
+                # refused rather than removed: the manifest can be pointed at
+                # anything, including a developer's own unpacked toolchain, and
+                # this is the end of the guard that ends in `rm -rf`. Inventing
+                # a second ownership rule here is the drift check-flag-parity
+                # exists for, with one of the two copies eventually being the
+                # permissive one.
+                _rcpt="$_d/.axl-receipt"
+                if [[ ! -r "$_rcpt" ]]; then
+                    echo "axl toolchain uninstall: $_d carries no .axl-receipt," >&2
+                    echo "     so this install did not place it and will not remove" >&2
+                    echo "     it. If it IS ours, re-mark it:" >&2
+                    echo "       axl-install-toolchain $_a" >&2
+                    exit 1
+                fi
+                # READ it, do not SOURCE it. Whether this directory is ours is
+                # the question still being answered, and `. "$_rcpt"` would run
+                # whatever is in it to find out -- under sudo, when /opt needs
+                # it. It would also overwrite the manifest variables just
+                # resolved, including $_d.
+                _rk="$(sed -n 's/^AXL_RECEIPT_KIND=//p' "$_rcpt" | head -1)"
+                _ra="$(sed -n 's/^AXL_RECEIPT_ARCH=//p' "$_rcpt" | head -1)"
+                if [[ "$_rk" != "toolchain" || "$_ra" != "$_a" ]]; then
+                    # A RECEIPT IS NOT ENOUGH, THE RIGHT RECEIPT IS. Same file
+                    # name, different owner: an SDK root's receipt, or the
+                    # other arch's, must not license this deletion.
+                    echo "axl toolchain uninstall: $_rcpt is not a receipt for" >&2
+                    echo "     this: KIND='${_rk:-<none>}' ARCH='${_ra:-<none>}', expected" >&2
+                    echo "     KIND='toolchain' ARCH='$_a'. Refusing." >&2
+                    echo "     If it IS ours, re-mark it:" >&2
+                    echo "       axl-install-toolchain $_a" >&2
+                    exit 1
+                fi
+                # REMOVING A DIRECTORY ENTRY NEEDS WRITE ON THE PARENT, not on
+                # the tree. /opt is root-owned on most machines, and a
+                # half-deleted toolchain is worse than one still installed --
+                # `list` probes the compiler, so a tree with its bin/ gone
+                # reads as MISSING while the bytes remain.
+                _parent="$(dirname "$_d")"
+                if [[ ! -w "$_parent" ]]; then
+                    echo "axl toolchain uninstall: cannot remove $_d --" >&2
+                    echo "     $_parent is not writable by $(id -un)." >&2
+                    _sudo_hint
+                    exit 1
+                fi
+                # EVERY GUARD ABOVE HAS RUN -- arch, path shape, symlink,
+                # not-installed, receipt KIND+ARCH, parent writability -- and
+                # nothing has been renamed or removed yet. This is the last
+                # point that is true, so it is where --dry-run reports and
+                # stops, same spelling and style as `axl prune --dry-run`.
+                if [[ "$_dry" -eq 1 ]]; then
+                    _sz="$(du -sh "$_d" 2>/dev/null | awk '{print $1}')"
+                    _nf="$(find "$_d" -type f 2>/dev/null | wc -l | tr -d ' ')"
+                    echo "axl toolchain uninstall: would remove $_d"
+                    if [[ -n "$_sz" ]]; then
+                        echo "     ${_sz}, ${_nf} file(s) -- dry run, nothing removed"
+                    else
+                        echo "     ${_nf} file(s) -- dry run, nothing removed"
+                    fi
+                    exit 0
+                fi
+                # RENAME FIRST, then remove the renamed path. Moving an entry
+                # out of a directory needs exactly the permission unlinking it
+                # needs, so this is refused in every case the unlink would be --
+                # but it is refused HAVING DESTROYED NOTHING, whereas `rm -rf`
+                # in place descends first and delivers the same refusal only
+                # after the compiler is already gone.
+                #
+                # That is what makes the guarantee real, because the `-w` check
+                # above is ADVISORY. Measured: a sticky, world-writable parent
+                # holding an entry owned by someone else leaves `-w` TRUE while
+                # both the rename and the unlink are refused, and `rm -rf`
+                # empties the tree on the way to finding out. (An immutable bit
+                # is the same shape. A read-only mount is NOT -- access(2)
+                # returns EROFS, so `-w` does see that one, and it sees an ACL
+                # too.) Prevention, not a post-hoc detector.
+                #
+                # $$ in the staging name, and it must not already exist: `mv`
+                # onto an EXISTING directory moves the source INSIDE it instead
+                # of failing, so a leftover from an interrupted run would nest
+                # silently rather than be refused.
+                _stage="$_d.axl-removing.$$"
+                if [[ -e "$_stage" ]]; then
+                    echo "axl toolchain uninstall: $_stage already exists." >&2
+                    echo "     Refusing rather than removing through a path this run" >&2
+                    echo "     did not create. Delete it by hand and retry." >&2
+                    exit 1
+                fi
+                if ! mv -- "$_d" "$_stage"; then
+                    echo "axl toolchain uninstall: could not move $_d aside," >&2
+                    echo "     so NOTHING was removed and the toolchain is untouched." >&2
+                    echo "     Removing a directory entry needs write permission on" >&2
+                    echo "     $_parent, which this user does not effectively have." >&2
+                    _sudo_hint
+                    exit 1
+                fi
+                rm -rf -- "$_stage"
+                # ASK, do not assume. The rename cleared every parent-side
+                # refusal, but something INSIDE the tree can still decline to be
+                # deleted, and `rm -rf` reports that on stderr where a caller
+                # reading stdout will not see it. Reporting a clean removal over
+                # bytes that are still on disk is the one outcome worse than
+                # refusing -- and the root is out of the manifest's way by now,
+                # so this is a report, not a rollback.
+                if [[ -e "$_stage" ]]; then
+                    echo "axl toolchain uninstall: $_d was moved aside to" >&2
+                    echo "     $_stage but could not be deleted -- something inside" >&2
+                    echo "     the tree refused. $_a is uninstalled as far as the" >&2
+                    echo "     manifest is concerned; those bytes are still on disk" >&2
+                    echo "     and are yours to remove." >&2
+                    exit 1
+                fi
+                echo "axl toolchain uninstall: removed $_d"
+                # WHAT CHANGED AS A RESULT, not just what was deleted. On x64
+                # the toolchain's presence is exactly what AXL_TOOLCHAIN=auto
+                # selects on, so this command has just moved the default
+                # compiler -- which is the point, and otherwise invisible until
+                # the next build behaves differently.
+                #
+                # RE-PROBE, do not assume. A fixed "now builds with host" line
+                # is true only when the root just removed was the ONLY x64
+                # toolchain reachable -- a second one still reachable via
+                # AXL_X64_GCC or another manifest root means the removal did
+                # not change the answer at all, and a confident wrong line
+                # here, from the verb that just ran `rm -rf`, is worse than
+                # saying nothing. Same probe `list` uses (axl-cc
+                # --print-toolchain), so the two verbs cannot disagree.
+                if [[ "$_a" == "x64" ]]; then
+                    _postw=""
+                    _postrc=0
+                    _posterr=""
+                    if [[ -x "$_sdk/bin/axl-cc" ]]; then
+                        _posterrf="$(mktemp 2>/dev/null || echo /dev/null)"
+                        _postw="$("$_sdk/bin/axl-cc" --arch x64 --print-toolchain 2>"$_posterrf")"
+                        _postrc=$?
+                        _posterr="$(head -1 "$_posterrf" 2>/dev/null)"
+                        _posterr="${_posterr#ERROR: }"
+                        [[ "$_posterrf" != /dev/null ]] && rm -f "$_posterrf"
+                    fi
+                    if [[ ! -x "$_sdk/bin/axl-cc" ]]; then
+                        echo "     Could not confirm what x64 now builds with:"
+                        echo "     no axl-cc at $_sdk/bin/axl-cc."
+                    elif [[ $_postrc -ne 0 ]]; then
+                        if [[ -n "$_posterr" ]]; then
+                            echo "     Could not confirm what x64 now builds with:"
+                            echo "     $_posterr"
+                        else
+                            echo "     Could not confirm what x64 now builds with:"
+                            echo "     axl-cc --print-toolchain exited $_postrc."
+                        fi
+                    elif [[ -z "$_postw" ]]; then
+                        echo "     Could not confirm what x64 now builds with:"
+                        echo "     axl-cc --print-toolchain produced no output."
+                    elif [[ "$_postw" == "host" ]]; then
+                        echo "     x64 now builds with the host compiler (auto -> host)."
+                        echo "     C++ needs the bare-metal toolchain:"
+                        echo "       axl toolchain install x64"
+                    elif [[ "$_postw" == "axl" ]]; then
+                        echo "     x64 STILL builds with a bare-metal toolchain --"
+                        echo "     another one is still reachable (a second"
+                        echo "     AXL_X64_GCC, or another manifest root). This"
+                        echo "     removal did not change what a build uses."
+                    else
+                        echo "     x64 now resolves to '$_postw'. Run"
+                        echo "       axl toolchain list"
+                        echo "     to see the reasoning."
+                    fi
+                fi
+                exit 0
+                ;;
+            update)
+                echo "axl toolchain: there is no 'update' -- the SDK version pins" >&2
+                echo "     the toolchain, so moving between toolchains is:" >&2
+                echo "       axl use <version>      # then: axl toolchain install" >&2
+                exit 2
+                ;;
+            *)
+                echo "axl toolchain: unknown subcommand '$1'" >&2
+                echo "Usage: axl toolchain list | install [aa64|x64|all] | uninstall [--dry-run|-n] <aa64|x64>" >&2
+                exit 2
                 ;;
         esac
         ;;
@@ -259,14 +1392,7 @@ case "${1-}" in
         # Falls back to $PREFIX when there is no `current` marker -- a
         # source-tree stage, an unpacked tarball, or a host-tools-only install
         # all land there, and naming your own tree beats naming nothing.
-        _pp_root="$(dirname "$PREFIX")"
-        if [[ -L "$_pp_root/axl-sdk" ]] \
-           && _pp="$(cd -P "$_pp_root/axl-sdk" 2>/dev/null && pwd)" \
-           && [[ -n "$_pp" ]]; then
-            printf '%s\n' "$_pp"
-        else
-            printf '%s\n' "$PREFIX"
-        fi
+        printf '%s\n' "$(sdk_prefix)"
         exit 0
         ;;
     --print-version|--version)

@@ -107,11 +107,11 @@ check $? "nothing listed that is not shipped${listed_extra:+ -- extra:$listed_ex
 # The licence payload. These are obligations, not prose.
 # ---------------------------------------------------------------------------
 declare -A OBLIGATION=(
-    ["GPL-2\\.0 .?3\\(b\\) written offer"]="iPXE's GPL-2.0 section 3(b) written offer"
+    ["GPL-2\\.0 section 3\\(b\\) written offer"]="iPXE's GPL-2.0 section 3(b) written offer"
     ["dual-licensed Apache-2.0 OR GPL-2.0-or-later"]="mbedTLS's dual licence"
     ["this[[:space:]]*distribution elects Apache-2.0"]="mbedTLS Apache-2.0 election"
     ["BSD-2-Clause-Patent"]="EDK2's BSD-2-Clause-Patent notice"
-    ["GPL-2.0-or-later"]="iPXE's licence"
+    ["licensed GPL-2.0-or-later"]="iPXE's licence"
     ["third_party/ipxe/COPYING.GPLv2"]="the iPXE licence-text pointer"
     ["support@aximcode.com"]="the address the written offer names"
 )
@@ -119,6 +119,29 @@ for pat in "${!OBLIGATION[@]}"; do
     tr '\n' ' ' < "$OUT" | grep -Eq "$pat"
     check $? "carries ${OBLIGATION[$pat]}"
 done
+
+# ---------------------------------------------------------------------------
+# The sidecars. The tarball ships one JSON5 database per file in share/, and
+# a README documenting a SUBSET is how usb-ids.json5 and jedec.json5 went
+# unshipped for their entire life: release.yml's staging loop named the PCI
+# files only, nothing compared it against what share/ actually holds, and the
+# README described the one that was staged -- so the artifact was internally
+# consistent and still missing two files that lsusb.efi and memspd.efi look
+# for beside themselves. Derive the expectation from share/, never restate it.
+# ---------------------------------------------------------------------------
+undocumented=""
+sidecars=0
+for sc in "$PROJECT_DIR"/share/*.json5; do
+    [[ -f "$sc" ]] || continue
+    sidecars=$((sidecars + 1))
+    grep -qF -- "$(basename "$sc")" "$OUT" || undocumented+=" $(basename "$sc")"
+done
+# A glob that matched nothing would make the loop above vacuous and this test
+# pass by finding no counterexample -- the same "empty is not an answer" trap
+# release.yml's own tool-set check refuses.
+(( sidecars >= 3 )) || undocumented+=" (share/ yielded only $sidecars sidecars)"
+[[ -z "$undocumented" ]]
+check $? "every share/*.json5 is documented${undocumented:+ -- missing:$undocumented}"
 
 # ---------------------------------------------------------------------------
 # Arch and version reach the text they parameterise.
@@ -131,5 +154,30 @@ check $? "carries the version it was given"
 "$GEN" --arch aa64 --version 9.9.9 > "$WORK/aa64.txt" 2>/dev/null
 grep -q 'drivers/aa64/' "$WORK/aa64.txt" && ! grep -q 'drivers/x64/' "$WORK/aa64.txt"
 check $? "--arch aa64 names drivers/aa64/ and not drivers/x64/"
+
+# ---------------------------------------------------------------------------
+# The WHOLE file is ASCII, not just the derived tool list. This is read with
+# `cat README.txt` at the UEFI Shell, which draws a block per non-ASCII byte --
+# which is why the generator carries ASCII_FOLD at all. The fold was applied to
+# the generated list only, so the hand-written tail shipped em-dashes.
+# ---------------------------------------------------------------------------
+# BYTES, not a regex class. `[^ -~\t]` reads \t as a tab under ugrep and as
+# the two literals \ and t under GNU grep (which then flags every TAB), and
+# `[:print:]` under a UTF-8-aware grep counts an em-dash as one printable
+# character -- so the obvious spellings disagree about both the false positive
+# and the true one. Deleting the allowed bytes leaves exactly the strays.
+strays() { LC_ALL=C tr -d '\11\12\40-\176' < "$1" | wc -c; }
+
+# CONTROL FIRST: a detector's silence is worth nothing until it has been shown
+# to speak. If this fixture does not trip it, the assertion below is vacuous.
+printf 'plain ascii\n' > "$WORK/ctl-clean.txt"
+printf 'an em dash \xe2\x80\x94 here\n' > "$WORK/ctl-dirty.txt"
+[[ "$(strays "$WORK/ctl-clean.txt")" -eq 0 && "$(strays "$WORK/ctl-dirty.txt")" -gt 0 ]]
+check $? "control: the ASCII check passes clean bytes and fails a non-ASCII one"
+
+stray_bytes="$(strays "$OUT")"
+detail=""; [[ "$stray_bytes" -eq 0 ]] || detail=" -- $stray_bytes stray byte(s)"
+[[ "$stray_bytes" -eq 0 ]]
+check $? "the emitted README is pure ASCII$detail"
 
 test_host_summary "uefi-tools-readme"

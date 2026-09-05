@@ -5,6 +5,12 @@
 > says so. Excluded from the public snapshot (D5), so it may name internal
 > paths.
 
+**STATUS: SHIPPED 2026-09-02 — in v4.6.0, NOT the 4.5.1 this doc plans for.**
+§20 M2 (the manager as its own component) landed between the plan and the cut,
+which made the release a minor. Everything below is the plan as written; the
+version numbers in §4 and §5 have been corrected to what actually shipped.
+**The consumer pin is 4.6.0.**
+
 ## 0. START HERE — state, task, why
 
 **axl-sdk:** `main`, VERSION **4.5.0** (just cut, new asset shape published to
@@ -94,7 +100,7 @@ releases-repo README) as the sanctioned escape hatch for a proxy-hostile host.
 This is a deliberate, auditable widening of an already-accepted tradeoff — note
 it, do not bury it.
 
-## 4. Verify + cut 4.5.1
+## 4. Verify + cut
 
 ```
 # local gate first (CI contends on this box — check `gh run list`):
@@ -104,22 +110,24 @@ AXL_INSECURE_FETCH=1 <exercise a fetch against a distrusted cert> → succeeds
 unset;                <same>                                       → fails (unchanged)
 # hash still bites when set:
 AXL_INSECURE_FETCH=1 <corrupt the artifact> → sha256sum -c rejects
-scripts/cut-release.sh 4.5.1   # prompts before pushing; publishes the new-shape assets + this fix
+scripts/cut-release.sh 4.6.0   # prompts before pushing; publishes the new-shape assets + this fix
 ```
 
-4.5.1 is a patch: no asset-shape change, no API change — a fetch-robustness
-knob. `check-published-release.sh` (D4) runs on it as usual.
+This was planned as 4.5.1, a patch: no asset-shape change, no API change — a
+fetch-robustness knob. It went out as **4.6.0** because §20 M2 landed in the
+same window and added a component. `check-published-release.sh` (D4) ran on it
+as usual: 6/6 against published bytes.
 
 ## 5. How this threads into D7
 
 The consumer migration (axl-utils, its own handoff
 `doc/axl-sdk-migration-handoff.md`) was about to pin **4.5.0**. With this fix it
-should pin **4.5.1** instead and set `AXL_INSECURE_FETCH=1` when it invokes the
+should pin **4.6.0** instead and set `AXL_INSECURE_FETCH=1` when it invokes the
 SDK's toolchain install — one line, mirroring the `curl -k` it already uses for
 the SDK assets, and it needs **no** consumer-side TLS shim. So the order is:
 
-1. Land this change, cut **4.5.1**.
-2. Tell axl-utils it can migrate, pinning 4.5.1.
+1. Land this change, cut it. **DONE — v4.6.0.**
+2. Tell axl-utils it can migrate, pinning **4.6.0**.
 3. D7's last step (delete `scripts/build-packages.sh`) is unchanged and still
    gated on that migration landing.
 

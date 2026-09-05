@@ -3,6 +3,467 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.7.0 — 2026-09-05
+
+### Upgrading — one-off steps for an existing install
+
+Nothing here degrades gracefully on purpose: the compatibility shims were left
+out deliberately, so an existing install needs these once.
+
+**Which of these apply to you** — three commands, before you change anything:
+
+```sh
+axl version                                   # manager version: < this release?
+axl prune --dry-run                           # exactly what would be removed
+ls -d /opt/*toolchain* /opt/x86_64-elf-gcc-*  # any toolchains we did not install?
+```
+
+1. **One manual step to get a self-updating `axl`.** `axl update` now updates
+   the manager too — but the `axl` performing *this* upgrade is the old one,
+   which does not know how yet, so it cannot bootstrap itself. Once per
+   machine:
+
+   ```sh
+   curl -fsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/install.sh
+   sh install.sh --host-tools                  # once; then never again
+   axl update                                  # moves both from here on
+   ```
+
+   **You need this if `axl version` reports a manager older than this
+   release** — which is every install made at v4.6.0 or earlier, because
+   `install.sh` only ever created a manager when there was none. Verify
+   afterwards with `axl version`: the manager row should have moved.
+
+2. **`axl prune` has been a no-op since v4.6.0 — dry-run it before trusting
+   it.** It removed *nothing* on any install from v4.6.0 onward and still
+   exited 0, so nothing has been cleaned up since then and whatever
+   accumulated is still on disk. It now also prunes superseded **manager**
+   roots, which never had a bound at all.
+
+   How much that actually removes depends on your history: a machine that has
+   only ever held one SDK version and one toolchain generation has nothing to
+   collect and will report exactly that. A machine that has been through
+   several upgrades may drop several roots at once, including toolchains at
+   ~235 MB installed each.
+
+   ```sh
+   axl prune --dry-run     # read this before the real run
+   axl prune
+   ```
+
+3. **If you keep your own toolchains beside ours, read that dry-run
+   carefully.** `axl prune` matches toolchain families by a name pattern
+   derived from the manifest, **not** by whether we installed them. A
+   hand-placed `/opt/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi` — a
+   *different* target triple, nothing to do with this SDK — matches
+   `^arm-gnu-toolchain-[0-9]` and is a deletion candidate. Verified, not
+   theoretical.
+
+   **Where the line falls, measured:** prune protects the one the manifest
+   names and then keeps the newest of whatever is left, so *one* foreign
+   toolchain beside ours is kept and reports `nothing to remove`. Exposure
+   starts at **two** foreign members of the same family — the oldest becomes a
+   candidate. Until pruning is ownership-based, keep private toolchains
+   outside the directory the manifest points into, or always dry-run first.
+
+4. **Re-run the installer if you use a custom `--bin-dir`.** The directory the
+   command links live in is now recorded in the prefix
+   (`share/axl/bin-dir`); installs made before this release have no such file,
+   so `axl use` / `axl uninstall` keep guessing it from the environment. One
+   `install.sh` run writes it. No action needed if you never passed
+   `--bin-dir`, since the guess was already correct.
+
+5. **`AXL_BIN_DIR` now affects `install.sh` too**, not just `axl`. Previously
+   the dispatcher honoured it and the installer ignored it, which is how the
+   two came to disagree. If you set it, both now use it.
+
+6. **If a CI image or machine-level policy relies on the build failing loudly
+   when the x64 bare-metal toolchain is absent, set `AXL_TOOLCHAIN=axl`.** The
+   x64 default is now `auto`, which falls back to the host's own `gcc` instead
+   of failing when the toolchain isn't found — a relocated toolchain launched
+   without `AXL_X64_GCC` exported, or a CI image whose `/opt` was wiped, used
+   to fail with `x64 C compiler not found at /opt/...` and now builds quietly
+   with a different compiler instead. No working build breaks; a policy that
+   depended on the *failure itself* as a guarantee does. `AXL_TOOLCHAIN=axl`
+   restores the old hard-fail-if-missing behavior.
+
+### Added
+
+- **`axl update` now updates the cross toolchain too — but only for arches you
+  already have.** The SDK *pins* the toolchain: `axl-toolchains.conf` ships
+  inside the SDK, so a release that pins a newer gcc used to move the SDK and
+  leave the compiler behind. Since x64 defaults to `AXL_TOOLCHAIN=auto` that
+  failure is **silent** — `axl-cc` simply falls back to the host gcc for C
+  instead of saying anything — so `axl update` was quietly leaving the install
+  in a state its owner could not see.
+
+  `axl update` now asks, *before* it touches the SDK, which arches actually
+  have a toolchain, and passes the answer to the installer's existing
+  `--toolchain x64|aa64|all`. The order is the whole trick: asked afterwards,
+  the manifest names the version you are *about* to get, so "is it installed?"
+  would answer about the wrong thing and fetch nothing on precisely the upgrade
+  that needed it.
+
+  **An arch you do not have is never downloaded.** A C-only consumer with no
+  bare-metal toolchain is exactly who `auto` exists for, and a routine update
+  must not post them ~55–96 MB; likewise an x64-only machine never receives
+  aa64. Presence is decided by *asking the compiler* — either locator, `gcc` or
+  `g++`, with `AXL_<ARCH>_GCC` / `AXL_<ARCH>_GXX` overrides honoured — because a
+  partial extract leaves the directory there and nothing in it.
+
+  **`AXL_TOOLCHAIN=host` (or `cross`) declines, and says so.** If you have told
+  AXL you build with another compiler, a leftover bare-metal root under `/opt`
+  is not a request to refresh it. `auto`, `axl` and unset keep the new
+  behaviour, and a value that is none of the four is now an error rather than a
+  silent fall-through -- `axl-cc` refuses the same four names (it exits 1; this
+  exits 2, matching `axl`'s own other argument refusals).
+
+  **A toolchain located by `AXL_<ARCH>_GCC` / `_GXX` is declined too, per
+  arch** — with the command that actually moves it. `axl-install-toolchain`
+  reads no override and always writes `<prefix>/<pinned-name>` under `/opt`, so
+  carrying such an arch would `sudo`-install a *second* toolchain beside yours
+  rather than updating it. You get the reason, the path it found, and
+  `axl toolchain install <arch> --prefix <parent>` — plus a note that this
+  writes a new root and leaves your variable pointing at the old one until you
+  re-export. When the locator is a bare name on `PATH`, or somewhere like
+  `/usr/bin`, no prefix can be derived and none is invented: you get
+  `--prefix <dir>` to fill in rather than `--prefix .` or `--prefix /`.
+
+  **`axl toolchain list` gained a fifth field**, `gcc:installed` /
+  `gcc:MISSING`, so it no longer reports `g++:MISSING` about a tree `axl update`
+  is about to refresh. Appended, so field 3 and the field-4 root path keep their
+  positions; an empty `AXL_<ARCH>_TOOLCHAIN_DIR` now prints `(unset)` there
+  rather than collapsing and shifting every later column.
+
+  With it, **`list`'s presence test widened**: it was `-x <locator>` and is now
+  the same probe `axl update` uses, so a locator holding a bare name resolved on
+  `PATH` counts as installed here too. `list` was answering a narrower question
+  than the command that acts on it.
+
+  In short: an explicit flag wins, then an explicit `AXL_TOOLCHAIN`, then what
+  is on disk — and a malformed flag or variant is refused **before** the manager
+  self-update, so a bad argument never costs a re-exec first. (The full
+  precedence table is in `docs/AXL-Distribution-Design.md` §21a.4a; it is not
+  restated here, because a second copy of an ordering is the thing that keeps
+  drifting from it.)
+
+  **New: `axl update --no-toolchain`**, because carrying the toolchain wants the
+  network and (for `/opt`) `sudo`, and making that the default created a path
+  that can fail where it used to succeed. It updates the SDK and the manager
+  only. Passing it together with `--toolchain` is refused, before the manager
+  phase runs; `--no-toolchain=VALUE` is refused by name.
+
+  > It is a **hard error against a manager older than this release** — the old
+  > `axl` forwards the flag and `install.sh` dies on it. No shim: every consumer
+  > gets a new manager at its next `axl update`.
+
+  **A failed toolchain step no longer looks like a failed install.** It used to
+  run under `ensure`, whose `die` fired *after* the SDK was already linked and
+  skipped `axl prune`, the PATH advice and the closing banner — so a network
+  hiccup left you with a toolchain error and no confirmation. The step is now
+  non-fatal: the banner reports the SDK version that did install **plus** a
+  marked line saying the cross toolchain did not, with `axl toolchain install
+  <arch>` as the remedy — and the installer still exits non-zero.
+
+  `axl use <version>` deliberately does **not** carry the toolchain: a rollback
+  should not move the compiler underneath you. All of the above is pinned by
+  `test-install-lifecycle.sh` steps 8h, 8i, 8ib, 8ic, 8id, 8j, 8k and 8L, against
+  a fixture where each SDK version pins a different toolchain root.
+
+- **`axl update` now updates `axl` itself.** The manager root carries the
+  dispatcher *and* the `install.sh` every verb execs, and `install.sh` used to
+  install a manager only when there was none — so it froze at whatever version
+  first created it and no fix to either ever reached an existing machine.
+  Measured by the lifecycle test: two SDK upgrades left `axl --version`
+  reporting the version from the first install.
+
+  `install.sh` now keeps the manager tracking the version being installed
+  (`already_installed` still short-circuits, so a current manager costs one
+  small request), and `axl update` updates the manager **first**, then re-execs
+  the new `axl` to do the SDK — so a fix to `install.sh` applies on *this*
+  update rather than the next one. `AXL_SELF_UPDATED` guards the re-exec
+  against a loop, the re-exec happens only when the manager actually moved, and
+  a manager that cannot be fetched warns and falls through rather than blocking
+  the SDK update.
+
+  **The manager only ever moves FORWARD.** `axl use <older>` returns before the
+  manager logic, so that path was always safe — but `install.sh --version
+  <older>`, the command the notes above teach and the one a consumer pins in
+  CI, runs the full install path and *did* roll the manager back, stranding
+  the user on an installer too old to fix itself. The comparison is now a
+  `sort -V`, not a `!=`.
+
+  **`axl update` no longer forwards arbitrary arguments into the manager
+  step.** `--use`/`--uninstall`/`--host-tools` are refused by name the way
+  `--version` already was — `axl update --uninstall` deleted the manager root
+  and then exec'd a path inside it — and `--toolchain`/`--prune` are dropped
+  from the manager phase, where they `die` *after* the manager has already
+  moved, producing a false "could not update" and skipping the re-exec. The
+  re-exec decision reads the manager's version file rather than the
+  installer's exit status, since that status also covers five advisory steps
+  that can fail on a manager that updated fine.
+
+- **`axl version` — the manager and the SDK, which are not the same number.**
+  `axl --version` is the *program* version, and since §20 M2 the program lives
+  in the manager root, so on a real install it answers a different question
+  than "which SDK am I using" — and the two legitimately diverge the moment you
+  `axl use <older>`. The SDK version was previously reachable only as a *path*,
+  via `--print-prefix`. `axl version` prints both with their prefixes, and says
+  why they differ when they do. `--version` keeps its conventional meaning.
+
+- **A consumer install is now proven to compile C++, not just C.**
+  `test-consumer-install.sh` compiled `hello.c` and nothing else;
+  `test-sdk-tarball.sh` asserted `bin/axl-c++`, `hello.cpp` and
+  `containers.cpp` were present *by name* and never ran the C++ driver. Every
+  real C++ test in the suite builds in-tree — the one caller whose success
+  proves least about an install. So the C++ half of the SDK reached users on a
+  file listing.
+
+  It now compiles `hello.cpp`, and links `cxx-errors.cpp` with `-fexceptions`,
+  against the installed tree on both `debian(dash)` and `fedora(bash)`. That
+  is a strictly larger ask than C: it needs the toolchain's
+  `libstdc++`/`libsupc++`, the four `axl-cxxrt-*.o` glue objects and the
+  exceptions linker script. Verified by removing `elf_x86_64_efi_eh.lds` from
+  staging — both new assertions fail on both distros while the C one stays
+  green.
+
+- **`test/integration/test-install-lifecycle.sh` — the install lifecycle, in a
+  container.** Every other installer test checks one operation in isolation:
+  asset resolution, idempotency, concurrency, a fresh machine. Nothing
+  exercised the *sequence*, which is where versioned roots, a per-component
+  `current` marker, a manager that must outlive what it manages, and a prune
+  policy that deletes things actually interact.
+
+  It installs three fabricated releases from a `file://` mirror and walks
+  install → upgrade → upgrade → `axl list` → **downgrade** → `axl prune` →
+  recover a pruned version → uninstall, re-checking after every transition
+  that `axl` itself still runs. Podman; the releases are local `file://`
+  mirrors so no release is fetched over the network, though the run does pull
+  its image and `apt-get install curl`. SKIPs cleanly without podman. Fixture
+  builders moved to `release-fixture.sh`, shared with
+  `test-installer-assets.sh` rather than copied, and its libexec staging is
+  read back from `make print-HOST_TOOL_FILES` rather than hand-listed.
+
+  It found the `--bin-dir` bug on its first green run, and it is the
+  test that would have caught `axl prune` silently doing nothing from v4.6.0
+  onward.
+
+- **`axl toolchain list` and `axl toolchain install`.** The dispatcher managed
+  SDK versions and toolchain versions in two unrelated vocabularies: `axl list`
+  / `axl use` for one, and a separate program name you had to already know for
+  the other. There was no way to ask the question every consumer has — *do I
+  have the compiler this SDK pins?* — without reading `axl-toolchains.conf` and
+  stat-ing a path out of it by hand.
+
+  `list` reports both arches with their pinned version, the resolved directory,
+  and `installed` / `MISSING` — **asking the compiler**, not stat-ing the
+  directory, because a partial extract leaves the directory there and nothing
+  in it. `install` delegates to the SDK's `axl-install-toolchain`.
+
+  **There is deliberately no `toolchain update`.** The toolchain is not
+  user-versioned: the SDK prefix pins it, so moving between toolchains *is*
+  `axl use <version>`. The verb exists only to say so and point there.
+
+  Both resolve the **current SDK**, not the prefix `axl` runs from — since §20
+  M2 those differ, and the manifest and installer are SDK content. Both
+  manifest layouts are tried (`share/axl/` when installed, `scripts/` in a
+  checkout), matching what `install-toolchain.sh` has always done.
+
+- **`axl-cc --print-toolchain` — ask which compiler will actually build.**
+  Resolves for `--arch` and prints the bare variant word (`axl`, `host` or
+  `cross`), then exits, before any compilation work — so it answers on a stage
+  that cannot build, and needs no sources. It exists so there is ONE owner of
+  that resolution: `axl toolchain list` calls it rather than re-probing the
+  locators itself, which is the drift `make check-flag-parity` exists to catch
+  one layer down.
+
+- **`AXL_TOOLCHAIN=auto` — x64 no longer needs the bare-metal toolchain for a
+  C-only build.** Three of AXL's four measured consumers are C-only, and
+  until now the only thing the 239 MB `x86_64-elf` cross bought any of them
+  was C++, which they don't use. `axl-cc`'s x64 default is now `auto`: it
+  builds with the bare-metal cross when `axl-install-toolchain x64` has put
+  one under `/opt`, and falls back to the *host's own* `gcc`/`binutils` — no
+  `/opt` download at all — when it hasn't. `axl toolchain list` and `axl-cc
+  --verbose` both say which one a build resolved to and why.
+
+  The fall-back is strictly *freestanding*: `-nostdinc` against the host
+  compiler's own header set (`stddef.h`, `stdint.h`, `stdbool.h`, … — not
+  `limits.h`, despite the C standard calling it freestanding too), and no C
+  library on the link at all. `<string.h>` / `<stdio.h>` / `<stdlib.h>` are
+  not available; a compile that reaches for one now gets an appended note
+  naming the mode and both ways out (AXL's own API, or install the bare-metal
+  toolchain). `libaxl.a`'s own vendored code (libvterm, lzma, mbedTLS) still
+  calls the plain C names, so a new archive, `lib/axl/<arch>/libaxl-standin.a`
+  — the eleven weak leaf functions this SDK carried before P3 handed that job
+  to newlib, rebuilt for the case newlib is absent instead of present —
+  completes those links. It is invisible to a normal build: it exists only
+  under `host`, inside the same `--start-group` as everything else, and
+  `check-libc-overlap` now asserts every symbol in it stays weak.
+
+  `AXL_TOOLCHAIN=host` is also available explicitly (x64 only — aa64 has no
+  host binutils that emits `pei-aarch64-little`, so it's refused by name), and
+  `AXL_TOOLCHAIN=axl` keeps today's behavior verbatim: unlike `auto`, it still
+  hard-fails rather than falling back when the toolchain it names is missing —
+  the reproducibility pin CI, or a machine-level "always bare-metal" policy,
+  wants. **Nobody's working build changes**: a machine with the toolchain
+  installed resolves to exactly the same compiler it always did; only a
+  machine with *no* toolchain gains a working C build instead of a hard
+  error — see the Upgrading note above if you relied on that hard error as a
+  guarantee. C++ without a toolchain still fails, now naming the remedy
+  instead of a bare "compiler not found". See
+  [`AXL-Host-Toolchain-Design.md`](docs/AXL-Host-Toolchain-Design.md).
+
+- **`axl toolchain uninstall <arch>`.** `auto` makes a toolchain's presence
+  load-bearing to which compiler a build actually uses, so there needed to be
+  a way back other than `rm -rf /opt/...` by hand. It removes the root
+  `axl-toolchains.conf` names for `<arch>`, refusing one that has no
+  `.axl-receipt` recording that this manager installed it — the same
+  ownership guard `axl prune` applies, with the same remedy
+  (`axl-install-toolchain <arch>` re-marks a root that predates receipts).
+
+### Fixed
+
+- **`axl prune` could delete a toolchain you installed yourself (§21).** It
+  matched toolchain families by a name pattern derived from the manifest, not
+  by whether we put them there — and ARM publishes its toolchains as
+  `arm-gnu-toolchain-<ver>-…`, so a hand-unpacked tree for a *different target
+  triple* matched. `AXL-Distribution-Design.md` §12.5 required "only roots
+  recorded in a manifest we wrote" from the first draft; the code never did.
+
+  `install-toolchain.sh` now writes a `.axl-receipt` into every root it
+  installs, and `axl prune` deletes a toolchain root only if it carries one.
+  It fails safe — no receipt means not ours — and `--dry-run` says what it
+  skipped. The receipt is written *last*, after the tree is known good, so a
+  failed install is never marked as ours.
+
+  **Two foreign toolchains are needed to see it**, which is why it survived:
+  with one, keep-newest hides it. Beyond the deletion, they also crowded out
+  the generation of *ours* that keep-one-previous exists to retain.
+
+  SDK and manager roots are unchanged and still prune by pattern —
+  `axl-sdk-<semver>` is our namespace and nothing else creates that name.
+
+  **Existing toolchains carry no receipt, so `axl prune` will not remove
+  them** — and an unmarked root is not merely spared, it does not count
+  toward `--keep` either, so it sits *outside* the policy rather than being
+  deferred by it. On a machine with several superseded generations that is
+  real disk (~235 MB each for x86_64-elf) staying put.
+
+  ```sh
+  axl-install-toolchain x64     # re-marks an already-installed root
+  axl-install-toolchain aa64
+  axl prune --dry-run           # now lists them as candidates
+  ```
+
+  The already-installed path writes a receipt for exactly this reason, so
+  re-running the command is cheap and does not re-download — and it **warns**
+  if it cannot write one (a read-only or managed `/opt`), because a remedy
+  that silently does nothing is the bug it exists to fix. `axl prune` names
+  what it skipped and why, in both dry and real runs, so a `/opt` that has
+  quietly stopped being bounded is visible rather than silent.
+
+- **`axl use`, `axl update` and `axl uninstall` ignored the `--bin-dir` the
+  install was created with.** They recomputed it from
+  `AXL_BIN_DIR`/`XDG_BIN_HOME`/`$HOME/.local/bin`, so on any install placed
+  with an explicit `--bin-dir` — what a packager or a consumer's install script
+  does — the links were written to a *different* directory than the ones on
+  `PATH`. The rollback path therefore did not roll back: `axl use <older>`
+  moved the marker and `axl --print-prefix` followed it, while the stale
+  `axl-cc` on `PATH` kept compiling with the version you had just left. Same
+  cause left `axl uninstall` removing one directory's links and leaving the
+  other's behind.
+
+  `axl` now takes the bin directory from its own invocation path when that is
+  a symlink — `install.sh` links `<bin-dir>/axl -> <prefix>/bin/axl`, and the
+  copy inside the prefix is a regular file, so a symlinked `$0` means we were
+  reached through the `PATH` link and its directory is the answer.
+  `AXL_BIN_DIR` still wins.
+
+  Found by the new lifecycle test below, on its first run.
+
+- **`axl prune` pruned nothing at all on a stock 4.6.0 install.** §20 M2 links
+  `axl` out of the manager root, so prune runs with `PREFIX` =
+  `axl-sdk-host-tools-<ver>` — which does not match `^axl-sdk-[0-9]`, because
+  the character after the dash is `h`. The versioned-root guard therefore
+  rejected its own manager, printed the "not a versioned root" message meant
+  for a package install, and skipped every SDK root. The toolchain half failed
+  for a second reason: it read the manifest from `$PREFIX/share/axl/`, and
+  `make-host-tools-tarball.sh` writes only `share/axl/version`. So the command
+  exited 0 having removed nothing, on every install since 4.6.0.
+
+  The guard now accepts a versioned manager root, and the manifest falls back
+  to the current SDK's copy — the toolchain families are a property of the SDK
+  in use, not of the manager.
+
+- **Superseded manager roots accumulated without bound.** §20 keeps the manager
+  outside `^axl-sdk-[0-9]` so `axl use`/`axl prune` can never move or remove
+  the thing that manages versions — but that invariant is about the *current*
+  manager, not every generation of one. `axl prune` now walks
+  `^axl-sdk-host-tools-[0-9]` too, protecting the current manager **and the
+  prefix it is running from**: prune executes out of that tree's `libexec`, so
+  pruning it would delete the running script and the `axl` on `PATH` together.
+
+- **A manifest that disagreed with itself started a 40-minute compile.**
+  `axl-toolchains.conf` names the x64 toolchain three times — a VERSION, a DIR
+  that must contain it, and a literal URL — and `check-toolchain-conf` compared
+  only the first two. With a bump that missed the URL, the download succeeds,
+  the sha of the *old* tarball matches, it extracts cleanly, and `$gxx` (built
+  from DIR) is still absent — at which point the installer printed one WARNING
+  and fell through to a source build of GCC that ends in a working toolchain,
+  hiding the inconsistency until the next bump.
+
+  The gate now compares the URL's release tag *and* tarball name against the
+  declared version (a plain substring test is not enough — the version appears
+  twice, so changing one still matched). The installer treats a post-extract
+  mismatch the way it already treats a checksum mismatch: manifest and artifact
+  disagree, so it reports both halves and refuses. aa64 was never exposed —
+  its URL is built from its VERSION.
+
+- **The UEFI-tools tarball shipped `lsusb.efi` and `memspd.efi` without their
+  name databases.** `share/` holds three curated JSON5 sidecars that the tools
+  auto-discover beside their own `.efi` — `pci-ids.json5` (lspci),
+  `usb-ids.json5` (lsusb), `jedec.json5` (memspd) — and the release workflow
+  staged the first one only. The loop was written as
+  `pci-ids.json5 pci-class.json5` when PCI was the only tool with a database
+  and was never revisited when the other two grew theirs, so **every published
+  `axl-sdk-uefi-tools-*` asset up to and including v4.6.0 is missing two
+  files.** Verified against published bytes, not the workflow source. The
+  installed SDK was never affected — `scripts/install.sh` staged all three;
+  the two paths had drifted and nothing compared them.
+
+  Both staging paths now read `share/` by **glob** — `scripts/install.sh`
+  carried the same hand-maintained list and was one edit from the same bug.
+  `make check-tools-sidecars` (new gate) rejects a revert to a list in either
+  file, and also fails on a sidecar with no description, so that lands as a
+  local gate failure rather than a dead tag build. Its own first version
+  **could not fail** — it matched the glob as a substring of the whole step,
+  and the comment explaining why a glob is used contains that literal string,
+  so a staging line reverted to one file still read as clean.
+  `test/integration/test-tools-sidecars-gate.sh` pins that exact scenario
+  along with five other ways the gate could go blind. The workflow refuses to
+  publish if the glob yields fewer than three. The tarball's `README.txt`
+  derives its sidecar section from `share/` too.
+
+  **This reaches users at the next tag**; the v4.6.0 asset stays incomplete.
+
+- **`README.txt` in the UEFI-tools tarball is now pure ASCII.** Its
+  `ASCII_FOLD` was applied to the generated tool list only, so the
+  hand-written tail shipped em-dashes and a `§` into a file read with `cat`
+  at the UEFI Shell, which draws a block per non-ASCII byte. The section sign
+  folds to the spelled-out word, keeping iPXE's GPL-2.0 section 3(b) written
+  offer legible rather than merely present.
+
+### Removed
+
+- **`scripts/build-packages.sh` and `packaging/postinst.sh` (D7).** The
+  `.deb`/`.rpm` retired with D2 and stopped being published then; the flagship
+  consumer has now moved to `install.sh`, so the local package build has no
+  remaining user. There is no `fpm`/`rpmbuild` path in the tree. A consumer
+  whose policy mandates a signed package (`AXL-Distribution-Design.md` §17.4)
+  gets one rebuilt from git history — the script pinned no state. This
+  completes the §14–§19 distribution series.
+
+
 ## 4.6.0 — 2026-09-02
 
 ### Added

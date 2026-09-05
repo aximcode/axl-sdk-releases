@@ -399,9 +399,29 @@ Library / SDK foundations:
   use-after-free), and an `AxlString` skin loses 9x on short-string
   construct/copy because it cannot express inline storage. Three no-go
   verdicts, three different reasons, none predicting the others
-- [AXL-Distribution-Design.md](AXL-Distribution-Design.md) — DRAFT: how the SDK is
-  packaged, installed, discovered and version-pinned; the missing tarball and
-  CMake toolchain file; consuming an unreleased checkout
+- [AXL-Distribution-Design.md](AXL-Distribution-Design.md) — how the SDK is
+  packaged, installed, discovered and version-pinned. **D1–D7 and §20 M1/M2 all
+  SHIPPED**; the §14–§19 series closed 2026-09-02 when the packages retired for
+  real, and §19b records what fell out of testing it afterwards. No longer a
+  DRAFT: the tarball and the CMake toolchain file it called "the gap" both
+  shipped, and consuming an unreleased checkout is answered by
+  `install.sh --prefix`. **§21 (an install receipt) is the one open section,
+  and it is now HALF built**: ownership-based pruning of TOOLCHAIN roots
+  shipped 2026-09-03 (`3ed108d4`) — `install-toolchain.sh` writes
+  `.axl-receipt` and `axl prune` requires one, which is what §12.5 asked for.
+  Still open is the provenance receipt for SDK/manager roots (source URL, tag,
+  sha256, insecure-fetch flag), deliberately deferred until something reads it
+- [AXL-Host-Toolchain-Design.md](AXL-Host-Toolchain-Design.md) — **SHIPPED
+  2026-09-03.** Which compiler builds a consumer's x64 image, and
+  how one is chosen. The feasibility spike is GREEN: Ubuntu 24.04's gcc 13.3
+  built and booted AXL images in a container with `/opt` empty. `AXL_TOOLCHAIN`
+  gains `host` and `auto`, and `auto` becomes the x64 default — bare-metal
+  toolchain present selects it, absent falls back to the host compiler — so a
+  C-only consumer installs no 239 MB toolchain at all. Measured motivation:
+  3 of 4 AXL consumers are C-only. **Not a breaking change** (a machine with a
+  toolchain installed behaves identically); aa64 is untouched, because ARM's
+  binutils is what supplies `pei-aarch64-little` and the host's has it not at
+  all. Adds `axl toolchain uninstall <arch>`, guarded by §21's receipt
 - **Install layout, versioned roots and the `axl` dispatcher** — ACCEPTED
   2026-08-29; **P5 (the dispatcher) and P8 (root-free toolchain install) SHIPPED**, P1's SDK tarball SHIPPED too (it was P6's prerequisite), as did P6's pruning half (`axl prune`, current + one previous, both axes) and the self-containment contract it rests on. P6's "change install.sh's default prefix" was WRONG and is retracted -- `stage/` is right for a source checkout and the tarball's top-level dir already is the versioned root. P7 SHIPPED (its content half had already ridden in with P5). P8 was twice scoped larger than it was -- no conf change and no CMake port were needed, because only the INSTALLER could not target a user prefix; building against one already worked. Folded into
   [AXL-Distribution-Design.md](AXL-Distribution-Design.md) **§12–§13** rather
@@ -447,7 +467,12 @@ Library / SDK foundations:
   AP worker pool runs into (from NightRun's MP-Services bring-up)
 - [AXL-Native-Backend-Design.md](AXL-Native-Backend-Design.md) — the native UEFI backend / CRT0
 - [AXL-Coding-Style.md](AXL-Coding-Style.md) · [AXL-Lifecycle.md](AXL-Lifecycle.md) · [AXL-Concurrency.md](AXL-Concurrency.md)
-- [AXLMM-Design.md](AXLMM-Design.md) — C++ (`libaxl-cxx`) bindings plan
+- [AXLMM-Design.md](AXLMM-Design.md) — C++ bindings plan. **Design complete;
+  implementation deferred pending AGT.** Note this line used to call it a
+  "`libaxl-cxx` bindings plan": that archive was DELETED by P4
+  (`Makefile:1157`, AXL-Libc-Substrate-Design.md §4d), and every C++ link now
+  carries the toolchain's own libstdc++/libsupc++. Remaining phases are in
+  the Open backlog
 - [AXL-EFI-Encapsulation-Plan.md](AXL-EFI-Encapsulation-Plan.md) — public-API UEFI-type hygiene / portability
 - [AXL-Loop-Reentrancy-Plan.md](AXL-Loop-Reentrancy-Plan.md) — remediate blocking-on-a-running-loop (re-entrancy guard, deferred HTTP responses, async-first services, `axl_yield` split)
 - [AXL-vs-EDK2-Scope.md](AXL-vs-EDK2-Scope.md) — what we replace vs deliberately omit; audience-facing gap list
@@ -1055,6 +1080,45 @@ never by path.
 ---
 
 ## Open backlog
+
+- [ ] **Cut a release without spending 15 minutes of a human's attention.**
+  Two releases were cut on 2026-09-02 and each one blocked Mike for most of
+  its duration. Measured, so the next attempt optimises the right thing:
+
+  | stage | v4.5.0 | v4.6.0 | note |
+  |---|---|---|---|
+  | local uncached suite (the gate) | 477s | 509s | **blocking, before the cut** |
+  | `Release` workflow | 7m05s | 4m11s | watched to the published release |
+  | `Docs` workflow | 5m20s | 3m18s | parallel with Release |
+  | `CI` on the release push | **16m46s** | **28s (skipped)** | already fixed |
+
+  **Already done today**, and it removed the largest single item: the release
+  commit carries `[release-cut]` and every `ci.yml` job skips on it, so the
+  push before the tag no longer re-runs the full suite on the same box
+  (`RELEASING.md` §"The release commit skips CI, on purpose"). The remaining
+  cost is the **local uncached gate (~8.5 min)** plus watching Release.
+
+  **The task: stop running CI on every push to `main`, and re-derive what the
+  release gate has to be.** Mike's proposal is nightly CI. Sketch, not a
+  decision:
+
+  - `ci.yml` moves to a `schedule:` (nightly on `main`) plus
+    `workflow_dispatch`. Pushes stop triggering it.
+  - The release gate then leans on the most recent nightly **plus** whatever
+    changed since it — which needs the release to know that, so the existing
+    CI stamp (`--ci-gate`, `test-release-gate.sh`) is the machinery to reuse
+    rather than replace.
+  - `cut-release.sh` could stop *watching* Release to completion and instead
+    hand back a URL plus `check-published-release.sh`, which already verifies
+    the published bytes independently (§16.2 job 2). That converts ~4 minutes
+    of waiting into a notification.
+
+  **Two things not to lose while doing it.** The local suite is the
+  authoritative pre-release gate precisely *because* a tag does not trigger CI
+  (`RELEASING.md`), so removing push-CI without replacing that coverage means
+  a release is gated by nothing. And `run-integration.sh` must keep its
+  default worker count: `-j$(nproc)` produced a false red on the 4.5.0 gate
+  for three seconds of wall time.
 
 - **The x64 and aa64 toolchains now MATCH (2026-08-17, `-axl3` published).**
   newlib 4.4.0 -> 4.5.0 and ARM's six newlib flags adopted verbatim from the

@@ -1,6 +1,23 @@
 # AXL-Build-System-Design — replacing the Makefile with CMake
 
-**Status: IN PROGRESS 2026-08-15.** Direction stated by Mike.
+**Status: PLANNED, NOT STARTED. Direction stated by Mike 2026-08-15; last
+touched 2026-08-16. Re-checked 2026-09-03 and corrected — it had read
+"IN PROGRESS" for three weeks while nothing progressed.**
+
+What "not started" means here, measured rather than asserted: the branch this
+work was to land on, `worktree-cmake-build-system`, is **zero commits ahead of
+`main`** — main has absorbed everything on it, and everything on it was docs.
+Its last commit (`dc0832ba`, 2026-08-16) is a design note. The worktree at
+`.claude/worktrees/cmake-build-system` is gone. **No `CMakeLists.txt` builds
+any part of `libaxl`** — the three in the tree are `sdk/examples/` (consumer
+projects exercising the GENERATED `axl-config.cmake` package, which is the
+opposite direction: CMake consuming us, not building us) plus vendored
+gcc/binutils sources under `toolchain/`. `main` still ships the Makefile this
+document exists to replace. No phase of §9 has begun.
+
+The DECISIONS below are still live and still correct — the constraint that the
+Makefile is replaced rather than supplemented, and the §5 sequencing that put
+4.0.0 first. Only the progress claim was wrong.
 **Constraint, stated explicitly: _"we will no longer ship Makefiles."_** The
 Makefile is **replaced**, not supplemented. Any plan that ends with both is not
 this plan.

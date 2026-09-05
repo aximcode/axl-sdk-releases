@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """check-libc-overlap.py — two providers of one libc name must not both be strong.
 
-`libaxl.a` carries unprefixed libc names (`memcpy`, `strlen`, ...) because a
-C-only link is `libaxl.a` and NOTHING else -- no `libc.a`, no `--start-group`.
-On that link libaxl IS the libc. The `-fexceptions` C++ link is the one link
-that also carries newlib, and `axl-cc` puts both archives in one group.
+`libaxl.a` defines NONE of the unprefixed libc names (`memcpy`, `strlen`,
+...) -- `6ec731d3` (P3) deleted them once `libc.a` (newlib) was on every
+link, and this file's own FORBIDDEN set below asserts they stay gone.
+HISTORICALLY, before P3, a C-only link was `libaxl.a` and NOTHING else -- no
+`libc.a`, no `--start-group` -- and on that link libaxl WAS the libc. The
+worked example just below is from that era; it stays because it is WHY the
+weak-vs-strong rule exists, not because it still describes the tree.
 
 Two providers of the same name inside a group is decided by whichever reference
 happens to be outstanding when each archive is scanned, which is not a property
-anyone controls. Adding `src/cxxrt/axl-cxxrt-terminate.o` perturbed it and broke
-`axl-c++ -fexceptions` for any program throwing a non-`std::exception`:
+anyone controls. HISTORICAL: adding `src/cxxrt/axl-cxxrt-terminate.o`
+perturbed it and broke `axl-c++ -fexceptions` for any program throwing a
+non-`std::exception`, back when `libaxl.a` still defined these names itself:
 
     libstdc++(eh_alloc.o) -> getenv -> libc(getenv.o) -> getenv_r.o
                                                       -> libc(strncmp.o)
@@ -22,6 +26,13 @@ anyone controls. Adding `src/cxxrt/axl-cxxrt-terminate.o` perturbed it and broke
 
 Five `multiple definition` errors, on a one-line program. It linked before only
 by luck, and the luck was load-bearing.
+
+The gate's LIVE subject today is the MUST_WIN hooks below -- plus, since
+AXL-Host-Toolchain-Design.md §5.3, a SEPARATE `libaxl-standin.a` restoring
+these same two files for `AXL_TOOLCHAIN=host`, where newlib is absent and
+they are once again the only provider. `check_standin()` asserts what makes
+that safe: every symbol it defines must stay WEAK, so it can coexist if it
+is ever linked beside a real libc instead of repeating the five errors above.
 
 WHERE THE LINE FALLS is not a matter of taste. It falls exactly where the
 RUNTIME DEPENDENCY falls:
@@ -222,6 +233,53 @@ FORBIDDEN: dict[str, str] = {
 }
 
 
+# The stand-in archive's expected symbol set (AXL-Host-Toolchain-Design.md
+# §5.3): the same eleven leaf names FORBIDDEN says libaxl.a must not define,
+# now living in a SEPARATE archive linked only under AXL_TOOLCHAIN=host,
+# where newlib is absent and there is no second provider to collide with.
+STANDIN_EXPECTED: set[str] = {
+    "memcpy", "memset", "memmove", "memcmp", "memchr",
+    "strlen", "strcmp", "strncmp", "strchr", "strstr", "strncpy",
+}
+
+
+def check_standin(arch: str, nm: str, archive: Path) -> tuple[list[str], int]:
+    """libaxl-standin.a is the ONLY provider of the leaf C names under
+    AXL_TOOLCHAIN=host, where newlib is absent. Its symbols must stay WEAK:
+    weak is what lets it coexist if it is ever linked beside a real libc, and
+    strong would be five `multiple definition` errors exactly as the header of
+    this file describes. Asserted rather than excluded, because an exclusion
+    would stop this gate seeing a regression.
+
+    Returns (errors, count-of-symbols-actually-read) -- the count is a real
+    measurement, not len(STANDIN_EXPECTED) restated, so the caller's success
+    line reports what was READ rather than a constant that would print the
+    same 11/11 even if this function were broken and reading nothing."""
+    if not archive.exists():
+        return ([f"check-libc-overlap: FAIL ({arch}) — {archive} is missing. "
+                  f"A gate that checks nothing reports clean forever. "
+                  f"Build or stage first, e.g. "
+                  f"scripts/install.sh --arch all --cpp"], 0)
+    try:
+        defined = nm_defined(nm, archive)
+    except RuntimeError as exc:
+        # The tool could not RUN, which is a different fact from "ran and
+        # found nothing" -- nm_defined raises rather than returning {} so
+        # this cannot be misread as "archive defines zero symbols".
+        return ([f"check-libc-overlap: FAIL ({arch}) — could not read "
+                  f"{archive}: {exc}"], 0)
+    names = set(defined)
+    errs: list[str] = []
+    if names != STANDIN_EXPECTED:
+        errs.append(f"check-libc-overlap: FAIL ({arch}) — {archive} defines "
+                    f"{sorted(names)}, expected {sorted(STANDIN_EXPECTED)}.")
+    for name, bind in sorted(defined.items()):
+        if bind != "W":
+            errs.append(f"check-libc-overlap: FAIL ({arch}) — {name} in "
+                        f"{archive} is {bind}, must be WEAK (W).")
+    return (errs, len(names))
+
+
 def nm_defined(nm: str, archive: Path) -> dict[str, str]:
     """Map defined GLOBAL symbol -> nm type letter for @a archive.
 
@@ -235,11 +293,23 @@ def nm_defined(nm: str, archive: Path) -> dict[str, str]:
     Later members win, which is irrelevant here: a name defined twice INSIDE one
     archive is a different defect, and `ar` would not have accepted it into one
     link anyway.
+
+    Raises RuntimeError if @a nm could not run at all (bad path, corrupt
+    archive nm refuses to open, ...) rather than returning {} -- an empty dict
+    reads identically to "ran cleanly, archive defines nothing", and this repo
+    has paid for that conflation before (check-cxx-entry's `nm`/`objdump`
+    misreadings, CLAUDE.md's "empty is not an answer" rule). The caller
+    decides how loud to be about it; this function only refuses to lie.
     """
     out = subprocess.run(
         [nm, "--defined-only", str(archive)],
         capture_output=True, text=True,
     )
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"{nm} --defined-only {archive} exited {out.returncode}: "
+            f"{out.stderr.strip() or '(no stderr)'}"
+        )
     syms: dict[str, str] = {}
     for line in out.stdout.splitlines():
         # "<addr> T name" or, for a bss symbol, "<addr> B name".
@@ -275,6 +345,19 @@ def main(argv: list[str]) -> int:
     if built:
         candidates.append(REPO / built / "lib" / "libaxl.a")
     candidates.append(REPO / "out" / f"native-{args.arch}" / "lib" / "libaxl.a")
+
+    # Same ladder, for the separate stand-in archive (§5.3). Resolved here so a
+    # missing archive is reported by check_standin() below with the exact path
+    # this gate looked for, not a generic "not found".
+    standin_candidates = [
+        Path(prefix) / "lib" / "axl" / args.arch / "libaxl-standin.a",
+    ]
+    if built:
+        standin_candidates.append(REPO / built / "lib" / "libaxl-standin.a")
+    standin_candidates.append(
+        REPO / "out" / f"native-{args.arch}" / "lib" / "libaxl-standin.a")
+    standin_archive = next(
+        (c for c in standin_candidates if c.exists()), standin_candidates[0])
 
     # The staged GLUE OBJECTS are checked alongside the archive, because the
     # allocator bridge lives there rather than in libaxl.a and is exactly the
@@ -331,13 +414,22 @@ def main(argv: list[str]) -> int:
         print(f"check-libc-overlap: SKIP — {gcc} cannot locate libc.a")
         return 0
 
-    axl_syms = nm_defined(nm, libaxl)
-    # Glue objects fold into the same map. An object's definitions displace an
-    # archive member outright (that is the whole mechanism -- see axl-cc), so
-    # for the purpose of "who provides this name" they belong in one set.
-    for g in glue:
-        axl_syms.update(nm_defined(nm, g))
-    libc_syms = nm_defined(nm, Path(libc))
+    # nm_defined RAISES rather than returning {} if nm could not run at all --
+    # caught here once, for every reader below, so "nm crashed" cannot be
+    # misread as "these archives define nothing in common" the way the
+    # no-overlap control just below would otherwise make it look.
+    try:
+        axl_syms = nm_defined(nm, libaxl)
+        # Glue objects fold into the same map. An object's definitions displace
+        # an archive member outright (that is the whole mechanism -- see
+        # axl-cc), so for the purpose of "who provides this name" they belong
+        # in one set.
+        for g in glue:
+            axl_syms.update(nm_defined(nm, g))
+        libc_syms = nm_defined(nm, Path(libc))
+    except RuntimeError as exc:
+        print(f"check-libc-overlap: FAIL ({args.arch}) — {exc}")
+        return 1
     overlap = sorted(set(axl_syms) & set(libc_syms))
 
     # A control: if the intersection is empty, something is wrong with the
@@ -378,14 +470,25 @@ def main(argv: list[str]) -> int:
                 f"      {Path(__file__).name} with the reason newlib's cannot serve."
             )
 
-    if problems:
-        print(f"check-libc-overlap: FAIL ({args.arch}) — "
-              f"{len(problems)} of {len(overlap)} overlapping symbols")
-        print("\n".join(problems))
+    # The stand-in archive is a DIFFERENT invariant (every symbol weak, not
+    # "weak unless MUST_WIN") on a DIFFERENT archive, so it is checked and
+    # reported separately rather than folded into `problems` above -- but in
+    # the SAME invocation, so one `check-libc-overlap.py --arch X` run covers
+    # both.
+    standin_problems, standin_count = check_standin(args.arch, nm, standin_archive)
+
+    if problems or standin_problems:
+        if problems:
+            print(f"check-libc-overlap: FAIL ({args.arch}) — "
+                  f"{len(problems)} of {len(overlap)} overlapping symbols")
+            print("\n".join(problems))
+        if standin_problems:
+            print("\n".join(standin_problems))
         return 1
 
     print(f"check-libc-overlap: clean ({args.arch}) — {len(overlap)} overlapping "
-          f"symbols, {len(MUST_WIN)} must-win, rest weak")
+          f"symbols, {len(MUST_WIN)} must-win, rest weak; "
+          f"standin {standin_count}/{len(STANDIN_EXPECTED)} weak")
     return 0
 
 

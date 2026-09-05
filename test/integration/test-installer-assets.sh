@@ -52,71 +52,10 @@ trap 'rm -rf "$WORK"' EXIT
 # already_installed reads share/axl/version, and `axl uninstall` runs the
 # staged libexec/axl/install.sh -- so all three are present.
 # ---------------------------------------------------------------------------
-make_tree() {  # make_tree <dir> <version>
-    local d="$1" v="$2"
-    mkdir -p "$d/bin" "$d/share/axl" "$d/libexec/axl"
-    # The REAL dispatcher, not a stub: §20's self-heal lives in it, and a
-    # fixture that stubs the thing under test proves nothing about it.
-    install -m 0755 "$PROJECT_DIR/scripts/axl" "$d/bin/axl"
-    echo "placeholder" > "$d/bin/.axl-stub-marker"
-    printf '#!/bin/sh\necho "axl-cc %s"\n' "$v" > "$d/bin/axl-cc"
-    printf 'not-a-script\n' > "$d/bin/pe-set-debug"
-    chmod +x "$d/bin/axl-cc" "$d/bin/pe-set-debug"
-    echo "$v" > "$d/share/axl/version"
-    cp "$INSTALLER" "$d/libexec/axl/install.sh"
-    chmod 0644 "$d/libexec/axl/install.sh"
-}
-
-# The v4.4.0 host-tools tarball, reproduced: a flat `scripts/` directory with
-# no `bin/` and no share/axl/version, unpacked at top level. §14.2 measured
-# both defects and §14.1c counted the six top-level entries.
-make_legacy_host_tools() {  # make_legacy_host_tools <dir> <version>
-    local d="$1" v="$2"
-    mkdir -p "$d/scripts"
-    printf '#!/bin/bash\necho run-qemu\n' > "$d/scripts/run-qemu.sh"
-    chmod +x "$d/scripts/run-qemu.sh"
-    printf 'Apache-2.0\n' > "$d/LICENSE"
-    printf 'NOTICE\n'     > "$d/NOTICE"
-    printf '# changelog\n' > "$d/CHANGELOG.md"
-    printf '# host tools\n' > "$d/README.md"
-    echo "$v" > "$d/VERSION"
-}
-
-# The MANAGER component as it really ships: bin/axl, libexec (with the staged
-# installer), share/axl/version. No axl-cc -- that is SDK content.
-make_manager_tree() {  # make_manager_tree <dir> <version>
-    local d="$1" v="$2"
-    mkdir -p "$d/bin" "$d/share/axl" "$d/libexec/axl"
-    install -m 0755 "$PROJECT_DIR/scripts/axl" "$d/bin/axl"
-    install -m 0644 "$INSTALLER" "$d/libexec/axl/install.sh"
-    echo "$v" > "$d/share/axl/version"
-}
-
-# publish <reldir> <asset> <root|-> <version> [maker]
-#   <root> archives the tree under that single top-level directory.
-#   '-'    archives its CONTENTS at top level -- a tarbomb, the legacy shape.
-publish() {
-    local rel="$1" asset="$2" root="$3" v="$4" maker="${5:-make_tree}"
-    local stage; stage="$(mktemp -d -p "$WORK")"
-    mkdir -p "$rel"
-    if [[ "$root" == "-" ]]; then
-        "$maker" "$stage" "$v"
-        tar -C "$stage" -czf "$rel/$asset" .
-    else
-        "$maker" "$stage/$root" "$v"
-        tar -C "$stage" -czf "$rel/$asset" "$root"
-    fi
-    rm -rf "$stage"
-}
-
-# SHA256SUMS is what install.sh verifies against, and -- after D2 -- what it
-# reads to decide WHICH name this release published. Regenerate after every
-# publish, exactly as the release job does.
-seal() {  # seal <reldir> <version>
-    local rel="$1" v="$2"
-    echo "$v" > "$rel/VERSION"
-    ( cd "$rel" && sha256sum -- *.tar.gz > SHA256SUMS )
-}
+# Fixture builders live in release-fixture.sh -- test-install-lifecycle.sh
+# builds the same shape of release and a second copy would drift.
+# shellcheck source=/dev/null
+source "$(dirname "$0")/release-fixture.sh"
 
 run_installer() {  # run_installer <log> <args...>
     local log="$1"; shift
@@ -373,10 +312,15 @@ check $? "\`axl use <older>\` does not move the manager at all"
 [[ "$(readlink "$M2P/axl-sdk")" == "axl-sdk-$OLD_SDK" ]]
 check $? "...while the SDK marker does follow it"
 
-# And `axl prune` must never remove the manager: it prunes ^axl-sdk-[0-9],
-# which axl-sdk-host-tools-<ver> is not. Asserted, not assumed.
+# And `axl prune` must never remove the manager IN USE. It used to be enough
+# to say "prune walks ^axl-sdk-[0-9] and this is not that" -- but prune now
+# walks the manager family too, precisely so old generations stop piling up,
+# so the guarantee is no longer "never touches host-tools" and asserting that
+# would go red the first time a third manager root exists. What must hold is
+# that the CURRENT manager and the running prefix are never proposed.
 "$M2B/axl" prune --dry-run > "$WORK/m2-prune.log" 2>&1 || true
-! grep -qE "would remove.*axl-sdk-host-tools" "$WORK/m2-prune.log"
-check $? "axl prune never proposes removing the manager"
+_mgr_cur="$(cd -P "$M2P/axl-sdk-host-tools" 2>/dev/null && pwd)"
+! grep -qF "would remove      $_mgr_cur" "$WORK/m2-prune.log"
+check $? "axl prune never proposes removing the CURRENT manager"
 
 test_host_summary "installer asset resolution ($TEST_ARCH)"

@@ -158,14 +158,23 @@ C++ consumer.
 
 ### Requirements
 
-- **Nothing from the distro's toolchain.** `axl-cc` compiles and
-  links with bare-metal crosses that `scripts/install-toolchain.sh`
-  fetches to `/opt` — ARM's `aarch64-none-elf` and AXL's own
-  `x86_64-elf` — so an installed SDK needs no compiler, assembler or
-  linker from the distro (only `curl`, `tar`, `sha256sum`, `awk`,
-  `tr` and `xz`, to install itself and fetch those toolchains;
-  `test-host-deps-minimal.sh` proves that set is sufficient on a
-  toolchain-free Debian image). A host GCC is needed only to build
+- **Nothing from the distro's toolchain — x64 C is the one
+  exception, and it leans on the distro's own gcc instead.** `axl-cc`
+  compiles and links with bare-metal crosses that
+  `scripts/install-toolchain.sh` fetches to `/opt` — ARM's
+  `aarch64-none-elf` and AXL's own `x86_64-elf` — so an installed SDK
+  needs no compiler, assembler or linker from the distro (only
+  `curl`, `tar`, `sha256sum`, `awk`, `tr` and `xz`, to install itself
+  and fetch those toolchains; `test-host-deps-minimal.sh` proves that
+  set is sufficient on a toolchain-free Debian image). C++ and aa64
+  always need the bare-metal cross above. A **C-only x64** build is
+  the one exception, and it goes the other way: `axl-cc` defaults to
+  `AXL_TOOLCHAIN=auto`, which falls back to the *distro's own*
+  `gcc`/`binutils` when the bare-metal cross isn't installed at all —
+  no `/opt` download needed for it. That fallback links with no C
+  library at all (`<string.h>`, `<stdio.h>`, `<stdlib.h>` aren't
+  available under it — use AXL's own API instead); see **Using your
+  own toolchain** below. A host GCC is otherwise needed only to build
   axl-sdk itself from source.
 - No EDK2, no gnu-efi, no external UEFI SDK.
 
@@ -188,7 +197,9 @@ axl-install-toolchain x64          # or: aa64, or: all
 ```
 
 `sh install.sh --toolchain x64` does both in one command if you already know
-which you want.
+which you want. Skip this step for a C-only x64 build — `axl-cc` builds it
+with your own `gcc` instead; add it when you need C++, aa64, or the
+bare-metal build specifically.
 
 It resolves the latest release, verifies the download against
 `SHA256SUMS` — not optional — and unpacks into a versioned
@@ -201,7 +212,11 @@ under `/opt`.
 The install then maintains itself:
 
 ```bash
-axl update            # move to the newest release
+axl update            # move to the newest release (and re-install the
+                      #   cross toolchains you ALREADY have, at the version
+                      #   the new SDK pins; an arch without one is never
+                      #   downloaded, and AXL_TOOLCHAIN=host declines)
+axl update --no-toolchain   # ... or skip that: SDK and manager only
 axl use 4.4.0         # switch to a version; downloads it only if absent
 axl list              # installed versions, * marking current
 axl uninstall         # remove a version, its links and its current marker
@@ -271,7 +286,12 @@ sha256sum --ignore-missing -c SHA256SUMS
 ### Using your own toolchain
 
 `AXL_TOOLCHAIN` selects **which** toolchain supplies the compiler
-and binutils; the `AXL_*` variables say **where** it is:
+and binutils; the `AXL_*` variables say **where** it is. `axl-cc`'s
+x64 default is `auto`: the bare-metal cross under `/opt` when it's
+installed, your own host `gcc`/`binutils` when it isn't (`axl-cc
+--verbose` and `axl toolchain list` both say which one a build
+resolved to). aa64 has no host fallback and always uses the
+bare-metal cross.
 
 ```bash
 # the default: whatever axl-install-toolchain put in /opt
@@ -286,8 +306,16 @@ make
 ```
 
 `axl-cc` honours the same variables, so a consumer build picks up
-the choice without changing its own build files. The toolchain
-must target **bare metal**, not `*-linux-gnu`.
+the choice without changing its own build files. Force a specific
+variant instead of `auto` with `AXL_TOOLCHAIN=axl` (the bare-metal
+cross, and a hard error rather than a fall-back if `/opt` has
+nothing — the reproducibility pin CI uses) or `AXL_TOOLCHAIN=host`
+(the host's own `gcc`, x64 only, C only — no C++, and no C library
+at all: use AXL's own API, not `<string.h>`). Under `axl` or `cross`
+the toolchain must target **bare metal**, not `*-linux-gnu` — `host`
+is the deliberate exception, compiling `-nostdinc` against the host
+compiler's own freestanding headers with no libc behind them. Full
+story: [`AXL-Host-Toolchain-Design.md`](docs/AXL-Host-Toolchain-Design.md).
 
 Leaving a variable unset under `cross` is refused by name rather
 than falling back — a silent fallback is what made the old

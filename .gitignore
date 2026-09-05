@@ -83,3 +83,8 @@ test/integration/.last-run-stamp
 
 # Skip-cache keys: one machine's run history, not a property of the tree.
 test/integration/.test-cache/
+
+# Subagent-driven-development scratch: one workspace per plan (ledger, briefs,
+# review packages). Session bookkeeping, not a property of the tree -- the
+# committed record is git history plus docs/superpowers/plans/.
+.superpowers/

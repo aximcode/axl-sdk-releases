@@ -153,6 +153,30 @@ fi
 AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-axl}"
 case "$AXL_TOOLCHAIN" in
     axl) ;;
+    auto)
+        # MAPPED to axl, not rejected. `auto` is axl-cc's x64 default and the
+        # value its --verbose reports, so it is the spelling a consumer is
+        # most likely to have exported -- and there is nothing here for it to
+        # choose between, since the SDK builds ITSELF bare-metal either way
+        # (AXL-Host-Toolchain-Design.md section 8). The packager must not be
+        # the one build path where the default's own name is a fatal typo.
+        AXL_TOOLCHAIN="axl"
+        ;;
+    host)
+        # Refused with its own reason rather than falling into the
+        # unknown-variant arm below: `host` IS a variant, just not one that
+        # builds this. Same three facts as the Makefile and axl-cc's help --
+        # a variant the three build paths describe differently is the drift
+        # `make check-flag-parity` exists over.
+        log_error "AXL_TOOLCHAIN=host does not build the SDK."
+        log_error "It governs what a CONSUMER compiles with axl-cc; the SDK"
+        log_error "builds ITSELF with the bare-metal toolchain on both arches"
+        log_error "(docs/AXL-Host-Toolchain-Design.md section 8)."
+        log_error "Use 'axl' here -- or 'auto', which means 'axl' for this"
+        log_error "build -- and set AXL_TOOLCHAIN=host on axl-cc when you"
+        log_error "compile against the result."
+        exit 1
+        ;;
     cross)
         AXL_X64_GCC_DEFAULT=""
         AXL_X64_GXX_DEFAULT=""
@@ -163,7 +187,8 @@ case "$AXL_TOOLCHAIN" in
         ;;
     *)
         log_error "AXL_TOOLCHAIN=$AXL_TOOLCHAIN is not a toolchain variant."
-        log_error "Use 'axl' (the default) or 'cross' (one you supply, named"
+        log_error "Use 'axl' (the default), 'auto' (the same thing here, and"
+        log_error "axl-cc's x64 default) or 'cross' (one you supply, named"
         log_error "by AXL_X64_GCC / AXL_AA64_GCC and the matching _GXX and"
         log_error "_BINUTILS_PREFIX)."
         exit 1
@@ -277,12 +302,13 @@ fi
 #
 #   <prefix>/bin/axl-cc, pe-set-debug
 #   <prefix>/include/axl.h, axl/, uefi/
-#   <prefix>/lib/axl/<arch>/libaxl.a, axl-crt0-*.o, axl-reloc.o, ...
+#   <prefix>/lib/axl/<arch>/libaxl.a, libaxl-standin.a, axl-crt0-*.o,
+#                          axl-reloc.o, ...
 #   <prefix>/lib/axl/elf_<arch>_efi.lds
 #   <prefix>/lib/cmake/axl/axl-config.cmake       (find_package(axl))
 #   <prefix>/lib/pkgconfig/axl{,-<arch>}.pc        (pkg-config)
 #   <prefix>/share/axl/{version,build-date,backend}      (metadata)
-#   <prefix>/share/axl/{pci-ids,pci-class,usb-ids,jedec}.json5
+#   <prefix>/share/axl/*.json5  (pci-ids, usb-ids, jedec)
 #                                                        (optional sidecars)
 #   <prefix>/share/axl/scripts/{pci,usb}-ids-to-json5.py + _ids_parser.py
 #                                                        (bulk converters)
@@ -369,6 +395,10 @@ for arch in "${ARCHES[@]}"; do
 
     mkdir -p "$PREFIX/lib/axl/$arch"
     install -C -m 644 "$LIBAXL_DIR/$local_prefix/lib/libaxl.a"              "$PREFIX/lib/axl/$arch/"
+    # THE STAND-IN LIBC (AXL-Host-Toolchain-Design.md §5.3) -- eleven weak leaf
+    # functions that complete a link with no libc at all (AXL_TOOLCHAIN=host).
+    # A separate archive from libaxl.a; staged unconditionally, same as it.
+    install -C -m 644 "$LIBAXL_DIR/$local_prefix/lib/libaxl-standin.a"      "$PREFIX/lib/axl/$arch/"
     install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-native.o"   "$PREFIX/lib/axl/$arch/"
     install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-minimal.o"  "$PREFIX/lib/axl/$arch/"
     if [[ "$BUILD_CPP" == "1" ]]; then
@@ -497,11 +527,16 @@ date -u '+%Y-%m-%d'    | write_if_changed "$PREFIX/share/axl/build-date"
 # (the auto-discovery companion path) or pass --ids-file explicitly.
 # New class triplets, USB vendors, JEDEC manufacturer codes can all
 # land via a JSON5 update without rebuilding any consumer binary.
-for sidecar in pci-ids.json5 \
-               usb-ids.json5 jedec.json5; do
-    if [[ -f "$LIBAXL_DIR/share/$sidecar" ]]; then
-        install -C -m 644 "$LIBAXL_DIR/share/$sidecar" "$PREFIX/share/axl/$sidecar"
-    fi
+# BY GLOB, never a list. The identical list in release.yml's tools-tarball
+# step named the PCI files only and was never revisited when lsusb and memspd
+# grew sidecars, so v4.6.0 shipped both tools without their databases. Two
+# staging paths, one of them silently a subset, and nothing compared them --
+# `make check-tools-sidecars` now checks BOTH read share/ by glob.
+shopt -s nullglob
+_sidecars=("$LIBAXL_DIR"/share/*.json5)
+shopt -u nullglob
+for sidecar in "${_sidecars[@]}"; do
+    install -C -m 644 "$sidecar" "$PREFIX/share/axl/$(basename "$sidecar")"
 done
 
 # Bulk-conversion scripts for the canonical pci.ids / usb.ids text

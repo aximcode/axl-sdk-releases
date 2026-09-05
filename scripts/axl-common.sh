@@ -901,6 +901,25 @@ stage_boot_shell() {
         launcher=$(find_shell_launcher "$arch" "$build") || launcher=""
         if [[ -n "$launcher" && "$mode" != "1" ]] &&
            shell_launcher_memo_present "$arch" "$launcher"; then
+            # SAY SO. Falling back is correct, but it costs ~4.6 s on EVERY
+            # boot of this firmware, and until now nothing reported it: the
+            # suite simply ran slower with no visible cause. On a 180-boot run
+            # that is ~14 minutes attributable to a file in a cache directory.
+            #
+            # Printed unconditionally rather than behind --verbose, because the
+            # whole defect is that the cost was INVISIBLE, and a diagnostic you
+            # have to already suspect is one you will not switch on. It fires
+            # only when a memo actually applies, which is rare -- and if it IS
+            # printing on every boot, that repetition is the finding.
+            local _memo
+            _memo=$(shell_launcher_memo_path "$arch" "$launcher" 2>/dev/null || echo '?')
+            echo "run-qemu: shell launcher SKIPPED for this firmware — this boot pays" >&2
+            echo "          the Shell's ~4.6 s startup countdown." >&2
+            echo "          firmware: ${FW_CODE:-unknown}" >&2
+            echo "          memo:     $_memo" >&2
+            [[ -f "$_memo" ]] && sed -n 's/^recorded=/          recorded: /p' "$_memo" >&2
+            echo "          Delete that file to retry; a firmware or launcher rebuild" >&2
+            echo "          retries anyway. AXL_SHELL_LAUNCHER=1 forces it on." >&2
             launcher=""
         fi
     fi

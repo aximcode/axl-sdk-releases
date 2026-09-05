@@ -8,8 +8,13 @@
 # path, the script reports it and exits 0 without touching anything.
 #
 # Uses sudo for the /opt extract step when not already root; the script prompts when it gets
-# there. Set the matching override variable (AXL_AA64_GXX / AXL_X64_GXX) to
-# use a toolchain installed elsewhere instead -- see axl-toolchains.conf.
+# there. If you already have a toolchain elsewhere, set the matching override
+# variable (AXL_AA64_GXX / AXL_X64_GXX) INSTEAD OF RUNNING THIS SCRIPT and
+# every consumer resolves through it -- see axl-toolchains.conf "OVERRIDING".
+# This script does NOT read those variables: it installs at the manifest's
+# path under INSTALL_ROOT (--prefix, default /opt), which is why `axl update`
+# declines to carry an override-located toolchain and tells you to run this
+# with --prefix instead (AXL-Distribution-Design.md 21a.4).
 #
 # Usage: ./scripts/install-toolchain.sh [aa64|x64|all]     (default: aa64)
 #
@@ -226,6 +231,36 @@ fetch_hint() {
     echo "       with the SDK, so tampering is still caught." >&2
 }
 
+# THE RECEIPT (§21). `axl prune` deletes a toolchain root only if it carries
+# one, because the family stem it derives from the manifest also matches a
+# developer's own unpacked ARM toolchain of a different target triple -- and
+# §12.5 required "only roots recorded in a manifest we wrote" from the start.
+# Fails safe: no receipt, not ours, left alone.
+#
+# key=value, the axl-toolchains.conf shape: simultaneously valid sh and valid
+# make, and it keeps this script free of a JSON dependency on a bare machine.
+# Written LAST, after the tree is known good, so a half-extracted root is
+# never marked as ours.
+write_receipt() {  # write_receipt <root> <arch> <version> <source> <sha256>
+    local root="$1" arch="$2" ver="$3" src="$4" sha="$5"
+    [[ -d "$root" ]] || return 0
+    # ARGV, not string splicing. `sh -c "cat > '$root/...'"` breaks on a path
+    # containing an apostrophe and EXECUTES one containing `'; cmd; '` -- and
+    # $root comes from --prefix/INSTALL_ROOT, under sudo when /opt needs it.
+    # An explicit mode too: sudo resets umask, and a 0600 receipt would make
+    # prune decline to remove our OWN roots, indistinguishable from an
+    # unmarked one.
+    as_root_for "$root" sh -c 'umask 022; cat > "$1"' sh "$root/.axl-receipt" <<EOF
+AXL_RECEIPT_KIND=toolchain
+AXL_RECEIPT_ARCH=$arch
+AXL_RECEIPT_VERSION=$ver
+AXL_RECEIPT_SOURCE=$src
+AXL_RECEIPT_SHA256=$sha
+AXL_RECEIPT_INSECURE_FETCH=${AXL_INSECURE_FETCH:-0}
+AXL_RECEIPT_INSTALLED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+}
+
 AA64_SHA256="${AXL_AA64_TOOLCHAIN_SHA256:-}"
 
 install_aa64() {
@@ -238,6 +273,19 @@ install_aa64() {
         if [[ "$installed" == *"${AXL_AA64_TOOLCHAIN_VERSION%%.rel*}"* ]]; then
             echo "[install-toolchain] aa64 already installed: $gxx"
             echo "                    $installed"
+            # MARK IT ANYWAY. `axl prune` deletes a toolchain root only if it
+            # carries a receipt, and this early return is the path every
+            # already-installed tree takes -- so without this, every toolchain
+            # installed before receipts existed is unprunable forever and
+            # re-running this command (the documented remedy) does nothing.
+            # Cheap and idempotent, so it also re-marks a root whose receipt
+            # was lost. It WARNS on failure rather than passing silently: this
+            # is the path the upgrade notes tell people to run, and a remedy
+            # that quietly does nothing is the bug it exists to fix (a
+            # read-only /opt is the case that found this).
+            write_receipt "$dir" aa64 "$AXL_AA64_TOOLCHAIN_VERSION" \
+                          "$AA64_URL" "$AA64_SHA256" \
+                || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
             return 0
         fi
         echo "[install-toolchain] WARNING: existing aa64 install at" \
@@ -272,6 +320,8 @@ install_aa64() {
         return 1
     fi
     echo "[install-toolchain] installed: $gxx"
+    write_receipt "$dir" aa64 "$AXL_AA64_TOOLCHAIN_VERSION" "$AA64_URL" "$AA64_SHA256" \
+        || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
     "$gxx" --version | head -1 | sed 's/^/                    /'
     print_env aa64 "$dir" "$AXL_AA64_TOOLCHAIN_DIR" \
         "$AXL_AA64_GCC_DEFAULT" "$AXL_AA64_GXX_DEFAULT" \
@@ -286,6 +336,11 @@ install_x64() {
     if [[ -x "$gxx" ]]; then
         echo "[install-toolchain] x64 already installed: $gxx"
         "$gxx" --version | head -1 | sed 's/^/                    /'
+        # Same as aa64 above: this is the path that re-marks an existing tree.
+        write_receipt "$dir" x64 "$AXL_X64_TOOLCHAIN_VERSION" \
+                      "${AXL_X64_TOOLCHAIN_URL:-unknown}" \
+                      "${AXL_X64_TOOLCHAIN_SHA256:-unknown}" \
+            || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
         return 0
     fi
 
@@ -311,10 +366,40 @@ install_x64() {
                     && as_root_for "$INSTALL_ROOT" tar -xJf "$tmp/$tarball" -C "$INSTALL_ROOT"
                 if [[ -x "$gxx" ]]; then
                     echo "[install-toolchain] installed: $gxx"
+                    write_receipt "$dir" x64 "$AXL_X64_TOOLCHAIN_VERSION" \
+                                  "$url" "$sha" \
+                        || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
                     return 0
                 fi
-                echo "[install-toolchain] WARNING: post-extract g++ missing at" \
-                     "$gxx; falling back to a source build" >&2
+                # DO NOT SOURCE-BUILD AROUND THIS. The download worked and
+                # the sha MATCHED, so the tarball is the one the manifest
+                # points at -- it simply is not the version DIR names. That is
+                # the same "manifest and artifact disagree" fact the checksum
+                # branch below refuses to build around, and it deserves the
+                # same answer: a ~40 minute compile that ends in a working
+                # toolchain would hide the inconsistency until the next bump.
+                # `make check-toolchain-conf` now catches this at commit time;
+                # this is the backstop for a prefix staged before that gate.
+                # `| head -1` WOULD ABORT THIS ENTIRE BLOCK. head exits after
+                # one line, tar takes SIGPIPE, pipefail promotes 141 to the
+                # substitution's status and `set -e` (line 21) kills the script
+                # -- before any of the eight echoes below. Silently, with exit
+                # 141, in exactly the case this diagnostic exists for. awk
+                # reads to EOF, so tar always finishes writing.
+                local _got
+                _got="$(tar -tJf "$tmp/$tarball" 2>/dev/null \
+                        | awk -F/ 'NR == 1 { print $1 }')" || _got=""
+                echo "[install-toolchain] ERROR: extracted $tarball, but no" \
+                     "g++ at" >&2
+                echo "                    $gxx" >&2
+                [[ -n "$_got" ]] && \
+                    echo "                    the tarball contains: $INSTALL_ROOT/$_got" >&2
+                echo "" >&2
+                echo "  The manifest disagrees with itself: AXL_X64_TOOLCHAIN_URL" >&2
+                echo "  delivers one version and AXL_X64_TOOLCHAIN_DIR names another." >&2
+                echo "  Fix the pair in axl-toolchains.conf (\`make check-toolchain-conf\`" >&2
+                echo "  reports it); do not wait out a source build that would mask it." >&2
+                return 1
             else
                 # A checksum mismatch is NOT something to build around
                 # silently: it means the manifest and the artifact disagree,
@@ -358,6 +443,8 @@ EOF
         return 1
     fi
     echo "[install-toolchain] installed: $gxx"
+    write_receipt "$dir" x64 "$AXL_X64_TOOLCHAIN_VERSION" "source-build" "-" \
+        || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
     print_env x64 "$dir" "$AXL_X64_TOOLCHAIN_DIR" \
         "$AXL_X64_GCC_DEFAULT" "$AXL_X64_GXX_DEFAULT" \
         "$AXL_X64_BINUTILS_PREFIX_DEFAULT"

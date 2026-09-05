@@ -173,7 +173,41 @@ after verifying the file is byte-identical again.
 ### Build gates (all must be green before commit)
 
 `./scripts/verify.sh` runs everything below concurrently and prints
-one table; prefer it over running these individually.
+one table; prefer it over hand-running these individually.
+
+**MATCH THE GATE TO THE CHANGE — the full set is not the default.**
+`verify.sh` has exactly three jobs (`lint`, `make`, `docs`) and takes
+`--only=<csv>` / `--no-docs`. A filtered run PRINTS WHAT IT DID NOT RUN,
+so it cannot be mistaken for a full one.
+
+| what changed | the gate |
+|---|---|
+| prose / design docs only | `verify.sh --only=docs` (~1m54s vs ~10m) |
+| shell tooling (`axl`, `axl-cc`, `install.sh`) | the covering integration test(s) DIRECTLY — not the suite |
+| C/C++/headers | `verify.sh` + the covering test |
+| before a push | `run-integration.sh` — cache ON (default), DEFAULT worker count |
+| cutting a release | add `--no-cache`; still the default worker count |
+
+**NEVER run `build-docs.sh` after `verify.sh`.** It runs INSIDE
+`verify.sh` (`scripts/verify.sh:121`), so calling it separately pays for
+Sphinx TWICE. Its own header says so at `:29`.
+
+**Run ONE test by executing it directly** — `./test/integration/test-foo.sh`.
+`run-integration.sh` has no `--only=<test>`; its filters are `--ci`
+(drops `local-only=1`, cache OFF), `--only-local` (the inverse),
+`--shard i/K` and `--no-build`. The suite is 201 tests; the ten dearest
+declare ~1,260s between them, led by `test-cpu-spike-qemu.sh` (233s),
+`test-host-toolchain-qemu.sh` (180s) and `test-consumer-install.sh`
+(150s). Running all of it to check a message string is how a 30-second
+edit costs fifteen minutes.
+
+**Do not re-run a suite that was green earlier in the same session when
+your change cannot reach it** — and say which you skipped and why. That
+is a claim to justify, not an excuse: "nothing I touched can affect it"
+is only honest after checking what CONSUMES what you changed. Output text
+is an interface — a message string can be exact-matched by a test in
+another file (`test-install-lifecycle.sh:546` broke exactly that way).
+`grep -rn` the string before deciding.
 
 Adding a gate is ONE edit: append it to `LINT_GATES` in the Makefile.
 `verify.sh` reads that list back via `make -s print-lint-gates` rather
@@ -443,8 +477,11 @@ make tests                                  # build test EFIs
 
 # `packaging/install.sh` is the install path for end users — release.yml
 # publishes it plus VERSION, SHA256SUMS and three versioned tarballs.
-# The .deb/.rpm RETIRED with D2 (AXL-Distribution-Design.md §17/§19);
-# scripts/build-packages.sh survives only until D7. See README.md.
+# The .deb/.rpm RETIRED with D2 (AXL-Distribution-Design.md §17/§19), and D7
+# deleted scripts/build-packages.sh with them -- there is no package build in
+# the tree. A consumer whose policy mandates one gets it rebuilt from git
+# history (§17.4), not from a script kept warm for a hypothetical. See
+# README.md.
 ```
 
 **A CFLAGS change forces a rebuild.** Objects do not depend on the Makefile,

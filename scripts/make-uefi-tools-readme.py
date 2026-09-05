@@ -36,6 +36,43 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEVKIT_CONF = ROOT / "devkit.conf"
+SHARE = ROOT / "share"
+
+# One entry per share/*.json5. The SECTION is derived from what share/ holds,
+# not from this table: a sidecar with no entry here fails the generator rather
+# than shipping undocumented, and a described file that no longer exists never
+# reaches the text. What this replaced described pci-ids.json5 alone -- an
+# accurate account of what the tarball staged, and the tarball was missing two.
+SIDECAR_DOCS = {
+    "pci-ids.json5": (
+        "Schema-2 unified file with two independent sections: vendors[] for "
+        "VID/DID/subsystem names; classes[] for base/subclass/progIF "
+        "triplets. Curated starter set covering QEMU, common server NICs, "
+        "NVMe, and GPUs. Bulk-populate from canonical pci.ids via "
+        "scripts/pci-ids-to-json5.py in the SDK source tree. New class "
+        "triplets (CXL Memory Expanders etc.) can be added without "
+        "rebuilding any tool -- drop a JSON5 update next to the .efi and "
+        "lspci picks it up on next launch."
+    ),
+    "usb-ids.json5": (
+        "USB vendor and device names. Curated starter set covering common "
+        "HID, NIC, hub and storage devices. Bulk-populate from canonical "
+        "usb.ids via scripts/usb-ids-to-json5.py in the SDK source tree."
+    ),
+    "jedec.json5": (
+        "JEDEC JEP-106 manufacturer codes, so memspd names a module's vendor "
+        "rather than printing a bank/offset pair. Manually curated -- JEP-106 "
+        "is not published in a machine-readable form -- covering common "
+        "server DRAM vendors."
+    ),
+}
+
+# Which tool reads which, for the per-file heading.
+SIDECAR_CONSUMER = {
+    "pci-ids.json5": "lspci",
+    "usb-ids.json5": "lsusb",
+    "jedec.json5": "memspd",
+}
 
 # Width of the `<name>.efi` column, so descriptions line up. Wide enough for
 # the longest tool name plus a gap; a name that outgrows it gets one space
@@ -54,6 +91,10 @@ WRAP = 78
 ASCII_FOLD = {
     "\u2014": "--", "\u2013": "-", "\u2018": "'", "\u2019": "'",
     "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
+    # Spelled out, not dropped: this one appears inside iPXE's GPL-2.0
+    # section 3(b) written offer, where legibility at a UEFI Shell prompt is
+    # the whole point of carrying the notice.
+    "\u00a7": "section ",
 }
 
 
@@ -103,6 +144,41 @@ def descriptions() -> dict[str, str]:
     return out
 
 
+# Returned instead of a filename list when share/ itself is empty -- a
+# different fact from "this file has no description", and a different fix.
+EMPTY_SHARE: list[str] = []
+
+
+def sidecar_section() -> str | list[str]:
+    """Render the sidecar block from share/, or name the files it cannot.
+
+    Returns the text on success; ``EMPTY_SHARE`` if share/ holds no sidecars
+    at all; otherwise the list of filenames with no ``SIDECAR_DOCS`` entry.
+    share/ is the authority: this cannot describe a file the tarball does not
+    carry, and cannot stay silent about one it does.
+    """
+    files = sorted(f.name for f in SHARE.glob("*.json5"))
+    if not files:
+        # Distinct from "undocumented": an empty share/ is share/ VANISHING,
+        # and telling the reader to write a description for a file that does
+        # not exist sends them after the wrong thing.
+        return EMPTY_SHARE
+    undocumented = [f for f in files if f not in SIDECAR_DOCS]
+    if undocumented:
+        return undocumented
+
+    out: list[str] = ["Name databases (auto-discovered next to the .efi):"]
+    for name in files:
+        consumer = SIDECAR_CONSUMER.get(name)
+        out.append(f"  {name}" + (f"    (consumed by {consumer})"
+                                  if consumer else ""))
+        out.extend(textwrap.wrap(SIDECAR_DOCS[name], width=WRAP,
+                                 initial_indent="    ",
+                                 subsequent_indent="    "))
+        out.append("")
+    return "\n".join(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--arch", required=True, choices=("x64", "aa64"),
@@ -137,34 +213,41 @@ def main() -> int:
             lines.append(" " * (2 + NAME_COL) + cont)
     lines.append("")
 
-    non_ascii = [c for c in "\n".join(lines) if ord(c) > 127]
+    sidecars = sidecar_section()
+    if isinstance(sidecars, list):
+        if not sidecars:
+            return fail(f"{SHARE} holds no *.json5 -- the tools tarball ships "
+                        "the name databases from there, so this would publish "
+                        "lspci, lsusb and memspd with no names at all.")
+        return fail("share/*.json5 with no SIDECAR_DOCS entry: "
+                    + ", ".join(sidecars)
+                    + " -- the tarball ships every share/*.json5, so add a "
+                      "description rather than shipping one undocumented.")
+
+    # ONE document, folded ONCE, checked ONCE -- and in that order, so the
+    # check sees exactly the bytes that will be written.
+    #
+    # This guard used to run over the derived tool list alone, which is a third
+    # of the file: the hand-written TAIL shipped em-dashes and a section sign
+    # for as long as it existed, and SIDECAR_DOCS is hand-written English prose
+    # in a .py -- the likeliest source of the next one. Folding without
+    # re-checking is the same hole one step along: any character absent from
+    # ASCII_FOLD passes through silently. `cat README.txt` at the UEFI Shell
+    # draws a block for each, so this is legibility, not pedantry.
+    document = to_ascii("\n".join(lines) + "\n" + sidecars + "\n"
+                        + TAIL.format(arch=args.arch))
+    non_ascii = [c for c in document if ord(c) > 127]
     if non_ascii:
-        return fail("the generated tool list is not ASCII: "
+        return fail("the generated README is not ASCII: "
                     + ", ".join(sorted(set(repr(c) for c in non_ascii)))
                     + " -- add it to ASCII_FOLD; this file is read with `cat` "
                       "in the UEFI Shell, which draws a block for each.")
 
-    sys.stdout.write("\n".join(lines))
-    sys.stdout.write("\n" + TAIL.format(arch=args.arch))
+    sys.stdout.write(document)
     return 0
 
 
-TAIL = """PCI name database (consumed by lspci):
-  pci-ids.json5    Schema-2 unified file with two
-                   independent sections: vendors[] for
-                   VID/DID/subsystem names; classes[] for
-                   base/subclass/progIF triplets. Curated
-                   starter set covering QEMU, common server
-                   NICs, NVMe, and GPUs. Bulk-populate from
-                   canonical pci.ids via
-                   scripts/pci-ids-to-json5.py in the SDK
-                   source tree. New class triplets (CXL
-                   Memory Expanders etc.) can be added
-                   without rebuilding any tool — drop a
-                   JSON5 update next to the .efi and lspci
-                   picks it up on next launch.
-
-Drivers included (drivers/{arch}/):
+TAIL = """Drivers included (drivers/{arch}/):
   ipxe-all.efidrv     Universal NIC driver — covers Intel,
                       Broadcom, Realtek PCI/USB, Atheros, 3Com,
                       AMD, USB CDC-ECM/NCM/RNDIS, and many more.

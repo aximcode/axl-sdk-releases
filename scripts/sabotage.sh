@@ -17,6 +17,36 @@
 #      this", which is the exact opposite of the truth. This script asserts the
 #      file actually changed before running anything.
 #
+# Three more turned up building the AXL_TOOLCHAIN=auto/host feature
+# (AXL-Host-Toolchain-Design.md), where this script's OWN mechanics were the
+# trap rather than the sabotage's content:
+#
+#   3. NO SHELL ON THE COMMAND LINE. `"${CMD[@]}"` execs the argv array
+#      directly -- there is no shell in between `--` and CMD. A bare STRING
+#      meant as a shell one-liner (`-- 'foo && bar'`) is looked up as a
+#      single executable NAMED "foo && bar", is not found, and exits 127 --
+#      and `--expect-fail` reads 127 as "the sabotage was detected". A
+#      sabotage that never RAN is indistinguishable from one the suite
+#      caught unless you notice the 127. Pass `bash -c '...'` as CMD (or a
+#      real executable) when the command needs shell syntax.
+#
+#   4. A SABOTAGED SOURCE THE COMMAND NEVER RUNS. `scripts/install.sh`
+#      COPIES `scripts/axl-cc` and `scripts/axl` into the staged prefix a
+#      test builds against; sabotaging the SOURCE does nothing to a test
+#      that only re-runs the already-staged copy. Re-stage INSIDE the
+#      sabotage command -- CMD as `bash -c 'install.sh ... && test-foo.sh'`
+#      -- not before or after it, or the sabotage is restored before the
+#      copy that matters ever gets rebuilt.
+#
+#   5. A SABOTAGE THAT PROVES LESS BY BREAKING MORE. Deleting a whole file or
+#      archive that a build hard-refuses to run without fails EVERY caller
+#      identically -- a strong-looking result that shows only "the thing
+#      must exist", not that the SPECIFIC mechanism under test does its job.
+#      Emptying its CONTENTS instead (e.g. the source list a stand-in
+#      archive builds from, leaving an empty-but-present archive) isolates
+#      the real mechanism and lets the suite discriminate which callers
+#      actually needed it from which did not.
+#
 # It also restores on Ctrl-C / failure (trap), and verifies the restored file is
 # byte-identical to the original via sha256 -- a restore that silently did not
 # restore is worse than no restore at all.
@@ -56,7 +86,7 @@ while [[ $# -gt 0 ]]; do
         -p) PATCHES+=("$2"); shift 2 ;;
         --expect-fail) EXPECT_FAIL=1; shift ;;
         -k|--keep) KEEP=1; shift ;;
-        -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,72p' "${BASH_SOURCE[0]}"; exit 0 ;;
         --) shift; break ;;
         *) echo "sabotage.sh: unknown option $1 (did you forget '--'?)" >&2; exit 2 ;;
     esac

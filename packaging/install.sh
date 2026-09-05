@@ -80,6 +80,10 @@ usage: sh install.sh [options]
   --base-url URL      fetch from here instead of GitHub (mirror, or a local dir)
 
 Environment:
+  AXL_BIN_DIR         where to put the command links, when --bin-dir is not
+                      given. Recorded in the prefix, so `axl use` / `axl
+                      uninstall` later relink and unlink the same directory
+                      rather than guessing it again.
   AXL_INSECURE_FETCH=1  skip TLS verification when downloading. For a host
                       behind a corporate MITM proxy whose CA is not installed.
                       Downloads are still checked against SHA256SUMS -- but
@@ -125,7 +129,11 @@ parse_args() {
     done
     case "$TOOLCHAIN" in ""|x64|aa64|all) ;; *) die "--toolchain wants x64, aa64 or all" ;; esac
     PREFIX_ROOT="${PREFIX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}}"
-    BIN_DIR="${BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+    # AXL_BIN_DIR is read HERE too, not only by `axl`. It used to be honoured
+    # by the dispatcher alone, so `AXL_BIN_DIR=/x sh install.sh` installed into
+    # ~/.local/bin while `AXL_BIN_DIR=/x axl use ...` relinked into /x -- the
+    # same split-brain the recorded bin dir below exists to remove.
+    BIN_DIR="${BIN_DIR:-${AXL_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}}"
     case "$COMPONENT" in
         sdk)        STEM="axl-sdk";            CURRENT="axl-sdk";            LABEL="AXL SDK" ;;
         host-tools) STEM="axl-sdk-host-tools"; CURRENT="axl-sdk-host-tools"; LABEL="AXL host tools" ;;
@@ -148,11 +156,37 @@ check_package_install() {
     [ "$ASSUME_YES" -eq 1 ] || die "re-run with --yes to install anyway"
 }
 
+# VERSION becomes a directory-name component ($STEM-$VERSION) that lands
+# straight in `rm -rf` (do_uninstall) or a same-filesystem `mv`
+# (extract_tree). It is reached from three places -- the fetched VERSION
+# asset, --version, and --use -- and all three are untrusted once you count a
+# MITM'd fetch or a copy-pasted command. Every version this project has ever
+# shipped is bare X.Y.Z (bump-version.sh enforces that going in); release.yml
+# additionally anticipates a prerelease suffix (v0.1.3-rc1, v0.0.0-test) for
+# tags cut by hand outside cut-release.sh, so that shape is accepted too. The
+# literal "axl-sdk-"/"axl-sdk-host-tools-" prefix means this was never a route
+# to / or ~ -- but a `/`, `..`, whitespace or a shell metacharacter in VERSION
+# still has no business becoming a path component, so all of that is refused
+# outright rather than merely checked for non-empty.
+validate_version() {
+    case "$1" in
+        *[!0-9A-Za-z.-]*) die "not a valid version: '$1'" ;;
+    esac
+    case "$1" in
+        *..*) die "not a valid version: '$1'" ;;
+    esac
+    case "$1" in
+        [0-9]*.[0-9]*.[0-9]*) ;;
+        *) die "not a valid version: '$1'" ;;
+    esac
+}
+
 # The prefix is self-contained (§12.3), so removal is rm -rf plus the links.
 # Links are RESOLVED rather than guessed, so one pointing elsewhere is safe.
 do_uninstall() {
     _target=""
     if [ -n "$VERSION" ]; then
+        validate_version "$VERSION"
         _target="$PREFIX_ROOT/$STEM-$VERSION"
     elif [ -L "$PREFIX_ROOT/$CURRENT" ]; then
         _target="$(cd -P "$PREFIX_ROOT/$CURRENT" 2>/dev/null && pwd)" || _target=""
@@ -176,11 +210,15 @@ do_uninstall() {
 }
 
 resolve_version() {
-    [ -n "$VERSION" ] && return 0
+    if [ -n "$VERSION" ]; then
+        validate_version "$VERSION"
+        return 0
+    fi
     _vurl="${BASE_URL:-$BASE/latest/download}/VERSION"
     VERSION="$(curl $INSECURE -fsSL "$_vurl" 2>/dev/null | tr -d ' \t\r\n')" \
         || die "could not resolve the latest version from $_vurl"
     [ -n "$VERSION" ] || die "the VERSION asset at $_vurl was empty"
+    validate_version "$VERSION"
 }
 
 # Skip the work when the target is already there. `axl update` on a current
@@ -316,6 +354,18 @@ link_tree() {
     ensure ln -sfn "$DIR" "$PREFIX_ROOT/$CURRENT"
 
     ensure mkdir -p "$BIN_DIR"
+    # RECORD IT. Which directory the links live in is a fact known only here,
+    # at install time -- it is not derivable from the prefix, and `axl use` /
+    # `axl uninstall` re-exec this script and have to pass a --bin-dir. They
+    # used to recompute it from the environment, so an install placed with an
+    # explicit --bin-dir got its links written to a DIFFERENT directory than
+    # the ones already on PATH: the rollback path moved the marker while the
+    # stale axl-cc kept compiling with the version you had just left, and
+    # uninstall cleaned the other directory. Inferring it from $0 instead was
+    # worse -- a second symlink (/usr/local/bin/axl -> ~/.local/bin/axl) made
+    # it hijack the wrong directory, which is a regression rather than a fix.
+    ensure mkdir -p "$PREFIX_ROOT/$DIR/share/axl"
+    printf '%s\n' "$BIN_DIR" > "$PREFIX_ROOT/$DIR/share/axl/bin-dir"
     _n=0
     for _b in "$PREFIX_ROOT/$DIR"/bin/*; do
         [ -f "$_b" ] && [ -x "$_b" ] || continue
@@ -356,9 +406,12 @@ link_tree() {
 # point of switching.
 link_manager() {
     # THE MANAGER IS THE HOST-TOOLS COMPONENT (§20 M2). It is preferred over
-    # every SDK prefix, and it needs no new root to be safe: `axl prune` prunes
-    # `^axl-sdk-[0-9]` and this is `axl-sdk-host-tools-<ver>`, so it is already
-    # outside what prune walks, and `axl use` only ever moves the SDK marker.
+    # every SDK prefix, and it needs no new root to be safe: `axl use` only
+    # ever moves the SDK marker, and `axl prune` protects the CURRENT manager
+    # plus the prefix it is running out of. (It does now walk the
+    # `^axl-sdk-host-tools-[0-9]` family -- superseded generations otherwise
+    # accumulate forever -- so "outside what prune walks" is no longer the
+    # reason this is safe; the explicit protection is.)
     #
     # Linked through the `current` marker rather than the versioned directory,
     # so upgrading the manager does not have to relink anything.
@@ -399,6 +452,7 @@ set_dir_for_version() {
 # --use: activate a version, downloading only if it is not already here.
 do_use() {
     VERSION="$USE_VERSION"
+    validate_version "$VERSION"
     set_dir_for_version
     if [ -d "$PREFIX_ROOT/$DIR" ]; then
         info "$LABEL $VERSION is already installed -- switching to it"
@@ -419,13 +473,45 @@ do_use() {
 # `axl` lives inside a versioned tree that `axl use` repoints and `axl prune`
 # can remove, which is the defect §20.1 measured.
 #
-# Skipped when installing --host-tools (that IS the manager), and skipped when
-# one is already present: re-fetching it on every SDK install would make
-# `axl update` slower for no gain.
+# Skipped when installing --host-tools (that IS the manager). It used to be
+# skipped whenever ANY manager was present -- "re-fetching it on every SDK
+# install would make `axl update` slower for no gain" -- and the gain turned
+# out to be the whole point: the manager carries `axl` and the staged
+# install.sh, so a manager frozen at whatever version first created it never
+# receives a fix to either. Measured by test-install-lifecycle.sh: two SDK
+# upgrades left `axl --version` reporting the version from the first install.
+#
+# Now it tracks the version being installed, FORWARD ONLY. The equality test
+# below is the no-op path (`already_installed` is main()'s, not this
+# function's, and fires before this is reached -- so a plain `install.sh` run
+# on an already-current SDK does NOT repair a stale manager; `axl update`,
+# which calls --host-tools explicitly, is what does).
 ensure_manager() {
     [ "$COMPONENT" = "sdk" ] || return 0
     _m="$PREFIX_ROOT/axl-sdk-host-tools"
-    [ -x "$_m/bin/axl" ] && [ -f "$_m/libexec/axl/install.sh" ] && return 0
+    if [ -x "$_m/bin/axl" ] && [ -f "$_m/libexec/axl/install.sh" ]; then
+        _mv=""
+        [ -r "$_m/share/axl/version" ] && _mv="$(cat "$_m/share/axl/version")"
+        # FORWARD ONLY, and `!=` was not that. `do_use` returns before this,
+        # so `axl use <older>` was safe -- but `install.sh --version <older>`
+        # runs the full install path and reached here, rolling the manager
+        # BACK to the pinned version. That is §20's "stranded on an installer
+        # too old to fix itself", reachable from the exact command the
+        # upgrade notes teach and from any consumer that pins in CI. The
+        # lifecycle test never caught it because it only ever installs
+        # ascending.
+        #
+        # An unversioned manager (`_mv` empty -- the legacy
+        # axl-sdk-host-tools.tar.gz carries no share/axl/version) is treated
+        # as older, so it gets replaced ONCE and then compares equal. Without
+        # that it would re-extract on every single SDK install, forever.
+        [ "$_mv" = "$VERSION" ] && return 0
+        if [ -n "$_mv" ] && [ "$(printf '%s\n%s\n' "$_mv" "$VERSION" \
+                                 | sort -V | tail -1)" != "$VERSION" ]; then
+            info "manager $_mv is newer than $VERSION -- leaving it alone"
+            return 0
+        fi
+    fi
 
     # DOES THIS RELEASE EVEN HAVE ONE? Checked against the SHA256SUMS already
     # downloaded for the SDK -- same release, so it is the authority. Without
@@ -493,12 +579,41 @@ advise_python() {
     fi
 }
 
+# THE ONE PLACE THE TOOLCHAIN STEP IS ANNOUNCED, and it is here rather than in
+# the caller because HERE is where the work actually happens. main() returns at
+# already_installed() well before this, so `axl update` announcing a download
+# before exec-ing this script promised one on the most common invocation there
+# is -- an update on an install that is already current -- and then did nothing.
+# The size and the reason belong on the line that fires only when the fetch
+# does.
+#
+# NON-FATAL, and that is a deliberate reversal of the `ensure` this used to be.
+# The step runs AFTER link_tree, so by the time it can fail the SDK is already
+# installed and linked -- and `ensure`'s `die` then skipped maybe_prune,
+# check_path and the closing banner, leaving a user whose SDK DID update with
+# nothing but a toolchain error. A network hiccup or a missing sudo read as a
+# failed install. The rest of main() now runs, the banner says plainly which
+# half did not happen and how to finish it, and main still exits non-zero so CI
+# can see it. `axl update` put this on the DEFAULT path, which is what makes the
+# distinction matter.
+TOOLCHAIN_FAILED=0
 maybe_toolchain() {
     [ -n "$TOOLCHAIN" ] || return 0
     _it="$PREFIX_ROOT/$DIR/bin/axl-install-toolchain"
     [ -x "$_it" ] || die "--toolchain needs the SDK component, not --host-tools"
-    info "installing the $TOOLCHAIN cross toolchain (uses sudo for /opt)"
-    ensure "$_it" "$TOOLCHAIN"
+    # CALLER-NEUTRAL WORDING. This function serves BOTH `axl update` (which
+    # computed the arch, so the user needs the reason) and a direct
+    # `sh install.sh --toolchain aa64` first install (where they asked, and
+    # `axl update` prose is simply wrong). The reason that fits both is the
+    # fact itself -- the SDK pins the toolchain -- not a sentence about which
+    # command is running.
+    info "installing the $TOOLCHAIN cross toolchain (uses sudo for /opt;"
+    info "  may download ~55-96 MB). The SDK version pins which toolchain"
+    info "  axl-cc uses, so this keeps the two in step."
+    if ! "$_it" "$TOOLCHAIN"; then
+        TOOLCHAIN_FAILED=1
+        warn "the $TOOLCHAIN cross toolchain did NOT install (see above)."
+    fi
 }
 
 # OFFERED, not absorbed. `axl prune` is a command in the SDK -- discoverable
@@ -595,6 +710,26 @@ main() {
     printf '    axl --help                 host commands\n'
     printf '    axl-cc hello.c -o hello.efi\n'
     printf '    sh install.sh --uninstall  remove it again\n'
+
+    # SAY WHICH HALF DID NOT HAPPEN. The banner above is true -- the SDK is
+    # installed -- and printing it alone after a failed toolchain step would be
+    # the same silent-downgrade defect this whole feature exists to remove,
+    # just relocated. aa64 has no host fallback at all (AXL_TOOLCHAIN=axl), so
+    # a stale compiler there is a hard failure at the next build, not a
+    # degradation.
+    if [ "$TOOLCHAIN_FAILED" -ne 0 ]; then
+        printf '\n  BUT the %s cross toolchain did NOT update.\n' "$TOOLCHAIN"
+        printf '    The SDK above is installed and usable; axl-cc will build\n'
+        printf '    with whatever toolchain is already on this machine.\n'
+        printf '    Finish it with:  axl toolchain install %s\n' "$TOOLCHAIN"
+        # BOTH CALLERS AGAIN: `axl update --no-toolchain` is the answer for the
+        # verb, and omitting --toolchain is the answer for a direct run. Naming
+        # only the first told a first-time install.sh user to type a flag on a
+        # command they had not run.
+        printf '    Skip it next time with:  axl update --no-toolchain\n'
+        printf '      (or, running install.sh directly, omit --toolchain)\n'
+        return 1
+    fi
 }
 
 main "$@"

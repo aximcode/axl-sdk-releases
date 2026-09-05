@@ -419,6 +419,17 @@ Reproduce: `x86_64-elf-gcc -ffreestanding -nostdlib probe.o stubs.o -lc
   work without one) and in `axl-cc`. Falling back to host gcc would defeat the
   goal AND re-create the "a suite run silently measured the host toolchain" bug
   the build-state signature exists to catch.
+
+  **Superseded for `axl-cc`'s CONSUMER C path by `AXL_TOOLCHAIN=auto`
+  (2026-09-03).** A genuinely absent bare-metal cross now falls back to the
+  host's own freestanding `gcc` there, rather than erroring — reported by
+  `axl-cc --verbose` / `axl toolchain list`, so "silent" means quiet on a
+  successful build, not unreported. See
+  `AXL-Host-Toolchain-Design.md`. This bullet's invariant holds UNCHANGED for
+  the SDK's own build (the Makefile still hard-errors with no fallback) and
+  for an EXPLICIT `AXL_TOOLCHAIN=axl` on a consumer build, which still
+  hard-fails rather than falling back — the fallback exists only under the
+  `auto` default, and only for x64.
 - **All four consumer entry points** moved with it: `axl-cc`'s C path, the
   generated CMake package (`AXL_C_COMPILER`, replacing `${AXL_CROSS}gcc`), the
   pkg-config `Cflags`, and `install.sh`'s staging step.
@@ -1205,7 +1216,12 @@ Raised 2026-08-13. Not scheduled; recorded so it is decided on purpose.
 > Everything from here to §4b.1 describes the tree BEFORE P3, and every load-
 > bearing fact in it is now false: `libc.a` is on EVERY link, AXL does *not*
 > supply every definition, and the two files named as "the whole libc in this
-> tree" are deleted. Verified against the current tree 2026-08-17.
+> tree" are absent from `libaxl.a`'s own link (verified against the current
+> tree 2026-08-17 — still true). **They reappeared 2026-09-03** as the
+> separate `libaxl-standin.a` archive, linked only under `AXL_TOOLCHAIN=host`
+> where newlib is absent from the link entirely; see
+> `AXL-Host-Toolchain-Design.md` §5.3. `libaxl.a`'s own link still has
+> neither file.
 >
 > **The question this section framed is therefore answered, not open.** It
 > asked whether "adopting newlib" should mean adopting more than its headers.
@@ -1228,8 +1244,10 @@ set of standard-named symbols `libaxl.a` defined was TWELVE:
     strchr strcmp strlen strncmp strncpy strstr   time
 
 That was the whole libc in the tree (`src/data/axl-str-compat.c` and
-`src/mem/axl-intrinsics.c`, both DELETED by P3, plus `time()` in the mbedTLS
-platform shim). §4.1
+`src/mem/axl-intrinsics.c`, both DELETED by P3 from `libaxl.a`'s link —
+restored 2026-09-03 as the separate `libaxl-standin.a` archive for
+`AXL_TOOLCHAIN=host`, `AXL-Host-Toolchain-Design.md` §5.3 — plus `time()`
+in the mbedTLS platform shim). §4.1
 already ruled newlib's own implementations out of the one place they would have
 mattered most (`printf` beneath `AxlLog`), so "adopting newlib" currently means
 "adopting its headers", and the substrate question is narrower than it reads.

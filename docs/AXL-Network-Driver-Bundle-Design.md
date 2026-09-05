@@ -239,7 +239,7 @@ SNP-installing one. The NII installer is the actual NIC driver.
   clones iPXE at pinned commit `df4eec8c` and builds the universal
   `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB, ~2.9k chip IDs on x64).
   Reproducible (~35s wall on 16-thread).
-- **Packaging** — `release.yml` and `build-packages.sh` build iPXE
+- **Packaging** — `release.yml` builds iPXE
   in CI, stage `drivers/<arch>/` with `ipxe-all.efidrv` plus auxiliary
   USB-network drivers (kept for firmware that benefits from them —
   see `third_party/edk2/README.md`), and carry
@@ -255,7 +255,9 @@ SNP-installing one. The NII installer is the actual NIC driver.
 
 ## Final consumer-flow validation
 
-Tarball produced by local `build-packages.sh` smoke-test contains:
+Tarball contents at the time of validation (produced by the local
+`build-packages.sh` smoke test, deleted with the packages in D7; the
+same tree is staged by `release.yml`'s tools-tarball step today):
 
 ```
 drivers/x64/

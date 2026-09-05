@@ -48,7 +48,16 @@ done
 # consumer enters through this script rather than the Makefile, so this is the
 # copy that actually faces users.
 #
-#   axl    (default) the toolchains axl-toolchains.conf names.
+#   auto   (x64 default) `axl` where the bare-metal x64 compiler is installed,
+#          `host` where it is not. Resolved further down, once the arch block
+#          has read the locators there is something to probe.
+#   axl    the toolchains axl-toolchains.conf names. The aa64 default, and
+#          still what an x64 machine with a toolchain installed uses. Named
+#          EXPLICITLY it HARD-FAILS when that toolchain is missing, and that
+#          is the reproducibility guard `auto` is safe to have
+#          (docs/AXL-Host-Toolchain-Design.md §3.1) -- CI sets it.
+#   host   the HOST's own gcc, x64 only. No C library at all -- see below and
+#          docs/AXL-Host-Toolchain-Design.md §5.
 #   cross  one you supply, via AXL_<ARCH>_GCC / _GXX / _BINUTILS_PREFIX; the
 #          conf defaults are NOT consulted, so an unset locator resolves empty
 #          and the existing "compiler not found" diagnostic fires by name.
@@ -56,9 +65,34 @@ done
 # See the Makefile's block for why the pairing exists (Zephyr, EDK2 and the
 # Linux kernel all pair a variant with a locator) and why `llvm` is absent
 # rather than a silent no-op.
-AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-axl}"
+AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-auto}"
+# WHAT THE VARIANT RESOLVED TO, which is not always what was asked for: `auto`
+# picks between `axl` and `host` by probing the compiler. $AXL_TOOLCHAIN keeps
+# what the CALLER said -- the two diverge, and a diagnostic that wants to
+# explain the caller's intent (axl_cc_name_toolchain_installer) needs the
+# request, while everything that wants to know how this build actually works
+# needs the answer. Every `== "host"` test below reads THIS one.
+#
+# Seeded here so the value is never unset, but for `auto` it is a PLACEHOLDER
+# until the resolution block after the arch `case`: nothing between the two
+# may read it, because `auto` is not an answer to any question asked of it.
+AXL_TC_RESOLVED="$AXL_TOOLCHAIN"
 case "$AXL_TOOLCHAIN" in
     axl) ;;
+    auto)
+        # Deliberately empty: `auto` starts from the `axl` locators and only
+        # replaces them if the probe below finds no compiler behind them. It
+        # cannot decide here -- $GCC_BIN does not exist until the arch block.
+        ;;
+    host)
+        # The HOST's own gcc, for x64 only. Its binutils emits pei-x86-64
+        # (verified on Ubuntu and AlmaLinux); no host binutils emits
+        # pei-aarch64-little, which is why aa64 is refused below rather than
+        # left to fail at objcopy with no explanation.
+        AXL_X64_GCC_DEFAULT="${AXL_X64_HOST_GCC:-$(command -v gcc || true)}"
+        AXL_X64_GXX_DEFAULT=""          # C++ is refused under host
+        AXL_X64_BINUTILS_PREFIX_DEFAULT=""   # host ld/objcopy/ar, unprefixed
+        ;;
     cross)
         AXL_X64_GCC_DEFAULT=""
         AXL_X64_GXX_DEFAULT=""
@@ -69,10 +103,13 @@ case "$AXL_TOOLCHAIN" in
         ;;
     *)
         echo "ERROR: AXL_TOOLCHAIN=$AXL_TOOLCHAIN is not a toolchain variant." >&2
-        echo "       Use 'axl' (the default: the toolchains" >&2
-        echo "       axl-install-toolchain installs), or 'cross' (one you" >&2
-        echo "       supply, named by AXL_X64_GCC / AXL_AA64_GCC and the" >&2
-        echo "       matching _GXX and _BINUTILS_PREFIX)." >&2
+        echo "       Use 'auto' (the x64 default: the toolchain" >&2
+        echo "       axl-install-toolchain installs when it is there, the" >&2
+        echo "       host's own gcc when it is not), 'axl' (that toolchain," >&2
+        echo "       failing if it is absent), 'host' (the host's own gcc," >&2
+        echo "       x64 only, no C library), or 'cross' (one you supply," >&2
+        echo "       named by AXL_X64_GCC / AXL_AA64_GCC and the matching" >&2
+        echo "       _GXX and _BINUTILS_PREFIX)." >&2
         exit 1
         ;;
 esac
@@ -148,6 +185,9 @@ VERBOSE=false
 NO_EH_FRAME=false
 RUN=false
 RUN_ARGS=()
+# Report the resolved toolchain variant and exit, taking no sources. `axl
+# toolchain list` reads it; see the handler after the arch block.
+PRINT_TOOLCHAIN=false
 SOURCES=()
 CFLAGS_EXTRA=()
 # -std is tracked PER LANGUAGE rather than in the shared CFLAGS_EXTRA. Those
@@ -267,6 +307,7 @@ while [[ $# -gt 0 ]]; do
         -o)         OUTPUT="$2"; OUTPUT_USER_SET=true; shift 2 ;;
         --no-eh-frame) NO_EH_FRAME=true; shift ;;
         --verbose|-v) VERBOSE=true; shift ;;
+        --print-toolchain) PRINT_TOOLCHAIN=true; shift ;;
         # Linker passthrough (gcc convention). MUST precede -W* below, or
         # -Wl,... is swallowed as a compile flag. -Wl,a,b -> a b to the ld link.
         -Wl,*)
@@ -334,18 +375,35 @@ both.
 Toolchain selection (environment, not flags -- the Makefile takes
 the same ones, so a consumer build and an SDK build agree):
 
-  AXL_TOOLCHAIN=axl     Default. The toolchain axl-install-toolchain
-                        installs, as named by axl-toolchains.conf.
+  AXL_TOOLCHAIN=auto    x64 default. The toolchain axl-toolchains.conf
+                        names when it is installed; the host's own gcc
+                        when it is not. --verbose says which it picked,
+                        as does `axl toolchain list`.
+  AXL_TOOLCHAIN=axl     That toolchain, and FAIL if it is absent
+                        rather than falling back. aa64 default; set it
+                        in CI to pin the compiler.
+  AXL_TOOLCHAIN=host    The host's own gcc. x64 ONLY, and there is no
+                        C library at all: no <string.h>, no <stdio.h>,
+                        and no C++. Use AXL's own API instead.
   AXL_TOOLCHAIN=cross   One you supply. The defaults are NOT
                         consulted, so an unset locator is refused by
                         name instead of silently falling back.
+  AXL_X64_HOST_GCC      Which host gcc `host` (and the auto fall-back)
+                        uses; otherwise the first gcc on $PATH. Under the
+                        auto fall-back, AXL_X64_GCC is NOT consulted -- it
+                        names the bare-metal compiler auto just found
+                        missing, so honouring it here would be circular.
+                        Explicit AXL_TOOLCHAIN=host still honours it.
   AXL_<ARCH>_GCC        Where it is: the C compiler,
   AXL_<ARCH>_GXX        the C++ compiler, and
   AXL_<ARCH>_BINUTILS_PREFIX   the ld/ar/objcopy prefix.
                         <ARCH> is X64 or AA64.
 
-The toolchain must target BARE METAL. A *-linux-gnu cross resolves
-<string.h> to a hosted libc, which no longer has shims to land on.
+Under axl / cross the toolchain must target BARE METAL: a
+*-linux-gnu cross resolves <string.h> to a hosted libc, which no
+longer has shims to land on. host is the deliberate exception --
+it compiles -nostdinc against the host compiler's own freestanding
+headers and supplies no libc at all.
 
 Options:
   --arch x64|aa64       Target architecture (default: x64)
@@ -494,6 +552,9 @@ Options:
                         are silently dead is a correctness failure
                         rather than the size trade this flag offers.
   -v, --verbose         Print compiler/linker commands
+  --print-toolchain     Print the RESOLVED toolchain variant for --arch
+                        -- axl, host or cross, never auto -- and exit.
+                        Takes no sources.
   --version             Show version and build info
   -h, --help            Show this help
 
@@ -541,7 +602,9 @@ CPPALIAS
     esac
 done
 
-if [[ ${#SOURCES[@]} -eq 0 ]]; then
+# --print-toolchain answers a question about the INSTALL, not about a build, so
+# it is the one invocation with nothing to compile.
+if [[ ${#SOURCES[@]} -eq 0 && "$PRINT_TOOLCHAIN" != "true" ]]; then
     echo "Usage: axl-cc [OPTIONS] source.c [-o output.efi]  (try --help)" >&2
     exit 1
 fi
@@ -660,7 +723,9 @@ fi
 # compilable source.  Order matters — longer suffixes first so .cpp
 # doesn't fall through to .c.  With -c, the output extension is .o
 # (mirrors gcc -c convention); without it, .efi.
-if [[ -z "$OUTPUT" ]]; then
+# The source list is non-empty for every invocation that builds anything; only
+# --print-toolchain reaches here without one, and it has no output to name.
+if [[ -z "$OUTPUT" && ${#SOURCES[@]} -gt 0 ]]; then
     first="${COMPILE_SOURCES[0]:-${PREBUILT_OBJS[0]}}"
     OUTPUT="$first"
     out_ext=$([[ "$COMPILE_ONLY" == "true" ]] && echo ".o" || echo ".efi")
@@ -695,10 +760,6 @@ if [[ "$BUILD" == "debug" ]]; then
     OPT_FLAGS="-Og -g -gdwarf -DAXL_MEM_DEBUG"
 else
     OPT_FLAGS="-Os -g -gdwarf -DNDEBUG"
-fi
-
-if [[ "$VERBOSE" == "true" ]]; then
-    echo "[axl-cc] arch=$ARCH type=$TYPE build=$BUILD toolchain=gcc entry=$ENTRY output=$OUTPUT" >&2
 fi
 
 # Stack-smashing detection, on by default. `-mstack-protector-guard=global` is
@@ -782,6 +843,99 @@ case "$ARCH" in
           GCC_BIN="${AXL_AA64_GCC:-${AXL_AA64_GCC_DEFAULT:-}}" ;;
 esac
 
+# WHICH VARIANT THIS BUILD ACTUALLY USES.
+#
+# Resolved HERE and not beside the variant `case` above, because `auto` decides
+# by probing $GCC_BIN and that does not exist until the arch block has read the
+# locators. A predicate hoisted up there would be stale exactly when it matters.
+#
+# PROBE THE COMPILER, never stat the directory (§4.1): a partial extract leaves
+# the directory in place and nothing in it, which is precisely the state worth
+# distinguishing.
+#
+# Only the DEFAULT is auto. An EXPLICIT AXL_TOOLCHAIN=axl keeps the hard
+# "compiler not found at <path>" failure further down, because a silent
+# fall-back would mask a genuinely broken bare-metal install -- and that guard
+# is what makes a persisted per-machine pin unnecessary (§3.1): CI expresses
+# "always bare-metal" by setting the variable, which is where a reproducibility
+# constraint belongs.
+#
+# aa64 never resolves to host and needs no arm of its own: no host binutils
+# emits pei-aarch64-little, so there is nothing to fall back TO. It resolves to
+# axl and fails by name on a missing compiler exactly as it does today.
+if [[ "$AXL_TOOLCHAIN" == "auto" ]]; then
+    # Usability, not just existence -- the same expression the C-compiler
+    # validation below applies, so `auto` cannot decide a compiler is absent
+    # that axl-cc would then have happily run. A bare name on $PATH is a
+    # legitimate locator (`AXL_X64_GCC=x86_64-elf-gcc`), and a plain `-x` test
+    # would send that configuration to the host compiler in silence.
+    _axl_tc_present=false
+    if [[ -n "${GCC_BIN:-}" ]] \
+       && { [[ -x "$GCC_BIN" ]] || command -v "$GCC_BIN" &>/dev/null; }; then
+        _axl_tc_present=true
+    fi
+    if [[ "$ARCH" == "x64" && "$_axl_tc_present" != "true" ]]; then
+        AXL_TC_RESOLVED="host"
+        # The locators the arch block just read name the BARE-METAL toolchain,
+        # which is the thing we have just established is not there; consulting
+        # them again would hand the host path back the compiler it could not
+        # find. AXL_X64_HOST_GCC is the host variant's own override and host
+        # binutils are unprefixed -- the same three DEFAULTS the explicit
+        # `host` arm's _DEFAULT assignments produce, written directly against
+        # the resolved names instead, which nothing reads past this point.
+        # NOT the same three RESOLVED values in general: explicit `host` still
+        # honours an exported AXL_X64_GXX / AXL_X64_BINUTILS_PREFIX via the
+        # ${VAR:-DEFAULT} pattern below, while this fall-back discards both
+        # unconditionally -- there is no AXL_X64_HOST_BINUTILS_PREFIX to
+        # redirect CROSS to the way AXL_X64_HOST_GCC redirects GCC_BIN
+        # (AXL-Host-Toolchain-Design.md §4.1).
+        GCC_BIN="${AXL_X64_HOST_GCC:-$(command -v gcc || true)}"
+        GXX_BIN=""      # C++ is refused under host
+        CROSS=""        # host ld/objcopy/ar, unprefixed
+    else
+        AXL_TC_RESOLVED="axl"
+    fi
+fi
+
+# ` (auto)` distinguishes a variant that was CHOSEN from one that was resolved,
+# which is the difference between "my build is configured wrong" and "this
+# machine has no toolchain installed".
+if [[ "$VERBOSE" == "true" ]]; then
+    _axl_tc_how=""
+    [[ "$AXL_TOOLCHAIN" == "auto" ]] && _axl_tc_how=" (auto)"
+    echo "[axl-cc] arch=$ARCH type=$TYPE build=$BUILD toolchain=$AXL_TC_RESOLVED$_axl_tc_how entry=$ENTRY output=$OUTPUT" >&2
+fi
+
+# A READER WHO HAS SEEN x64 WORK WILL ASSUME host WORKS FOR BOTH, and this is
+# where that assumption is cheapest to correct. Refused here, before the
+# "no SDK libraries for arch aa64" and "compiler not found" checks, so the
+# answer is the same on a one-arch stage and on a full one.
+if [[ "$AXL_TC_RESOLVED" == "host" && "$ARCH" != "x64" ]]; then
+    echo "ERROR: AXL_TOOLCHAIN=host is x64-only." >&2
+    echo "       A UEFI image is converted with 'objcopy -O <target>', and" >&2
+    echo "       for $ARCH that target is pei-aarch64-little, which no host" >&2
+    echo "       binutils provides -- ARM's bare-metal toolchain supplies it." >&2
+    echo "       Build $ARCH with the bare-metal toolchain:" >&2
+    echo "         axl toolchain install aa64" >&2
+    rm -rf "$TMPDIR"
+    exit 1
+fi
+
+# --print-toolchain: resolve for --arch, print the variant, exit. `axl
+# toolchain list` calls this rather than re-deriving the answer from the same
+# inputs -- two programs computing one fact is the drift check-flag-parity
+# exists over, one layer up.
+#
+# Placed here so it needs NO sources and runs before any compilation work, and
+# AFTER the aa64 refusal so a combination that cannot build is refused by name
+# rather than reported as a usable variant. The output is a contract: the bare
+# variant word on stdout, nothing else.
+if [[ "$PRINT_TOOLCHAIN" == "true" ]]; then
+    printf '%s\n' "$AXL_TC_RESOLVED"
+    rm -rf "$TMPDIR"
+    exit 0
+fi
+
 # Per-source language detection.  Returns "cpp" or "c" on stdout.
 # Honors -x override; otherwise dispatches by extension.
 detect_lang() {
@@ -808,6 +962,71 @@ for src in "${COMPILE_SOURCES[@]}"; do
         HAS_C=true
     fi
 done
+
+# C++ UNDER host IS REFUSED, NAMING THE REMEDY (§6.3).
+#
+# A function because there are TWO ways C++ reaches this driver and both must
+# answer the same way: a .cpp on this command line, and a pre-built C++ object
+# handed to a link that compiles nothing (the staged flow -- CXX_LINK, decided
+# by an nm scan much further down).
+axl_cc_refuse_cxx_under_host() {
+    echo "ERROR: C++ is not available under the host compiler." >&2
+    echo "       The host compiler is glibc-targeted: libsupc++ reads the" >&2
+    echo "       exception globals and the stack canary through %fs, glibc's" >&2
+    echo "       TLS block, which UEFI never sets up (commit dbd7d296)." >&2
+    echo "       C++ needs the bare-metal toolchain:" >&2
+    echo "         axl toolchain install x64" >&2
+    echo "       Once installed it is selected automatically; nothing else" >&2
+    echo "       needs to change." >&2
+    rm -rf "$TMPDIR"
+    exit 1
+}
+# Before the C++ compiler validation below, deliberately: that check would
+# report "no x64 C++ compiler is configured", which is true and useless -- the
+# variant emptied AXL_X64_GXX_DEFAULT on purpose, and the reader needs to know
+# why and what to do, not that a variable is unset.
+if [[ "$AXL_TC_RESOLVED" == "host" && "$HAS_CPP" == "true" ]]; then
+    axl_cc_refuse_cxx_under_host
+fi
+
+# A HOSTED HEADER UNDER host (§6.3): "fatal error: string.h: No such file or
+# directory" does not say "this mode has no C library", and that is the
+# failure a host-mode user is most likely to hit and least likely to
+# diagnose. APPEND, NEVER REPLACE -- the compiler's own message names the
+# file and line, the only part that says WHERE, so <errfile> is always
+# replayed to stderr in full before this ever runs.
+#
+# limits.h IS in the detection set even though the C standard calls it
+# freestanding: gcc's own limits.h reaches the platform's via #include_next
+# (via syslimits.h), and -nostdinc removes the directory that would answer
+# it -- so it fails exactly like a hosted header (measured, §5.1). It must
+# NOT be listed among the headers still available: naming an unavailable
+# header as available is worse than no message at all.
+axl_cc_note_missing_hosted_header() {   # <compiler stderr file>
+    local errfile="$1" hit
+    [[ "$AXL_TC_RESOLVED" == "host" ]] || return 0
+    # `|| true`: under -o pipefail a compile that failed for an unrelated
+    # reason (a plain syntax error, say) makes grep find nothing and exit 1,
+    # which pipefail then hands to this ASSIGNMENT -- and under -e that
+    # aborts the whole script right here, silently, skipping the caller's
+    # `rm -rf "$TMPDIR"` (measured with `bash -x`: it exits at `hit=` with no
+    # trace of ever reaching the caller's cleanup). "No match" is an
+    # expected, ordinary outcome of this grep, not a failure to propagate.
+    hit="$(grep -oE '(stdio|stdlib|string|math|ctype|time|errno|assert|inttypes|wchar|locale|signal|setjmp|limits)\.h' \
+           "$errfile" | sort -u | head -1 || true)"
+    [[ -n "$hit" ]] || return 0
+    echo "" >&2
+    echo "NOTE: the HOST compiler has no C standard library -- only its own" >&2
+    echo "      FREESTANDING headers (stddef.h, stdarg.h, stdint.h, stdbool.h," >&2
+    echo "      float.h, iso646.h, stdalign.h, stdatomic.h, stdnoreturn.h)." >&2
+    echo "      <$hit> is not among them, so it cannot be found." >&2
+    echo "      NOTE limits.h is absent too, despite being freestanding in" >&2
+    echo "      the standard: gcc's reaches the platform's via #include_next." >&2
+    echo "      Two ways forward:" >&2
+    echo "        - use AXL's own API instead (axl_memcpy, axl_printf, ...)" >&2
+    echo "        - install the bare-metal toolchain, which brings newlib:" >&2
+    echo "            axl toolchain install x64" >&2
+}
 
 # A caller-supplied -std that NO source in this build can use would otherwise
 # be dropped in silence, because -std is routed per language. Two ways in:
@@ -953,6 +1172,26 @@ axl_cc_name_toolchain_installer() {
 # invokes, which is the failure mode this guard exists to prevent, inverted.
 if [[ "$HAS_C" == "true" || ${#EMBEDS[@]} -gt 0 ]] \
    && { [[ -z "$GCC_BIN" ]] || { [[ ! -x "$GCC_BIN" ]] && ! command -v "$GCC_BIN" &>/dev/null; }; }; then
+    # NEITHER TOOLCHAIN EXISTS (routed from Task 3's review, confirmed by two
+    # reviewers). Under `host` (explicit, or auto's fall-back) GCC_BIN is
+    # resolved from AXL_X64_HOST_GCC or `command -v gcc`, with NO conf default
+    # behind it (§4.1) -- so an empty result here means this machine has
+    # neither compiler, not that axl-toolchains.conf failed to load. The
+    # branch below says "was not found ... install may be incomplete", which
+    # is FALSE in this case: the conf was read fine. `auto` makes this the
+    # DEFAULT outcome on exactly the toolchain-free machine this feature
+    # serves, so it is now the first thing such a user sees.
+    if [[ -z "$GCC_BIN" && "$AXL_TC_RESOLVED" == "host" ]]; then
+        echo "ERROR: no $ARCH C compiler could be found." >&2
+        echo "       axl-toolchains.conf was read fine -- this machine simply" >&2
+        echo "       has neither the bare-metal toolchain nor a host gcc for" >&2
+        echo "       it to point past. Two ways forward:" >&2
+        echo "         - install a host gcc via your distro's package manager" >&2
+        echo "         - install AXL's own bare-metal toolchain:" >&2
+        echo "             axl toolchain install x64" >&2
+        rm -rf "$TMPDIR"
+        exit 1
+    fi
     if [[ -z "$GCC_BIN" ]]; then
         echo "ERROR: no $ARCH C compiler is configured." >&2
         echo "       axl-toolchains.conf was not found beside this script or in" >&2
@@ -1027,6 +1266,45 @@ if [[ "$HAS_CPP" == "true" ]]; then
     fi
 fi
 
+# THE FREESTANDING INCLUDE SET, resolved ONCE (§5.1).
+#
+# -nostdinc plus the COMPILER's own include dir. That directory holds the C
+# standard's FREESTANDING set (stddef/stdarg/stdint/stdbool/float/iso646/
+# stdalign/stdatomic/stdnoreturn) and no string.h, stdio.h or stdlib.h -- so
+# under host the C standard library is ABSENT, not shimmed. libaxl.a is
+# unaffected: it calls axl_memcpy, not memcpy.
+#
+# Resolved HERE and not inside the per-source loop because TWO things read it:
+# the compile flags, and the hermeticity exemption further down, which under
+# host is exactly this directory (§5.2). Two resolutions are two chances for
+# the check and the compile to disagree about which headers are legitimate.
+#
+# After the C-compiler validation above, so a missing gcc is reported by that
+# check -- which names the variable to set -- rather than by this one. The
+# usability test is the same expression, deliberately: skipping when the
+# compiler cannot run at all keeps the guard below meaning what it says.
+HOST_STDINC=()
+_hostinc=""
+if [[ "$AXL_TC_RESOLVED" == "host" ]] \
+   && { [[ -x "$GCC_BIN" ]] || command -v "$GCC_BIN" &>/dev/null; }; then
+    _hostinc="$("$GCC_BIN" -print-file-name=include 2>/dev/null || true)"
+    # An empty result must be a NAMED failure, not an empty -isystem: "the
+    # tool could not run" and "the tool ran and found nothing" are the same
+    # empty string and opposite facts, and an `-isystem ''` would silently
+    # compile against the host's default search path instead.
+    if [[ ! -d "$_hostinc" ]]; then
+        echo "ERROR: $GCC_BIN could not report its own include directory" >&2
+        echo "       (-print-file-name=include gave '${_hostinc:-<nothing>}')," >&2
+        echo "       so the freestanding header set cannot be located." >&2
+        rm -rf "$TMPDIR"
+        exit 1
+    fi
+    # No trailing slash: the value is substituted into `grep -v "^$dir/"`
+    # below, and a doubled slash there matches nothing at all.
+    _hostinc="${_hostinc%/}"
+    HOST_STDINC=(-nostdinc -isystem "$_hostinc")
+fi
+
 RELOC_OBJ="$LIB_DIR/axl-reloc.o"
 DEBUG_INFO_OBJ="$LIB_DIR/axl-debug-info.o"
 PE_SET_DEBUG="$SDK_DIR/bin/pe-set-debug"
@@ -1081,7 +1359,14 @@ for src in "${COMPILE_SOURCES[@]}"; do
         HERM_MODE_FLAGS=(-fshort-wchar -fno-builtin "${STD_CXX[@]}")
     else
         HERM_CC="$GCC_BIN"
+        # HOST_STDINC belongs here for the same reason -ffreestanding does:
+        # under host the real compile searches ONLY the compiler's own include
+        # dir, and a -M pass without -nostdinc would additionally search
+        # /usr/local/include and /usr/include -- resolving headers the compile
+        # never saw and reporting them as a host reach. Empty under every
+        # other variant.
         HERM_MODE_FLAGS=(-ffreestanding -fshort-wchar -fno-builtin
+                         ${HOST_STDINC[@]+"${HOST_STDINC[@]}"}
                          ${STD_C[@]+"${STD_C[@]}"})
     fi
 
@@ -1110,17 +1395,55 @@ for src in "${COMPILE_SOURCES[@]}"; do
             ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
             -c "$src" -o "$obj" || { echo "ERROR: C++ compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
     else
-        run_cmd "$GCC_BIN" \
-            -ffreestanding -fshort-wchar -fno-builtin \
-            ${STD_C[@]+"${STD_C[@]}"} \
-            $STACK_PROTECTOR -fno-omit-frame-pointer -fpic $GCC_ARCH \
-            -ffunction-sections -fdata-sections \
-            $OPT_FLAGS -Wall \
-            -DAXL_BACKEND_NATIVE \
-            ${UEFI_DEFINE[@]+"${UEFI_DEFINE[@]}"} \
-            -isystem "$SDK_DIR/include/axl-sdk" \
-            ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
-            -c "$src" -o "$obj" || { echo "ERROR: compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
+        # Built as an ARRAY and echoed MANUALLY, NOT through run_cmd (mirrors
+        # the hermeticity -M pass below, same reason): run_cmd's own
+        # `+ ...` verbose echo would land inside cc_err too, and
+        # axl_cc_note_missing_hosted_header greps THAT file -- a consumer's
+        # own `-include stdio.h` in CFLAGS_EXTRA, or a source path
+        # containing e.g. "time.h", would then draw a spurious
+        # hosted-header note on a totally unrelated failure. Only gcc's OWN
+        # stderr belongs in this file; it is replayed to the real stderr
+        # immediately below, unconditionally, so a successful compile's
+        # warnings are exactly as visible as before and a failing one's
+        # error text is REPLACED BY NOTHING -- the note (if any) is
+        # appended after it, never instead of it.
+        #
+        # -fdiagnostics-color=always when the REAL stderr (before the
+        # capture redirect below) is a tty: capturing to a file makes
+        # gcc's OWN fd 2 a non-tty, so its `-fdiagnostics-color=auto`
+        # default would otherwise silently turn color off for every C
+        # compile on every arch and variant -- not just host -- while C++
+        # above, which is never captured, keeps it. Forcing it here and
+        # letting the byte-for-byte replay carry the escape codes through
+        # keeps interactive output identical to before this change.
+        cc_color=()
+        [[ -t 2 ]] && cc_color=(-fdiagnostics-color=always)
+        cc_args=(
+            "$GCC_BIN"
+            -ffreestanding -fshort-wchar -fno-builtin
+            ${HOST_STDINC[@]+"${HOST_STDINC[@]}"}
+            ${STD_C[@]+"${STD_C[@]}"}
+            $STACK_PROTECTOR -fno-omit-frame-pointer -fpic $GCC_ARCH
+            -ffunction-sections -fdata-sections
+            $OPT_FLAGS -Wall
+            ${cc_color[@]+"${cc_color[@]}"}
+            -DAXL_BACKEND_NATIVE
+            ${UEFI_DEFINE[@]+"${UEFI_DEFINE[@]}"}
+            -isystem "$SDK_DIR/include/axl-sdk"
+            ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"}
+            -c "$src" -o "$obj"
+        )
+        if [[ "$VERBOSE" == "true" ]]; then echo "+ ${cc_args[*]}" >&2; fi
+        cc_err="$TMPDIR/axlcc-cc-${obj_base}.err"
+        cc_rc=0
+        "${cc_args[@]}" 2>"$cc_err" || cc_rc=$?
+        cat "$cc_err" >&2
+        if [[ $cc_rc -ne 0 ]]; then
+            echo "ERROR: compilation failed: $src" >&2
+            axl_cc_note_missing_hosted_header "$cc_err"
+            rm -rf "$TMPDIR"
+            exit 1
+        fi
     fi
 
     # HERMETICITY: did this TU actually OPEN anything under the host's tree?
@@ -1170,13 +1493,20 @@ for src in "${COMPILE_SOURCES[@]}"; do
         # guard passed cleanly. Preprocessor state is part of "which headers
         # this TU opens". Failure to produce the file is fatal: the compile already
         # succeeded, so a missing record means the check silently did not run.
-        if ! "$HERM_CC" ${HERM_MODE_FLAGS[@]+"${HERM_MODE_FLAGS[@]}"} \
-                -M -MF "$HERM_D" -MT herm \
-                $OPT_FLAGS $GCC_ARCH -DAXL_BACKEND_NATIVE \
-                ${UEFI_DEFINE[@]+"${UEFI_DEFINE[@]}"} \
-                -isystem "$SDK_DIR/include/axl-sdk" \
-                ${HERM_CFLAGS[@]+"${HERM_CFLAGS[@]}"} \
-                "$src" >/dev/null 2>"$TMPDIR/herm.err" || [[ ! -f "$HERM_D" ]]; then
+        HERM_CMD=("$HERM_CC" ${HERM_MODE_FLAGS[@]+"${HERM_MODE_FLAGS[@]}"}
+                  -M -MF "$HERM_D" -MT herm
+                  $OPT_FLAGS $GCC_ARCH -DAXL_BACKEND_NATIVE
+                  ${UEFI_DEFINE[@]+"${UEFI_DEFINE[@]}"}
+                  -isystem "$SDK_DIR/include/axl-sdk"
+                  ${HERM_CFLAGS[@]+"${HERM_CFLAGS[@]}"}
+                  "$src")
+        # Echoed like every other command --verbose shows, but NOT through
+        # run_cmd: this invocation's stderr is redirected into herm.err, which
+        # is printed verbatim when the pass fails, so run_cmd's own `+ ...`
+        # line would land inside the error report.
+        if [[ "$VERBOSE" == "true" ]]; then echo "+ ${HERM_CMD[*]}" >&2; fi
+        if ! "${HERM_CMD[@]}" >/dev/null 2>"$TMPDIR/herm.err" \
+             || [[ ! -f "$HERM_D" ]]; then
             echo "ERROR: could not determine which headers $src opened, so" >&2
             echo "       the host-header check did not run. A check that" >&2
             echo "       cannot see is worse than none." >&2
@@ -1186,10 +1516,12 @@ for src in "${COMPILE_SOURCES[@]}"; do
         # A HOST location is /usr or /lib -- EXCEPT the SDK's own tree and the
         # toolchain's, both of which legitimately live there.
         #
-        # This is not hypothetical tidiness: build-packages.sh stages with
-        # --prefix /usr, so a .deb/.rpm consumer's OWN headers are at
-        # /usr/include/axl-sdk/ and a plain `axl-cc hello.c` would have been
-        # rejected as "reached the HOST's headers" on every packaged install.
+        # This is not hypothetical tidiness: `install.sh --prefix /usr` is
+        # supported and puts a consumer's OWN headers at /usr/include/axl-sdk/,
+        # so a plain `axl-cc hello.c` would be rejected as "reached the HOST's
+        # headers" on every such install. (The retired .deb/.rpm staged to /usr
+        # unconditionally, which is where this was first found; the prefix is
+        # now a choice, and the exemption is what keeps it a valid one.)
         # axl-toolchains.conf likewise documents a /usr/local toolchain prefix
         # as supported. A blocklist without these exemptions breaks the SDK's
         # own shipping configuration, which the staged-out/ test could not see.
@@ -1202,14 +1534,42 @@ for src in "${COMPILE_SOURCES[@]}"; do
         # a worse bug than the false positive it was fixing, and one only a
         # /usr-rooted test would ever show.
         _herm_tc_root="$(dirname "$(dirname "$HERM_CC")")"
+        if [[ "$AXL_TC_RESOLVED" == "host" ]]; then
+            # REPLACED, not extended. The grandparent of /usr/bin/gcc is /usr,
+            # and exempting that disables this check exactly where it ships --
+            # the same failure the SDK_DIR comment above warns about, and worse
+            # than the false positive it would be fixing. Exempt the compiler's
+            # OWN include directory and nothing else: those headers are the
+            # compiler's and ABI-neutral; a libc's are not. Already stripped of
+            # a trailing slash where it was resolved.
+            #
+            # EMPTY IS FATAL, and this guard is not defensive noise. The value
+            # is substituted into `grep -v "^$_herm_tc_root/"` below, so an
+            # empty one degrades to `grep -v "^/"` -- which drops EVERY hit and
+            # turns this check into a no-op that reports clean forever. The
+            # resolution above cannot produce an empty value today (it exits by
+            # name on a non-directory), but nothing else asserts that, and the
+            # failure mode is total rather than partial: a gate that cannot see
+            # is worse than none.
+            if [[ -z "$_hostinc" ]]; then
+                echo "ERROR: the host-header check has no exemption directory" >&2
+                echo "       to apply under AXL_TOOLCHAIN=host, so it would" >&2
+                echo "       match nothing and report clean regardless of what" >&2
+                echo "       $src opened. Refusing rather than checking" >&2
+                echo "       nothing." >&2
+                rm -f "$obj"; rm -rf "$TMPDIR"; exit 1
+            fi
+            _herm_tc_root="$_hostinc"
+        fi
         # EXCLUDE THE SOURCE ITSELF. `-M` lists the TU as its own first
         # prerequisite, so a source that merely LIVES under /usr matched the
         # blocklist and was reported as the host header it had supposedly
         # opened -- naming itself in the error, which is the tell. That is not
-        # a corner case: build-packages.sh stages examples to
-        # /usr/share/doc/axl-sdk/examples/, and the .deb's own post-install
-        # message tells the user to compile one from there, so every packaged
-        # install failed on the first command it recommends.
+        # a corner case: the SDK stages examples to
+        # <prefix>/share/doc/axl-sdk/examples/, so under `--prefix /usr` a
+        # source that merely LIVES under /usr is exactly what the getting-
+        # started command compiles -- the first command the install recommends
+        # was the one that failed.
         _herm_src_abs="$(readlink -f "$src" 2>/dev/null || echo "$src")"
         _herm_hits="$(tr ' \\' '\n\n' < "$HERM_D" \
                       | grep -E '^(/usr/|/lib/)' \
@@ -1557,6 +1917,16 @@ if [[ "$HAS_CPP" == "true" ]]; then
     CXX_LINK="true"
 fi
 
+# The staged flow's half of the host refusal: `axl-cc app.o cxxthing.a -o
+# app.efi` compiles no .cpp, so HAS_CPP is false and the check above never
+# fired -- but this IS a C++ link, and under host $GXX_BIN is empty by design.
+# Without this it fails at the libstdc++ `-print-file-name` lookup with
+# "'<none configured>' could not locate it", which names neither the cause nor
+# the remedy.
+if [[ "$AXL_TC_RESOLVED" == "host" && "$CXX_LINK" == "true" ]]; then
+    axl_cc_refuse_cxx_under_host
+fi
+
 # ONE C++ LINK SHAPE (P4, AXL-Libc-Substrate-Design.md §4d).
 #
 # There used to be two, selected by whether the caller passed -fexceptions:
@@ -1677,8 +2047,26 @@ fi
 EH_LIBS=()
 _libsrc="$GCC_BIN"
 _libwhy="the C library"
+_libkind="the bare-metal toolchain"
 _libfix="axl-install-toolchain $ARCH"
 _liblist=(libc.a libm.a libgcc.a)
+if [[ "$AXL_TC_RESOLVED" == "host" ]]; then
+    # NO libc.a / libm.a. Under host there is deliberately none (§5.3), so the
+    # "could not locate it" hard error below is correct for `axl` and wrong
+    # here -- the host compiler WOULD find a glibc libc.a, which is the one
+    # thing that must never reach this link. libgcc.a stays: the compiler's own
+    # intrinsics (__udivti3 and friends) are still needed and the host compiler
+    # supplies its own, built for the same ABI as the code it just emitted.
+    #
+    # _libkind/_libfix follow: under host this libgcc.a is the HOST compiler's,
+    # not the bare-metal toolchain's, and "Install it via axl-install-toolchain"
+    # is not the remedy -- that installs a DIFFERENT toolchain, which would
+    # only flip `auto`, not fix an explicit `AXL_TOOLCHAIN=host` request that
+    # already got what it asked for and found it incomplete.
+    _liblist=(libgcc.a)
+    _libkind="the host compiler"
+    _libfix="reinstalling your distro's gcc package (it ships its own libgcc.a)"
+fi
 if [[ "$CXX_LINK" == "true" ]]; then
     _libsrc="$GXX_BIN"
     _libwhy="the C++ runtime"
@@ -1687,8 +2075,8 @@ fi
 for _ehlib in "${_liblist[@]}"; do
     _p="$("$_libsrc" -print-file-name="$_ehlib" 2>/dev/null || true)"
     if [[ ! -f "$_p" ]]; then
-        echo "ERROR: $_libwhy needs $_ehlib from the bare-metal" >&2
-        echo "       toolchain; '${_libsrc:-<none configured>}' could not" >&2
+        echo "ERROR: $_libwhy needs $_ehlib from $_libkind;" >&2
+        echo "       '${_libsrc:-<none configured>}' could not" >&2
         echo "       locate it (got: '${_p:-<nothing>}')." >&2
         echo "       Install it via '$_libfix'." >&2
         rm -rf "$TMPDIR"; exit 1
@@ -1708,14 +2096,42 @@ done
 #         link error.
 #
 # Named as OBJECTS, for the displacement reason documented below.
-for _pobj in axl-cxxrt-alloc.o axl-cxxrt-stubs.o; do
-    if [[ -f "$LIB_DIR/$_pobj" ]]; then
-        case " ${CXX_LIB_ARGS[*]-} " in
-            *" $LIB_DIR/$_pobj "*) ;;
-            *) CXX_LIB_ARGS+=("$LIB_DIR/$_pobj") ;;
-        esac
+if [[ "$AXL_TC_RESOLVED" == "host" ]]; then
+    # THE STAND-IN REPLACES NEWLIB, and the porting layer goes with newlib.
+    # axl-cxxrt-alloc.o (sbrk for dlmalloc) and axl-cxxrt-stubs.o (the
+    # write/read/open/close/lseek/fstat set newlib's reentrant stdio calls back
+    # into) exist to serve a C library that is not on this link. Linking them
+    # anyway would imply to the next reader that host mode has one.
+    #
+    # libaxl-standin.a is what takes newlib's place, and only that: eleven WEAK
+    # leaf names (memcpy, strlen, ...) forwarding to their axl_* equivalents,
+    # for libaxl.a's VENDORED code (libvterm, lzma, mbedTLS). --gc-sections
+    # drops those references only when the vendored code is unused, which is
+    # why hello.c links without it and http-server.c does not. It is not a
+    # consumer-facing libc: a caller writing strlen() still has no <string.h>
+    # to declare it, and that is intended (§5.1/§5.3).
+    if [[ ! -f "$LIB_DIR/libaxl-standin.a" ]]; then
+        echo "ERROR: AXL_TOOLCHAIN=host links $LIB_DIR/libaxl-standin.a," >&2
+        echo "       which this SDK does not carry -- it was staged before" >&2
+        echo "       host mode existed. Without it a link that keeps any of" >&2
+        echo "       libaxl.a's vendored code (libvterm, lzma, mbedTLS) fails" >&2
+        echo "       on memcpy and its siblings, since host mode puts no C" >&2
+        echo "       library on the line at all." >&2
+        echo "       Re-stage the SDK:" >&2
+        echo "         ./scripts/install.sh --arch $ARCH" >&2
+        rm -rf "$TMPDIR"; exit 1
     fi
-done
+    CXX_LIB_ARGS+=("$LIB_DIR/libaxl-standin.a")
+else
+    for _pobj in axl-cxxrt-alloc.o axl-cxxrt-stubs.o; do
+        if [[ -f "$LIB_DIR/$_pobj" ]]; then
+            case " ${CXX_LIB_ARGS[*]-} " in
+                *" $LIB_DIR/$_pobj "*) ;;
+                *) CXX_LIB_ARGS+=("$LIB_DIR/$_pobj") ;;
+            esac
+        fi
+    done
+fi
 # ALWAYS a group: libc.a is on every link (P3), and libaxl.a <-> libc.a is
 # genuinely mutually dependent -- libaxl's vendored code calls memcpy, while
 # newlib's stdio calls back into AXL's porting layer. One pass in either order

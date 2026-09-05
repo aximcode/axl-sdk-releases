@@ -158,6 +158,19 @@ OBJCOPY    = $(CROSS)objcopy
 #
 #   axl    (default) the ones scripts/axl-toolchains.conf names and
 #          scripts/install-toolchain.sh installs.
+#   auto   accepted and MAPPED to `axl`. It is axl-cc's x64 default and the
+#          value --verbose reports, so it is the spelling a consumer is most
+#          likely to have in their environment -- and the SDK builds ITSELF
+#          bare-metal regardless (AXL-Host-Toolchain-Design.md section 8), so
+#          there is nothing here for it to choose between. Rejecting the
+#          default's own name would make `AXL_TOOLCHAIN=auto make` fail for a
+#          consumer whose axl-cc build works.
+#   host   REFUSED here, by name, though axl-cc accepts it. It governs what a
+#          CONSUMER compiles; libaxl.a is built and shipped by the bare-metal
+#          toolchain on both arches. A reader who has just used
+#          `AXL_TOOLCHAIN=host axl-cc` will otherwise assume the same value
+#          builds the SDK, so the refusal says why rather than reading as a
+#          typo.
 #   cross  one you supply, named by AXL_<ARCH>_GCC / _GXX / _BINUTILS_PREFIX.
 #          The conf defaults are NOT consulted.
 #
@@ -193,9 +206,31 @@ else
   TC_ARCH := X64
 endif
 
+# `host` BEFORE the unknown-variant filter, so it gets its own reason instead
+# of the "is not a toolchain variant" typo message -- it IS a variant, just not
+# one that builds this. Same three facts as scripts/install.sh and axl-cc's
+# help, because a variant the three build paths describe differently is the
+# drift `make check-flag-parity` exists over.
+ifeq ($(AXL_TOOLCHAIN),host)
+  $(error AXL_TOOLCHAIN=host does not build the SDK. It governs what a \
+    CONSUMER compiles with axl-cc; the SDK builds ITSELF with the bare-metal \
+    toolchain on both arches (docs/AXL-Host-Toolchain-Design.md section 8). \
+    Use `axl` here -- or `auto`, which means `axl` for this build -- and set \
+    AXL_TOOLCHAIN=host on axl-cc when you compile against the result)
+endif
+
+# `override`, for the same reason the `cross` block below needs it: a plain
+# assignment cannot change a variable set on the make COMMAND LINE, so
+# `make AXL_TOOLCHAIN=auto` would keep the literal `auto` and fall straight
+# into the unknown-variant error this mapping exists to prevent.
+ifeq ($(AXL_TOOLCHAIN),auto)
+  override AXL_TOOLCHAIN := axl
+endif
+
 ifeq ($(filter $(AXL_TOOLCHAIN),axl cross),)
   $(error AXL_TOOLCHAIN=$(AXL_TOOLCHAIN) is not a toolchain variant. Use `axl` \
-    (the default: the toolchains scripts/install-toolchain.sh installs) or \
+    (the default: the toolchains scripts/install-toolchain.sh installs), \
+    `auto` (the same thing here, and axl-cc's x64 default) or \
     `cross` (one you supply, named by AXL_$(TC_ARCH)_GCC, AXL_$(TC_ARCH)_GXX \
     and AXL_$(TC_ARCH)_BINUTILS_PREFIX))
 endif
@@ -439,9 +474,14 @@ CXXFLAGS      = $(CXXFLAGS_BASE) $(CFLAGS_BUILD) -MD -MP
 # distinction is worth keeping straight: -frtti was tried as a fix for that and
 # MEASURED not to be one -- the five `multiple definition` errors survived it.
 # That was first fixed with weak definitions in axl-str-compat.c /
-# axl-intrinsics.c; under P3 both files are DELETED and newlib owns those names
-# outright, which `make check-libc-overlap` now enforces as a FORBIDDEN set. -frtti earns its place on the size and
-# symbol-surface argument above, on its own.
+# axl-intrinsics.c; under P3 both files were REMOVED from libaxl.a's own
+# LIB_SOURCES and newlib owns those names outright on THIS link, which
+# `make check-libc-overlap` now enforces as a FORBIDDEN set. (The files
+# themselves came back as a SEPARATE archive, libaxl-standin.a, linked only
+# under AXL_TOOLCHAIN=host where newlib is absent from the link entirely --
+# docs/AXL-Host-Toolchain-Design.md §5.3. libaxl.a's LIB_SOURCES still
+# excludes them, which is the invariant the gate above checks.) -frtti earns
+# its place on the size and symbol-surface argument above, on its own.
 #
 # It also keeps the object out of axl-cc's RTTI_LINK heuristic, which matches
 # an undefined `__class_type_info` (see scripts/axl-cc). Nothing depends on that
@@ -531,9 +571,13 @@ OBJCOPY_SECTIONS = -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
 #
 # Until P3 a link was libaxl.a and nothing else, and AXL carried its own
 # memcpy/strlen/... in axl-str-compat.c and axl-intrinsics.c to serve the
-# vendored code that calls the standard names. Those are deleted; newlib owns
-# them now, so every link needs libc.a or the vendored libvterm/lzma objects
-# have no memcpy.
+# vendored code that calls the standard names. Those two files were dropped
+# from libaxl.a's own sources; newlib owns the names on THIS link now, so
+# every link needs libc.a or the vendored libvterm/lzma objects have no
+# memcpy. (The files reappeared as a SEPARATE archive, libaxl-standin.a, for
+# AXL_TOOLCHAIN=host -- docs/AXL-Host-Toolchain-Design.md §5.3 -- where
+# there is no newlib on the link to own the names instead. libaxl.a's own
+# sources still exclude them.)
 #
 # The PORTING LAYER travels with it, for the reason axl-cc documents: newlib
 # defines none of write/read/open/close/lseek/fstat, and `malloc` reaches
@@ -1227,7 +1271,7 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
     check-log-levels check-handle-exclusions check-libc-overlap check-build-mode \
     check-awk-portability check-devkit-conf check-tool-version check-tool-docs \
-    check-asset-names
+    check-asset-names check-tools-sidecars
 
 # Gates that need BUILT IMAGES, and therefore CANNOT be in LINT_GATES.
 #
@@ -1483,7 +1527,7 @@ PREV_BUILD_STATE := $(shell cat $(BUILD_STATE_FILE) 2>/dev/null)
 
 ifneq ($(BUILD_STATE),$(PREV_BUILD_STATE))
 ifneq ($(PREV_BUILD_STATE),)
-$(info build state changed: $(PREV_BUILD_STATE) -> $(BUILD_STATE); wiping .o, libaxl.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage and stale-flag objects)
+$(info build state changed: $(PREV_BUILD_STATE) -> $(BUILD_STATE); wiping .o, libaxl.a, libaxl-standin.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage and stale-flag objects)
 # Wipe everything that links against libaxl.a. The earlier targeted
 # wipe missed test binaries (which live at $(PREFIX)/AxlTest*.efi —
 # root of PREFIX, not tools/) AND example binaries (hello.efi,
@@ -1494,7 +1538,15 @@ $(info build state changed: $(PREV_BUILD_STATE) -> $(BUILD_STATE); wiping .o, li
 # producing baffling failures like "alloc fill 0xDA" tripping on
 # freshly-malloced memory. Blanket-wipe everything that could
 # reference the libaxl.a ABI; rebuilds are cheap.
-$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/lib/libaxl-cxxrt.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.efi $(PREFIX)/drivers/*.so)
+#
+# libaxl-standin.a is in this list for the same reason libaxl.a is: it is
+# compiled from these same CFLAGS/INCLUDES, and it is a LINT_GATES member
+# (check-libc-overlap) that verify.sh runs CONCURRENTLY with a build --
+# leaving a stale-flag copy behind would have that gate read old-flag
+# bytes and report a clean verdict over content this build state no
+# longer describes. Exactly the shadowing this task's own sabotage step
+# hit by hand with a leftover BUILD=RELEASE tree.
+$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/lib/libaxl-standin.a $(PREFIX)/lib/libaxl-cxxrt.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.efi $(PREFIX)/drivers/*.so)
 endif
 $(shell mkdir -p $(BUILDDIR) && echo $(BUILD_STATE) > $(BUILD_STATE_FILE))
 endif
@@ -1518,10 +1570,11 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # any future helper target) into the default by accident.
 .DEFAULT_GOAL := all
 
-all: check-version $(PREFIX)/lib/libaxl.a $(LIBAXL_CXXRT_TARGET) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ) $(CRT0_MINIMAL_OBJ) $(PE_SET_DEBUG)
+all: check-version $(PREFIX)/lib/libaxl.a $(PREFIX)/lib/libaxl-standin.a $(LIBAXL_CXXRT_TARGET) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ) $(CRT0_MINIMAL_OBJ) $(PE_SET_DEBUG)
 	@echo ""
 	@echo "  AXL library built (gcc, $(ARCH))"
 	@echo "  Library:  $(PREFIX)/lib/libaxl.a"
+	@echo "  Standin:  $(PREFIX)/lib/libaxl-standin.a"
 ifdef AXL_CPP
 	@echo "  C++ glue: $(PREFIX)/lib/libaxl-cxxrt.a"
 endif
@@ -1955,8 +2008,8 @@ check-log-levels:
 # headers.
 #
 # 20 of the 51 examples were reachable by no build rule and no test at all --
-# they are copied verbatim into the .deb / .rpm by scripts/build-packages.sh,
-# so the first person to compile one was a consumer. That is not hypothetical:
+# they ship verbatim in the SDK tarball, so the first person to compile one was
+# a consumer. That is not hypothetical:
 # commit 1b88001a renamed AxlFsProviderInfo to AxlFsEntry across the tree and
 # left sdk/examples/memfs.c behind, and it stayed broken because nothing ever
 # fed it to a compiler.
@@ -2314,6 +2367,13 @@ check-tool-docs:
 check-asset-names:
 	@python3 scripts/check-asset-names.py
 
+# Every share/*.json5 reaches the UEFI-tools tarball. The staging loop named
+# the PCI files only and was never revisited when lsusb and memspd grew
+# sidecars, so v4.6.0 shipped both tools without their databases -- in a
+# workflow no test reads, which runs only on a tag.
+check-tools-sidecars:
+	@python3 scripts/check-tools-sidecars.py
+
 check-version:
 	@file_ver=$$(cat VERSION); \
 	header_ver=$$(sed -n 's/^#define AXL_VERSION_STRING  *"\(.*\)".*/\1/p' include/axl/axl-version.h); \
@@ -2567,6 +2627,24 @@ $(PREFIX)/lib/libaxl-cxxrt.a: $(BUILDDIR)/axl-cxxrt-alloc.o \
 	@rm -f $@
 	$(AR) rcs $@ $^
 endif
+
+# THE STAND-IN LIBC, for AXL_TOOLCHAIN=host ONLY (AXL-Host-Toolchain-Design.md
+# §5.3). Eleven WEAK leaf functions forwarding to axl_*, restored from
+# 6ec731d3^ -- that commit deleted them because "libc.a is on every link now,
+# so a second provider would only compete on scan order", which is true under
+# AXL_TOOLCHAIN=axl and false under host, where there is no competitor.
+#
+# A SEPARATE ARCHIVE, deliberately: inside libaxl.a it would change that
+# archive's bytes on every existing configuration and restore the multiple-
+# definition hazard check-libc-overlap exists for. Unconditional (not gated
+# by LIBAXL_CXXRT_TARGET/AXL_CPP above) -- host mode is C-only, so this must
+# build with a plain `make` and no C++ toolchain in play.
+STANDIN_SOURCES = src/data/axl-str-compat.c src/mem/axl-intrinsics.c
+STANDIN_OBJS    = $(patsubst %.c,$(BUILDDIR)/%.o,$(notdir $(STANDIN_SOURCES)))
+
+$(PREFIX)/lib/libaxl-standin.a: $(STANDIN_OBJS) | $(PREFIX)/lib
+	@rm -f $@
+	$(AR) rcs $@ $^
 
 $(BUILDDIR):
 	mkdir -p $@

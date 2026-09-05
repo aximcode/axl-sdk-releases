@@ -2,8 +2,16 @@
 # test-meta: arch=x64 needs= est=5 local-only=1
 # test-axl-cc-hosted-headers.sh — a consumer that directly #include's hosted
 # libc headers (<string.h>, <stdlib.h>, <stdio.h>, ...) must build via the
-# STAGED SDK for EVERY staged arch, and must resolve them from the SDK's own
-# bare-metal toolchain — never from host glibc.
+# STAGED SDK for every staged arch that RESOLVES TO THE BARE-METAL TOOLCHAIN,
+# and must resolve them from that toolchain — never from host glibc.
+#
+# That qualifier is load-bearing since AXL_TOOLCHAIN=auto landed
+# (docs/AXL-Host-Toolchain-Design.md §3): the headers come from the
+# toolchain's newlib, and where x64 resolves to `host` instead there is no
+# newlib and no C library at all (§5.1), so the guarantee is conditional on
+# the toolchain being installed rather than unconditional. Such an arch SKIPS
+# by name below. Failing it would tell a consumer whose install is working
+# exactly as designed that it is broken.
 #
 # The guarantee is the same one this test was written for; only the mechanism
 # changed. It used to be met by SHIMS: install.sh staged include/compat/ and
@@ -69,6 +77,30 @@ for arch in x64 aa64; do
         echo "SKIP: $arch not staged (lib/axl/$arch absent)"
         continue
     fi
+    # Ask axl-cc which toolchain it resolved rather than re-deriving it here:
+    # it owns the rule, and a second copy of it is the drift that would make
+    # this test skip on the wrong machines.
+    #
+    # The probe's stderr is KEPT and its status read. "The probe could not
+    # run" and "the probe ran and said axl" are the same empty string and
+    # opposite facts: swallowing stderr would turn a broken axl-cc into a
+    # silent decision to build anyway, with the reason invisible. An
+    # unanswerable probe is a FAILURE here, not a skip and not a build --
+    # this test cannot know whether its premise holds.
+    variant="$("$AXL_CC" --arch "$arch" --print-toolchain 2>"$WORK/probe-$arch.err")"
+    probe_rc=$?
+    if [[ "$probe_rc" -ne 0 || -z "$variant" ]]; then
+        check 1 "$arch: axl-cc could not report its resolved toolchain (rc=$probe_rc)"
+        sed 's/^/      /' "$WORK/probe-$arch.err" | head -5
+        continue
+    fi
+    if [[ "$variant" == "host" ]]; then
+        echo "SKIP: $arch resolved to the host compiler; hosted libc headers"
+        echo "      do not exist there by design (no newlib, no libc at all)."
+        echo "      Install the bare-metal toolchain to run this:"
+        echo "        axl toolchain install $arch"
+        continue
+    fi
     built_any=1
 
     "$AXL_CC" --arch "$arch" --type app -c "$WORK/consumer.c" \
@@ -101,7 +133,7 @@ for arch in x64 aa64; do
 done
 
 if [[ "$built_any" -eq 0 ]]; then
-    echo "SKIP: no arch staged under $STAGE/lib/axl"
+    echo "SKIP: no staged arch resolves to the bare-metal toolchain under $STAGE/lib/axl"
 fi
 
 echo "--- results ---"
