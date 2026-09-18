@@ -98,12 +98,12 @@ echo TOOL-MOUNT
 echo TOOL-MOUNT-STATUS
 9p.efi status
 echo TOOL-MOUNT-READ
-type fs1:\\dir\\a.txt
+type fs20:\\dir\\a.txt
 echo TOOL-UMOUNT
 9p.efi umount
 9p.efi status
 echo TOOL-UMOUNT-DONE
-type fs1:\\dir\\a.txt
+type fs20:\\dir\\a.txt
 echo TOOL-DONE
 reset -s
 NSHEOF
@@ -205,11 +205,12 @@ test_slice_log TOOL-UMOUNT       TOOL-UMOUNT-DONE  "$UMOUNT_LOG"
 test_slice_log TOOL-UMOUNT-DONE  TOOL-DONE         "$UMOUNT_READ_LOG"
 
 # The mount verb names the volume it published, so a human can type it -- and
-# so this test can. `fs1:` is what the guest actually reports here (the boot
-# volume is fs0:); the `type` below uses the same name, so a firmware that
+# so this test can. `fs20:` is what the guest reports here: the first free
+# name from AXL_VOLUME_FSN_FLOOR up, clear of the low numbers the shell's
+# `map -u` hands out. The `type` below uses the same name, so a build that
 # assigned a different one fails BOTH lines rather than silently reading some
 # other volume.
-assert_line "9p: mounted 10.0.2.2 as fs1:" "$MOUNTED_LOG"
+assert_line "9p: mounted 10.0.2.2 as fs20:" "$MOUNTED_LOG"
 assert_line "9p-mount: running" "$MOUNT_STATUS_LOG"
 
 # The other half of `status`, and the reason it exists at all: the two

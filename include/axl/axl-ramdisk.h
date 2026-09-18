@@ -18,9 +18,12 @@
     axl_ramdisk_ensure_driver(NULL, 0, NULL);
     void *dp = NULL;
     if (axl_ramdisk_create("SCRATCH", 64, &dp) == AXL_OK) {
-        // The volume exists but has no shell name yet: give it one with
-        // axl_volume_set_map(dp, "FS9") (what mkrd does), or let the user
-        // run `map -r`. create never refreshes the shell's map.
+        // The volume exists but has no shell name yet: give it a free
+        // FS<n> at or above FS20 with axl_volume_set_map, checking
+        // axl_volume_map_taken first (SetMap takes a name from whatever
+        // holds it); mkrd does the same, out of the range `map -u`
+        // normally hands out. Or let the user run `map -r`. create never
+        // refreshes the shell's map.
     }
     @endcode
 

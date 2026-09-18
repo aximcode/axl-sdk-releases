@@ -140,4 +140,19 @@ axl_efi1x_map_exists(
     const unsigned short  *name  ///< UCS-2 map name
     );
 
+/**
+ * @brief True when the old shell maps @p name to exactly @p device_path.
+ *
+ * GetMap(name) byte-compared with @p device_path — the same comparison the
+ * fs<n> reverse lookup uses.
+ *
+ * @return true on a match; false if @p name is unmapped, maps elsewhere, or
+ *     there is no shell environment.
+ */
+bool
+axl_efi1x_map_is(
+    const unsigned short  *name,         ///< UCS-2 map name
+    void                  *device_path   ///< device path to compare against
+    );
+
 #endif /* AXL_BACKEND_NATIVE_EFI1X_H */

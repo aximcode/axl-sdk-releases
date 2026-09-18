@@ -779,7 +779,8 @@ axl_volume_enumerate(
  * @brief Resolve the UEFI Shell's fsN alias for a device path.
  *
  * Looks @p device_path up in the shell's volume map (GetMapFromDevicePath)
- * and writes the lowercased `fsN` alias (no trailing `:`) to @p out. This is
+ * and writes the lowercased `fsN` alias (no trailing `:`) to @p out -- `fs`
+ * and digits only, so a custom name like `fs1a` is not taken for one. This is
  * the shell's *actual* mapping — unlike axl_volume_enumerate()'s `.name`,
  * it never falls back to a synthesized LocateHandle index. Use it when you
  * must publish a caller-usable `fsN` (e.g. a freshly created RAM disk): a real
@@ -791,7 +792,8 @@ axl_volume_enumerate(
  *
  * @return AXL_OK with @p out set to the alias; AXL_ERR if @p device_path has no
  *     shell mapping (not yet remapped, or no fs alias), an argument is invalid,
- *     or the backend has no shell at all. @p out is left unchanged on any
+ *     @p out_size is too small for the whole name (it is never shortened), or
+ *     the backend has no shell at all. @p out is left unchanged on any
  *     non-AXL_OK return.
  */
 AXL_WARN_UNUSED int
@@ -858,7 +860,9 @@ axl_volume_map_taken(
  * (i.e. be connected — e.g. a RAM disk from @ref axl_ramdisk_create, which
  * connects it) for the name to be usable as a volume.
  *
- * Pair with axl_volume_map_taken() to avoid clobbering an existing name.
+ * If @p name is already mapped, the volume that held it loses it: the shell
+ * removes the old mapping before adding the new one. Pair with
+ * axl_volume_map_taken() to avoid that, or use axl_volume_pick_free_fsn().
  *
  * @return AXL_OK on success; AXL_ERR on bad args / SetMap failure;
  *     AXL_UNSUPPORTED when there is no shell (SetMap unavailable).
@@ -910,6 +914,84 @@ axl_volume_alias_to_fsn(
 AXL_WARN_UNUSED int
 axl_volume_unmap(
     const char *name           ///< mapping name to delete, `:` optional
+);
+
+/// Lowest `FS<n>` number axl_volume_pick_free_fsn() hands out. The shell's
+/// `map -u` names each volume that has no name `FS<count++>` from a counter of
+/// its own, which starts at the number of volumes named at boot, is reset only
+/// by `map -r`, and never checks the map; SetMap then takes the name from
+/// whatever held it. The lowest free number is exactly that counter's next
+/// value. Numbers from this floor up stay clear of it until `map -u` has named
+/// enough new volumes to get there, or at once on a system that boots with
+/// this many volumes.
+#define AXL_VOLUME_FSN_FLOOR  20
+
+/// End (exclusive) of the axl_volume_pick_free_fsn() scan.
+#define AXL_VOLUME_FSN_LIMIT  256
+
+/**
+ * @brief Pick a free `FS<n>` name for a volume a program names itself.
+ *
+ * Returns the lowest `FS<n>` the shell has not mapped, from
+ * @ref AXL_VOLUME_FSN_FLOOR up to (not including) @ref AXL_VOLUME_FSN_LIMIT,
+ * in the shell's own uppercase spelling (e.g. `"FS20"`, no `:`). Starting at
+ * the floor, not at 0, keeps the name out of the numbers the shell's `map -u`
+ * hands out (see @ref AXL_VOLUME_FSN_FLOOR). Assign it with
+ * axl_volume_set_map(). Keeps no state: each call asks the shell's live map,
+ * so a name freed with axl_volume_unmap() is picked again.
+ *
+ * With no shell every name reads as free, so this returns the floor and the
+ * following axl_volume_set_map() reports AXL_UNSUPPORTED.
+ *
+ * @return AXL_OK with @p out set; AXL_ERR if every name in the range is
+ *     taken, @p out is NULL, or @p out_size is too small for the name.
+ */
+AXL_WARN_UNUSED int
+axl_volume_pick_free_fsn(
+    char   *out,        ///< [out] receives the name, e.g. "FS20"
+    size_t  out_size    ///< capacity of @p out in bytes (including NUL)
+);
+
+/**
+ * @brief Is @p name one of the shell's names for @p device_path?
+ *
+ * Unlike axl_volume_map_taken(), which only says the name is in use, this
+ * says whether it is in use by this device — e.g. to tell "the label is
+ * already our alias" from "the label belongs to another volume".
+ *
+ * Works on the modern shell (GetDevicePathFromMap) and on the old EFI 1.x
+ * shell (SHELL_ENVIRONMENT.GetMap), comparing the device paths byte for byte.
+ *
+ * @return true if the shell maps @p name to exactly @p device_path; false if
+ *     not, on bad args, or with no shell at all.
+ */
+bool
+axl_volume_map_is(
+    const char *name,          ///< mapping name, `:` optional
+    const void *device_path    ///< device path to compare against
+);
+
+/**
+ * @brief Remove every shell name that maps to @p device_path.
+ *
+ * For a volume that is going away: drops the names its owner set, and any a
+ * user or a `map -r` added since, so none of them is left pointing at a
+ * device that no longer exists. Only names that currently map to
+ * @p device_path are touched — a name that has since moved to another volume
+ * stays with it (unlike axl_volume_unmap() on a remembered name).
+ *
+ * Names are taken whole from the shell's own list for the device, so a name of
+ * any length or spelling is removed exactly as the shell stores it.
+ *
+ * @return AXL_OK when no name maps to @p device_path any more (including when
+ *     none did, and with no shell at all); AXL_ERR when one still does — the
+ *     shell refused to remove it, or has no programmatic unmap (the old EFI
+ *     1.x shell, where only `map -r` clears it) — or @p device_path is NULL.
+ */
+AXL_WARN_UNUSED int
+axl_volume_unmap_device(
+    const void *device_path,   ///< device path whose names to remove
+    size_t     *removed        ///< [out, optional] how many names were removed
 );
 
 #ifdef __cplusplus

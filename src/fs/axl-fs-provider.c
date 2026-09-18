@@ -23,10 +23,6 @@ AXL_LOG_DOMAIN("fs-provider");
 
 #define MAX_PATH_BYTES  512u
 
-/* Ceiling for the free-"fsN"-slot scan in publish_shell_map — mirrors
-   mkrd.c's MKRD_MAX_FS_SCAN (same shell-mapping problem, same bound). */
-#define FS_PROVIDER_MAX_FS_SCAN  256u
-
 // ===================================================================
 // Internal types
 // ===================================================================
@@ -61,14 +57,6 @@ struct Publication {
     /* Device-path allocated by axl_device_path_new_vendor; freed on
        unpublish. */
     AxlDevicePath                   *device_path;
-
-    /* "fsN" shell mapping publish_shell_map assigned to device_path, or ""
-       if none was (no shell / no free slot). Unpublish must remove it
-       BEFORE freeing device_path below -- otherwise the shell's map table
-       is left holding a dangling pointer to freed memory, and a later
-       `dir`/`type fsN:` (or another axl_volume_enumerate walking every
-       mapped entry's device path) dereferences it. */
-    char                             shell_name[16];
 
     /* Open-file list (singly-anchored doubly-linked). Walked on
        unpublish to force-close + mark dead. Single-threaded
@@ -884,33 +872,34 @@ provider_validate(const AxlFsProvider *p)
  * same as any other shell-only feature — callers still reach it via the
  * returned handle / axl_protocol_enumerate.
  *
- * On success, writes the assigned name to @p pub->shell_name so unpublish
- * can remove it later; left as "" (the calloc'd default) otherwise.
+ * Unpublish removes it again by device path, not by name, so a name that has
+ * since moved to another volume stays with that volume.
  */
 static void
 publish_shell_map(Publication *pub)
 {
-    for (uint32_t i = 0; i < FS_PROVIDER_MAX_FS_SCAN; i++) {
-        char name[16];
-        axl_snprintf(name, sizeof(name), "fs%u", i);
-        if (!axl_volume_map_taken(name)) {
-            int rc = axl_volume_set_map(pub->device_path, name);
-            if (rc == AXL_OK) {
-                axl_strlcpy(pub->shell_name, name, sizeof(pub->shell_name));
-            } else if (rc == AXL_UNSUPPORTED) {
-                /* Expected in a headless/driver context (no EFI_SHELL_PROTOCOL
-                   locatable) -- not a fault, so no WARN. Best-effort, matching
-                   axl_driver_connect_handle above: the volume is still
-                   reachable via the returned handle / axl_protocol_enumerate,
-                   just not by an "fsN:" path. */
-                axl_debug("no shell present; volume left unmapped");
-            } else {
-                /* A shell IS present but rejected SetMap for this name --
-                   worth a WARN, unlike the plain no-shell case above. */
-                axl_warning("shell map assignment failed (SetMap rejected)");
-            }
-            return;
-        }
+    /* FS20 and up, not the lowest free name: the shell's `map -u` hands out
+       low numbers from a counter that never checks the map, and would take
+       this volume's name for the next volume it names (AXL_VOLUME_FSN_FLOOR). */
+    char name[16];
+    if (axl_volume_pick_free_fsn(name, sizeof(name)) != AXL_OK) {
+        axl_warning("no free shell name from FS%u to FS%u; volume left unmapped",
+                    (unsigned)AXL_VOLUME_FSN_FLOOR,
+                    (unsigned)(AXL_VOLUME_FSN_LIMIT - 1));
+        return;
+    }
+    int rc = axl_volume_set_map(pub->device_path, name);
+    if (rc == AXL_UNSUPPORTED) {
+        /* Expected in a headless/driver context (no EFI_SHELL_PROTOCOL
+           locatable) -- not a fault, so no WARN. Best-effort, matching
+           axl_driver_connect_handle above: the volume is still reachable via
+           the returned handle / axl_protocol_enumerate, just not by an
+           "fsN:" path. */
+        axl_debug("no shell present; volume left unmapped");
+    } else if (rc != AXL_OK) {
+        /* A shell IS present but rejected SetMap for this name -- worth a
+           WARN, unlike the plain no-shell case above. */
+        axl_warning("shell map assignment failed (SetMap rejected)");
     }
 }
 
@@ -1003,14 +992,21 @@ axl_fs_provider_unpublish(void *handle)
     axl_protocol_unregister("simple-fs", &pub->sfs, pub->handle);
     axl_protocol_unregister("device-path", pub->device_path, pub->handle);
 
-    /* Drop the shell mapping BEFORE freeing device_path below -- otherwise
-       the shell's map table is left holding a pointer into freed memory,
-       and a later `dir`/`type fsN:` (or another axl_volume_enumerate
-       walking every mapped entry's device path) dereferences it. */
-    if (pub->shell_name[0] != '\0' && axl_volume_unmap(pub->shell_name) != AXL_OK) {
-        /* Best-effort: the shell may already be gone (e.g. exiting alongside
-           this unpublish), in which case there is no map left to leak. */
-        axl_warning("shell map '%s' removal failed", pub->shell_name);
+    /* Drop every shell name for this volume while device_path is still ours
+       to match on. The shell keeps its own copy of a mapped device path, so
+       a name left behind outlives the volume: it resolves to a path with no
+       volume behind it, or to the next publication with the same vendor
+       GUID. Match by device path, not by the name publish assigned: that
+       name may have moved to another volume since (the user, or `map -u`,
+       gave it away), and removing it would take it from that volume; and a
+       user or a `map -r` may have added names of their own. The shell
+       cannot tell apart two publications with the same vendor GUID either
+       (identical device paths), so their names go together. */
+    if (axl_volume_unmap_device(pub->device_path, NULL) != AXL_OK) {
+        /* Best-effort: a shell with no programmatic unmap (the old EFI 1.x
+           shell) keeps a name its own `map -r` gave the volume. */
+        axl_warning("the shell still maps a name to the unpublished volume; "
+                    "'map -r' clears it");
     }
 
     pub->dead = true;

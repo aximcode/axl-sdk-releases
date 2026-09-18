@@ -1,24 +1,26 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=12 local-only=0
+# test-meta: arch=both needs= est=25 local-only=0
 # test-ramdisk-map-qemu.sh — mkrd maps a freshly created RAM disk so it shows in
 # a bare `map` IMMEDIATELY (no `map -r`), looking like a native volume:
 #
-#       FS1: Alias(s):DEMO:
+#       FS20: Alias(s):DEMO:
 #           VirtualDisk(...)
 #
 # It does this with TWO EFI_SHELL_PROTOCOL.SetMap calls on the disk's device
-# path: the next-free `FS<n>` name FIRST (so the shell's name filter shows it and
-# it becomes the PRIMARY column) and the volume LABEL second (so the label lands
-# in the `Alias(s):` column). Both `FS<n>:` and `LABEL:` are usable paths with no
-# `map -r`. There is NO `-a/--alias` option and NO `%<label>%` env var anymore —
-# the label IS the friendly alias, and the fsN is the native handle.
+# path: a free `FS<n>` name, FS20 or above, FIRST (so the shell's name filter
+# shows it and it becomes the PRIMARY column) and the volume LABEL second (so
+# the label lands in the `Alias(s):` column). Both `FS<n>:` and `LABEL:` are
+# usable paths with no `map -r`. There is NO `-a/--alias` option and NO
+# `%<label>%` env var anymore — the label IS the friendly alias, and the fsN is
+# the native handle.
 #
 # A ~20-check matrix over one QEMU boot:
 #   - no-args / -h        -> print help; help no longer advertises -a
-#   - `mkrd DEMO`         -> `map` shows `FS<n>: Alias(s):DEMO:`; DEMO: usable
+#   - `mkrd DEMO`         -> `map` shows `FS20: Alias(s):DEMO:`; DEMO: usable
 #   - `mkrd DEMO` again   -> idempotent: same fsN + alias, "reused", no duplicate
 #   - ALPHA/BETA/GAMMA    -> coexist, each `FS<n>: Alias(s):<LABEL>:`, distinct fsN
 #   - `-l` columns MAPPING(fsN)/LABEL/ALIAS(label:)/SIZE/FS; `-d GAMMA` destroys+unmaps
+#     and the next create reuses the fsN it freed
 #   - label unusable as an alias (fs-pattern `fs9` / unsafe `BADX.Y` / over-long)
 #     -> mapped as `FS<n>:` with NO label alias, and a note says why
 #   - `mkrd fs0`          -> never clobbers the boot volume
@@ -26,6 +28,12 @@
 #   - `-v`                -> protocol probe; quiet (no [INFO]) without it
 #   - a map name + %path% made BEFORE mkrd survive create+destroy, and create
 #     warns that a later `map -r` replaces the names it set (mkrd runs none)
+#   - a SECOND boot: `map -u` names an unmapped volume from the shell's own
+#     counter (FS1) and leaves the FS20 mkrd took alone; a re-run says
+#     "reused", gives back a missing fsN or label, reports the disk's real
+#     size, and notes only names it set; with FS20..FS255 all taken it exits
+#     0 and points at `map -u` (or, for a disk that keeps its label, at
+#     `map -r`, since `map -u` skips a disk that has a name)
 # This is the read-only-boot scratch-volume workflow (delldiags).
 #
 # Usage: ./test/integration/test-ramdisk-map-qemu.sh [--arch X64|AARCH64]
@@ -36,7 +44,7 @@ ARCH="X64"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^# Usage/p' "$0"; exit 0 ;;
         *) echo "ERROR: unknown arg '$1'"; exit 2 ;;
     esac
 done
@@ -126,6 +134,8 @@ echo MARK_LIST2
 mkrd.efi -l
 echo MARK_QDEAD
 map GAMMA:
+echo MARK_REUSE
+mkrd.efi DELTA -s 4
 echo MARK_PRESERVE
 map PRESRV:
 echo MARK_PATH_AFTER=[%path%]
@@ -144,6 +154,11 @@ sed -n '/MARK_NOARGS/,/MARK_DONE/p' "$LOG" | grep -aE "RAM disk (created|reused)
 fail=0
 # The log slice between two markers.
 sect() { sed -n "/$1/,/$2/p" "$LOG"; }
+# The FS<n> in mkrd's create summary for label $2, first create in log $1.
+fsn_of() {
+    grep -aoE "mapping : FS[0-9]+: \(alias $2:\)" "$1" | head -1 \
+        | grep -oE "FS[0-9]+" || true
+}
 ok()   { echo "PASS: $1"; }
 no()   { echo "FAIL: $1"; fail=1; }
 
@@ -161,6 +176,11 @@ sect MARK_HELP MARK_CREATE | grep -aqiF "alias override" \
 sect MARK_CREATE MARK_MAP_CREATE | grep -aqE "mapping : FS[0-9]+: \(alias DEMO:\)" \
     && ok "create prints 'mapping : FS<n>: (alias DEMO:)'" \
     || no "create did not print the fsN-primary + label-alias mapping line"
+# The first create in this boot takes the floor, FS20: not FS1, the number the
+# shell's own `map -u` counter hands out next (check 13 covers why).
+sect MARK_CREATE MARK_MAP_CREATE | grep -aqF "mapping : FS20: (alias DEMO:)" \
+    && ok "the first create takes FS20, the floor, not the shell's next number" \
+    || no "the first create did not take FS20"
 if sect MARK_CREATE MARK_MAP_CREATE | grep -aqE "^  var |%DEMO%"; then
     no "create still emits a %VAR% (the '  var :' line / %DEMO%)"
 else
@@ -264,6 +284,12 @@ sect MARK_LIST MARK_DESTROY | grep -aqE "MAPPING[[:space:]]+LABEL/ALIAS[[:space:
 sect MARK_LIST MARK_DESTROY | grep -aqE "FS[0-9]+:[[:space:]]+ALPHA:[[:space:]]+[0-9]+MB[[:space:]]+FAT16" \
     && ok "-l row: MAPPING=FS<n>: LABEL=ALPHA: SIZE=NMB FS=FAT16" \
     || no "-l row not MAPPING(fsN)/LABEL(ALPHA:)/SIZE(NMB)/FS"
+# COLL: is fs0's name (mapped before `mkrd COLL`), not the COLL disk's, so -l
+# must show that disk's label plain -- the colon means "type this to reach
+# the disk", and COLL: reaches fs0.
+sect MARK_LIST MARK_DESTROY | grep -aqE "FS[0-9]+:[[:space:]]+COLL[[:space:]]" \
+    && ok "-l shows a label held by another volume without the colon" \
+    || no "-l shows COLL: as the COLL disk's alias, but COLL: is fs0's name"
 
 # --- 10. -d GAMMA destroys + unmaps; -l drops it; map GAMMA: gone ---
 sect MARK_DESTROY MARK_LIST2 | grep -aqF "destroyed" \
@@ -276,9 +302,18 @@ if sect MARK_LIST2 MARK_QDEAD | grep -aqF "ALPHA" \
 else
     no "-l after destroy did not drop GAMMA (or lost ALPHA)"
 fi
-sect MARK_QDEAD MARK_PRESERVE | grep -aqF "Cannot find mapped device" \
+sect MARK_QDEAD MARK_REUSE | grep -aqF "Cannot find mapped device" \
     && ok "GAMMA: no longer mapped after destroy (alias removed)" \
     || no "GAMMA: still mapped after destroy (dangling alias)"
+# The fsN a destroy frees is free in the shell's live map at once, so the next
+# create takes it: mkrd keeps no counter between runs, it asks the map.
+gamma_fsn=$(fsn_of "$LOG" GAMMA)
+delta_fsn=$(fsn_of "$LOG" DELTA)
+if [[ -n "$gamma_fsn" && "$delta_fsn" == "$gamma_fsn" ]]; then
+    ok "the next create reuses $gamma_fsn, the name -d GAMMA freed"
+else
+    no "after -d GAMMA (${gamma_fsn:-no fsN}) the next create took ${delta_fsn:-no fsN}"
+fi
 
 # --- 11. Quiet by default; -v enables the protocol probe ---
 # Scope the check to GUEST output — between the first guest marker (MARK_NOARGS)
@@ -339,6 +374,202 @@ fi
 sect MARK_CREATE MARK_MAP_CREATE | grep -aqF "a later 'map -r'" \
     && ok "create warns that a later 'map -r' replaces the names" \
     || no "create does not warn about a later 'map -r'"
+
+# --- 13. `map -u` leaves mkrd's names alone (the FS20 floor) ---------------
+# `map -u` names each volume that has no name FS<mFsMaxCount++>: a private
+# counter that starts at the number of volumes named at boot and never looks at
+# the map (ShellPkg ShellCommandCreateNewMappingName), and EfiShellSetMap
+# deletes the previous holder of a name first. mkrd used to take the lowest
+# free FS<n>, which is exactly that counter's next value, so the next volume
+# `map -u` named took the disk's name. mkrd now starts at FS20.
+#
+# A SECOND boot, so the shell's counter is known: with one boot volume, the
+# next name `map -u` hands out is FS1. UTWO's names are removed so it is an
+# unmapped volume -- with every volume named, `map -u` skips them all and does
+# nothing. Its fsN is removed under both numbers a build can give it (FS21 with
+# the floor, FS2 without); the one that is not mapped just errors. That keeps
+# the check about the steal rather than the number: against a build without
+# the floor it fails at "keeps the name mkrd gave it", not at setup.
+UNSH="$TMP/mapu.nsh"
+ULOG="$TMP/mapu.log"
+cat > "$UNSH" <<'EOF'
+@echo -off
+fs0:
+mkrd.efi UONE -s 4
+mkrd.efi UTWO -s 4
+UONE:
+echo uone-content > uone.txt
+UTWO:
+echo utwo-content > utwo.txt
+fs0:
+map -d UTWO:
+map -d FS21:
+map -d FS2:
+echo MARK_U_BEFORE
+map UONE:
+mkrd.efi -l
+echo MARK_U_MAPU
+map -u
+echo MARK_U_AFTER
+map UONE:
+echo MARK_U_NEW
+dir FS1:\
+echo MARK_U_LABEL
+dir UONE:\
+echo MARK_U_DONE
+map -d FS20:
+echo MARK_R_LABEL_ONLY
+mkrd.efi UONE -s 4
+map UONE:
+echo MARK_R_UNMAPPED
+map -d UONE:
+map -d FS20:
+mkrd.efi UONE -s 4
+echo MARK_R_MAPR
+map -r
+echo MARK_R_AFTER_MAPR
+mkrd.efi UONE -s 4
+map UONE:
+echo MARK_R_AGAIN
+mkrd.efi UONE -s 8
+echo MARK_R_SETUP_KEEP
+mkrd.efi UKEEP -s 4
+map -d FS20:
+echo MARK_R_FILL
+for %a run (20 255)
+  map FS%a fs0: > nul
+endfor
+echo MARK_R_FULL
+mkrd.efi UFULL -s 4
+echo MARK_R_RC=%lasterror%
+echo MARK_R_KEEP
+mkrd.efi UKEEP -s 4
+echo MARK_R_MAPU
+map -u
+mkrd.efi -l
+echo MARK_R_DONE
+reset -s
+EOF
+"$PROJECT_DIR/scripts/run-qemu.sh" --arch "$ARCH" --timeout "$timeout" \
+    --nsh "$UNSH" "$MKRD" > "$ULOG" 2>&1 || true
+
+usect() { sed -n "/$1/,/$2/p" "$ULOG"; }
+uname=$(fsn_of "$ULOG" UONE)
+# `map UONE:` prints UONE's device as "<first name>: Alias(s):<the rest>".
+holds_uname() { grep -aqE "(^|[[:space:]])$uname: Alias\(s\):.*UONE:"; }
+# The "before" range stops ahead of `map -u`, which prints a mapping table.
+if [[ -n "$uname" ]] && usect MARK_U_BEFORE MARK_U_MAPU | holds_uname; then
+    ok "before map -u, UONE is mapped as $uname, the name mkrd gave it"
+else
+    no "setup failed: no 'mapping : FS<n>: (alias UONE:)', or map UONE: did not show it"
+fi
+if usect MARK_U_BEFORE MARK_U_MAPU | grep -aqE "\(unmapped\)[[:space:]]+UTWO[[:space:]]"; then
+    ok "before map -u, UTWO has no shell name (mkrd -l: (unmapped))"
+else
+    no "setup failed: UTWO still had a shell name before map -u"
+fi
+# Control: map -u really named the unmapped volume, and from its own counter.
+if usect MARK_U_NEW MARK_U_LABEL | grep -aqF "utwo.txt"; then
+    ok "map -u named the unmapped volume FS1 (the shell's own counter)"
+else
+    no "map -u did not name the unmapped volume FS1 -- the check below proves nothing"
+fi
+if [[ -n "$uname" ]] && usect MARK_U_AFTER MARK_U_NEW | holds_uname; then
+    ok "after map -u, UONE keeps $uname, the name mkrd gave it"
+else
+    no "map -u took UONE's ${uname:-FS<n>} -- mkrd picked a number the shell's counter hands out"
+fi
+if usect MARK_U_LABEL MARK_U_DONE | grep -aqF "uone.txt"; then
+    ok "the disk is still reachable by its label after map -u"
+else
+    no "the label stopped resolving after map -u"
+fi
+
+# --- 14. A re-run gives back missing names and says what it did --------------
+# Same boot. A re-run of an existing disk must say "reused", never "created",
+# and give back whatever name it finds missing: the fsN when only the label is
+# left (after `map -d FS20:`, or when `map -u` took the fsN), both when neither
+# is, and the label after a `map -r` (which gives the disk an fsN of the shell's
+# own and drops the label). The fsN stays the disk's FIRST name, the one a bare
+# `map` shows as primary, so a restored label goes back behind it. The note
+# about `map -r` is printed only when mkrd set a name in that run.
+if usect MARK_R_LABEL_ONLY MARK_R_UNMAPPED | grep -aqF "RAM disk reused:" \
+   && usect MARK_R_LABEL_ONLY MARK_R_UNMAPPED | grep -aqF "mapping : FS20: (alias UONE:)" \
+   && usect MARK_R_LABEL_ONLY MARK_R_UNMAPPED | grep -aqE "(^|[[:space:]])FS20: Alias\(s\):UONE:"; then
+    ok "label left, fsN gone: a re-run gives FS20 back as the primary name"
+else
+    no "label left, fsN gone: a re-run did not give FS20 back ahead of UONE:"
+fi
+if usect MARK_R_UNMAPPED MARK_R_MAPR | grep -aqF "RAM disk reused:" \
+   && ! usect MARK_R_UNMAPPED MARK_R_MAPR | grep -aqF "RAM disk created:" \
+   && usect MARK_R_UNMAPPED MARK_R_MAPR | grep -aqF "mapping : FS20: (alias UONE:)"; then
+    ok "no names left: a re-run says reused and names the disk again"
+else
+    no "no names left: a re-run said created, or did not name the disk again"
+fi
+if usect MARK_R_AFTER_MAPR MARK_R_AGAIN | grep -aqF "RAM disk reused:" \
+   && usect MARK_R_AFTER_MAPR MARK_R_AGAIN | grep -aqE "mapping : FS[0-9]+: \(alias UONE:\)" \
+   && usect MARK_R_AFTER_MAPR MARK_R_AGAIN | grep -aqE "(^|[[:space:]])FS[0-9]+: Alias\(s\):.*UONE:"; then
+    ok "after map -r: a re-run gives the label back"
+else
+    no "after map -r: a re-run did not give the label back"
+fi
+if usect MARK_R_AFTER_MAPR MARK_R_AGAIN | grep -aqF "a later 'map -r' drops UONE:" \
+   && ! usect MARK_R_AFTER_MAPR MARK_R_AGAIN | grep -aqF "replaces these names"; then
+    ok "after map -r: the note is about the label it set, not the shell's own fsN"
+else
+    no "after map -r: the note does not match what mkrd set (only the label)"
+fi
+if usect MARK_R_AGAIN MARK_R_SETUP_KEEP | grep -aqF "RAM disk reused:" \
+   && ! usect MARK_R_AGAIN MARK_R_SETUP_KEEP | grep -aqF "Note:"; then
+    ok "nothing missing: a re-run sets nothing and prints no note"
+else
+    no "nothing missing: a re-run still printed a note (or was not reported reused)"
+fi
+# The same re-run asks for -s 8: the disk that exists is 4 MB, and the
+# summary must say so, and that -s was ignored, rather than echo the request.
+if usect MARK_R_AGAIN MARK_R_SETUP_KEEP | grep -aqF "size    : 4 MB (FAT16)" \
+   && usect MARK_R_AGAIN MARK_R_SETUP_KEEP | grep -aqF -- "-s 8 ignored"; then
+    ok "re-run with another -s: reports the disk's real size, -s ignored"
+else
+    no "re-run with another -s: the summary did not report the disk's real size"
+fi
+
+# --- 15. No free fsN: the disk is still made, exit 0, and the advice works -----
+# Every name from FS20 to FS255 is taken above (mapped to fs0; the output goes
+# to nul, since 236 mapping tables would swamp the log), so mkrd cannot name
+# UFULL. It must say so, exit 0 (the disk exists; a non-zero status would
+# abort a calling script), and point at `map -u`, which then names it: UFULL
+# has no name to lose, so `map -u` does not skip it.
+if usect MARK_R_FULL MARK_R_RC | grep -aqF "no free fsN from FS20 to FS255" \
+   && usect MARK_R_FULL MARK_R_RC | grep -aqF "run 'map -u'"; then
+    ok "no free fsN: mkrd says so and points at map -u"
+else
+    no "no free fsN: mkrd did not name the cause and the follow-up"
+fi
+if grep -aqE "MARK_R_RC=(0x)?0([^0-9xa-fA-F]|$)" "$ULOG"; then
+    ok "no free fsN: mkrd exits 0 (the disk was created)"
+else
+    no "no free fsN: mkrd exited non-zero: $(grep -ao 'MARK_R_RC=[^[:space:]]*' "$ULOG" | head -1)"
+fi
+if usect MARK_R_MAPU MARK_R_DONE | grep -aqE "(^|[[:space:]])FS[0-9]+:[[:space:]]+UFULL[[:space:]]"; then
+    ok "no free fsN: the advised map -u names the disk"
+else
+    no "no free fsN: the disk still had no name after the advised map -u"
+fi
+
+# --- 16. No free fsN for a disk that keeps its label: no map -u advice ---------
+# UKEEP was left with only its label (map -d FS20:) before FS20..FS255 were
+# taken. A re-run cannot give it an fsN, and `map -u` skips a disk that has any
+# name, so pointing at `map -u` would be advice that does nothing. mkrd must
+# point at the name it has and at `map -r` (which drops that name) instead.
+if usect MARK_R_KEEP MARK_R_MAPU | grep -aqF "reachable as UKEEP:" \
+   && usect MARK_R_KEEP MARK_R_MAPU | grep -aqF "'map -u' skips a disk that already has a name" \
+   && ! usect MARK_R_KEEP MARK_R_MAPU | grep -aqF "run 'map -u' to mount it"; then
+    ok "label kept, no free fsN: points at the label and map -r, not map -u"
+else
+    no "label kept, no free fsN: advised map -u, which skips a disk with a name"
+fi
 
 echo ""
 if [[ "$fail" -eq 0 ]]; then

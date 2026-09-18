@@ -623,15 +623,18 @@ axl_efi1x_map_fs_name_from_dp(
     return AXL_ERR;
 }
 
-bool
-axl_efi1x_map_exists(
+/* The device path the old shell maps @p name to (bare or ':'-terminated), or
+   NULL. GetMap wants the BARE name, so any ':' the caller appended is copied
+   off first. A name too long for the buffer is NULL, never looked up cut
+   short, which could match a different mapping. */
+static void *
+map_device_path_of(
     const unsigned short  *name
     )
 {
     if (name == NULL) {
-        return false;
+        return NULL;
     }
-    /* GetMap wants the BARE name, so copy off any ':' the caller appended. */
     CHAR16 bare[AXL_EFI1X_NAME_MAX];
     size_t i = 0;
     while (name[i] != 0 && name[i] != (unsigned short)':'
@@ -639,6 +642,30 @@ axl_efi1x_map_exists(
         bare[i] = (CHAR16)name[i];
         i++;
     }
+    if (name[i] != 0 && name[i] != (unsigned short)':') {
+        return NULL;
+    }
     bare[i] = 0;
-    return map_device_path(bare) != NULL;
+    return map_device_path(bare);
+}
+
+bool
+axl_efi1x_map_exists(
+    const unsigned short  *name
+    )
+{
+    return map_device_path_of(name) != NULL;
+}
+
+bool
+axl_efi1x_map_is(
+    const unsigned short  *name,
+    void                  *device_path
+    )
+{
+    if (device_path == NULL) {
+        return false;
+    }
+    void *dp = map_device_path_of(name);
+    return dp != NULL && axl_backend_dp_equal(dp, device_path);
 }

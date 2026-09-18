@@ -21,6 +21,7 @@
 #include <axl/axl-fs-provider.h>
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
+#include <axl/axl-shell.h>
 #include <axl/axl-str.h>
 #include <axl/axl-sys.h>
 #include <uefi/axl-uefi.h>
@@ -1037,6 +1038,132 @@ test_status_codes_negative_convention(void)
 }
 
 // ---------------------------------------------------------------------------
+// Shell names: FS20 and up, removed by device path
+// ---------------------------------------------------------------------------
+
+/* A second provider kind, so the two volumes below have different device
+   paths: the shell matches names to devices by device path, and cannot tell
+   two publications with the same vendor GUID apart. */
+static const AxlGuid g_mock_names_guid = AXL_GUID(
+    0x12345678, 0xabcd, 0x4003,
+    0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcf);
+
+/* Assertions test_shell_names makes when the modern shell is present. */
+#define SHELL_NAMES_CHECKS  10
+
+static void *
+published_device_path(void *handle)
+{
+    void *dp = NULL;
+    if (gBS->HandleProtocol((EFI_HANDLE)handle, &gEfiDevicePathProtocolGuid,
+                            &dp) != EFI_SUCCESS) {
+        return NULL;
+    }
+    return dp;
+}
+
+/* Publish names each volume FS20 or above, and unpublish removes the
+   volume's names by device path. The name publish assigned can move to
+   another volume -- a user's `map`, or the shell's own `map -u`, which
+   hands out numbers from a counter that never checks the map -- and
+   removing it by name would take it from that volume. */
+static void
+test_shell_names(void)
+{
+    if (axl_shell_kind() != AXL_SHELL_KIND_UEFI) {
+        test_skip_n(SHELL_NAMES_CHECKS,
+                    "fs-provider: shell names need EFI_SHELL_PROTOCOL");
+        return;
+    }
+
+    void *a = NULL;
+    void *b = NULL;
+    if (axl_fs_provider_publish(&g_mock_provider, &g_mock_guid, &a) != AXL_OK) {
+        test_fail("fs-provider: shell names setup: publish A failed");
+        return;
+    }
+    if (axl_fs_provider_publish(&g_mock_provider, &g_mock_names_guid, &b)
+            != AXL_OK) {
+        test_fail("fs-provider: shell names setup: publish B failed");
+        axl_fs_provider_unpublish(a);
+        return;
+    }
+    void *dpa = published_device_path(a);
+    void *dpb = published_device_path(b);
+
+    char     name_a[16] = "";
+    char     name_b[16] = "";
+    uint32_t num_a      = 0;
+    bool named = dpa != NULL && dpb != NULL
+        && axl_volume_map_name(dpa, name_a, sizeof(name_a)) == AXL_OK
+        && axl_volume_map_name(dpb, name_b, sizeof(name_b)) == AXL_OK;
+    test_check(named, "fs-provider: publish gives each volume an fsN name");
+    test_check(named
+               && axl_str_to_u32(name_a + 2, 10, &num_a, NULL) == AXL_OK
+               && num_a >= AXL_VOLUME_FSN_FLOOR,
+               "fs-provider: the name is FS20 or above, clear of map -u's numbers");
+    test_check(named && axl_volume_map_is(name_a, dpa)
+               && !axl_volume_map_is(name_a, dpb),
+               "fs-provider: map_is tells which volume a name belongs to");
+    /* A buffer too small for the name is an error, never a shortened name
+       ("fs2" for "fs20") that would resolve to another volume. */
+    char small[4];
+    test_check(named && axl_volume_map_name(dpa, small, sizeof(small)) != AXL_OK,
+               "fs-provider: map_name refuses a buffer too small for the name");
+
+    /* Give A's name to B, as `map <name> <B>` or `map -u` would, and give A
+       names of its own that publish did not set -- one not ASCII, one
+       longer than any fixed buffer -- which unpublish must remove whole.
+       The shell lists a device's names in the order they were set, so the
+       non-ASCII one comes first: a removal that cannot spell it stops
+       there, before the long one. */
+    char long_name[160];
+    size_t li = 0;
+    while (li + 1 < 151) {
+        long_name[li] = (char)('A' + (int)(li % 26));
+        li++;
+    }
+    long_name[li] = '\0';
+    bool moved = named
+        && axl_volume_set_map(dpb, name_a) == AXL_OK
+        && axl_volume_set_map(dpa, "FSPNAMES") == AXL_OK
+        && axl_volume_set_map(dpa, "FSPNÄMES") == AXL_OK
+        && axl_volume_set_map(dpa, long_name) == AXL_OK;
+    test_check(moved && axl_volume_map_is(name_a, dpb),
+               "fs-provider: setup: A's name now belongs to B");
+    /* A now has no fsN of its own, only custom names. One that merely
+       starts like an fsN is not one: taking it for the volume's fsN would
+       stop mkrd from giving a disk labelled that way its FS20 back. */
+    char probe[16];
+    test_check(moved && axl_volume_set_map(dpa, "fs1a") == AXL_OK
+               && axl_volume_map_name(dpa, probe, sizeof(probe)) != AXL_OK,
+               "fs-provider: map_name does not take \"fs1a\" for an fsN");
+
+    int rc = axl_fs_provider_unpublish(a);
+    test_check(rc == AXL_OK && axl_volume_map_is(name_a, dpb),
+               "fs-provider: unpublish leaves a name that moved to another volume");
+    test_check(moved && !axl_volume_map_taken("FSPNAMES")
+               && !axl_volume_map_taken("fs1a")
+               && !axl_volume_map_taken(long_name)
+               && !axl_volume_map_taken("FSPNÄMES"),
+               "fs-provider: unpublish removes names publish did not set");
+
+    rc = axl_fs_provider_unpublish(b);
+    test_check(named && rc == AXL_OK && !axl_volume_map_taken(name_a)
+               && !axl_volume_map_taken(name_b),
+               "fs-provider: unpublish removes every name the volume had");
+
+    /* Nothing is remembered between picks. A was published first, so it got
+       the lowest free name; with both volumes gone that name is handed out
+       again. */
+    char next[16] = "";
+    test_check(named
+               && axl_volume_pick_free_fsn(next, sizeof(next)) == AXL_OK
+               && axl_strcasecmp(next, name_a) == 0,
+               "fs-provider: pick_free_fsn hands out a freed name again");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -1057,6 +1184,7 @@ test_fs_provider_main(int argc, char **argv)
     test_truncate_over_size_ignoring_provider();
     test_force_close_on_unpublish();
     test_status_codes_negative_convention();
+    test_shell_names();
 
     return test_print_results();
 }

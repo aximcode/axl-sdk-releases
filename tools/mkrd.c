@@ -29,19 +29,25 @@
       echo ... > last.nsh          -> write where the boot FD is read-only
 
     How the mapping works: mkrd makes TWO EFI_SHELL_PROTOCOL.SetMap calls on the
-    disk's device path — the next-free `FS<n>` name FIRST (so it becomes the
-    PRIMARY name a bare `map` displays, matching the shell's own fsN convention)
-    and the volume LABEL second (so it lands in the `Alias(s):` column). Both
-    `FS<n>:` and `<label>:` are usable paths with no `map -r`. SetMap targets the
-    shell's GLOBAL map (not a nested Execute), so the names are usable by the
-    launching script immediately. The label is the stable handle to script
-    against; the fsN is the native display name.
+    disk's device path — a free `FS<n>` name, FS20 or above, FIRST (so it
+    becomes the PRIMARY name a bare `map` displays, matching the shell's own fsN
+    convention) and the volume LABEL second (so it lands in the `Alias(s):`
+    column). Both `FS<n>:` and `<label>:` are usable paths with no `map -r`.
+    SetMap targets the shell's GLOBAL map (not a nested Execute), so the names
+    are usable by the launching script immediately. The label is the stable
+    handle to script against; the fsN is the native display name.
 
-    The fsN number is the lowest free `FS<n>` at create time — a best-effort
-    guess at what the shell would assign, mirroring its namespace. It never
-    reuses a taken slot (so the boot volume's fs0 is untouched) and never claims
-    an fsN when the shell is unreachable (SetMap fails cleanly; the disk is still
-    created — mount via `map -r`).
+    The fsN number comes from axl_volume_pick_free_fsn: the lowest free
+    `FS<n>` at or above FS20, not the lowest free overall, so the shell's own
+    `map -u` does not hand the disk's name to the next volume it names (why:
+    AXL_VOLUME_FSN_FLOOR in <axl/axl-fs.h>). A system that boots with twenty
+    or more volumes has no such margin. mkrd never reuses a taken slot and
+    never claims an fsN when the shell is unreachable (SetMap fails cleanly;
+    the disk is still created — mount via `map -r`).
+
+    No state is kept between runs: each create asks the shell's live map which
+    names are taken (GetDevicePathFromMap), so a second disk gets FS21 and a
+    number freed by `mkrd -d` is reused.
 
     Old / no shell: the SetMap path above needs the EDK2 EFI_SHELL_PROTOCOL. The
     old EFI 1.x shell has no programmatic SetMap for a custom name, so there is
@@ -53,7 +59,8 @@
     report a media change, and a device that does has its BlockIo re-installed
     — which re-enumerates removable and virtual media and invalidates file
     handles a running script or an open editor still holds. Whoever wants the
-    shell's map rebuilt says so.
+    shell's map rebuilt says so. A re-run once that `map -r` has mounted the
+    disk reports the fsN it got (GetMap reverse lookup) and asks for nothing.
 
     Label as alias: the LABEL doubles as the friendly alias when it is a clean
     map token. It is NOT set as an alias (the disk is reachable as `FS<n>:` only,
@@ -61,12 +68,16 @@
     too long, or has characters outside [A-Za-z0-9_-]. There is no `-a/--alias`
     option and no `%<label>%` env var — the label IS the alias.
 
-    Idempotent: a re-run of a still-mapped disk reuses its existing fsN handle —
-    no drift, no duplicate — so a startup.nsh may re-run it each boot.
+    Idempotent: a re-run of an existing disk says "reused", keeps the names it
+    still has — no drift, no duplicate — and gives back any that are missing:
+    an fsN if it has none (after a `map -d`, or when `map -u` gave it to another
+    volume), and the label alias if the label is not its name. So a startup.nsh
+    may re-run it each boot.
 
     Caveat: a later `map -r` rebuilds the shell map from scratch and drops the
-    SetMap'd names (the disk re-emerges as a firmware-assigned fsN). The one-call
-    workflow above never runs `map -r`, so this is a non-issue there.
+    SetMap'd names (the disk re-emerges as a firmware-assigned fsN); re-running
+    `mkrd <label>` gives the label back. The one-call workflow above never runs
+    `map -r`, so this is a non-issue there.
 
     Driver discovery: EFI_RAM_DISK_PROTOCOL is optional in UEFI 2.6+
     and absent on some firmware. When it isn't already registered,
@@ -92,6 +103,13 @@ AXL_EMBED_DECLARE(ramdiskdxe);
 
 /* Shell map-name buffer capacity; the usable bare name is one less (NUL). */
 #define MKRD_MAP_NAME_CAP     16
+
+/* RAM disks `mkrd -l` lists, and a re-run searches for its disk's size. */
+#define MKRD_LIST_MAX         16
+
+/* Longest shell name mkrd reads back to advise with: far above any the shell
+   generates, so a user's long alias still reads as a name. */
+#define MKRD_NAME_READ_MAX    128
 
 static bool   verbose = false;
 static int    g_argc;
@@ -121,9 +139,6 @@ static const AxlArgDesc positional[] = {
 // ---------------------------------------------------------------------------
 // CLI handlers — thin wrappers over the library + presentation
 // ---------------------------------------------------------------------------
-
-/* Highest fsN the auto-pick scan will consider when hunting a free slot. */
-#define MKRD_MAX_FS_SCAN  256
 
 /* Is @p name a reserved shell fsN name? Normalizes case AND an optional
    trailing ':' so "fs9", "FS9", "fs9:", "FS9:" all match. The `fs<digits>`
@@ -188,33 +203,12 @@ label_alias_reject_reason(
     return NULL;
 }
 
-/* Pick the lowest free FS<n> shell name (uppercase, matching the shell's own
-   FS0/FS1 display) into @p out. Skips taken slots — so the boot volume's fs0 is
-   never reused — mirroring how the shell numbers a fresh volume. Returns
-   AXL_OK, or AXL_ERR when no slot below MKRD_MAX_FS_SCAN is free. */
-static int
-pick_free_fsn(
-    char   *out,
-    size_t  out_size
-    )
-{
-    for (uint32_t i = 0; i < MKRD_MAX_FS_SCAN; i++) {
-        char cand[MKRD_MAP_NAME_CAP];
-        axl_snprintf(cand, sizeof(cand), "FS%u", i);
-        if (!axl_volume_map_taken(cand)) {
-            axl_snprintf(out, out_size, "%s", cand);
-            return AXL_OK;
-        }
-    }
-    return AXL_ERR;
-}
-
 static int
 cli_list(void)
 {
-    AxlRamDisk disks[16];
+    AxlRamDisk disks[MKRD_LIST_MAX];
     size_t     n = 0;
-    if (axl_ramdisk_list(disks, sizeof(disks) / sizeof(disks[0]), &n) != AXL_OK) {
+    if (axl_ramdisk_list(disks, MKRD_LIST_MAX, &n) != AXL_OK) {
         axl_printf("No filesystems found.\n");
         return 1;
     }
@@ -244,7 +238,7 @@ cli_list(void)
             axl_snprintf(mapping, sizeof(mapping), "(unmapped)");
         }
         /* LABEL/ALIAS: the FAT label, shown with a trailing ':' only when it is
-           CURRENTLY a live shell alias (a clean token AND actually in the map) —
+           CURRENTLY this disk's shell alias (a clean token AND mapped to it) —
            so it reads as a path you can type right now. A label that can't be an
            alias, or one a `map -r` has since dropped, shows plain; "(unlabeled)"
            for none. */
@@ -252,7 +246,8 @@ cli_list(void)
         if (disks[i].label[0] == '\0') {
             axl_snprintf(label_disp, sizeof(label_disp), "(unlabeled)");
         } else if (label_alias_reject_reason(disks[i].label) == NULL
-                       && axl_volume_map_taken(disks[i].label)) {
+                       && axl_volume_map_is(disks[i].label,
+                                            disks[i].device_path)) {
             axl_snprintf(label_disp, sizeof(label_disp), "%s:", disks[i].label);
         } else {
             axl_snprintf(label_disp, sizeof(label_disp), "%s", disks[i].label);
@@ -270,204 +265,339 @@ cli_destroy(
     const char *label
     )
 {
-    /* Remove every shell map name pointing at this disk's device BEFORE freeing
-       it (the device path is freed on destroy, and a lingering name would then
-       dangle at freed memory). mkrd may have set two names (the fsN primary + the
-       LABEL alias). We drop them by re-reading the device's OWN current name each
-       pass (map_alias matches by device path), so we only ever unmap names that
-       belong to THIS device — never another volume's same-spelled entry — however
-       many there are. The cap is a runaway guard, not an expected limit. */
-    void *dev_path = NULL;
-    bool  unmapped = false;
-    if (axl_ramdisk_find(label, &dev_path) == AXL_OK) {
-        char name[MKRD_MAP_NAME_CAP];
-        for (int i = 0; i < 8
-                && axl_volume_map_alias(dev_path, name, sizeof(name)) == AXL_OK;
-                i++) {
-            if (axl_volume_unmap(name) != AXL_OK) {
-                break;   /* couldn't remove it — stop rather than spin */
-            }
-            unmapped = true;
-        }
+    /* Remove every shell name for this disk BEFORE freeing it, while its
+       device path is still valid to match on: the fsN primary and the LABEL
+       alias mkrd set, and any a user or a `map -r` added since. Matching by
+       device path never touches another volume's same-spelled name. A name
+       that survives (a shell with no programmatic unmap, e.g. old EFI 1.x,
+       keeps the fsN its own `map -r` assigned) is read back for the advice
+       below. */
+    void  *dev_path     = NULL;
+    size_t unmapped     = 0;
+    bool   names_remain = false;
+    bool   left_known   = false;
+    char   left[MKRD_MAP_NAME_CAP];
+    if (axl_ramdisk_find(label, &dev_path) == AXL_OK
+            && axl_volume_unmap_device(dev_path, &unmapped) != AXL_OK) {
+        names_remain = true;
+        left_known   = (axl_volume_map_alias(dev_path, left, sizeof(left))
+                            == AXL_OK);
     }
-
-    /* Does any shell name still point at this device? The loop above clears the
-       ones it can reach; what it cannot is an fsN the SHELL assigned on an
-       earlier `map -r` (a shell with no programmatic unmap, e.g. old EFI 1.x,
-       leaves every name in place). Read it while dev_path is still valid —
-       destroy frees the device path. */
-    char left[MKRD_MAP_NAME_CAP];
-    bool names_remain = (dev_path != NULL)
-        && (axl_volume_map_alias(dev_path, left, sizeof(left)) == AXL_OK);
 
     if (axl_ramdisk_destroy(label) != AXL_OK) {
         axl_printf("MkRd: no RAM disk with label \"%s\" found.\n", label);
         return 1;
     }
-    if (unmapped) {
+    if (unmapped > 0) {
         axl_printf("RAM disk \"%s\" destroyed (unmapped shell alias).\n", label);
     } else {
         axl_printf("RAM disk \"%s\" destroyed.\n", label);
     }
-    /* A name we could not clear now dereferences a freed device path
-       ("Invalid file system mapping on fsN"), so say which command clears it —
-       but only when one actually survived, so a clean destroy stays quiet.
-       mkrd names the command; it does not run `map -r` itself, for the reasons
-       in axl_ramdisk_create. */
+    /* A name we could not clear now points at a disk that no longer exists,
+       so say which command clears it — but only when one actually survived,
+       so a clean destroy stays quiet. mkrd names the command; it does not run
+       `map -r` itself, for the reasons in axl_ramdisk_create. On the modern
+       shell, say why not `map -u`: ShellCommandUpdateMapping's "remove
+       mappings that represent removed devices" is a comment with no code
+       under it, and `map -d` walks live handles, so neither can clear a
+       mapping whose device is gone. The old EFI 1.x shell has no `map -u` at
+       all ("map: Unknown flag -u", measured), so there it goes unsaid. */
     if (names_remain) {
-        axl_printf("The shell still maps \"%s\" to the destroyed disk; "
-                   "run 'map -r' to clear it.\n", left);
+        const char *not_u = (axl_shell_kind() == AXL_SHELL_KIND_UEFI)
+                          ? " ('map -u' will not)" : "";
+        if (left_known) {
+            axl_printf("The shell still maps \"%s\" to the destroyed disk; "
+                       "run 'map -r' to clear it%s.\n", left, not_u);
+        } else {
+            axl_printf("The shell still maps a name to the destroyed disk; "
+                       "run 'map -r' to clear it%s.\n", not_u);
+        }
     }
     return 0;
+}
+
+/* The size, in MB, of the existing disk at @p dev_path, read from the RAM
+   disk list. Its device paths come from the same volume enumeration as
+   axl_ramdisk_find's, so the pointers are the same firmware-owned ones.
+   Returns false if the disk is not among the first MKRD_LIST_MAX listed. */
+static bool
+existing_size_mb(
+    const void *dev_path,
+    size_t     *mb
+    )
+{
+    AxlRamDisk disks[MKRD_LIST_MAX];
+    size_t     n = 0;
+    if (axl_ramdisk_list(disks, MKRD_LIST_MAX, &n) != AXL_OK) {
+        return false;
+    }
+    size_t shown = (n < MKRD_LIST_MAX) ? n : MKRD_LIST_MAX;
+    for (size_t i = 0; i < shown; i++) {
+        if (disks[i].device_path == dev_path) {
+            *mb = (size_t)(disks[i].size_bytes / (1024 * 1024));
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The summary a create prints: whether the disk is new, the disk itself, and
+   its shell mapping when it has one (@p mapping is the text after
+   "mapping :", or NULL). For a disk that already existed the size is the
+   disk's own, not the one asked for: axl_ramdisk_create hands the existing
+   disk back unchanged. @p requested_mb is the explicit -s, or 0. */
+static void
+print_summary(
+    bool        existed,
+    const char *label,
+    size_t      size_mb,
+    size_t      requested_mb,
+    const char *mapping,
+    const void *dev_path
+    )
+{
+    axl_printf("RAM disk %s:\n", existed ? "reused" : "created");
+    axl_printf("  label   : %s\n", label);
+    size_t disk_mb = size_mb;
+    if (existed && !existing_size_mb(dev_path, &disk_mb)) {
+        axl_printf("  size    : (not found in the RAM disk list)\n");
+    } else {
+        /* FAT16 below the 512 MB cutover, FAT32 at/above it (mirrors the
+           library's choice). */
+        axl_printf("  size    : %zu MB (%s)\n", disk_mb,
+                   (disk_mb <= 512) ? "FAT16" : "FAT32");
+    }
+    if (existed && requested_mb != 0 && requested_mb != disk_mb) {
+        axl_printf("  note    : -s %zu ignored; the disk already exists "
+                   "('mkrd -d %s' first to resize it)\n", requested_mb, label);
+    }
+    if (mapping != NULL) {
+        axl_printf("  mapping : %s\n", mapping);
+    }
+    AXL_AUTO_FREE char *dp_text = axl_device_path_to_text(dev_path);
+    if (dp_text != NULL) {
+        axl_printf("  device  : %s\n", dp_text);
+    }
+}
+
+/* Uppercase an fs<n> name in place, to the spelling the modern shell's `map`
+   shows (axl_volume_map_name reports it lowercased). */
+static void
+fsn_to_display(
+    char *name
+    )
+{
+    for (char *p = name; *p != '\0'; p++) {
+        if (*p >= 'a' && *p <= 'z') {
+            *p = (char)(*p - 'a' + 'A');
+        }
+    }
 }
 
 static int
 cli_create(
     const char *label,
-    size_t      size_mb
+    size_t      requested_mb   ///< explicit -s, or 0 for the default
     )
 {
-    void *dev_path = NULL;
-    /* Idempotent on the label: an existing same-label disk returns AXL_OK and
-       its device path, so a startup.nsh that re-runs mkrd every boot is safe. */
+    size_t size_mb = (requested_mb != 0) ? requested_mb : MKRD_DEFAULT_SIZE_MB;
+    /* axl_ramdisk_create is idempotent on the label (a startup.nsh may re-run
+       mkrd every boot) and does not say whether it made a disk or found one,
+       so ask first: both the summary and the advice depend on it. */
+    void       *dev_path = NULL;
+    bool        existed  = (axl_ramdisk_find(label, &dev_path) == AXL_OK);
+    const char *verb     = existed ? "reused" : "created";
     if (axl_ramdisk_create(label, size_mb, &dev_path) != AXL_OK) {
         axl_printf("MkRd: failed to create RAM disk \"%s\" (%zu MB).\n",
                    label, size_mb);
         return 1;
     }
-    /* FAT16 below the 512 MB cutover, FAT32 at/above it (mirrors the
-       library's choice). */
-    const char *fs_type = (size_mb <= 512) ? "FAT16" : "FAT32";
 
     /* Shells with no programmatic map — the old EFI 1.x shell (its
        SHELL_ENVIRONMENT exposes only a read-only GetMap; no SetMap/AddMap)
-       or no shell at all — can't be handed an fsN/label name. Every map
-       call below routes through EFI_SHELL_PROTOCOL, which isn't present, so
-       skip them entirely: the disk is already created AND connected (its
-       BlockIo / SimpleFileSystem are published), so the shell enumerates it
-       as an fsN on the next `map -r`.
+       or no shell at all — can't be handed an fsN/label name. The disk is
+       already created AND connected (its BlockIo / SimpleFileSystem are
+       published), so the shell enumerates it as an fsN on the next `map -r`.
 
        mkrd does NOT drive that `map -r` itself. Running the shell's map
        refresh from inside a create probes every physical block device in the
        system (ShellPkg Map.c ProbeForMediaChange), letting each report a media
        change; one that does has its BlockIo re-installed, which invalidates
-       handles a running script or an open editor still holds. Naming a disk is not worth
-       disturbing every other volume, so this names the one manual step and
-       exits 0 — the disk WAS created (a shell-less create is a partial
-       success, and a non-zero exit reads as EFI_ABORTED to a caller, which
-       would abort the script at this line). */
-    if (axl_shell_kind() != AXL_SHELL_KIND_UEFI) {
-        AXL_AUTO_FREE char *dp_text = axl_device_path_to_text(dev_path);
-        axl_printf("RAM disk created:\n");
-        axl_printf("  label   : %s\n", label);
-        axl_printf("  size    : %zu MB (%s)\n", size_mb, fs_type);
-        if (dp_text != NULL) {
-            axl_printf("  device  : %s\n", dp_text);
+       handles a running script or an open editor still holds. Naming a disk is
+       not worth disturbing every other volume, so this names the one manual
+       step and exits 0 — the disk WAS created (a shell-less create is a
+       partial success, and a non-zero exit reads as EFI_ABORTED to a caller,
+       which would abort the script at this line).
+
+       A re-run once that `map -r` has mounted the disk must not ask for
+       another: the old shell's GetMap reverse lookup finds the fsN it gave
+       the disk, so report it and ask for nothing. Only on that shell: with
+       no shell at all the lookup falls back to a positional fs<n>, which is
+       not what a shell started later would call the disk. */
+    AxlShellKind kind = axl_shell_kind();
+    if (kind != AXL_SHELL_KIND_UEFI) {
+        char fsn[MKRD_MAP_NAME_CAP];
+        char mapping[MKRD_MAP_NAME_CAP + 2];
+        bool mounted = existed && kind == AXL_SHELL_KIND_EFI_1X
+            && axl_volume_map_name(dev_path, fsn, sizeof(fsn)) == AXL_OK;
+        if (mounted) {
+            axl_snprintf(mapping, sizeof(mapping), "%s:", fsn);
         }
-        axl_printf("Run 'map -r' to mount the disk (it appears as an fsN).\n");
+        print_summary(existed, label, size_mb, requested_mb,
+                      mounted ? mapping : NULL, dev_path);
+        if (mounted) {
+            axl_printf("Ready: use  %s:  now.\n", fsn);
+        } else {
+            axl_printf("Run 'map -r' to mount the disk (it appears as an fsN).\n");
+        }
         return 0;
     }
 
-    /* Does this (possibly pre-existing) disk already carry a shell mapping? A
-       fresh create does not touch the shell's global map, so map_alias resolves
-       to AXL_ERR and we assign names below; a re-run of a still-mapped disk
-       reuses its existing fsN primary (idempotent — no drift, no duplicate). */
-    char primary[MKRD_MAP_NAME_CAP];
-    bool reused = (axl_volume_map_alias(dev_path, primary, sizeof(primary))
-                       == AXL_OK);
+    /* Name the disk the way a fresh create does, and on a re-run give back
+       whatever is missing: an fsN (FS20 and up) if it has none — after a
+       `map -d`, or when `map -u` gave its fsN to another volume — and the
+       LABEL alias if the label is not this disk's name — after a `map -r`,
+       which also gives the disk an fsN of the shell's own, kept as is. Names
+       the disk still has are kept: no drift, no duplicate. `reject` explains
+       why the label is not an alias, for the note. */
+    const char *reject     = label_alias_reject_reason(label);
+    bool        label_ours = (reject == NULL)
+                             && axl_volume_map_is(label, dev_path);
+    char        fsn[MKRD_MAP_NAME_CAP];
+    bool        set_fsn    = false;
+    bool        set_label  = false;
 
-    /* Whether the LABEL is (or becomes) a usable alias of THIS disk, resolved
-       against real map state — never advertised in the summary unless actually
-       set. `reject` explains why not, for the note. */
-    const char *reject      = label_alias_reject_reason(label);
-    bool        label_alias = false;
-
-    if (reused) {
-        /* Re-run: names already set. The label is an alias iff it is a valid
-           token AND still present in the map (a prior `map -r` may have dropped
-           it, or the original label SetMap may have been skipped/failed). */
-        label_alias = (reject == NULL) && axl_volume_map_taken(label);
-    } else {
-        /* Two SetMap calls, ORDER-SENSITIVE: the next-free FS<n> FIRST so it is
-           the PRIMARY name a bare `map` shows (the shell displays the
-           first-inserted name as primary), then the LABEL so it lands in the
-           Alias(s) column. Both target the shell's global map, so both are
-           usable immediately — no `map -r`. */
-        if (pick_free_fsn(primary, sizeof(primary)) != AXL_OK) {
-            axl_printf("MkRd: no free fsN slot below %u.\n",
-                       (unsigned)MKRD_MAX_FS_SCAN);
-            return 1;
-        }
-        /* Distinguish WHY the map failed: AXL_UNSUPPORTED means no
-           EFI_SHELL_PROTOCOL was locatable (get_shell() == NULL — the shell's
-           map is unreachable, which also makes pick_free_fsn see every fsN as
-           free); AXL_ERR means the shell is present but rejected SetMap. The
-           distinction tells a real-hardware report which half broke. Either way
-           the disk exists and is mountable via 'map -r'. */
-        int map_rc = axl_volume_set_map(dev_path, primary);
+    if (axl_volume_map_name(dev_path, fsn, sizeof(fsn)) != AXL_OK) {
+        /* Distinguish WHY no fsN could be set, because it decides which
+           command to name. Every old or absent shell already returned at the
+           axl_shell_kind() check above, so reaching here means
+           EFI_SHELL_PROTOCOL was located and `map -u` exists (EDK2's Level-2
+           map registers it unconditionally): AXL_ERR is a modern shell that
+           merely rejected this name, and no free name is the same situation.
+           AXL_UNSUPPORTED can then only mean the protocol went away between
+           that check and this call, or that it exposes no SetMap — no shell to
+           run anything in, so -r is named as the conservative answer. The
+           distinction also tells a real-hardware report which half broke. */
+        bool picked = (axl_volume_pick_free_fsn(fsn, sizeof(fsn)) == AXL_OK);
+        int  map_rc = picked ? axl_volume_set_map(dev_path, fsn) : AXL_ERR;
         if (map_rc != AXL_OK) {
-            const char *why = (map_rc == AXL_UNSUPPORTED)
-                ? "no EFI_SHELL_PROTOCOL on this firmware (shell map unavailable)"
-                : "the shell rejected SetMap for this name";
-            axl_printf("MkRd: RAM disk \"%s\" created (%zu MB %s) but could not "
-                       "auto-map it as \"%s:\" - %s. The disk exists; run 'map -r' "
-                       "to mount it.\n", label, size_mb, fs_type, primary, why);
-            /* Exit 0: the disk WAS created (and connected) — a shell-less map
-               is a partial success, not a failure. A non-zero exit here reads
-               as EFI_ABORTED to a caller, aborting a `mkrd X; map -r; X:`
-               script at the first step; the advisory above already names the
-               `map -r` follow-up. */
+            char        why_buf[64];
+            const char *why = why_buf;
+            if (!picked) {
+                axl_snprintf(why_buf, sizeof(why_buf),
+                             "no free fsN from FS%u to FS%u",
+                             (unsigned)AXL_VOLUME_FSN_FLOOR,
+                             (unsigned)(AXL_VOLUME_FSN_LIMIT - 1));
+            } else if (map_rc == AXL_UNSUPPORTED) {
+                why = "the shell's SetMap is unavailable";
+            } else {
+                axl_snprintf(why_buf, sizeof(why_buf),
+                             "the shell rejected SetMap for \"%s:\"", fsn);
+            }
+            /* `map -u` names any volume that has none, skipping devices that
+               already have a mapping of any kind (ShellPkg
+               ShellCommandUpdateMapping), and it does NOT empty the map list,
+               blank %path% or drop the per-mapping current directories the
+               way `map -r` does. That is why it is the better follow-up for a
+               disk with no name to lose. A disk that still has a name — its
+               label, or an alias a user gave it — is one `map -u` skips, so
+               that one is pointed at the name it has, and at `map -r` for an
+               fsN, which drops that name. Both flags probe media, so neither
+               is free. The old EFI 1.x shell answers "map: Unknown flag -u"
+               (measured), and AXL_UNSUPPORTED leaves no SetMap to name the
+               disk with, so both keep naming -r. */
+            char held[MKRD_NAME_READ_MAX];
+            if (axl_volume_map_alias(dev_path, held, sizeof(held)) == AXL_OK) {
+                bool is_label = (axl_strcasecmp(held, label) == 0);
+                axl_printf("MkRd: RAM disk \"%s\" %s but could not give it an "
+                           "fsN - %s. It is reachable as %s:. 'map -r' gives it "
+                           "an fsN but drops %s:%s%s%s; 'map -u' skips a disk "
+                           "that already has a name.\n",
+                           label, verb, why, held, held,
+                           is_label ? " (re-run 'mkrd " : "",
+                           is_label ? label : "",
+                           is_label ? "' afterwards to get it back)" : "");
+            } else {
+                const char *how = (map_rc == AXL_UNSUPPORTED)
+                    ? "run 'map -r' to mount it"
+                    : "run 'map -u' to mount it (it names volumes that have "
+                      "none, without rebuilding the map)";
+                axl_printf("MkRd: RAM disk \"%s\" %s but could not name it - "
+                           "%s. The disk exists; %s.\n", label, verb, why, how);
+            }
+            /* Exit 0: the disk WAS created (and connected) — a disk without a
+               name is a partial success, not a failure. A non-zero exit here
+               reads as EFI_ABORTED to a caller, aborting a
+               `mkrd X; map -u; X:` script at the first step; the advisory
+               above already names the follow-up. */
             return 0;
         }
-        /* Second name = the LABEL, in the Alias(s) column — but only when it is
-           a clean token AND not already mapped to another volume (SetMap does an
-           unconditional insert, so it would silently repoint that name at this
-           disk). Reflect the real outcome in label_alias so the summary never
-           advertises a name we didn't actually set. */
-        if (reject == NULL) {
-            if (axl_volume_map_taken(label)) {
-                reject = "name already mapped to another volume";
-            } else if (axl_volume_set_map(dev_path, label) != AXL_OK) {
-                reject = "the shell rejected SetMap for the label";
-            } else {
-                label_alias = true;
-            }
+        set_fsn = true;
+        /* The fsN must be the disk's FIRST name — the shell displays the
+           first-inserted one as primary — so a label left from before goes
+           behind it: remove it here and set it again below. Only now that
+           the fsN is in place, so a failure above left the label usable. */
+        if (label_ours && axl_volume_unmap(label) == AXL_OK) {
+            label_ours = false;
+        }
+    }
+    fsn_to_display(fsn);
+
+    /* The LABEL, in the Alias(s) column — only when it is a clean token and
+       not already another volume's name (SetMap removes a name from its holder
+       first, so it would silently take the name from that volume). */
+    if (reject == NULL && !label_ours) {
+        if (axl_volume_map_taken(label)) {
+            reject = "name already mapped to another volume";
+        } else if (axl_volume_set_map(dev_path, label) != AXL_OK) {
+            reject = "the shell rejected SetMap for the label";
+        } else {
+            label_ours = true;
+            set_label  = true;
         }
     }
 
-    /* Success summary — label, size/format, the shell mapping (fsN primary, with
-       the label alias when set), and the backing device path (varies per boot). */
-    AXL_AUTO_FREE char *dp_text = axl_device_path_to_text(dev_path);
-    axl_printf("%s\n", reused ? "RAM disk reused (already mapped):"
-                              : "RAM disk created:");
-    axl_printf("  label   : %s\n", label);
-    axl_printf("  size    : %zu MB (%s)\n", size_mb, fs_type);
-    if (label_alias) {
-        axl_printf("  mapping : %s: (alias %s:)\n", primary, label);
+    char mapping[2 * MKRD_MAP_NAME_CAP + 16];
+    if (label_ours) {
+        axl_snprintf(mapping, sizeof(mapping), "%s: (alias %s:)", fsn, label);
     } else {
-        axl_printf("  mapping : %s:\n", primary);
+        axl_snprintf(mapping, sizeof(mapping), "%s:", fsn);
     }
-    if (dp_text != NULL) {
-        axl_printf("  device  : %s\n", dp_text);
-    }
+    print_summary(existed, label, size_mb, requested_mb, mapping, dev_path);
     /* A label that can't be an alias: say so, so it isn't a surprise that only
-       the fsN works as a path. (reject is NULL on the reused path when the label
-       is a valid token that just isn't currently mapped — no note needed then.) */
-    if (!label_alias && reject != NULL) {
+       the fsN works as a path. */
+    if (!label_ours && reject != NULL) {
         axl_printf("MkRd: label \"%s\" is not a usable shell alias (%s); "
-                   "reachable as %s: only.\n", label, reject, primary);
+                   "reachable as %s: only.\n", label, reject, fsn);
     }
-    if (label_alias) {
+    if (label_ours) {
         axl_printf("Ready: use  %s:  or  %s:  now - no 'map -r' needed.\n",
-                   primary, label);
+                   fsn, label);
     } else {
-        axl_printf("Ready: use  %s:  now - no 'map -r' needed.\n", primary);
+        axl_printf("Ready: use  %s:  now - no 'map -r' needed.\n", fsn);
     }
-    /* Say it once, here, rather than leave it to the docs: these names are
-       mkrd's, and the shell's own `map -r` rebuilds its map from scratch. */
-    axl_printf("Note: a later 'map -r' replaces %s with a firmware-assigned "
-               "fsN ('mkrd -l' finds it).\n",
-               label_alias ? "these names" : "this name");
+    /* Say it once, here, rather than leave it to the docs: the names mkrd set
+       in this run are its own, and the shell's `map -r` rebuilds its map from
+       scratch. Only names set in this run: an fsN the shell assigned itself is
+       what a `map -r` produces anyway. A re-run gives the label back. The note
+       does not offer `map -u` as a way to keep them: the FS20 floor only keeps
+       them out of its counter's way until that counter gets there (file
+       header). test-ramdisk-map-qemu.sh (check 13) pins the typical case: two
+       creates, then unmapping the SECOND disk's names so it is an unmapped
+       volume again, then `map -u` — the shell names that volume FS1 and the
+       first disk keeps its FS20. Before the floor, mkrd took FS1 itself, and
+       `map -u` moved it onto the second disk. */
+    if (set_fsn && label_ours) {
+        axl_printf("Note: a later 'map -r' replaces these names with a "
+                   "firmware-assigned fsN; re-run 'mkrd %s' to get %s: back.\n",
+                   label, label);
+    } else if (set_fsn) {
+        axl_printf("Note: a later 'map -r' replaces this name with a "
+                   "firmware-assigned fsN ('mkrd -l' finds it).\n");
+    } else if (set_label) {
+        axl_printf("Note: a later 'map -r' drops %s:; re-run 'mkrd %s' to get "
+                   "it back.\n", label, label);
+    }
     return 0;
 }
 
@@ -542,11 +672,9 @@ run_mkrd(AxlArgs *a)
         return cli_destroy(destroy_label);
     }
 
-    uint32_t size_mb = (uint32_t)axl_args_get_uint(a, "size");
-    if (size_mb == 0) {
-        size_mb = MKRD_DEFAULT_SIZE_MB;
-    }
-    return cli_create(label, size_mb);
+    /* 0 when -s was not given: cli_create picks the default, and a re-run
+       without -s does not report a size as ignored. */
+    return cli_create(label, (size_t)axl_args_get_uint(a, "size"));
 }
 
 AXL_TOOL_MAIN(mkrd)

@@ -23,6 +23,10 @@
 
 AXL_LOG_DOMAIN("backend");
 
+/* Runaway guard for axl_backend_shell_unmap_device: more names than any one
+   device carries. */
+#define AXL_UNMAP_MAX_NAMES  32u
+
 // ===================================================================
 // Global firmware table pointers (set by CRT0)
 // ===================================================================
@@ -2225,7 +2229,15 @@ axl_backend_shell_map_name(
     }
 
     /* GetMapFromDevicePath advances the pointer past the matched volume
-       portion; pass a local copy so the caller's device path is untouched. */
+       portion; pass a local copy so the caller's device path is untouched.
+       The list it returns is NOT freed, here or in map_alias and
+       unmap_device: the shell owns it. Its header comment says the caller
+       frees it, but the function returns it through AddBufferToFreeList
+       (ShellProtocol.c), and the shell frees that list itself once the
+       command finishes (Shell.c). Freeing it here is a double free: the
+       shell's own free then trips the DXE core's pool-header ASSERT
+       (MdeModulePkg Pool.c, measured on a debug OVMF with --debugcon) and
+       the shell hangs after the app returns. */
     EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)device_path;
     const unsigned short *map = (const unsigned short *)
         shell->GetMapFromDevicePath(&dp);
@@ -2236,33 +2248,43 @@ axl_backend_shell_map_name(
     /* `map` is one or more ';'-separated aliases in UCS-2, e.g. "FS1:;F1:".
        Take the first "fs<digits>" token, lowercased, without the ':'. The
        shell lists the friendliest (FSn:) alias first, but scanning for the
-       fs<n> token explicitly is robust to ordering. */
+       fs<n> token explicitly is robust to ordering. A token that does not fit
+       in @p out is an error, never a shortened name that would resolve to
+       another volume; @p out is written only on success. */
+    int rc = AXL_ERR;   /* no fs<n> alias maps to this device path */
     for (const unsigned short *p = map; *p != 0; ) {
         const unsigned short *tok = p;
         while (*p != 0 && *p != (unsigned short)';') {
             p++;
         }
         size_t toklen = (size_t)(p - tok);
+        /* "fs" and digits only, up to the ':' -- the shape the shell
+           generates. A custom name that merely starts that way (a label
+           "fs1a") is not the volume's fsN. */
+        size_t n = 2;
+        while (n < toklen && tok[n] >= '0' && tok[n] <= '9') {
+            n++;
+        }
         if (toklen >= 3
             && (tok[0] == 'f' || tok[0] == 'F')
             && (tok[1] == 's' || tok[1] == 'S')
-            && tok[2] >= '0' && tok[2] <= '9') {
-            size_t j = 0;
-            for (size_t k = 0; k < toklen && j + 1 < out_size; k++) {
-                unsigned short c = tok[k];
-                if (c == (unsigned short)':') {
-                    break;
+            && n > 2
+            && (n == toklen || tok[n] == (unsigned short)':')) {
+            if (n < out_size) {
+                for (size_t k = 0; k < n; k++) {
+                    unsigned short c = tok[k];
+                    out[k] = (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
                 }
-                out[j++] = (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+                out[n] = '\0';
+                rc = AXL_OK;
             }
-            out[j] = '\0';
-            return (j > 0) ? AXL_OK : AXL_ERR;
+            break;
         }
         if (*p == (unsigned short)';') {
             p++;
         }
     }
-    return AXL_ERR;   /* no fs<n> alias maps to this device path */
+    return rc;
 }
 
 int
@@ -2295,18 +2317,23 @@ axl_backend_shell_map_alias(
     /* `map` is one or more ';'-separated aliases, e.g. "RAMDISK:;FS9:". Take
        the FIRST token verbatim (minus the trailing ':') — any form, fs<n> or a
        custom SetMap name. This is the "what is it mapped as" query, distinct
-       from map_name's fs<n>-only filter. */
-    const unsigned short *p = map;
-    size_t j = 0;
-    while (*p != 0 && *p != (unsigned short)';' && *p != (unsigned short)':') {
-        if (j + 1 >= out_size) {
-            return AXL_ERR;   /* alias longer than the buffer — don't return a
-                                 truncated, un-resolvable name as success */
-        }
-        out[j++] = (char)*p++;
+       from map_name's fs<n>-only filter. An alias longer than the buffer is an
+       error, never a truncated, un-resolvable name; @p out is written only on
+       success. */
+    size_t n = 0;
+    while (map[n] != 0 && map[n] != (unsigned short)';'
+           && map[n] != (unsigned short)':') {
+        n++;
     }
-    out[j] = '\0';
-    return (j > 0) ? AXL_OK : AXL_ERR;
+    int rc = AXL_ERR;
+    if (n > 0 && n < out_size) {
+        for (size_t k = 0; k < n; k++) {
+            out[k] = (char)map[k];
+        }
+        out[n] = '\0';
+        rc = AXL_OK;
+    }
+    return rc;
 }
 
 bool
@@ -2328,6 +2355,33 @@ axl_backend_shell_map_exists(
        instead (axl_efi1x_map_exists strips any ':' the caller appended and
        tries the case foldings the old shell stores names in). */
     return axl_efi1x_map_exists(name);
+}
+
+bool
+axl_backend_shell_map_is(
+    const unsigned short  *name,
+    void                  *device_path
+    )
+{
+    if (name == NULL || device_path == NULL) {
+        return false;
+    }
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL) {
+        /* The old EFI 1.x shell answers through SHELL_ENVIRONMENT.GetMap;
+           with no shell at all there are no names. */
+        return axl_efi1x_map_is(name, device_path);
+    }
+    if (shell->GetDevicePathFromMap == NULL) {
+        return false;
+    }
+    /* Byte comparison. The shell itself compares device paths as text
+       (DevicePathCompare), but stores a byte copy of the path a name was set
+       for, so a name set for @p device_path, or generated by a `map -r` for
+       the handle it came from, compares equal. */
+    const EFI_DEVICE_PATH_PROTOCOL *dp =
+        shell->GetDevicePathFromMap((const CHAR16 *)name);
+    return dp != NULL && axl_backend_dp_equal(dp, device_path);
 }
 
 int
@@ -2368,6 +2422,80 @@ axl_backend_shell_unmap(
        shell's global map (UEFI Shell 2.2 EFI_SHELL_PROTOCOL.SetMap). */
     EFI_STATUS st = shell->SetMap(NULL, (const CHAR16 *)name);
     return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
+}
+
+int
+axl_backend_shell_unmap_device(
+    void    *device_path,
+    size_t  *removed
+    )
+{
+    size_t n  = 0;
+    int    rc = AXL_ERR;
+    if (removed != NULL) {
+        *removed = 0;
+    }
+    if (device_path == NULL) {
+        return AXL_ERR;
+    }
+    if (no_shell_at_all()) {
+        return AXL_OK;   /* no shell, no names */
+    }
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL) {
+        /* The old EFI 1.x shell cannot remove a name: one its own `map -r`
+           gave this device stays until the next `map -r`. */
+        char name[32];
+        return (axl_efi1x_map_fs_name_from_dp(device_path, name, sizeof(name))
+                    == AXL_OK) ? AXL_ERR : AXL_OK;
+    }
+    if (shell->GetMapFromDevicePath == NULL || shell->SetMap == NULL) {
+        return AXL_ERR;   /* can neither list nor remove this device's names */
+    }
+
+    /* Remove the device's first name until it has none. Each name is taken
+       from the shell's own list for this device, whole and in UCS-2, so it is
+       removed exactly as the shell spells it, whatever its length or
+       characters, and a name that has moved to another volume is never
+       touched. One lookup past the cap confirms the device has none left. */
+    for (;;) {
+        EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)device_path;
+        const CHAR16 *map = shell->GetMapFromDevicePath(&dp);
+        if (map == NULL) {
+            rc = AXL_OK;
+            break;
+        }
+        if (n >= AXL_UNMAP_MAX_NAMES) {
+            break;
+        }
+        size_t len = 0;
+        while (map[len] != 0 && map[len] != (CHAR16)';') {
+            len++;
+        }
+        CHAR16 *name = axl_backend_alloc((len + 1) * sizeof(CHAR16));
+        if (name != NULL) {
+            for (size_t k = 0; k < len; k++) {
+                name[k] = map[k];
+            }
+            name[len] = 0;
+        }
+        /* The list is not freed; see axl_backend_shell_map_name. */
+        if (name == NULL) {
+            break;
+        }
+        /* The token keeps its ':' — SetMap(NULL, name) wants the name the way
+           the shell stores it. */
+        EFI_STATUS st = shell->SetMap(NULL, name);
+        axl_backend_free(name);
+        if (EFI_ERROR(st)) {
+            break;
+        }
+        n++;
+    }
+    if (removed != NULL) {
+        *removed = n;
+    }
+    return rc;
 }
 
 // ===================================================================

@@ -13,7 +13,9 @@
 #   2. mkrd on a shell with no programmatic map (Finding 2): `mkrd
 #      SCRATCH` creates + connects the disk, prints a `map -r` advisory,
 #      and exits 0 (NOT EFI_ABORTED); after `map -r` the disk enumerates
-#      as an fsN and a write+read round-trip on it succeeds.
+#      as an fsN and a write+read round-trip on it succeeds. A re-run says
+#      "reused" and asks for `map -r` only while the disk is unmounted,
+#      and `mkrd -d` names `map -r`, never `map -u` (this shell has none).
 #
 # The modern-shell regression halves of both findings are already
 # covered by test-sd-sibling-qemu.sh and test-ramdisk-map-qemu.sh (both
@@ -181,6 +183,8 @@ fs0:
 echo MARK_CREATE
 mkrd SCRATCH
 echo MKRD_RC=[%lasterror%]
+echo MARK_RERUN_UNMOUNTED
+mkrd SCRATCH
 echo MARK_AFTER_CREATE
 map -r
 echo MARK_AFTER_MAPR
@@ -189,6 +193,11 @@ fs1:
 echo axl-old-shell-proof > proof.txt
 type proof.txt
 fs0:
+echo MARK_RERUN_MOUNTED
+mkrd SCRATCH
+echo MARK_DESTROY
+mkrd -d SCRATCH
+echo MARK_END
 reset -s
 NSH
 
@@ -220,13 +229,15 @@ fi
 # itself from inside create — in-context on this shell, so the map rebuild hit
 # the real map list, and the probe let every physical block device report a
 # media change. Both assertions fail against that old build.
-CREATE_OUT=$(echo "$MKRD_LOG" | sed -n '/MARK_CREATE/,/MARK_AFTER_CREATE/p')
+CREATE_OUT=$(echo "$MKRD_LOG" | sed -n '/MARK_CREATE/,/MARK_RERUN_UNMOUNTED/p')
+# The negative checks cover the re-run before `map -r` too.
+CREATE_ALL=$(echo "$MKRD_LOG" | sed -n '/MARK_CREATE/,/MARK_AFTER_CREATE/p')
 if echo "$CREATE_OUT" | grep -qiF "Run 'map -r' to mount the disk"; then
     test_host_pass "mkrd names the manual 'map -r' instead of running it"
 else
     test_host_fail "mkrd names the manual 'map -r' instead of running it"
 fi
-if echo "$CREATE_OUT" | grep -qiE "no 'map -r' needed"; then
+if echo "$CREATE_ALL" | grep -qiE "no 'map -r' needed"; then
     test_host_fail "mkrd no longer claims 'no map -r needed' on this shell"
 else
     test_host_pass "mkrd no longer claims 'no map -r needed' on this shell"
@@ -235,7 +246,7 @@ fi
 # the "Device mapping table" that this shell's in-context Execute prints. Scoped
 # to the create region: the script's OWN `map -r` (after MARK_AFTER_CREATE)
 # prints that table legitimately.
-if echo "$CREATE_OUT" | grep -qiF 'Device mapping table'; then
+if echo "$CREATE_ALL" | grep -qiF 'Device mapping table'; then
     test_host_fail "create runs no 'map -r' (no 'Device mapping table' in its output)"
 else
     test_host_pass "create runs no 'map -r' (no 'Device mapping table' in its output)"
@@ -248,6 +259,35 @@ if echo "$MKRD_LOG" | grep -qE '^fs1:'; then
     test_host_pass "mkrd -l shows lowercase fs1: on the old shell (GetMap reverse-lookup)"
 else
     test_host_fail "mkrd -l shows lowercase fs1: on the old shell (GetMap reverse-lookup)"
+fi
+# A re-run says whether it made the disk or found it, and asks for `map -r`
+# only while the disk is not mounted. Before the script's `map -r` it still
+# needs one; after it, GetMap's reverse lookup finds the fs1 the shell gave the
+# disk, so mkrd reports it and asks for nothing -- another `map -r` would
+# re-probe every block device for no reason.
+RERUN_UNMOUNTED=$(echo "$MKRD_LOG" | sed -n '/MARK_RERUN_UNMOUNTED/,/MARK_AFTER_CREATE/p')
+if echo "$RERUN_UNMOUNTED" | grep -q '^RAM disk reused:$' \
+   && echo "$RERUN_UNMOUNTED" | grep -qiF "Run 'map -r' to mount the disk"; then
+    test_host_pass "re-run before map -r: reused, still asks for map -r"
+else
+    test_host_fail "re-run before map -r: reused, still asks for map -r"
+fi
+RERUN_MOUNTED=$(echo "$MKRD_LOG" | sed -n '/MARK_RERUN_MOUNTED/,/MARK_DESTROY/p')
+if echo "$RERUN_MOUNTED" | grep -q '^RAM disk reused:$' \
+   && echo "$RERUN_MOUNTED" | grep -qF 'mapping : fs1:' \
+   && ! echo "$RERUN_MOUNTED" | grep -qiF "Run 'map -r'"; then
+    test_host_pass "re-run after map -r: reports fs1, asks for no map -r"
+else
+    test_host_fail "re-run after map -r: reports fs1, asks for no map -r"
+fi
+# This shell cannot remove a name, so -d leaves fs1 behind and says to run
+# `map -r`. It has no `map -u` at all, so the advice must not mention one.
+DESTROY_OUT=$(echo "$MKRD_LOG" | sed -n '/MARK_DESTROY/,/MARK_END/p')
+if echo "$DESTROY_OUT" | grep -qF "run 'map -r' to clear it" \
+   && ! echo "$DESTROY_OUT" | grep -qF "map -u"; then
+    test_host_pass "-d on this shell names map -r and not map -u"
+else
+    test_host_fail "-d on this shell names map -r and not map -u"
 fi
 
 # ---------------------------------------------------------------------------
@@ -312,6 +352,14 @@ if echo "$INT_LOG" | grep -qE '^fs1:'; then
     test_host_pass "mkrd -l shows the disk's fsN after the user's map -r"
 else
     test_host_fail "mkrd -l shows the disk's fsN after the user's map -r"
+fi
+# The user's `map FOOBAR fs1:` made the label an alias of this disk; -l shows
+# it as one (with the colon) only when the name maps to this disk, which this
+# shell answers through SHELL_ENVIRONMENT.GetMap.
+if echo "$INT_LOG" | grep -qE '^fs1:[[:space:]]+FOOBAR:[[:space:]]'; then
+    test_host_pass "mkrd -l shows the user-made FOOBAR: as this disk's alias"
+else
+    test_host_fail "mkrd -l shows the user-made FOOBAR: as this disk's alias"
 fi
 if echo "$INT_LOG" | grep -q 'No RAM disks found'; then
     test_host_pass "mkrd -d destroys the disk interactively (map cleaned)"

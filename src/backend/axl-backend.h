@@ -808,6 +808,48 @@ axl_backend_shell_map_exists(
     );
 
 /**
+ * @brief Does a shell map name resolve to this device path?
+ *
+ * Consults EFI_SHELL_PROTOCOL.GetDevicePathFromMap and compares the result
+ * with @p device_path byte for byte. The shell stores a byte copy of the path
+ * a name was set for, so a name set for @p device_path compares equal.
+ * @p name must be ':'-terminated.
+ *
+ * On the old EFI 1.x shell the same comparison is made against
+ * SHELL_ENVIRONMENT.GetMap's device path for @p name.
+ *
+ * @return true if @p name is mapped to @p device_path; false if it is not
+ *     mapped, is mapped to another device, or there is no shell at all.
+ */
+bool
+axl_backend_shell_map_is(
+    const unsigned short  *name,        ///< ':'-terminated UCS-2 mapping name
+    void                  *device_path  ///< opaque EFI_DEVICE_PATH_PROTOCOL
+    );
+
+/**
+ * @brief Remove every shell map name for a device path.
+ *
+ * Takes each name from the shell's own list for @p device_path
+ * (GetMapFromDevicePath) and removes it with SetMap(NULL, name), until the
+ * device has none. Names are handled whole, in UCS-2, so any length or
+ * character works, and a name that has moved to another device is never
+ * touched.
+ *
+ * @return AXL_OK when no name maps to @p device_path any more, including with
+ *     no shell at all (there are no names then); AXL_ERR when one may still:
+ *     the shell refused, it is the old EFI 1.x shell (which cannot remove a
+ *     name), the shell lacks GetMapFromDevicePath or SetMap, an allocation
+ *     failed, or the device still had names after 32 were removed — or when
+ *     @p device_path is NULL.
+ */
+int
+axl_backend_shell_unmap_device(
+    void    *device_path,  ///< opaque EFI_DEVICE_PATH_PROTOCOL
+    size_t  *removed       ///< [out, optional] how many names were removed
+    );
+
+/**
  * @brief Assign a shell map name to a device path (EFI_SHELL_PROTOCOL.SetMap).
  *
  * Adds the mapping to the shell's GLOBAL map list — not a nested shell like

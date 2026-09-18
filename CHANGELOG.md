@@ -3,6 +3,72 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.7.3 — 2026-09-17
+
+### Added
+
+- **`axl_volume_pick_free_fsn()`, `axl_volume_map_is()` and
+  `axl_volume_unmap_device()` in `<axl/axl-fs.h>`, for programs that name
+  volumes themselves.** `pick_free_fsn` returns the lowest free `FS<n>` from
+  `AXL_VOLUME_FSN_FLOOR` (20) up, keeping no state between calls. `map_is`
+  says whether a name belongs to a given device, not just whether it is in
+  use. `unmap_device` removes every name that maps to a device, for a volume
+  that is going away, and leaves alone a name that has moved to another
+  volume. The `axl_volume_set_map()` docs now say that setting a taken name
+  takes it from its holder.
+
+### Changed
+
+- **`mkrd`, and volumes published with `axl_fs_provider_publish()` (9p
+  mounts), are named `FS20` or above, out of the range the shell's `map -u`
+  normally hands out.** Both used to take the lowest free `FS<n>` — `FS1` on a
+  system with one boot volume. `map -u` names each volume that has no name
+  from a counter of its own (`FS<mFsMaxCount++>`), which starts at the number
+  of volumes named at boot and never checks the map, and `SetMap` removes
+  whatever held the name first. The lowest free number is exactly that
+  counter's next value, so the next volume `map -u` named (a USB stick, or a
+  disk whose driver was just loaded) silently took over the RAM disk's or the
+  mount's `FS<n>`, and a script writing to it wrote to that volume instead.
+  The counter reaches `FS20` only after `map -u` has named enough new volumes,
+  or at once on a system that boots with twenty or more; a RAM disk's label
+  stays the stable name to script against. A freed number is reused.
+  `9p mount` now reports `fs20:` where it reported `fs1:`.
+
+### Fixed
+
+- **`axl_fs_provider_unpublish()` removes the volume's shell names by device
+  path, not by the name publish assigned.** Once that name had moved to
+  another volume (a user's `map`, or `map -u`), unpublishing took it from that
+  volume; and names added since (a user's alias, or the ones a `map -r`
+  generates) were left pointing at a volume that no longer exists. `mkrd -d`
+  uses the same helper.
+- **`axl_volume_map_name()` no longer returns a shortened name.** Given a
+  buffer too small for the name, it returned the name cut short (`fs2` for
+  `fs20`), which names a different volume. It now fails, and it and
+  `axl_volume_map_alias()` leave the buffer untouched on failure, as
+  documented.
+- **`mkrd` gives the right advice when it is re-run, and on the old EFI 1.x
+  shell.** A re-run of an existing disk says "reused"; it said "created" when
+  the disk had no shell name. It reports the disk's real size, and that an
+  explicit `-s` was ignored; it printed the size asked for. On the old shell,
+  a re-run once `map -r` has mounted the disk reports the `fsN` it got and
+  asks for nothing; it asked for another `map -r`, which re-probes every block
+  device. On the modern shell, a re-run gives back a name it finds missing: an
+  `FS<n>` when only the label is left (it printed
+  `mapping : AAA: (alias AAA:)` and left the disk out of a bare `map`), and
+  the label alias after a `map -r` dropped it. The `FS<n>` stays the primary
+  name, and the note about `map -r` appears only when `mkrd` set a name in
+  that run. With no free name from `FS20` to `FS255`, `mkrd` exits 0 and
+  points at `map -u`, or, for a disk that still has a name, at that name and
+  `map -r`, since `map -u` skips a disk that has one; it exited 1 with no
+  advice although the disk had been created. `mkrd -d` on the old shell no
+  longer mentions `map -u`, which that shell does not have, and `mkrd -l`
+  shows the label as an alias only when it maps to that disk.
+- **`axl_volume_map_name()` takes only `fs` and digits for a volume's `fsN`.**
+  A custom name that merely started that way (a label `fs1a`) was returned as
+  the volume's `fsN`, so `mkrd` took a disk with only that label for one that
+  had its `FS<n>`.
+
 ## 4.7.2 — 2026-09-17
 
 ### Fixed

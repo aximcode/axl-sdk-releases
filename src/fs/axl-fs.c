@@ -1441,3 +1441,46 @@ axl_volume_map_alias(const void *device_path, char *out, size_t out_size)
        path is not modified. */
     return axl_backend_shell_map_alias((void *)device_path, out, out_size);
 }
+
+int
+axl_volume_pick_free_fsn(char *out, size_t out_size)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    for (uint32_t i = AXL_VOLUME_FSN_FLOOR; i < AXL_VOLUME_FSN_LIMIT; i++) {
+        char cand[16];
+        axl_snprintf(cand, sizeof(cand), "FS%u", i);
+        if (!axl_volume_map_taken(cand)) {
+            if (axl_strlen(cand) >= out_size) {
+                return AXL_ERR;
+            }
+            axl_strlcpy(out, cand, out_size);
+            return AXL_OK;
+        }
+    }
+    return AXL_ERR;
+}
+
+bool
+axl_volume_map_is(const char *name, const void *device_path)
+{
+    if (device_path == NULL) {
+        return false;
+    }
+    unsigned short *w = map_name_to_ucs2(name);
+    if (w == NULL) {
+        return false;
+    }
+    bool is = axl_backend_shell_map_is(w, (void *)device_path);
+    axl_free(w);
+    return is;
+}
+
+int
+axl_volume_unmap_device(const void *device_path, size_t *removed)
+{
+    /* The backend works on the shell's own UCS-2 names, so a name of any
+       length or spelling is removed as the shell stores it. */
+    return axl_backend_shell_unmap_device((void *)device_path, removed);
+}
