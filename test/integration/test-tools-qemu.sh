@@ -233,11 +233,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# mkrd must NOT clobber the user's %path%. Creating a RAM disk runs the shell's
-# `map -r` to make the disk usable; on the legacy shell that command also
-# rewrites %path%. axl_map_refresh now snapshots + restores it. Separate boot
-# (mkrd mutates the volume map, which would disturb the battery above), legacy
-# shell only — that's where the clobber happens and where the fix matters.
+# mkrd must NOT clobber the user's %path%. On the legacy shell `map -r` rewrites
+# %path% from the device-alias form to the fsN form, and mkrd used to run that
+# command from inside create (through SHELL_ENVIRONMENT.Execute, in-context), so
+# a create silently rewrote the caller's search path; axl_map_refresh grew a
+# snapshot+restore to hide it. mkrd now runs no `map -r` at all, so %path% is
+# untouched for a stronger reason than the restore. Separate boot (mkrd mutates
+# the volume map, which would disturb the battery above), legacy shell only.
+#
+# NOTE: axl_map_refresh()'s own snapshot+restore of %path% now has no in-repo
+# caller to exercise it — it is public API kept for callers that want a refresh.
 # ---------------------------------------------------------------------------
 mkrd_path_scenario() { # shell_label, extra args...
     local label="$1"; shift
@@ -263,16 +268,18 @@ if [[ "$TEST_ARCH" == "X64" && -f "$OLD_SHELL" ]]; then
     MKRD_LOG="$WORK/mkrd.log"
     mkrd_path_scenario old --shell "$OLD_SHELL" > "$MKRD_LOG"
     grep -aE "MKRD_PATH_(BEFORE|AFTER)|RAM disk created" "$MKRD_LOG" | sed 's/^/  /'
-    # The disk must actually get created (so map -r ran), and %path% must read
-    # back IDENTICAL after — without the fix, the legacy shell's map -r rewrites
-    # it from the device-alias form to the fsN form.
+    # The disk must actually get created, and %path% must read back IDENTICAL
+    # after: pre-fix that depended on axl_map_refresh's restore surviving the
+    # legacy shell's in-context `map -r`; now nothing rewrites it in the first
+    # place. Both halves still matter — a create that silently fails would also
+    # leave %path% intact.
     _pbefore=$(grep -aoE 'MKRD_PATH_BEFORE=\[[^]]*\]' "$MKRD_LOG" | tail -1)
     _pafter=$(grep -aoE 'MKRD_PATH_AFTER=\[[^]]*\]' "$MKRD_LOG"  | tail -1)
     _pbefore=${_pbefore#MKRD_PATH_BEFORE=}
     _pafter=${_pafter#MKRD_PATH_AFTER=}
     if grep -qa "RAM disk created" "$MKRD_LOG" \
        && [[ -n "$_pafter" && "$_pbefore" == "$_pafter" ]]; then
-        test_host_pass "[legacy] mkrd preserves %path% across its map -r"
+        test_host_pass "[legacy] mkrd preserves %path% (it runs no map -r)"
     else
         test_host_fail "[legacy] mkrd preserves %path% (before=$_pbefore after=$_pafter)"
     fi

@@ -3,6 +3,50 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.7.2 — 2026-09-17
+
+### Fixed
+
+- **Creating or destroying a RAM disk no longer runs the shell's `map -r`.**
+  `axl_ramdisk_create`, `axl_ramdisk_destroy` and `axl_ramdisk_register_image`
+  all called `axl_map_refresh()`, which runs that command — the one `mkrd`'s
+  own help says you will not need. It is not a local operation. Before it
+  rebuilds the shell's map list (dropping every user-made name, each mapping's
+  remembered current directory, and `%path%`), it calls
+  `ProbeForMediaChange()`: a dummy `ReadBlocks` against every physical block
+  device, which lets each one *report* a media change. A device that does has
+  its BlockIo re-installed, tearing down the partition and filesystem stack
+  above it — underneath handles that a running `startup.nsh`, or an open
+  editor, still holds.
+
+  That is the mechanism matching a field report of `edit` failing with "Read
+  File Failed", small files coming back truncated, and a user's map name
+  needing an unmap and remap after a `startup.nsh` created a RAM disk. The
+  causation was never isolated on that hardware — the hazard is removed
+  regardless, and it bought nothing on a modern shell: EDK2's RamDiskDxe
+  already connects the new handle inside `Register`, and `mkrd` names the disk
+  with `EFI_SHELL_PROTOCOL.SetMap`, which has no global side effects. Verified
+  in QEMU: a create still shows as `FS<n>: Alias(s):<LABEL>:` and is usable
+  with no `map -r`.
+
+  **On a shell with no programmatic `SetMap` (the old EFI 1.x shell), `mkrd`
+  now prints `Run 'map -r' to mount the disk` instead of running it for you.**
+  The disk is created and connected either way; the script decides when the
+  shell's map is rebuilt. `mkrd -d` likewise names the command when a mapping
+  outlived the device, rather than refreshing on your behalf.
+
+  `scripts/check-no-inner-map-refresh.py` keeps it that way: a behavioural test
+  cannot catch a reintroduction on a nesting shell, because
+  `EFI_SHELL_PROTOCOL.Execute` runs the refresh in a nested shell image whose
+  map rebuild is invisible from outside.
+
+- **`axl_ramdisk_register_image` connects the new device's handle, not every
+  handle in the system.** It used the equivalent of the shell's `connect -r`,
+  which re-binds drivers under unrelated controllers. It now resolves the
+  handle by BlockIo, then by DevicePath, and connects that one recursively —
+  falling back to the system-wide form only when neither resolves, where it is
+  the difference between binding a block driver and binding nothing.
+
 ## 4.7.1 — 2026-09-05
 
 ### Added

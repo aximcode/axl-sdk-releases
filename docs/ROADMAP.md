@@ -574,9 +574,10 @@ Active sub-projects (pre-code planning — see "Active sub-projects" below):
 **v3.2.3**, **10405 unit tests** both arches (X64 + AArch64), built with AXL's
 own bare-metal crosses on both arches (nothing from the host — see
 [AXL-Libc-Substrate-Design.md](AXL-Libc-Substrate-Design.md) §4.1d, inventory
-empty). `scripts/cut-release.sh` automates a cut from `main`; a release that
-must NOT carry everything on `main` is cut from the previous tag on a release
-branch, which is how 3.2.1, 3.2.2 and 3.2.3 shipped — see
+empty). `scripts/cut-release.sh` automates a cut from `main`, and
+`--branch release-X.Y.Z` automates the other flow: a release that must NOT
+carry everything on `main` is cut from the previous tag on a release branch,
+which is how 3.2.1, 3.2.2 and 3.2.3 shipped — see
 [RELEASING.md](RELEASING.md) "Which flow".
 
 > **`git describe` on `main` reports v3.2.0, not v3.2.3.** Those three tags

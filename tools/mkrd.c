@@ -44,16 +44,16 @@
     created — mount via `map -r`).
 
     Old / no shell: the SetMap path above needs the EDK2 EFI_SHELL_PROTOCOL. The
-    old EFI 1.x shell has no programmatic SetMap for a custom name, but it does
-    expose SHELL_ENVIRONMENT.Execute — so axl_ramdisk_create drives the shell's
-    own `map -r` through it (the same way the legacy mkramdisk mapped its disks:
-    by running the shell's `map` command, not a private API). By the time mkrd
-    detects the non-UEFI shell via `axl_shell_kind()`, the disk is therefore
-    already enumerated as an `fsN`; mkrd reports that `fsN` (resolved via the
-    SHELL_ENVIRONMENT.GetMap reverse-lookup) and exits 0 — no manual `map -r`.
-    The custom label can't become a shell alias here (the old shell rejects
-    `map <name> <fsN>`), so the disk is reachable as its `fsN` only. If the
-    auto-`map -r` didn't take, mkrd falls back to naming the manual step.
+    old EFI 1.x shell has no programmatic SetMap for a custom name, so there is
+    nothing to name the disk with: mkrd creates and connects it, prints
+    `Run 'map -r' to mount the disk`, and exits 0. It does NOT run the shell's
+    `map -r` for you (it once did, through SHELL_ENVIRONMENT.Execute). A map
+    refresh is not a local operation: it first probes every physical block
+    device in the system (ShellPkg Map.c, ProbeForMediaChange), letting each
+    report a media change, and a device that does has its BlockIo re-installed
+    — which re-enumerates removable and virtual media and invalidates file
+    handles a running script or an open editor still holds. Whoever wants the
+    shell's map rebuilt says so.
 
     Label as alias: the LABEL doubles as the friendly alias when it is a clean
     map token. It is NOT set as an alias (the disk is reachable as `FS<n>:` only,
@@ -291,6 +291,15 @@ cli_destroy(
         }
     }
 
+    /* Does any shell name still point at this device? The loop above clears the
+       ones it can reach; what it cannot is an fsN the SHELL assigned on an
+       earlier `map -r` (a shell with no programmatic unmap, e.g. old EFI 1.x,
+       leaves every name in place). Read it while dev_path is still valid —
+       destroy frees the device path. */
+    char left[MKRD_MAP_NAME_CAP];
+    bool names_remain = (dev_path != NULL)
+        && (axl_volume_map_alias(dev_path, left, sizeof(left)) == AXL_OK);
+
     if (axl_ramdisk_destroy(label) != AXL_OK) {
         axl_printf("MkRd: no RAM disk with label \"%s\" found.\n", label);
         return 1;
@@ -299,6 +308,15 @@ cli_destroy(
         axl_printf("RAM disk \"%s\" destroyed (unmapped shell alias).\n", label);
     } else {
         axl_printf("RAM disk \"%s\" destroyed.\n", label);
+    }
+    /* A name we could not clear now dereferences a freed device path
+       ("Invalid file system mapping on fsN"), so say which command clears it —
+       but only when one actually survived, so a clean destroy stays quiet.
+       mkrd names the command; it does not run `map -r` itself, for the reasons
+       in axl_ramdisk_create. */
+    if (names_remain) {
+        axl_printf("The shell still maps \"%s\" to the destroyed disk; "
+                   "run 'map -r' to clear it.\n", left);
     }
     return 0;
 }
@@ -327,47 +345,26 @@ cli_create(
        call below routes through EFI_SHELL_PROTOCOL, which isn't present, so
        skip them entirely: the disk is already created AND connected (its
        BlockIo / SimpleFileSystem are published), so the shell enumerates it
-       as an fsN on the next `map -r`. Advise + exit 0 (a shell-less create
-       is a partial success — see the SetMap-rejected branch below for the
-       modern-shell counterpart). */
+       as an fsN on the next `map -r`.
+
+       mkrd does NOT drive that `map -r` itself. Running the shell's map
+       refresh from inside a create probes every physical block device in the
+       system (ShellPkg Map.c ProbeForMediaChange), letting each report a media
+       change; one that does has its BlockIo re-installed, which invalidates
+       handles a running script or an open editor still holds. Naming a disk is not worth
+       disturbing every other volume, so this names the one manual step and
+       exits 0 — the disk WAS created (a shell-less create is a partial
+       success, and a non-zero exit reads as EFI_ABORTED to a caller, which
+       would abort the script at this line). */
     if (axl_shell_kind() != AXL_SHELL_KIND_UEFI) {
-        /* The old shell has no programmatic SetMap for a custom name, but
-           axl_ramdisk_create already drove the shell's own `map -r` (through
-           SHELL_ENVIRONMENT.Execute — the same mechanism the legacy mkramdisk
-           used), so the disk is already enumerated as an fsN. Report that fsN;
-           no manual `map -r` is needed. The custom label can't become a shell
-           alias here (the old shell's `map <name> <fsN>` is unsupported), so
-           the disk is reachable as its fsN only. */
         AXL_AUTO_FREE char *dp_text = axl_device_path_to_text(dev_path);
-        char primary[MKRD_MAP_NAME_CAP];
-        bool mapped = (axl_volume_map_alias(dev_path, primary, sizeof(primary))
-                           == AXL_OK);
         axl_printf("RAM disk created:\n");
         axl_printf("  label   : %s\n", label);
         axl_printf("  size    : %zu MB (%s)\n", size_mb, fs_type);
         if (dp_text != NULL) {
             axl_printf("  device  : %s\n", dp_text);
         }
-        if (mapped) {
-            /* Also try to add the custom label as an alias of the fsN via the
-               shell's own `map <label> <fsN>:` command — works where the shell
-               exposes a resolvable device path for the fsN (an interactive
-               session), giving `<label>:` in addition to `fsN:`. */
-            bool aliased = (label_alias_reject_reason(label) == NULL)
-                && (axl_volume_alias_to_fsn(label, primary) == AXL_OK);
-            if (aliased) {
-                axl_printf("  mapping : %s: (alias %s:)\n", primary, label);
-                axl_printf("Ready: use  %s:  or  %s:  now - no 'map -r' needed.\n",
-                           primary, label);
-            } else {
-                axl_printf("  mapping : %s:\n", primary);
-                axl_printf("Ready: use  %s:  now - no 'map -r' needed.\n", primary);
-            }
-        } else {
-            /* Auto-map didn't take (no SHELL_ENVIRONMENT.Execute on this shell,
-               or the rescan missed the fresh disk) — name the manual step. */
-            axl_printf("Run 'map -r' to mount the disk (it appears as an fsN).\n");
-        }
+        axl_printf("Run 'map -r' to mount the disk (it appears as an fsN).\n");
         return 0;
     }
 
@@ -466,6 +463,11 @@ cli_create(
     } else {
         axl_printf("Ready: use  %s:  now - no 'map -r' needed.\n", primary);
     }
+    /* Say it once, here, rather than leave it to the docs: these names are
+       mkrd's, and the shell's own `map -r` rebuilds its map from scratch. */
+    axl_printf("Note: a later 'map -r' replaces %s with a firmware-assigned "
+               "fsN ('mkrd -l' finds it).\n",
+               label_alias ? "these names" : "this name");
     return 0;
 }
 

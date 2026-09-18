@@ -169,14 +169,21 @@ fi
 # ---------------------------------------------------------------------------
 echo "=== old-shell mkrd + map -r round-trip ==="
 
-# fs0 is the boot volume; mkrd drives the shell's own `map -r` (via
-# SHELL_ENVIRONMENT.Execute), so the fresh RAM disk is already enumerated as
-# fs1 by the time mkrd returns — NO manual `map -r` here on purpose, to prove
-# the auto-map.
+# fs0 is the boot volume. mkrd creates and connects the disk but does NOT map
+# it: this shell has no programmatic SetMap, and a create has no business
+# running the shell's `map -r`. That command probes every physical block device
+# so any can report a media change (re-installing its BlockIo), and on THIS
+# shell SHELL_ENVIRONMENT.Execute runs in-context, so a map rebuild lands on the
+# real map list rather than a nested shell's throwaway one. mkrd names the
+# manual step; the SCRIPT runs `map -r` when it is ready for it.
 cat > "$WORK/mkrd.nsh" <<'NSH'
 fs0:
+echo MARK_CREATE
 mkrd SCRATCH
 echo MKRD_RC=[%lasterror%]
+echo MARK_AFTER_CREATE
+map -r
+echo MARK_AFTER_MAPR
 mkrd -l
 fs1:
 echo axl-old-shell-proof > proof.txt
@@ -201,33 +208,41 @@ if echo "$MKRD_LOG" | grep -q 'MKRD_RC=\[0\]'; then
 else
     test_host_fail "mkrd exits 0 on a shell-less create (not EFI_ABORTED)"
 fi
-# The nsh runs NO manual `map -r` — mkrd drove the shell's own `map -r` via
-# SHELL_ENVIRONMENT.Execute during create, so the disk is already usable.
+# The disk is usable once the SCRIPT has run `map -r` — create + connect worked,
+# only the naming was left to the caller.
 if echo "$MKRD_LOG" | grep -q '^axl-old-shell-proof$'; then
-    test_host_pass "disk usable with NO manual 'map -r' (mkrd auto-mapped it)"
+    test_host_pass "disk usable after the script's own 'map -r'"
 else
-    test_host_fail "disk usable with NO manual 'map -r' (mkrd auto-mapped it)"
+    test_host_fail "disk usable after the script's own 'map -r'"
 fi
-if echo "$MKRD_LOG" | grep -qiE "no 'map -r' needed"; then
-    test_host_pass "mkrd reports the auto-mapped fsN ('no map -r needed')"
+# REGRESSION (this is what changed): mkrd must name the manual step and must NOT
+# claim the disk is already mapped. mkrd used to drive the shell's `map -r`
+# itself from inside create — in-context on this shell, so the map rebuild hit
+# the real map list, and the probe let every physical block device report a
+# media change. Both assertions fail against that old build.
+CREATE_OUT=$(echo "$MKRD_LOG" | sed -n '/MARK_CREATE/,/MARK_AFTER_CREATE/p')
+if echo "$CREATE_OUT" | grep -qiF "Run 'map -r' to mount the disk"; then
+    test_host_pass "mkrd names the manual 'map -r' instead of running it"
 else
-    test_host_fail "mkrd reports the auto-mapped fsN ('no map -r needed')"
+    test_host_fail "mkrd names the manual 'map -r' instead of running it"
 fi
-# The internal `map -r` (axl_map_refresh, driven through SHELL_ENVIRONMENT.Execute
-# during create) must NOT dump the shell's "Device mapping table" to the console:
-# mkrd already prints its own detailed summary, so the table is redundant noise.
-# This nsh runs NO explicit `map`, so any "Device mapping table" in the log is
-# the refresh leaking — which it did before axl_map_refresh redirected `map -r`
-# to nul. (On the modern shell EFI_SHELL_PROTOCOL.Execute is already silent; this
-# old-shell path via SHELL_ENVIRONMENT.Execute was the visible one.)
-if echo "$MKRD_LOG" | grep -qiF 'Device mapping table'; then
-    test_host_fail "internal map -r stays silent (no redundant 'Device mapping table')"
+if echo "$CREATE_OUT" | grep -qiE "no 'map -r' needed"; then
+    test_host_fail "mkrd no longer claims 'no map -r needed' on this shell"
 else
-    test_host_pass "internal map -r stays silent (no redundant 'Device mapping table')"
+    test_host_pass "mkrd no longer claims 'no map -r needed' on this shell"
+fi
+# create must not run the shell's `map -r` at all, so its output can't contain
+# the "Device mapping table" that this shell's in-context Execute prints. Scoped
+# to the create region: the script's OWN `map -r` (after MARK_AFTER_CREATE)
+# prints that table legitimately.
+if echo "$CREATE_OUT" | grep -qiF 'Device mapping table'; then
+    test_host_fail "create runs no 'map -r' (no 'Device mapping table' in its output)"
+else
+    test_host_pass "create runs no 'map -r' (no 'Device mapping table' in its output)"
 fi
 # mkrd -l reverse-looks-up the fsN via SHELL_ENVIRONMENT.GetMap (the disk is in
-# the shell's map from the auto `map -r`): lowercase 'fs1:' (the old shell's own
-# casing), NOT '(unmapped)'. The modern shell shows uppercase 'FS<n>:', so the
+# the shell's map once the SCRIPT ran `map -r` above): lowercase 'fs1:' (the old
+# shell's own casing), NOT '(unmapped)'. The modern shell shows uppercase 'FS<n>:', so the
 # listing stays consistent with whichever shell is in use.
 if echo "$MKRD_LOG" | grep -qE '^fs1:'; then
     test_host_pass "mkrd -l shows lowercase fs1: on the old shell (GetMap reverse-lookup)"
@@ -245,28 +260,58 @@ fi
 # ---------------------------------------------------------------------------
 echo "=== old-shell mkrd label-alias (interactive) ==="
 
+# mkrd no longer maps anything on this shell, so the alias is the USER's to make
+# with the shell's own `map <label> fsN:` (which needs the device-path aliases
+# only interactive mode generates). The round-trip writes through FOOBAR: and
+# reads back through fs1: — it cannot pass by silently landing on fs0, and the
+# assertion is anchored so the echoed keystrokes cannot satisfy it either.
+#
+# NOTE: this scenario was axl_volume_alias_to_fsn()'s only exercise in the repo.
+# mkrd no longer calls it (the shell's own `map` command is typed here instead),
+# so that published API is now untested — deliberately, not by oversight.
 INT_LOG=$(run_old_shell_interactive "$MKRD" \
-    "mkrd FOOBAR" "mkrd -l" "FOOBAR:" \
-    "echo axl-alias-round-trip > p.txt" "type p.txt" "fs0:" \
-    "mkrd -d FOOBAR" "mkrd -l" "reset -s")
+    "mkrd FOOBAR" "map -r" "map FOOBAR fs1:" "FOOBAR:" \
+    "echo axl-alias-round-trip > p.txt" "type fs1:\\p.txt" "fs0:" \
+    "mkrd -l" "mkrd -d FOOBAR" "mkrd -l" "reset -s")
 
-echo "$INT_LOG" | grep -aiE 'mapping :|alias FOOBAR|axl-alias-round-trip|No RAM disks|^fs1:' \
+echo "$INT_LOG" | grep -aiE "mapping :|alias FOOBAR|axl-alias-round-trip|No RAM disks|^fs1:|Run 'map -r'" \
     | sed 's/^/  /' | head
 
-if echo "$INT_LOG" | grep -q 'alias FOOBAR:'; then
-    test_host_pass "mkrd creates a usable label alias interactively (map <label> fsN:)"
+if echo "$INT_LOG" | grep -qiF "Run 'map -r' to mount the disk"; then
+    test_host_pass "mkrd advises 'map -r' interactively too (never runs it)"
 else
-    test_host_fail "mkrd creates a usable label alias interactively (map <label> fsN:)"
+    test_host_fail "mkrd advises 'map -r' interactively too (never runs it)"
 fi
-if echo "$INT_LOG" | grep -q 'axl-alias-round-trip'; then
-    test_host_pass "FOOBAR: alias round-trip (write+read through the label)"
+INT_CREATE=$(echo "$INT_LOG" | sed -n '/mkrd FOOBAR/,/map -r/p')
+if echo "$INT_CREATE" | grep -q 'alias FOOBAR:'; then
+    test_host_fail "mkrd claims no label alias it did not set on this shell"
 else
-    test_host_fail "FOOBAR: alias round-trip (write+read through the label)"
+    test_host_pass "mkrd claims no label alias it did not set on this shell"
 fi
-if echo "$INT_LOG" | grep -qE '^fs1:[[:space:]]+FOOBAR:'; then
-    test_host_pass "mkrd -l shows the label with a colon (FOOBAR:) interactively"
+# NO "a user's map name survives mkrd" PROBE HERE, and the measurement is why.
+# The obvious probe is `map PRESRV fs0:` before `mkrd FOOBAR`, then ask for it
+# back. Measured on this shell (Shell106, interactive), a CONTROL that asks for
+# it back BEFORE mkrd runs at all already answers:
+#
+#     Shell> map PRESRV fs0:   ->  Device mapping table ... PRESRV :BlockDevice
+#     Shell> map PRESRV:       ->  map: Cannot find required map name.
+#
+# So `map <name> fsN:` here leaves nothing a later `map <name>:` finds, and the
+# probe never establishes a name for mkrd to lose: it measures the shell, not
+# us. (That wording also differs from the modern shell's "Cannot find mapped
+# device" — don't reuse that grep here.) A real detector on this shell would
+# need another way to create a name that persists. The modern-shell side of the
+# same question is contract-checked in test-ramdisk-map-qemu.sh.
+# fs1:\p.txt is on the RAM disk: the write went through the user's FOOBAR: alias.
+if echo "$INT_LOG" | grep -qE '^axl-alias-round-trip[[:space:]]*$'; then
+    test_host_pass "user-made FOOBAR: alias round-trips (write FOOBAR:, read fs1:)"
 else
-    test_host_fail "mkrd -l shows the label with a colon (FOOBAR:) interactively"
+    test_host_fail "user-made FOOBAR: alias round-trips (write FOOBAR:, read fs1:)"
+fi
+if echo "$INT_LOG" | grep -qE '^fs1:'; then
+    test_host_pass "mkrd -l shows the disk's fsN after the user's map -r"
+else
+    test_host_fail "mkrd -l shows the disk's fsN after the user's map -r"
 fi
 if echo "$INT_LOG" | grep -q 'No RAM disks found'; then
     test_host_pass "mkrd -d destroys the disk interactively (map cleaned)"

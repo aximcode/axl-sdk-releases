@@ -453,11 +453,13 @@ document. Ask one question:
 **No — release the tip of `main`.** Use `scripts/cut-release.sh X.Y.Z`. This is
 the flow the script was written for and the rest of this document describes.
 
-**Yes — cut from the previous TAG on a release branch.** The script cannot do
-this: it hard-requires `main` (`git branch --show-current == main`) and
-hardcodes `git push origin main`, so running it from a release branch would
-push that branch's commits onto `main`. Follow "Cut the release" below by hand,
-with the differences in the next section.
+**Yes — cut from the previous TAG on a release branch.** Use
+`scripts/cut-release.sh X.Y.Z --branch release-X.Y.Z` from a worktree on that
+branch. The script used to hard-require `main` and hardcode
+`git push origin main`; `--branch` parameterises both, and refuses any branch
+whose name does not encode the version being cut (`release-X.Y.Z`, or
+`release/X.Y.x` for a maintenance line carrying successive patches of one
+minor). The differences from a `main` cut are in the next section.
 
 This is not an exotic case. **v3.2.1, v3.2.2 and v3.2.3 were all cut from tags**
 — every release since v3.2.0 — because `main` was accumulating a toolchain and
@@ -545,22 +547,33 @@ that is a re-classification, not a bypass.
 
 ### Cutting from a tag — what differs
 
-Steps 1, 2, 3, 5, 6 and 7 below are **identical**. Only the branch handling
-changes:
+Steps 1, 2, 3, 5, 6 and 7 below are **identical**. Step 4 pushes this branch
+rather than `main`, and step **4b** — the gate — is the one that differs in
+kind: see "CI is dispatched, not awaited" below.
 
 ```sh
 # instead of working on main:
 git worktree add ~/axl-sdk-X.Y.Z -b release-X.Y.Z vPREV   # e.g. v3.2.2
 cd ~/axl-sdk-X.Y.Z
 
-# cherry-pick or apply ONLY the change this release is for, then
-# steps 1-3: bump-version.sh, date the CHANGELOG, commit "release: vX.Y.Z"
+# cherry-pick or apply ONLY the change this release is for, write the
+# `## Unreleased` section (see below), commit it, then:
+scripts/cut-release.sh X.Y.Z --branch release-X.Y.Z
 
-# step 4 becomes: push the RELEASE BRANCH, not main
-git push -u origin release-X.Y.Z
-
-# steps 5-7 unchanged: tag, push the tag, watch, confirm
+# steps 1-3 and 5-7 are what the script always does; step 4 pushes THIS
+# branch rather than main. By hand, the only difference is:
+#     git push -u origin release-X.Y.Z
 ```
+
+**CI is dispatched, not awaited.** `ci.yml` triggers on `push: branches:
+[main]`, so pushing a release branch starts **no run at all** — the gate would
+wait 75 minutes for something that can never appear. On a `--branch` cut the
+script therefore turns `--ci-gate` on for you and dispatches `ci.yml` on that
+ref — *unless* the local stamp or an existing green run already covers the
+release commit, in which case it says so and skips the dispatch. In a worktree
+where you have just run the local suite, skipping is the normal outcome, not a
+bug. (A dispatched run also ignores the `[release-cut]` marker, because that
+guard reads `github.event.head_commit`, which is null on `workflow_dispatch`.)
 
 Two things to get right:
 
@@ -568,6 +581,12 @@ Two things to get right:
   tag's CHANGELOG will not have one (it was dated at that release), so add a
   heading carrying *only* this release's entries. Do not copy `main`'s
   accumulator across; that is the mistake this whole section exists to prevent.
+- **The source mirror follows the tag.** `release.yml`'s "Publish source
+  snapshot" step force-replaces `aximcode/axl-sdk-releases`' default branch
+  with the tagged tree. Cutting a patch from an OLDER line therefore rewinds
+  that mirror to the older source until the next cut from `main`. Harmless when
+  the patch is the newest thing released; worth knowing before cutting, say,
+  4.6.x after 4.7.0 shipped.
 - **Land it on `main` afterwards.** The release branch is not a long-lived
   fork. Cherry-pick the change onto `main` as one squashed commit with the
   version appended to the subject — the pattern `e98a4f6a` (v3.2.1) and
@@ -942,7 +961,9 @@ has been created yet**, it's safe to re-cut:
 
 1. Verify no release exists: `gh release view vX.Y.Z` should print
    `release not found`.
-2. Land the fix on `main` as a normal commit.
+2. Land the fix where the tag was cut from: `main` for a normal cut, **the
+   release branch** for a `--branch` cut — it is what the tag will be re-cut
+   from.
 3. Move the tag:
 
    ```sh
@@ -951,6 +972,12 @@ has been created yet**, it's safe to re-cut:
    git tag -a vX.Y.Z -m "<original tag message>"
    git push origin vX.Y.Z
    ```
+
+   On a release branch, `scripts/cut-release.sh X.Y.Z --resume --branch <branch>`
+   does that re-cut for you **once the old tag is deleted** — it refuses while
+   the tag still exists — and it dispatches the CI run, because `ci.yml` has no
+   trigger for that ref and nothing else will start one. (`--branch` turns the
+   gate on by itself; `--ci-gate` adds nothing there.)
 
 4. Watch the new workflow runs (step 6) and confirm (step 7).
 

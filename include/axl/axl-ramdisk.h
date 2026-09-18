@@ -7,9 +7,10 @@
 
     A RAM disk is a block of allocated memory registered with the
     firmware as a virtual block device, FAT-formatted so the firmware
-    binds its filesystem driver and the volume appears as an `fsN:`
-    mapping. Useful for scratch space, staging files a tool produces,
-    or the backing store of a virtual-media feature.
+    binds its filesystem driver. Naming it in the shell's map is a
+    separate step the caller owns (see `axl_ramdisk_create`). Useful for
+    scratch space, staging files a tool produces, or the backing store of
+    a virtual-media feature.
 
     @code
     // Make the protocol available (embedded fallback optional), then
@@ -17,7 +18,9 @@
     axl_ramdisk_ensure_driver(NULL, 0, NULL);
     void *dp = NULL;
     if (axl_ramdisk_create("SCRATCH", 64, &dp) == AXL_OK) {
-        // ... fsN: now resolves to the new FAT volume ...
+        // The volume exists but has no shell name yet: give it one with
+        // axl_volume_set_map(dp, "FS9") (what mkrd does), or let the user
+        // run `map -r`. create never refreshes the shell's map.
     }
     @endcode
 
@@ -87,9 +90,15 @@ axl_ramdisk_ensure_driver(
  * Allocates @p size_mb of page-aligned memory, formats it FAT16
  * (`size_mb <= 512`) or FAT32 (larger) with @p label as the volume
  * label, and registers it via EFI_RAM_DISK_PROTOCOL. Blocks ~0.5s for
- * the firmware to bind its FAT driver, then refreshes the volume map so
- * the disk is immediately enumerable and reachable as `fsN:` (relevant
- * for a consumer creating one at boot).
+ * the firmware to bind its FAT driver (EDK2's RamDiskDxe connects the
+ * new handle inside Register, so the volume is usually live already).
+ *
+ * The shell's map is NOT touched: the disk has no `fsN:` name until
+ * someone gives it one. Name it with `axl_volume_set_map` (what `mkrd`
+ * does — no global side effects), or leave it to a `map -r` the caller
+ * runs when it suits them. A map refresh from inside a create would
+ * probe media on every physical block device and rebuild the shell's
+ * map list, which breaks handles and names its caller still relies on.
  *
  * Requires the protocol — call `axl_ramdisk_ensure_driver` first (or
  * run on firmware that publishes it). @p size_mb must be in the range
@@ -190,12 +199,19 @@ typedef enum {
  * uploaded OS image boots as-is: the image carries its own filesystem
  * (ISO9660 for a CD-ROM, a partition / FAT image for a disk). @p kind
  * selects the firmware-recognized type GUID — CD-ROM vs raw disk. After
- * registering, the firmware's controllers are connected so it binds its
+ * registering, controllers are connected so the firmware binds its
  * block / FAT / ISO9660 drivers and the device enumerates (a bootable
- * image becomes a boot option). The connect is global (equivalent to the
- * shell's `connect -r`) — heavier than a targeted connect, but it only
- * binds drivers, never unbinds, so it does not disturb controllers
- * already in use (e.g. a running server's NICs).
+ * image becomes a boot option). The connect is scoped to the new
+ * device's own handle and recursive, so the whole stack below it binds
+ * without re-binding drivers under unrelated controllers. The handle is
+ * resolved by BlockIo, then by DevicePath for a handle that exists with
+ * nothing bound to it yet. Only if neither resolves does it fall back to
+ * the global connect (the shell's `connect -r`), which can still bind a
+ * block driver to a handle that exists; if the firmware created no
+ * handle at all, neither form helps and a later `map -r` or connect is
+ * the recovery. The global form only binds, never unbinds, so
+ * controllers already in use keep working. The shell's map is not
+ * refreshed either way.
  *
  * Ownership: @p image is caller-owned and is NOT copied — it must be
  * page-aligned (allocate with `axl_alloc_pages`) and MUST stay valid

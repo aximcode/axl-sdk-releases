@@ -20,10 +20,13 @@
 #include <axl/axl-ramdisk.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-fs.h>
+#include <axl/axl-log.h>    /* axl_debug */
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-sys.h>
 #include <axl/axl-wait.h>   /* axl_msleep */
+
+AXL_LOG_DOMAIN("ramdisk");
 
 // ---------------------------------------------------------------------------
 // Device path constants (UEFI spec Table 10-46, 10-62)
@@ -202,6 +205,48 @@ find_ramdisk_dp(
         axl_free(vol);
         if (match) {
             *dev_path_out = vols[i].device_path;
+            return AXL_OK;
+        }
+    }
+    return AXL_ERR;
+}
+
+/* Resolve the controller handle a freshly registered RAM disk lives on, so a
+   connect can be scoped to it instead of every handle in the system.
+
+   Two protocols, most specific first. BlockIo is what the RAM-disk provider
+   publishes on the new handle before any filesystem driver binds, so it
+   resolves even for an image whose filesystem is not mounted yet. DevicePath is
+   the fallback for a handle that exists but has no BlockIo bound to it yet --
+   EDK2 installs both in one InstallMultipleProtocolInterfaces call, and any
+   provider must install DevicePath for the path it returned to mean anything.
+   Returns AXL_OK and sets *handle_out (firmware owned) on a match, AXL_ERR
+   otherwise. */
+static int
+handle_from_device_path(
+    void  *dev_path,
+    void **handle_out
+    )
+{
+    if (dev_path == NULL || handle_out == NULL) {
+        return AXL_ERR;
+    }
+    *handle_out = NULL;
+
+    EFI_GUID candidates[2] = {
+        gEfiBlockIoProtocolGuid,
+        gEfiDevicePathProtocolGuid,
+    };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        /* LocateDevicePath advances a copy of the pointer, never the caller's. */
+        EFI_DEVICE_PATH_PROTOCOL *walk = (EFI_DEVICE_PATH_PROTOCOL *)dev_path;
+        EFI_HANDLE                handle = NULL;
+
+        if (!EFI_ERROR(axl_efi_call(axl_bs()->LocateDevicePath, 3,
+                                    &candidates[i], &walk, &handle))
+            && handle != NULL) {
+            *handle_out = handle;
             return AXL_OK;
         }
     }
@@ -455,10 +500,20 @@ axl_ramdisk_create(
         return AXL_IO_ERROR;
     }
 
-    /* Let firmware bind the FAT driver, then refresh the volume map so
-       the disk is immediately enumerable / reachable as fsN:. */
+    /* Settle for firmware that binds its FAT driver from an event rather than
+       inside Register (EDK2's RamDiskDxe ConnectController()s the new handle
+       before Register returns, so the volume is usually live already).
+
+       The shell's map is deliberately NOT refreshed here. `map -r` first runs
+       ProbeForMediaChange(), a dummy ReadBlocks against every physical block
+       device (logical partitions skipped) that lets each one REPORT a media
+       change — and one that does has its BlockIo re-installed, tearing down the
+       partition/filesystem stack above it and invalidating handles other
+       software still holds (a running startup.nsh, an open editor).
+       A refresh driven from inside a create is also the wrong layer: naming is
+       the caller's business. mkrd names the disk with SetMap (no global side
+       effects); anyone who wants the shell's own fsN runs `map -r` themselves. */
     axl_msleep(500);
-    axl_map_refresh();
 
     if (dev_path_out != NULL) {
         *dev_path_out = dev_path;
@@ -505,15 +560,36 @@ axl_ramdisk_register_image(
 
     /* Bind the firmware's block / FAT / ISO9660 drivers to the new device
        (the EDK2 ConnectController(...,TRUE) step) so it enumerates and a
-       bootable image becomes a boot option, then refresh the volume map.
-       Unlike axl_ramdisk_create — which FAT-formats and relies on the
-       RamDiskDxe auto-connect of the FAT driver (a stall + map refresh) —
-       an arbitrary image's drivers (an El Torito ISO9660 binding, a
-       partitioned disk) need an explicit connect, so this does a global
-       connect (axl_driver_connect(NULL) == `connect -r`). It only binds,
-       never unbinds, so controllers already in use are undisturbed. */
-    axl_driver_connect(NULL);
-    axl_map_refresh();
+       bootable image becomes a boot option. Unlike axl_ramdisk_create — which
+       FAT-formats and relies on the RamDiskDxe auto-connect of the FAT driver
+       — an arbitrary image's drivers (an El Torito ISO9660 binding, a
+       partitioned disk) may need an explicit connect.
+
+       Scoped to THIS device's handle, not `connect -r` over every handle in
+       the system: recursive is still passed, so the whole driver subtree below
+       the new disk (partition -> filesystem) binds in one call, but nothing
+       else is touched. A system-wide connect re-binds drivers under unrelated
+       controllers, which on removable / virtual media re-enumerates volumes
+       other software is using. The shell's map is likewise not refreshed —
+       see axl_ramdisk_create for why `map -r` does not belong in a create.
+
+       If neither protocol resolves a handle, fall back to the system-wide
+       connect rather than silently binding nothing: an image that never
+       enumerates is a create that returned AXL_OK and did nothing. What that
+       rescues is the case where a handle EXISTS but nothing has bound to it
+       yet, so a global connect can bind the block driver and the stack builds.
+       If the firmware has created no handle at all, neither form can help --
+       the caller's later `map -r` or connect is the recovery. The global form
+       only BINDS drivers, never unbinds (it is exactly what this function did
+       unconditionally before), so it is heavier, not dangerous. */
+    void *disk_handle = NULL;
+    if (handle_from_device_path(dev_path, &disk_handle) == AXL_OK) {
+        axl_driver_connect_handle(disk_handle);
+    } else {
+        axl_debug("no handle bound to the new device path yet; "
+                  "falling back to a system-wide connect");
+        axl_driver_connect(NULL);
+    }
 
     if (dev_path_out != NULL) {
         *dev_path_out = dev_path;
@@ -586,13 +662,13 @@ axl_ramdisk_destroy(
         if (start != 0 && size > 0) {
             axl_free_pages(start, (size_t)((size + 4095) / 4096));
         }
-        /* Refresh the shell's volume map so the removed disk's now-dangling
-           fsN entry is dropped — symmetric with axl_ramdisk_create's refresh
-           after Register. Without this the shell keeps an fsN pointing at the
-           freed device ("Invalid file system mapping on fsN"). On the old EFI
-           1.x shell this drives `map -r` through SHELL_ENVIRONMENT.Execute; on
-           the modern shell it is the EFI_SHELL_PROTOCOL.Execute path. */
-        axl_map_refresh();
+        /* The shell's map is NOT refreshed here — symmetric with
+           axl_ramdisk_create, and for the same reason: `map -r` probes every
+           physical block device in the system (see the comment there). A name the
+           caller SetMap'd for this disk is theirs to remove (mkrd -d does);
+           an fsN the shell itself assigned on an earlier `map -r` survives as a
+           dangling entry until the user runs `map -r` again, which is what
+           mkrd -d tells them. */
         return AXL_OK;
     }
     return AXL_ERR;   /* no RAM disk with that label */

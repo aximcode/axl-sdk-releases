@@ -14,17 +14,25 @@
 #                                           #   change under a non-major version
 #   scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs instead of
 #                                           #   being handed a URL
-#   scripts/cut-release.sh X.Y.Z --resume   # recovery: main already has the
-#                                           #   release commit + green CI — just
-#                                           #   tag, push, watch, confirm
+#   scripts/cut-release.sh X.Y.Z --resume   # recovery: the release branch
+#                                           #   already has the release commit +
+#                                           #   green CI — just tag, push, watch
+#   scripts/cut-release.sh X.Y.Z --branch release-X.Y.Z
+#                                           # cut from a tag on a release branch
+#                                           #   (RELEASING.md "Cutting from a
+#                                           #   tag"): ships a fix to released
+#                                           #   users without whatever main has
+#                                           #   picked up since. Also accepts a
+#                                           #   maintenance line, release/X.Y.x
 #
 # What it does (normal flow):
-#   1. preconditions  : on main, clean tree, gh authed, tag absent, CHANGELOG
-#                       has an "## Unreleased" section
+#   1. preconditions  : on the release branch (main by default), clean tree,
+#                       gh authed, tag absent, CHANGELOG has an "## Unreleased"
+#                       section
 #   2. bump-version   : VERSION + axl-version.h (via scripts/bump-version.sh)
 #   3. date CHANGELOG : "## Unreleased" -> "## X.Y.Z — YYYY-MM-DD"
 #   4. check-version  : make check-version
-#   5. commit + push  : one "release: vX.Y.Z" commit -> origin/main
+#   5. commit + push  : one "release: vX.Y.Z" commit -> origin/<release branch>
 #   6. GATE           : wait for CI to go GREEN on the release commit
 #   7. tag + push     : annotated vX.Y.Z (body summarised from the CHANGELOG)
 #   8. watch + confirm: scripts/watch-release-runs.sh, then gh release view
@@ -49,11 +57,12 @@ FORCE_CI=false  # --force-ci: dispatch CI even when the local stamp
 # shellcheck source=../test/integration/lib/release-gate.sh
 source "$(dirname "$0")/../test/integration/lib/release-gate.sh"
 
-CI_GATE=false   # CI runs only via workflow_dispatch (NOT on push, NOT on
-                # release tags), so the release gate is the LOCAL suite plus a
-                # manual CI dispatch on main watched green before tagging (see
-                # docs/RELEASING.md §4b). --ci-gate makes this script dispatch
-                # ci.yml on main and wait for it green before it tags.
+CI_GATE=false   # ci.yml runs on a push to main and via workflow_dispatch (NOT
+                # on release tags), so the release gate is the LOCAL suite plus
+                # a CI run watched green before tagging (docs/RELEASING.md §4b).
+                # --ci-gate makes this script dispatch ci.yml on the release
+                # branch and wait for it. A --branch cut turns it on itself:
+                # a push to a non-main branch starts no run at all.
 RELEASES_REPO="aximcode/axl-sdk-releases"
 # Deliberate exception to the semver refusal below: a release that really is
 # meant to carry a documented breaking change under a non-major version.
@@ -65,9 +74,15 @@ RUN_DOCS_CHECK=true
 # check-published-release.sh verifies the published bytes instead, which is
 # both stronger and asynchronous. --watch restores the old behaviour.
 WATCH=false
+# The branch this release is cut from. `main` is the line; a maintenance line
+# (`release/X.Y.x`) cuts a patch that deliberately excludes what landed on main
+# afterwards -- a fix for released users when main is mid-feature.
+RELEASE_BRANCH="main"
 
-for arg in "$@"; do
-    case "$arg" in
+# while/shift rather than `for arg`: --branch takes a value. Both spellings are
+# accepted so neither habit is wrong.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --dry-run) DRY_RUN=true ;;
         --yes|-y)  ASSUME_YES=true ;;
         --resume)  RESUME=true ;;
@@ -76,18 +91,25 @@ for arg in "$@"; do
         --allow-breaking) ALLOW_BREAKING=1 ;;
         --no-docs-check)  RUN_DOCS_CHECK=false ;;
         --watch)          WATCH=true ;;
-        -*)        echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
+        --branch)
+            [[ $# -ge 2 ]] || { echo "ERROR: --branch needs a branch name" >&2; exit 2; }
+            RELEASE_BRANCH="$2"; shift
+            ;;
+        --branch=*) RELEASE_BRANCH="${1#--branch=}" ;;
+        -*)        echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
         *)
             if [[ -n "$VERSION" ]]; then
-                echo "ERROR: version given twice ('$VERSION', '$arg')" >&2; exit 2
+                echo "ERROR: version given twice ('$VERSION', '$1')" >&2; exit 2
             fi
-            VERSION="$arg"
+            VERSION="$1"
             ;;
     esac
+    shift
 done
 
 if [[ -z "$VERSION" ]]; then
-    echo "usage: $0 X.Y.Z [--dry-run] [--yes] [--resume] [--allow-breaking] [--no-docs-check]" >&2
+    echo "usage: $0 X.Y.Z [--branch release-X.Y.Z|release/X.Y.x] [--dry-run] [--yes]" \
+         "[--resume] [--ci-gate] [--force-ci] [--watch] [--allow-breaking] [--no-docs-check]" >&2
     exit 2
 fi
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -96,7 +118,42 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 TAG="v$VERSION"
+# Only a non-default branch belongs in the resume hint the recovery text prints.
+RESUME_HINT=""
+[[ "$RELEASE_BRANCH" == "main" ]] || RESUME_HINT=" --branch $RELEASE_BRANCH"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The branch name must ENCODE the version being cut, so `--branch` cannot become
+# "release from wherever I happen to be". Two shapes, both already in use:
+# `release-X.Y.Z` is the per-release branch RELEASING.md's "Cutting from a tag"
+# section documents (v3.2.1, v3.2.2 and v3.2.3 were all cut this way);
+# `release/X.Y.x` is a longer-lived maintenance line that carries successive
+# patches of one minor.
+if [[ "$RELEASE_BRANCH" != "main" ]]; then
+    if [[ "$RELEASE_BRANCH" =~ ^release-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        [[ "${BASH_REMATCH[1]}" == "$VERSION" ]] \
+            || { echo "ERROR: branch $RELEASE_BRANCH does not name the version being cut ($VERSION)" >&2; exit 2; }
+    elif [[ "$RELEASE_BRANCH" =~ ^release/([0-9]+)\.([0-9]+)\.x$ ]]; then
+        LINE_MAJOR="${BASH_REMATCH[1]}"; LINE_MINOR="${BASH_REMATCH[2]}"
+        IFS=. read -r V_MAJOR V_MINOR V_PATCH <<<"$VERSION"
+        if [[ "$V_MAJOR" != "$LINE_MAJOR" || "$V_MINOR" != "$LINE_MINOR" \
+              || "$V_PATCH" == "0" ]]; then
+            echo "ERROR: $RELEASE_BRANCH may only cut patches of ${LINE_MAJOR}.${LINE_MINOR}" \
+                 "(got $VERSION). A new minor or major comes from main." >&2
+            exit 2
+        fi
+    else
+        echo "ERROR: --branch must be main, release-X.Y.Z or release/X.Y.x (got '$RELEASE_BRANCH')" >&2
+        exit 2
+    fi
+    # NOT OPTIONAL HERE, and this is the one thing that makes a maintenance cut
+    # different in kind: ci.yml triggers on `push: branches: [main]`, so pushing
+    # this branch starts NO run and the gate below would wait 75 minutes for a
+    # run that can never appear. Dispatch is the only way CI ever sees this ref.
+    # (A dispatched run also ignores the [release-cut] marker: that guard reads
+    # github.event.head_commit, which is null on workflow_dispatch.)
+    CI_GATE=true
+fi
 cd "$REPO_ROOT"
 
 say()  { printf '\n=== %s ===\n' "$*"; }
@@ -117,7 +174,8 @@ command -v gh >/dev/null   || die "gh (GitHub CLI) not found"
 gh api user -q .login >/dev/null 2>&1 \
     || die "gh cannot reach the API as the active account (gh auth login)"
 
-[[ "$(git branch --show-current)" == "main" ]] || die "not on branch main"
+[[ "$(git branch --show-current)" == "$RELEASE_BRANCH" ]] \
+    || die "not on branch $RELEASE_BRANCH (use --branch to cut a maintenance line)"
 
 # Working tree must be clean (gitignored files like CLAUDE.md / .claude are fine).
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
@@ -129,7 +187,7 @@ git tag -l "$TAG" | grep -q . && die "tag $TAG already exists locally"
 if git ls-remote --tags origin "$TAG" 2>/dev/null | grep -q .; then
     die "tag $TAG already exists on origin"
 fi
-note "on main, clean tree, $TAG is free, gh authenticated"
+note "on $RELEASE_BRANCH, clean tree, $TAG is free, gh authenticated"
 
 # --------------------------------------------------------------------------
 # wait_for_ci <sha> — poll the CI workflow for <sha> until it completes.
@@ -148,7 +206,24 @@ wait_for_ci() {
                   --json status,conclusion \
                   --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || true)"
         case "$line" in
-            completed:success) note "CI: SUCCESS"; return 0 ;;
+            completed:success)
+                # RUN-LEVEL SUCCESS IS NOT ENOUGH. GitHub reports an all-skipped
+                # run as success, and the `[release-cut]` marker makes exactly
+                # that shape reachable — "tag code no suite ever ran". The
+                # stamp helper already asserts every job succeeded AND that the
+                # full-suite job was among them; use it rather than a weaker
+                # second opinion. On a release branch this is the only gate.
+                if _release_gate_ci_green "$sha"; then note "CI: SUCCESS"; return 0; fi
+                # TWO CAUSES, AND THIS CANNOT TELL THEM APART: the helper is
+                # quiet, returning 1 both when the jobs say no full suite ran
+                # and when their listing could not be read at all. Name both,
+                # and hand over the run so a human can settle it in one click.
+                note "CI reported success, but its jobs do not show a full-suite run"
+                note "(or could not be read). Refusing — check the run:"
+                note "    $(gh run list --commit "$sha" --workflow CI --limit 1 \
+                              --json url --jq '.[0].url' 2>/dev/null \
+                          || echo "gh run list --commit $sha --workflow CI")"
+                return 1 ;;
             completed:*)       note "CI: ${line#completed:}"; return 1 ;;
             *)
                 # One line per 5 min, not per poll: 150 identical
@@ -219,10 +294,11 @@ tag_and_publish() {
     # run kept the poll loop alive. A tag cannot be re-cut, so a Docs failure
     # nobody waited for is a broken docs site with a green release.
     #
-    # CI is not triggered by the TAG -- but it is triggered by the `git push
-    # origin main` this script does two steps earlier, and that push carries the
-    # release commit. So a CI run on this same SHA is expected and the watcher
-    # will see it; it just is not something the tag started.
+    # CI is not triggered by the TAG. On main it IS triggered by the `git push
+    # origin main` this script does two steps earlier, which carries the release
+    # commit, so a CI run on this same SHA is expected and the watcher will see
+    # it -- it just is not something the tag started. On a release branch no
+    # push-triggered run exists at all; the one the gate used was dispatched.
     local expect="Release Docs"
     if ! $WATCH; then
         # HANDING BACK A URL BEATS HOLDING A HUMAN. Watching to completion cost
@@ -261,13 +337,39 @@ tag_and_publish() {
 }
 
 # --------------------------------------------------------------------------
-# --resume: main already carries the release commit + green CI — just tag.
+# --resume: the release branch already carries the release commit + green CI
+# (or, on a non-main branch, a CI run this dispatches) — just tag.
 # --------------------------------------------------------------------------
 if $RESUME; then
     [[ "$(cat VERSION)" == "$VERSION" ]] || die "VERSION is $(cat VERSION), not $VERSION — nothing to resume"
-    [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main 2>/dev/null)" ]] \
-        || die "HEAD != origin/main — push main first"
-    $CI_GATE && { wait_for_ci "$(git rev-parse HEAD)" || die "CI is not green on origin/main HEAD"; }
+    [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$RELEASE_BRANCH" 2>/dev/null)" ]] \
+        || die "HEAD != origin/$RELEASE_BRANCH — push $RELEASE_BRANCH first"
+    if $CI_GATE; then
+        RESUME_SHA="$(git rev-parse HEAD)"
+        # DISPATCH BELONGS TO THE BRANCH, NOT TO THE CODE PATH. A push to a
+        # non-main branch starts no ci.yml run at all, so a resume that only
+        # WAITED would poll for 75 minutes for a run that cannot appear — and
+        # the recovery text below sends you here. Skipped when a green run
+        # already covers this sha, which is the post-timeout resume the 75-min
+        # ceiling exists for: that case must still return in seconds.
+        if [[ "$RELEASE_BRANCH" != "main" ]] && _release_gate_ci_green "$RESUME_SHA"; then
+            # ANSWERED, so do not ask a second, weaker question. wait_for_ci
+            # reads the NEWEST run at the sha whatever its conclusion, while
+            # this helper accepts any completed+success run whose jobs all ran:
+            # with a failed re-run sitting on top of a green one they disagree,
+            # and asking both would print "already covered" and then die "not
+            # green" about the same commit.
+            note "a green CI run already covers $RESUME_SHA — no dispatch needed"
+        else
+            if [[ "$RELEASE_BRANCH" != "main" ]]; then
+                say "Dispatching CI on $RELEASE_BRANCH (a push to it starts no run)"
+                gh workflow run ci.yml --ref "$RELEASE_BRANCH" \
+                    || die "could not dispatch ci.yml (gh auth / workflow name?)"
+                sleep 10   # let the dispatched run register before polling
+            fi
+            wait_for_ci "$RESUME_SHA" || die "CI is not green on origin/$RELEASE_BRANCH HEAD"
+        fi
+    fi
     tag_and_publish "$(git rev-parse HEAD)"
     exit 0
 fi
@@ -287,6 +389,27 @@ grep -q '^## Unreleased' CHANGELOG.md \
 scripts/check-release-semver.sh "$VERSION" \
     ${ALLOW_BREAKING:+--allow-breaking} \
     || die "release content does not match the version being cut"
+
+PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+
+# WHAT THE BRANCH CONTAINS, not just what it is called. The name guard above
+# stops a release branch being pushed onto main; it cannot stop a branch that
+# was cut from main instead of from the tag -- `git checkout -b release-X.Y.Z`
+# one directory up, and every other check still passes while 70-odd commits of
+# mid-feature work ship as a patch. That is the v3.2.3 incident, which the
+# commit range printed below did not prevent (and --yes skips the prompt
+# entirely). A cut-from-tag release is a handful of cherry-picks; anything
+# larger is refused by default and has to say so out loud.
+MAX_BRANCH_COMMITS="${AXL_MAX_BRANCH_COMMITS:-10}"
+[[ "$MAX_BRANCH_COMMITS" =~ ^[0-9]+$ ]] \
+    || die "AXL_MAX_BRANCH_COMMITS must be a number (got '$MAX_BRANCH_COMMITS')"
+if [[ "$RELEASE_BRANCH" != "main" && -n "$PREV_TAG" ]]; then
+    BRANCH_COMMITS="$(git rev-list --count "$PREV_TAG..HEAD")"
+    (( BRANCH_COMMITS <= MAX_BRANCH_COMMITS )) || die \
+"$RELEASE_BRANCH carries $BRANCH_COMMITS commits since $PREV_TAG — that looks
+       like main, not a cut-from-tag release. Check you branched from the TAG.
+       If it really is deliberate:  AXL_MAX_BRANCH_COMMITS=$BRANCH_COMMITS $0 $VERSION --branch $RELEASE_BRANCH"
+fi
 
 # THE DOCS GATE, and it runs BEFORE anything is pushed because it is the one
 # gate that cannot be re-run after the fact: docs.yml fires on every `v*` tag
@@ -308,7 +431,6 @@ else
     note "docs gate SKIPPED (--no-docs-check) — docs.yml still fires on this tag"
 fi
 
-PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
 say "Will release $TAG — commits since ${PREV_TAG:-the beginning}"
 git --no-pager log --oneline "${PREV_TAG:+$PREV_TAG..}HEAD" | sed 's/^/  /'
 
@@ -325,7 +447,7 @@ if ! $ASSUME_YES && ! $DRY_RUN; then
 
            scripts/cut-release.sh ${VERSION} --yes"
     fi
-    printf '\nCut and publish %s? This pushes main and creates a public tag. [y/N] ' "$TAG"
+    printf '\nCut and publish %s? This pushes %s and creates a public tag. [y/N] ' "$TAG" "$RELEASE_BRANCH"
     read -r reply
     [[ "$reply" == "y" || "$reply" == "Y" ]] \
         || die "declined at the prompt. Nothing was pushed and no tag was created."
@@ -356,7 +478,7 @@ make check-version >/dev/null && note "check-version OK"
 if $DRY_RUN; then
     say "DRY RUN — release-metadata diff that WOULD be committed"
     git --no-pager diff -- VERSION include/axl/axl-version.h CHANGELOG.md
-    note "DRY RUN — would: git commit -m 'release: $TAG' (+ [release-cut]) && git push origin main"
+    note "DRY RUN — would: git commit -m 'release: $TAG' (+ [release-cut]) && git push origin $RELEASE_BRANCH"
     note "DRY RUN — would: wait for CI green, then tag + push + watch + confirm"
     restore_metadata
     trap - EXIT INT TERM HUP
@@ -364,7 +486,7 @@ if $DRY_RUN; then
     exit 0
 fi
 
-say "Committing release metadata + pushing main"
+say "Committing release metadata + pushing $RELEASE_BRANCH"
 git add VERSION include/axl/axl-version.h CHANGELOG.md
 # THE MARKER IS WHY CI DOES NOT RUN ON THIS COMMIT.
 #
@@ -386,7 +508,7 @@ cut, and release.yml builds and tests it again on the tag. See RELEASING.md."
 # The bump is committed — there is nothing left to restore, and a later failure
 # (e.g. the push) must NOT roll the working tree back over the commit.
 trap - EXIT INT TERM HUP
-git push origin main
+git push origin "$RELEASE_BRANCH"
 REL_SHA="$(git rev-parse HEAD)"
 note "pushed release commit $REL_SHA"
 
@@ -427,7 +549,7 @@ WARNING: nothing has certified $REL_SHA.
          Tagging anyway, because --ci-gate was not passed.
          To certify it, either:
            ./test/integration/run-integration.sh --no-cache
-           git push          # and let CI go green on main
+           git push          # and let CI go green on $RELEASE_BRANCH
          or re-run this with --ci-gate to dispatch and wait.
 
 EOF
@@ -460,18 +582,19 @@ elif $CI_GATE; then
     note "dispatching CI instead (this is correct, just slower)"
     # CI no longer auto-runs on a push, so trigger it on the release commit and
     # wait for it before tagging.
-    say "Triggering CI on main (--ci-gate)"
-    gh workflow run ci.yml --ref main || die "could not dispatch ci.yml (gh auth / workflow name?)"
+    say "Triggering CI on $RELEASE_BRANCH (--ci-gate)"
+    gh workflow run ci.yml --ref "$RELEASE_BRANCH" \
+        || die "could not dispatch ci.yml (gh auth / workflow name?)"
     sleep 10   # let the dispatched run register before polling
     if ! wait_for_ci "$REL_SHA"; then
         cat >&2 <<EOF
 
 CI did NOT pass on the release commit — NOT tagging (a published tag can't be
 re-cut; see docs/RELEASING.md "Recovery"). The 'release: $TAG' commit is on
-origin/main. To recover:
-  1. fix the failure on main (normal commits) and push;
+origin/$RELEASE_BRANCH. To recover:
+  1. fix the failure on $RELEASE_BRANCH (normal commits) and push;
   2. wait for CI to go green;
-  3. run:  scripts/cut-release.sh $VERSION --resume --ci-gate
+  3. run:  scripts/cut-release.sh $VERSION --resume --ci-gate$RESUME_HINT
 EOF
         exit 1
     fi

@@ -24,6 +24,8 @@
 #   - `mkrd fs0`          -> never clobbers the boot volume
 #   - `mkrd X -a RD`      -> `-a` is gone: "unknown flag -a", no disk created
 #   - `-v`                -> protocol probe; quiet (no [INFO]) without it
+#   - a map name + %path% made BEFORE mkrd survive create+destroy, and create
+#     warns that a later `map -r` replaces the names it set (mkrd runs none)
 # This is the read-only-boot scratch-volume workflow (delldiags).
 #
 # Usage: ./test/integration/test-ramdisk-map-qemu.sh [--arch X64|AARCH64]
@@ -34,7 +36,7 @@ ARCH="X64"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "ERROR: unknown arg '$1'"; exit 2 ;;
     esac
 done
@@ -59,6 +61,8 @@ LOG="$TMP/serial.log"
 cat > "$NSH" <<'EOF'
 @echo -off
 fs0:
+map PRESRV fs0:
+echo MARK_PATH_BEFORE=[%path%]
 echo MARK_NOARGS
 mkrd.efi
 echo MARK_HELP
@@ -122,6 +126,9 @@ echo MARK_LIST2
 mkrd.efi -l
 echo MARK_QDEAD
 map GAMMA:
+echo MARK_PRESERVE
+map PRESRV:
+echo MARK_PATH_AFTER=[%path%]
 echo MARK_DONE
 reset -s
 EOF
@@ -159,16 +166,14 @@ if sect MARK_CREATE MARK_MAP_CREATE | grep -aqE "^  var |%DEMO%"; then
 else
     ok "create emits no %<label>% env var"
 fi
-# The internal `map -r` (axl_map_refresh) must not dump the shell's mapping
-# table during create — mkrd prints its own summary. Only the EXPLICIT `map`
-# after MARK_MAP_CREATE should. On the modern shell EFI_SHELL_PROTOCOL.Execute
-# was already silent (nested shell, off-console), so this is a regression guard;
-# the visible leak was the old shell's in-context SHELL_ENVIRONMENT.Execute,
-# pinned in test-old-shell-qemu.sh. "Mapping table" is the EDK2 `map` header.
+# create runs no `map -r`, so the shell's mapping table cannot appear in its
+# output — only the EXPLICIT `map` after MARK_MAP_CREATE prints one ("Mapping
+# table" is the EDK2 `map` header). Contract, not a detector on this shell: the
+# pre-fix refresh went through a nested, off-console Execute and was silent too.
 if sect MARK_CREATE MARK_MAP_CREATE | grep -aqiF "Mapping table"; then
-    no "internal map -r leaked the mapping table into create output"
+    no "create printed a mapping table — something ran `map -r`"
 else
-    ok "internal map -r stays silent during create (no mapping table)"
+    ok "create prints no mapping table (it runs no map -r)"
 fi
 
 # --- 2. CORE: bare `map` shows the disk as `FS<n>: Alias(s):DEMO:` (no map -r) ---
@@ -271,7 +276,7 @@ if sect MARK_LIST2 MARK_QDEAD | grep -aqF "ALPHA" \
 else
     no "-l after destroy did not drop GAMMA (or lost ALPHA)"
 fi
-sect MARK_QDEAD MARK_DONE | grep -aqF "Cannot find mapped device" \
+sect MARK_QDEAD MARK_PRESERVE | grep -aqF "Cannot find mapped device" \
     && ok "GAMMA: no longer mapped after destroy (alias removed)" \
     || no "GAMMA: still mapped after destroy (dangling alias)"
 
@@ -295,6 +300,45 @@ else
 fi
 sect MARK_VERBOSE MARK_LIST | grep -aqF "PROBE" \
     && ok "-v enables diagnostics (protocol probe shown)" || no "-v did not enable diagnostics"
+
+# --- 12. mkrd NEVER rebuilds the shell's map ---
+# mkrd used to run the shell's `map -r` from inside create/destroy
+# (axl_map_refresh). That is not a local operation: ShellCommandCreateInitial-
+# MappingsAndPaths() empties the WHOLE map list (every user-made name, and each
+# mapping's remembered current directory) and blanks %path%, while `map -r`
+# first calls ProbeForMediaChange() — a dummy ReadBlocks on every physical
+# block device that lets each REPORT a media change, and one that does has its
+# BlockIo re-installed. That is the mechanism matching a field report (an
+# editor's "Read File Failed", truncated small files, a user map name needing a
+# remap); the mechanism is EDK2-sourced, the causation was never isolated on
+# hardware. PRESRV: is mapped by the SCRIPT before any mkrd runs; several
+# creates and a destroy later it must still resolve, and %path% untouched.
+# Both halves: no "cannot find" error AND the name actually listed among fs0's
+# aliases, so a `map PRESRV:` that printed nothing at all cannot pass this.
+if sect MARK_PRESERVE MARK_DONE | grep -aqiF "Cannot find mapped device"; then
+    no "mkrd dropped a pre-existing map name -- it rebuilt the shell's map"
+elif sect MARK_PRESERVE MARK_DONE | grep -aqE "Alias\(s\):.*PRESRV"; then
+    ok "a map name made before mkrd survives create+destroy (no internal map -r)"
+else
+    no "map PRESRV: printed no mapping at all -- the probe did not run"
+fi
+# CONTRACT, not detectors: on a nesting shell the pre-fix build passed these
+# two as well (Execute ran the map rebuild inside a nested image, and
+# axl_map_refresh snapshotted and restored %path% itself). The detector for the
+# real thing is in test-old-shell-qemu.sh, where Execute runs in-context. The
+# [brackets] keep an empty %path% distinguishable from a missing marker.
+path_before=$(grep -a 'MARK_PATH_BEFORE=' "$LOG" | head -1 | sed 's/.*MARK_PATH_BEFORE=//')
+path_after=$(grep -a 'MARK_PATH_AFTER=' "$LOG" | head -1 | sed 's/.*MARK_PATH_AFTER=//')
+if [[ -n "$path_before" && "$path_before" == "$path_after" ]]; then
+    ok "%path% is unchanged across mkrd (it runs no map -r)"
+else
+    no "%path% changed across mkrd: before=$path_before after=$path_after"
+fi
+# The names are mkrd's own SetMap entries, so a later `map -r` reclaims them —
+# create says so rather than leaving it to the docs.
+sect MARK_CREATE MARK_MAP_CREATE | grep -aqF "a later 'map -r'" \
+    && ok "create warns that a later 'map -r' replaces the names" \
+    || no "create does not warn about a later 'map -r'"
 
 echo ""
 if [[ "$fail" -eq 0 ]]; then

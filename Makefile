@@ -1271,7 +1271,7 @@ LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
     check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope \
     check-log-levels check-handle-exclusions check-libc-overlap check-build-mode \
     check-awk-portability check-devkit-conf check-tool-version check-tool-docs \
-    check-asset-names check-tools-sidecars
+    check-asset-names check-tools-sidecars check-no-inner-map-refresh
 
 # Gates that need BUILT IMAGES, and therefore CANNOT be in LINT_GATES.
 #
@@ -1564,7 +1564,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # ===================================================================
 
 .PHONY: print-lint-gates-artifact
-.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-examples check-json-dialect check-log-levels check-log-linkage driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal minimal-log-off minimal-log-on compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test cxx-ctor-test hello-minimal shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest cxx-seam-selftest cxx-json-selftest
+.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-no-inner-map-refresh check-examples check-json-dialect check-log-levels check-log-linkage driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal minimal-log-off minimal-log-on compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test cxx-ctor-test hello-minimal shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest cxx-seam-selftest cxx-json-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1735,6 +1735,17 @@ check-nul:
 # an object was built with, not which HEADERS it depends on.
 check-dep-tracking:
 	@python3 scripts/check-dep-tracking.py
+
+# Verify no RAM-disk code drives the shell's `map -r` (axl_map_refresh). That
+# command lets every physical block device report a media change (re-installing
+# the BlockIo of any that does, under handles other software holds) and rebuilds
+# the shell's whole map list -- the mechanism matching a field report of a
+# corrupted edit and a lost map name, though the causation was never isolated on
+# hardware. A behavioral test cannot catch it on a nesting shell (the default:
+# Execute nests, hiding the map rebuild), so the guard is source-level. See
+# scripts/check-no-inner-map-refresh.py.
+check-no-inner-map-refresh:
+	@python3 scripts/check-no-inner-map-refresh.py
 
 # check-libc-overlap -- libaxl.a and newlib both define some libc names, and
 # two STRONG providers inside axl-cc's --start-group resolve by luck. That luck

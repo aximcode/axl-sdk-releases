@@ -18,7 +18,9 @@ now a thin CLI over it.
 axl_ramdisk_ensure_driver(NULL, 0, NULL);
 void *dp = NULL;
 if (axl_ramdisk_create("SCRATCH", 64, &dp) == AXL_OK) {
-    // ... fsN: now resolves to the new FAT volume ...
+    // The volume exists but has no shell name yet. Give it one
+    // (axl_volume_set_map(dp, "FS9"), what mkrd does), or let the
+    // user run `map -r`. create never refreshes the shell's map.
 }
 ```
 
@@ -86,7 +88,23 @@ Why this works where a plain create doesn't, and its limits:
   scratch, drops the `SetMap`'d names, and the disk re-emerges as a real
   firmware-assigned `fsN` (a different number) + consist name. The one-call
   workflow never runs `map -r`, so it's unaffected — but don't assume the
-  `FS<n>` / `<LABEL>` names survive one.
+  `FS<n>` / `<LABEL>` names survive one. `mkrd` says so when it creates a disk.
+- **Creating a disk never runs `map -r` for you** (it once did, inside
+  `axl_ramdisk_create`). `map -r` is not a local operation: it first calls
+  `ProbeForMediaChange()`, a dummy `ReadBlocks` against every *physical* block
+  device (logical partitions are skipped) that lets each one **report** a media
+  change — and a device that does has its BlockIo re-installed, tearing down the
+  partition/filesystem stack above it. It then rebuilds the shell's whole map
+  list, dropping user-made names, each mapping's current directory and `%path%`.
+  Run from inside a live `startup.nsh`, that can re-enumerate removable / virtual
+  media underneath handles the script and an open editor still hold. So: `mkrd` names the disk
+  with `SetMap` and nothing else; whoever wants the shell's map rebuilt runs
+  `map -r` themselves. `scripts/check-no-inner-map-refresh.py` keeps it that
+  way. (`axl_map_refresh()` remains public API for callers that mean it.)
+- **On the old EFI 1.x shell there is no `SetMap`**, so `mkrd` creates and
+  connects the disk, prints `Run 'map -r' to mount the disk`, and exits 0. The
+  script runs `map -r` when it is ready; the label can then be aliased with the
+  shell's own `map <label> fsN:` at an interactive prompt.
 
 (`axl_volume_set_map` / `axl_volume_map_taken` / `axl_volume_map_alias` /
 `axl_volume_unmap` in `<axl/axl-fs.h>` expose the mapping, the name-in-use
@@ -121,7 +139,9 @@ shape). `AxlRamDiskKind` picks the firmware-recognized type GUID:
 `AXL_RAMDISK_CDROM` (`gEfiVirtualCdGuid`, an El Torito CD-ROM for a
 bootable ISO) or `AXL_RAMDISK_DISK` (`gEfiVirtualDiskGuid`, a raw disk
 image). It connects controllers so the firmware binds its block / FAT /
-ISO9660 drivers and the device enumerates.
+ISO9660 drivers and the device enumerates — scoped to the new device's own
+handle (recursively, so the whole stack below it binds), not a system-wide
+`connect -r`, which would re-bind drivers under unrelated controllers.
 
 ```c
 // Mount an uploaded ISO as a bootable virtual CD-ROM.
