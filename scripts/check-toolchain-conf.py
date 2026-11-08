@@ -128,7 +128,8 @@ def main() -> int:
         )
 
     # X64's URL is a LITERAL; aa64's is built from its VERSION
-    # (install-toolchain.sh: AA64_URL=".../${AXL_AA64_TOOLCHAIN_VERSION}/..."),
+    # (install-toolchain.sh: AA64_PATH=".../${AXL_AA64_TOOLCHAIN_VERSION}/...",
+    # shared by both AA64_URLS),
     # so only this one can name a different version than the manifest declares.
     #
     # WHAT THAT COSTS when it drifts, which is why it is a gate and not a

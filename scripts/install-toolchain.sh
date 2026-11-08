@@ -67,12 +67,18 @@ axl_handle_version "axl-install-toolchain" "$@" && exit 0
 # scalar means the second mktemp overwrites the first -- so the ~96 MB aa64
 # tree survives the run. That was latent while x64 built from source and took
 # no download path at all; it stopped being latent when x64 gained a tarball.
+#
+# Returned in DL_TMP, NOT on stdout. It used to `echo` the path for callers to
+# capture with tmp="$(new_tmpdir_dl)" -- but $(...) is a subshell, so the
+# TMPDIRS_DL+= never reached this shell, cleanup() always saw an empty array,
+# and every download (~96 MB for aa64) stayed in /tmp. 1113 such directories
+# had piled up on one development box before test-toolchain-mirror.sh counted
+# them.
 TMPDIRS_DL=()
+DL_TMP=""
 new_tmpdir_dl() {
-    local d
-    d="$(mktemp -d -t axl-toolchain-XXXXXX)"
-    TMPDIRS_DL+=("$d")
-    echo "$d"
+    DL_TMP="$(mktemp -d -t axl-toolchain-XXXXXX)"
+    TMPDIRS_DL+=("$DL_TMP")
 }
 cleanup() {
     local d
@@ -205,7 +211,18 @@ EOF
 HOST="x86_64"
 AA64_TARGET="aarch64-none-elf"
 AA64_TARBALL="arm-gnu-toolchain-${AXL_AA64_TOOLCHAIN_VERSION}-${HOST}-${AA64_TARGET}.tar.xz"
-AA64_URL="https://developer.arm.com/-/media/Files/downloads/gnu/${AXL_AA64_TOOLCHAIN_VERSION}/binrel/${AA64_TARBALL}"
+# TWO SOURCES, blob store first. developer.arm.com only 302-redirects the
+# tarball to ARM's blob store, so the bytes always come from there. Asking it
+# directly skips a hop an intercepting proxy can break: in October 2026
+# www.arm.com moved to a certificate from the new "GlobalSign GCC E46 OV TLS
+# CA 2025" intermediate, Dell's proxy did not trust it and answered with its
+# own "Certificate Error" page, while the blob host (a Microsoft-issued
+# certificate) was still allowed. developer.arm.com stays as the fallback in
+# case ARM moves its storage. The pinned SHA256 vouches for either.
+AA64_PATH="Files/downloads/gnu/${AXL_AA64_TOOLCHAIN_VERSION}/binrel/${AA64_TARBALL}"
+AA64_URLS=("https://armkeil.blob.core.windows.net/developer/${AA64_PATH}"
+           "https://developer.arm.com/-/media/${AA64_PATH}")
+AA64_URL="${AA64_URLS[0]}"
 # The checksum comes from the manifest alongside the version it belongs to.
 # Kept apart, a version bump changes the URL but not the sha, and the install
 # fails at `sha256sum -c` with a mismatch that names neither cause.
@@ -228,9 +245,22 @@ AA64_URL="https://developer.arm.com/-/media/Files/downloads/gnu/${AXL_AA64_TOOLC
 # packaging/install.sh honours the same variable but its guarantee is WEAKER:
 # it verifies against a SHA256SUMS it fetches over the same connection. Its
 # warning says so.
-INSECURE_CURL=()
+#
+# --http1.1 whenever curl knows it, flag or not. The same intercepting proxies
+# negotiate h2 and then break it: curl dies with "(56) Remote peer returned
+# unexpected data while we expected SETTINGS frame" while HTTP/1.1 to the same
+# URL gets 200 (measured against developer.arm.com from a Dell laptop). That is
+# not a TLS failure, so -k does not get around it, and a single large download
+# gains nothing from h2's multiplexing. Probed, not assumed: curl < 7.33 (EL7
+# ships 7.29) rejects the option, which would fail every download.
+#
+# CURL_OPTS can stay EMPTY (old curl, no flag), and bash < 4.4 under `set -u`
+# calls "${CURL_OPTS[@]}" on an empty array unbound -- so the call sites use
+# the ${CURL_OPTS[@]+...} form.
+CURL_OPTS=()
+if curl --http1.1 --version >/dev/null 2>&1; then CURL_OPTS=(--http1.1); fi
 if [[ "${AXL_INSECURE_FETCH:-0}" == "1" ]]; then
-    INSECURE_CURL=(-k)
+    CURL_OPTS+=(-k)
     echo "[install-toolchain] AXL_INSECURE_FETCH=1 -- TLS verification OFF." >&2
     echo "[install-toolchain]   The tarball is still verified against the SHA256" >&2
     echo "[install-toolchain]   pinned in axl-toolchains.conf, which ships with the" >&2
@@ -243,6 +273,15 @@ fi
 # none at all.
 fetch_hint() {
     echo "" >&2
+    # Already off: -k cannot be the way out, and offering it again sends the
+    # user round in a circle. What is left is a proxy refusing the site itself
+    # (see describe_bad_payload) or no route at all.
+    if [[ "${AXL_INSECURE_FETCH:-0}" == "1" ]]; then
+        echo "[install-toolchain] download failed with TLS verification already OFF" >&2
+        echo "  (AXL_INSECURE_FETCH=1), so a missing CA is not the cause. Read the" >&2
+        echo "  per-source errors above: a proxy refusing the site, or no network." >&2
+        return 0
+    fi
     echo "[install-toolchain] download failed. If this is a TLS/certificate error," >&2
     echo "  the usual cause is a corporate proxy intercepting HTTPS. Two ways out:" >&2
     echo "    1. install your organisation's CA chain (per machine), or" >&2
@@ -284,6 +323,62 @@ EOF
 
 AA64_SHA256="${AXL_AA64_TOOLCHAIN_SHA256:-}"
 
+# fetch_verified <dest> <sha256> <url>... -- download from each URL in turn
+# until one delivers bytes matching <sha256>, and print the URL that did (for
+# the receipt). Progress and every failure go to stderr, each naming its host
+# and what went wrong; returns 1 when no URL delivered.
+fetch_verified() {
+    local dest="$1" sha="$2" url host
+    shift 2
+    for url in "$@"; do
+        host="${url#*://}"; host="${host%%/*}"
+        echo "[install-toolchain]   from $host ..." >&2
+        # A curl that gets an empty 200 may create no file at all, which would
+        # leave the PREVIOUS host's answer here to be judged -- and blamed on
+        # this host.
+        rm -f "$dest"
+        if ! curl ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -fL --progress-bar -o "$dest" "$url" >&2; then
+            echo "[install-toolchain]   $host: download failed (curl's error is above)" >&2
+            continue
+        fi
+        if [[ ! -s "$dest" ]]; then
+            echo "[install-toolchain]   $host returned an empty response, not the tarball" >&2
+            continue
+        fi
+        echo "[install-toolchain]   verifying sha256 ..." >&2
+        if echo "${sha}  $dest" | sha256sum -c --status -; then
+            printf '%s\n' "$url"
+            return 0
+        fi
+        describe_bad_payload "$dest" "$host" "$sha"
+    done
+    rm -f "$dest"
+    return 1
+}
+
+# Say WHAT arrived instead of the tarball. An intercepting proxy that refuses a
+# site answers 200 with its own HTML page, which reads as a bare "checksum did
+# NOT match" -- true, and useless for finding the cause.
+describe_bad_payload() {  # <file> <host> <expected sha256>
+    local file="$1" host="$2" want="$3" got title
+    got="$(sha256sum "$file" | cut -d' ' -f1)"
+    if head -c 2048 "$file" | grep -qiE '<!doctype html|<html'; then
+        # The FIRST <title>: a page can carry more (an inline SVG's). sed -n 1p
+        # reads to EOF, so grep never takes SIGPIPE under pipefail; no match is
+        # grep's exit 1, hence the || -- "untitled" below covers it. -a: one
+        # Latin-1 byte makes the page "binary" to GNU grep in a UTF-8 locale.
+        title="$(head -c 8192 "$file" | tr '\r\n' '  ' \
+                 | grep -aoiE '<title[^>]*>[^<]*' \
+                 | sed -n '1{s/^<[^>]*>//; s/^ *//; s/ *$//; p;}')" || title=""
+        echo "[install-toolchain]   $host returned a web page" \
+             "(\"${title:-untitled}\", $(wc -c < "$file") bytes), not the tarball." >&2
+        echo "[install-toolchain]   An intercepting proxy refusing the site is the" \
+             "usual cause; open the URL in a browser to read its reason." >&2
+    else
+        echo "[install-toolchain]   $host: sha256 mismatch (got $got, want $want)" >&2
+    fi
+}
+
 install_aa64() {
     local dir gxx
     dir="$(relocated_dir "$AXL_AA64_TOOLCHAIN_DIR")"
@@ -304,8 +399,12 @@ install_aa64() {
             # is the path the upgrade notes tell people to run, and a remedy
             # that quietly does nothing is the bug it exists to fix (a
             # read-only /opt is the case that found this).
+            # Keep the SOURCE an earlier install recorded: with two URLs, the
+            # first in the list is not necessarily the one that delivered.
+            local src
+            src="$(sed -n 's/^AXL_RECEIPT_SOURCE=//p' "$dir/.axl-receipt" 2>/dev/null)" || src=""
             write_receipt "$dir" aa64 "$AXL_AA64_TOOLCHAIN_VERSION" \
-                          "$AA64_URL" "$AA64_SHA256" \
+                          "${src:-$AA64_URL}" "$AA64_SHA256" \
                 || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
             return 0
         fi
@@ -323,14 +422,13 @@ install_aa64() {
     fi
 
     local tmp
-    tmp="$(new_tmpdir_dl)"
+    new_tmpdir_dl
+    tmp="$DL_TMP"
 
     echo "[install-toolchain] downloading $AA64_TARBALL (~96 MB) ..."
-    curl "${INSECURE_CURL[@]}" -fL --progress-bar -o "$tmp/$AA64_TARBALL" "$AA64_URL" \
+    local src
+    src="$(fetch_verified "$tmp/$AA64_TARBALL" "$AA64_SHA256" "${AA64_URLS[@]}")" \
         || { fetch_hint "$@"; return 1; }
-
-    echo "[install-toolchain] verifying sha256 ..."
-    echo "${AA64_SHA256}  $tmp/$AA64_TARBALL" | sha256sum -c -
 
     echo "[install-toolchain] extracting to $INSTALL_ROOT/ ..."
     as_root_for "$INSTALL_ROOT" mkdir -p "$INSTALL_ROOT" || return 1
@@ -341,7 +439,7 @@ install_aa64() {
         return 1
     fi
     echo "[install-toolchain] installed: $gxx"
-    write_receipt "$dir" aa64 "$AXL_AA64_TOOLCHAIN_VERSION" "$AA64_URL" "$AA64_SHA256" \
+    write_receipt "$dir" aa64 "$AXL_AA64_TOOLCHAIN_VERSION" "$src" "$AA64_SHA256" \
         || echo "[install-toolchain] WARNING: no receipt written; axl prune will not remove this root" >&2
     "$gxx" --version | head -1 | sed 's/^/                    /'
     print_env aa64 "$dir" "$AXL_AA64_TOOLCHAIN_DIR" \
@@ -375,11 +473,12 @@ install_x64() {
     local sha="${AXL_X64_TOOLCHAIN_SHA256:-}"
     if [[ -n "$url" && -n "$sha" && "$sha" != "PENDING_UPLOAD" ]]; then
         local tmp
-        tmp="$(new_tmpdir_dl)"
+        new_tmpdir_dl
+        tmp="$DL_TMP"
         local tarball="${url##*/}"
 
         echo "[install-toolchain] downloading $tarball (~55 MB) ..."
-        if curl "${INSECURE_CURL[@]}" -fL --progress-bar -o "$tmp/$tarball" "$url"; then
+        if curl ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -fL --progress-bar -o "$tmp/$tarball" "$url"; then
             echo "[install-toolchain] verifying sha256 ..."
             if echo "${sha}  $tmp/$tarball" | sha256sum -c -; then
                 echo "[install-toolchain] extracting to /opt/ ..."

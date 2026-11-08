@@ -16,8 +16,8 @@
 # inconsistency until the next bump. Found by a prune test that created the
 # inconsistency by hand; the degradation path is real and expensive.
 #
-# aa64 never had this shape: AA64_URL is BUILT from AXL_AA64_TOOLCHAIN_VERSION,
-# so the two cannot disagree. Only the x64 URL is a literal, which is why the
+# aa64 never had this shape: both AA64_URLS are BUILT from
+# AXL_AA64_TOOLCHAIN_VERSION, so they cannot disagree with it. Only the x64 URL is a literal, which is why the
 # gate and this test are x64-specific.
 #
 # The script is staged into a private tree with its own conf -- the same move

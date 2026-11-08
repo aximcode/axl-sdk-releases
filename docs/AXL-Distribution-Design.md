@@ -1093,7 +1093,8 @@ dropping the label would leave no name for an aarch64-Linux build.
 The cross toolchain ships as its own release — tag
 `toolchain-x86_64-elf-<ver>`, one 55.5 MB `x86_64-elf-gcc-<ver>.tar.xz` — and
 the AArch64 one is not ours at all: `install-toolchain.sh` fetches it from
-`developer.arm.com`. Three reasons that stays true:
+ARM (its blob store first, then `developer.arm.com`). Three reasons that stays
+true:
 
 - **Cadence.** 18 SDK releases against 4 toolchain releases. Bundling
   republishes 55 MB on every patch release for a payload that changed 4 times.
@@ -1106,8 +1107,15 @@ it is a GCC build rather than an AXL artifact, and it sits on its own tag so it
 never competes for sort order with the SDK assets.
 
 **One external single point of failure is worth naming**: the AArch64
-toolchain URL is ARM's. The pinned SHA256 protects integrity, not
-availability — if ARM reorganises that path, `axl-install-toolchain aa64`
+toolchain comes from ARM. The pinned SHA256 protects integrity, not
+availability. `install-toolchain.sh` tries two ARM URLs in turn and accepts
+the first whose bytes match: `armkeil.blob.core.windows.net`, where
+`developer.arm.com` 302-redirects anyway, and then `developer.arm.com` itself.
+Fetching from the blob store directly skips a hop an intercepting proxy can
+break. In October 2026 `www.arm.com` moved to a certificate from a new
+GlobalSign intermediate that Dell's proxy did not trust, so the proxy returned
+its own "Certificate Error" page for `developer.arm.com` while still allowing
+the blob host. If ARM reorganises both paths, `axl-install-toolchain aa64`
 breaks and nothing on our side fixes it short of re-hosting.
 
 ### 14.1c Two of three tarballs are tarbombs

@@ -3,6 +3,43 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.7.4 — 2026-11-07
+
+### Fixed
+
+- **`axl-install-toolchain aa64` failed behind a proxy that refuses
+  developer.arm.com.** In October 2026 `www.arm.com` moved to a certificate
+  from the new "GlobalSign GCC E46 OV TLS CA 2025" intermediate. Dell's
+  intercepting proxy did not trust it and returned its own "Certificate
+  Error" page in place of the tarball. Over HTTP/2 that broke curl
+  (`(56) Remote peer returned unexpected data while we expected SETTINGS
+  frame`); over HTTP/1.1 it failed the SHA256 check. `developer.arm.com`
+  only 302-redirects to ARM's blob store, which the proxy still allowed.
+  - The tarball is now fetched from `armkeil.blob.core.windows.net` first,
+    with `developer.arm.com` as the fallback. Whichever answers must match
+    the pinned SHA256, and the receipt records the URL that delivered.
+  - A web page that arrives in place of the tarball is reported as one,
+    with its title, rather than as a bare checksum mismatch.
+  - With `AXL_INSECURE_FETCH=1` already set, the failure hint no longer
+    offers that flag again.
+  - `install.sh` and `axl-install-toolchain` send every download as
+    `--http1.1` when the host's curl accepts that option (7.33+), so a
+    proxy's page arrives as content the installer can name rather than as
+    broken h2 framing. An older curl, such as EL7's 7.29, downloads as
+    before.
+- **`axl-install-toolchain` left every downloaded tarball in `/tmp`.**
+  `new_tmpdir_dl` returned its directory through `$(...)`, a subshell, so the
+  cleanup list never saw it and the EXIT trap removed nothing: about 96 MB
+  per aa64 install, and 55 MB per x64 install. The directory now comes back
+  in a variable, and the trap removes it.
+- **`install.sh`'s remedy for a failed toolchain step named an `axl` that
+  might not run.** It printed `axl toolchain install <arch>` even when its
+  own bin dir was off `PATH` or sat behind an older `axl`, such as the
+  `/usr/bin/axl` a `.deb` install leaves. Running the hint then gave
+  `axl: unknown command 'toolchain'`. The `Finish it with:` and `Skip it next
+  time with:` lines now print the full path to this install's `axl` unless
+  the bare name already resolves to it.
+
 ## 4.7.3 — 2026-09-17
 
 ### Added

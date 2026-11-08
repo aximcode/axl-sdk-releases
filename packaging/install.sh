@@ -48,7 +48,19 @@ BASE="https://github.com/${REPO}/releases"
 # pinned the hashes out-of-band -- which the flagship consumer does. But it is
 # not "the hash is the trust anchor", and main() says so out loud when the flag
 # is on rather than letting the weaker guarantee read as the stronger one.
-INSECURE=""
+#
+# --http1.1 whenever curl knows it: intercepting proxies that negotiate h2 and
+# then break it fail curl with "(56) ... expected SETTINGS frame" while
+# HTTP/1.1 works. Not a TLS failure, so the flag above is no way around it.
+# Probed, because curl < 7.33 (EL7's 7.29) rejects the option and would fail
+# every download. Same rule, same reason, as scripts/install-toolchain.sh.
+CURL_OPTS=""
+if curl --http1.1 --version >/dev/null 2>&1; then CURL_OPTS="--http1.1"; fi
+# Every download goes through here, so no call site can drop the options.
+fetch() {
+    # shellcheck disable=SC2086  # CURL_OPTS is a word list we build: split it
+    curl $CURL_OPTS "$@"
+}
 
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
@@ -215,7 +227,7 @@ resolve_version() {
         return 0
     fi
     _vurl="${BASE_URL:-$BASE/latest/download}/VERSION"
-    VERSION="$(curl $INSECURE -fsSL "$_vurl" 2>/dev/null | tr -d ' \t\r\n')" \
+    VERSION="$(fetch -fsSL "$_vurl" 2>/dev/null | tr -d ' \t\r\n')" \
         || die "could not resolve the latest version from $_vurl"
     [ -n "$VERSION" ] || die "the VERSION asset at $_vurl was empty"
     validate_version "$VERSION"
@@ -291,7 +303,7 @@ fetch_and_verify() {
     # download 404s -- a 404 and an unreachable mirror are the same failed
     # curl. It also stops 13 MB being spent before we learn there is nothing
     # to check it against.
-    curl $INSECURE -fsSL -o "$WORK/SHA256SUMS" "$DL/SHA256SUMS" \
+    fetch -fsSL -o "$WORK/SHA256SUMS" "$DL/SHA256SUMS" \
         || die "could not download $DL/SHA256SUMS"
 
     ASSET=""; _tried=""
@@ -301,7 +313,7 @@ fetch_and_verify() {
     done
     [ -n "$ASSET" ] || die "release $VERSION publishes none of:$_tried"
 
-    curl $INSECURE -fsSL -o "$WORK/$ASSET" "$DL/$ASSET" || die "could not download $DL/$ASSET"
+    fetch -fsSL -o "$WORK/$ASSET" "$DL/$ASSET" || die "could not download $DL/$ASSET"
     sums_line "$WORK/SHA256SUMS" "$ASSET" > "$WORK/want.sha256"
     ( cd "$WORK" && sha256sum -c want.sha256 >/dev/null 2>&1 ) \
         || die "SHA256 mismatch for $ASSET -- refusing to install"
@@ -632,6 +644,30 @@ maybe_prune() {
     fi
 }
 
+# How a remedy line should spell THIS install's axl. The bare name is right
+# only when it resolves to $BIN_DIR/axl. With the bin dir off PATH, or behind an
+# older axl (the /usr/bin/axl a .deb install leaves), `axl toolchain install`
+# ran that other one and failed with "unknown command 'toolchain'" -- right
+# after the warnings that predicted it. The path is made absolute because the
+# user runs the hint from wherever they are, not from the install's directory.
+own_axl() {
+    case "$BIN_DIR" in
+        /*) _bd="$BIN_DIR" ;;
+        *)  _bd="$PWD/$BIN_DIR" ;;
+    esac
+    while :; do
+        case "$_bd" in
+            ?*/) _bd="${_bd%/}" ;;
+            *)   break ;;
+        esac
+    done
+    if [ "$(command -v axl 2>/dev/null)" = "$_bd/axl" ]; then
+        printf 'axl'
+    else
+        printf '%s/axl' "$_bd"
+    fi
+}
+
 check_path() {
     case ":$PATH:" in
         *":$BIN_DIR:"*) return 0 ;;
@@ -655,7 +691,7 @@ main() {
     parse_args "$@"
 
     if [ "${AXL_INSECURE_FETCH:-0}" = "1" ]; then
-        INSECURE="-k"
+        CURL_OPTS="$CURL_OPTS -k"
         # Said out loud, every time. The doctrine this tree already follows for
         # log levels and the semver guard: make the exceptional case announce
         # itself, so nobody discovers later that a build was fetching without
@@ -707,7 +743,7 @@ main() {
     check_path
 
     printf '\n  %s %s installed.\n' "$LABEL" "$VERSION"
-    printf '    axl --help                 host commands\n'
+    printf '    %-26s host commands\n' "$(own_axl) --help"
     printf '    axl-cc hello.c -o hello.efi\n'
     printf '    sh install.sh --uninstall  remove it again\n'
 
@@ -721,12 +757,13 @@ main() {
         printf '\n  BUT the %s cross toolchain did NOT update.\n' "$TOOLCHAIN"
         printf '    The SDK above is installed and usable; axl-cc will build\n'
         printf '    with whatever toolchain is already on this machine.\n'
-        printf '    Finish it with:  axl toolchain install %s\n' "$TOOLCHAIN"
+        _axl="$(own_axl)"
+        printf '    Finish it with:  %s toolchain install %s\n' "$_axl" "$TOOLCHAIN"
         # BOTH CALLERS AGAIN: `axl update --no-toolchain` is the answer for the
         # verb, and omitting --toolchain is the answer for a direct run. Naming
         # only the first told a first-time install.sh user to type a flag on a
         # command they had not run.
-        printf '    Skip it next time with:  axl update --no-toolchain\n'
+        printf '    Skip it next time with:  %s update --no-toolchain\n' "$_axl"
         printf '      (or, running install.sh directly, omit --toolchain)\n'
         return 1
     fi

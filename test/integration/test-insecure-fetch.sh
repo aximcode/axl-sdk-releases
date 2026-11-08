@@ -25,6 +25,14 @@
 # So install.sh must SAY so when the flag is on. Silence there would let the
 # weaker of the two guarantees be read as the stronger one.
 #
+# Every fetch goes out as --http1.1 where curl accepts it. A proxy that answers
+# with its own page in place of the file broke h2 framing on a Dell laptop
+# ("(56) ... expected SETTINGS frame", developer.arm.com, 2026-11); HTTP/1.1
+# delivers that page instead, which the installers can name (see
+# test-toolchain-mirror.sh). And when the toolchain step fails anyway, the
+# remedy install.sh prints must name an `axl` that will actually run -- not a
+# bare name an old /usr/bin/axl shadows.
+#
 # Driven through a STUB curl that records its argv: no network, no real fetch.
 #
 # Usage: ./test/integration/test-insecure-fetch.sh
@@ -44,6 +52,8 @@ check() { if [[ "$1" -eq 0 ]]; then test_host_pass "$2"; else test_host_fail "$2
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/curl" <<STUB
 #!/bin/bash
+# --version is the installers' capability probe, not a fetch: answer, unlogged.
+for a in "\$@"; do [[ "\$a" == --version ]] && { echo "curl 8.5.0 (stub)"; exit 0; }; done
 printf '%s\n' "\$*" >> "$WORK/curl.argv"
 out=""; url=""
 while [[ \$# -gt 0 ]]; do
@@ -71,6 +81,9 @@ REL="$WORK/rel"; mkdir -p "$REL"
 V=9.9.9
 mkdir -p "$WORK/t/axl-sdk-$V/bin" "$WORK/t/axl-sdk-$V/share/axl" "$WORK/t/axl-sdk-$V/libexec/axl"
 printf '#!/bin/sh\necho axl\n' > "$WORK/t/axl-sdk-$V/bin/axl"; chmod +x "$WORK/t/axl-sdk-$V/bin/axl"
+# A toolchain installer that always fails, for the remedy-hint checks below.
+printf '#!/bin/sh\nexit 1\n' > "$WORK/t/axl-sdk-$V/bin/axl-install-toolchain"
+chmod +x "$WORK/t/axl-sdk-$V/bin/axl-install-toolchain"
 echo "$V" > "$WORK/t/axl-sdk-$V/share/axl/version"
 install -m 0644 "$PROJECT_DIR/packaging/install.sh" "$WORK/t/axl-sdk-$V/libexec/axl/install.sh"
 tar czf "$REL/axl-sdk-linux-$V-x86_64.tar.gz" -C "$WORK/t" "axl-sdk-$V"
@@ -85,11 +98,12 @@ run_install() {  # run_install <log> <env...>
     # every assertion about curl's arguments pass or fail for the wrong reason
     # -- it did, twice, while this test was being written.
     rm -rf "$WORK/p" "$WORK/b"
-    env "$@" PATH="$WORK/bin:$PATH" HOME="$WORK/home" \
+    env PATH="$WORK/bin:$PATH" "$@" HOME="$WORK/home" \
         sh "$PROJECT_DIR/packaging/install.sh" --yes --version "$V" \
         --base-url "file://$REL" --prefix "$WORK/p" --bin-dir "$WORK/b" \
-        > "$log" 2>&1
+        ${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"} > "$log" 2>&1
 }
+INSTALL_ARGS=()
 
 run_install "$WORK/off.log"
 ! grep -qE '(^| )-k( |$)' "$WORK/curl.argv" 2>/dev/null
@@ -106,6 +120,57 @@ check $? "install.sh warns that SHA256SUMS shares the channel"
 ! grep -qi 'AXL_INSECURE_FETCH' "$WORK/off.log"
 check $? "...and says nothing about it when the flag is off"
 
+# Every install.sh fetch goes out as HTTP/1.1, flag or not.
+[[ -s "$WORK/curl.argv" ]] && ! grep -vqE '(^| )--http1\.1( |$)' "$WORK/curl.argv"
+check $? "install.sh: every curl call carries --http1.1"
+
+# The remedy for a failed toolchain step must name an axl that RUNS. Here the
+# bin dir is off PATH and an older axl sits on it (the leftover /usr/bin/axl
+# of a .deb install): the bare name ran that one and said "unknown command
+# 'toolchain'".
+mkdir -p "$WORK/old"
+printf '#!/bin/sh\necho "axl: unknown command"; exit 2\n' > "$WORK/old/axl"; chmod +x "$WORK/old/axl"
+INSTALL_ARGS=(--toolchain aa64)
+run_install "$WORK/hint-shadow.log" PATH="$WORK/bin:$WORK/old:$PATH"
+grep -qF "Finish it with:  $WORK/b/axl toolchain install aa64" "$WORK/hint-shadow.log"
+check $? "bin dir off PATH, another axl on it: the remedy names $WORK/b/axl"
+grep -qF "Skip it next time with:  $WORK/b/axl update --no-toolchain" "$WORK/hint-shadow.log"
+check $? "...and so does the skip hint"
+# CONTROL: with the bin dir first on PATH the bare name is right, and a full
+# path would only be noise.
+run_install "$WORK/hint-path.log" PATH="$WORK/b:$WORK/bin:$WORK/old:$PATH"
+grep -qF "Finish it with:  axl toolchain install aa64" "$WORK/hint-path.log"
+check $? "control: bin dir first on PATH: the remedy says plain 'axl'"
+# A relative --bin-dir is printed absolute: the user runs the hint from
+# wherever they are, not from the directory the install ran in.
+INSTALL_ARGS=(--toolchain aa64 --bin-dir relbin)
+( cd "$WORK" && run_install "$WORK/hint-rel.log" PATH="$WORK/bin:$WORK/old:$PATH" )
+grep -qF "Finish it with:  $WORK/relbin/axl toolchain install aa64" "$WORK/hint-rel.log"
+check $? "relative --bin-dir: the remedy names the absolute $WORK/relbin/axl"
+rm -rf "$WORK/relbin"
+INSTALL_ARGS=()
+
+# A curl too old for --http1.1 (EL7's 7.29 rejects unknown options) must
+# still download: the flag is added only where curl accepts it.
+mkdir -p "$WORK/oldcurl"
+cat > "$WORK/oldcurl/curl" <<STUB
+#!/bin/bash
+for a in "\$@"; do
+    [[ "\$a" == --http1.1 ]] && { echo "curl: option --http1.1: is unknown" >&2; exit 2; }
+done
+exec "$WORK/bin/curl" "\$@"
+STUB
+chmod +x "$WORK/oldcurl/curl"
+run_install "$WORK/oldcurl.log" PATH="$WORK/oldcurl:$WORK/bin:$PATH"
+rc=$?
+[[ "$rc" -eq 0 && -s "$WORK/curl.argv" ]] && ! grep -qF -- '--http1.1' "$WORK/curl.argv"
+check $? "curl without --http1.1: install.sh still installs, without the flag (rc=$rc)"
+rm -f "$WORK/curl.argv"
+PATH="$WORK/oldcurl:$WORK/bin:$PATH" timeout 60 "$PROJECT_DIR/scripts/install-toolchain.sh" \
+    aa64 --prefix "$WORK/tcp" > "$WORK/tc-old.log" 2>&1
+[[ -s "$WORK/curl.argv" ]] && ! grep -qF -- '--http1.1' "$WORK/curl.argv"
+check $? "curl without --http1.1: install-toolchain.sh still reaches the download"
+
 # The hash still bites with the flag ON. If it did not, the flag would be a
 # blanket disable rather than a change of trust anchor.
 printf 'x' >> "$REL/axl-sdk-linux-$V-x86_64.tar.gz"
@@ -120,6 +185,15 @@ check $? "a corrupted asset is still refused with the flag ON (rc=$rc)"
 # ---------------------------------------------------------------------------
 grep -q 'AXL_INSECURE_FETCH' "$PROJECT_DIR/scripts/install-toolchain.sh"
 check $? "install-toolchain.sh honours the flag"
+
+# Its download goes out as HTTP/1.1 too -- this is the fetch that failed. An
+# empty --prefix makes it fetch; the stub has no tarball, so it fails after
+# recording argv, before anything needs sudo.
+rm -f "$WORK/curl.argv"
+PATH="$WORK/bin:$PATH" timeout 60 "$PROJECT_DIR/scripts/install-toolchain.sh" \
+    aa64 --prefix "$WORK/tcp" > "$WORK/tc-h1.log" 2>&1
+[[ -s "$WORK/curl.argv" ]] && ! grep -vqE '(^| )--http1\.1( |$)' "$WORK/curl.argv"
+check $? "install-toolchain.sh: the toolchain download carries --http1.1"
 
 grep -q 'AXL_INSECURE_FETCH' "$PROJECT_DIR/scripts/axl-toolchains.conf" 2>/dev/null || true
 grep -qE 'AXL_(AA64|X64)_TOOLCHAIN_SHA256=' "$PROJECT_DIR/scripts/axl-toolchains.conf"
