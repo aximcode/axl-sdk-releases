@@ -3,6 +3,22 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 4.7.5 — 2026-11-09
+
+### Fixed
+
+- **`axl_unsetenv` of a variable that is not set printed "set: NAME not
+  found" on the EFI 1.x shell, and failed on the UEFI shell.** The old shell
+  has no programmatic SetEnv, so AXL deletes through the shell's own
+  `set -d NAME`, which complains about a missing name into the caller's
+  output. A script clearing a variable that may be unset (`do lookfor=` in a
+  Dell `fd.nsh`) showed the message on every run. On the UEFI shell, EDK2's
+  `SetEnv(name, "")` returns `EFI_NOT_FOUND` for a missing name, so
+  `axl_unsetenv` returned `AXL_ERR`.
+  - Deleting a variable that is not set now returns `AXL_OK` and prints
+    nothing, on both shells, as POSIX `unsetenv` does.
+  - An empty name is `AXL_ERR` on both.
+
 ## 4.7.4 — 2026-11-07
 
 ### Fixed

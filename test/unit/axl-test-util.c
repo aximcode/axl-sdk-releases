@@ -1495,6 +1495,11 @@ test_env(void)
     val = axl_getenv("AXL_TEST_VAR");
     test_check(val == NULL, "env: unset var is gone");
     axl_free(val);
+    /* Unsetting a var that is not set succeeds, as POSIX unsetenv does: the
+       shell's SetEnv deletes a missing var with EFI_NOT_FOUND. */
+    test_check(axl_unsetenv("AXL_TEST_VAR") == AXL_OK,
+               "env: unsetenv of an unset var returns 0");
+    test_check(axl_unsetenv("") == AXL_ERR, "env: unsetenv of an empty name fails");
 
     /* axl_diag_startup reads AXL_DIAG through axl_getenv, whose result is
        OWNED. It used to drop that string on both the gated-off early return

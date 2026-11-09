@@ -1576,7 +1576,7 @@ axl_backend_shell_setenv(
     EFI_SHELL_PROTOCOL  *shell;
     EFI_STATUS           status;
 
-    if (name == NULL) {
+    if (name == NULL || name[0] == 0) {
         return AXL_ERR;
     }
 
@@ -1585,6 +1585,14 @@ axl_backend_shell_setenv(
         /* Old EFI 1.x shell: no SetEnv member — drive the shell's own `set`
            command through Execute (the mkrd `map -r` pattern). */
         return axl_efi1x_setenv(name, value, volatile_var);
+    }
+
+    /* An empty value deletes. EDK2's SetEnv returns EFI_NOT_FOUND for a var
+       that is not set (its own header says "no action"); deleting what is not
+       there succeeds, as POSIX unsetenv and the old-shell path do. */
+    if ((value == NULL || value[0] == 0) &&
+        shell->GetEnv((CONST CHAR16 *)name) == NULL) {
+        return AXL_OK;
     }
 
     status = shell->SetEnv((CONST CHAR16 *)name, (CONST CHAR16 *)value,

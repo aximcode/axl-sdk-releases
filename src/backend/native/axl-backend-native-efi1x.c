@@ -201,6 +201,14 @@ axl_efi1x_setenv(
        ""`, which would leave an empty var behind. */
     bool remove = (value == NULL || value[0] == 0);
 
+    /* Deleting a var that is not set succeeds silently, as on the modern
+       shell (axl_backend_shell_setenv): the old shell's `set -d` would print
+       "set: NAME not found" into the caller's output (a script clearing a
+       maybe-unset var). */
+    if (remove && axl_efi1x_getenv(name) == NULL) {
+        return AXL_OK;
+    }
+
     CHAR16 cmd[AXL_EFI1X_CMD_MAX];
     size_t len = 0;
 

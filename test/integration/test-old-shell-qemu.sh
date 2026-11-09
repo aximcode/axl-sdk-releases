@@ -511,6 +511,16 @@ if echo "$FSREAD_LOG" | grep -q '^FSREAD:drv-unset=gone$'; then
 else
     test_host_fail "resident driver unsetenv deletes the var (set -d)"
 fi
+# Unsetting a var that is not set prints nothing (the old shell's `set -d`
+# says "set: NAME not found") and succeeds, for the app and the driver alike.
+for ctx in app drv; do
+    if [[ "$(echo "$FSREAD_LOG" | tr -d '\r' | awk -v b="FSREAD:$ctx-unset-absent-begin" '
+            $0 == b { getline; print; exit }')" == "FSREAD:$ctx-unset-absent=OK" ]]; then
+        test_host_pass "$ctx unsetenv of an unset var is silent and OK"
+    else
+        test_host_fail "$ctx unsetenv of an unset var is silent and OK"
+    fi
+done
 # 3. The var the driver set is visible to the SHELL afterward (persisted past
 #    the launcher's exit) — the whole point of `do -f<file> var`.
 if echo "$FSREAD_LOG" | grep -qE '^\* +FSRVAR_drv : HELLO_LINE one two'; then

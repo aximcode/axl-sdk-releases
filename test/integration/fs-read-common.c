@@ -71,6 +71,13 @@ fsread_report(
         char *gone = axl_getenv(tmp);
         axl_printf("FSREAD:%s-unset=%s\n", tag, gone == NULL ? "gone" : "STAY");
         axl_free(gone);
+        /* Unsetting a var that is NOT set succeeds silently (axl-test-util
+           covers the modern shell): the old shell's `set -d` prints "set:
+           <name> not found", so nothing may appear between the begin marker
+           and the result. */
+        axl_printf("FSREAD:%s-unset-absent-begin\n", tag);
+        int ua = axl_unsetenv(tmp);
+        axl_printf("FSREAD:%s-unset-absent=%s\n", tag, ua == AXL_OK ? "OK" : "ERR");
         axl_free(line);
     }
     axl_fclose(txt);   /* wrapper: frees its ctx, does NOT close raw */
