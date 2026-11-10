@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=20 local-only=0
+# test-meta: arch=x64 needs= est=20 local-only=0 guest=mac_replay
 # test-mac-replay-qemu.sh — HF4: end-to-end NIC MAC replay.
 #
 # Proves the full chain: a fixture net.json carrying a distinctive
@@ -30,7 +30,7 @@ fail() { echo "FAIL: $1"; [[ -n "${2:-}" ]] && echo "  $2"; FAIL=$((FAIL + 1)); 
 
 if [[ ! -x "$NETINFO" ]]; then
     echo "Building tools..."
-    make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -3
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -3
 fi
 [[ -x "$NETINFO" ]] || { echo "FAIL: netinfo.efi not found at $NETINFO"; exit 1; }
 

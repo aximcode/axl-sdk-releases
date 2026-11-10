@@ -13,11 +13,17 @@ than 100 bytes use the ustar name/prefix split (up to ~255 bytes), and a
 name that can't be split is rejected rather than truncated. The reader
 (``axl_tar_reader_new`` → ``axl_tar_reader_next`` → ``axl_tar_reader_read``)
 validates each header checksum and streams entry data, stopping at the
-end-of-archive marker.
+end-of-archive marker. It also reads the long names other tars write --
+a GNU ``L`` record (GNU tar's default format) or a pax ``x`` ``path``
+(bsdtar, ``--format=posix``), with a pax ``size`` overriding the header's
+-- and never cuts one: a name it cannot report whole sets
+``AxlTarEntry.name_refused`` so the caller skips that member. A pax
+global header is reported as ``AXL_TAR_TYPE_GLOBAL``; links keep their
+raw typeflag.
 
 It backs the ``tar`` host tool and mkfixture's HTTP write target (which
-builds a fixture tarball in memory and POSTs it). GNU/PAX long-name and
-sparse extensions are out of scope.
+builds a fixture tarball in memory and POSTs it). The writer emits ustar
+only, and sparse files are out of scope.
 
 Header: ``<axl/axl-tar.h>``
 

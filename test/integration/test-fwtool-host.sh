@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=8 local-only=0
+# test-meta: arch=both needs= est=8 local-only=0 builds=ARCH=x64,fwtool-host
 # test-fwtool-host.sh — golden byte-match: the HOST fwtool (HOSTCC build of
 # the SAME backend-free parser + LZMA sources as fwtool.efi) must extract the
 # UEFI Shell from real OVMF/AAVMF firmware BYTE-FOR-BYTE identically to the
@@ -32,7 +32,7 @@ SHELL_GUID="7C04A583-9E3E-4F1C-AD65-E05268D0B4D1"
 PY_EXTRACT="$PROJECT_DIR/scripts/extract-fv-shell.py"
 
 # The host fwtool lives under the X64 build dir (the binary is arch-neutral —
-# it parses bytes, not the running arch). Build it via the Makefile so the
+# it parses bytes, not the running arch). Build it via axl-build.sh so the
 # exact host build recipe under test is the one CI uses.
 FWTOOL_HOST="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/build/fwtool-host"
 
@@ -43,7 +43,7 @@ log_info() { printf '%s\n' "$*"; }
 
 # --- Build the host tool ---------------------------------------------------
 log_info "==> building host fwtool"
-make -C "$PROJECT_DIR" ARCH=x64 fwtool-host >/dev/null
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 fwtool-host >/dev/null
 [[ -x "$FWTOOL_HOST" ]] || { echo "FAIL: host fwtool not built at $FWTOOL_HOST"; exit 1; }
 
 # --- Locate firmware -------------------------------------------------------

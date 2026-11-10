@@ -25,8 +25,8 @@
 
 AXL_LOG_DOMAIN("fbcon");
 
-/* The resident take-over driver, embedded at build time (EMBED_BLOB in the Makefile
-   emits axl_embedded_fbcon_drv{,_end}). */
+/* The resident take-over driver, embedded at build time (the build's
+   axl_embed_blob emits axl_embedded_fbcon_drv{,_end}). */
 AXL_EMBED_DECLARE(fbcon_drv);
 
 /* UnloadImage every resident fbcon driver (those carrying the presence marker). Safe

@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=20 local-only=0
+# test-meta: arch=both needs= est=20 local-only=0 builds=gfx-avail-probe guest=none
+# guest=none: run-qemu.sh's --no-gpu machine, and the --gpu one it is
+#   compared with, are the subject.
 # test-no-gpu-qemu.sh — run-qemu.sh --no-gpu gives the guest NO graphics
 # adapter, so OVMF exposes no GOP and axl_gfx_available() is false.
 #
@@ -77,7 +79,7 @@ for arch in "${ARCHES[@]}"; do
     efi="$out/gfx-avail-probe.efi"
 
     echo "=== run-qemu --no-gpu ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" gfx-avail-probe 2>&1 | tail -1
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" gfx-avail-probe 2>&1 | tail -1
 
     # 1. Behavior: --no-gpu reports no GOP on every arch.
     probe_reports "$arch" 0 "--no-gpu" "$efi" --no-gpu

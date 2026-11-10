@@ -94,6 +94,9 @@ AxlRand *
 axl_rand_new_seeded(uint64_t seed)
 {
     AxlRand *r = axl_calloc(1, sizeof(*r));
+    if (r == NULL) {
+        return NULL;   /* seeding it would write through NULL */
+    }
     seed_state(r, seed);
     return r;
 }
@@ -105,6 +108,9 @@ axl_rand_copy(const AxlRand *r)
         return NULL;
     }
     AxlRand *copy = axl_calloc(1, sizeof(*copy));
+    if (copy == NULL) {
+        return NULL;
+    }
     axl_memcpy(copy->s, r->s, sizeof(r->s));
     return copy;
 }

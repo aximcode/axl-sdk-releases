@@ -16,7 +16,7 @@
  * iDRAC virtual console), so it works headless.  Press ESC to exit (also
  * auto-quits after 5 min).
  *
- * Build with: make keytrace
+ * Build with: scripts/axl-build.sh keytrace
  */
 
 #include <axl.h>

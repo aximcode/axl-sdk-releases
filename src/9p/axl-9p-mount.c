@@ -39,7 +39,7 @@ struct AxlFsProviderFile {
     uint64_t   offset;      ///< current byte (file) or entry-cursor is separate
     bool       is_dir;
     bool       read_only;
-    char       path[512];   ///< absolute server path (for rename source, root check)
+    char       path[AXL_9P_PATH_MAX];   ///< absolute server path (for get_info, rename)
     /* Directory iteration: entries buffered from Treaddir, served one per read_dir. */
     AxlArray  *dents;       ///< AxlArray of AxlFsEntry, or NULL until first read_dir
     size_t     dent_pos;    ///< next index into dents
@@ -92,7 +92,7 @@ mount_open(void *backend_ctx, const char *utf8_path, unsigned mode,
             return AXL_FS_ERR_NOT_FOUND;
         }
         /* CREATE: walk to parent, then Tlcreate (file) or Tmkdir (dir). */
-        char parent[512];
+        char parent[AXL_9P_PATH_MAX];
         const char *name = NULL;
         if (axl_9p_client_split_parent(utf8_path, parent, sizeof(parent), &name) != AXL_OK) {
             axl_free(f);
@@ -105,7 +105,7 @@ mount_open(void *backend_ctx, const char *utf8_path, unsigned mode,
         }
         if (attributes & AXL_FS_ATTR_DIRECTORY) {
             /* Tmkdir(dfid, name, mode=0755, gid=0) -> Rmkdir. */
-            uint8_t req[512];
+            uint8_t req[AXL_9P_NAME_REQ_MAX];
             Axl9pWriter w;
             axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TMKDIR, 0);
             axl_9p_w_u32(&w, dfid);
@@ -253,7 +253,7 @@ mount_fill_dents(AxlFsProviderFile *f)
             break;                                  /* end of directory */
         }
         f->dir_off = last_off;
-        if (axl_array_len(f->dents) > AXL_9P_MAX_DIR_ENTRIES) {
+        if (axl_array_len(f->dents) > AXL_9P_MAX_DIR_BYTES / sizeof(AxlFsEntry)) {
             goto fail;
         }
     }
@@ -393,7 +393,10 @@ mount_get_info(AxlFsProviderFile *f, AxlFsEntry *out)
         if (*p == '/') base = p + 1;
     }
     size_t blen = axl_strlen(base);
-    if (blen >= sizeof(out->name)) blen = sizeof(out->name) - 1;
+    if (blen >= sizeof(out->name)) {
+        /* The thunk never opens one (AxlFsProviderOpen); never cut it. */
+        return AXL_FS_ERR_INVALID;
+    }
     axl_memcpy(out->name, base, blen);
     out->name[blen] = '\0';
     out->mtime_unix = mtime;
@@ -406,41 +409,105 @@ mount_get_info(AxlFsProviderFile *f, AxlFsEntry *out)
     return AXL_FS_OK;
 }
 
-// --- set_info (rename only in v1) -------------------------------------------
+// --- set_info: size and time ------------------------------------------------
 
+/* The AxlFsStatus a server's Rlerror errno @p e means. */
+static AxlFsStatus
+errno_status(uint32_t e)
+{
+    switch (e) {
+    case AXL_9P_ENOENT:  return AXL_FS_ERR_NOT_FOUND;
+    case AXL_9P_EPERM:   /* fallthrough */
+    case AXL_9P_EACCES:  /* fallthrough */
+    case AXL_9P_EEXIST:  return AXL_FS_ERR_ACCESS_DENIED;
+    case AXL_9P_EROFS:   return AXL_FS_ERR_WRITE_PROTECTED;
+    case AXL_9P_ENOSPC:  return AXL_FS_ERR_NO_SPACE;
+    case AXL_9P_ENOTDIR: return AXL_FS_ERR_NOT_DIR;
+    case AXL_9P_EISDIR:  return AXL_FS_ERR_IS_DIR;
+    case AXL_9P_EINVAL:  return AXL_FS_ERR_INVALID;
+    case AXL_9P_ENOMEM:  return AXL_FS_ERR_NO_MEMORY;
+    case AXL_9P_EXDEV:   return AXL_FS_ERR_UNSUPPORTED;
+    default:             return AXL_FS_ERR_IO;
+    }
+}
+
+/* Size first, then the time: a server that stamps the time on a resize
+   (truncate(2) does) would otherwise overwrite the one asked for. Attributes
+   have no 9P2000.L counterpart and are accepted unchanged. The name never
+   changes here: every name change goes to mount_rename. */
 static AxlFsStatus
 mount_set_info(AxlFsProviderFile *f, const AxlFsEntry *in)
 {
     if (f->read_only) {
         return AXL_FS_ERR_WRITE_PROTECTED;
     }
-    /* Only a basename change (rename within the same directory) is honored in
-       v1; attribute-only SetInfo is accepted as a no-op. */
-    const char *cur_base = f->path;
-    for (const char *p = f->path; *p; p++) {
-        if (*p == '/') cur_base = p + 1;
+    struct Axl9pClient *c = f->client;
+    if (!f->is_dir) {
+        uint64_t size = 0;
+        if (axl_9p_client_getattr(c, f->fid, &size, NULL, NULL) != AXL_OK) {
+            return errno_status(c->last_errno);
+        }
+        if (size != in->size
+            && axl_9p_client_setattr(c, f->fid, AXL_9P_SETATTR_SIZE, in->size, 0)
+                   != AXL_OK) {
+            return errno_status(c->last_errno);
+        }
     }
-    if (in->name[0] == '\0' || axl_strcmp(in->name, cur_base) == 0) {
-        return AXL_FS_OK;                            /* no rename requested */
+    if (in->mtime_unix != 0
+        && axl_9p_client_setattr(c, f->fid,
+                                 AXL_9P_SETATTR_MTIME | AXL_9P_SETATTR_MTIME_SET,
+                                 0, in->mtime_unix) != AXL_OK) {
+        return errno_status(c->last_errno);
     }
-    /* Build the destination path: parent(f->path) + "/" + in->name. */
-    char parent[512];
-    const char *ignore = NULL;
-    if (axl_9p_client_split_parent(f->path, parent, sizeof(parent), &ignore) != AXL_OK) {
+    return AXL_FS_OK;
+}
+
+// --- rename: Trename on the file's own fid ----------------------------------
+
+/* Moves the entry @p f is open on -- its fid, not a path remembered at open
+   -- so the move cannot land on whatever else now has that path. Never
+   copies: a server that answers EXDEV leaves it AXL_FS_ERR_UNSUPPORTED and
+   axl_file_move() copies with its own guarantees. A Trename replaces an
+   existing destination on a POSIX server, so one is refused first; another
+   writer between the check and the Trename is the window the provider
+   contract names. */
+static AxlFsStatus
+mount_rename(AxlFsProviderFile *f, const char *new_path)
+{
+    if (f->read_only) {
+        return AXL_FS_ERR_WRITE_PROTECTED;
+    }
+    struct Axl9pClient *c = f->client;
+
+    uint32_t tfid = AXL_9P_NOFID;
+    if (axl_9p_client_walk(c, new_path, &tfid) == AXL_OK) {
+        uint64_t q_new = 0;
+        uint64_t q_cur = 1;
+        bool     same  = axl_9p_client_qid_path(c, tfid, &q_new) == AXL_OK
+                         && axl_9p_client_qid_path(c, f->fid, &q_cur) == AXL_OK
+                         && q_new == q_cur;
+        axl_9p_client_clunk(c, tfid);
+        if (!same) {
+            return AXL_FS_ERR_ACCESS_DENIED;   /* another entry is there */
+        }
+    }
+
+    char        parent[AXL_9P_PATH_MAX];
+    const char *name = NULL;
+    if (axl_9p_client_split_parent(new_path, parent, sizeof(parent), &name) != AXL_OK) {
         return AXL_FS_ERR_INVALID;
     }
-    char dst[512];
-    int n = axl_snprintf(dst, sizeof(dst), "%s%s%s", parent,
-                         (parent[axl_strlen(parent) - 1] == '/') ? "" : "/", in->name);
-    if (n < 0 || (size_t)n >= sizeof(dst)) {
-        return AXL_FS_ERR_INVALID;
+    uint32_t dfid = AXL_9P_NOFID;
+    if (axl_9p_client_walk(c, parent, &dfid) != AXL_OK) {
+        return AXL_FS_ERR_NOT_FOUND;
     }
-    if (axl_9p_rename(f->client, f->path, dst) != AXL_OK) {
-        return errno_to_fs();
+    int      rc = axl_9p_client_trename(c, f->fid, dfid, name);
+    uint32_t e  = c->last_errno;   /* before the clunk clears it */
+    axl_9p_client_clunk(c, dfid);
+    if (rc != AXL_OK) {
+        return errno_status(e);
     }
-    /* Track the new path so a later get_info reports the new basename. */
-    size_t dlen = axl_strlen(dst);
-    axl_memcpy(f->path, dst, dlen + 1);
+    axl_strlcpy(f->path, new_path, sizeof(f->path));
     return AXL_FS_OK;
 }
 
@@ -470,6 +537,7 @@ axl_9p_build_provider(struct Axl9pClient *c, bool read_only,
         .volume_info   = NULL,
         .default_label = "9p",
         .backend_ctx   = ctx,
+        .rename        = read_only ? NULL : mount_rename,
     };
     *out = p;
 }

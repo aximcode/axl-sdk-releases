@@ -11,6 +11,11 @@
  *   4. An axl_atexit handler prints a SHUTDOWN-MARKER line that the
  *      harness greps for.
  *
+ * With the argument `defer-chain` (or built with -DYIELD_TEST_DEFER_CHAIN,
+ * for a boot with no Shell to pass arguments), step 3 runs with a deferred
+ * callback that re-queues itself for ever: the loop never waits, so a
+ * serial Ctrl-C must be noticed by the events it CHECKS each iteration.
+ *
  * Run with scripts/run-qemu.sh --background, wait for the idle
  * marker, wait for QEMU CPU to drop near zero, send a 0x03 byte
  * into QEMU's stdin FIFO. The shell's break handler should fire,
@@ -28,6 +33,16 @@ cmp_int(const void *a, const void *b)
     return (ia > ib) - (ia < ib);
 }
 
+/* A deferred callback that re-queues itself: the loop always has deferred
+   work, so it only ever checks its events and never waits on them. */
+static void
+on_chain(void *data)
+{
+    if (axl_defer((AxlLoop *)data, on_chain, data) == 0) {
+        axl_printf("yield-test: defer queue full; the chain stopped\n");
+    }
+}
+
 static void
 on_shutdown(void *data)
 {
@@ -38,8 +53,13 @@ on_shutdown(void *data)
 int
 main(int argc, char **argv)
 {
+#ifdef YIELD_TEST_DEFER_CHAIN
+    bool chain = true;
     (void)argc;
     (void)argv;
+#else
+    bool chain = argc > 1 && axl_strcmp(argv[1], "defer-chain") == 0;
+#endif
 
     axl_atexit(on_shutdown, NULL);
 
@@ -66,7 +86,12 @@ main(int argc, char **argv)
     axl_printf("yield-test: sort complete\n");
     axl_array_free(a);
 
-    axl_printf("yield-test: entering idle -- ready for Ctrl-C\n");
+    if (chain && axl_defer(axl_loop_default(), on_chain, axl_loop_default()) == 0) {
+        axl_printf("yield-test: the defer chain could not start\n");
+        return 1;
+    }
+    axl_printf("yield-test: entering idle -- ready for Ctrl-C%s\n",
+               chain ? " (defer chain running)" : "");
     axl_loop_run(axl_loop_default());
 
     /* If we got here, the loop quit cleanly (e.g., on break). */

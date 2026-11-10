@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=gpu est=21 local-only=1
+# test-meta: arch=x64 needs=gpu est=21 local-only=1 guest=none
+# guest=none: not converted yet (pool design §6.7 step 8 item 10):
+#   --screenshot and --sendkey, a machine no class gives yet.
 # test-sendkey-render-qemu.sh — the CAPTURE must reflect every injected key.
 #
 # The sibling test (test-sendkey-load-qemu.sh) asks "did the key arrive". This

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=8 local-only=0
+# test-meta: arch=x64 needs= est=8 local-only=0 builds=driver guest=standard
 # Test the example DXE driver — loads it, verifies output, unloads it.
 #
 # Usage: ./test/integration/test-driver.sh [--arch X64|AARCH64]
@@ -19,21 +19,15 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} driver 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" driver 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/driver.efi"
 
-# startup.nsh: load the driver, then shutdown
+# test-driver.nsh: load the driver (booted, the generated startup.nsh then shuts down)
 # (unload requires a handle number which can't be scripted portably)
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "load driver.efi"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

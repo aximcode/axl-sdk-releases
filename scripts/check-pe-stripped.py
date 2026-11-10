@@ -13,9 +13,9 @@ Nothing is lost by removing it. The side-by-side `.so` keeps every symbol, and
 `rsod-decode` and any debugger follow. The `.dbgdir` section survives stripping
 (it is a section, not a symbol), so that pointer is intact.
 
-WHAT THIS GUARDS. The strip lives in the objcopy invocation of three separate
-build paths -- the Makefile's link macros, `scripts/axl-cc`, and the
-`axl-config.cmake` that `install.sh` generates. That is the same three-way
+WHAT THIS GUARDS. The strip lives in the objcopy invocation of each build
+path -- the CMake build (cmake/AxlImages.cmake) and `scripts/axl-cc`, which
+the `axl-config.cmake` that `install.sh` generates delegates to. That is the
 split `check-flag-parity` exists for, and its failure mode here is silent: an
 image built by the path that forgot the flag is simply 20% larger, which
 nothing notices. This gate reads the ARTIFACT rather than the command lines, so
@@ -87,10 +87,12 @@ def main() -> int:
         print("\n".join(findings))
         print()
         print("  The firmware never reads it, and it is ~20% of a small image.")
-        print("  Add --strip-all to that path's objcopy. All three must have it:")
-        print("    Makefile        the LINK_EFI_* macros' objcopy line")
-        print("    scripts/axl-cc  the objcopy near 'output-target=$PE_TARGET'")
-        print("    install.sh      the objcopy in the generated axl-config.cmake")
+        print("  Add --strip-all to that path's objcopy. Every path must have it:")
+        print("    cmake/AxlImages.cmake  AXL_OBJCOPY_STRIP, on every image's objcopy")
+        print("    scripts/axl-cc         the objcopy near 'output-target=$PE_TARGET'")
+        print("  A pointer with ZERO symbols is objcopy's string table for a long")
+        print("  section name, which scripts/pe-set-debug.c drops: an image that")
+        print("  skipped it (NO_PE_PATCH) keeps the table.")
         print("  Symbols stay in the side-by-side .so, which is what")
         print("  pe-set-debug points the PE debug directory at.")
         return 1

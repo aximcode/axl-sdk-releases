@@ -16,6 +16,8 @@ deps/*
 !deps/freetype
 !deps/sdefl
 !deps/libvterm
+!deps/ed25519-ref10
+!deps/CMakeLists.txt
 *.pyc
 __pycache__/
 *.o
@@ -66,8 +68,8 @@ test/fuzz/oom-*
 test/fuzz/timeout-*
 
 # libFuzzer artifacts from a harness run started outside test/fuzz. The gate
-# passes -artifact_prefix so its own failures land in test/fuzz/, but a manual
-# run from the repo root drops them HERE, where `git add -A` would sweep them
+# passes -artifact_prefix so its own failures land in build/fuzz/artifacts/,
+# but a manual run from the repo root drops them HERE, where `git add -A` would sweep them
 # into a commit.
 /crash-*
 /leak-*

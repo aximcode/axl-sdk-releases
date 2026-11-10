@@ -31,6 +31,37 @@ owns no pump or timer — the consumer drives the loop. See the design doc
 for the layering (substrate owns the mechanism; the consumer owns
 transport, RBAC, terminal size, and late-join policy).
 
+Remote input: what a key looks like
+-----------------------------------
+
+:cpp:func:`axl_console_mirror_inject_text` (and the tap's and device's
+``inject_text``) turn the bytes a terminal sends into the keystrokes an
+OVMF USB keyboard delivers for the same keys, so a guest sees one keyboard
+whichever way the key arrived. Every key carries ``KeyShiftState`` VALID
+plus its modifiers and ``KeyToggleState`` ``0xC0``
+(``AXL_CONSOLE_TOGGLE_KEYBOARD``).
+
+- **Control bytes are Ctrl chords.** ``0x01``-``0x1a`` are the letter plus
+  left Ctrl, ``0x00`` is Ctrl+Space and ``0x1c``-``0x1f`` are Ctrl plus
+  backslash, ``]``, ``^`` and ``_``.
+  The Simple ``ReadKeyStroke`` folds a Ctrl+letter back to its C0 code, as
+  the console splitter does, and the Shell's Ctrl-C / Ctrl-S notifies fire.
+- **Four bytes are ambiguous and stay keys.** A terminal sends ``0x7f`` (or
+  ``0x08``) for Backspace, ``0x09`` for Tab, ``0x0d`` for Enter and ``0x1b``
+  for Esc, so those are Backspace, Tab, Enter and Esc -- never Ctrl+H/I/M/[.
+  A client that turns on CSI-u (``ESC[9;5u``) or modifyOtherKeys
+  (``ESC[27;5;9~``) can send those chords unambiguously, and they decode.
+- **Modifiers.** The xterm parameter (``ESC[1;5F`` is Ctrl-End,
+  ``ESC[1;2A`` Shift-Up, ``ESC[24;5~`` Ctrl-F12) maps to left Shift / Alt /
+  Ctrl / Logo; ESC followed by one key is that key plus Alt; ``ESC[Z`` is
+  Shift-Tab. Shift is dropped where it only changed the character (``A``,
+  ``!``) and kept on Space, Tab, Backspace, Enter and scan keys -- what the
+  USB driver does.
+
+One consequence is deliberate: the Shell's ``edit`` acts on scan keys only
+with no modifier, so Ctrl-End over a remote terminal shows "Unknown
+Command", exactly as it does on a local keyboard.
+
 AxlConsoleVtEnc — the remote sink, usable on its own
 ----------------------------------------------------
 
@@ -71,6 +102,21 @@ firmware console stays in the fan-out and paints alongside us. It requires
 physical geometry (``cols``/``rows`` must be 0) — two consoles drawing one
 screen have to agree on the grid — so a remote viewer adapts to the console's
 size rather than the other way round.
+
+There is one take-over per system, but the "already installed" check inside
+``axl_console_device_install`` only covers the calling image: every image links
+its own copy of the library. A second resident driver (``fbcon`` is loaded and
+now a remote-console driver starts) asks the firmware with
+:cpp:func:`axl_console_device_present`, which finds any image's device by its
+device path, and refuses with a message of its own before it does anything with
+side effects:
+
+.. code-block:: c
+
+   if (axl_console_device_present()) {
+       axl_printerr("another console take-over is active\n");
+       return 1;
+   }
 
 AxlConsoleTap — the structured console underneath
 -------------------------------------------------

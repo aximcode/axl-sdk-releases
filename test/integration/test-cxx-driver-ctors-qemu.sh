@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=22 local-only=0
+# test-meta: arch=both needs= est=22 local-only=0 builds=AXL_CPP=1,cxx-ctor-test guest=standard
 # test-cxx-driver-ctors-qemu.sh — a C++ DRIVER image runs its global
 # constructors, and runs the matching destructors on unload.
 #
@@ -55,7 +55,7 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 NATIVE_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" \
     AXL_CPP=1 cxx-ctor-test 2>&1 | tail -2
 
 test_add_efi "$NATIVE_DIR/cxx-ctor-test.efi"       "app/cxx-ctor-test.efi"
@@ -65,13 +65,9 @@ test_add_efi "$NATIVE_DIR/cxx-ctor-svc-driver.efi" "app/cxx-ctor-svc-driver.efi"
 test_add_efi "$NATIVE_DIR/cxx-ctor-fe-driver.efi"  "app/cxx-ctor-fe-driver.efi"
 test_add_efi "$NATIVE_DIR/cxx-ctor-fu-driver.efi"  "app/cxx-ctor-fu-driver.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "app\\cxx-ctor-test.efi"
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-cxx-driver-ctors-qemu.nsh.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh
 
 test_build_image
 
@@ -80,8 +76,8 @@ echo "=== C++ driver global constructors ($TEST_ARCH) ==="
 test_build_qemu_cmd
 test_run_background
 
-if ! test_wait_for "CTOR_DONE" 120; then
-    echo "FAIL: fixture did not finish within 120s"
+if ! test_wait_boot "CTOR_DONE" 120; then
+    echo "FAIL: fixture did not finish within ${TEST_WAITED_S}s"
     test_clean_log; echo "--- Serial ---"; tail -60 "$TEST_CLEAN_LOG"
     exit 1
 fi

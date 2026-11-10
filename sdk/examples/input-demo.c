@@ -16,7 +16,7 @@
  * screenshot captures the static prompts; on hardware with real
  * input you see the cursor follow + key feedback live.
  *
- * Build with: make input-demo
+ * Build with: scripts/axl-build.sh input-demo
  */
 
 #include <axl.h>

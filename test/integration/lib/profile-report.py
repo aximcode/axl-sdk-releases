@@ -19,7 +19,7 @@ Two questions, one data file (see lib/profile.sh for the format):
 Usage:
   AXL_TEST_PROFILE=/tmp/prof.txt ./test/integration/run-integration.sh --arch X64
   python3 test/integration/lib/profile-report.py /tmp/prof.txt
-  python3 test/integration/lib/profile-report.py /tmp/prof.txt --affected out/native-x64/hello.efi
+  python3 test/integration/lib/profile-report.py /tmp/prof.txt --affected build/x64-debug/hello.efi
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ def report_time(p: Profile) -> None:
 def report_affected(staged: dict[str, set[str]], changed: list[str]) -> None:
     # Match on basename: the profile records the DESTINATION inside the guest
     # image (`app/hello.efi`), while a caller naturally passes a build path
-    # (`out/native-x64/hello.efi`). Matching whole paths would silently select
+    # (`build/x64-debug/hello.efi`). Matching whole paths would silently select
     # nothing, which is the failure mode that reads as "no test covers this".
     want = {Path(c).name for c in changed}
     hit = sorted(t for t, arts in staged.items()

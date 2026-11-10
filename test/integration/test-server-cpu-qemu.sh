@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=48 local-only=0
+# test-meta: arch=x64 needs= est=48 local-only=0 builds=ARCH=x64,echo-server-sync guest=standard
 # Post-traffic server CPU regression test.
 #
 # Boots an HTTPS server driven by a RESIDENT driver-tick loop
@@ -42,27 +42,13 @@ SAMPLE_SECS=12       # post-traffic steady-state sampling window
 CPU_BUDGET_CORES="0.50"
 
 TEST_BUILD_DIR="$(test_build_dir)"
-make -C "$PROJECT_DIR" \
-    ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests echo-server-sync 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH=x64 all tests echo-server-sync 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting HTTPS server (resident driver-tick loop)...
-AxlTestNet.efi serve-tls-driver
-NSHEOF
+# The startup commands live in test-server-cpu-qemu.nsh
+test_use_nsh
 
 test_build_image
 
@@ -74,8 +60,8 @@ test_add_port_forward "$HOST_PORT" "$GUEST_PORT"
 test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: HTTPS server did not start within 60 seconds"
+if ! test_wait_boot "READY" 60; then
+    echo "FAIL: HTTPS server did not start within ${TEST_WAITED_S} seconds"
     test_clean_log; echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
 fi
@@ -88,13 +74,13 @@ pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 BASE_URL="https://127.0.0.1:${HOST_PORT}"
-CURL=(curl -s --insecure -H "Connection: close" --max-time 8 -o /dev/null -w "%{http_code}")
+CURL=(test_curl -s --insecure -H "Connection: close" --max-time 8 -o /dev/null -w "%{http_code}")
 
 # --- Send a burst of real HTTPS traffic through the full server path ---
 echo "  Sending $REQUESTS HTTPS requests..."
 served=0
 for _ in $(seq 1 "$REQUESTS"); do
-    code=$("${CURL[@]}" "${BASE_URL}/api/version" 2>/dev/null || echo 000)
+    code=$("${CURL[@]}" "${BASE_URL}/api/version" || echo 000)
     [[ "$code" == "200" ]] && served=$((served + 1))
 done
 [[ $served -eq $REQUESTS ]] \
@@ -103,8 +89,11 @@ done
 
 # --- Measure CPU AFTER the traffic has drained ---
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
+# The guest's QEMU: this test's own when booted; on a leased guest
+# TEST_QEMU_PID is empty and the pool names the guest's (AXL_POOL_QEMU_PID).
+GUEST_QEMU_PID="${TEST_QEMU_PID:-${AXL_POOL_QEMU_PID:-}}"
 read_cpu() { awk '{n=index($0,") ");split(substr($0,n+2),f," ");print f[12]+f[13]}' \
-    "/proc/${TEST_QEMU_PID}/stat" 2>/dev/null; }
+    "/proc/${GUEST_QEMU_PID}/stat" 2>/dev/null; }
 
 echo "  Settling ${SETTLE_SECS}s, then sampling CPU for ${SAMPLE_SECS}s (post-traffic)..."
 sleep "$SETTLE_SECS"
@@ -125,15 +114,14 @@ else
 fi
 
 # --- Liveness: still responsive after the idle window (not wedged) ---
-code=$("${CURL[@]}" "${BASE_URL}/api/version" 2>/dev/null || echo 000)
+code=$("${CURL[@]}" "${BASE_URL}/api/version" || echo 000)
 [[ "$code" == "200" ]] \
     && pass "server still responsive after the idle window (200)" \
     || fail "server unresponsive after idle (got '$code') — wedged after serving"
 
 # Done with the harness server; stop it before the standalone run-qemu check
 # so the two QEMUs don't contend.
-kill "$TEST_QEMU_PID" 2>/dev/null || true
-TEST_QEMU_PID=0
+test_guest_stop
 
 # --- Exercise run-qemu.sh --cpu-report (the standalone CPU reporter) ---
 # Asserts the output contract consumers grep ("CPU-REPORT: mean <m> cores,

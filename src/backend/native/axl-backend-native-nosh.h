@@ -47,9 +47,10 @@
  * The returned `EFI_FILE_PROTOCOL *` is the same handle shape the old-shell
  * path produces, so every handle-based backend op works on it unchanged.
  *
- * @return AXL_OK on success; AXL_ERR on a path with no `fsN:` prefix, an
- *     index past the end of the volume array, a volume that will not open,
- *     or any firmware failure (including the ordinary "no such file").
+ * @return AXL_OK on success; AXL_NOT_FOUND when the volume opened and the
+ *     file system reported no such file; AXL_ERR on a path with no `fsN:`
+ *     prefix, an index past the end of the volume array, a volume that will
+ *     not open, or any other firmware failure.
  */
 int
 axl_nosh_file_open(
@@ -57,6 +58,41 @@ axl_nosh_file_open(
     uint64_t               mode,        ///< EFI file mode flags
     uint64_t               attributes,  ///< EFI file attributes (create only)
     EFI_FILE_PROTOCOL    **out          ///< [out] receives the open file
+    );
+
+/**
+ * @brief Open the root directory of the SimpleFileSystem volume @p volume.
+ *
+ * The one volume-open every shell-free path shares: this file's positional
+ * `fsN:` opens and the modern-Shell path resolution in
+ * axl-backend-native-shell.c, which reaches the volume through the Shell's
+ * map instead.
+ *
+ * @return EFI_SUCCESS with @p root set (the caller closes it);
+ *     EFI_NOT_FOUND when @p volume carries no SimpleFileSystem; else
+ *     OpenVolume's status. @p root is NULL on any failure.
+ */
+EFI_STATUS
+axl_nosh_open_root(
+    EFI_HANDLE           volume,   ///< SimpleFileSystem handle
+    EFI_FILE_PROTOCOL  **root      ///< [out] the open root directory
+    );
+
+/**
+ * @brief axl_backend_path_locate for no shell at all: the volume a path
+ *     resolves to and the path below its root, resolved exactly as
+ *     axl_nosh_file_open resolves it, without opening anything.
+ *
+ * @return AXL_OK with @p volume (the SimpleFileSystem EFI_HANDLE) and
+ *     @p rel set; AXL_ERR when the volume does not resolve or @p rel does
+ *     not fit.
+ */
+int
+axl_nosh_path_locate(
+    const unsigned short  *path,     ///< UCS-2 path
+    void                 **volume,   ///< [out] SimpleFileSystem EFI_HANDLE
+    unsigned short        *rel,      ///< [out] volume-relative path, `\` separators
+    size_t                 rel_cap   ///< capacity of @p rel in characters
     );
 
 /**

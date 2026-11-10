@@ -28,7 +28,7 @@ typedef struct {
     char      *scheme;     ///< URL scheme without `://` ("http", "https", ...)
     char      *user;       ///< userinfo user portion before `:` (NULL if no `user[:pass]@` in authority)
     char      *password;   ///< userinfo password portion after `:` (NULL if no `:` in userinfo; "" if `user:@host`)
-    char      *host;       ///< hostname or IP literal (no userinfo, no port)
+    char      *host;       ///< hostname or IP literal (no userinfo, no port; an IPv6 literal without its brackets)
     char      *path;       ///< path component starting with `/` ("/" if absent)
     char      *query;      ///< raw query string after `?` (NULL if no `?`)
     char      *fragment;   ///< fragment after `#` (NULL if no `#`)
@@ -39,7 +39,11 @@ typedef struct {
  * @brief Parse a URL string into components.
  *
  * Supports the RFC 3986 generic URI shape:
- *   `scheme://[user[:password]@]host[:port][/path][?query][#fragment]`
+ *   `scheme://[user[:password]@]host[:port][/path][?query][#fragment]`,
+ * where host may be an IPv6 literal in brackets (`[::1]`, RFC 3986
+ * §3.2.2) -- stored without them. A bracketed host must hold a ':';
+ * IPv6 zone IDs (`[fe80::1%25eth0]`) are not supported and refused. The
+ * scheme is stored lowercased (RFC 3986 §3.1).
  *
  * Userinfo is recognized only when an `@` appears in the authority
  * (between `://` and the first `/`, `?`, or `#`); an `@` later in
@@ -69,6 +73,10 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlUrl, axl_url_free)
 
 /**
  * @brief Build a URL string from components.
+ *
+ * `scheme://host[:port]path`: the port is left out when it is the
+ * scheme's default (80 for http, 443 for https) or 0, and a host holding
+ * a ':' (an IPv6 literal) is put in brackets.
  *
  * @return allocated URL string, or NULL on failure. Caller frees.
  */

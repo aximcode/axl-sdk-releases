@@ -29,7 +29,7 @@
  * `connect` / `disconnect` can re-drive it against the synthetic controller.
  *
  * Build:  axl-cc --type driver binding-driver.c -o binding-driver.efi
- *         (in-tree: `make binding-driver`)
+ *         (in-tree: `scripts/axl-build.sh binding-driver`)
  * Load:   load binding-driver.efi
  * Drivers listing (shows the Component Name 2 name):  drivers
  * Re-drive: connect <controller-handle> / disconnect <controller-handle>

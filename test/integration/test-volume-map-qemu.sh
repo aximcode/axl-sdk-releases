@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=volume-map-test guest=none
+# guest=none: the boot is the subject: the Shell's fsN map over volumes
+#   added at boot (--mount).
 # axl_volume_enumerate must name volumes from the UEFI Shell fsN map, not the
 # LocateHandle(SimpleFileSystem) iteration index. The two orders diverge when
 # the FS set is anything but trivial — reported as `do fd` printing the wrong
@@ -28,8 +30,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     volume-map-test 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"

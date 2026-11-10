@@ -14,11 +14,13 @@ runs on a machine with nothing of ours on it, so it cannot source a helper, and
 a rename on either side is invisible until a user's ``axl update`` cannot find
 its download.
 
-WHAT THIS COMPARES.  Computed names, not spellings.  The two producer scripts
-are ASKED (``--print-name``); ``install.sh``'s ``asset_candidates()`` is
-extracted and RUN.  Only ``release.yml`` is parsed, because a workflow cannot be
-executed here -- and what is parsed there is the two places a name is written
-down, the uefi-tools ``NAME=`` and the release job's ``cp --`` list.
+WHAT THIS COMPARES.  Computed names, not spellings.  The producer,
+``scripts/make-release-assets.sh`` (CPack since 2026-11-10), is ASKED
+(``<kind> --print-name``; uefi-tools once per arch);
+``install.sh``'s ``asset_candidates()`` is extracted and RUN.  Only
+``release.yml`` is parsed, because a workflow cannot be executed here -- and
+what is parsed there is the one place a name is still written down, the
+release job's ``cp --`` list.
 
 So a variable renamed, an indirection added, or a component spelled differently
 cannot pass: the gate never reads the format string, it reads the result.
@@ -43,10 +45,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = ROOT / "packaging" / "install.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
-SDK_MAKER = ROOT / "scripts" / "make-sdk-tarball.sh"
-HT_MAKER = ROOT / "scripts" / "make-host-tools-tarball.sh"
+MAKER = ROOT / "scripts" / "make-release-assets.sh"
 
-VERSION = (ROOT / "VERSION").read_text().strip()
+def _version() -> str:
+    """The version whose names are checked: VERSION, or `--version V` -- the
+    seam that lets a test hold the gate to a prerelease's asset set (no
+    .deb/.rpm) and a release's (both) from one tree."""
+    if len(sys.argv) == 3 and sys.argv[1] == "--version":
+        return sys.argv[2]
+    if len(sys.argv) != 1:
+        print("usage: check-asset-names.py [--version V]", file=sys.stderr)
+        sys.exit(2)
+    return (ROOT / "VERSION").read_text().strip()
+
+
+VERSION = _version()
 UEFI_ARCHES = ("x64", "aa64")
 
 # The settled scheme, with the version as a LITERAL rather than a pattern.
@@ -70,7 +83,7 @@ def fail(msg: str) -> None:
 def normalize_host_arch(name: str) -> str:
     """Fold the machine's own arch and the literal x86_64 to one token.
 
-    make-sdk-tarball.sh names the archive after `uname -m`, while release.yml
+    make-release-assets.sh names the SDK archive after `uname -m`, while release.yml
     and install.sh spell `x86_64` because that is what the release builds on.
     Comparing them literally would report a false drift on an aarch64 host and
     say nothing useful; folding both keeps the gate meaningful everywhere.
@@ -120,30 +133,34 @@ def installer_candidates() -> dict[str, list[str]] | None:
     return out
 
 
-def workflow_names() -> tuple[set[str], set[str]] | None:
-    """(names release.yml EMITS, names its release job PUBLISHES)."""
-    src = WORKFLOW.read_text()
-
-    emitted: set[str] = set()
-    # The uefi-tools archive is the one name still written inside the workflow.
-    uefi = re.search(r'^\s*NAME="(axl-sdk-[^"]*)"', src, re.M)
-    if uefi is None:
-        fail("no uefi-tools NAME= assignment in release.yml -- the step changed"
-             " shape and this gate must follow it")
-        return None
+def uefi_names() -> set[str] | None:
+    """The uefi-tools archive names, asked of the script once per arch."""
+    names: set[str] = set()
     for arch in UEFI_ARCHES:
-        emitted.add(uefi.group(1).replace("${V}", VERSION)
-                                 .replace("${ARCH}", arch) + ".tar.gz")
+        got = run([str(MAKER), "uefi-tools", "--arch", arch, "--version", VERSION,
+                   "--print-name"])
+        if got is None:
+            return None
+        if not got:
+            fail(f"{MAKER.name} uefi-tools --print-name named nothing for {arch}")
+            return None
+        names.add(got)
+    return names
+
+
+def workflow_names() -> set[str] | None:
+    """The names release.yml's release job PUBLISHES."""
+    src = WORKFLOW.read_text()
 
     published = {
         m.replace("${V}", VERSION)
-        for m in re.findall(r'^\s*cp -- "dist/(axl-sdk-[^"]*\.tar\.gz)"', src, re.M)
+        for m in re.findall(r'^\s*cp -- "dist/(axl-sdk-[^"]*\.(?:tar\.gz|deb|rpm))"', src, re.M)
     }
     if not published:
         fail("the release job copies no dist/axl-sdk-*.tar.gz -- it changed shape"
              " and this gate must follow it")
         return None
-    return emitted, published
+    return published
 
 
 def main() -> int:
@@ -151,13 +168,20 @@ def main() -> int:
         fail("no sh on PATH")
         return 1
 
-    sdk = run([str(SDK_MAKER), "--print-name"])
-    host = run([str(HT_MAKER), "--print-name"])
+    sdk = run([str(MAKER), "sdk", "--version", VERSION, "--print-name"])
+    host = run([str(MAKER), "host-tools", "--version", VERSION, "--print-name"])
+    # THE PUBLISHED SET, from the one place it is decided: the driver's
+    # `assets` (the archives, install.sh, VERSION, and the .deb/.rpm unless
+    # VERSION is a prerelease). release.yml asks the same question.
+    assets_out = run([str(MAKER), "assets", "--version", VERSION])
     candidates = installer_candidates()
-    wf = workflow_names()
-    if sdk is None or host is None or candidates is None or wf is None:
+    emitted_uefi = uefi_names()
+    published = workflow_names()
+    if (sdk is None or host is None or assets_out is None or candidates is None
+            or emitted_uefi is None or published is None):
         return 1
-    emitted_uefi, published = wf
+    assets = {line for line in assets_out.splitlines() if line}
+    packages = {n for n in assets if n.endswith((".deb", ".rpm"))}
 
     errors = 0
 
@@ -188,10 +212,30 @@ def main() -> int:
                  " reach releases published before the rename")
             errors += 1
 
-    # 4. The release job publishes exactly what the jobs produce.
-    if {normalize_host_arch(n) for n in published} != {normalize_host_arch(n) for n in produced}:
-        fail("the release job's asset list disagrees with what the build jobs emit:")
+    # 4. The driver's asset set holds exactly what the producers emit, plus
+    #    the two stable names and the packages it decides on.
+    if {normalize_host_arch(n) for n in assets - packages - {"install.sh", "VERSION"}} \
+            != {normalize_host_arch(n) for n in produced}:
+        fail("the driver's `assets` disagrees with the archives its kinds name:")
+        fail(f"  assets:    {sorted(assets)}")
         fail(f"  produced:  {sorted(produced)}")
+        errors += 1
+    for name in sorted(packages):
+        kind = "deb" if name.endswith(".deb") else "rpm"
+        got = run([str(MAKER), kind, "--version", VERSION, "--print-name"])
+        if got != name:
+            fail(f"`assets` lists {name!r} but `{kind} --print-name` says {got!r}")
+            errors += 1
+
+    # 5. The release job publishes exactly that set. Its package cp lines sit
+    #    under the driver's own `assets` test, so for a version with no
+    #    packages (a prerelease) they are not part of what it stages.
+    if not packages:
+        published = {n for n in published if not n.endswith((".deb", ".rpm"))}
+    produced_all = produced | packages
+    if {normalize_host_arch(n) for n in published} != {normalize_host_arch(n) for n in produced_all}:
+        fail("the release job's asset list disagrees with what the build jobs emit:")
+        fail(f"  produced:  {sorted(produced_all)}")
         fail(f"  published: {sorted(published)}")
         errors += 1
 
@@ -199,7 +243,7 @@ def main() -> int:
         print(f"check-asset-names: FAIL -- {errors} problem(s)", file=sys.stderr)
         return 1
 
-    print(f"check-asset-names: clean -- {len(produced)} assets, "
+    print(f"check-asset-names: clean -- {len(produced)} archives and {len(packages)} packages for {VERSION}, "
           f"{sum(len(v) for v in candidates.values())} installer candidates")
     return 0
 

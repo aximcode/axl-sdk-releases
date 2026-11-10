@@ -1538,7 +1538,8 @@ axl_json_array_next(
  * Writes the escaped string WITH surrounding double quotes into @p out.
  * Escapes double-quote, backslash, the standard whitespace escapes
  * (newline / carriage-return / tab), and any remaining control
- * characters below 0x20.
+ * characters below 0x20 as `\u00XX` -- six bytes for one, so size the
+ * buffer for it. (The writer's strings escape them the same way.)
  *
  * Well-formed UTF-8 passes through byte-for-byte; RFC 8259 §7 requires
  * escaping only those characters. Ill-formed UTF-8 is replaced with

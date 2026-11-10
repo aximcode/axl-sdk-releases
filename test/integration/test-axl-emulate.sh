@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=swtpm est=1 local-only=0
+# test-meta: arch=x64 needs=swtpm est=1 local-only=0 guest=none
+# guest=none: harness test: scripts/axl-emulate's argument handling, in
+#   AXL_EMULATE_DRYRUN mode; no guest boots.
 # test-axl-emulate.sh -- argument-parsing and fixture-translation
 # tests for scripts/axl-emulate.
 #

@@ -20,6 +20,7 @@
 #ifndef AXL_HTTP_CLIENT_TLS_H
 #define AXL_HTTP_CLIENT_TLS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 /* AxlTcp, AxlTcpCallback, AxlLoop, AxlStatus — type declarations only, no TLS
    reference, so the header stays self-contained and never pins mbedTLS.
@@ -34,8 +35,8 @@ typedef struct AxlTlsContext AxlTlsContext;
 
 /* The TLS operations the HTTP client needs. Field signatures match the
    corresponding axl_tls_* functions exactly, so axl-tls.c can register the
-   real functions directly. The async pair (handshake_async / write_async) is
-   what lets the ALWAYS-LINKED async HTTP client drive a TLS request on a loop
+   real functions directly (peer_closed, which has no public twin, aside).
+   The async pair (handshake_async / write_async) is what lets the ALWAYS-LINKED async HTTP client drive a TLS request on a loop
    without a static axl_tls_* reference — keeping mbedTLS strippable for a
    plain-HTTP consumer exactly as the sync ops do. */
 typedef struct {
@@ -48,6 +49,9 @@ typedef struct {
     int            (*handshake_async)(AxlTlsContext *ctx, AxlLoop *loop);
     int            (*write_async)(AxlTlsContext *ctx, const void *data, size_t len,
                                   AxlLoop *loop, AxlTcpCallback cb, void *cb_data);
+    /* true once the peer's close_notify has been read -- the one orderly
+       end of a TLS stream; a transport EOF without it is a cut. */
+    bool           (*peer_closed)(AxlTlsContext *ctx);
 } AxlHttpClientTlsOps;
 
 /**

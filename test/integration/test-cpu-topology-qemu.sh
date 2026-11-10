@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=41 local-only=0
+# test-meta: arch=x64 needs= est=41 local-only=0 builds=ARCH=x64,cpu-topology-selftest guest=none
+# guest=none: four machines in one test (four -smp layouts), and a lease is
+#   one class; three of the four would boot inside it. Pooling it means
+#   splitting it per layout or leasing several classes per test.
 # test-cpu-topology-qemu.sh — axl_cpu_topology() against explicit QEMU
 # -smp layouts.
 #
@@ -29,7 +32,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export TEST_SKIP_RATCHET=1
 
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/cpu-topology-selftest.efi"
-make -C "$PROJECT_DIR" ARCH=x64 cpu-topology-selftest 2>&1 | tail -2
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 cpu-topology-selftest 2>&1 | tail -2
 
 overall_fail=0
 

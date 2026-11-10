@@ -44,6 +44,7 @@ struct AxlCancellable {
     uint32_t  magic;
     uint32_t  _registry_handle;
     AxlEvent *event;
+    bool      on_break;   ///< axl_cancellable_set_cancel_on_break
 };
 
 static bool
@@ -165,4 +166,18 @@ _axl_cancellable_event(AxlCancellable *c)
         return NULL;
     }
     return axl_event_handle(c->event);
+}
+
+void
+axl_cancellable_set_cancel_on_break(AxlCancellable *c, bool on)
+{
+    if (cancellable_is_live(c, "axl_cancellable_set_cancel_on_break")) {
+        c->on_break = on;
+    }
+}
+
+bool
+_axl_cancellable_on_break(const AxlCancellable *c)
+{
+    return c != NULL && c->magic == AXL_CANCELLABLE_MAGIC && c->on_break;
 }

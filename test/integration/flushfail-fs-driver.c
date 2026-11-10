@@ -18,8 +18,9 @@
  * happens in the one top-level shell, where `AXLFF:` resolves and
  * %lasterror% means what it says.
  *
- * Also seeds `fs0:\ffsrc.txt`, so the harness's .nsh has something to feed
- * the tool without a second image.
+ * Also seeds `ffsrc.txt` in the Shell's current directory (the boot disk's
+ * root, or a pooled run's own directory), so the harness's .nsh has
+ * something to feed the tool without a second image.
  *
  * Driven by test/integration/test-flushfail-tools-qemu.sh.
  *
@@ -37,7 +38,7 @@
 #define FF_MAX_BYTES  16384u
 #include "axl-test-flushfail-fs.h"
 
-#define SRC       "fs0:\\ffsrc.txt"
+#define SRC       "ffsrc.txt"
 #define SRC_BODY  "payload\n"
 
 static int
@@ -46,7 +47,7 @@ flushfail_fs_main(AxlHandle image, AxlSystemTable *st)
     (void)image;
     (void)st;
 
-    /* Seeded on fs0: (a real volume), NOT on the fixture -- the tool needs
+    /* Seeded on a real volume, NOT on the fixture -- the tool needs
        something it can genuinely read, and the fixture's job is to be the
        destination. */
     if (axl_file_set_contents(SRC, SRC_BODY, sizeof(SRC_BODY) - 1) != AXL_OK) {

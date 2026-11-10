@@ -20,6 +20,32 @@ One archive carries both x64 and aa64 UEFI target libraries.
 Afterwards ``axl update``, ``axl use <version>``, ``axl list`` and
 ``axl uninstall`` maintain the install from inside it.
 
+Which install should I use?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``install.sh`` is the install for **you**: no root, several versions side
+by side, and ``axl`` manages them (``update``, ``use``, ``list``,
+``prune``, ``uninstall``). The ``.deb`` and ``.rpm`` on the releases page
+are the install for **a machine**: ``axl-sdk-<version>`` in
+``/opt/axl-sdk-<version>``, on every user's ``PATH`` through
+``/etc/profile.d/axl-sdk.sh``, upgraded and removed with ``apt`` or
+``dnf``::
+
+    sudo apt install ./axl-sdk-<v>_<v>-1_amd64.deb     # Debian, Ubuntu
+    sudo dnf install ./axl-sdk-<v>-<v>-1.x86_64.rpm    # Fedora, RHEL
+
+The two coexist: the package puts nothing in ``/usr/bin`` and appends to
+``PATH``, so a user's own ``install.sh`` copy wins. ``axl list`` labels
+each installed version ``install.sh``, ``deb`` or ``rpm``. The ``axl``
+version-manager verbs act on ``install.sh``'s versions only: run from a
+package's copy they refuse and print the ``apt``/``dnf`` command (or
+``update-alternatives --config axl-sdk-package`` to switch between
+installed packages), and ``axl prune`` never removes a package's
+directory. To move from one to the other, install the new way first, then
+remove the old one with its own tool (``apt``/``dnf remove``, or
+``axl uninstall``). ``axl use`` with no version names the version a
+project pins in a ``.axl-sdk-version`` file, without switching to it.
+
 Then add the cross toolchain for the firmware you are **building
 for**::
 

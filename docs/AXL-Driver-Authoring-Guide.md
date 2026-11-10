@@ -30,7 +30,8 @@ Package a driver with:
 
 ```bash
 axl-cc --type driver mydrv.c -o mydrv.efi    # SDK toolchain
-# in-tree: add a Makefile target modeled on the `driver` example
+# in-tree: an image + goal modeled on the `driver` example
+#   (sdk/CMakeLists.txt, cmake/AxlGoals.cmake)
 ```
 
 `--type driver` selects the driver subsystem and the driver CRT0 wiring

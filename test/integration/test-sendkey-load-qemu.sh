@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=24 local-only=1
+# test-meta: arch=x64 needs=socat est=24 local-only=1 guest=none
+# guest=none: not converted yet (pool design §6.7 step 8 item 10):
+#   --screenshot and --sendkey, a machine no class gives yet.
 # test-sendkey-load-qemu.sh — run-qemu.sh --sendkey must deliver EVERY key,
 # including when the host is busy.
 #

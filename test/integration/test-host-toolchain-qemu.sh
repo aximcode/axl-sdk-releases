@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=180 local-only=0
+# test-meta: arch=x64 needs= est=180 local-only=0 guest=plain
 # test-host-toolchain-qemu.sh — AXL_TOOLCHAIN=host builds and boots x64 with
 # the HOST compiler and no bare-metal toolchain involvement.
 #

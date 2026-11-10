@@ -144,6 +144,26 @@ typedef void (*AxlWriteFunc)(const char *data, size_t len, void *ctx);
 
 Width and zero-padding are supported: `%08x`, `%-20s`, `%5d`.
 
+### A precision on `%s` bounds the READ, not just the write
+
+`%.*s` (and `%.Ns`) emits at most that many bytes AND reads at most that many:
+the terminator scan stops at the precision, so the argument does not have to
+be NUL-terminated. That is C99 7.21.6.1p8 -- the array need only contain a
+null character "if the precision is not specified or is greater than the size
+of the array" -- and it is what makes the conversion usable over a slice of a
+received packet, an `.incbin` blob, a line in a read buffer or any other
+bounded run of bytes:
+
+```c
+axl_printf("%.*s\n", (int)AXL_EMBED_SIZE(greeting),
+           (const char *)AXL_EMBED_DATA(greeting));
+```
+
+The engine scanned for the NUL FIRST and truncated afterwards until 2026-09-07,
+which read past every such buffer. Callers that copied into a terminated
+scratch buffer to avoid it can drop the copy -- unless they were also
+sanitising bytes or passing NULs through, which no `%s` conversion does.
+
 ## Floating Point
 
 The float conversions are built on `axl_dtoa` (Grisu2) — one shortest-digits

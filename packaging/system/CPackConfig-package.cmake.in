@@ -1,0 +1,73 @@
+# CPackConfig-package.cmake -- generated from
+# packaging/system/CPackConfig-package.cmake.in: the axl-sdk-<v> .deb and
+# .rpm (AXL-Distribution-Design.md §17.5). scripts/make-release-assets.sh
+# runs `cpack -G DEB|RPM` against it, passing the trees and components
+# (CPACK_INSTALL_CMAKE_PROJECTS) and the file name.
+#
+# A VERSIONED PACKAGE NAME, axl-sdk-<v>: versions install side by side (D2),
+# each owning its root, and the name is not the 4.4.0 `axl-sdk` -- which a
+# deployed consumer's installer removes on sight. That package's /usr/bin/axl
+# is what shadowed install.sh's, so every new package Conflicts/Replaces
+# (deb) or Obsoletes (rpm) it: installing any new one removes it.
+set(CPACK_PACKAGE_NAME "axl-sdk-@_axl_ver@")
+set(CPACK_PACKAGE_VERSION "@_axl_ver@")
+set(CPACK_PACKAGE_VENDOR "AximCode")
+set(CPACK_PACKAGE_CONTACT "AximCode <noreply@aximcode.github.io>")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "AXL SDK @_axl_ver@ -- the AximCode Library for UEFI")
+set(CPACK_PACKAGE_DESCRIPTION "The AXL SDK for building UEFI applications and drivers: libaxl, headers, axl-cc/axl-c++, the CMake package and the axl host tools, in /opt/axl-sdk-@_axl_ver@. The bare-metal cross toolchain is installed separately (axl-install-toolchain).")
+set(CPACK_CMAKE_GENERATOR "Ninja")
+# /opt/axl-sdk-<v>: the tarball's own versioned root. Nothing in /usr/bin.
+set(CPACK_PACKAGING_INSTALL_PREFIX "/opt/axl-sdk-@_axl_ver@")
+set(CPACK_SET_DESTDIR OFF)
+
+# --- .deb ---------------------------------------------------------------------
+# Read by packaging/system/AxlPackDeb.cmake, which writes the control file and
+# runs dpkg-deb (CPack's DEB writer is not used: §10.18).
+set(CPACK_DEBIAN_PACKAGE_NAME "axl-sdk-@_axl_ver@")
+set(CPACK_DEBIAN_PACKAGE_RELEASE 1)
+set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
+set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
+set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://axl.aximcode.com")
+# What axl-install-toolchain runs. Not gcc/binutils: the SDK compiles with its
+# own bare-metal cross (installed separately).
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "curl, xz-utils, tar")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "@AXL_DEB_RECOMMENDS@")
+set(CPACK_DEBIAN_PACKAGE_CONFLICTS "axl-sdk")
+set(CPACK_DEBIAN_PACKAGE_REPLACES "axl-sdk")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "@AXL_PKG_DIR@/postinst;@AXL_PKG_DIR@/prerm")
+
+# --- .rpm ---------------------------------------------------------------------
+set(CPACK_RPM_PACKAGE_NAME "axl-sdk-@_axl_ver@")
+set(CPACK_RPM_PACKAGE_RELEASE 1)
+set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
+set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
+set(CPACK_RPM_PACKAGE_GROUP "Development/Tools")
+set(CPACK_RPM_PACKAGE_URL "https://axl.aximcode.com")
+set(CPACK_RPM_PACKAGE_DESCRIPTION "${CPACK_PACKAGE_DESCRIPTION}")
+set(CPACK_RPM_PACKAGE_REQUIRES "curl, xz, tar")
+set(CPACK_RPM_PACKAGE_RECOMMENDS "@AXL_RPM_RECOMMENDS@")
+set(CPACK_RPM_PACKAGE_OBSOLETES "axl-sdk < 4.5")
+# The maintainer scripts run alternatives, which is not essential on Fedora
+# or RHEL: required by FILE, so either distribution's package satisfies it.
+set(CPACK_RPM_PACKAGE_REQUIRES_POST "/usr/sbin/alternatives")
+set(CPACK_RPM_PACKAGE_REQUIRES_PREUN "/usr/sbin/alternatives")
+# Scanning the payload would invent requirements from the shipped .o/.a and
+# scripts; and rpmbuild's post-install strip would rewrite the libraries and
+# both arches' objects (aarch64 ones with the x86_64 strip).
+set(CPACK_RPM_PACKAGE_AUTOREQPROV OFF)
+# REPRODUCIBLE: rpmbuild stamps the build time and the build HOST's name into
+# every package (measured: two builds of one commit differed in BUILDTIME,
+# and named the build machine). SOURCE_DATE_EPOCH (set by
+# make-release-assets.sh) becomes the build time and every file's clamped
+# mtime, and the host is a fixed word. Clamping only lowers a NEWER mtime,
+# so the post-install step -- otherwise disabled -- sets every file's to the
+# commit's first: an older one would keep the checkout's.
+set(CPACK_RPM_SPEC_MORE_DEFINE "%define __os_install_post find %{buildroot} -exec touch -h -d @\${SOURCE_DATE_EPOCH:?run scripts/make-release-assets.sh} {} +
+%define debug_package %{nil}
+%define _build_id_links none
+%define use_source_date_epoch_as_buildtime 1
+%define clamp_mtime_to_source_date_epoch 1
+%define _buildhost reproducible")
+set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "@AXL_PKG_DIR@/postinst")
+set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE "@AXL_PKG_DIR@/prerm")
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt")

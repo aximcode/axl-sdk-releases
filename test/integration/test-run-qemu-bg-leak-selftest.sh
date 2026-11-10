@@ -16,12 +16,14 @@
 #      immortal guest carries the path in argv, so the sweeper can never collect
 #      it.
 #
-# Real guests, so this needs QEMU + OVMF — but it is deliberately NOT part of
-# the integration matrix. The assertions are `df -k /dev/shm` deltas, and a df
-# delta is a GLOBAL measurement: under the parallel pool, sibling guests churn
-# 40 MB state dirs concurrently and the number becomes noise. Excluded from
-# discovery by name (*-selftest.sh), exactly as test-runner-selftest.sh is.
-# Run it by hand.
+# Real guests, so this needs QEMU + OVMF. Excluded from discovery by name
+# (*-selftest.sh), exactly as test-runner-selftest.sh is; scripts/run-selftests.sh
+# runs it. Every assertion is SCOPED TO THIS RUN'S BASE, so it can share the box
+# with other runs: the leak checks list processes still holding a file under
+# the base (lib/shm-holders.sh -- the only way tmpfs keeps a deleted file's
+# pages), and the orphan check counts ppid-1 guests whose argv names the base.
+# They were `df -k /dev/shm` deltas and a host-wide orphan count, both GLOBAL:
+# any sibling run writing /dev/shm or leaving a guest moved them.
 #
 # Two traps this test is built to avoid, both paid for once already:
 #
@@ -45,9 +47,8 @@ RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 # has taken its measurements (run-qemu itself spends ~2 s in its hostfwd probe
 # before returning), short enough that the whole file stays under a minute.
 GUEST_TIMEOUT="${BG_LEAK_TIMEOUT:-12}"
-# df noise floor, same value test-runner-selftest.sh uses. The leak under test
-# is ~42 MB, so this discriminates by a factor of five.
-NOISE_KB=8192
+# shellcheck source=lib/shm-holders.sh
+source "$SCRIPT_DIR/lib/shm-holders.sh"
 
 fail=0
 case_fail=0
@@ -57,7 +58,11 @@ DUMMY="$(mktemp --suffix=.efi)"
 
 # Never leave our own strays behind, pass or fail. Two handles: the guest
 # carries the state dir in argv, and the state dir lives under the base.
-harness_cleanup() {
+# The current case's processes and base. Also what an ABANDONED case runs
+# (case_abort): clearing the state first, as the early returns did, left the
+# base where harness_cleanup could no longer find it -- a failed control
+# leaked one /dev/shm/axlbgprobe.* per case.
+case_cleanup() {
     [[ -n "$GUEST"  ]] && kill -9 "$GUEST"  2>/dev/null
     [[ -n "$HANDLE" ]] && kill -9 "$HANDLE" 2>/dev/null
     [[ -n "$OWNER"  ]] && kill -9 "$OWNER"  2>/dev/null
@@ -66,18 +71,32 @@ harness_cleanup() {
         sleep 0.3
         rm -rf "$BASE"
     fi
+}
+harness_cleanup() {
+    case_cleanup
     rm -f "$DUMMY"
 }
 trap harness_cleanup EXIT
 
-df_used() { df -k --output=used /dev/shm | tail -1 | tr -d ' '; }
+# Processes still holding (fd or mapping) a file under this run's base: what
+# keeps tmpfs pages after the directory is gone. Empty = reclaimed.
+base_holders() { shm_holders "$BASE"; }
 
 # Processes referencing the current guest's state dir. No self-filter by
 # design — see the header. `wc -l` never receives the path, and pgrep excludes
 # its own pid, so nothing here can match itself.
 held_count() { pgrep -af -- "$TMPD" 2>/dev/null | wc -l; }
 
-orphan_qemus() { ps -eo pid,ppid,comm | awk '$2==1 && $3 ~ /^qemu-system/' | wc -l; }
+# ppid-1 qemu-system processes whose argv names THIS run's base. Not every
+# ppid-1 guest on the host: another run's orphan is not this test's defect.
+orphan_qemus() {
+    local p n=0
+    for p in $(pgrep -f -- "$BASE" 2>/dev/null); do
+        [[ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" == 1 \
+           && "$(cat "/proc/$p/comm" 2>/dev/null)" == qemu-system* ]] && n=$((n + 1))
+    done
+    echo "$n"
+}
 
 say_fail() { echo "  FAIL: $*"; fail=1; case_fail=1; }
 
@@ -131,6 +150,15 @@ probe_discriminates() {
         say_fail "probe blind: no qemu-system process among the $n references"
         return 1
     fi
+    # ...and the leak check's control: the live guest holds files of its state
+    # dir open, and the holder scan must list it doing so.
+    # Captured, then matched: `base_holders | grep -q` under pipefail fails ON
+    # a match when the scan is still writing (SIGPIPE), reading as "blind".
+    local holders; holders=$(base_holders)
+    if ! grep -q "^$GUEST " <<<"$holders"; then
+        say_fail "holder scan blind: guest $GUEST holds nothing under $BASE by its count"
+        return 1
+    fi
     return 0
 }
 
@@ -145,6 +173,7 @@ wait_gone() {
 }
 
 reset_state() { BASE=""; TMPD=""; HANDLE=""; OWNER=""; GUEST=""; }
+case_abort() { case_cleanup; reset_state; }
 
 # --- Case 1: an undisturbed --background run is unchanged -------------------
 # The guard against the pdeathsig fix firing early. pdeathsig ties the guest's
@@ -154,29 +183,28 @@ reset_state() { BASE=""; TMPD=""; HANDLE=""; OWNER=""; GUEST=""; }
 # also pins the self-clean semantics the trap must preserve: the state dir goes
 # away when the guest does, not before.
 case_normal() {
-    local before after delta held
+    local held holders
     case_fail=0
-    before=$(df_used)
-    bg_launch || { reset_state; return; }
-    probe_discriminates || { reset_state; return; }
+    bg_launch || { case_abort; return; }
+    probe_discriminates || { case_abort; return; }
 
     sleep 3
     if ! kill -0 "$GUEST" 2>/dev/null; then
         say_fail "guest died ~3 s into a ${GUEST_TIMEOUT}s undisturbed run (pdeathsig firing early?)"
-        reset_state; return
+        case_abort; return
     fi
     [[ -d "$TMPD" ]] || say_fail "state dir removed while the guest was still running"
 
     if wait_gone "$GUEST" $(( (GUEST_TIMEOUT + 20) * 10 )); then
         say_fail "watchdog never reaped the guest"
-        reset_state; return
+        case_abort; return
     fi
     sleep 1
     [[ -e "$TMPD" ]] && say_fail "undisturbed run left its state dir: $TMPD"
     held=$(held_count)
     [[ "$held" -ne 0 ]] && say_fail "undisturbed run left $held process(es) holding $TMPD"
-    after=$(df_used); delta=$(( after - before ))
-    [[ "$delta" -gt "$NOISE_KB" ]] && say_fail "undisturbed run leaked ${delta} KB of /dev/shm"
+    holders=$(base_holders)
+    [[ -n "$holders" ]] && say_fail "undisturbed run left files of $BASE held open: $holders"
 
     rm -rf "$BASE"; reset_state
     [[ "$case_fail" -eq 0 ]] && echo "  PASS: undisturbed --background run lives its full timeout, then self-cleans"
@@ -184,11 +212,10 @@ case_normal() {
 
 # --- Case 2 (shape A): SIGTERM the cleanup-owner subshell -------------------
 case_shape_a() {
-    local before after delta held pre_orphans post_orphans
+    local held holders post_orphans
     case_fail=0
-    before=$(df_used); pre_orphans=$(orphan_qemus)
-    bg_launch || { reset_state; return; }
-    probe_discriminates || { reset_state; return; }
+    bg_launch || { case_abort; return; }
+    probe_discriminates || { case_abort; return; }
 
     kill -TERM "$OWNER" 2>/dev/null
 
@@ -202,17 +229,16 @@ case_shape_a() {
 
     if wait_gone "$GUEST" $(( (GUEST_TIMEOUT + 20) * 10 )); then
         say_fail "shape A: orphaned watchdog never reaped the guest"
-        reset_state; return
+        case_abort; return
     fi
     sleep 1
     [[ -e "$TMPD" ]] && say_fail "shape A: state dir survived the killed owner: $TMPD"
     held=$(held_count)
     [[ "$held" -ne 0 ]] && say_fail "shape A: $held process(es) still hold $TMPD"
-    after=$(df_used); delta=$(( after - before ))
-    [[ "$delta" -gt "$NOISE_KB" ]] && say_fail "shape A: leaked ${delta} KB of /dev/shm"
+    holders=$(base_holders)
+    [[ -n "$holders" ]] && say_fail "shape A: files of $BASE still held open: $holders"
     post_orphans=$(orphan_qemus)
-    [[ "$post_orphans" -gt "$pre_orphans" ]] \
-        && say_fail "shape A: ppid-1 qemu orphans $pre_orphans -> $post_orphans"
+    [[ "$post_orphans" -ne 0 ]] && say_fail "shape A: $post_orphans ppid-1 qemu orphan(s) on $BASE"
 
     rm -rf "$BASE"; reset_state
     [[ "$case_fail" -eq 0 ]] && echo "  PASS: shape A (SIGTERM owner) reclaims the state dir"
@@ -225,11 +251,10 @@ case_shape_a() {
 # dir forever. Kill the guest with its watchdog and the leak stops protecting
 # itself, which is all this case asserts.
 case_shape_b() {
-    local before after delta held pre_orphans post_orphans
+    local held holders post_orphans
     case_fail=0
-    before=$(df_used); pre_orphans=$(orphan_qemus)
-    bg_launch || { reset_state; return; }
-    probe_discriminates || { reset_state; return; }
+    bg_launch || { case_abort; return; }
+    probe_discriminates || { case_abort; return; }
     local guest="$GUEST" tmpd="$TMPD"
 
     kill -KILL "$OWNER" "$HANDLE" 2>/dev/null
@@ -242,16 +267,14 @@ case_shape_b() {
     held=$(held_count)
     [[ "$held" -ne 0 ]] && say_fail "shape B: $held process(es) still hold $tmpd — sweeper stays blind"
     post_orphans=$(orphan_qemus)
-    [[ "$post_orphans" -gt "$pre_orphans" ]] \
-        && say_fail "shape B: ppid-1 qemu orphans $pre_orphans -> $post_orphans"
+    [[ "$post_orphans" -ne 0 ]] && say_fail "shape B: $post_orphans ppid-1 qemu orphan(s) on $BASE"
 
-    # The sweeper's job, done here so the test is self-contained. The df check
-    # AFTER our own rm is the deleted-inode check: if anything were still
-    # holding the disk, tmpfs would not give the pages back.
+    # The sweeper's job, done here so the test is self-contained. The holder
+    # check AFTER our own rm is the deleted-inode check: anything still holding
+    # the disk keeps tmpfs from giving the pages back.
     rm -rf "$BASE"; sleep 0.5
-    after=$(df_used); delta=$(( after - before ))
-    [[ "$delta" -gt "$NOISE_KB" ]] \
-        && say_fail "shape B: ${delta} KB of /dev/shm unreclaimed after removing the dir"
+    holders=$(base_holders)
+    [[ -n "$holders" ]] && say_fail "shape B: files of $BASE held open after removing the dir: $holders"
 
     reset_state
     [[ "$case_fail" -eq 0 ]] && echo "  PASS: shape B (SIGKILL owner+watchdog) leaves no immortal guest"

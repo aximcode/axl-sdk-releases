@@ -1,0 +1,27 @@
+# CPackConfig-release.cmake -- generated from cmake/CPackConfig.cmake.in.
+#
+# The settings every release archive shares. WHICH archive -- its file name,
+# its versioned root and the tree;project;component;/ quadruples it installs
+# -- is passed by scripts/make-release-assets.sh (`cpack -D ...`), the one
+# owner of the asset names, so a CPack default can never name one.
+#
+# THE EXTERNAL GENERATOR, not TGZ (docs/AXL-Build-System-Design.md §10.18).
+# CPack installs the components into its staging tree, and
+# cmake/AxlPackTar.cmake packs that tree with the deterministic tar line the
+# release has always used. CPack's own archive writer cannot be made
+# reproducible: it records the builder's user and group NAMES, and it lists
+# entries in the staging directory's readdir order -- which on ext4 differs
+# from one filesystem to the next, so two runners gave two archives.
+set(CPACK_GENERATOR "External")
+set(CPACK_EXTERNAL_ENABLE_STAGING ON)
+set(CPACK_EXTERNAL_PACKAGE_SCRIPT "@AXL_CMAKE_DIR@/AxlPackTar.cmake")
+set(CPACK_EXTERNAL_REQUESTED_VERSIONS "1.0")
+set(CPACK_PACKAGE_NAME "axl-sdk")
+set(CPACK_PACKAGE_VERSION "@_axl_ver@")
+set(CPACK_PACKAGE_DESCRIPTION "AXL SDK -- the AximCode Library for UEFI")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "AXL SDK -- the AximCode Library for UEFI")
+set(CPACK_CMAKE_GENERATOR "Ninja")
+# The versioned root is CPACK_PACKAGING_INSTALL_PREFIX (/axl-sdk-<v>), and
+# AxlPackTar.cmake archives exactly that one directory: the root says which
+# SDK this is, the file name which host it runs on.
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)

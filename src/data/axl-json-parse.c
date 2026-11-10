@@ -2049,6 +2049,25 @@ axl_json_check_duplicate_keys(const char *json, const AxlJsonTok *toks,
 // AXL_JSON_UTF8_STRICT on read (P7)
 // ---------------------------------------------------------------------------
 
+/* COLLAPSING THIS ONTO axl_utf8_validate() (axl-str.h) IS POSSIBLE BUT NOT A
+ * RENAME, and the difference is one byte value.
+ *
+ * Everything else lines up: both walk a counted range, both refuse overlongs,
+ * surrogates and anything above U+10FFFF, and both report the first byte of
+ * the first ill-formed SEQUENCE (for `C3 28`, the lead), which is the offset
+ * this function's err->offset already carries.
+ *
+ * NUL is where they part. This loop passes every byte below 0x80, NUL
+ * included, and a raw NUL really does survive lexing: skip_ws's line- and
+ * block-comment loops walk a comment body looking only for its terminator,
+ * and this check runs only after a successful parse. So a document parsed with
+ * AXL_JSON_UTF8_STRICT | AXL_JSON_ALLOW_COMMENTS carrying a NUL in a comment
+ * is ACCEPTED today, and axl_utf8_validate() refuses a NUL by contract.
+ *
+ * A collapse is therefore behaviour-preserving only if it STEPS OVER NUL: call
+ * axl_utf8_validate(); when it fails with `*endptr == '\0'`, resume at
+ * `endptr + 1`. Refusing NUL here instead is a JSON behaviour change (comment
+ * bodies would become AXL_JSON_ERR_BAD_UTF8) and needs its own decision. */
 bool
 axl_json_check_utf8_strict(const char *json, size_t len, AxlJsonError *err)
 {

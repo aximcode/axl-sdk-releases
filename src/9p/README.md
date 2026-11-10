@@ -92,10 +92,11 @@ Three gotchas the code encodes and the tests pin down:
   part of removing it (on both success and error). The client does
   **not** send a separate `Tclunk` afterward — doing so would be a
   double-clunk against a fid the server has already retired.
-- `axl_9p_rename` issues a `Trename` and, if the server refuses it with
-  `Rlerror(EXDEV)` — which `Axl9pServer` does for every cross-directory
-  rename, see "Rename is same-directory only" below — **falls back to
-  copy-then-unlink on the client**, the same degradation `mv(1)` and every
+- `axl_9p_rename` issues a `Trename` -- rename(2): an existing
+  destination is replaced atomically, by a POSIX server and by
+  `Axl9pServer` alike -- and, if the server refuses it with
+  `Rlerror(EXDEV)` (a move between two of its filesystems), **falls back
+  to copy-then-unlink on the client**, the same degradation `mv(1)` and every
   other `rename(2)` caller performs. The fallback is deliberately bounded
   and its partial-failure modes are visible rather than papered over:
   a **directory** is refused with `AXL_ERR` (a recursive tree copy has
@@ -109,10 +110,10 @@ Three gotchas the code encodes and the tests pin down:
   destination** rather than overwriting it — `rename(2)`'s permission to
   clobber is only safe because the replacement is atomic, and a
   copy-then-unlink is not (a session drop mid-copy would leave the
-  destination corrupted rather than either whole file) — matching the
-  same-directory path against `Axl9pServer`, which refuses a taken
-  destination with `EEXIST` too. A caller that wants replace semantics
-  removes the destination first. The copy also does **not preserve mode,
+  destination corrupted rather than either whole file). A caller that
+  wants replace semantics removes the destination first. The volume
+  `axl_9p_mount` publishes never uses this fallback (see "Mount"). The
+  copy also does **not preserve mode,
   mtime, or ownership**: the write path creates the destination at mode
   0644 with a fresh mtime under the attach user, inert against AXL's own
   FAT-backed server but not against a POSIX-backed one (diod,
@@ -146,6 +147,12 @@ Two contracts to keep straight:
   mount — call `axl_9p_unmount` before `axl_9p_disconnect`;
   disconnecting first leaves the mount's fids pointing at a dead
   socket.
+- **Paths stop at 511 characters.** The mount is an AxlFsProvider
+  volume, which takes paths of up to 511 UCS-2 units below `fsN:` --
+  for AXL calls and the Shell's own commands alike (see AxlFs, "Path
+  length"). A host file deeper than that is not reachable through the
+  mount, though `axl_9p_read_file` and friends reach it directly (up to
+  `AXL_9P_PATH_MAX`, 1536 bytes).
 - **`read_only` is enforced in the bridge itself**, not just
   documented: passing `true` wires `write`/`del`/`set_info` out of the
   `AxlFsProvider` vtable entirely (`NULL` callbacks, which the
@@ -153,6 +160,22 @@ Two contracts to keep straight:
   `Open` rejects `AXL_FS_OPEN_WRITE`/`AXL_FS_OPEN_CREATE` up front — a
   read-only mount can't be coaxed into a write via some other
   `EFI_FILE_PROTOCOL` entry point.
+
+The mount is a version-2 provider. Every name change -- in a directory or
+to another one -- goes to its `rename` callback, which sends `Trename` on
+the file's OWN fid (never a path remembered at open, so the move cannot
+land on whatever else now has that path) and never copies: a server that
+answers `EXDEV` leaves it `AXL_FS_ERR_UNSUPPORTED`, so `axl_file_rename`
+reports `AXL_UNSUPPORTED` and `axl_file_move` copies with its own undo
+rules. `axl_9p_rename`'s client-side copy fallback is never used here. A
+`Trename` replaces an existing destination on a POSIX server, so the mount
+walks it first and refuses another entry there (`AXL_FS_ERR_ACCESS_DENIED`);
+the same entry under another spelling -- the same `qid.path` -- is not
+"another". `set_info` sends `Tsetattr`: the size first (only when it
+differs), then the time (`MTIME|MTIME_SET`), so `axl_file_truncate` and
+`axl_file_set_mtime` work through the mount. Attributes have no 9P2000.L
+counterpart and are accepted unchanged. A listed name too long for
+`AxlFsEntry.name` is skipped with a warning, never cut.
 
 The `fsN:` shell-mapping assignment on publish (and its best-effort
 fallback when no shell is present, e.g. a DXE driver) is
@@ -200,7 +223,9 @@ if (axl_9p_server_new(loop, "fs0:\\9pexport", false, &s) == AXL_OK
   with `EFI_INVALID_PARAMETER`. The trade is the usual one — the RST discards
   any un-ACKed tail of an in-flight reply, and clients see a reset rather
   than a clean FIN. Connections dropped while the server is *running* are
-  unaffected: those still get a graceful FIN.
+  unaffected: those still get a graceful FIN, unless the close would drop
+  part of a reply not yet handed to the firmware -- `axl_tcp_close` makes
+  such a close abortive.
 
 ### Messages implemented
 
@@ -233,7 +258,7 @@ refuse the same fid.
 | Connection pool | 8, fixed | the `S9pConn` slot array is preallocated, so the CONNECTION COUNT is bounded with no allocation. Each accept still allocates that slot's `rbuf` and `txbuf` (`msize` bytes each, 8 KiB at the default), and the reap frees them |
 | Fids per connection | 128 | bounds worst-case firmware handles |
 | `msize` | 8 KiB default, negotiated up to 128 KiB | `rbuf`/`txbuf` grow to the negotiated value and never shrink |
-| `msize` floor | 512 | below it a session cannot carry a useful request; `Tversion` refuses with `Rversion(..., "unknown")` |
+| `msize` floor | 1024 | below it a maximal `Rreaddir` record (a 765-byte name) cannot fit one reply; `Tversion` refuses with `Rversion(..., "unknown")`, and the client refuses a server that negotiates less |
 | Page cache | 64 KiB × 16 frames = 1 MiB, **server-wide** | one shared `AxlPageCache` for every open file fid on every connection — per-fid pools would let 8 conns × 128 fids multiply the budget a thousandfold |
 
 ### v1 limits and deliberate deviations
@@ -242,7 +267,11 @@ These are decisions, not omissions. Each one is here because the
 alternative was worse on this platform.
 
 **`qid.path` is a hash of the path, not an inode.** It is FNV-1a over the
-export path string; `qid.version` is always 0. Consequence: a rename
+export path in the spelling the filesystem STORES -- `Twalk` replaces each
+component with the stored name, so on FAT `a.txt`, `A.TXT` and an 8.3
+alias walk to one fid path and one `qid.path` (what lets a client, the 9P
+mount among them, tell "the file itself" from "another file"); readdir
+records hash the same stored names. `qid.version` is always 0. Consequence: a rename
 changes a node's `qid.path`, so two qids for "the same" file across a
 rename do not match, and in principle two distinct paths could collide.
 `AxlFs` exposes no inode or file index to source a stable identity from; a
@@ -281,19 +310,26 @@ Shrinks move no data, so they are not bounded. No free-space check
 accompanies the ceiling: `AxlFs` has no volume-free-space API, so a grow
 that fits the bound but not the volume still fails, as `Rlerror(EIO)`.
 
-**Rename is same-directory only; cross-directory answers `EXDEV`.**
-`axl_file_rename` refuses a cross-directory rename outright (most UEFI FAT
-drivers cannot move a node between directories via `SetFileInfo`), and the
-only fallback — `axl_file_move` — is an unbounded, synchronous whole-file
-copy: the same single-loop stall the grow ceiling exists to prevent, except
-a rename has no natural ceiling to apply. `EXDEV` is chosen because it is
-exactly what a `rename(2)` caller already knows how to handle: `mv(1)`,
-coreutils and the Linux 9p client all fall back to copy-then-unlink on it,
-which comes back as ordinary bounded `Twrite`s the loop can interleave. So
-this **degrades** rather than breaking — for a POSIX client and, since the
-`EXDEV` fallback landed, for our own `axl_9p_rename` too (see the client's
-write-path section above for the fallback's bounds and its
-both-paths-exist failure mode).
+**`Trename` is rename(2).** The server answers it with `axl_file_replace`
+(no flags): an existing destination -- a file, or an EMPTY directory -- is
+replaced, a node moves between directories of the export in one
+`SetFileInfo` and no data is copied, and a change of letter case alone
+takes. Every refusal is rename(2)'s, mapped as the newlib `rename()` maps
+it (`src/cxxrt/axl-cxxrt-stubs.c`): `ENOENT`, `ENOTDIR`, `EISDIR`,
+`ENOTEMPTY`, `EINVAL` (a directory into itself), `EACCES` (a read-only
+entry) or `EROFS` (a read-only volume), `ENOSPC`, `EINTR` (a Ctrl-C undid
+it), and `EXDEV` where the filesystem cannot move the node as one rename (a
+provider without a `rename` callback under the export) -- which `mv(1)`,
+coreutils and the Linux 9p client answer by copying on their side, in
+ordinary bounded `Twrite`s the loop can interleave. The server never copies:
+a whole-file copy on its single loop would be the stall the grow ceiling
+exists to prevent.
+
+Fids are path-based, so a replace is visible to OTHER fids: one that named
+the replaced destination now names whatever is at that path -- the moved
+node -- and `qid.path`, a hash of the path, is reused for it; bytes another
+fid wrote to the replaced file and has not flushed are lost with it, as
+POSIX loses an unlinked file's.
 
 A renamed fid is also left **bound but closed** — its open handles are
 dropped before the rename and are not reopened after, so it must be
@@ -330,17 +366,21 @@ firmware accepted the flush; it is not a claim about what the device did
 below that. Closing alone is *not* a durability point in AXL and is not
 treated as one here — see `src/stream/README.md`.
 
-**Times are accepted and discarded.** `Tsetattr` honors `ATTR_SIZE` only.
-`mode`/`uid`/`gid` are no-ops because `AxlFs` has no POSIX permission or
-ownership model, and `atime`/`mtime` are no-ops because the SDK exposes no
-mtime setter at all. Concretely: `Tsetattr(ATTR_MTIME)` cannot set an
-mtime, because there is nothing in `AxlFs` to set one with — a Linux client
-that issues `utimensat(2)` gets `Rsetattr` and no change. Whether the
-underlying FAT driver bumps mtime **on its own** when a `Twrite` or a
-size change lands is firmware behavior that nothing in this tree pins or
-promises, so do not read this as "mtime never moves". `Rsetattr` carries no
-field asserting what was set, so the reply is not lying — but a client
-relying on the server to maintain mtime should not.
+**`Tsetattr` sets the size, then the modification time.** `ATTR_SIZE`
+resizes (bounded, above), and `ATTR_MTIME` sets the time through
+`axl_file_set_mtime` -- through the fid's own write stream when it holds
+one, so bytes still buffered there cannot land at the clunk and stamp the
+current time over it (write, `Tsetattr`, `Tclunk` is what `cp -p` sends).
+With `ATTR_MTIME_SET` the time is the one sent (nanoseconds dropped; FAT
+keeps two-second steps); without it, it is "now" as the FAT driver stamps
+it -- the RTC's calendar fields, zone ignored. A time FAT cannot keep is
+CLAMPED, as Linux vfat clamps it: below to 1981-01-01
+(`AXL_FS_MTIME_KEPT_MIN` -- the EDK2 driver drops the year of a 1980 time)
+and above to 2107-12-31 (`AXL_FS_MTIME_MAX`), so `cp -p` of an
+epoch-stamped file succeeds. `mode`/`uid`/`gid` are no-ops because `AxlFs`
+has no POSIX permission or ownership model, and `atime` because FAT stamps
+its own. A size change alone does not bump the time: `axl_file_truncate`
+writes the file's existing times back.
 
 **The export is close-to-open consistent, not coherent.** This is the
 `AxlFileView` consistency model (see `src/fs/README.md`) reaching the wire,
@@ -415,8 +455,8 @@ tested.
 ## Tool
 
 `tools/9p.c` is the shell front end over everything above — `9p.efi`, a
-first-class tool with its own Makefile recipe rather than a busybox
-subcommand, because it links two embedded DXE driver images and the
+first-class tool with its own link rule (`tools/CMakeLists.txt`) rather than a
+busybox subcommand, because it links two embedded DXE driver images and the
 multiplexer's one-object-per-tool rule cannot express that.
 
 ```
@@ -497,9 +537,11 @@ copy-then-unlink fallback), documented under "Write path" above.
   byte-exact, list, write/read-back, truncate-existing, chunked
   multi-`msize` round-trip, mkdir, remove, rename, and a cross-directory
   rename the fixture refuses with `Rlerror(EXDEV)` so the client's
-  copy-then-unlink fallback is exercised against the same answer
-  `Axl9pServer` gives — then `9p-mount-selftest.efi` mounts the same
-  server as a UEFI `fsN:` volume and proves the mount path end to end.
+  copy-then-unlink fallback is exercised -- then `9p-mount-selftest.efi`
+  mounts the same server as a UEFI `fsN:` volume and proves the mount path
+  end to end, including a cross-directory `Trename` (allowed below the
+  fixture's `/mv`, where only a rename can fill `/mv/b`), the `EXDEV`
+  mapping, and `Tsetattr` size and time.
   (Both arches, by its `test-meta` line.)
 - **Server** — `test/integration/test-9p-server-qemu.sh`, both arches: the
   inverse topology. A guest app (`9p-server-selftest.efi`) seeds a tree, exports it
@@ -507,8 +549,9 @@ copy-then-unlink fallback), documented under "Write path" above.
   QEMU forwards a host port to it and `p9-client.py` drives the whole
   functional surface plus an adversarial layer — malformed and **pipelined**
   frames, counts that lie about the frame, 64-bit offsets and dirent
-  cursors, a full fid table, `EFBIG`, `EXDEV`, and the `EROFS` gate on every
-  mutating message against a second read-only export. Assertions are the
+  cursors, a full fid table, `EFBIG`, rename(2)'s replace and refusals,
+  `Tsetattr` times, and the `EROFS` gate on every mutating message against
+  a second read-only export. Assertions are the
   host client's own stdout matched exactly, never a grep of the guest's log
   — the server is never graded on its own testimony.
 - **Tool, client side** — `test/integration/test-9p-tool-qemu.sh`, both

@@ -51,6 +51,27 @@
     `-fno-rtti`, which is why it shares those flags with the terminate
     handler). Consumer translation units are unaffected and stay `-fno-rtti`.
 
+    @par No emergency pool
+
+    This file also defines the five symbols libsupc++'s `eh_alloc.o` exports
+    (`__cxa_allocate_exception`, `__cxa_free_exception`, the two dependent
+    forms, `__gnu_cxx::__freeres`), so that member is never pulled onto a
+    `--no-eh-frame` link. It carried the emergency exception pool: a static
+    constructor that malloc'd ~1.1 KiB before `main` in every C++ image, to
+    serve exception allocations when the heap is exhausted -- for a throw this
+    build can only halt on. Measured: that constructor was the ONLY allocation
+    in a C++ image that never mallocs, so it alone committed newlib's 1 MiB
+    arena and linked its allocator (~17.5 KB of image). Without it such an
+    image takes no C heap at all (test-heap-release-qemu.sh).
+
+    The storage still carries the ABI's 128-byte header in front of the
+    object, zeroed, exactly as eh_alloc lays it out. A throw never needs it
+    (the interceptor below halts first), but with `-frtti`
+    std::make_exception_ptr is the real one even under -fno-exceptions, and
+    libsupc++'s __cxa_init_primary_exception writes that header and
+    ~exception_ptr reads its refcount. Plain storage had that write land on
+    the heap block before it (test-heap-release-qemu.sh, `EHPTR`).
+
     @par What a consumer gives up
 
     Real `try`/`catch`. A handler in a `--no-eh-frame` image can never run,
@@ -60,8 +81,18 @@
     diagnostics trade and a correctness one.
 **/
 
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <typeinfo>
+
+/* sizeof(__cxa_refcounted_exception), which no installed header declares.
+   Read off the toolchain's own eh_alloc.o on BOTH arches: its
+   __cxa_allocate_exception mallocs thrown_size + 0x80 and returns +0x80, and
+   its __cxa_free_exception subtracts 0x80. A multiple of 16, so the object
+   keeps malloc's alignment. A different value would have libsupc++ write the
+   header outside the block, which the EHPTR check sees. */
+#define AXL_CXA_HEADER_SIZE 128u
 
 extern "C" {
 
@@ -108,4 +139,71 @@ __wrap___cxa_throw(
     __builtin_unreachable();
 }
 
+/**
+ * Storage for a thrown object. Out of memory is std::terminate, as the ABI
+ * specifies -- the case the emergency pool existed for, and one this build
+ * can only halt on either way.
+ */
+void *
+__cxa_allocate_exception(
+    std::size_t thrown_size   ///< size of the object being thrown
+) noexcept
+{
+    auto *p = static_cast<unsigned char *>(
+        std::malloc(thrown_size + AXL_CXA_HEADER_SIZE));
+
+    if (p == nullptr) {
+        std::terminate();
+    }
+    std::memset(p, 0, AXL_CXA_HEADER_SIZE);
+    return p + AXL_CXA_HEADER_SIZE;
+}
+
+/** Releases what __cxa_allocate_exception returned (a throw site does, if the
+ *  object's constructor itself throws). */
+void
+__cxa_free_exception(
+    void *thrown   ///< the object's storage
+) noexcept
+{
+    std::free(static_cast<unsigned char *>(thrown) - AXL_CXA_HEADER_SIZE);
+}
+
+/**
+ * For std::rethrow_exception, which raises through the unwinder -- which a
+ * --no-eh-frame image cannot do (with -frtti an exception_ptr can exist, but
+ * rethrowing one has no tables to unwind with). Halts with a name rather
+ * than reach that.
+ */
+void *
+__cxa_allocate_dependent_exception(
+    void
+) noexcept
+{
+    axl_print("terminate: dependent exception requested "
+              "(image linked --no-eh-frame)\n");
+    axl_exit(1);
+    __builtin_unreachable();
+}
+
+/** Counterpart of the above; never has anything to free. */
+void
+__cxa_free_dependent_exception(
+    void *dependent   ///< unused
+) noexcept
+{
+    (void)dependent;
+}
+
 } // extern "C"
+
+namespace __gnu_cxx {
+
+/** libsupc++ frees its emergency pool here; this build has none. Defined so
+ *  that nothing pulls eh_alloc.o for it. */
+void
+__freeres() noexcept
+{
+}
+
+} // namespace __gnu_cxx

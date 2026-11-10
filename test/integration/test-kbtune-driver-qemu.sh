@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=X64 est=13 local-only=1
+# test-meta: arch=both est=13 local-only=1 builds=kbtune-drv,kbtune-drv-test guest=plain
 # test-kbtune-driver-qemu.sh — hazard-safe lifecycle test for the kbtune-drv
 # resident console-conditioning shim.
 #
@@ -27,7 +27,7 @@ DRV="$(test_build_dir "$_arch_lc")/tools/kbtune-drv.efi"
 APP="$(test_build_dir "$_arch_lc")/kbtune-drv-test.efi"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 
-make -C "$PROJECT_DIR" ARCH="$_arch_lc" kbtune-drv kbtune-drv-test >/dev/null 2>&1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_arch_lc" kbtune-drv kbtune-drv-test >/dev/null 2>&1
 if [[ ! -f "$DRV" || ! -f "$APP" ]]; then
     echo "WARN: kbtune-drv / test app not built; skipping."
     echo "test-kbtune-driver: SKIP"; exit 0
@@ -39,7 +39,8 @@ WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 NSH="$WORK/kbt.nsh"
 printf '@echo -off\nkbtune-drv-test.efi\nreset -s\n' > "$NSH"
 
-# Stage the driver as a sibling of the test app (both land at the fsN: root, so
+# Stage the driver as a sibling of the test app (both land in the run's
+# directory -- the fsN: root booted, the lease's share directory pooled -- so
 # axl_shared_driver_locate_sibling resolves kbtune-drv.efi).
 timeout 90 "$RUN_QEMU" --arch "$TEST_ARCH" --nsh "$NSH" \
     --extra "$DRV:kbtune-drv.efi" \

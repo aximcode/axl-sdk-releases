@@ -21,6 +21,14 @@
 
     The unit harness boots single-core, so this is an integration test run
     under `-smp 4` (test-task-pool-mp-qemu.sh). Single-core boots SKIP.
+
+    `--pools N` cycles N pools instead of enough to exhaust the slot table,
+    requires each to count the same workers as the first, and stops there,
+    skipping the waves. test-task-pool-mp-starved-qemu.sh runs it that way
+    with the APs' host threads starved: what it pins is how long
+    axl_task_pool_new waits for a descheduled AP, which every cycle
+    exercises, while each starved cycle costs about a second and the waves
+    would add minutes of a starved guest crawling through work.
 **/
 
 #include <axl.h>
@@ -55,7 +63,17 @@ stress_task(AxlArena *arena, void *arg)
 int
 main(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
+    uint16_t pools_only = 0;    /* --pools N: N cycles, then stop */
+    if (argc == 3 && axl_strcmp(argv[1], "--pools") == 0) {
+        if (axl_str_to_u16(argv[2], 10, &pools_only, NULL) != AXL_OK ||
+            pools_only == 0) {
+            axl_printf("MP-POOL: FAIL bad --pools count '%s'\r\n", argv[2]);
+            return 1;
+        }
+    } else if (argc != 1) {
+        axl_printf("MP-POOL: FAIL usage: task-pool-mp-selftest [--pools N]\r\n");
+        return 1;
+    }
 
     AxlTaskPool *pool = axl_task_pool_new();
     if (pool == NULL) {
@@ -70,8 +88,12 @@ main(int argc, char *argv[])
     }
 
     size_t W = axl_task_pool_worker_count(pool);
-    axl_printf("MP-POOL: %zu workers; %d waves x %d tasks\r\n",
-               W, WAVES, N_CHUNKS);
+    if (pools_only > 0) {
+        axl_printf("MP-POOL: %zu workers; %u pools\r\n", W, pools_only);
+    } else {
+        axl_printf("MP-POOL: %zu workers; %d waves x %d tasks\r\n",
+                   W, WAVES, N_CHUNKS);
+    }
 
     /* Worker slots come from a fixed static pool, not the heap, because an
        AP may write to its slot after the pool that dispatched it is gone.
@@ -84,7 +106,9 @@ main(int argc, char *argv[])
     /* Enough cycles to consume the whole table if nothing is reclaimed —
        anything less and a release that reclaims nothing still finds free
        entries and the check passes vacuously. */
-    const int reclaim_cycles = (int)(AXL_TASK_MAX_WORKERS / W) + 2;
+    const int reclaim_cycles = (pools_only > 0)
+                             ? (int)pools_only
+                             : (int)(AXL_TASK_MAX_WORKERS / W) + 2;
     for (int cycle = 0; cycle < reclaim_cycles; cycle++) {
         AxlTaskPool *p2 = axl_task_pool_new();
         size_t W2 = (p2 != NULL) ? axl_task_pool_worker_count(p2) : 0;
@@ -95,6 +119,11 @@ main(int argc, char *argv[])
             return 1;
         }
         axl_task_pool_free(p2);
+    }
+    if (pools_only > 0) {
+        axl_printf("MP-POOL: PASS (W=%zu, %d pools, every one counted all workers)\r\n",
+                   W, reclaim_cycles);
+        return 0;
     }
     pool = axl_task_pool_new();
     if (pool == NULL || axl_task_pool_worker_count(pool) != W) {

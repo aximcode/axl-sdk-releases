@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=140 local-only=1
+# test-meta: arch=x64 needs= est=140 local-only=1 builds=ARCH=x64,kbprobe guest=none
+# guest=none: not converted yet (pool design §6.7 step 8 item 10): a held
+#   key and a screenshot, a machine no class gives yet.
 # test-kbtune-bounce — reproduce the UEFI USB-keyboard typematic "bounce" in QEMU
 # (no hardware) and run the kbtune read-cadence A/B against it.
 #
@@ -53,7 +55,7 @@ RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 KBPROBE="$(test_build_dir x64)/kbprobe.efi"
 
 # Build the reader. A build failure is a real FAIL (it's the test's own fixture).
-if ! make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} kbprobe 2>&1 | tail -5; then
+if ! "$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 kbprobe 2>&1 | tail -5; then
     echo "kbtune-bounce test: FAIL (kbprobe build failed)"
     exit 1
 fi

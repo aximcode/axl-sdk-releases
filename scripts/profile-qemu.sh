@@ -23,7 +23,7 @@
 #   --out STEM             report path stem (default: /tmp/axl-profile)
 #   --port N               GDB stub TCP port (default: 1234)
 #   --build-dir DIR        axl build dir with the app's .so (default:
-#                          out/native-<arch>)
+#                          scripts/build-prefix.sh's tree)
 #   --ovmf-build-dir DIR   OVMF DEBUG build dir, to also symbolize firmware
 #                          frames (optional; unresolved firmware frames still
 #                          show as raw addresses, which distinguishes an
@@ -92,7 +92,7 @@ fi
 
 _arch_lc="$(echo "$ARCH" | tr 'A-Z' 'a-z')"
 [[ "$_arch_lc" == "aarch64" ]] && _arch_lc="aa64"
-[[ -z "$BUILD_DIR" ]] && BUILD_DIR="$PROJECT_DIR/out/native-$_arch_lc"
+[[ -z "$BUILD_DIR" ]] && BUILD_DIR="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$_arch_lc")"
 # gdb-syms.py requires a --build-dir; when no OVMF dir is given, point it at
 # the axl build dir so the arg is satisfied and only app frames resolve.
 [[ -z "$OVMF_BUILD_DIR" ]] && OVMF_BUILD_DIR="$BUILD_DIR"
@@ -113,7 +113,11 @@ cleanup() {
     [[ -n "$QEMU_TMPDIR" ]] && rm -rf "$QEMU_TMPDIR"
     rm -rf "$WORK"
 }
-trap cleanup EXIT INT TERM
+# INT/TERM run the cleanup and END the script (axl_trap_cleanup). A plain
+# `trap cleanup EXIT INT TERM` resumed after it: the next step then failed on
+# the files the cleanup had just removed and reported that failure --
+# "gdb-syms.py failed" -- as the verdict on a run that had been killed.
+axl_trap_cleanup cleanup
 
 # --- 1. launch the app under QEMU + the GDB stub, in the background ---------
 echo "[profile] booting $APP under QEMU (--gdb :$PORT, TCG)..." >&2
@@ -152,25 +156,18 @@ fi
 # --- 2b. measure QEMU's host CPU over a settle window ----------------------
 # A quick "is it even spinning?" verdict up front, so a profile that turns out
 # to be an idle/HLT wait is called out as such before it confuses anyone. We
-# sample QEMU_PID's utime+stime delta over CPU_WINDOW (robust to a comm with
-# spaces) and express it in cores; a busy TCG vCPU pegs ~1.0 core, an idle/
-# HLT-bound guest sits near 0.
+# sample the REAL qemu process (QEMU_PID is the `timeout` wrapper, whose own CPU
+# is ~0 -- sampling it always said "idle") over CPU_WINDOW and express the
+# utime+stime delta in cores; a busy TCG vCPU pegs ~1.0 core, an idle/HLT-bound
+# guest sits near 0. If the real pid cannot be found or read, fail: a verdict of
+# "idle" from a process that was never measured is the one wrong answer here.
 CPU_WINDOW=2
-qemu_cpu_cores() {   # $1 = pid ; echoes cores over CPU_WINDOW seconds
-    local pid="$1" hz s1 s2 t1 t2 st
-    hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
-    st="$(cat "/proc/$pid/stat" 2>/dev/null)" || { echo "0"; return; }
-    # Fields after the "(comm)" are utime(#14),stime(#15) => idx 11,12 of the tail.
-    read -r -a t1 <<<"${st##*) }"
-    s1=$(( ${t1[11]:-0} + ${t1[12]:-0} ))
-    sleep "$CPU_WINDOW"
-    st="$(cat "/proc/$pid/stat" 2>/dev/null)" || { echo "0"; return; }
-    read -r -a t2 <<<"${st##*) }"
-    s2=$(( ${t2[11]:-0} + ${t2[12]:-0} ))
-    awk -v d="$(( s2 - s1 ))" -v hz="$hz" -v w="$CPU_WINDOW" \
-        'BEGIN { printf "%.2f", (hz > 0 && w > 0) ? d / hz / w : 0 }'
-}
-CORES="$(qemu_cpu_cores "$QEMU_PID")"
+REAL_QEMU_PID="$(qemu_real_pid "$QEMU_PID")" || {
+    echo "[profile] cannot measure QEMU CPU: no qemu process under pid $QEMU_PID" >&2
+    exit 1; }
+CORES="$(proc_cpu_cores "$REAL_QEMU_PID" "$CPU_WINDOW")" || {
+    echo "[profile] cannot measure QEMU CPU: qemu pid $REAL_QEMU_PID unreadable" >&2
+    exit 1; }
 # ~half a core sustained is the busy/idle boundary (a spinning vCPU pegs one).
 SPINNING=$(awk -v c="$CORES" 'BEGIN { print (c + 0 >= 0.5) ? 1 : 0 }')
 if [[ "$SPINNING" == 1 ]]; then

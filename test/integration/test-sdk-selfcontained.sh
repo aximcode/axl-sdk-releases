@@ -50,6 +50,16 @@ FAKE_HOME="$WORK/home"
 PREFIX="$WORK/pfx"
 mkdir -p "$FAKE_HOME"
 
+# The pinned CMake first on PATH, from the REAL user's cache, before HOME is
+# replaced: install.sh runs `cmake --install` and so takes the pin
+# (scripts/axl-cmake-pin.sh), which with nothing on PATH would download it
+# into the fake HOME's cache. That cache is the BUILD tool's, not something
+# the install leaves for the user, and CI has the pin on PATH already --
+# this is the state every real install.sh run from a checkout is in.
+# shellcheck source=../../scripts/axl-cmake-pin.sh
+source "$PROJECT_DIR/scripts/axl-cmake-pin.sh"
+axl_use_pinned_cmake || { test_host_fail "the pinned CMake is available"; exit 1; }
+
 if HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
    XDG_CACHE_HOME="$FAKE_HOME/.cache" XDG_DATA_HOME="$FAKE_HOME/.local/share" \
    "$PROJECT_DIR/scripts/install.sh" --arch x64 --prefix "$PREFIX" \

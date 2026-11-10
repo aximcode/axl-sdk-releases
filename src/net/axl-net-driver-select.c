@@ -30,6 +30,7 @@
 #include <axl/axl-fv.h>   /* axl_fv_find_file_name — name an FV-dispatched driver */
 #include <axl/axl-watchdog.h>
 #include <axl/axl-net.h>
+#include <axl/axl-app.h>   /* axl_app_image_dir_path -- axl_net_driver_dir */
 
 AXL_LOG_DOMAIN("net");
 
@@ -48,6 +49,9 @@ AXL_LOG_DOMAIN("net");
 #define DP_MEDIA_FW_FILE    0x06   ///< driver dispatched from a firmware volume
 #define DP_END_TYPE         0x7F
 #define DP_END_SUBTYPE      0xFF
+
+/** Room for a drivers directory path axl_net_driver_dir builds. */
+#define AXL_NET_DRIVER_DIR_BUF  512
 
 /* Build-arch label for drivers/<arch>/ — mirrors the static driver_arch
    in src/util/axl-driver.c. axl-sdk builds per-arch, so a compile-time
@@ -228,8 +232,8 @@ read_driver_component_name(
     return (out[0] != '\0') ? AXL_OK : AXL_ERR;
 }
 
-/* Resolve a driver-image handle to a printable name. Prefers the on-disk .efi
-   filename (best for a staged/filesystem driver), then the driver's
+/* Resolve a driver-image handle to a printable name. Prefers the file path
+   the image was loaded from (best for a staged/filesystem driver), then the driver's
    ComponentName2 human name, then — for an FV-dispatched driver with neither —
    the module UI name read from its firmware volume (e.g. "Ip4Dxe"), and only
    then the opaque "<firmware volume>" / "<unknown>". Caller frees. */
@@ -250,8 +254,8 @@ resolve_driver_image_name(
         ImgNameCtx ctx = { 0 };
         axl_device_path_for_each(img->FilePath, resolve_driver_cb, &ctx);
         if (ctx.image_name != NULL) {
-            axl_debug("resolve: agent -> .efi filename '%s'", ctx.image_name);
-            return ctx.image_name;   /* .efi filename */
+            axl_debug("resolve: agent -> file path '%s'", ctx.image_name);
+            return ctx.image_name;   /* file path */
         }
         saw_fv       = ctx.saw_fv_node;
         have_fv_guid = ctx.have_fv_guid;
@@ -286,7 +290,9 @@ resolve_driver_image_name(
 
 /* Find the BY_DRIVER agent that has @p protocol_guid open on @p handle
    and resolve its image name. NULL if no BY_DRIVER agent exists. Caller
-   frees the returned string. */
+   frees the returned string. The first BY_DRIVER entry is the answer:
+   BY_DRIVER is exclusive per protocol instance, so UsbIo on an interface
+   handle and PciIo on a function each have at most one. */
 static char *
 find_by_driver_agent(
     EFI_HANDLE  handle,
@@ -364,14 +370,20 @@ resolve_driver_for_handle(
         handle_has_protocol(handle, &niig)   ? "NII"    :
         handle_has_protocol(handle, &snpg)   ? "SNP"    : NULL;
 
-    /* Name: the hardware driver (PCI then USB bus controller), then fall back to
-       the NII producer's agent for topologies with no discoverable bus node.
+    /* Name: the hardware driver -- the DEEPEST bus controller on the NIC's
+       path, so USB before PCI -- then fall back to the NII producer's agent
+       for topologies with no discoverable bus node. Order matters: a USB
+       NIC's path is PciRoot/Pci(host controller)/USB(..)/MAC(..), so a PCI
+       lookup succeeds on it too, stopping at the USB host controller, whose
+       BY_DRIVER agent is the host controller's driver, not the NIC's. A USB
+       node always sits below its host controller and a PCI NIC's path has no
+       USB node, so trying USB first picks the deeper controller in both cases.
        The source that first yields a (possibly-placeholder) name wins; the
        axl_debug lines trace which source that was so an unexpected
        "<firmware volume>" on real hardware can be pinned to a layer. */
-    char *name = find_bus_driver_name(handle, &pcig);
-    const char *src = "pci-bus";
-    if (name == NULL) { name = find_bus_driver_name(handle, &usbg); src = "usb-bus"; }
+    char *name = find_bus_driver_name(handle, &usbg);
+    const char *src = "usb-bus";
+    if (name == NULL) { name = find_bus_driver_name(handle, &pcig); src = "pci-bus"; }
     if (name == NULL) { name = find_by_driver_agent(handle, &nii31g); src = "nii3.1-agent"; }
     if (name == NULL) { name = find_by_driver_agent(handle, &niig); src = "nii-agent"; }
     axl_debug("resolve: layer=%s source=%s name=%s",
@@ -513,6 +525,18 @@ axl_net_list_available_drivers(
             if (axl_fs_entry_is_dir(&entry) || !is_driver_file(entry.name)) {
                 continue;
             }
+            /* A name or path AxlNetDriverFile cannot hold whole is skipped,
+               never cut: a cut path names another file, or none, and
+               axl_net_try_driver would load what it names. */
+            size_t nlen = axl_strlen(entry.name);
+            if (nlen >= sizeof(((AxlNetDriverFile *)0)->name)
+                || axl_strlen(dir_path) + 1 + nlen
+                       >= sizeof(((AxlNetDriverFile *)0)->path)) {
+                /* log-level: the list a UI offers cannot say it is short. */
+                axl_warning("net: driver file %s\\%s skipped: its name or path is "
+                            "too long to report whole", dir_path, entry.name);
+                continue;
+            }
             /* Entries are unique by full path: filenames are unique within
                a directory, and the volume name disambiguates across
                volumes — so no explicit dedup pass is needed. */
@@ -521,9 +545,7 @@ axl_net_list_available_drivers(
                 AxlNetDriverFile *f = &out[filled];
                 axl_memset(f, 0, sizeof(*f));
                 axl_strlcpy(f->name, entry.name, sizeof(f->name));
-                char full[320];
-                axl_snprintf(full, sizeof(full), "%s\\%s", dir_path, entry.name);
-                axl_strlcpy(f->path, full, sizeof(f->path));
+                axl_snprintf(f->path, sizeof(f->path), "%s\\%s", dir_path, entry.name);
                 f->size = entry.size;
                 filled++;
             }
@@ -597,6 +619,55 @@ path_has_separator(
         }
     }
     return false;
+}
+
+/* True when @dir opens as a directory. */
+static bool
+net_dir_exists(const char *dir)
+{
+    AxlDir *d = axl_dir_open(dir);
+    if (d == NULL) {
+        return false;
+    }
+    axl_dir_close(d);
+    return true;
+}
+
+int
+axl_net_driver_dir(char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+    out[0] = '\0';
+
+    /* Beside the image first (a release tarball's versioned directory is what
+       is copied to a stick), then the volume root (a stick laid out flat). The
+       answer is built at full size and copied once, so a short @p out fails
+       rather than settling on a shorter candidate further down the list. */
+    char beside[24];
+    char root[24];
+    char found[AXL_NET_DRIVER_DIR_BUF];
+    axl_snprintf(beside, sizeof(beside), "drivers\\%s", net_drv_arch);
+    axl_snprintf(root, sizeof(root), "\\drivers\\%s", net_drv_arch);
+    const char *const candidates[] = { beside, "drivers", root };
+    int rc = AXL_ERR;
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]) && rc == AXL_ERR; i++) {
+        if (axl_app_image_dir_path(candidates[i], found, sizeof(found)) == AXL_OK
+            && net_dir_exists(found)) {
+            rc = AXL_OK;
+        }
+    }
+    /* None exists: name the root's \drivers, where a flat stick would put them. */
+    if (rc == AXL_ERR && axl_app_image_dir_path("\\drivers", found, sizeof(found)) == AXL_OK) {
+        rc = AXL_NOT_FOUND;
+    }
+    if (rc == AXL_ERR || axl_strlcpy(out, found, out_size) >= out_size) {
+        out[0] = '\0';
+        return AXL_ERR;
+    }
+    return rc;
 }
 
 /* Filename heuristic only -- see the header doc for the two obligations
@@ -683,6 +754,67 @@ attribute_new_snp(
    asynchronously; let them appear before the before/after diff. */
 #define AXL_NET_TRY_SETTLE_MS  200
 
+/* axl_net_try_driver's body once the image is loaded (@p drv, NULL when the
+   load failed): start it, connect, and attribute the NICs it brought up
+   against @p before (freed here). @p name is for the iPXE check and the log. */
+static int
+try_loaded(
+    AxlDriverHandle  drv,
+    const char      *name,
+    void           **before,
+    size_t           n_before,
+    AxlNetTryResult *r
+    )
+{
+    if (drv == NULL) {
+        if (before != NULL) {
+            axl_free(before);
+        }
+        return AXL_ERR;   /* found = true, loaded = false */
+    }
+
+    EFI_STATUS st = (EFI_STATUS)axl_backend_start_image((void *)drv);
+    if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
+        axl_debug("try_driver: StartImage failed for '%s': 0x%llx",
+                  name, (unsigned long long)st);
+        axl_driver_unload(drv);
+        r->unloaded = true;
+        if (before != NULL) {
+            axl_free(before);
+        }
+        axl_backend_exit_if_deferred();
+        return AXL_ERR;
+    }
+    axl_backend_exit_if_deferred();
+    r->loaded = true;
+
+    /* iPXE arms a 5-min boot-services watchdog; disarm it (recognized
+       iPXE names only — see header). */
+    if (axl_net_driver_is_ipxe(name)) {
+        axl_watchdog_disarm();
+    }
+
+    axl_net_connect_stack();
+    axl_msleep(AXL_NET_TRY_SETTLE_MS);
+
+    attribute_new_snp(before, n_before, r);
+
+    if (before != NULL) {
+        axl_free(before);
+    }
+
+    if (r->snp_handles_added == 0) {
+        /* Bound nothing — roll back so the next candidate starts clean. */
+        axl_driver_unload(drv);
+        r->unloaded = true;
+        return AXL_ERR;
+    }
+    /* Success: the driver stays resident — hand its handle back so a caller
+       running its own sweep can drop it after a failed downstream check. */
+    r->driver = (void *)drv;
+    return AXL_OK;
+}
+
 int
 axl_net_try_driver(
     const char      *path_or_name,
@@ -713,51 +845,39 @@ axl_net_try_driver(
     size_t  n_before = snp_snapshot(&before);
 
     AxlDriverHandle drv = NULL;
-    if (axl_driver_load(load_path, &drv) != AXL_OK || drv == NULL) {
-        if (before != NULL) {
-            axl_free(before);
-        }
-        return AXL_ERR;   /* found = true, loaded = false */
+    if (axl_driver_load(load_path, &drv) != AXL_OK) {
+        drv = NULL;
     }
+    return try_loaded(drv, load_path, before, n_before, r);
+}
 
-    size_t exit_data_size = 0;
-    EFI_STATUS st = axl_efi_call(axl_bs()->StartImage, 3,
-        (EFI_HANDLE)drv, &exit_data_size, NULL);
-    if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
-        axl_debug("try_driver: StartImage failed for '%s': 0x%llx",
-                  load_path, (unsigned long long)st);
-        axl_driver_unload(drv);
-        r->unloaded = true;
-        if (before != NULL) {
-            axl_free(before);
-        }
+int
+_axl_net_try_driver_image(
+    const void      *image,
+    size_t           size,
+    const char      *name,
+    void            *device_handle,
+    AxlNetTryResult *r
+    )
+{
+    axl_memset(r, 0, sizeof(*r));
+    if (image == NULL || size == 0 || name == NULL || name[0] == '\0') {
         return AXL_ERR;
     }
-    r->loaded = true;
+    r->found = true;
 
-    /* iPXE arms a 5-min boot-services watchdog; disarm it (recognized
-       iPXE names only — see header). */
-    if (axl_net_driver_is_ipxe(load_path)) {
-        axl_watchdog_disarm();
+    void  **before = NULL;
+    size_t  n_before = snp_snapshot(&before);
+
+    /* The file name is the loaded image's identity, so `dh -v` and the
+       driver-info lookup name it as they would the file; the volume is its
+       DeviceHandle, as a load from that volume gives it (iPXE reads its
+       device path at entry, and fails without one). */
+    AxlEmbeddedImageInfo info = { .file_name = name, .device_handle = device_handle };
+    AxlDriverHandle      drv  = NULL;
+    if (axl_driver_load_buffer_with_image_info((const unsigned char *)image, size, &info,
+                                               &drv) != AXL_OK) {
+        drv = NULL;
     }
-
-    axl_net_connect_stack();
-    axl_msleep(AXL_NET_TRY_SETTLE_MS);
-
-    attribute_new_snp(before, n_before, r);
-
-    if (before != NULL) {
-        axl_free(before);
-    }
-
-    if (r->snp_handles_added == 0) {
-        /* Bound nothing — roll back so the next candidate starts clean. */
-        axl_driver_unload(drv);
-        r->unloaded = true;
-        return AXL_ERR;
-    }
-    /* Success: the driver stays resident — hand its handle back so a caller
-       running its own sweep can drop it after a failed downstream check. */
-    r->driver = (void *)drv;
-    return AXL_OK;
+    return try_loaded(drv, name, before, n_before, r);
 }

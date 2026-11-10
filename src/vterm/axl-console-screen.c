@@ -563,8 +563,12 @@ emit_grid(Emitter *e, const AxlConsoleScreen *s, const ScreenCell *grid, AxlCons
     }
 }
 
-int
-axl_console_screen_snapshot(const AxlConsoleScreen *s, AxlConsoleScreenSink sink, void *user)
+/* The serializer behind both snapshots. @p active_only repaints just the grid on
+   show, with no 1049 switch: what an encoder writes AFTER its own 1049 switch to
+   carry the visible screen across it (see _axl_console_screen_snapshot_active). */
+static int
+snapshot_impl(const AxlConsoleScreen *s, AxlConsoleScreenSink sink, void *user,
+              bool active_only)
 {
     if (s == NULL || sink == NULL) {
         return AXL_ERR;
@@ -581,14 +585,19 @@ axl_console_screen_snapshot(const AxlConsoleScreen *s, AxlConsoleScreenSink sink
     if (s->reverse) {
         emit_cstr(&e, "\x1b[?5h");
     }
+    if (active_only) {
+        /* A live terminal's pen is the console's current one, and ESC[2J erases
+           with its background: start from the default, as a fresh joiner does. */
+        emit_cstr(&e, "\x1b[m");
+    }
     emit_cstr(&e, "\x1b[2J");   /* clear the primary screen to the default background */
     emit_cstr(&e, "\x1b[m");    /* baseline: default pen */
-    emit_grid(&e, s, s->primary, &cur);
+    emit_grid(&e, s, active_only ? s->active : s->primary, &cur);
 
     /* When the alternate screen is active, the primary was just repainted and is
        saved by DECSET 1049 (which the joiner's DECRST 1049 restores when the guest
        exits the full-screen app); then repaint the alternate on top. */
-    if (s->alt) {
+    if (s->alt && !active_only) {
         emit_cstr(&e, "\x1b[?1049h");   /* save primary, switch to (and clear) the alt */
         emit_cstr(&e, "\x1b[2J");       /* deterministic clear of the alternate buffer */
         emit_cstr(&e, "\x1b[m");
@@ -606,6 +615,19 @@ axl_console_screen_snapshot(const AxlConsoleScreen *s, AxlConsoleScreenSink sink
     axl_console_vt_buf_flush(&e.vb);     /* deliver the tail */
     axl_console_vt_buf_dispose(&e.vb);
     return AXL_OK;
+}
+
+int
+axl_console_screen_snapshot(const AxlConsoleScreen *s, AxlConsoleScreenSink sink, void *user)
+{
+    return snapshot_impl(s, sink, user, /*active_only=*/false);
+}
+
+int
+_axl_console_screen_snapshot_active(const AxlConsoleScreen *s, AxlConsoleScreenSink sink,
+                                    void *user)
+{
+    return snapshot_impl(s, sink, user, /*active_only=*/true);
 }
 
 // ---------------------------------------------------------------------------

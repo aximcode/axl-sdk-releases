@@ -41,6 +41,150 @@ log_warning() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 # --------------------------------------------------------------------------
+# axl_trap_cleanup / axl_exit_on_signal / axl_die_by_signal — a signal ENDS
+# the script, and runs its cleanup on the way
+#
+#   axl_trap_cleanup 'rm -rf "$WORK"'  # EXIT trap + INT/TERM handlers
+#   axl_trap_cleanup 'rm -rf "$D"' INT TERM HUP    # choose the signals
+#   trap 'rm -rf "$OTHER"' EXIT        # replacing the EXIT trap later is
+#                                      # fine: handlers read it on arrival
+#
+# THE SHAPE THIS REPLACES, and why it is wrong: `trap cleanup EXIT INT TERM`.
+# A bash trap handler that does not exit RESUMES the script where the signal
+# interrupted it, so a `timeout` kill ran the cleanup (deleting the script's
+# own work dir) and then carried on running against the deleted files. In a
+# test that meant polling a deleted serial log until its wait expired and then
+# reporting a verdict -- CI read "the event loop never reached its deadline --
+# it is wedged" for a test the runner had killed.
+#
+# THE OBVIOUS FIX IS ALSO WRONG: re-raise the signal with its default action
+# and trust bash to run the EXIT trap on the way out. It does that for a
+# signal that was never trapped -- but a signal trapped BEFORE any EXIT trap
+# existed has SIG_DFL recorded as its original disposition, so `trap - TERM;
+# kill -TERM $$` kills the shell outright and skips every EXIT trap (measured,
+# bash 5.2). So the handler runs the EXIT trap ITSELF, clears it so it cannot
+# run twice, and only then dies by the signal -- whose death, not an exit
+# status, is what a caller waiting on Ctrl-C needs to see.
+#
+# It reads the EXIT trap at signal time, so a script may install or replace
+# its EXIT trap after this, any number of times. $BASHPID, not $$: in a
+# subshell $$ is the PARENT, which this must never signal. If the re-raise
+# does not end the shell (the signal was ignored when the script started), it
+# exits with 128 + the signal number, so it can never resume either way.
+#
+# HARDENED AGAINST THREE MORE EDGE CASES (review finding N-1), none of which
+# any shipped trap hits today, but the eval-in-a-function shape invites them
+# for the next one that does:
+#   - a second signal landing DURING the cleanup below used to kill the shell
+#     outright, mid-cleanup (`trap - EXIT "$sig"` cleared this signal's trap
+#     before running the cleanup it guards). INT/TERM/HUP are ignored for the
+#     cleanup's own duration instead.
+#   - a bare `return` in a captured EXIT trap, eval'd inline, would return
+#     from axl_die_by_signal ITSELF -- skipping the kill below and resuming
+#     the script, the exact bug class this file exists to fix, reopened one
+#     level down. The eval now runs inside a nested wrapper function, so
+#     `return` only returns from that.
+#   - `exit $?` in a captured EXIT trap exited 0, because $? by that point was
+#     whatever axl_die_by_signal's OWN prior command left it as (normally 0),
+#     not the signal death this function reports. A subshell exit right
+#     before the eval presets $? to the conventional 128+n first.
+# --------------------------------------------------------------------------
+
+# The current EXIT trap's command, or nothing. `trap -p` prints
+# `trap -- '<cmd>' EXIT`, quoted for re-reading, so this recovers <cmd>
+# exactly -- also from inside $(...), where bash still reports the parent's
+# traps.
+axl_exit_trap_cmd() {
+    local t
+    t=$(trap -p EXIT)
+    [[ -n "$t" ]] || return 0
+    eval "set -- $t"
+    printf '%s' "$3"
+}
+
+# axl_die_by_signal's helper: eval CMD ($1) with $? preset to RC ($2). A
+# nested function rather than eval'ing CMD directly in axl_die_by_signal so a
+# bare `return` inside CMD returns only from here.
+_axl_run_exit_trap() {
+    ( exit "$2" )
+    eval "$1"
+}
+
+axl_die_by_signal() {
+    local sig="$1" on_exit rc
+    # IGNORE INT/TERM/HUP -- every signal this file's trap helpers install by
+    # default -- and the one that came, FIRST, before anything forks, and for the whole cleanup.
+    # The signal that brought us here rarely comes alone: coreutils `timeout`
+    # sends it to its child AND then to the child's whole process group, and
+    # a runner or a user may send more. A handler (even `:`) is reset to the
+    # default action in every subshell, so a repeat landing while one of the
+    # $(...) below runs KILLED that subshell: an empty `kill -l` made the
+    # arithmetic a syntax error, which aborted this function and RESUMED the
+    # script -- a run-qemu.sh then dropped the guard that kills its guest and
+    # exited leaving the guest running to its --timeout (measured: 8 runs in
+    # 48 under parallel load, and 9 in 10 under a TERM storm). An empty
+    # capture of the EXIT trap skipped the cleanup outright; a truncated one
+    # failed to parse. SIG_IGN, unlike a handler, is inherited by subshells
+    # and commands, so the captures and the cleanup's own children (an
+    # `rm -rf` cut short left the state dir behind) run to completion. The
+    # cost, deliberate: a command the cleanup starts cannot be stopped by a
+    # repeat INT/TERM/HUP either -- a cleanup must not wait on anything
+    # unbounded (KILL still ends it).
+    trap '' INT TERM HUP "$sig"
+    rc=$(( 128 + $(kill -l "$sig") ))
+    on_exit=$(axl_exit_trap_cmd)
+    trap - EXIT
+    # `|| true`: under set -e a failing cleanup step must not cut the rest of
+    # the cleanup short.
+    if [[ -n "$on_exit" ]]; then _axl_run_exit_trap "$on_exit" "$rc" || true; fi
+    trap - INT TERM HUP "$sig"
+    kill -s "$sig" "$BASHPID"
+    exit "$rc"
+}
+
+axl_exit_on_signal() {
+    local sig
+    [[ $# -gt 0 ]] || set -- INT TERM
+    for sig in "$@"; do
+        # shellcheck disable=SC2064  # $sig is meant to expand NOW
+        trap "axl_die_by_signal $sig" "$sig"
+    done
+}
+
+# axl_trap_cleanup CMD [SIG...] -- CMD as the EXIT trap, and the signals
+# (default INT TERM) running it once and ending the script. The drop-in for
+# `trap CMD EXIT INT TERM`.
+axl_trap_cleanup() {
+    trap "$1" EXIT
+    shift
+    axl_exit_on_signal "$@"
+}
+
+# axl_pdeath_init -- set AXL_PDEATH to the command prefix that makes a child
+# die with its parent (`setpriv --pdeathsig KILL`), or to () where that is not
+# available. Run a long-lived child as `"${AXL_PDEATH[@]}" cmd ...`.
+#
+# PR_SET_PDEATHSIG survives the exec into the command, so when the process
+# that started it dies -- by ANY signal, SIGKILL included, which runs no trap
+# -- the kernel kills the child too. run-qemu.sh ties a --background guest to
+# its `timeout` watchdog this way, and test_run_background ties a test's guest
+# to the test shell: without it, a SIGKILLed test left its QEMU running at
+# ppid 1, holding its ports and /dev/shm memory.
+#
+# setpriv is util-linux >= 2.33; probed rather than assumed, because these
+# scripts run on CI runners and dev boxes alike and must not gain a hard
+# dependency. `command -v` alone is not enough -- an older setpriv exists but
+# rejects --pdeathsig, and a launch that fails at exec is worse than the leak
+# -- so the probe actually runs the flag once.
+axl_pdeath_init() {
+    AXL_PDEATH=()
+    if command -v setpriv >/dev/null 2>&1 \
+            && setpriv --pdeathsig KILL true >/dev/null 2>&1; then
+        AXL_PDEATH=(setpriv --pdeathsig KILL)
+    fi
+}
+
+# --------------------------------------------------------------------------
 # axl_version_string / axl_handle_version — one answer to `--version`
 #
 #   axl_handle_version <prog> "$@" && exit 0
@@ -207,6 +351,65 @@ axl_warn_stale_sdk_prefix() {
 }
 
 # --------------------------------------------------------------------------
+# UNIX socket path length
+# --------------------------------------------------------------------------
+#
+# A UNIX socket path lives in sockaddr_un.sun_path, which is 108 bytes on
+# Linux INCLUDING the terminating NUL -- so 107 is the longest usable path.
+# QEMU refuses a longer one with a single line in its own log, and what a
+# caller sees is something else entirely: a screenshot suite reporting every
+# case failed with zero PNGs, which reads exactly like a render regression.
+# So every place that builds a socket path checks it here first, and names the
+# setting that has to change.
+AXL_SUN_PATH_MAX=107
+
+# The longest socket NAME a test may create in its own scratch dir
+# (common-test.sh's TEST_TMPDIR). That dir sits one level below
+# $AXL_QEMU_TMPDIR, and which names a test uses is up to the test, so the
+# check up front can only reserve room. test-run-qemu-flags.sh fails if a
+# literal *.sock name under test/integration/ (and its lib/) outgrows it.
+AXL_TEST_SOCK_NAME_MAX=32
+
+# axl_sock_path_check KNOB PATH [RESERVE] -- 0 if PATH, plus RESERVE more
+# bytes of socket name still to be appended, fits in sun_path. Otherwise
+# print one error naming KNOB (the setting the caller must change), the
+# length and the limit, and return 1. Byte length, not characters: sun_path
+# counts bytes.
+axl_sock_path_check() {
+    local knob="$1" path="$2" reserve="${3:-0}" len shown
+    len=$(( $(printf '%s' "$path" | wc -c) + reserve ))
+    (( len <= AXL_SUN_PATH_MAX )) && return 0
+    shown="$path"
+    (( reserve > 0 )) && shown="$path<$reserve-byte socket name>"
+    echo "ERROR: $knob is too long for a UNIX socket path: $shown is $len bytes; the limit is $AXL_SUN_PATH_MAX (sun_path holds 108 including the NUL)." >&2
+    echo "       Shorten $knob by at least $(( len - AXL_SUN_PATH_MAX )) byte(s)." >&2
+    return 1
+}
+
+# axl_mktemp_dir_template BASE TEMPLATE -- the path `mktemp -d -p BASE
+# TEMPLATE` will create, X's and all. mktemp drops EVERY trailing slash from
+# BASE ("/x//" gives "/x/..."), so this strips them all; stripping one would
+# count a byte that is not there and refuse a path that fits.
+axl_mktemp_dir_template() {
+    local base="$1"
+    while [[ "$base" == */ && "$base" != / ]]; do base="${base%/}"; done
+    printf '%s/%s' "${base%/}" "$2"
+}
+
+# axl_test_tmpdir_check BASE [KNOB] [TEMPLATE] -- the check for a
+# test-scratch base: BASE is where common-test.sh's test_setup makes its
+# scratch dir (default template axl-ctest.XXXXXXXX), the deepest place the
+# suite puts a socket. run-qemu.sh's own dir (axl-qemu.XXXXXXXX/virtiofs.sock)
+# is shallower than this, so one check covers both. KNOB (default
+# AXL_QEMU_TMPDIR) is the setting the error names; a plain `mktemp -d` takes
+# TMPDIR and tmp.XXXXXXXXXX instead.
+axl_test_tmpdir_check() {
+    axl_sock_path_check "${2:-AXL_QEMU_TMPDIR}" \
+        "$(axl_mktemp_dir_template "$1" "${3:-axl-ctest.XXXXXXXX}")/" \
+        "$AXL_TEST_SOCK_NAME_MAX"
+}
+
+# --------------------------------------------------------------------------
 # arch_dir — map EDK2 arch name to image directory name
 # --------------------------------------------------------------------------
 
@@ -226,10 +429,84 @@ boot_efi_name() {
     esac
 }
 
+# The header line of a firmware CPU-exception dump on AARCH64 (ArmPkg's
+# DefaultExceptionHandler: its four exception types). The header is the
+# console's; the registers, backtrace and stack dump after it are DEBUG, on the
+# debug UART -- which is how a reader knows to fetch them from there.
+AXL_FW_EXCEPTION_RE='(Synchronous|SError|IRQ|FIQ) Exception at 0x'
+
 # --------------------------------------------------------------------------
-# build_qemu_base_cmd <arch> <qemu_bin> <mem> <vars_file> [cpu_override]
+# qemu_fw_debug_uart <array-name> <arch> <file>
+# Gives a guest a channel of its own for the firmware's DEBUG output (ASSERTs
+# included), written to <file>, so the console carries none of it.
+#
+# AARCH64: a SECOND serial port. The bundled ArmVirtQemu firmware
+# (edk2-stable202408) sends DEBUG to the second PL011 when there is one; with
+# one it shares the console. A CPU exception is split: its "<type> Exception
+# at ..." header stays on the console (SerialPortWrite), its registers and
+# backtrace are DEBUG (run-qemu.sh and common-test.sh bring them back beside
+# the console's log). Call it LAST, on the whole command: the UARTs follow
+# -serial order on `virt`, so the debug one goes after the console's, and a
+# -nographic command gets its console spelled out first -- any explicit
+# -serial drops the one -nographic would add, and the debug file would become
+# UART0. The spelling is QEMU's own (system/vl.c): `mon:stdio`, unless an
+# option took the monitor (-monitor, -mon, -qmp, -qmp-pretty), then `stdio`.
+# A -nodefaults command with no console gets nothing: there is no console UART
+# to come second to.
+#
+# X64: OVMF's debug port, an isa-debugcon at I/O port 0x402 (OVMF already
+# keeps DEBUG off the console; without the port it is simply lost, and a
+# firmware ASSERT shows only as a hang). The device on a file chardev is
+# `-debugcon file:<file> -global isa-debugcon.iobase=0x402` spelled so that
+# it can append. It is no UART, so order and -nodefaults do not matter. OVMF
+# probes the port and writes nothing when it is absent; when it is present
+# every byte is a VM exit -- which is why a booted X64 run does not get it
+# unasked (docs/AXL-Test-Guest-Pool-Design.md, "a debugcon on every pooled
+# X64 guest"). Neither can be added to a running guest.
+#
+# append=on: a pooled guest's cold start relaunches the recorded argv, and must
+# not truncate the record a lease reads from an offset. A caller that wants
+# this launch's output alone truncates <file> itself. Idempotent.
+# --------------------------------------------------------------------------
+qemu_fw_debug_uart() {
+    local -n _fq="$1"
+    local chardev="file,id=axl_fwdebug,path=${3//,/,,},append=on"
+    local a serial=false nographic=false mon=false nodefaults=false
+    for a in ${_fq[@]+"${_fq[@]}"}; do
+        case "$a" in
+            chardev:axl_fwdebug|*,chardev=axl_fwdebug) return 0 ;;
+            -serial|--serial) serial=true ;;
+            -nographic|--nographic) nographic=true ;;
+            -nodefaults|--nodefaults) nodefaults=true ;;
+            -monitor|--monitor|-mon|--mon|-qmp|--qmp|-qmp-pretty|--qmp-pretty) mon=true ;;
+        esac
+    done
+    case "$2" in
+        X64)
+            _fq+=(-chardev "$chardev" -device isa-debugcon,iobase=0x402,chardev=axl_fwdebug)
+            return 0 ;;
+        AARCH64) ;;
+        *) return 0 ;;
+    esac
+    if [[ "$serial" == false && "$nodefaults" == true ]]; then
+        return 0
+    fi
+    if [[ "$serial" == false && "$nographic" == true ]]; then
+        if [[ "$mon" == true ]]; then _fq+=(-serial stdio); else _fq+=(-serial mon:stdio); fi
+    fi
+    _fq+=(-chardev "$chardev" -serial chardev:axl_fwdebug)
+}
+
+# --------------------------------------------------------------------------
+# build_qemu_base_cmd <arch> <qemu_bin> <mem> <vars_file> [cpu_override] [devices]
 # Outputs the base QEMU arguments (machine, CPU, memory, pflash) to stdout,
 # NUL-separated for safe consumption via mapfile -d ''.
+#
+# devices (optional): `standard` appends the standard guest's devices
+# (qemu_standard_devices below) -- what common-test.sh and run-qemu.sh
+# --bridges boot, so both build ONE guest shape. Without it the output is the
+# bare machine, as every other caller (and an outside consumer) has always
+# had it.
 # Requires FW_CODE to be set by find_firmware() before calling.
 # Usage: mapfile -d '' -t cmd < <(build_qemu_base_cmd X64 /path/qemu 512M vars.fd)
 #
@@ -242,6 +519,7 @@ boot_efi_name() {
 
 build_qemu_base_cmd() {
     local arch="$1" qemu_bin="$2" mem="$3" vars_file="$4" cpu_override="${5:-}"
+    local devices="${6:-}"
 
     if [[ -z "${FW_CODE:-}" ]]; then
         log_error "build_qemu_base_cmd: FW_CODE not set (call find_firmware first)"
@@ -273,13 +551,71 @@ build_qemu_base_cmd() {
             # network driver in "discovered but not loaded" state forever.
             # virtio-rng-pci lets VirtioRngDxe (in the firmware) bind and
             # install the protocol, unblocking the entire network stack.
-            printf '%s\0' "-device" "virtio-rng-pci"
+            # The standard devices carry their own, behind the root port;
+            # a second one here was an accidental duplicate.
+            [[ "$devices" == standard ]] || printf '%s\0' "-device" "virtio-rng-pci"
             ;;
     esac
 
     printf '%s\0' "-m" "$mem"
     printf '%s\0' "-drive" "if=pflash,format=raw,readonly=on,file=$FW_CODE"
-    printf '%s\0' "-drive" "if=pflash,format=raw,file=$vars_file"
+    # The vars file's format follows its name: a .qcow2 copy is what a
+    # snapshot can capture (run-qemu.sh --qcow2); everything else is raw.
+    local vars_fmt=raw
+    [[ "$vars_file" == *.qcow2 ]] && vars_fmt=qcow2
+    printf '%s\0' "-drive" "if=pflash,format=$vars_fmt,file=$vars_file"
+    [[ "$devices" == standard ]] && qemu_standard_devices
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# qemu_boot_wait_args
+# Skip the firmware Boot Manager countdown before auto-booting the first
+# option (the UEFI shell). QEMU publishes this as the `etc/boot-menu-wait`
+# fw_cfg, sourced from `-boot splash-time=N` (ms); OVMF's
+# GetFrontPageTimeoutFromQemu() reads it and, when 0, boots immediately
+# (otherwise it defaults to ~5 s). Faster, more deterministic boots -- and
+# visual-capture timing no longer rides on a 5 s wait. Set QEMU_BOOT_MENU_WAIT
+# to a non-empty ms value to restore a countdown. Both launchers use it.
+# --------------------------------------------------------------------------
+qemu_boot_wait_args() {
+    printf '%s\0' "-boot" "splash-time=${QEMU_BOOT_MENU_WAIT:-0}"
+}
+
+# --------------------------------------------------------------------------
+# qemu_standard_devices
+# The standard guest's devices, NUL-separated: the census's commonest guest
+# (docs/AXL-Test-Guest-Pool-Design.md §7), one shape a resident pool serves.
+#
+#   PCI   one PCIe root port (a PCI-PCI bridge per the spec) with a virtio-rng
+#         behind it, so the AxlPci tree walker has a bridge to cross -- stock
+#         q35 and virt are otherwise flat, and shipping bridge code without
+#         that coverage is how the aa64 cap-walk infinite loop (commit
+#         8b90954) reached CI. On AARCH64 the RNG is also what NetworkPkg's
+#         DEPEX waits for (see build_qemu_base_cmd), and it is the only one.
+#   USB   a qemu-xhci with a usb-mouse (port 1) and a usb-hub (port 2)
+#         carrying a usb-tablet (port 2.1): three EFI_USB_IO handles, one a
+#         hub tier deep. The unit tests pin the mouse (QEMU vid 0x0627, the
+#         HID Boot Mouse triplet) and need the tablet, the only source of
+#         EFI_ABSOLUTE_POINTER_PROTOCOL.
+#
+# SLOTS ARE PINNED: the root port at 00:02.0 and xHCI at 00:03.0, on both
+# arches. q35's VGA holds 00:01.0 and virt's slot 1 is free, so left to QEMU
+# the same guest numbered differently per arch and shifted whenever a device
+# ahead of it came or went (removing AARCH64's duplicate RNG moved its xHCI
+# from 00:03.0 to 00:02.0). A test pins BDFs in exact strings; a pool needs
+# the topology fixed. The bridge's secondary bus is still the firmware's.
+#
+# Cost, measured 2026-11-03: the PCI half nothing; each USB device ~0.2 s of
+# firmware enumeration per boot (X64 2.25 s -> 2.78 s, AARCH64 6.7 s -> 7.3 s).
+# --------------------------------------------------------------------------
+qemu_standard_devices() {
+    printf '%s\0' "-device" "pcie-root-port,id=axl_rp0,bus=pcie.0,addr=0x2,chassis=1"
+    printf '%s\0' "-device" "virtio-rng-pci,bus=axl_rp0"
+    printf '%s\0' "-device" "qemu-xhci,id=axl_usb0,bus=pcie.0,addr=0x3"
+    printf '%s\0' "-device" "usb-mouse,bus=axl_usb0.0,port=1"
+    printf '%s\0' "-device" "usb-hub,bus=axl_usb0.0,port=2"
+    printf '%s\0' "-device" "usb-tablet,bus=axl_usb0.0,port=2.1"
 }
 
 # --------------------------------------------------------------------------
@@ -291,7 +627,7 @@ build_qemu_base_cmd() {
 # Validates the mtools deps up front with an install hint, and surfaces
 # mkfs/mcopy failures rather than swallowing them. Shared by run-qemu.sh and the
 # integration harness (common-test.sh) so the two cannot drift. Returns non-zero
-# on a missing tool. `find` prints top-level entries so mcopy -s auto-creates the
+# on a missing tool, or when dd, mkfs.vfat or any mcopy fails. `find` prints top-level entries so mcopy -s auto-creates the
 # destination tree at the FAT root (a per-file loop trips mtools on nested paths).
 # --------------------------------------------------------------------------
 qemu_stage_disk() {
@@ -319,14 +655,18 @@ qemu_stage_disk() {
     size_kb=$(du -sk "$staging" | cut -f1)
     size_kb=$(( (size_kb + 4096) / 1024 * 1024 ))   # round up to a whole MB
     [[ $size_kb -lt 40960 ]] && size_kb=40960        # minimum 40 MB
-    dd if=/dev/zero of="$target" bs=1K count="$size_kb" 2>/dev/null
-    mkfs.vfat -F 32 -n "$label" "$target" >/dev/null
+    dd if=/dev/zero of="$target" bs=1K count="$size_kb" 2>/dev/null || return $?
+    mkfs.vfat -F 32 -n "$label" "$target" >/dev/null || return $?
     (
         cd "$staging" || exit 1
+        # NUL-separated, so a staged name with a space in it is one entry;
+        # `./` so one starting with `-` is not read as an option; stdin from
+        # /dev/null so mcopy (which may prompt on a name clash) cannot eat
+        # the list; and the first failure is the result, as promised above.
         local entry
-        for entry in $(find . -maxdepth 1 -mindepth 1 -printf '%P\n'); do
-            mcopy -s -i "$target" "$entry" "::/"
-        done
+        while IFS= read -r -d '' entry; do
+            mcopy -s -i "$target" "./$entry" "::/" < /dev/null || exit $?
+        done < <(find . -maxdepth 1 -mindepth 1 -printf '%P\0')
     )
 }
 
@@ -350,6 +690,43 @@ qemu_strip_kvm() {
         esac
     done
     _cmd=("${out[@]}")
+}
+
+# --------------------------------------------------------------------------
+# axl_census_argv ARG... — a QEMU argv as the guest-pool census records it
+# (test/integration/lib/profile.sh, _prof_launch; scripts/run-qemu.sh).
+#
+# Prints the arguments joined with US (0x1f), which no QEMU argument contains,
+# so the reader splits them exactly. Every fixture FILE handed to the guest --
+# `-smbios`/`-acpitable`/`-fw_cfg`/`-device`/`-tpmdev` `file=` or `romfile=`
+# -- is replaced by `sha256:<16 hex>` of its contents: these are usually
+# per-run temp copies, so once the run is over the path names nothing, and two
+# fixtures written under the same temp name would otherwise read as one guest.
+# A newline inside an argument would tear the one-line record; it becomes a
+# space.
+# --------------------------------------------------------------------------
+
+axl_census_argv() {
+    local out=() prev="" a key f d
+    for a in "$@"; do
+        case "$prev" in
+            -smbios|-acpitable|-fw_cfg|-device|-tpmdev)
+                if [[ "$a" =~ (^|,)(file|romfile)=([^,]+) ]]; then
+                    key="${BASH_REMATCH[2]}" f="${BASH_REMATCH[3]}"
+                    # Unreadable or failed: keep the raw value. An empty digest
+                    # would key every such fixture alike, and a message here
+                    # would land in the test's own log.
+                    if [[ -f "$f" && -r "$f" ]] \
+                       && d=$(sha256sum "$f" 2>/dev/null) && [[ -n "$d" ]]; then
+                        a="${a/"$key=$f"/"$key=sha256:${d:0:16}"}"
+                    fi
+                fi ;;
+        esac
+        prev="$a"
+        out+=("${a//$'\n'/ }")
+    done
+    local IFS=$'\x1f'
+    printf '%s' "${out[*]}"
 }
 
 # --------------------------------------------------------------------------
@@ -539,6 +916,86 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# find_debug_ovmf — locate a DEBUG build of OVMF (x64), for the tests that
+# need its cleared-on-free pool, compiled-in ASSERTs or DEBUG log.
+# Usage: find_debug_ovmf  (sets DEBUG_OVMF_CODE and DEBUG_OVMF_VARS; returns 1
+#        when there is none, with DEBUG_OVMF_SEARCHED naming each place it
+#        looked and why it had none: "DIR: missing", "DIR: unreadable",
+#        "DIR: no CODE file", "DIR: no VARS file", joined by "; ")
+#
+# THE one discovery point: every such test goes through it, so where a
+# DEBUG OVMF is found is set in ONE place and cannot differ per test or per
+# runner account.
+#   AXL_OVMF_DEBUG_DIR  a directory holding OVMF_CODE.fd and OVMF_VARS.fd.
+#                       When set it is the ONLY place looked: an explicit
+#                       choice never quietly falls back to another build.
+#   unset               $EDK2_DIR/Build/OvmfX64/DEBUG_GCC5/FV when EDK2_DIR
+#                       is set, then $HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV --
+#                       not searched at all when HOME is unset, which would
+#                       otherwise make it /uefi/...
+# "Not there" and "could not look" are different facts and are reported as
+# such: a directory or file this account cannot read is "unreadable".
+# --------------------------------------------------------------------------
+
+find_debug_ovmf() {
+    local dirs=() why=() d
+    local home_fv='$HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV'
+    DEBUG_OVMF_CODE=""
+    DEBUG_OVMF_VARS=""
+    DEBUG_OVMF_SEARCHED=""
+    if [[ -n "${AXL_OVMF_DEBUG_DIR:-}" ]]; then
+        dirs=("$AXL_OVMF_DEBUG_DIR")
+    else
+        [[ -n "${EDK2_DIR:-}" ]] && dirs+=("$EDK2_DIR/Build/OvmfX64/DEBUG_GCC5/FV")
+        if [[ -n "${HOME:-}" ]]; then
+            dirs+=("$HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV")
+        fi
+    fi
+    for d in "${dirs[@]}"; do
+        if [[ ! -e "$d" ]]; then
+            why+=("$d: missing")
+        elif [[ ! -r "$d" || ! -x "$d" ]]; then
+            why+=("$d: unreadable")
+        elif [[ ! -f "$d/OVMF_CODE.fd" ]]; then
+            why+=("$d: no CODE file")
+        elif [[ ! -f "$d/OVMF_VARS.fd" ]]; then
+            why+=("$d: no VARS file")
+        elif [[ ! -r "$d/OVMF_CODE.fd" || ! -r "$d/OVMF_VARS.fd" ]]; then
+            why+=("$d: unreadable")
+        else
+            DEBUG_OVMF_CODE="$d/OVMF_CODE.fd"
+            DEBUG_OVMF_VARS="$d/OVMF_VARS.fd"
+            return 0
+        fi
+    done
+    if [[ -z "${AXL_OVMF_DEBUG_DIR:-}" && -z "${HOME:-}" ]]; then
+        why+=("$home_fv: not searched, HOME is unset")
+    fi
+    for d in "${why[@]}"; do
+        DEBUG_OVMF_SEARCHED+="${DEBUG_OVMF_SEARCHED:+; }$d"
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# debug_ovmf_unavailable — end a test that found no DEBUG OVMF.
+# A SKIP (exit 77) by default. With AXL_REQUIRE_DEBUG_OVMF=1 -- which
+# scripts/release-suite.sh sets -- a FAILURE (exit 1): a skip passes a suite,
+# and a release certified by a run that skipped such a test was never checked
+# by it.
+# --------------------------------------------------------------------------
+
+debug_ovmf_unavailable() {
+    local why="no DEBUG OVMF -- $DEBUG_OVMF_SEARCHED (set AXL_OVMF_DEBUG_DIR)"
+    if [[ "${AXL_REQUIRE_DEBUG_OVMF:-}" == 1 ]]; then
+        echo "FAIL: $why -- this run requires one"
+        exit 1
+    fi
+    echo "SKIP: $why"
+    exit 77
+}
+
+# --------------------------------------------------------------------------
 # find_shell_efi — locate a UEFI Shell binary that MATCHES the active firmware
 # Usage: SHELL_EFI=$(find_shell_efi <arch>)
 #
@@ -621,9 +1078,9 @@ find_shell_efi() {
     local scripts_dir project_root fwtool_host
     scripts_dir="$(dirname "${BASH_SOURCE[0]}")"
     project_root="$(cd "$scripts_dir/.." && pwd)"
-    fwtool_host="$project_root/out/native-x64/build/fwtool-host"
+    fwtool_host="$("$project_root/scripts/build-prefix.sh" --abs x64)/build/fwtool-host"
     if [[ ! -x "$fwtool_host" ]]; then
-        make -C "$project_root" ARCH=x64 fwtool-host >/dev/null 2>&1 || true
+        "$project_root/scripts/axl-build.sh" ARCH=x64 fwtool-host >/dev/null 2>&1 || true
     fi
     if [[ -x "$fwtool_host" ]]; then
         local fv_shell="$tmpdir/Shell.efi"
@@ -740,12 +1197,12 @@ find_shell_efi() {
 # directly (the countdown returns, but the boot is unaffected).
 #
 # Built on demand (like the native fwtool-host in find_shell_efi) so a fresh
-# tree / standalone integration test still gets it without a prior `make all`.
+# tree / standalone integration test still gets it without a prior full build.
 #
 # AXL_SHELL_LAUNCHER_BIN overrides which binary is staged as the launcher,
 # skipping both the build and the default path. Two uses: staging a launcher
-# built elsewhere (a package layout ships no Makefile, so the on-demand build
-# cannot run), and FAULT INJECTION — the fallback test stages a binary that
+# built elsewhere (a package layout ships no build definition, so the on-demand
+# build cannot run), and FAULT INJECTION — the fallback test stages a binary that
 # never chains the Shell, which is the only way to exercise the "firmware does
 # not reach the Shell" path without the firmware that once did it. The MZ check
 # applies to the override too: a non-PE override is no launcher at all, and
@@ -766,14 +1223,15 @@ find_shell_launcher() {
     scripts_dir="$(dirname "${BASH_SOURCE[0]}")"
     project_root="$(cd "$scripts_dir/.." && pwd)"
     native_arch="$(arch_dir "$arch")"
-    launcher="$project_root/out/native-$native_arch/axl-shell-launcher.efi"
-    # Always invoke make (not just when the .efi is absent): the launcher depends
-    # on its source and libaxl.a, so a PRESENT-BUT-STALE binary — built against
-    # an older library — must be rebuilt, not reused. make's own dependency check
-    # makes this a no-op when the binary is already fresh. (A stale launcher was
-    # the cause of a hang mistaken for the launcher being broken.)
+    launcher="$("$project_root/scripts/build-prefix.sh" --abs "$native_arch")/axl-shell-launcher.efi"
+    # Always invoke the build (not just when the .efi is absent): the launcher
+    # depends on its source and libaxl.a, so a PRESENT-BUT-STALE binary — built
+    # against an older library — must be rebuilt, not reused. ninja's
+    # dependency check makes this a no-op when the binary is already fresh. (A
+    # stale launcher was the cause of a hang mistaken for the launcher being
+    # broken.)
     if [[ "$build" == "build" ]]; then
-        make -C "$project_root" ARCH="$native_arch" shell-launcher >/dev/null 2>&1 || true
+        "$project_root/scripts/axl-build.sh" ARCH="$native_arch" shell-launcher >/dev/null 2>&1 || true
     fi
     if [[ -f "$launcher" ]] && head -c2 "$launcher" | grep -q "MZ"; then
         echo "$launcher"
@@ -890,9 +1348,23 @@ stage_boot_shell() {
     SHELL_LAUNCHER_PATH=""
     local mode="${AXL_SHELL_LAUNCHER:-$unset_default}"
     local launcher=""
+    rm -f "$staging/EFI/BOOT/axl-shell.opt"
+    # AXL_SHELL_OPTIONS reach the Shell only through the launcher, so asking
+    # for them FORCES it: auto mode could otherwise fall back (a memo, a
+    # failed boot's retry) to a Shell booted without them, and the caller
+    # would rely on -nonest it never got. With the launcher switched off
+    # they cannot apply at all, and that is an error, not a warning.
+    if [[ -n "${AXL_SHELL_OPTIONS:-}" ]]; then
+        if [[ "$mode" == "0" || "$mode" == "off" ]]; then
+            echo "run-qemu: AXL_SHELL_OPTIONS='$AXL_SHELL_OPTIONS' needs the Shell" \
+                 "launcher, which AXL_SHELL_LAUNCHER=$mode switches off" >&2
+            return 1
+        fi
+        mode=1
+    fi
     if [[ "$mode" != "0" && "$mode" != "off" ]]; then
         # Build the launcher only when it was explicitly ASKED for. In auto mode
-        # this is an optimization, and a silent multi-minute `make` inside what
+        # this is an optimization, and a silent multi-minute build inside what
         # looks like a QEMU launch is not one — nor is racing another ad-hoc run
         # in the same tree. A stale prebuilt launcher is safe here precisely
         # because auto mode can undo itself.
@@ -928,7 +1400,20 @@ stage_boot_shell() {
         cp "$shell_efi" "$staging/EFI/BOOT/Shell.efi"
         SHELL_LAUNCHER_STAGED=true
         SHELL_LAUNCHER_PATH="$launcher"
+        # AXL_SHELL_OPTIONS: more Shell options after "-delay 0" (e.g. -nonest,
+        # which a guest needs for Execute to report whether a command ran).
+        # The launcher reads them from this file beside it.
+        if [[ -n "${AXL_SHELL_OPTIONS:-}" ]]; then
+            printf '%s\n' "$AXL_SHELL_OPTIONS" > "$staging/EFI/BOOT/axl-shell.opt"
+        fi
     else
+        # Only the launcher passes options, and mode=1 above means a missing
+        # one is a build failure: say so rather than boot without them.
+        if [[ -n "${AXL_SHELL_OPTIONS:-}" ]]; then
+            echo "run-qemu: AXL_SHELL_OPTIONS='$AXL_SHELL_OPTIONS' NOT applied:" \
+                 "the Shell launcher could not be built for $arch" >&2
+            return 1
+        fi
         cp "$shell_efi" "$staging/EFI/BOOT/$boot_name"
     fi
 }
@@ -1180,7 +1665,8 @@ axl_report_hostfwd_failure() {
     line=$(grep -m1 -a "Could not set up host forwarding rule" "$log" 2>/dev/null) || return 0
     [[ -n "$line" ]] || return 0
     local port
-    port=$(sed -n "s/.*hostfwd=tcp::\([0-9]\+\)-.*/\1/p" <<<"$line" | head -1)
+    # hostfwd=tcp::PORT- or, with --hostfwd-bind, hostfwd=tcp:ADDR:PORT-
+    port=$(sed -n "s/.*hostfwd=tcp:[0-9.]*:\([0-9]\+\)-.*/\1/p" <<<"$line" | head -1)
     cat >&2 <<EOF
 
 ERROR: $context — QEMU refused its network device: a host port is already in use.
@@ -1290,10 +1776,14 @@ cpu_policy_init() {
     return 0
 }
 
+# cpu_sampler PID OUT [UNTIL]: as above; with UNTIL, sampling also ends when
+# that process does -- for a guest that outlives the run being measured (a
+# leased pool guest: run-qemu.sh's pooled mode passes a sentinel it kills when
+# the run ends).
 cpu_sampler() {
-    local qpid="$1" out="$2"
+    local qpid="$1" out="$2" until="${3:-$1}"
     local hz; hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-    awk -v pid="$qpid" -v hz="$hz" -v interval=0.2 \
+    awk -v pid="$qpid" -v until_pid="$until" -v hz="$hz" -v interval=0.2 \
         -v warmup="$CPU_WARMUP" -v thr="$CPU_THRESHOLD" '
     function read_total(p,    line, n, after, f) {
         if ((getline line < ("/proc/" p "/stat")) <= 0) {
@@ -1309,6 +1799,7 @@ cpu_sampler() {
         return f[12] + f[13]
     }
     function alive(p) { return (system("kill -0 " p " 2>/dev/null") == 0) }
+    function running() { return alive(pid) && (until_pid == pid || alive(until_pid)) }
     BEGIN {
         # Warm-up, but poll rather than one long sleep: a guest that exits
         # during the window (most integration tests finish in 10-20s) would
@@ -1316,13 +1807,13 @@ cpu_sampler() {
         # for the full warm-up with nothing left to measure. Same measurement,
         # no added latency.
         for (t = 0; t < warmup; t += interval) {
-            if (!alive(pid)) { print "0.00 0.00 0.000"; exit 0 }
+            if (!running()) { print "0.00 0.00 0.000"; exit 0 }
             system("sleep " interval)
         }
         prev = read_total(pid)
         if (prev < 0) { print "0.00 0.00 0.000"; exit 0 }
         peak = 0; streak = 0; streak_max = 0; sum = 0; n = 0
-        while (alive(pid)) {
+        while (running()) {
             system("sleep " interval)
             cur = read_total(pid)
             if (cur < 0) break
@@ -1400,6 +1891,296 @@ qemu_child_pid() {
     printf '%s' "$pid"
 }
 
+# Resolve the REAL qemu pid behind the QEMU_PID that `run-qemu.sh --background`
+# prints. That value is the `timeout` wrapper (see the note in run-qemu.sh's
+# background branch), whose own utime+stime is ~0 for the guest's whole life, so
+# /proc sampling it reports an idle guest however hard the guest spins. When
+# run-qemu's `pgrep -P` misses it falls back to the SUBSHELL pid, whose only
+# child is `timeout` -- so the child found here is checked by comm, and a
+# `timeout` is descended through once more.
+# Echoes the pid of a process whose comm is qemu-system*; returns 1 with a
+# message on stderr otherwise -- never a fallback to a wrapper, which would read
+# as "idle".
+qemu_real_pid() {
+    local wrapper="$1" pid="" comm="" depth
+    pid="$wrapper"
+    for depth in 1 2; do
+        pid=$(qemu_child_pid "$pid")
+        if [[ -z "$pid" ]]; then
+            echo "qemu_real_pid: no child process under pid $wrapper (QEMU" \
+                 "exited, or it is not the run-qemu wrapper); refusing to" \
+                 "sample the wrapper" >&2
+            return 1
+        fi
+        # setpriv (the pdeathsig prefix) execs into qemu in place, so for a
+        # moment this pid's comm is still `setpriv`: poll it, bounded to ~2 s,
+        # rather than refuse a guest that is a few ms from existing.
+        local _t
+        for ((_t = 0; _t < 20; _t++)); do
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+            [[ "$comm" == setpriv ]] || break
+            sleep 0.1
+        done
+        case "$comm" in
+            qemu-system*) printf '%s' "$pid"; return 0 ;;
+            timeout) continue ;;
+        esac
+        break
+    done
+    echo "qemu_real_pid: pid $pid under $wrapper is '$comm', not qemu-system*;" \
+         "refusing to sample it" >&2
+    return 1
+}
+
+# proc_cpu_cores <pid> <window_secs> -- host cores (utime+stime delta) the pid
+# used over the window. Returns 1 with a message, printing nothing, when the pid
+# vanishes: "0.00" must only ever mean "measured, idle".
+proc_cpu_cores() {
+    local pid="$1" window="$2" hz st t1 t2 s1 s2
+    hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+    st="$(cat "/proc/$pid/stat" 2>/dev/null)" \
+        || { echo "proc_cpu_cores: /proc/$pid/stat unreadable" >&2; return 1; }
+    # Fields after "(comm)": utime(#14),stime(#15) are idx 11,12 of the tail.
+    read -r -a t1 <<<"${st##*) }"
+    s1=$(( ${t1[11]:-0} + ${t1[12]:-0} ))
+    sleep "$window"
+    st="$(cat "/proc/$pid/stat" 2>/dev/null)" \
+        || { echo "proc_cpu_cores: pid $pid exited during the window" >&2; return 1; }
+    read -r -a t2 <<<"${st##*) }"
+    s2=$(( ${t2[11]:-0} + ${t2[12]:-0} ))
+    awk -v d="$(( s2 - s1 ))" -v hz="$hz" -v w="$window" \
+        'BEGIN { printf "%.2f", (hz > 0 && w > 0) ? d / hz / w : 0 }'
+}
+
+# host_load_sampler <pid> <outfile> [interval] -- while <pid> lives, sample how
+# many tasks the HOST has runnable (procs_running in /proc/stat) and keep
+# "<sum> <samples>" in <outfile>. host_contention_factor turns that into a
+# number. This is a measurement of the box the run shared, taken during the run.
+#
+# WHY NOT THE GUEST'S OWN SCHEDSTAT. Tried first: /proc/<pid>/schedstat's
+# runqueue-wait. On this box (a hybrid-core laptop part) a guest sharing the
+# machine with verify.sh's other jobs waited only ~7 s of a 119 s run, yet its
+# ON-CPU time rose from 48 s (alone) to 90 s -- the same work took ~1.9x the
+# CPU time, because contended threads land on slower cores and clocks. Time
+# waiting for a CPU is the part that is small; the slowdown is in the part
+# that looks like work. Host oversubscription is what moves with it.
+host_load_sampler() {
+    local pid="$1" out="$2" interval="${3:-0.5}" r sum=0 n=0
+    while kill -0 "$pid" 2>/dev/null; do
+        r=$(awk '$1 == "procs_running" { print $2 }' /proc/stat 2>/dev/null)
+        if [[ "$r" =~ ^[0-9]+$ ]]; then
+            sum=$((sum + r)); n=$((n + 1))
+            printf '%s %s\n' "$sum" "$n" > "$out.tmp" && mv -f "$out.tmp" "$out"
+        fi
+        sleep "$interval"
+    done
+}
+
+# host_steal_ns -- one reading, in ns, of the box's steal time (/proc/stat,
+# summed over its CPUs: time a hypervisor below this kernel ran something
+# else -- this box can itself be a VM). Only grows; a run's figure is the
+# difference of two readings. Box-wide, so no thread of the guest can take
+# it away by exiting. [hz] is CLK_TCK, for a caller reading it repeatedly
+# (getconf is a fork). Returns 1, printing nothing, when it cannot be read:
+# a 0 here would read as the box's whole lifetime of steal against the next.
+host_steal_ns() {
+    local steal hz="${1:-}"
+    [[ -n "$hz" ]] || hz=$(getconf CLK_TCK)
+    { read -r _ _ _ _ _ _ _ _ steal _ < /proc/stat; } 2>/dev/null || return 1
+    [[ "$steal" =~ ^[0-9]+$ && "$hz" =~ ^[0-9]+$ && "$hz" -gt 0 ]] || return 1
+    printf '%s\n' "$(( steal * (1000000000 / hz) ))"
+}
+
+# proc_start_ticks <pid> -- <pid>'s start time (field 22 of /proc/<pid>/stat,
+# clock ticks since boot): the same pid with another start time is another
+# process. Read after the last ") ", which ends the command name (a name
+# may hold spaces and parentheses). Returns 1 when it cannot be read.
+proc_start_ticks() {
+    local st f
+    { st=$(< "/proc/$1/stat"); } 2>/dev/null || return 1
+    read -ra f <<<"${st##*) }"
+    [[ "${f[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${f[19]}"
+}
+
+# thread_run_delays <pid> -- one "<tid> <run_delay_ns>" line per thread of
+# <pid>: field 2 of /proc/<pid>/task/<tid>/schedstat, the time the thread
+# was runnable but waiting for a CPU, on THIS kernel. Returns 1 with nothing
+# printed when no thread could be read.
+#
+# Why run delay and not the load average: what voids a timing measurement is
+# a vCPU that wanted the CPU and did not get it, and run delay is that,
+# directly. Every thread, not the vCPU alone: QEMU names them all
+# "qemu-system-*" unless started with debug-threads=on, and its main loop
+# kept waiting delays the guest's timers just the same.
+#
+# PER THREAD, never summed into one number: a summed reading loses a thread
+# that exits between two readings -- QEMU's I/O workers retire after ~10 s
+# idle, about when a guest's first real work starts -- and its whole history
+# with it, which read a starved window as idle or NEGATIVE (qloop's row on a
+# leased guest read -59 ms). Compare two readings with run_delay_window_ns.
+thread_run_delays() {
+    local t d n=0
+    for t in /proc/"$1"/task/*; do
+        { read -r _ d _ < "$t/schedstat"; } 2>/dev/null || continue
+        [[ "$d" =~ ^[0-9]+$ ]] || continue
+        printf '%s %s\n' "${t##*/}" "$d"; n=$((n + 1))
+    done
+    (( n > 0 ))
+}
+
+# run_delay_window_ns <before> <after> -- the ns of run delay between two
+# thread_run_delays readings: each thread's growth, summed. A thread only in
+# <after> was born inside the window and counts from 0; so does one whose
+# counter went DOWN (its tid was reused by a new thread). A thread only in
+# <before> exited and adds nothing -- nor takes anything away. Never
+# negative. Returns 1, printing nothing, when the two share no thread: not
+# measured is never 0.
+run_delay_window_ns() {
+    awk 'NF != 2 { next }
+         NR == FNR { b[$1] = $2; nb++; next }
+         { d = ($1 in b && $2 + 0 >= b[$1] + 0) ? $2 - b[$1] : $2; s += d; if ($1 in b) n++ }
+         END { if (!nb || !n) exit 1; printf "%.0f\n", s }' \
+        <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+# run_delay_window_ms <before> <after> -- run_delay_window_ns in whole ms.
+run_delay_window_ms() {
+    local ns
+    ns=$(run_delay_window_ns "$1" "$2") || return 1
+    printf '%s\n' "$(( ns / 1000000 ))"
+}
+
+# AXL_STARVE_MAX_MS -- the ONE limit both timing witnesses judge against: a
+# timing miss while the guest's QEMU waited longer than this for a CPU (run
+# delay, read per thread: thread_run_delays) is load, not a verdict.
+# scripts/qloop-verdict.sh reads it over a whole qloop run
+# (vcpu_starve_sampler); test/integration/test-net-latency-qemu.sh over each
+# guest's round-trip window (run_delay_window_ms). Measured (12 CPUs): a
+# whole qloop run (~28 s) 6 ms quiet, 7014 ms with twelve busy loops on the
+# twelve CPUs; a net-latency round-trip window (~0.1-0.5 s) under 1 ms in a
+# spike and 0-34 ms over five full quiet runs (load ~5); beside busy loops
+# 15-280 ms, and every one of the 13 p90 misses seen there (5.11-8.89 ms) in
+# a window of 78 ms or more (2026-11-09).
+AXL_STARVE_MAX_MS=50
+
+# vcpu_starve_sampler <pid> <outfile> [interval] -- while <pid> lives, read
+# its threads' run delay (thread_run_delays) every <interval> s and keep the
+# run's figures so far in <outfile> as "<delay_ns> <steal_first_ns>
+# <steal_last_ns> <readings>"; vcpu_starve_report turns them into the run's
+# line. The delay is ACCUMULATED reading to reading (run_delay_window_ns),
+# so a thread that exits mid-run keeps what it accrued up to the last reading
+# it was in. One SUMMED first-against-last pair (the old witness) also
+# subtracted that thread's whole earlier history, which drove the figure
+# negative; one PER-THREAD pair would still drop the exiting thread's share
+# of the run. A reading that fails (the process going) is skipped. The pid
+# is pinned by its start time (proc_start_ticks): once it names another
+# process, sampling stops and the figure so far -- the right process's --
+# stands, as when it exits. Two consecutive readings that share no thread
+# cannot come from one live process (its main thread's tid is the pid), so
+# that case writes "unmeasured" and stops: a figure only where one was
+# measured. Steal is box-wide (host_steal_ns), first reading against last.
+vcpu_starve_sampler() {
+    local pid="$1" outf="$2" interval="${3:-0.2}" prev="" cur w total=0 n=0 s0="" s
+    local hz st st0=""
+    hz=$(getconf CLK_TCK)
+    while kill -0 "$pid" 2>/dev/null; do
+        if cur=$(thread_run_delays "$pid") && st=$(proc_start_ticks "$pid") \
+           && s=$(host_steal_ns "$hz"); then
+            [[ -n "$st0" ]] || st0="$st"
+            [[ "$st" == "$st0" ]] || return 0
+            if [[ -n "$prev" ]]; then
+                if ! w=$(run_delay_window_ns "$prev" "$cur"); then
+                    echo unmeasured > "$outf.tmp" && mv -f "$outf.tmp" "$outf"
+                    return 0
+                fi
+                total=$((total + w))
+            fi
+            [[ -n "$s0" ]] || s0="$s"
+            prev="$cur"; n=$((n + 1))
+            printf '%s %s %s %s\n' "$total" "$s0" "$s" "$n" > "$outf.tmp" && mv -f "$outf.tmp" "$outf"
+        fi
+        sleep "$interval"
+    done
+}
+
+# vcpu_starve_report <outfile> -- "<delay_ms> <steal_ms>" over the sampled
+# run, or nothing and return 1 when it was not measured: no file, fewer than
+# two readings (a window of no length), or readings that could not be
+# compared. Both figures are non-negative by construction, and anything else
+# in the file reads as not measured, never as a number.
+vcpu_starve_report() {
+    local d s1 s2 n
+    [[ -s "$1" ]] && read -r d s1 s2 n < "$1" || return 1
+    [[ "$d" =~ ^[0-9]+$ && "$s1" =~ ^[0-9]+$ && "$s2" =~ ^[0-9]+$ && "$n" =~ ^[0-9]+$ ]] || return 1
+    (( n >= 2 && s2 >= s1 )) || return 1
+    printf '%s %s\n' $(( d / 1000000 )) $(( (s2 - s1) / 1000000 ))
+}
+
+# budget_scale_ok <value> -- a declared wall-clock budget scale is a decimal in
+# [1, 3] with a nonzero leading digit: 0 or 0.5 would shrink a budget below its
+# idle value (a false failure by construction), more than 3 (the cap on the
+# measured factor too) would cancel it, and junk would abort arithmetic. Both
+# budget checks use it: common-test.sh's one-boot run (TEST_BUDGET_SCALE) and
+# test/integration/lib/unit-ratchet.sh over pooled runs (AXL_UNIT_BUDGET_SCALE).
+budget_scale_ok() {
+    [[ "$1" =~ ^[1-9][0-9]*(\.[0-9]+)?$ ]] && awk -v v="$1" 'BEGIN { exit !(v <= 3) }'
+}
+
+# host_contention_factor <outfile> [cpus] [cap] -- echoes
+# min(cap, max(1, mean runnable / cpus)) to two decimals: how oversubscribed the
+# box was while the run shared it. 1.00 means it was not. Returns 1, printing
+# nothing, when there were no samples: the caller decides what unmeasured means
+# -- it must not be "factor 1" silently.
+#
+# WHY THE RAW RATIO, which overstates the slowdown. Beside verify.sh's other
+# jobs the x64 suite (75-89 s with nothing of ours beside it) took 107-134 s over
+# five runs at mean runnable 1.4-2.4 per cpu: a slowdown of 1.4-1.8x, between
+# 0.75x and 1.0x the ratio, and not steady -- the guest is partly asleep (24 of
+# its 73 idle seconds are wall-clock waits), the other jobs run niced, and the
+# box is shared with other people's work. A damped factor (K = 0.5-0.6 was
+# tried) fell 17% short of a clean run in one of the five, and a gate that
+# fails a clean run is worse than a loose one. So the budget scales by the raw
+# ratio, and what that costs is margin: up to ~85% over a heavily contended
+# run, against ~27% idle. The idle margin is the one that catches a regression
+# -- run `verify.sh --only=x64` (no neighbours, factor 1.00) for that. The cap
+# keeps a pathological box from cancelling the budget altogether. The mean
+# includes the guest and the sampler's own wakeups (~1-2 runnable), far below
+# the cpu count, so an idle box reads 1.00.
+#
+# CPUS IS THE HOST'S, not `nproc`: procs_running counts the whole host, and
+# nproc shrinks under taskset or a cpuset cgroup, which would inflate the factor
+# toward its cap with nothing wrong.
+host_contention_factor() {
+    local file="$1" cpus="${2:-$(getconf _NPROCESSORS_ONLN)}" cap="${3:-3}" sum n
+    [[ -s "$file" ]] && read -r sum n < "$file" && (( n > 0 )) || return 1
+    awk -v s="$sum" -v n="$n" -v c="$cpus" -v cap="$cap" \
+        'BEGIN { f = (s / n) / c; if (f < 1) f = 1;
+                 if (f > cap) f = cap; printf "%.2f", f }'
+}
+
+# tools_dir_stale <tools-dir> -- print (one per line) each *.efi in the dir that
+# is OLDER than the library in the sibling lib/ (<prefix>/lib/libaxl.a). Every
+# tool of this tree links libaxl.a, so a tool built before the current library
+# is either a leftover from another build (a release's RTK image, an old
+# checkout) or a missed rebuild -- and a test that enumerates tools/*.efi tests
+# it as if it were current. Returns 1 with a message, printing nothing, when the
+# library cannot be found: "nothing stale" must not be what an unchecked dir
+# reports. Prints nothing and returns 0 when every tool is current.
+tools_dir_stale() {
+    local dir="$1" lib f
+    lib="$(dirname "$dir")/lib/libaxl.a"
+    if [[ ! -f "$lib" ]]; then
+        echo "tools_dir_stale: no $lib to compare against" >&2
+        return 1
+    fi
+    for f in "$dir"/*.efi; do
+        [[ -e "$f" ]] || continue
+        if [[ "$f" -ot "$lib" ]]; then basename "$f"; fi
+    done
+    return 0
+}
+
 # duration_summary <elapsed_ms> -- enforce MAX_DURATION, if one is set.
 # Returns DURATION_EXIT on a breach so the caller can surface it as the run's
 # status, exactly as cpu_summary does for a spike. No budget set = no-op.
@@ -1418,17 +2199,201 @@ duration_summary() {
 # Milliseconds since the epoch, for the duration budget.
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
+# ---------------------------------------------------------------------------
+# Wall-time accounting: the TIMING lines. Always on, CI included, so a run's
+# logs alone say where each test's wall time went (guest boot, guest run, pool
+# lease and release, host-side setup and checks). One line per event, every
+# seconds value with three decimals, `-` where a value is unknowable:
+#
+#   TIMING: guest kind=<booted|pooled> via=<fg|bg|direct> guest=<s> boot=<s|-> rc=<n|-|unfinished>
+#       common-test.sh, when one guest run ends. guest = the run's wall time:
+#       booted, launch to QEMU's exit (firmware boot included); pooled, from
+#       entering the lease's directory to the end of the exec (fg) or of the
+#       stream (bg). boot = launch to the Shell's banner on the serial console
+#       (AXL_TIMING_BOOT_MARK: firmware init + BDS + Shell start); `-` on a
+#       pooled run (the pool booted it) or a guest that printed no banner.
+#       rc = the guest's status (124: the harness's limit); `-` for a
+#       background run (nothing waits for its status); `unfinished` for a run
+#       still going when the test exited (killed, or failed mid-run).
+#   TIMING: test=<name> total=<s> setup=<s|-> guest=<s> boot=<s> between=<s|-> post=<s|-> booted=<n> pooled=<n> start=<kind|-> lease=<ms|->
+#       common-test.sh, once, as test_cleanup begins (before its teardown, so
+#       a teardown that hangs cannot lose it). total = from sourcing
+#       common-test.sh. setup = before the first guest run; post = after the
+#       last one ended; between = the host time between the first run's start
+#       and the last one's end that no run covered. `-`: no guest run, so no
+#       split. guest/boot = the sums of the guest lines above (boot over the
+#       runs that had a reading). start/lease: a pooled test's lease -- how
+#       its guest came to be clean (booted|restored|cold) and the wait for it
+#       in ms, as `axlpool run` measured it (AXL_POOL_START, AXL_POOL_LEASE_MS).
+#   TIMING: run-qemu mode=<fg|bg|shot|interactive|window> guest=<s> boot=<s|-> rc=<n|unfinished>
+#       scripts/run-qemu.sh, when its guest ends (for --background, from the
+#       watchdog subshell, after this script has returned). guest/boot as above.
+#   TIMING: run-qemu mode=pooled guest=<s> boot=- restore=<s> rc=<n|unfinished>
+#       scripts/run-qemu.sh on a leased guest (its pooled mode): guest = from
+#       the mid-lease restore's start to the end of the run, restore = that
+#       restore's share of it. rc = exec's status (124: --timeout cut it off).
+#       lib/timing-report.py counts it as a pooled run.
+#   TIMING: runner test=<name> attempt=<n> via=<boot|pool> wall=<s> cpu=<s> rc=<n>
+#       lib/run-one.sh, after each run of a test (a --background guest that
+#       outlives its test may still append its own line after this one):
+#       its whole wall time, the pool's lease and release included. cpu =
+#       user + system of every process the attempt REAPED (the test, its
+#       QEMUs, builds, tools), from the runner's cutime + cstime. The runner
+#       is a child subreaper (lib/subreaper.py), so an orphan -- a
+#       `run-qemu.sh --background` guest's watchdog -- is reaped by it too.
+#       Not in it: a process still running when the line is written, one
+#       killed with nothing left to reap it, and a pooled guest's QEMU (the
+#       pool's).
+#   axlpool run: leased <guest> <class>/<arch> (<start>, pool start <ms> ms) in <ms> ms
+#   axlpool run: released <guest> (<outcome>) in <ms> ms
+#       test/pool/axlpool/client.py, the pooled run's wrapper (stderr).
+#
+# WHERE THEY GO. To $AXL_TEST_TIMING_LOG when it is set -- lib/run-one.sh
+# sets it to the test's own log, which it opens O_APPEND so an appended line
+# lands between the test's output instead of being overwritten by it. That is
+# what makes run-qemu.sh's line survive: 46 tests capture run-qemu.sh's
+# stdout+stderr in a variable and parse it, so a line on stderr would be
+# swallowed (and could break an exact match). Unset, every producer writes
+# only to a TERMINAL, never to a stderr that is not one: a caller capturing a
+# harness snippet's output with 2>&1 (test-duration-budget-selftest.sh reads
+# its last line) must never find a TIMING line in it. Started from a terminal,
+# common-test.sh points the variable at that terminal for its children.
+#
+# lib/timing-report.py reads a run's log directory and tabulates them.
+# ---------------------------------------------------------------------------
+# axl_strip_escapes FILE -- FILE with terminal escape sequences removed, to
+# stdout (carriage returns kept: callers decide). The ONE definition, for
+# run-qemu.sh's clean log and common-test.sh's: the parameter class is the
+# full CSI parameter range (ECMA-48 0x30-0x3F), so DEC private modes like
+# ESC[=3h and ESC[?25l strip, not only numeric CSI like ESC[2J; and the
+# ESC( / ESC) charset designators UEFI consoles emit on init go too.
+axl_strip_escapes() {
+    sed -E '
+        s/\x1b\[[0-9;:<=>?]*[a-zA-Z@`{|}~]//g
+        s/\x1b[()][A-Za-z0-9]//g
+    ' "$1"
+}
+
+AXL_TIMING_BOOT_MARK='UEFI Interactive Shell'
+
+# axl_timing_now VAR -- microseconds since the epoch into VAR. No fork on
+# bash 5 ($EPOCHREALTIME; its radix follows the locale, so every non-digit is
+# dropped -- the fraction is always six digits).
+axl_timing_now() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        printf -v "$1" '%s' "${EPOCHREALTIME//[!0-9]/}"
+    else
+        printf -v "$1" '%s' "$(date +%s%6N)"
+    fi
+}
+
+# axl_timing_secs VAR US -- US microseconds as seconds, three decimals, into
+# VAR ("12.345"); a negative span (clock steps) reads 0.000.
+axl_timing_secs() {
+    local ms=$(( $2 / 1000 ))
+    (( ms < 0 )) && ms=0
+    printf -v "$1" '%d.%03d' $(( ms / 1000 )) $(( ms % 1000 ))
+}
+
+# axl_timing_emit LINE -- LINE to $AXL_TEST_TIMING_LOG (one >> per line, so
+# concurrent writers interleave whole lines), else to stderr only when it is a
+# terminal, else nowhere.
+axl_timing_emit() {
+    if [[ -n "${AXL_TEST_TIMING_LOG:-}" ]]; then
+        printf '%s\n' "$1" >> "$AXL_TEST_TIMING_LOG" 2>/dev/null || true
+    elif [[ -t 2 ]]; then
+        printf '%s\n' "$1" >&2
+    fi
+    return 0
+}
+
+# axl_timing_watch PID LOG OUT [noend] -- a background watcher (its pid in
+# AXL_TIMING_WATCH_PID): OUT.boot gets the time LOG first shows the Shell
+# banner, OUT.end the time PID ended (not with `noend`: then it writes
+# nothing once PID is gone, and exits with it). Whoever removes OUT's
+# directory stops it first with axl_timing_unwatch. Either file stays absent when it did not
+# happen; the reader takes "now" for a missing end. LOG may be empty (no file
+# to read: no boot reading). One subshell and two tails per guest, no loop.
+#
+# A `read` loop, not `grep -m1 -q`: grep held its match until the tail
+# feeding it exited (measured: a banner at 0.5 s reported at 1.5 s, the
+# writer's lifetime). Both tails take --pid, so they end with the guest even
+# if this subshell is killed; an empty PID is refused, since `tail --pid=`
+# with no pid follows forever. Output to /dev/null: a watcher must not hold
+# a caller's $(...) open.
+axl_timing_watch() {
+    local pid="$1" log="$2" out="$3" noend="${4:-}"
+    AXL_TIMING_WATCH_PID=""
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    (
+        if [[ -n "$log" ]]; then
+            while IFS= read -r line; do
+                if [[ "$line" == *"$AXL_TIMING_BOOT_MARK"* ]]; then
+                    axl_timing_now now
+                    printf '%s\n' "$now" > "$out.boot"
+                    break
+                fi
+            done < <(exec tail -n +1 -s 0.1 --pid="$pid" -F -- "$log" 2>/dev/null)
+        fi
+        [[ "$noend" == noend ]] && exit 0
+        tail --pid="$pid" -s 0.2 -f /dev/null 2>/dev/null || true
+        axl_timing_now now
+        # TEST HOOK (test-timing-lines.sh): hold the write, deaf to TERM, as a
+        # watcher caught mid-write is; and record a write whose directory is
+        # already gone -- the cleanup removed it while this could still write.
+        if [[ -n "${AXL_TIMING_TEST_HOLD:-}" ]]; then
+            trap '' TERM
+            sleep "$AXL_TIMING_TEST_HOLD"
+            [[ -d "${out%/*}" ]] || printf '%s\n' "$out" >> "${AXL_TIMING_TEST_LATE:-/dev/null}"
+        fi
+        printf '%s\n' "$now" > "$out.end"
+    ) > /dev/null 2>&1 &
+    AXL_TIMING_WATCH_PID=$!
+    # Out of the job table: a caller's bare `wait` or `jobs -p` must not see
+    # it, and killing it must print no "Terminated" job report.
+    disown "$AXL_TIMING_WATCH_PID" 2>/dev/null || true
+}
+
+# axl_timing_unwatch PID -- stop a watcher and WAIT until it has exited, so
+# a cleanup may then remove the directory it writes into: a file it created
+# mid-`rm -rf` would make the final rmdir fail and leave the tree behind.
+# TERM, polled up to 1 s; then KILL, polled up to 1 s more -- bounded, so it
+# never hangs a cleanup. Polls `kill -0`: a disowned watcher is not ours to
+# `wait` for, and bash still reaps it, so it does not linger as a zombie.
+axl_timing_unwatch() {
+    local pid="$1" i sig
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    for sig in TERM KILL; do
+        kill -s "$sig" "$pid" 2>/dev/null || return 0
+        for (( i = 0; i < 20; i++ )); do
+            kill -0 "$pid" 2>/dev/null || return 0
+            sleep 0.05
+        done
+    done
+    return 0
+}
+
+# axl_timing_read VAR FILE -- the stamp a watcher wrote to FILE into VAR, or
+# empty when it wrote none.
+axl_timing_read() {
+    local v=""
+    [[ -s "$2" ]] && read -r v < "$2" 2>/dev/null
+    [[ "$v" =~ ^[0-9]+$ ]] || v=""
+    printf -v "$1" '%s' "$v"
+}
+
 # Start the background CPU sampler against a running QEMU pid. No-op (leaves the
 # globals empty) when both warn and report are off, or the pid is empty.
-# Usage: cpu_monitor_start <qemu-pid> [tmpdir]   (tmpdir defaults to $TMPDIR)
+# Usage: cpu_monitor_start <qemu-pid> [tmpdir] [until-pid]   (tmpdir defaults
+# to $TMPDIR; until-pid: see cpu_sampler)
 cpu_monitor_start() {
-    local qpid="$1" tmpdir="${2:-$TMPDIR}"
+    local qpid="$1" tmpdir="${2:-$TMPDIR}" until="${3:-}"
     CPU_SUMMARY_FILE=""
     CPU_SAMPLER_PID=""
     [[ "$CPU_WARN" != "true" && "$CPU_REPORT" != "true" ]] && return 0
     [[ -z "$qpid" ]] && return 0
     CPU_SUMMARY_FILE="$tmpdir/cpu-summary.txt"
-    cpu_sampler "$qpid" "$CPU_SUMMARY_FILE" &
+    cpu_sampler "$qpid" "$CPU_SUMMARY_FILE" ${until:+"$until"} &
     CPU_SAMPLER_PID=$!
 }
 

@@ -1,0 +1,18 @@
+#!/bin/sh
+# axl-sdk-@AXL_VERSION@ -- before removal (.deb prerm "remove", .rpm %preun on
+# erase). Takes this root out of the alternatives: /opt/axl-sdk-package moves
+# to the next-newest package, or goes with the last one (and the profile.d
+# slave with it). Never on a .deb "upgrade" or an .rpm upgrade (%preun $1 > 0):
+# the root is still there afterwards.
+set -e
+case "${1:-0}" in
+    remove|deconfigure|0) ;;
+    *) exit 0 ;;
+esac
+if command -v update-alternatives >/dev/null 2>&1; then
+    alt=update-alternatives
+else
+    alt=alternatives
+fi
+"$alt" --remove axl-sdk-package /opt/axl-sdk-@AXL_VERSION@ || true
+exit 0

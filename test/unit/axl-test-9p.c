@@ -279,6 +279,36 @@ test_parse_readdir_well_formed(void)
     axl_array_free(arr);
 }
 
+/* A listed name with a NUL inside it reads as its prefix -- "x\0y" as "x",
+   which may be a sibling's name: skipped, never cut. */
+static void
+test_parse_readdir_skips_an_embedded_nul(void)
+{
+    static const DirEntSpec ents[] = {
+        { .off = 1, .dtype = 8, .name = "xQy" },
+        { .off = 2, .dtype = 8, .name = "ok"  },
+    };
+    uint8_t buf[128];
+    size_t  body_len = build_readdir_body(buf, sizeof(buf), ents, 2);
+    for (size_t i = 0; i + 2 < body_len; i++) {
+        if (buf[i] == 'x' && buf[i + 1] == 'Q' && buf[i + 2] == 'y') {
+            buf[i + 1] = 0;
+        }
+    }
+
+    AxlArray *arr = axl_array_new(sizeof(AxlFsEntry));
+    uint32_t  dcount = 0;
+    uint64_t  last_off = 0;
+    test_log_quiet_begin("9p");
+    int rc = axl_9p_parse_readdir(buf, body_len, arr, &dcount, &last_off);
+    test_log_quiet_abort();
+    AxlFsEntry *e0 = (AxlFsEntry *)axl_array_get(arr, 0);
+    test_check(rc == AXL_OK && axl_array_len(arr) == 1 && e0 != NULL
+               && axl_strcmp(e0->name, "ok") == 0 && last_off == 2,
+               "9p parse_readdir: a name with an embedded NUL is skipped, not cut");
+    axl_array_free(arr);
+}
+
 static void
 test_parse_readdir_dir_entry(void)
 {
@@ -734,15 +764,22 @@ test_9p_path_up(void)
 {
     char path[64];
 
+    /* The root as axl_9p_server_new stores a whole-volume export. */
+    char root[16];
+    axl_strlcpy(root, "fs0:", sizeof(root));
+    test_check(s9p_root_normalize(root, sizeof(root))
+               && axl_strcmp(root, "fs0:\\") == 0,
+               "9p path up: a bare volume root normalizes to \"fs0:\\\"");
+
     axl_strlcpy(path, "fs0:\\a\\b", sizeof(path));
-    test_check(s9p_path_up("fs0:", path, sizeof(path))
+    test_check(s9p_path_up(root, path, sizeof(path))
                && axl_strcmp(path, "fs0:\\a") == 0,
                "9p path up: a step inside the root yields the parent");
 
-    axl_strlcpy(path, "fs0:", sizeof(path));
-    test_check(!s9p_path_up("fs0:", path, sizeof(path)),
+    axl_strlcpy(path, "fs0:\\", sizeof(path));
+    test_check(!s9p_path_up(root, path, sizeof(path)),
                "9p path up: a step at the export root is refused");
-    test_check(axl_strcmp(path, "fs0:") == 0,
+    test_check(axl_strcmp(path, "fs0:\\") == 0,
                "9p path up: a refusal at the root leaves the buffer untouched");
 
     /* Walk a nested path all the way up: each step succeeds until the root,
@@ -750,14 +787,53 @@ test_9p_path_up(void)
        the root. This is exactly the sequence Treaddir's ".." record and
        Twalk's ".." component depend on. */
     axl_strlcpy(path, "fs0:\\a\\b\\c", sizeof(path));
-    test_check(s9p_path_up("fs0:", path, sizeof(path))
-               && s9p_path_up("fs0:", path, sizeof(path))
-               && s9p_path_up("fs0:", path, sizeof(path))
-               && axl_strcmp(path, "fs0:") == 0,
+    test_check(s9p_path_up(root, path, sizeof(path))
+               && s9p_path_up(root, path, sizeof(path))
+               && s9p_path_up(root, path, sizeof(path))
+               && axl_strcmp(path, "fs0:\\") == 0,
                "9p path up: three steps from fs0:\\a\\b\\c land exactly on the root");
-    test_check(!s9p_path_up("fs0:", path, sizeof(path))
-               && axl_strcmp(path, "fs0:") == 0,
+    test_check(!s9p_path_up(root, path, sizeof(path))
+               && axl_strcmp(path, "fs0:\\") == 0,
                "9p path up: the step that would escape refuses, buffer intact");
+}
+
+/* s9p_root_normalize -- the root's spelling must equal what
+   axl_path_get_dirname yields at the top of the tree, or the ".." guard in
+   s9p_path_up never fires. */
+static void
+test_9p_root_normalize(void)
+{
+    static const struct {
+        const char *in;
+        const char *want;
+    } cases[] = {
+        { "fs0:\\",          "fs0:\\" },
+        { "fs0:",            "fs0:\\" },
+        { "fs0:/",           "fs0:/" },
+        { "fs0:\\export\\",  "fs0:\\export" },
+        { "fs0:\\export",    "fs0:\\export" },
+        { "/export/",        "/export" },
+        { "/",               "/" },
+    };
+    char root[32];
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        axl_strlcpy(root, cases[i].in, sizeof(root));
+        bool ok = s9p_root_normalize(root, sizeof(root));
+        char name[96];
+        axl_snprintf(name, sizeof(name),
+                     "9p root normalize: \"%s\" -> \"%s\" (got \"%s\")",
+                     cases[i].in, cases[i].want, root);
+        test_check(ok && axl_strcmp(root, cases[i].want) == 0, name);
+    }
+
+    /* Gaining the separator must not overflow: a 5-byte buffer holds
+       "fs0:" but not "fs0:\". */
+    char tight[5];
+    axl_strlcpy(tight, "fs0:", sizeof(tight));
+    test_check(!s9p_root_normalize(tight, sizeof(tight))
+               && axl_strcmp(tight, "fs0:") == 0,
+               "9p root normalize: no room for the separator is refused, root intact");
 }
 
 /* s9p_comp_is_safe -- the ONE guard standing between a wire-supplied path
@@ -1421,6 +1497,7 @@ test_9p_main(int argc, char **argv)
     test_9p_getattr_codec();
     test_parse_readdir_well_formed();
     test_parse_readdir_dir_entry();
+    test_parse_readdir_skips_an_embedded_nul();
     test_parse_readdir_eof();
     test_parse_readdir_dcount_lies();
     test_parse_readdir_truncated_entry();
@@ -1433,6 +1510,7 @@ test_9p_main(int argc, char **argv)
     test_9p_readdir_resume();
     test_9p_dirent_put();
     test_9p_path_up();
+    test_9p_root_normalize();
     test_9p_comp_is_safe();
     test_9p_type_is_mutating();
     test_9p_write_bounds();

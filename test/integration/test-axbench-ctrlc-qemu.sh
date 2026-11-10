@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=20 local-only=0
+# test-meta: arch=x64 needs=socat est=20 local-only=0 builds=ARCH=x64,axbench guest=none
+# guest=none: it sends a real Ctrl-C over --serial-socket to a --background
+#   guest with its own -smp; a leased guest has neither.
 # test-axbench-ctrlc-qemu.sh — proof that Ctrl-C aborts axbench cleanly
 # while it is CPU-bound in an AP-pool scenario.
 #
@@ -47,7 +49,7 @@ trap cleanup EXIT
 
 command -v socat >/dev/null 2>&1 || { echo "ERROR: socat required" >&2; exit 2; }
 
-make -C "$PROJECT_DIR" ARCH=x64 axbench 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 axbench 2>&1 | tail -1
 
 qemu_timeout=120
 if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then qemu_timeout=300; fi

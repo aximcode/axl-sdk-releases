@@ -120,6 +120,10 @@ usage() {
     # exit 2 for the same class of mistake.
     echo "usage: axl <command> [args ...]"
     echo "       axl update | use <version> | list | uninstall"
+    echo "                      (install.sh's versions; from a .deb/.rpm copy they"
+    echo "                       refuse and name the apt/dnf command. 'axl list'"
+    echo "                       shows every version with its owner, 'axl use'"
+    echo "                       with no version names a .axl-sdk-version pin)"
     echo "       axl toolchain list [--porcelain] | install [aa64|x64|all]"
     echo "                      | uninstall [--dry-run|-n] <aa64|x64>"
     echo "                      (list names which compiler each arch builds with)"
@@ -193,6 +197,39 @@ sdk_prefix() {
     fi
 }
 
+# root_owner DIR -- who placed an SDK root, from its receipt
+# (share/axl/.axl-receipt; AXL-Distribution-Design.md §21): install.sh, deb,
+# rpm, another owner, or nothing (a root from before receipts existed).
+root_owner() {
+    [[ -e "$1/share/axl/.axl-receipt" ]] || return 0
+    # One that exists and cannot be read is an owner this user cannot see,
+    # never "no receipt" -- that would be the pattern rule, i.e. rm -rf.
+    [[ -r "$1/share/axl/.axl-receipt" ]] || { echo "unreadable"; return 0; }
+    sed -n 's/^AXL_RECEIPT_SOURCE=//p' "$1/share/axl/.axl-receipt" | head -1
+}
+
+# Where the .deb/.rpm install their versioned roots and keep their own
+# `current` (§17.5). Overridable for tests; nothing else should need to.
+PKG_ROOT="${AXL_PACKAGE_ROOT:-/opt}"
+
+# project_pin -- "<version> <file>" for the nearest .axl-sdk-version in this
+# directory or a parent (the per-project pin a consumer keeps; its
+# `make install-sdk` reads it), or nothing. A file that does not hold one
+# bare version is ignored, never echoed: it may hold anything.
+project_pin() {
+    local d="$PWD" v
+    while :; do
+        if [[ -f "$d/.axl-sdk-version" ]]; then
+            v="$(tr -d '[:space:]' < "$d/.axl-sdk-version" 2>/dev/null)"
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 0
+            printf '%s %s\n' "$v" "$d/.axl-sdk-version"
+            return 0
+        fi
+        [[ "$d" == / ]] && return 0
+        d="$(dirname "$d")"
+    done
+}
+
 # THE CROSS TOOLCHAIN, resolved ONCE for every arm that asks about it. The
 # `toolchain` arm's own comment already refused a second copy for its two
 # callers -- `list` would report one root installed while `uninstall` removed a
@@ -227,7 +264,7 @@ tc_conf_path() {   # tc_conf_path <sdk prefix> -> the manifest path, or status 1
 # manifest to have been sourced.
 #
 # `${AXL_<ARCH>_GXX:-$AXL_<ARCH>_GXX_DEFAULT}` -- the resolution
-# axl-toolchains.conf documents and which axl-cc, install.sh and the Makefile
+# axl-toolchains.conf documents and which axl-cc, install.sh and the CMake build
 # all use. Reading _DEFAULT alone reported MISSING for anyone who installed
 # with `--prefix $HOME/.local/opt` and exported what the installer's own
 # print_env told them to, then advised re-downloading 55 MB into /opt.
@@ -336,7 +373,7 @@ tc_have_compiler() {   # tc_have_compiler <path or bare name>
 # always compare equal and the case would never fire. The manifest dirs live
 # under /opt, which is install-toolchain.sh's INSTALL_ROOT DEFAULT, so that is
 # the target it would pick here; a manifest naming a root outside /opt would be
-# disagreeing with its own installer, which `make check-toolchain-conf` is the
+# disagreeing with its own installer, which `gate.check-toolchain-conf` is the
 # gate for.
 #
 # $INSTALL_ROOT ITSELF IS NOT CONSULTED, deliberately. install-toolchain.sh
@@ -406,14 +443,31 @@ case "${1-}" in
         exit 2
         ;;
     list)
-        # Reads the filesystem only, so this also works in a package install
-        # (where it will correctly find nothing to list).
+        # Reads the filesystem only. TWO managers' roots (§17.5): install.sh's
+        # beside this prefix, and the .deb/.rpm's under $PKG_ROOT -- each
+        # labelled by its receipt, each manager's current marked with its
+        # own sign, since the packages keep their own link
+        # ($PKG_ROOT/axl-sdk-package) rather than share install.sh's.
         _root="$(dirname "$PREFIX")"
         _cur=""
         [[ -L "$_root/axl-sdk" ]] && _cur="$(cd -P "$_root/axl-sdk" 2>/dev/null && pwd)"
+        _pcur=""
+        [[ -L "$PKG_ROOT/axl-sdk-package" ]] \
+            && _pcur="$(cd -P "$PKG_ROOT/axl-sdk-package" 2>/dev/null && pwd)"
         _any=0
+        _roots=()
         for _d in "$_root"/axl-sdk-[0-9]*; do
-            [[ -d "$_d" ]] || continue
+            [[ -d "$_d" ]] && _roots+=("$_d")
+        done
+        # Package roots, when they live elsewhere: only the ones a package's
+        # receipt claims (an install.sh root under /opt is listed from there).
+        if [[ "$(cd -P "$PKG_ROOT" 2>/dev/null && pwd)" != "$(cd -P "$_root" 2>/dev/null && pwd)" ]]; then
+            for _d in "$PKG_ROOT"/axl-sdk-[0-9]*; do
+                [[ -d "$_d" ]] || continue
+                case "$(root_owner "$_d")" in deb|rpm) _roots+=("$_d") ;; esac
+            done
+        fi
+        for _d in "${_roots[@]}"; do
             _any=1
             # SIZE, because the very next line of output advises `axl prune`
             # and this is the number that decides whether that is worth
@@ -425,11 +479,13 @@ case "${1-}" in
             # follow it into whatever it leads to.
             _sz="$(du -shx "$_d" 2>/dev/null | awk '{print $1}')"
             _mark="  "; [[ "$_d" == "$_cur" ]] && _mark="* "
-            # TWO FORMATS, so an unmeasured size leaves no trailing blanks.
+            [[ -n "$_pcur" && "$_d" == "$_pcur" ]] && _mark="+ "
+            _own="$(root_owner "$_d")"; _own="${_own:-(no receipt)}"
+            # TWO FORMATS, so an unmeasured size leaves no blank column.
             if [[ -n "$_sz" ]]; then
-                printf '%s%-24s %6s\n' "$_mark" "$(basename "$_d")" "$_sz"
+                printf '%s%-24s %6s  %s\n' "$_mark" "$(basename "$_d")" "$_sz" "$_own"
             else
-                printf '%s%s\n' "$_mark" "$(basename "$_d")"
+                printf '%s%-24s  %s\n' "$_mark" "$(basename "$_d")" "$_own"
             fi
         done
         if [[ "$_any" -eq 0 ]]; then
@@ -437,11 +493,41 @@ case "${1-}" in
             echo "(this prefix was not placed by install.sh -- see 'axl --print-prefix')"
         else
             echo ""
-            echo "* = current.  'axl use <version>' switches;  'axl prune' removes old ones."
+            if [[ -n "$_pcur" ]]; then
+                echo "* = current (install.sh).  + = current (the system packages)."
+                echo "'axl use <version>' switches install.sh roots; 'axl prune' removes old ones."
+                echo "Package roots belong to apt/dnf: install or remove them there."
+            else
+                echo "* = current.  'axl use <version>' switches;  'axl prune' removes old ones."
+            fi
         fi
         exit 0
         ;;
     update|use|uninstall)
+        # TWO MANAGERS OF ONE TREE is the failure (§17.5): a root a .deb/.rpm
+        # placed belongs to apt/dnf, whose database lists its files. So from a
+        # package root these refuse and name the command that does the job --
+        # Google Cloud CLI disables its own updater in its package installs
+        # the same way.
+        case "$(root_owner "$PREFIX")" in
+            deb|rpm)
+                _src="$(root_owner "$PREFIX")"; _pv="$(basename "$PREFIX")"
+                if [[ "$_src" == deb ]]; then
+                    _kind="a deb package, which apt manages"; _pm=apt; _alt=update-alternatives
+                    _new="sudo apt install ./axl-sdk-<version>_<version>-1_amd64.deb"
+                else
+                    _kind="an rpm package, which dnf manages"; _pm=dnf; _alt=alternatives
+                    _new="sudo dnf install ./axl-sdk-<version>-<version>-1.x86_64.rpm"
+                fi
+                echo "axl: this SDK ($_pv) is $_kind -- 'axl $1' is for install.sh's roots." >&2
+                case "$1" in
+                    update)    echo "     A newer one installs beside it: $_new" >&2 ;;
+                    use)       echo "     Switch the packages' current with: sudo $_alt --config axl-sdk-package" >&2 ;;
+                    uninstall) echo "     Remove it with: sudo $_pm remove $_pv" >&2 ;;
+                esac
+                exit 1
+                ;;
+        esac
         # Maintenance runs from the copy INSIDE this prefix, so it works
         # without the original download and always matches what is installed.
         # Not commands in libexec/axl (install.sh stages 0644 there, so the
@@ -516,7 +602,16 @@ case "${1-}" in
                 exec sh "$_inst" --uninstall --prefix "$_root" --bin-dir "$_bin" "$@"
                 ;;
             use)
-                [[ $# -ge 1 ]] || { echo "axl: use needs a version (try 'axl list')" >&2; exit 2; }
+                if [[ $# -lt 1 ]]; then
+                    echo "axl: use needs a version (try 'axl list')" >&2
+                    # A HINT, never a switch: the project's pin, if one is
+                    # in reach, with the exact command to return to it.
+                    _pin="$(project_pin)"
+                    if [[ -n "$_pin" ]]; then
+                        echo "axl: this project pins ${_pin%% *} (${_pin#* }) -- to switch to it: axl use ${_pin%% *}" >&2
+                    fi
+                    exit 2
+                fi
                 _v="$1"; shift
                 exec sh "$_inst" --use "$_v" --prefix "$_root" --bin-dir "$_bin" "$@"
                 ;;
@@ -875,6 +970,17 @@ case "${1-}" in
                 # already-current install and then did nothing, which is this
                 # feature's own "say what you are doing" guarantee inverted on
                 # its most common invocation.
+                #
+                # THE PROJECT'S PIN is the exception, and only as a hint: an
+                # update ignores .axl-sdk-version (it always moves to the
+                # newest), which is the trap -- so a pin in reach that is not
+                # the version in use is named, with the way back.
+                _pin="$(project_pin)"
+                _now=""
+                [[ -r "$(sdk_prefix)/share/axl/version" ]] && _now="$(cat "$(sdk_prefix)/share/axl/version")"
+                if [[ -n "$_pin" && "${_pin%% *}" != "$_now" ]]; then
+                    echo "axl: this project pins ${_pin%% *} (${_pin#* }); 'update' moves to the newest release -- to return to the pin: axl use ${_pin%% *}" >&2
+                fi
                 exec sh "$_inst" --prefix "$_root" --bin-dir "$_bin" \
                      ${_tc_arg[@]+"${_tc_arg[@]}"} \
                      ${_upd_args[@]+"${_upd_args[@]}"}
@@ -927,6 +1033,12 @@ case "${1-}" in
         [[ -r "$_sdk/share/axl/version" ]] && _sdk_v="$(cat "$_sdk/share/axl/version")"
         [[ -r "$_sdk/VERSION" ]] && _sdk_v="$(cat "$_sdk/VERSION")"
         printf '%-9s %-10s %s\n' "sdk" "$_sdk_v" "$_sdk"
+        # WHO MANAGES IT, when that is not install.sh (§17.5): a package's
+        # root is apt's or dnf's, and the verbs above refuse there.
+        case "$(root_owner "$_sdk")" in
+            deb) printf '%-9s %-10s %s\n' "owner" "deb" "managed by apt ($(basename "$_sdk"))" ;;
+            rpm) printf '%-9s %-10s %s\n' "owner" "rpm" "managed by dnf ($(basename "$_sdk"))" ;;
+        esac
         if [[ "$_mgr_v" != "$_sdk_v" ]]; then
             echo ""
             # WHICH WAY ROUND, because the two directions need opposite advice

@@ -30,7 +30,14 @@ main(int argc, char **argv)
     (void)argc; (void)argv;
 
     /* Capture this launcher's (piped) StdIn into the bridge. */
-    axl_shared_driver_install_stdio_bridge();
+    /* Aimed at the resident driver, as a real launcher's would be. */
+    AxlGuid guid;
+    void   *vt = NULL;
+    if (axl_shared_driver_guid(STDIO_BRIDGE_FIX_NAME, &guid) != AXL_OK
+        || axl_protocol_find_guid(&guid, &vt) != AXL_OK) {
+        vt = NULL;
+    }
+    axl_shared_driver_install_stdio_bridge(vt);
 
     /* Exit WITHOUT CRT0 cleanup -> the bridge is never uninstalled.
        The shell unloads this image and frees its pipe StdIn handle,

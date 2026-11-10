@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=80 local-only=0
+# test-meta: arch=x64 needs= est=80 local-only=0 builds=hello,kbprobe,shell-launcher guest=none
+# guest=none: the boot is the subject: the AXL Shell launcher's fallback
+#   when it cannot start the Shell.
 # test-shell-launcher-fallback-qemu.sh — guards the self-healing default.
 #
 # The AXL shell launcher (test/integration/axl-shell-launcher.c) is staged as
@@ -54,7 +56,7 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 # hello = the app under test; kbprobe = the hanging fault injection; the
 # launcher itself is what scenario 1 exercises. Build up front so a missing
 # binary is a loud failure here, not a confusing boot-time fallback.
-make -C "$PROJECT_DIR" ARCH="$_native_arch" hello kbprobe shell-launcher 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" hello kbprobe shell-launcher 2>&1 | tail -1
 
 PREFIX="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$_native_arch")"
 APP="$PREFIX/hello.efi"

@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=11 local-only=0
+# test-meta: arch=x64 needs= est=11 local-only=0 guest=none
+# guest=none: measured slower pooled (pool design §6.7 step 8 item 1): its
+#   file I/O on the virtio-fs share costs more than the boot it saves.
 # test-jose-qemu.sh — axl-jose (JWS/JWT/JWK) against a real mbedTLS.
 #
 # Auxiliary single-binary test (opt out of the test-axl.sh ratchet).
@@ -30,7 +32,7 @@ export TEST_SKIP_RATCHET=1
 
 PREFIX_DIR="$("$PROJECT_DIR/scripts/build-prefix.sh" x64)"
 EFI="$PROJECT_DIR/$PREFIX_DIR/AxlTestJose.efi"
-make -C "$PROJECT_DIR" ARCH=x64 all tests 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 all tests 2>&1 | tail -1
 [[ -f "$EFI" ]] || { echo "FAIL: build did not produce $EFI"; exit 1; }
 
 LOG="$(mktemp)"

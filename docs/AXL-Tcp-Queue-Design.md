@@ -174,6 +174,14 @@ are answered by the reference:
   AXL's existing `axl_tcp_send_async` contract, so the port preserves it — no
   allocation-per-send on the hot path, and no redefinition of ownership. This
   was the reason a queue looked expensive; it is not.
+  *Superseded for the Transmit itself (2026-09):* AxlTcp now copies each piece
+  into a per-socket buffer before handing it to the firmware. Zero-copy meant
+  a cancelled send's buffer stayed referenced by TcpDxe, and the only way to
+  get it back -- `Cancel` on the armed Transmit -- frees the token while its
+  data stays queued, which `SockDataSent` then ASSERTs on. The queue above the
+  firmware still borrows the caller's buffer until its callback; the copy
+  costs one piece of memory per sending socket and measured below the noise
+  (see `axl-tcp.h`, `axl_tcp_send_async`, and the orphan piece).
 - **No dependence on firmware completion ordering.** The socket layer keeps its
   queue *above* a single protocol-level flow and completes tokens itself, in
   FIFO order, from a byte count the protocol reports. It never relies on the

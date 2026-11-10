@@ -91,9 +91,10 @@
 #include <axl.h>
 #include <uefi/axl-uefi.h>   /* EFI_RAM_DISK_PROTOCOL_GUID for the -v probe */
 
-/* Embedded RamDiskDxe.efi blob — emitted into .rodata by
- * tools/mkrd-blob.S via the GNU assembler's `.incbin` directive
- * (the per-arch path is supplied by the Makefile). Passed to
+/* Embedded RamDiskDxe.efi blob — emitted into .rodata by the
+ * build's axl_embed_blob(ramdiskdxe ...) via the GNU assembler's
+ * `.incbin` directive (tools/CMakeLists.txt picks the per-arch
+ * file). Passed to
  * axl_ramdisk_ensure_driver as the embedded fallback. */
 AXL_EMBED_DECLARE(ramdiskdxe);
 

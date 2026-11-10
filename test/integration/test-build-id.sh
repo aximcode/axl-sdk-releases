@@ -44,13 +44,18 @@ echo ""
 PSD="$(test_build_dir x64)/build/pe-set-debug"
 TOOLS="$(test_build_dir x64)/tools"
 if [[ ! -x "$PSD" ]]; then
-    echo "SKIP: pe-set-debug not built (run: make ARCH=x64 tools)"
+    echo "SKIP: pe-set-debug not built (run: scripts/axl-build.sh ARCH=x64 tools)"
     exit 0
 fi
 test_host_pass "pe-set-debug is built"
 
-A="$TOOLS/hexdump.efi"
-B="$TOOLS/lspci.efi"
+# The RAW images (tools/raw/): what the linker produced and pe-set-debug named
+# after its file. A shipped tools/<n>.efi is usually the axl-pack stub, whose
+# recorded module name is `axl-pack-stub`, so the idempotence check below --
+# which re-runs pe-set-debug under the file's own name -- would rename it and
+# read a different id: the tool behaving properly on the wrong input.
+A="$TOOLS/raw/hexdump.efi"
+B="$TOOLS/raw/lspci.efi"
 for f in "$A" "$B"; do
     [[ -f "$f" ]] || { echo "SKIP: $f not built"; exit 0; }
 done
@@ -144,17 +149,18 @@ fi
 #
 # A per-image property is only worth having if it holds for all of them; one
 # link path that skipped pe-set-debug would leave a hole exactly where triage
-# needs it.
+# needs it. Both sets: the raw images, and what ships (a wrapped image is the
+# stub, linked and stamped by its own path through WRAP_EFI).
 MISSING=""
-for f in "$TOOLS"/*.efi; do
+for f in "$TOOLS"/*.efi "$TOOLS"/raw/*.efi; do
     id="$("$PSD" --print-build-id "$f" 2>/dev/null)"
     [[ "$id" =~ ^[0-9a-f]{32}$ ]] && [[ "$id" != "00000000000000000000000000000000" ]] \
         || MISSING="$MISSING $(basename "$f")"
 done
 if [[ -z "$MISSING" ]]; then
-    test_host_pass "every built .efi in tools/ carries a non-zero id"
+    test_host_pass "every built .efi in tools/ and tools/raw/ carries a non-zero id"
 else
-    test_host_fail "every built .efi in tools/ carries a non-zero id"
+    test_host_fail "every built .efi in tools/ and tools/raw/ carries a non-zero id"
     echo "      without one:$MISSING"
 fi
 

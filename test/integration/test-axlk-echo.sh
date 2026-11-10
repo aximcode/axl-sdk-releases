@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=22 local-only=0
+# test-meta: arch=x64 needs= est=22 local-only=0 builds=axlk-echo-server guest=standard
 # axl-kernel K3 integration test — runs axlk-echo-server.efi inside
 # QEMU (axl-kernel process spawning a handler per connection), fires
 # three probes from the host via hostfwd, verifies each gets echoed.
@@ -20,29 +20,15 @@ GUEST_PORT=7000
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     all axlk-echo-server 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/axlk-echo-server.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting axlk-echo-server...
-axlk-echo-server.efi
-NSHEOF
+# The startup commands live in test-axlk-echo.nsh
+test_use_nsh
 
 test_build_image
 
@@ -55,8 +41,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for server..."
 
-if ! test_wait_for "listening on port" 60; then
-    echo "FAIL: axlk-echo-server did not start within 60s"
+if ! test_wait_boot "listening on port" 60; then
+    echo "FAIL: axlk-echo-server did not start within ${TEST_WAITED_S}s"
     test_clean_log
     echo "--- Serial log ---"
     tail -40 "$TEST_CLEAN_LOG"
@@ -84,9 +70,7 @@ done
 
 # Give the kernel a moment to print its final PASS + clean exit.
 sleep 3
-kill "$TEST_QEMU_PID" 2>/dev/null || true
-wait "$TEST_QEMU_PID" 2>/dev/null || true
-TEST_QEMU_PID=0
+test_guest_stop
 
 test_clean_log
 

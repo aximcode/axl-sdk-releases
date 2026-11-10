@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=13 local-only=0
+# test-meta: arch=both needs= est=13 local-only=0 guest=standard
 # test-cxx-noeh-qemu.sh — `axl-c++ --no-eh-frame`: an ~18% smaller C++ image
 # that still halts readably.
 #
@@ -156,20 +156,7 @@ test_add_efi "$WORK/throw-eh.efi"
 test_add_efi "$WORK/throw-noeh.efi"
 test_add_efi "$WORK/plain-noeh.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo NOEH_BEGIN"
-    echo "echo --CASE-PLAIN--"
-    echo "plain-noeh.efi"
-    echo "echo --CASE-EH--"
-    echo "throw-eh.efi"
-    echo "echo --CASE-NOEH--"
-    echo "throw-noeh.efi"
-    echo "echo NOEH_DONE"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

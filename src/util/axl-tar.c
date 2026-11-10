@@ -32,11 +32,45 @@ struct AxlTarWriter {
    record boundary makes streamed reads exit cleanly. */
 #define AXL_TAR_RECORD  (20u * AXL_TAR_BLOCK)
 
+/* Cap on the data of a GNU 'L'/'K' or pax 'x' record the reader holds in
+   memory: far above any name it can report. A larger record is stepped
+   over, and the member it describes is refused. */
+#define TAR_META_MAX  (64u * 1024u)
+
+/* Largest member size a pax `size` may give: off_t's maximum, as GNU tar
+   reads it. Far beyond any real file, and it keeps size + padding (at
+   most 511) from wrapping a uint64_t -- a wrapped skip of 0 would parse
+   the member's own DATA as the next header. A larger value refuses the
+   member as a malformed record set. */
+#define TAR_SIZE_MAX  ((uint64_t)INT64_MAX)
+
 struct AxlTarReader {
     AxlStream  *in;         // borrowed
     uint64_t    remaining;  // unread data bytes of the current entry
     uint64_t    pad;        // padding bytes after the current entry's data
+    int         stopped;    // AXL_OK while reading; else the status every
+                            //   later axl_tar_reader_next returns
 };
+
+/* What GNU 'L' and pax 'x' records say about the member that follows. */
+typedef struct {
+    bool      have_name;               // an 'L' or a pax path named it
+    bool      refused;                 // ...with a name not reported whole
+    char      name[AXL_TAR_NAME_MAX];
+    bool      have_size;               // a pax size overrides the header's
+    uint64_t  size;
+} TarPending;
+
+static int   tar_read_status(axl_ssize_t got);
+static int   tar_skip(AxlStream *in, uint64_t n);
+static int   tar_read_full(AxlStream *in, void *buf, size_t n, size_t *done);
+static int   tar_read_meta(AxlStream *in, uint64_t size, char **out);
+static void  tar_set_name(TarPending *pend, const char *s, size_t n);
+static void  tar_refuse(TarPending *pend, bool untrusted);
+static bool  tar_field_len(const uint8_t *f, size_t cap, size_t *len);
+static void  tar_apply_gnu_long(TarPending *pend, const char *data, uint64_t n);
+static void  tar_apply_pax(TarPending *pend, const char *data, uint64_t n);
+static int   tar_next(AxlTarReader *r, AxlTarEntry *out);
 
 // ---------------------------------------------------------------------------
 // Octal field helpers
@@ -284,8 +318,218 @@ axl_tar_reader_new(
         r->in = in;
         r->remaining = 0;
         r->pad = 0;
+        r->stopped = AXL_OK;
     }
     return r;
+}
+
+/* The status for an axl_read that returned @p got <= 0 while bytes were
+   still owed: the stream ended early (truncated), or failed. */
+static int
+tar_read_status(
+    axl_ssize_t  got
+    )
+{
+    return (got == 0) ? AXL_INCOMPLETE : AXL_IO_ERROR;
+}
+
+/* Step over @p n bytes of @p in. AXL_INCOMPLETE if the stream ends first,
+   AXL_IO_ERROR on a stream error. */
+static int
+tar_skip(
+    AxlStream  *in,
+    uint64_t    n
+    )
+{
+    uint8_t tmp[AXL_TAR_BLOCK];
+    while (n > 0) {
+        size_t      chunk = (n > sizeof tmp) ? sizeof tmp : (size_t)n;
+        axl_ssize_t got   = axl_read(in, tmp, chunk);
+        if (got <= 0) { return tar_read_status(got); }
+        n -= (uint64_t)got;
+    }
+    return AXL_OK;
+}
+
+/* Read exactly @p n bytes, counting them in @p *done. AXL_INCOMPLETE if
+   the stream ends first, AXL_IO_ERROR on a stream error. */
+static int
+tar_read_full(
+    AxlStream  *in,
+    void       *buf,
+    size_t      n,
+    size_t     *done
+    )
+{
+    *done = 0;
+    while (*done < n) {
+        axl_ssize_t got = axl_read(in, (uint8_t *)buf + *done, n - *done);
+        if (got <= 0) { return tar_read_status(got); }
+        *done += (size_t)got;
+    }
+    return AXL_OK;
+}
+
+/* Read a metadata record's @p size data bytes and their padding. Sets
+   @p *out to a NUL-terminated heap copy, or to NULL when the record is
+   over TAR_META_MAX (stepped over, not held) or memory runs out. Returns
+   AXL_INCOMPLETE or AXL_IO_ERROR when the stream ends early or fails. */
+static int
+tar_read_meta(
+    AxlStream  *in,
+    uint64_t    size,
+    char      **out
+    )
+{
+    uint64_t pad = (AXL_TAR_BLOCK - (size % AXL_TAR_BLOCK)) % AXL_TAR_BLOCK;
+    *out = NULL;
+    char *buf = (size <= TAR_META_MAX) ? axl_malloc((size_t)size + 1) : NULL;
+    if (buf == NULL) {
+        return tar_skip(in, size + pad);
+    }
+    size_t done = 0;
+    int    rc   = tar_read_full(in, buf, (size_t)size, &done);
+    if (rc == AXL_OK) { rc = tar_skip(in, pad); }
+    if (rc != AXL_OK) {
+        axl_free(buf);
+        return rc;
+    }
+    buf[size] = '\0';
+    *out = buf;
+    return AXL_OK;
+}
+
+/* Name the pending member @p s (@p n bytes), or refuse it when the name is
+   empty, holds a NUL, or does not fit AxlTarEntry.name whole. */
+static void
+tar_set_name(
+    TarPending  *pend,
+    const char  *s,
+    size_t       n
+    )
+{
+    pend->have_name = true;
+    pend->refused   = (n == 0 || n >= sizeof pend->name
+                       || axl_memchr(s, '\0', n) != NULL);
+    if (!pend->refused) {
+        axl_memcpy(pend->name, s, n);
+        pend->name[n] = '\0';
+    }
+}
+
+/* Refuse the pending member. An @p untrusted record set (malformed, or
+   too large to hold) also drops any size it gave, so the member's data
+   is stepped over by its header size -- what a reader that ignores the
+   record would use; a well-formed set refused only for its name keeps
+   its size, which is the member's real length. */
+static void
+tar_refuse(
+    TarPending  *pend,
+    bool         untrusted
+    )
+{
+    pend->have_name = true;
+    pend->refused   = true;
+    if (untrusted) {
+        pend->have_size = false;
+        pend->size      = 0;
+    }
+}
+
+/* The length of a NUL-padded header name field of @p cap bytes. False
+   when bytes follow the first NUL: such a name would be cut there. */
+static bool
+tar_field_len(
+    const uint8_t  *f,
+    size_t          cap,
+    size_t         *len
+    )
+{
+    size_t n = 0;
+    while (n < cap && f[n] != 0) { n++; }
+    for (size_t i = n; i < cap; i++) {
+        if (f[i] != 0) { return false; }
+    }
+    *len = n;
+    return true;
+}
+
+/* A GNU 'L' record: the name, NUL-terminated, then NUL padding. NULL
+   @p data is a record too large to hold. */
+static void
+tar_apply_gnu_long(
+    TarPending  *pend,
+    const char  *data,
+    uint64_t     n
+    )
+{
+    size_t len = 0;
+    if (data == NULL || !tar_field_len((const uint8_t *)data, (size_t)n, &len)) {
+        tar_refuse(pend, false);
+        return;
+    }
+    tar_set_name(pend, data, len);
+}
+
+/* A pax 'x' record set: "LEN key=value\n" records, LEN counting the whole
+   record. `path` and `size` are honoured; other keys are ignored. A
+   malformed set (or NULL @p data, one too large to hold), or a size over
+   TAR_SIZE_MAX, refuses the member: its name and size cannot be trusted,
+   so an earlier record's size is dropped too. */
+static void
+tar_apply_pax(
+    TarPending  *pend,
+    const char  *data,
+    uint64_t     n
+    )
+{
+    if (data == NULL) {
+        tar_refuse(pend, true);
+        return;
+    }
+    size_t pos = 0;
+    while (pos < n) {
+        size_t len = 0;
+        size_t i   = pos;
+        while (i < n && data[i] >= '0' && data[i] <= '9' && len <= n) {
+            len = len * 10 + (size_t)(data[i] - '0');
+            i++;
+        }
+        if (i >= n || data[i] != ' ' || len == 0 || len > n - pos
+            || data[pos + len - 1] != '\n') {
+            tar_refuse(pend, true);
+            return;
+        }
+        const char *key = data + i + 1;
+        const char *end = data + pos + len - 1;        /* the '\n' */
+        const char *eq  = key;
+        while (eq < end && *eq != '=') { eq++; }
+        if (eq == end) {
+            tar_refuse(pend, true);
+            return;
+        }
+        size_t      klen = (size_t)(eq - key);
+        const char *val  = eq + 1;
+        size_t      vlen = (size_t)(end - val);
+        if (klen == 4 && axl_memcmp(key, "path", 4) == 0) {
+            tar_set_name(pend, val, vlen);
+        } else if (klen == 4 && axl_memcmp(key, "size", 4) == 0) {
+            uint64_t v  = 0;
+            bool     ok = (vlen > 0);
+            for (size_t k = 0; k < vlen && ok; k++) {
+                ok = (val[k] >= '0' && val[k] <= '9'
+                      && v <= (UINT64_MAX - 9u) / 10u);
+                v = v * 10u + (uint64_t)(val[k] - '0');
+            }
+            if (!ok || v > TAR_SIZE_MAX) {
+                tar_refuse(pend, true);
+                return;
+            }
+            pend->have_size = true;
+            pend->size      = v;
+        }
+        pos += len;
+    }
 }
 
 int
@@ -295,58 +539,110 @@ axl_tar_reader_next(
     )
 {
     if (r == NULL || out == NULL) { return AXL_ERR; }
+    if (r->stopped != AXL_OK) { return r->stopped; }
+    int rc = tar_next(r, out);
+    if (rc != AXL_OK) { r->stopped = rc; }
+    return rc;
+}
 
-    /* Skip any unread data + padding from the previous entry. */
-    uint64_t skip = r->remaining + r->pad;
-    while (skip > 0) {
-        uint8_t tmp[AXL_TAR_BLOCK];
-        size_t  chunk = (skip > sizeof tmp) ? sizeof tmp : (size_t)skip;
-        axl_ssize_t n = axl_read(r->in, tmp, chunk);
-        if (n <= 0) { break; }
-        skip -= (uint64_t)n;
+/* axl_tar_reader_next's body, without the sticky stop. */
+static int
+tar_next(
+    AxlTarReader  *r,
+    AxlTarEntry   *out
+    )
+{
+    TarPending pend;
+    axl_memset(&pend, 0, sizeof pend);
+    /* An 'L', 'K' or 'x' record was read: it announces a member, so the
+       stream ending before that member's header is a truncation -- even a
+       'K' or an 'x' of ignored keys, which leave nothing in @c pend. */
+    bool record_pending = false;
+    uint8_t  hdr[AXL_TAR_BLOCK];
+    uint64_t size;
+    for (;;) {
+        /* Step over any unread data + padding of the previous entry: the
+           stream ending in there is a truncated archive. */
+        int rc = tar_skip(r->in, r->remaining + r->pad);
+        if (rc != AXL_OK) { return rc; }
+        r->remaining = 0;
+        r->pad = 0;
+
+        /* The stream ending exactly at a header boundary is an end, as GNU
+           tar reads it; ending part-way into a header is a truncation (GNU
+           tar accepts that silently and loses the member; libarchive
+           reports it, and so do we). */
+        size_t got = 0;
+        rc = tar_read_full(r->in, hdr, AXL_TAR_BLOCK, &got);
+        if (rc == AXL_INCOMPLETE && got == 0 && !record_pending) {
+            return AXL_ERR;
+        }
+        if (rc != AXL_OK) { return rc; }
+        bool allzero = true;
+        for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) {
+            if (hdr[i] != 0) { allzero = false; break; }
+        }
+        if (allzero) { return AXL_ERR; }  // end-of-archive marker (one is enough)
+
+        /* Verify the header checksum (chksum field treated as spaces). */
+        uint64_t stored = get_octal((char *)hdr + 148, 8);
+        unsigned sum = 0;
+        for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) {
+            sum += (i >= 148 && i < 156) ? (unsigned)' ' : hdr[i];
+        }
+        if ((uint64_t)sum != stored) { return AXL_INVALID; }
+
+        size = get_octal((char *)hdr + 124, 12);
+        char type = (char)hdr[156];
+        if (type != 'L' && type != 'K' && type != 'x') { break; }
+
+        /* A record about the NEXT header: GNU long name / long link name,
+           or pax extended attributes. Consume it and read on. */
+        record_pending = true;
+        char *data = NULL;
+        rc = tar_read_meta(r->in, size, &data);
+        if (rc != AXL_OK) { return rc; }
+        if (type == 'L') {
+            tar_apply_gnu_long(&pend, data, size);
+        } else if (type == 'x') {
+            tar_apply_pax(&pend, data, size);
+        }   /* 'K' names a link target: no link is created, so drop it */
+        axl_free(data);
     }
-    r->remaining = 0;
-    r->pad = 0;
 
-    uint8_t hdr[AXL_TAR_BLOCK];
-    if (axl_read(r->in, hdr, AXL_TAR_BLOCK) != (axl_ssize_t)AXL_TAR_BLOCK) {
-        return AXL_ERR;  // truncated / EOF before a full header
+    /* A pax global header names no member: a pending 'x' is not its (a
+       pending size would skip the wrong span), and pax writers never put
+       one there. Drop it. */
+    if ((char)hdr[156] == AXL_TAR_TYPE_GLOBAL) {
+        axl_memset(&pend, 0, sizeof pend);
     }
-    bool allzero = true;
-    for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) {
-        if (hdr[i] != 0) { allzero = false; break; }
-    }
-    if (allzero) { return AXL_ERR; }  // end-of-archive marker
 
-    /* Verify the header checksum (chksum field treated as spaces). */
-    uint64_t stored = get_octal((char *)hdr + 148, 8);
-    unsigned sum = 0;
-    for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) {
-        sum += (i >= 148 && i < 156) ? (unsigned)' ' : hdr[i];
-    }
-    if ((uint64_t)sum != stored) { return AXL_ERR; }
-
-    char name100[101];
-    char prefix155[156];
-    axl_memcpy(name100, hdr, 100);
-    name100[100] = '\0';
-    axl_memcpy(prefix155, hdr + 345, 155);
-    prefix155[155] = '\0';
-
-    axl_memset(out->name, 0, sizeof out->name);
-    size_t nl = axl_strlen(name100);
-    if (prefix155[0] != '\0') {
-        size_t pl = axl_strlen(prefix155);
-        if (pl + 1 + nl >= sizeof out->name) { return AXL_ERR; }
-        axl_memcpy(out->name, prefix155, pl);
-        out->name[pl] = '/';
-        axl_memcpy(out->name + pl + 1, name100, nl);
+    axl_memset(out, 0, sizeof *out);
+    if (pend.have_name) {
+        out->name_refused = pend.refused;
+        if (!pend.refused) {
+            axl_memcpy(out->name, pend.name, sizeof out->name);
+        }
     } else {
-        if (nl >= sizeof out->name) { return AXL_ERR; }
-        axl_memcpy(out->name, name100, nl);
+        /* Only a POSIX header has a prefix: GNU's "ustar  " header keeps
+           atime/ctime at the same offset. */
+        bool   posix = (axl_memcmp(hdr + 257, "ustar\0", 6) == 0);
+        size_t nl = 0;
+        size_t pl = 0;
+        if (!tar_field_len(hdr, 100, &nl)
+            || (posix && !tar_field_len(hdr + 345, 155, &pl))) {
+            out->name_refused = true;
+        } else if (pl > 0) {
+            /* 155 + '/' + 100 = 256: always fits AXL_TAR_NAME_MAX. */
+            axl_memcpy(out->name, hdr + 345, pl);
+            out->name[pl] = '/';
+            axl_memcpy(out->name + pl + 1, hdr, nl);
+        } else {
+            axl_memcpy(out->name, hdr, nl);
+        }
     }
 
-    out->size = get_octal((char *)hdr + 124, 12);
+    out->size = pend.have_size ? pend.size : size;
     out->mode = (uint32_t)get_octal((char *)hdr + 100, 8);
     out->type = (char)hdr[156];
     if (out->type == '\0') { out->type = AXL_TAR_TYPE_FILE; }
@@ -367,7 +663,10 @@ axl_tar_reader_read(
     if (r->remaining == 0) { return 0; }
     size_t want = (len > r->remaining) ? (size_t)r->remaining : len;
     axl_ssize_t n = axl_read(r->in, buf, want);
-    if (n < 0) { return -1; }
+    if (n <= 0) {   /* EOF with bytes owed (a truncated archive), or an error */
+        r->stopped = tar_read_status(n);
+        return -1;
+    }
     r->remaining -= (uint64_t)n;
     return n;
 }

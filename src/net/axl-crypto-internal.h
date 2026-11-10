@@ -43,17 +43,35 @@
    mbedTLS 3.6.3 has no twisted-Edwards curve at all -- so the key
    became a tagged union: `alg` is the tag, and only the arm it names
    is live. Defined here, not in axl-pk-provider.h, because that header
-   is the algorithm-neutral seam every provider (including a future
-   ref10-backed one) includes, and it must stay mbedTLS-free; this
+   is the algorithm-neutral seam every provider (the ref10-backed one
+   included) includes, and it must stay mbedTLS-free; this
    header already carries mbedTLS types shared across the pk-verify
-   dispatcher and the mbedTLS provider translation unit. A union with
-   one arm reads oddly today and is deliberate: a later Ed25519
-   provider adds its arm beside this one. */
+   dispatcher and the mbedTLS provider translation unit. */
+
+/* The Ed25519 arm. `sk` is ref10's secret-key layout -- seed || public
+   key -- NOT a clamped scalar: crypto_sign_ed25519_keypair_from_seed
+   writes the 32-byte seed it was given into sk[0..32) and the derived
+   public key into sk[32..64), and crypto_sign_ed25519 re-derives the
+   scalar from the seed on every call. `pk` duplicates sk[32..64) so a
+   public-only key (raw or SPKI import, where no seed exists) has
+   somewhere to live and every read of the public half has one spelling.
+
+   THE ARM IS THE SECRET for this provider, which is why the provider's
+   key_free zeroizes it with a non-elidable scrub rather than relying on
+   axl_free: axl_pk_key_free() promises publicly that it zeroizes
+   private key material, and there is no library context underneath
+   this one to keep that promise instead. */
+typedef struct {
+    uint8_t pk[32];   /* public key, RFC 8032 compressed point */
+    uint8_t sk[64];   /* seed || public key -- ref10's layout, see above */
+} AxlEd25519Key;
+
 struct AxlPkKey {
     AxlPkAlg alg;
     bool     has_private;
     union {
         mbedtls_pk_context mbedtls;
+        AxlEd25519Key      ed25519;
     } u;
 };
 
@@ -111,6 +129,16 @@ key_alloc(void)
  */
 mbedtls_ctr_drbg_context *
 axl_crypto_rng(void);
+
+/**
+ * Whether the clock-seeded fallback (axl_crypto_set_weak_entropy_allowed)
+ * has ever fed the entropy pool in this image. Sticky: once true, every key
+ * the DRBG produces from then on is derived from a guessable seed, so a
+ * caller about to persist a key -- one that would outlive the boot -- must
+ * not.
+ */
+bool
+axl_crypto_entropy_was_weak(void);
 
 /* The ECDSA curve order size in bytes for a raw r||s signature. Zero for
    an algorithm whose signature is not r||s, which is every non-ECDSA one.

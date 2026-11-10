@@ -63,6 +63,86 @@ select_decrypt_buf(
 }
 
 // ---------------------------------------------------------------------------
+// Carried bytes -- what a client pipelined behind a finished request in the
+// same segment. Every read phase takes them before it reads the transport,
+// so they are parsed as the next request, in order.
+// ---------------------------------------------------------------------------
+
+/* PREPEND: every caller keeps bytes out of the buffer the current phase
+   was filled from, and those always come BEFORE what is already carried --
+   the header buffer past a request's end, the upload read past its length,
+   the chunk decoder past its terminator are all filled from the transport
+   or from the front of the carry, so anything still carried follows them in
+   the stream. The one caller that keeps a TLS batch's tail does so only
+   with the carry empty (the drain feeds the carry before decrypting more),
+   where prepending and appending agree. Appending put a request's tail
+   behind the bytes that follow it (a TLS header split, then a pipelined
+   request past the header room). */
+void
+conn_carry_keep(
+    HttpConn   *conn,
+    const char *data,
+    size_t      n
+    )
+{
+    if (n == 0) {
+        return;
+    }
+    char *grown = axl_realloc(conn->carry, conn->carry_len + n);
+    if (grown == NULL) {
+        axl_warning("%zu pipelined bytes could not be kept; closing the "
+                    "connection after this response", n);
+        conn->keep_alive = false;
+        return;
+    }
+    axl_memmove(grown + n, grown, conn->carry_len);
+    axl_memcpy(grown, data, n);
+    conn->carry      = grown;
+    conn->carry_len += n;
+}
+
+/* Move up to @p avail carried bytes into @p buf, in order. @return the
+   count moved. */
+static size_t
+carry_take(
+    HttpConn *conn,
+    void     *buf,
+    size_t    avail
+    )
+{
+    size_t n = (conn->carry_len < avail) ? conn->carry_len : avail;
+    axl_memcpy(buf, conn->carry, n);
+    conn->carry_len -= n;
+    if (conn->carry_len == 0) {
+        axl_free(conn->carry);
+        conn->carry = NULL;
+    } else {
+        axl_memmove(conn->carry, conn->carry + n, conn->carry_len);
+    }
+    return n;
+}
+
+
+/* Feed carried bytes to the current read phase as if they had just been
+   received. @return false when the phase takes no bytes (its body is
+   complete), leaving them for the next request. */
+static bool
+carry_feed(
+    AxlHttpServer *s,
+    HttpConn      *conn
+    )
+{
+    void  *buf   = NULL;
+    size_t avail = 0;
+    select_decrypt_buf(conn, &buf, &avail);
+    if (buf == NULL || avail == 0) {
+        return false;
+    }
+    dispatch_decrypted(s, conn, carry_take(conn, buf, avail));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // arm_transport_recv — issue the actual async TCP receive for the current
 // read phase. (start_conn_recv wraps this with TLS-drain handling.)
 // ---------------------------------------------------------------------------
@@ -74,6 +154,11 @@ arm_transport_recv(
     )
 {
     size_t avail;
+
+    /* Bytes a client pipelined come before anything still on the wire. */
+    if (conn->carry_len > 0 && carry_feed(s, conn)) {
+        return;
+    }
 
     /* TLS: every phase receives ciphertext into the dedicated cipher
        buffer; drive_tls_drain decrypts and routes the plaintext to the
@@ -189,6 +274,10 @@ start_conn_recv(
         conn->tls_rearm_wanted = true;
         return;
     }
+    /* Carried bytes first: they arrived before anything TLS still holds. */
+    if (conn->carry_len > 0 && carry_feed(s, conn)) {
+        return;
+    }
     if (conn->tls_ctx != NULL && axl_tls_pending(conn->tls_ctx)) {
         drive_tls_drain(s, conn);
         return;
@@ -220,12 +309,21 @@ dispatch_decrypted(
         if (conn->chunked) {
             /* Chunked: decode framing via process_chunked_data, which
                calls stream_upload_data for decoded body bytes */
-            process_chunked_data(s, conn, conn->chunk_read_buf, bytes);
-            if (!conn->chunked_done && conn->active) {
+            size_t st = process_chunked_data(s, conn, conn->chunk_read_buf, bytes);
+            if (st != 0) {
+                stream_upload_fail(conn, st);
+            } else if (!conn->chunked_done && conn->active && !conn->upload_ended) {
                 start_conn_recv(s, conn);
             }
         } else {
-            /* Content-Length: raw data is body bytes */
+            /* Content-Length: raw data is body bytes -- up to the
+               length; what follows it is the next request. */
+            size_t want = (conn->content_length > conn->body_bytes_read)
+                          ? conn->content_length - conn->body_bytes_read : 0;
+            if (bytes > want) {
+                conn_carry_keep(conn, conn->chunk_read_buf + want, bytes - want);
+                bytes = want;
+            }
             conn->body_bytes_read += bytes;
             bool final = (conn->content_length > 0 &&
                           conn->content_length != SIZE_MAX &&
@@ -265,9 +363,27 @@ drive_tls_drain(
         size_t  buf_avail = 0;
         select_decrypt_buf(conn, &raw_buf, &buf_avail);
         if (raw_buf == NULL) {
-            conn->tls_draining = false;
-            reset_connection(conn);
-            return;
+            /* The request in hand is whole and takes no more bytes: what
+               is carried or still buffered is the NEXT request. Leave the
+               drain; arm_transport_recv dispatches this one, and the next
+               is read after its response (this once reset the connection,
+               dropping a pipelined request). */
+            break;
+        }
+
+        if (conn->carry_len > 0) {
+            /* Plaintext an earlier record held past the request it ended:
+               it goes before anything decrypted next. */
+            conn->tls_rearm_wanted = false;
+            dispatch_decrypted(s, conn, carry_take(conn, raw_buf, buf_avail));
+            if (!conn->active) {
+                return;
+            }
+            if (!conn->tls_rearm_wanted) {
+                conn->tls_draining = false;
+                return;
+            }
+            continue;
         }
 
         uint8_t plain_buf[TLS_DRAIN_BATCH];
@@ -287,9 +403,12 @@ drive_tls_drain(
             return;
         }
 
-        /* Land plaintext in the phase buffer, clamped to its space. */
+        /* Land plaintext in the phase buffer, clamped to its space; what
+           does not fit (the next pipelined request, or the rest of a
+           record longer than the phase wants) is carried, not dropped. */
         size_t copy_len = plain_len > buf_avail ? buf_avail : plain_len;
         axl_memcpy(raw_buf, plain_buf, copy_len);
+        conn_carry_keep(conn, (const char *)plain_buf + copy_len, plain_len - copy_len);
 
         conn->tls_rearm_wanted = false;
         dispatch_decrypted(s, conn, copy_len);
@@ -306,7 +425,7 @@ drive_tls_drain(
             conn->tls_draining = false;
             return;
         }
-        if (!axl_tls_pending(conn->tls_ctx)) {
+        if (!axl_tls_pending(conn->tls_ctx) && conn->carry_len == 0) {
             /* Nothing more buffered — re-arm the transport for the rest. */
             break;
         }
@@ -323,8 +442,27 @@ drive_tls_drain(
 // upload streaming, or HTTP request parsing.
 // ---------------------------------------------------------------------------
 
+static bool
+on_conn_data_body(
+    AxlTcp    *sock,
+    AxlStatus  status,
+    void      *data
+    );
+
 bool
 on_conn_data(
+    AxlTcp    *sock,
+    AxlStatus  status,
+    void      *data
+    )
+{
+    /* @p data is always a live pool connection here. */
+    return http_dispatch(((HttpConn *)data)->server, on_conn_data_body, sock,
+                         status, data);
+}
+
+static bool
+on_conn_data_body(
     AxlTcp    *sock,
     AxlStatus  status,
     void      *data
@@ -402,16 +540,38 @@ do_reset_connection(HttpConn *conn, bool abortive)
     if (!conn->active || conn->tearing_down) {
         return;
     }
+    /* NOT WHILE THE APP'S CONNECT HANDLER IS ON THE STACK. It may close its
+       own connection (axl_ws_conn_close), or a send it makes may fail; either
+       reaches here. Tearing down now would fire DISCONNECT nested inside the
+       CONNECT that is still running, and free per-connection state its
+       caller -- on_response_sent -- still reads. Record it instead; the
+       CONNECT delivery runs it once the handler has returned. */
+    if (conn->ws_in_connect) {
+        conn->ws_close_deferred  = true;
+        conn->ws_close_abortive |= abortive;
+        return;
+    }
     conn->tearing_down = true;
 
-    /* Free any in-flight response buffer. axl_tcp_close below will
-       cancel an outstanding send (and that cancel removes the
-       send_source from the loop), so on_response_sent won't fire to
-       free this for us. Safety-net here avoids the leak. */
-    if (conn->tx_buf != NULL) {
-        axl_free(conn->tx_buf);
-        conn->tx_buf = NULL;
-    }
+    /* Take the in-flight response buffers. From here on this function owns
+       every piece of per-response state. axl_tcp_close below delivers each
+       send callback it still owes before it returns -- AXL_CANCELLED for a
+       send still pending, the REAL status (usually AXL_OK) for one that had
+       already finished -- and on_response_sent (which every response and
+       stream-chunk send completes through) and ws_out_on_sent return at once
+       when they see tearing_down. They must: an AXL_OK 101 completion
+       acted on here would fire the app's AXL_WS_CONNECT after the
+       DISCONNECT decision below was taken.
+
+       Both buffers may still be LENT to axl_tcp_send_async, whose contract is
+       "valid until the callback" -- and those callbacks run inside the close
+       below. So they are detached now and freed only after it, with the
+       app's DISCONNECT / upload-abort handlers running in between. */
+    void *lent_tx_buf    = conn->tx_buf;
+    void *lent_chunk_buf = conn->stream_chunk_buf;
+    conn->tx_buf           = NULL;
+    conn->stream_chunk_buf = NULL;
+    conn->stream_chunk_cap = 0;
 
     /* Streaming response state: same race as tx_buf — the producer
        owns ctx (file handle, generated-data state), and our cleanup
@@ -441,7 +601,8 @@ do_reset_connection(HttpConn *conn, bool abortive)
        immediately so on_response_sent's upload-stream cleanup path
        (which would normally fire after a clean response) doesn't also
        run — we own the teardown from here. */
-    if (conn->is_upload_stream && conn->upload_route != NULL &&
+    if (conn->is_upload_stream && !conn->upload_ended &&
+        conn->upload_route != NULL &&
         conn->upload_route->upload_handler != NULL) {
         conn->upload_route->upload_handler(
             &conn->upload_req, &conn->upload_resp,
@@ -460,6 +621,9 @@ do_reset_connection(HttpConn *conn, bool abortive)
     } else {
         axl_tcp_close(conn->sock, AXL_TEARDOWN_GRACEFUL);
     }
+    /* Every send that borrowed them has had its callback. */
+    axl_free(lent_tx_buf);
+    axl_free(lent_chunk_buf);
 
     axl_free(conn->method);
     axl_free(conn->path);
@@ -472,19 +636,17 @@ do_reset_connection(HttpConn *conn, bool abortive)
     if (conn->body != NULL) {
         axl_free(conn->body);
     }
+    axl_free(conn->carry);   /* a closed connection has no next request */
 
     /* Upload streaming cleanup */
     axl_free(conn->upload_buf);
-    if (conn->upload_resp.body != NULL) {
-        axl_free(conn->upload_resp.body);
-    }
-    if (conn->upload_resp.headers != NULL) {
-        axl_hash_table_free(conn->upload_resp.headers);
-    }
+    http_response_release(&conn->upload_resp);   /* a static body is the handler's */
 
     /* WebSocket cleanup. ws_outq_clear frees any queued outbound frames; the
-       in-flight head's send was just cancelled by axl_tcp_close above, so its
-       buffer is no longer referenced and is safe to free here. */
+       in-flight head's send was retired by axl_tcp_close above (its callback
+       delivered and ignored). The firmware only ever held AxlTcp's own copy
+       of its bytes, never the frame buffer, so once that callback has run
+       nothing references it and it is safe to free here. */
     axl_free(conn->ws_path);
     axl_free(conn->ws_partial_buf);
     ws_outq_clear(conn);

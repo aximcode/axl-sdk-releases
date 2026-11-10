@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=20 local-only=0
+# test-meta: arch=both needs= est=20 local-only=0 guest=standard
 # test-http-rebind-qemu.sh — port-releasing HTTP-server teardown.
 #
 # Proves axl_http_server_free(RESET) releases the listen port SYNCHRONOUSLY:
@@ -34,28 +34,13 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -2
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" all tests 2>&1 | tail -2
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting serve-rebind (${VARIANT})...
-AxlTestNet.efi serve-rebind ${VARIANT}
-stall 1000000
-reset -s
-NSHEOF
+# The startup commands live in test-http-rebind-qemu.nsh.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$VARIANT"
 
 test_build_image
 
@@ -67,8 +52,8 @@ test_run_background
 
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: server did not reach READY within 60 seconds"
+if ! test_wait_boot "READY" 60; then
+    echo "FAIL: server did not reach READY within ${TEST_WAITED_S} seconds"
     test_clean_log; echo "--- Serial ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
 fi

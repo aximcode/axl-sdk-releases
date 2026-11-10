@@ -26,6 +26,11 @@
    forcing this sink to own the selection policy. */
 static AxlSerial *mSerialPort  = NULL;
 
+/* The console redirect's port (axl_log_set_console_serial). Console lines
+   arrive whole from the engine, so each is one write -- the remainder
+   dropped on a short one, as for the handler below. */
+static AxlSerial *mConsolePort = NULL;
+
 static void
 serial_handler(int level, const char *domain, const char *message,
                const AxlRealtime *stamp, void *data)
@@ -95,4 +100,20 @@ axl_log_serial_detach(void)
     }
     axl_log_remove_handler(serial_handler);
     mSerialPort = NULL;
+}
+
+static void
+console_serial_sink(const char *line, size_t len)
+{
+    AxlSerial *port = mConsolePort;
+    if (port != NULL) {
+        axl_serial_write(port, line, len, NULL);
+    }
+}
+
+void
+axl_log_set_console_serial(AxlSerial *port)
+{
+    mConsolePort = port;
+    _axl_log_set_console_sink(port != NULL ? console_serial_sink : NULL);
 }

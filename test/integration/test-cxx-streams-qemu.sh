@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=AXL_CPP=1,cxx-streams-selftest guest=standard
 # test-cxx-streams-qemu.sh — axl::cout / axl::cin / axl::cerr and axl::string,
 # built FREESTANDING by the staged SDK's axl-c++ and run under QEMU.
 #
@@ -94,13 +94,13 @@ check_absent() {  # check_absent <msg> <pattern> <file>
 echo "=== C++ Streams Test ($TEST_ARCH) ==="
 
 # ---------------------------------------------------------------------------
-# The image that RUNS is the Makefile's, built DEBUG so AXL_MEM_DEBUG is on
+# The image that RUNS is the in-tree build's, built DEBUG so AXL_MEM_DEBUG is on
 # and the leak assertions below have something to read. scripts/install.sh
 # stages RELEASE only.
 # ---------------------------------------------------------------------------
 echo "--- building the DEBUG fixture (freestanding, AXL_MEM_DEBUG on) ---"
-make -C "$PROJECT_DIR" ARCH="$_native_arch" AXL_CPP=1 \
-    ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} cxx-streams-selftest 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" AXL_CPP=1 \
+    cxx-streams-selftest 2>&1 | tail -3
 
 EFI="$NATIVE_DIR/cxx-streams-selftest.efi"
 if [[ ! -f "$EFI" ]]; then
@@ -173,24 +173,7 @@ printf '42 hello 3.5\ntrue 7\nff\nZ\ntoolongtoken\n' > "$TEST_STAGING/in.txt"
 printf 'first line\nsecond\n\nlast-no-newline'    > "$TEST_STAGING/lines.txt"
 printf 'notanumber alsobad\n'                     > "$TEST_STAGING/bad.txt"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo STREAMS_BEGIN"
-    echo "cxx-streams-selftest.efi out"
-    echo "cxx-streams-selftest.efi str"
-    echo "cxx-streams-selftest.efi edge"
-    echo "cxx-streams-selftest.efi in < in.txt"
-    echo "cxx-streams-selftest.efi getline < lines.txt"
-    echo "cxx-streams-selftest.efi fail < bad.txt"
-    # The shell's DEFAULT pipe, which transcodes to UCS-2. No `|a` here on
-    # purpose: reading raw axl_stdin would yield 4, not 42, and that is the
-    # whole reason axl::cin goes through axl_stdin_text().
-    echo "echo 42 | cxx-streams-selftest.efi pipe"
-    echo "echo STREAMS_DONE"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

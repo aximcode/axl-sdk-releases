@@ -1,22 +1,33 @@
 #!/bin/bash
 # cut-release.sh — one-command release cut, per docs/RELEASING.md.
 #
-# Automates the whole flow so a release is "run one command, wait one CI
-# cycle, done" — and ENFORCES the quality gate: it will not create the tag
-# until CI is green on the release commit (the docs/RELEASING.md §4b rule that
-# a public tag can't be cleanly re-cut once Release publishes).
+# Automates the whole flow, and ENFORCES the release gate before it changes
+# anything (docs/RELEASING.md "The gate"; AXL-CI-Release-Speed-Design.md §14).
+# The commit is certified by EITHER a green dispatched CI suite run on it (or
+# its release-only parent), OR a complete local scripts/release-suite.sh run
+# on it plus a green push run of the cheap CI jobs. With neither, the cut
+# REFUSES -- unless --ci-gate (dispatch the suite after pushing the release
+# commit, and wait for it) or --tag-untested (tag anyway, loudly, with a
+# "Released untested" line in the release notes and the tag message). A
+# public tag can't be cleanly re-cut once Release publishes.
 #
 # Usage:
-#   scripts/cut-release.sh X.Y.Z            # cut a release
-#   scripts/cut-release.sh X.Y.Z --dry-run  # show what it would do, change nothing
+#   scripts/cut-release.sh X.Y.Z            # cut a release; refuses if nothing certifies it
+#   scripts/cut-release.sh X.Y.Z --dry-run  # show what it would do (and whether it
+#                                           #   would refuse), change nothing
 #   scripts/cut-release.sh X.Y.Z --yes      # skip the confirmation prompt
+#   scripts/cut-release.sh X.Y.Z --ci-gate  # nothing covers it yet: dispatch the
+#                                           #   suite and wait for it before tagging
+#   scripts/cut-release.sh X.Y.Z --force-ci # --ci-gate, even if something covers it
+#   scripts/cut-release.sh X.Y.Z --tag-untested  # tag with NOTHING certifying it;
+#                                           #   recorded in the notes. Not with --resume
 #   scripts/cut-release.sh X.Y.Z --allow-breaking  # cut a documented breaking
 #                                           #   change under a non-major version
 #   scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs instead of
 #                                           #   being handed a URL
-#   scripts/cut-release.sh X.Y.Z --resume   # recovery: the release branch
-#                                           #   already has the release commit +
-#                                           #   green CI — just tag, push, watch
+#   scripts/cut-release.sh X.Y.Z --resume   # recovery: the release branch already
+#                                           #   has the release commit -- the same
+#                                           #   gate, then tag, push, watch
 #   scripts/cut-release.sh X.Y.Z --branch release-X.Y.Z
 #                                           # cut from a tag on a release branch
 #                                           #   (RELEASING.md "Cutting from a
@@ -28,18 +39,24 @@
 # What it does (normal flow):
 #   1. preconditions  : on the release branch (main by default), clean tree,
 #                       gh authed, tag absent, CHANGELOG has an "## Unreleased"
-#                       section
-#   2. bump-version   : VERSION + axl-version.h (via scripts/bump-version.sh)
-#   3. date CHANGELOG : "## Unreleased" -> "## X.Y.Z — YYYY-MM-DD"
-#   4. check-version  : make check-version
-#   5. commit + push  : one "release: vX.Y.Z" commit -> origin/<release branch>
-#   6. GATE           : wait for CI to go GREEN on the release commit
-#   7. tag + push     : annotated vX.Y.Z (body summarised from the CHANGELOG)
-#   8. watch + confirm: scripts/watch-release-runs.sh, then gh release view
+#                       section, semver matches the CHANGELOG
+#   2. GATE           : wait for HEAD's push run to finish (refuse if it failed),
+#                       then decide: covered, --ci-gate, --tag-untested, or
+#                       REFUSE -- all BEFORE the bump, so a refusal strands no
+#                       release commit
+#   3. docs gate      : build-docs.sh --ci-doxygen (unless --no-docs-check)
+#   4. bump-version   : VERSION + axl-version.h (via scripts/bump-version.sh)
+#   5. date CHANGELOG : "## Unreleased" -> "## X.Y.Z — YYYY-MM-DD" (+ the
+#                       --tag-untested note under it, or the cut dies)
+#   6. check-version  : scripts/check-version.sh
+#   7. commit + push  : one "release: vX.Y.Z" commit -> origin/<release branch>
+#   8. dispatch       : only when step 2 decided it: dispatch ci.yml, wait GREEN
+#   9. tag + push     : annotated vX.Y.Z (body summarised from the CHANGELOG)
+#  10. watch + confirm: scripts/watch-release-runs.sh, then gh release view
 #
-# It does NOT run the heavy local prerequisite gate — CI on the release
-# commit (step 6) is the authoritative gate. If main has un-CI'd work you want
-# to fail-fast on, run the docs/RELEASING.md prerequisites by hand first.
+# It does NOT run the heavy local suite itself. To certify locally, run
+# scripts/release-suite.sh on the commit first (CI's integration job, the same
+# steps; it writes the stamp step 2 reads) -- or pass --ci-gate and let CI.
 
 set -euo pipefail
 
@@ -52,17 +69,26 @@ ASSUME_YES=false
 RESUME=false
 FORCE_CI=false  # --force-ci: dispatch CI even when the local stamp
                 # already covers the release commit.
-# The stamp helper is shared with run-integration.sh so the two cannot
-# drift on the format. Sourced, not re-implemented.
+TAG_UNTESTED=false  # --tag-untested: tag with NOTHING certifying the commit.
+                    # Loud, and written into the release notes -- the gate
+                    # otherwise refuses (review ruling R-B).
+# The release gate: the stamp reader (scripts/release-suite.sh is its only
+# writer), the CI queries and release_gate_decide. Sourced, not re-implemented.
 # shellcheck source=../test/integration/lib/release-gate.sh
 source "$(dirname "$0")/../test/integration/lib/release-gate.sh"
+# axl_trap_cleanup / axl_die_by_signal -- a signal ENDS this script after its
+# cleanup, rather than resuming it. See where they are used below.
+# shellcheck source=axl-common.sh
+source "$(dirname "$0")/axl-common.sh"
 
-CI_GATE=false   # ci.yml runs on a push to main and via workflow_dispatch (NOT
-                # on release tags), so the release gate is the LOCAL suite plus
-                # a CI run watched green before tagging (docs/RELEASING.md §4b).
-                # --ci-gate makes this script dispatch ci.yml on the release
-                # branch and wait for it. A --branch cut turns it on itself:
-                # a push to a non-main branch starts no run at all.
+CI_GATE=false   # A push to main runs only ci.yml's CHEAP jobs; the QEMU suite
+                # runs on workflow_dispatch alone (AXL-CI-Release-Speed-Design
+                # §14). So a release is certified by a dispatched suite run, or
+                # by a local uncached run plus the cheap push CI -- see the gate
+                # below. --ci-gate makes this script dispatch ci.yml on the
+                # release branch and wait for it when nothing covers the commit
+                # yet. A --branch cut turns it on itself: a push to a non-main
+                # branch starts no run at all.
 RELEASES_REPO="aximcode/axl-sdk-releases"
 # Deliberate exception to the semver refusal below: a release that really is
 # meant to carry a documented breaking change under a non-major version.
@@ -88,6 +114,7 @@ while [[ $# -gt 0 ]]; do
         --resume)  RESUME=true ;;
         --ci-gate) CI_GATE=true ;;
         --force-ci) CI_GATE=true; FORCE_CI=true ;;
+        --tag-untested) TAG_UNTESTED=true ;;
         --allow-breaking) ALLOW_BREAKING=1 ;;
         --no-docs-check)  RUN_DOCS_CHECK=false ;;
         --watch)          WATCH=true ;;
@@ -107,9 +134,20 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# --tag-untested CANNOT ride a --resume: the release commit is already pushed,
+# and release.yml builds the notes from its CHANGELOG section alone, so the
+# note would reach the tag message and not the notes a consumer reads.
+# Checked before anything else about the arguments, so it is the answer.
+if $RESUME && $TAG_UNTESTED; then
+    echo "ERROR: --tag-untested cannot be used with --resume: the release commit is already pushed, and release.yml builds the release notes from its CHANGELOG section alone, so the note could not reach them." >&2
+    echo "       Certify the commit instead: --resume --ci-gate dispatches the suite and waits; or run scripts/release-suite.sh on it, then --resume." >&2
+    exit 2
+fi
+
 if [[ -z "$VERSION" ]]; then
     echo "usage: $0 X.Y.Z [--branch release-X.Y.Z|release/X.Y.x] [--dry-run] [--yes]" \
-         "[--resume] [--ci-gate] [--force-ci] [--watch] [--allow-breaking] [--no-docs-check]" >&2
+         "[--resume] [--ci-gate] [--force-ci] [--tag-untested] [--watch] [--allow-breaking]" \
+         "[--no-docs-check]" >&2
     exit 2
 fi
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -201,8 +239,14 @@ wait_for_ci() {
     # v3.2.0 cut — so the gate timed out on a run that went on to pass, and the
     # release had to be finished with --resume. Size the ceiling to the job.
     say "Waiting for CI to pass on $sha (the release gate; up to 75 min)"
+    local why
     for i in $(seq 1 150); do
-        line="$(gh run list --commit "$sha" --workflow CI \
+        # DISPATCHED RUNS ONLY. Every caller of this has just dispatched (or is
+        # resuming after one), and since §14 the suite runs on nothing else.
+        # Without the filter the newest run at the sha could be its PUSH run --
+        # the release commit's, which skips every job -- if the dispatch had
+        # not registered yet, and that answered "not green" and aborted the cut.
+        line="$(gh run list --commit "$sha" --workflow CI --event workflow_dispatch \
                   --json status,conclusion \
                   --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || true)"
         case "$line" in
@@ -210,18 +254,17 @@ wait_for_ci() {
                 # RUN-LEVEL SUCCESS IS NOT ENOUGH. GitHub reports an all-skipped
                 # run as success, and the `[release-cut]` marker makes exactly
                 # that shape reachable — "tag code no suite ever ran". The
-                # stamp helper already asserts every job succeeded AND that the
-                # full-suite job was among them; use it rather than a weaker
-                # second opinion. On a release branch this is the only gate.
-                if _release_gate_ci_green "$sha"; then note "CI: SUCCESS"; return 0; fi
-                # TWO CAUSES, AND THIS CANNOT TELL THEM APART: the helper is
-                # quiet, returning 1 both when the jobs say no full suite ran
-                # and when their listing could not be read at all. Name both,
+                # gate helper asserts the suite job AND the three cheap jobs
+                # succeeded, by name; use it rather than a weaker second
+                # opinion. On a release branch this is the only gate.
+                if why=$(_release_gate_ci_green "$sha"); then note "CI: SUCCESS"; return 0; fi
+                # The helper says WHY -- a job that did not run, one that did
+                # not pass, or a listing it could not read -- so print that,
                 # and hand over the run so a human can settle it in one click.
-                note "CI reported success, but its jobs do not show a full-suite run"
-                note "(or could not be read). Refusing — check the run:"
-                note "    $(gh run list --commit "$sha" --workflow CI --limit 1 \
-                              --json url --jq '.[0].url' 2>/dev/null \
+                note "CI reported success, but it does not certify $sha: $why"
+                note "Refusing — check the run:"
+                note "    $(gh run list --commit "$sha" --workflow CI --event workflow_dispatch \
+                              --limit 1 --json url --jq '.[0].url' 2>/dev/null \
                           || echo "gh run list --commit $sha --workflow CI")"
                 return 1 ;;
             completed:*)       note "CI: ${line#completed:}"; return 1 ;;
@@ -262,6 +305,7 @@ make_tag_message() {
             }' CHANGELOG.md | head -12
         echo
         echo "See CHANGELOG.md for the full list${prev:+ (changes since $prev)}."
+        [[ -z "${UNTESTED_NOTE:-}" ]] || { echo; echo "$UNTESTED_NOTE"; }
     }
 }
 
@@ -337,40 +381,51 @@ tag_and_publish() {
 }
 
 # --------------------------------------------------------------------------
-# --resume: the release branch already carries the release commit + green CI
-# (or, on a non-main branch, a CI run this dispatches) — just tag.
+# --resume: the release branch already carries the release commit. With the
+# gate on, a green dispatched suite run covers it, or this dispatches one and
+# waits -- on main too, since a push runs no suite (§14). Then tag.
 # --------------------------------------------------------------------------
 if $RESUME; then
     [[ "$(cat VERSION)" == "$VERSION" ]] || die "VERSION is $(cat VERSION), not $VERSION — nothing to resume"
     [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$RELEASE_BRANCH" 2>/dev/null)" ]] \
         || die "HEAD != origin/$RELEASE_BRANCH — push $RELEASE_BRANCH first"
-    if $CI_GATE; then
-        RESUME_SHA="$(git rev-parse HEAD)"
-        # DISPATCH BELONGS TO THE BRANCH, NOT TO THE CODE PATH. A push to a
-        # non-main branch starts no ci.yml run at all, so a resume that only
-        # WAITED would poll for 75 minutes for a run that cannot appear — and
-        # the recovery text below sends you here. Skipped when a green run
-        # already covers this sha, which is the post-timeout resume the 75-min
-        # ceiling exists for: that case must still return in seconds.
-        if [[ "$RELEASE_BRANCH" != "main" ]] && _release_gate_ci_green "$RESUME_SHA"; then
-            # ANSWERED, so do not ask a second, weaker question. wait_for_ci
-            # reads the NEWEST run at the sha whatever its conclusion, while
-            # this helper accepts any completed+success run whose jobs all ran:
-            # with a failed re-run sitting on top of a green one they disagree,
-            # and asking both would print "already covered" and then die "not
-            # green" about the same commit.
-            note "a green CI run already covers $RESUME_SHA — no dispatch needed"
-        else
-            if [[ "$RELEASE_BRANCH" != "main" ]]; then
-                say "Dispatching CI on $RELEASE_BRANCH (a push to it starts no run)"
-                gh workflow run ci.yml --ref "$RELEASE_BRANCH" \
-                    || die "could not dispatch ci.yml (gh auth / workflow name?)"
-                sleep 10   # let the dispatched run register before polling
-            fi
-            wait_for_ci "$RESUME_SHA" || die "CI is not green on origin/$RELEASE_BRANCH HEAD"
-        fi
+    RESUME_SHA="$(git rev-parse HEAD)"
+    UNTESTED_NOTE=""
+    # THE SAME GATE AS THE NORMAL FLOW (review ruling R-B): covered, or
+    # --ci-gate dispatches and waits, or it refuses. (--tag-untested is
+    # refused with --resume at argument parsing -- see there.) A resume used
+    # to tag without asking unless --ci-gate was given.
+    if $FORCE_CI; then
+        RELEASE_GATE_DECISION=dispatch
+    else
+        say "Release gate"
+        release_gate_decide "$RESUME_SHA" "$CI_GATE" "$TAG_UNTESTED" "$RELEASE_BRANCH" || true
+        [[ "$RELEASE_GATE_DECISION" != refuse ]] || exit 1
     fi
-    tag_and_publish "$(git rev-parse HEAD)"
+    case "$RELEASE_GATE_DECISION" in
+        dispatch)
+            # DISPATCH ON EVERY BRANCH, main included: a push to a non-main
+            # branch starts no ci.yml run at all, and since §14 a push to main
+            # starts one WITHOUT the suite. A dispatched run STILL GOING -- the
+            # post-timeout resume the 75-min ceiling exists for -- is waited
+            # on, not replaced: dispatches share a concurrency group with
+            # cancel-in-progress, so a second dispatch would cancel it.
+            _st="$(gh run list --commit "$RESUME_SHA" --workflow CI --event workflow_dispatch \
+                     --json status --jq '.[0].status // ""' 2>/dev/null || true)"
+            case "$_st" in
+                queued|in_progress|waiting|requested|pending)
+                    note "a dispatched CI run at $RESUME_SHA is $_st — waiting on it" ;;
+                *)
+                    say "Dispatching CI on $RELEASE_BRANCH (a push runs no suite)"
+                    gh workflow run ci.yml --ref "$RELEASE_BRANCH" \
+                        || die "could not dispatch ci.yml (gh auth / workflow name?)"
+                    sleep 10   # let the dispatched run register before polling
+                    ;;
+            esac
+            wait_for_ci "$RESUME_SHA" || die "CI is not green on origin/$RELEASE_BRANCH HEAD"
+            ;;
+    esac
+    tag_and_publish "$RESUME_SHA"
     exit 0
 fi
 
@@ -410,6 +465,42 @@ if [[ "$RELEASE_BRANCH" != "main" && -n "$PREV_TAG" ]]; then
        like main, not a cut-from-tag release. Check you branched from the TAG.
        If it really is deliberate:  AXL_MAX_BRANCH_COMMITS=$BRANCH_COMMITS $0 $VERSION --branch $RELEASE_BRANCH"
 fi
+
+# ── THE RELEASE GATE, decided BEFORE anything changes (review ruling R-B) ──
+#
+# ENFORCED BY DEFAULT. A release is certified by a green DISPATCHED CI suite
+# run on this tree, or by a local scripts/release-suite.sh stamp on it plus a
+# green push run of the cheap jobs (AXL-CI-Release-Speed-Design.md §14). With
+# neither, this REFUSES -- here, before the bump, so a refusal strands no
+# release commit on $RELEASE_BRANCH. Proceeding without one takes a flag:
+# --ci-gate (dispatch the suite after pushing the release commit, and wait) or
+# --tag-untested (loud, and recorded in the release notes).
+#
+# FIRST, WAIT FOR HEAD'S PUSH RUN (review ruling R-C). Its cheap jobs are half
+# of the local path, and the [release-cut] push about to land on top of it
+# must not race it. A run that did not succeed refuses the cut.
+if $DRY_RUN; then
+    note "DRY RUN — would wait for the push run at $(git rev-parse HEAD) to finish"
+elif ! WAIT_WHY="$(release_gate_wait_push_run "$(git rev-parse HEAD)")"; then
+    die "$WAIT_WHY"
+else
+    note "$WAIT_WHY"
+fi
+UNTESTED_NOTE=""
+if $FORCE_CI; then
+    RELEASE_GATE_DECISION=dispatch
+    note "--force-ci: dispatching the suite whatever covers the commit"
+else
+    say "Release gate"
+    release_gate_decide "$(git rev-parse HEAD)" "$CI_GATE" "$TAG_UNTESTED" "$RELEASE_BRANCH" || true
+    if $DRY_RUN; then
+        [[ "$RELEASE_GATE_DECISION" != refuse ]] || note "DRY RUN — a real cut REFUSES here"
+    else
+        [[ "$RELEASE_GATE_DECISION" != refuse ]] || exit 1
+    fi
+fi
+[[ "$RELEASE_GATE_DECISION" != untested ]] \
+    || UNTESTED_NOTE="$(release_gate_untested_note "$(git rev-parse HEAD)")"
 
 # THE DOCS GATE, and it runs BEFORE anything is pushed because it is the one
 # gate that cannot be re-run after the fact: docs.yml fires on every `v*` tag
@@ -461,19 +552,38 @@ say "Bumping version + dating CHANGELOG"
 # the next cut abort on the clean-tree precondition. (The happy-path revert
 # below is not enough on its own: with `set -euo pipefail`, a SIGPIPE'd
 # `git diff` kills the script before it is reached.)
+#
+# INT/TERM/HUP go through axl_trap_cleanup (axl-common.sh), not a bare
+# `trap restore_metadata EXIT INT TERM HUP`: a trap handler that does not
+# itself exit RESUMES the script where the signal landed, at the interrupted
+# command's own failure status -- so a Ctrl-C here restored the metadata and
+# then carried on into whatever came next, with `set -e` catching it only
+# sometimes (never in a condition context). axl_die_by_signal runs
+# restore_metadata itself, once, and then dies by the signal.
 restore_metadata() {
     git checkout -- VERSION include/axl/axl-version.h CHANGELOG.md 2>/dev/null || true
 }
-trap restore_metadata EXIT INT TERM HUP
+axl_trap_cleanup restore_metadata INT TERM HUP
 
 scripts/bump-version.sh "$VERSION" >/dev/null
 TODAY="$(date +%Y-%m-%d)"
 # Date only the FIRST "## Unreleased" (the active section).
 sed -i.bak "0,/^## Unreleased$/s//## $VERSION — $TODAY/" CHANGELOG.md
 rm -f CHANGELOG.md.bak
+# --tag-untested goes INTO the release notes: release.yml publishes this
+# section as the GitHub release body, so a consumer reading it sees it.
+if [[ -n "$UNTESTED_NOTE" ]]; then
+    release_gate_record_untested CHANGELOG.md "## $VERSION — $TODAY" "$UNTESTED_NOTE" \
+        || die "--tag-untested: the note did not land in the '## $VERSION — $TODAY' section, so the release notes would not say this is untested -- refusing"
+    note "recorded --tag-untested in the CHANGELOG section"
+fi
 note "VERSION -> $VERSION ; CHANGELOG '## Unreleased' -> '## $VERSION — $TODAY'"
 
-make check-version >/dev/null && note "check-version OK"
+# A refusal, not a note: `cmd && note` under errexit SKIPS the note and goes
+# on to commit when cmd fails (errexit ignores a non-final command of a &&
+# list) -- the check could never stop a cut.
+"$REPO_ROOT/scripts/check-version.sh" || die "VERSION and axl-version.h disagree (above)"
+note "check-version OK"
 
 if $DRY_RUN; then
     say "DRY RUN — release-metadata diff that WOULD be committed"
@@ -491,11 +601,10 @@ git add VERSION include/axl/axl-version.h CHANGELOG.md
 # THE MARKER IS WHY CI DOES NOT RUN ON THIS COMMIT.
 #
 # ci.yml triggers on every push to main, and cut-release.sh pushes this commit
-# before tagging -- so a release ran the whole integration suite twice on the
-# same box: once as the LOCAL pre-release gate (which is the authoritative one,
-# see RELEASING.md) and again from this push, minutes later, for a commit whose
-# entire content is a version string and a date. The tag then builds and tests
-# everything a third time in release.yml.
+# before tagging. Its content is a version string and a date: the gate below
+# certifies it from its PARENT's runs (the release-only rule), and release.yml
+# builds and tests it again on the tag, so running even the cheap push jobs
+# here buys nothing.
 #
 # NOT `[skip ci]`. GitHub honours that natively, but it inspects the pushed
 # HEAD commit -- and the TAG push carries this same commit, so it would very
@@ -503,8 +612,8 @@ git add VERSION include/axl/axl-version.h CHANGELOG.md
 # marker is ours, GitHub gives it no meaning, and only ci.yml looks for it.
 git commit -q -m "release: $TAG
 
-[release-cut] ci.yml skips this commit: the local suite gated it before the
-cut, and release.yml builds and tests it again on the tag. See RELEASING.md."
+[release-cut] ci.yml skips this commit: the release gate covers it from its
+parent, and release.yml builds and tests it again on the tag. See RELEASING.md."
 # The bump is committed — there is nothing left to restore, and a later failure
 # (e.g. the push) must NOT roll the working tree back over the commit.
 trap - EXIT INT TERM HUP
@@ -512,96 +621,45 @@ git push origin "$RELEASE_BRANCH"
 REL_SHA="$(git rev-parse HEAD)"
 note "pushed release commit $REL_SHA"
 
-# ── the gate, consulted ALWAYS ────────────────────────────────────────────
+# ── the gate, ACTED ON ────────────────────────────────────────────────────
 #
-# TWO SOURCES OF GREEN, and the second is the one that removes the ~8.5 minutes
-# a human used to wait. `ci.yml` runs the identical uncached suite on every push
-# to main, on the same self-hosted box, and goes green on the commit this
-# release is cut from -- and the stamp reader could not see any of it, because
-# it reads a local file only an uncached LOCAL run writes. So the only way to
-# satisfy the gate was to run that suite a SECOND time here, and --ci-gate
-# would then dispatch a THIRD (AXL-CI-Release-Speed-Design.md §4.4/§10.3).
-#
-# CONSULTED EVEN WITHOUT --ci-gate. The check is free and the answer is the one
-# fact that decides whether this tag is verified; only the DISPATCH is gated by
-# the flag. Reporting nothing when nothing covers the commit is how a release
-# comes to be gated by a human's memory.
-GATE_WHY=""
-GATE_SRC=""
-if ! $FORCE_CI; then
-    if GATE_WHY="$(release_gate_covers "$REL_SHA")"; then
-        GATE_SRC="local suite"
-    elif GATE_WHY="$(release_gate_ci_covers "$REL_SHA")"; then
-        GATE_SRC="CI"
-    else
-        GATE_SRC=""
-    fi
-fi
-if [[ -n "$GATE_SRC" ]]; then
-    say "Gate satisfied by the $GATE_SRC — $GATE_WHY"
-elif ! $CI_GATE; then
-    # NOT a `note`. Nothing certified this tree, and the next line of output is
-    # a public tag that cannot be re-cut.
-    cat >&2 <<EOF
+# Decided before the bump (above); the release commit changes only the version
+# files, so what covered its parent covers it. What is left is the dispatch,
+# when that is what the decision -- or --force-ci -- asked for.
+case "$RELEASE_GATE_DECISION" in
+    covered-local|covered-ci)
+        say "Gate satisfied ($RELEASE_GATE_DECISION) — no CI dispatch"
+        ;;
+    untested)
+        cat >&2 <<EOF
 
-WARNING: nothing has certified $REL_SHA.
-         no local stamp, and no green CI run at it or its parent.
-         Tagging anyway, because --ci-gate was not passed.
-         To certify it, either:
-           ./test/integration/run-integration.sh --no-cache
-           git push          # and let CI go green on $RELEASE_BRANCH
-         or re-run this with --ci-gate to dispatch and wait.
+WARNING: tagging $TAG with NOTHING certifying it (--tag-untested). The release
+notes say so. To certify the tree after the fact, dispatch the suite:
+    gh workflow run ci.yml --ref $RELEASE_BRANCH
 
 EOF
-fi
-
-if $CI_GATE && ! $FORCE_CI && [[ -n "$GATE_SRC" ]]; then
-    # ALREADY GREEN — skip the dispatch entirely. The local suite is the
-    # authoritative gate (RELEASING.md), and it stamped this tree; dispatching
-    # CI would run the same tests on the same code for an answer we hold.
-    # That is the one move that improves turnaround AND cost at once, since a
-    # run never dispatched costs nothing and takes no time
-    # (AXL-CI-Release-Speed-Design.md §10.3/§10.4).
-    #
-    # It reads the stamp against the RELEASE commit, not HEAD-before-the-bump:
-    # release_gate_covers accepts a descendant whose whole diff is VERSION,
-    # axl-version.h and CHANGELOG.md, which is exactly what the bump touches.
-    note "skipping the CI dispatch (pass --force-ci to run it anyway)"
-elif $CI_GATE; then
-    # No usable stamp. Since 2026-08-19 the commonest reason is not "you did
-    # not run the suite" but "you ran it WITH THE CACHE" -- caching is on by
-    # default (run-integration.sh), and a cached run deliberately refuses to
-    # stamp, because it skipped tests whose inputs merely looked unchanged.
-    # Say so before dispatching, or the fix reads as "run it again" and the
-    # next run is cached too.
-    say "Nothing covers $REL_SHA -- no local stamp, and no green CI run at it"
-    say "or its parent."
-    note "a CACHED run cannot stamp -- for the local gate use:"
-    note "    ./test/integration/run-integration.sh --no-cache --arch X64"
-    note "    ./test/integration/run-integration.sh --no-cache --arch AARCH64"
-    note "dispatching CI instead (this is correct, just slower)"
-    # CI no longer auto-runs on a push, so trigger it on the release commit and
-    # wait for it before tagging.
-    say "Triggering CI on $RELEASE_BRANCH (--ci-gate)"
-    gh workflow run ci.yml --ref "$RELEASE_BRANCH" \
-        || die "could not dispatch ci.yml (gh auth / workflow name?)"
-    sleep 10   # let the dispatched run register before polling
-    if ! wait_for_ci "$REL_SHA"; then
-        cat >&2 <<EOF
+        ;;
+    dispatch)
+        # A push runs no suite since §14, so trigger it on the release commit
+        # and wait for it before tagging.
+        say "Triggering CI on $RELEASE_BRANCH (--ci-gate)"
+        gh workflow run ci.yml --ref "$RELEASE_BRANCH" \
+            || die "could not dispatch ci.yml (gh auth / workflow name?)"
+        sleep 10   # let the dispatched run register before polling
+        if ! wait_for_ci "$REL_SHA"; then
+            cat >&2 <<EOF
 
 CI did NOT pass on the release commit — NOT tagging (a published tag can't be
 re-cut; see docs/RELEASING.md "Recovery"). The 'release: $TAG' commit is on
 origin/$RELEASE_BRANCH. To recover:
   1. fix the failure on $RELEASE_BRANCH (normal commits) and push;
-  2. wait for CI to go green;
-  3. run:  scripts/cut-release.sh $VERSION --resume --ci-gate$RESUME_HINT
+  2. run:  scripts/cut-release.sh $VERSION --resume --ci-gate$RESUME_HINT
+     (it dispatches the suite on the new tip and waits for it)
 EOF
-        exit 1
-    fi
-else
-    note "CI gate SKIPPED — the LOCAL suite is the release gate now."
-    note "Run './test/integration/run-integration.sh -j\$(nproc)' before cutting"
-    note "(see docs/RELEASING.md). Pass --ci-gate to wait on a manual CI run."
-fi
+            exit 1
+        fi
+        ;;
+    *)  die "internal: no release-gate decision reached the tag step" ;;
+esac
 
 tag_and_publish "$REL_SHA"

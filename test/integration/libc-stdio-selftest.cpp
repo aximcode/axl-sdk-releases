@@ -28,6 +28,7 @@
 
 #include <axl.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -139,7 +140,49 @@ main(void)
         check(stat(pb, &st) == 0 && st.st_size == 10,
               "rename: the NEW path has the content");
 
-        remove(pb);
+        /* rename(x, x) is a no-op: the file must survive it. It used to be
+         * deleted, because the move under it removed the target first. */
+        axl_memset(&st, 0, sizeof st);
+        check(rename(pb, pb) == 0 && stat(pb, &st) == 0 && st.st_size == 10,
+              "rename(x, x) is a no-op that keeps x");
+
+        /* rename()'s failures set errno to what rename(2) documents. */
+        errno = 0;
+        check(rename("fs0:\\axl-no-such-file.txt", pa) == -1 && errno == ENOENT,
+              "rename: a missing source is -1 with errno ENOENT");
+        axl_dir_mkdir("fs0:\\axl-stat-dir");
+        errno = 0;
+        check(rename(pb, "fs0:\\axl-stat-dir") == -1 && errno == EISDIR
+                  && stat(pb, &st) == 0,
+              "rename: a file onto a directory is -1 with errno EISDIR, file kept");
+        axl_dir_rmdir("fs0:\\axl-stat-dir");
+
+        /* Another volume is EXDEV with nothing changed: rename() never
+           copies -- a portable caller (mv) copies on EXDEV itself. */
+        void *dp = nullptr;
+        if (axl_ramdisk_ensure_driver(nullptr, 0, nullptr) == AXL_OK
+            && axl_ramdisk_create("AXLLIBCRD", 2, &dp) == AXL_OK
+            && axl_volume_set_map(dp, "AXLLIBCRD") == AXL_OK) {
+            errno = 0;
+            check(rename(pb, "AXLLIBCRD:\\b.txt") == -1 && errno == EXDEV
+                      && stat(pb, &st) == 0 && stat("AXLLIBCRD:\\b.txt", &st) != 0,
+                  "rename: across volumes is -1 with errno EXDEV, nothing moved");
+            if (axl_volume_unmap("AXLLIBCRD") != AXL_OK) {
+                axl_printf("  NOTE: RAM disk map not removed\n");
+            }
+        } else {
+            check(false, "rename: a RAM disk for the cross-volume case");
+        }
+        if (dp != nullptr) {
+            axl_ramdisk_destroy("AXLLIBCRD");
+        }
+
+        /* remove() is 0 on success and -1 on failure, as POSIX has it --
+         * the status was inverted, so a caller checking it saw every
+         * successful remove fail and every failed one succeed. */
+        check(remove(pb) == 0 && stat(pb, &st) != 0,
+              "remove() of an existing file returns 0 and it is gone");
+        check(remove(pb) == -1, "remove() of a missing file returns -1");
     }
 
     axl_printf("=== %d passed, %d failed ===\n", passed, failed);

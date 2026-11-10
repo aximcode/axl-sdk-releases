@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=stdio-bridge-reap-test guest=standard
 # Stdio-bridge dead-instance leak: launchers that skip CRT0 atexit
 # (--minimal-runtime, or gBS->Exit) leave their bridge protocol installed.
 # Each launcher is a fresh image whose static install handle can't see prior
@@ -30,23 +30,15 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     stdio-bridge-reap-test 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/stdio-bridge-leak.efi"
 test_add_efi "$NATIVE_DIR/stdio-bridge-reap-test.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "stdio-bridge-leak.efi"
-    echo "stdio-bridge-leak.efi"
-    echo "stdio-bridge-reap-test.efi"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

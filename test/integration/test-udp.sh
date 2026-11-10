@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=13 local-only=0
+# test-meta: arch=x64 needs= est=13 local-only=0 guest=standard
 # AxlUdp integration test — boots QEMU with networking, sends a UDP
 # datagram to a host-side echo server, verifies the response.
 #
@@ -16,31 +16,16 @@ UDP_HOST_PORT=$(test_port 0)
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
 # Startup: init network, run UDP echo test to host gateway (10.0.2.2)
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo ""
-    echo "echo Connecting drivers..."
-    echo "connect -r"
-    echo "stall 1000000"
-    echo ""
-    echo "echo Configuring network via DHCP..."
-    echo "ifconfig -s eth0 dhcp"
-    echo "stall 3000000"
-    echo ""
-    echo "echo Running UDP echo test..."
-    echo "AxlTestNet.efi udp-echo 10.0.2.2 ${UDP_HOST_PORT}"
-    echo ""
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-udp.nsh; the echo port is %1.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$UDP_HOST_PORT"
 
 test_build_image
 
@@ -59,10 +44,7 @@ echo "  UDP echo server PID: $ECHO_PID, port: $UDP_HOST_PORT"
 # Boot QEMU with networking (user-mode, no port forward needed for
 # outbound UDP — QEMU's SLIRP forwards outbound UDP automatically)
 test_build_qemu_cmd
-TEST_QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev "user,id=net0"
-)
+test_add_network
 test_run_foreground 45
 
 test_clean_log

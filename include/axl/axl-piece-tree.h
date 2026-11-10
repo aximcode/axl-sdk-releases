@@ -444,12 +444,15 @@ axl_piece_tree_line_iter_next(
  *
  * Line endings follow axl_piece_tree_set_eol (verbatim by default).
  *
- * @return AXL_OK on success; AXL_ERR on NULL args or a failed write /
- *     flush (@p path untouched, temp removed). A failed rename is the
- *     one exception to "untouched": FAT cannot rename over an existing
- *     file, so the target is deleted first — if the retry then fails
- *     too, @p path is gone and the complete document is left in
- *     "<path>.tmp" for recovery rather than deleted as well.
+ * The temp takes @p path's place through axl_file_replace(), which sets an
+ * existing @p path aside rather than deleting it and puts it back if the
+ * rename fails.
+ *
+ * @return AXL_OK on success; AXL_ERR on NULL args, a failed write / flush,
+ *     or a failed replace -- @p path untouched and the temp removed, except
+ *     in the cases axl_file_replace() cannot prevent: when @p path existed
+ *     and no longer resolves, the complete document is left in
+ *     "<path>.tmp" for recovery.
  */
 AXL_WARN_UNUSED int
 axl_piece_tree_save(

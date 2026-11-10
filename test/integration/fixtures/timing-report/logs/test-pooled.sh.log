@@ -1,0 +1,5 @@
+axlpool run: leased g3 standard/X64 (restored, pool start 380 ms) in 400 ms
+TIMING: guest kind=pooled via=fg guest=2.000 boot=- rc=0
+TIMING: test=test-pooled.sh total=2.600 setup=0.300 guest=2.000 boot=0.000 between=0.000 post=0.300 booted=0 pooled=1 start=restored lease=400
+axlpool run: released g3 (returned) in 150 ms
+TIMING: runner test=test-pooled.sh attempt=1 via=pool wall=3.300 cpu=0.400 rc=0

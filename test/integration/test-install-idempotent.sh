@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=45 local-only=0
+# test-meta: arch=both needs= est=65 local-only=0
 # test-install-idempotent.sh — install.sh must not rewrite files whose content
 # has not changed.
 #
@@ -118,6 +118,7 @@ declare -A VICTIMS=(
     ["$HDR_DIR/axl/axl-mem.h"]="header (install -C -m 644)"
     ["$PREFIX/lib/axl/efi-localize.ver"]="linker version script (install -C)"
     ["$PREFIX/bin/axl-cc"]="axl-cc driver (install -C -m 755)"
+    ["$PREFIX/bin/axl-efi-pack"]="axl-efi-pack host tool (install -C -m 755)"
     ["$PREFIX/lib/pkgconfig/axl-$INSTALL_ARCH.pc"]="pkg-config (write_if_changed)"
     ["$PREFIX/lib/cmake/axl/axl-config.cmake"]="cmake config (write_if_changed)"
     ["$PREFIX/share/axl/backend"]="metadata (write_if_changed)"
@@ -145,6 +146,8 @@ done
 # Executable bits must survive the repair, not just content.
 [[ -x "$PREFIX/bin/axl-cc" ]]
 check "$?" "the repaired axl-cc is still executable"
+[[ -f "$PREFIX/bin/axl-efi-pack" && -x "$PREFIX/bin/axl-efi-pack" ]]
+check "$?" "install.sh stages bin/axl-efi-pack as an executable file"
 
 # --- 4. A fourth no-op install is still a no-op ------------------------------
 # Guards against a fix that is idempotent only on the first repeat (e.g. one
@@ -205,8 +208,8 @@ check "$?" "--arch x64 --cpp still fails when the x64 compiler is absent (rc=$rc
 X64_CXX="${AXL_X64_GXX:-$AXL_X64_GXX_DEFAULT}"
 # The predicate must MATCH install.sh's, not merely resemble it. install.sh
 # accepts a bare name found on PATH as well as a path, and AXL_X64_GXX spelled
-# as a bare name is a supported override (the Makefile's guard says so
-# explicitly). A plain `-x` test rejects that spelling and SKIPS the gate --
+# as a bare name is a supported override (the retired Makefile's guard said
+# so explicitly). A plain `-x` test rejects that spelling and SKIPS the gate --
 # quietly returning the wrong answer, which is the failure this guard was
 # rewritten to stop doing.
 have_x64_cxx() {
@@ -228,11 +231,11 @@ fi
 # result as "this regression was not exercised here", not as coverage.
 #
 # It is the only gate that BUILDS, and it is restricted to the x64 shard
-# because sections 1-4 of THIS script have already warmed out/native-x64-release
+# because sections 1-4 of THIS script have already warmed build/x64-release
 # there (measured: 5s). run-integration.sh's prebuild is NOT the warmer -- that
-# builds out/native-x64 at BUILD=DEBUG, a different PREFIX and so a different
-# BUILDDIR. On an aa64 shard those sections warm aa64 instead, leaving this a
-# from-scratch RELEASE build against a `# test-meta:` est of 45s.
+# builds build/x64-debug at BUILD=DEBUG, a different tree. On an aa64 shard
+# those sections warm aa64 instead, leaving this a from-scratch RELEASE build
+# against a `# test-meta:` est of 45s.
 if [[ "$INSTALL_ARCH" != "x64" ]]; then
     check 0 "SKIP: aa64 shard — the discriminating x64 --cpp gate runs on the x64 shard"
 elif ! have_x64_cxx; then

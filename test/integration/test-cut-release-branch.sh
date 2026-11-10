@@ -135,10 +135,30 @@ else
     fail "--resume waits on CI without dispatching it — a release-branch resume would hang"
 fi
 
-if grep -q '_release_gate_ci_green' <<<"$(resume_block)"; then
-    pass "--resume skips the dispatch when a green run already covers the sha"
+# ...ON MAIN TOO (AXL-CI-Release-Speed-Design.md §14). The dispatch used to be
+# for non-main branches only, because a push to main ran the suite. It no
+# longer does, so a main resume that only waited would poll 75 minutes for a
+# suite run nothing starts.
+if grep -qF '!= "main"' <<<"$(resume_block)"; then
+    fail "--resume still limits the dispatch to non-main branches -- a main resume would hang"
 else
-    fail "--resume dispatches unconditionally — a post-timeout resume would re-run CI"
+    pass "--resume dispatches on main as well (a push to main runs no suite)"
+fi
+
+# Skips the dispatch when something already covers the sha: the resume asks
+# the same release_gate_decide the normal flow does, which accepts a green
+# dispatched run (review ruling R-B)...
+if grep -q 'release_gate_decide' <<<"$(resume_block)"; then
+    pass "--resume asks the release gate first (a covered sha is not re-dispatched)"
+else
+    fail "--resume does not consult the release gate — a covered sha would re-run CI"
+fi
+# ...and a dispatched run still going is WAITED on, not replaced: dispatches
+# share a cancel-in-progress group, so a second dispatch would cancel it.
+if grep -q 'queued|in_progress|waiting|requested|pending)' <<<"$(resume_block)"; then
+    pass "--resume waits on a dispatched run still in progress"
+else
+    fail "--resume re-dispatches over a run in progress — it would cancel it"
 fi
 
 # The gate itself must not accept a run in which every job was skipped: on a

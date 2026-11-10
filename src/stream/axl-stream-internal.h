@@ -8,7 +8,9 @@
     buffer, text, compress) builds and serves itself through the PUBLIC
     `axl_stream_open_custom` / `axl_stream_ctx` / `axl_read` and names nothing
     in here, so `src/stream/` has no construction or composition path a
-    consumer lacks. See the design doc §11–§14. Not a public header.
+    consumer lacks (the one reach past it, clearing end-of-file alone, is
+    the function in axl-stream-eof.h). See the design doc §11–§14. Not a
+    public header.
 **/
 
 #ifndef AXL_STREAM_INTERNAL_H

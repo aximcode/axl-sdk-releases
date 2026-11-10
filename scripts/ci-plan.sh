@@ -51,7 +51,6 @@
 # Usage: scripts/ci-plan.sh [--list-unsafe] <base> <head>
 set -uo pipefail
 
-SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=classify
 if [[ "${1:-}" == "--list-unsafe" ]]; then MODE=list-unsafe; shift; fi
 BASE="${1:-}"
@@ -61,21 +60,15 @@ if [[ -z "$BASE" || -z "$HEAD_REF" ]]; then
     exit 2
 fi
 
+# THERE WAS A THIRD OUTPUT, ci_only (+ only_tests), and it is gone with the
+# push trigger for the suite (AXL-CI-Release-Speed-Design.md §14). It shrank a
+# PUSH run of the integration job to the tests that read workflow files; the
+# integration job no longer runs on a push, and a dispatch is never
+# path-filtered, so nothing could read it. (It was never wired into the plan
+# job's `outputs:` either, so the shrinking it promised in §13.12 did not
+# happen on any push it was meant for.)
 emit() {
-    printf 'docs_only=%s\ndocs_touched=%s\nci_only=%s\nonly_tests=%s\n' \
-           "$1" "$2" "${3:-false}" "${4:-}"
-}
-
-# WHICH TESTS READ THE WORKFLOW FILES -- derived, never written down. A
-# hand-kept list here would go stale the first time a new test starts reading
-# a workflow, which is the defect this whole script exists to prevent one level
-# up. Over-inclusion is the safe direction: a test that only MENTIONS .github
-# in a comment gets run, which costs seconds.
-ci_reader_tests() {
-    local d="$SELF_DIR/../test/integration"
-    [[ -d "$d" ]] || return 0
-    grep -rl -- '\.github/workflows' "$d"/test-*.sh 2>/dev/null \
-        | xargs -r -n1 basename 2>/dev/null | sort -u | paste -sd, -
+    printf 'docs_only=%s\ndocs_touched=%s\n' "$1" "$2"
 }
 
 # A diff we could not compute is not an empty diff. Both are the same empty
@@ -138,31 +131,13 @@ fi
 
 only=true
 touched=false
-# CI-ONLY IS A DIFFERENT KIND OF CLAIM from "probably just prose", and that is
-# why it is allowed where "shell changed" is not. §12.5's warning is about
-# GUESSING which tests a change can reach; this is not a guess: NOTHING BUILDS
-# FROM .github. There is no path from a .yml file to a produced artifact, so
-# the only things such a change can reach are CI itself and the tests that READ
-# those files -- and that set is derived above rather than assumed.
-ci=true
 while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     is_doc_input "$f" && touched=true
     is_safe_doc  "$f" || only=false
-    [[ "$f" == .github/* ]] || ci=false
 done <<< "$changed"
 
 # Any removal drops back to the full run -- see the header.
 [[ -n "$removed" ]] && only=false
 
-# A ci-only push runs the readers and nothing else -- unless the derivation
-# came back EMPTY, which means the grep found nothing and is indistinguishable
-# from "no test reads a workflow". Running everything is the only safe reading
-# of that, so it falls back rather than skipping the suite on a blank list.
-_readers=""
-if [[ "$ci" == "true" ]]; then
-    _readers="$(ci_reader_tests)"
-    [[ -n "$_readers" ]] || ci=false
-fi
-
-emit "$only" "$touched" "$ci" "$_readers"
+emit "$only" "$touched"

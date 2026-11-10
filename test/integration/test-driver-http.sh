@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=19 local-only=0
+# test-meta: arch=x64 needs= est=19 local-only=0 builds=http-server-driver guest=standard
 # Driver-mode HTTP server integration test.
 #
 # Boots the example DXE driver `http-server-driver.efi` from the
@@ -29,8 +29,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
 # Build the driver
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} http-server-driver 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" http-server-driver 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/http-server-driver.efi"
@@ -39,26 +39,11 @@ test_add_efi "$NATIVE_DIR/http-server-driver.efi"
 # actually bind), then load the driver. The driver returns to the
 # shell after axl_loop_attach_driver succeeds; firmware-managed
 # notifications drive the loop from there.
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Loading HTTP server driver...
-load http-server-driver.efi
-stall 1000000
-
-echo Driver loaded; firmware timer is now driving the loop.
-echo READY
-NSHEOF
+# Its commands are in test-driver-http.nsh. The guest must keep running after
+# it returns -- the resident driver is what the requests below reach -- so
+# --keep-up: booted, the startup ends at the Shell prompt (no reset -s);
+# pooled, the leased guest stays up after the agent's run.
+test_use_nsh --keep-up
 
 test_build_image
 
@@ -73,8 +58,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for driver and server..."
 
-if ! test_wait_for "READY" 90; then
-    echo "FAIL: driver did not finish loading within 90 seconds"
+if ! test_wait_boot "READY" 90; then
+    echo "FAIL: driver did not finish loading within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log (tail) ---"
     tail -40 "$TEST_CLEAN_LOG"
@@ -85,9 +70,12 @@ fi
 # all of them landed (load → routes → server-attach → loop-attach).
 echo ""
 echo "  --- Driver bring-up ---"
-DRIVER_PASS=$(grep -c '^PASS: ' "$TEST_LOG" || true)
-DRIVER_FAIL=$(grep -c '^FAIL: ' "$TEST_LOG" || true)
-grep -E '^(PASS|FAIL): ' "$TEST_LOG" | while IFS= read -r line; do
+# Read from the clean log: a pooled run's stream stamps each line
+# ("[<seconds>] "), a booted background run's raw log does not.
+test_clean_log
+DRIVER_PASS=$(grep -c '^PASS: ' "$TEST_CLEAN_LOG" || true)
+DRIVER_FAIL=$(grep -c '^FAIL: ' "$TEST_CLEAN_LOG" || true)
+grep -E '^(PASS|FAIL): ' "$TEST_CLEAN_LOG" | while IFS= read -r line; do
     echo "  $line"
 done
 

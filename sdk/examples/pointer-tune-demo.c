@@ -67,7 +67,7 @@
  * View over reverse VNC (run-qemu.sh adds usb-tablet = an absolute pointer):
  *   ./scripts/run-qemu.sh --vnc-reverse HOST:PORT pointer-tune-demo.efi
  *
- * Build with: make pointer-tune-demo
+ * Build with: scripts/axl-build.sh pointer-tune-demo
  */
 
 #include <axl.h>

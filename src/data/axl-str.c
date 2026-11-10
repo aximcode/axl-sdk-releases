@@ -100,19 +100,29 @@ axl_strcasecmp(
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+/* The toolchain's memmove, not a byte loop. On the `axl` link that is newlib's
+   (word-at-a-time, and hand-written assembly on aa64); on the `host` link it
+   is the stand-in in src/mem/axl-intrinsics.c. AxlTcp copies every
+   transmitted byte through here. `-fno-builtin` stops the compiler from
+   expanding a plain call itself, so the builtin is spelled out; with a
+   variable size it still compiles to a call to the library routine.
+
+   memmove, not memcpy, on purpose. The byte loop this replaced copied an
+   overlapping region correctly whenever dst < src, and in-tree code relies on
+   that -- AxlArray's remove_index / remove_range and AxlLog's table removals
+   shift their tails down with axl_memcpy -- as consumer code may too. A
+   library memcpy would make that undefined; memmove keeps it correct, in both
+   directions, for one comparison per call. */
 void *
 axl_memcpy(void *dst, const void *src, size_t n)
 {
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-
     if (dst == NULL || src == NULL) {
         return dst;
     }
-    for (size_t i = 0; i < n; i++) {
-        d[i] = s[i];
-    }
-    return dst;
+    /* The analyzer's "use memmove_s" advice does not apply: n is the caller's
+       contract, exactly as for the library routine this wraps. */
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    return __builtin_memmove(dst, src, n);
 }
 
 void *
@@ -176,22 +186,17 @@ axl_memmem(
     return NULL;
 }
 
+/* The same library routine as axl_memcpy (see there): fast, overlap-safe. */
 void *
 axl_memmove(void *dst, const void *src, size_t n)
 {
-    uint8_t       *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-
-    if (d < s || d >= s + n) {
-        for (size_t i = 0; i < n; i++) {
-            d[i] = s[i];
-        }
-    } else {
-        for (size_t i = n; i > 0; i--) {
-            d[i - 1] = s[i - 1];
-        }
+    /* The byte loop this replaced never touched either pointer for n == 0;
+       the library routine is undefined for a NULL pointer at any size. */
+    if (n == 0) {
+        return dst;
     }
-    return dst;
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    return __builtin_memmove(dst, src, n);
 }
 
 void *
@@ -987,6 +992,73 @@ axl_utf8_decode(
     #undef UTF8_IS_CONT
 }
 
+bool
+axl_utf8_validate(
+    const char  *s,
+    size_t       len,
+    const char **endptr
+    )
+{
+    size_t i = 0;
+
+    /* GLib's g_utf8_validate_len has no NULL guard: with max_len above 0 it
+       dereferences, and with max_len 0 its scan loop never runs, so it
+       answers TRUE for a NULL, empty range. This matches it on the empty
+       case and refuses rather than faults on the other. */
+    if (s == NULL) {
+        if (endptr != NULL) {
+            *endptr = NULL;
+        }
+        return len == 0;
+    }
+
+    while (i < len) {
+        const uint8_t b0 = (uint8_t)s[i];
+        size_t        need;
+        uint32_t      cp;
+
+        /* A NUL is refused, never read as the end -- see the header. */
+        if (b0 == 0) {
+            break;
+        }
+        if (b0 < 0x80) {
+            i++;
+            continue;
+        }
+        if ((b0 & 0xE0) == 0xC0) {
+            need = 2;
+        } else if ((b0 & 0xF0) == 0xE0) {
+            need = 3;
+        } else if ((b0 & 0xF8) == 0xF0) {
+            need = 4;
+        } else {
+            break;   /* a lone continuation byte, or an F8-FF lead */
+        }
+        /* Bounded by len, and that is load-bearing: the continuation
+           bytes of a sequence the range cuts may be present and valid in the
+           caller's buffer, and axl_utf8_decode below would read them. This
+           guard is what keeps it inside the range -- with it, the decode
+           touches at most `need` bytes, every one of them inside. */
+        if (need > len - i) {
+            break;
+        }
+        /* Defer the well-formedness rules to axl_utf8_decode rather than
+           re-deriving them: it already refuses overlongs, surrogates and
+           anything above U+10FFFF, returning 1 for every one of them, so a
+           return of exactly `need` means the sequence is well-formed.
+           (axl_json_utf8_step composes the same two pieces.) */
+        if (axl_utf8_decode(s + i, &cp) != need) {
+            break;
+        }
+        i += need;
+    }
+
+    if (endptr != NULL) {
+        *endptr = s + i;
+    }
+    return i == len;
+}
+
 size_t
 axl_utf8_encode(
     uint32_t   codepoint,
@@ -1281,29 +1353,44 @@ axl_ucs2_to_utf8_buf(
     return i;
 }
 
-size_t
-axl_utf16_to_utf8(const uint16_t *src, size_t count, char *dst, size_t dst_size)
+/* UTF-16 to UTF-8 over either a uint16_t array or raw little-endian bytes,
+   so a file's bytes decode in place with no unit copy. Measures when @a dst
+   is NULL; stops at a clean boundary when @a dst is full. An unpaired
+   surrogate becomes U+FFFD; @a first (may be NULL) receives the index of the
+   first one, or @a count for none. */
+static size_t
+utf16_units_to_utf8(const uint16_t *units, const unsigned char *le, size_t count,
+                    char *dst, size_t dst_size, size_t *first)
 {
-    if (src == NULL) {
-        return 0;
-    }
     size_t out = 0;
+    if (first != NULL) {
+        *first = count;
+    }
     for (size_t i = 0; i < count; i++) {
-        uint32_t cp = src[i];
-        if (cp >= 0xD800 && cp <= 0xDBFF) {                 /* high surrogate */
-            if (i + 1 < count && src[i + 1] >= 0xDC00 && src[i + 1] <= 0xDFFF) {
-                cp = 0x10000u + ((cp - 0xD800u) << 10) + (src[i + 1] - 0xDC00u);
+        uint32_t cp = (units != NULL)
+                          ? units[i]
+                          : (uint32_t)(le[2 * i] | ((unsigned)le[2 * i + 1] << 8));
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            uint32_t lo = 0;
+            if (cp <= 0xDBFF && i + 1 < count) {
+                lo = (units != NULL)
+                         ? units[i + 1]
+                         : (uint32_t)(le[2 * i + 2] | ((unsigned)le[2 * i + 3] << 8));
+            }
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {                 /* a pair */
+                cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
                 i++;
-            } else {
+            } else {                                            /* unpaired */
+                if (first != NULL && *first == count) {
+                    *first = i;
+                }
                 cp = 0xFFFD;
             }
-        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {          /* lone low surrogate */
-            cp = 0xFFFD;
         }
         size_t need = (cp < 0x80) ? 1 : (cp < 0x800) ? 2 : (cp < 0x10000) ? 3 : 4;
         if (dst != NULL) {
             if (out + need > dst_size) {
-                break;                                      /* clean boundary */
+                break;                                          /* clean boundary */
             }
             if (cp < 0x80) {
                 dst[out++] = (char)cp;
@@ -1325,6 +1412,91 @@ axl_utf16_to_utf8(const uint16_t *src, size_t count, char *dst, size_t dst_size)
         }
     }
     return out;
+}
+
+size_t
+axl_utf16_to_utf8(const uint16_t *src, size_t count, char *dst, size_t dst_size)
+{
+    if (src == NULL) {
+        return 0;
+    }
+    return utf16_units_to_utf8(src, NULL, count, dst, dst_size, NULL);
+}
+
+/* UTF-16LE bytes (mark removed) to UTF-8 in *out, decoded straight from the
+   bytes. The first unit that does not convert -- an unpaired surrogate, or
+   an odd byte at the end -- makes the result AXL_INVALID; *bad is where it
+   landed in the text. */
+static int
+text_utf16le(const unsigned char *b, size_t len, char **out, size_t *out_len,
+             size_t *bad)
+{
+    size_t units = len / 2;
+    size_t first = units;
+    size_t need  = utf16_units_to_utf8(NULL, b, units, NULL, 0, &first);
+    char  *text  = axl_malloc(need + 1);
+    if (text == NULL) {
+        return AXL_NO_RESOURCES;
+    }
+    size_t got = utf16_units_to_utf8(NULL, b, units, text, need + 1, NULL);
+    text[got] = '\0';
+    *bad      = utf16_units_to_utf8(NULL, b, first, NULL, 0, NULL);
+    *out      = text;
+    *out_len  = got;
+    return (first < units || (len % 2) != 0) ? AXL_INVALID : AXL_OK;
+}
+
+int
+axl_text_to_utf8(const void *data, size_t len, char **out, size_t *out_len,
+                 size_t *bad_at)
+{
+    const unsigned char *b   = (const unsigned char *)data;
+    size_t               n   = 0;
+    size_t               bad = 0;
+    int                  rc  = AXL_OK;
+
+    /* Defined on every return, failures included: 0 until text exists. */
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (bad_at != NULL) {
+        *bad_at = 0;
+    }
+    if (out == NULL) {
+        return AXL_INVALID;
+    }
+    *out = NULL;
+    if (b == NULL && len > 0) {
+        return AXL_INVALID;
+    }
+    if (len >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
+        rc = text_utf16le(b + 2, len - 2, out, &n, &bad);
+        if (rc == AXL_NO_RESOURCES) {
+            return rc;
+        }
+    } else {
+        if (len >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+            b   += 3;
+            len -= 3;
+        }
+        *out = axl_malloc(len + 1);
+        if (*out == NULL) {
+            return AXL_NO_RESOURCES;
+        }
+        if (len > 0) {
+            axl_memcpy(*out, b, len);
+        }
+        (*out)[len] = '\0';
+        n   = len;
+        bad = len;
+    }
+    if (out_len != NULL) {
+        *out_len = n;
+    }
+    if (bad_at != NULL) {
+        *bad_at = bad;
+    }
+    return rc;
 }
 
 size_t

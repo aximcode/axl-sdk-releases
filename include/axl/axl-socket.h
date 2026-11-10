@@ -114,7 +114,10 @@ axl_socket_new_from_tcp(
  * @brief Close and free a socket. NULL-safe.
  *
  * @p mode selects the teardown (see @ref AxlTeardown): `AXL_TEARDOWN_GRACEFUL`
- * (orderly FIN, the default for ordinary shutdown) or `AXL_TEARDOWN_RESET`
+ * (orderly FIN, the default for ordinary shutdown -- but a stream socket
+ * whose close would drop accepted bytes, such as an async send still queued,
+ * is reset, see @ref axl_tcp_close) or
+ * `AXL_TEARDOWN_RESET`
  * (abortive RST + synchronous loop-free finalize, so a stream-socket listen
  * port is free on return even with connections in flight — the in-place
  * server-upgrade / port hand-off case; the RST discards un-ACKed in-flight
@@ -200,7 +203,12 @@ axl_socket_accept(
 /**
  * @brief Send data on a connected stream socket. Blocking.
  *
- * @return AXL_OK on success, AXL_ERR on failure or timeout.
+ * Follows axl_tcp_send(). A timeout or interruption can leave the
+ * data partly sent (the count is not surfaced here), and a send cut
+ * short that way makes the socket's eventual close abortive (RST).
+ *
+ * @return AXL_OK on success, AXL_TIMEOUT when the timeout expired
+ *     first, AXL_ERR on failure.
  */
 int
 axl_socket_send(

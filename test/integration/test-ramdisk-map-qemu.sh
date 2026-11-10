@@ -1,5 +1,9 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=25 local-only=0
+# test-meta: arch=both needs= est=25 local-only=0 guest=none
+# guest=none: its subject is the Shell's volume map around the boot volume
+#   fs0: (`mkrd fs0` must never clobber it, aliases mapped to fs0:, d.txt
+#   absent from fs0 afterwards); on a leased guest fs0: is the pool's disk,
+#   not the run's.
 # test-ramdisk-map-qemu.sh — mkrd maps a freshly created RAM disk so it shows in
 # a bare `map` IMMEDIATELY (no `map -r`), looking like a native volume:
 #
@@ -58,7 +62,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MKRD="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools/mkrd.efi"
 
-make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 [[ -f "$MKRD" ]] || { echo "ERROR: $MKRD not built"; exit 1; }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT

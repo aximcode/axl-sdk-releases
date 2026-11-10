@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="5"
+	failures="0"
+	disabled="0"
+	skipped="0"
+	hostname=""
+	time="0"
+	timestamp="2026-11-08T23:46:22"
+	>
+	<testcase name="unit.counts-reset" classname="unit.counts-reset" time="0.00116242" status="run">
+		<properties>
+			<property name="cmake_labels" value="unit"/>
+		</properties>
+		<system-out>
+</system-out>
+	</testcase>
+	<testcase name="unit.AxlTestA" classname="unit.AxlTestA" time="0.00172617" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;unit"/>
+		</properties>
+		<system-out>Results: 5 passed, 0 failed (AARCH64) in 1s
+</system-out>
+	</testcase>
+	<testcase name="unit.AxlTestB" classname="unit.AxlTestB" time="0.00110275" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;unit"/>
+		</properties>
+		<system-out>Results: 5 passed, 0 failed (AARCH64) in 1s
+</system-out>
+	</testcase>
+	<testcase name="unit.inventory" classname="unit.inventory" time="0.00164897" status="run">
+		<properties>
+			<property name="cmake_labels" value="unit"/>
+		</properties>
+		<system-out>inventory: clean
+</system-out>
+	</testcase>
+	<testcase name="unit.ratchet" classname="unit.ratchet" time="0.00120572" status="run">
+		<properties>
+			<property name="cmake_labels" value="unit"/>
+		</properties>
+		<system-out>unit ratchet: 10 assertions across 2 binaries (baseline 10; 0 red)
+unit budget: not judged -- a judge-only tree (WRITE 0), as its one-boot run skips the budget too
+unit-counts: AxlTestA=5 AxlTestB=5
+</system-out>
+	</testcase>
+</testsuite>

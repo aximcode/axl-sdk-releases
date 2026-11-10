@@ -22,7 +22,10 @@ sgr_advance(size_t off, size_t cap, int n)
     return (off > cap - 1) ? cap - 1 : off;
 }
 
-/* One SGR colour parameter: ;39/;49 default, ;38;5;N/;48;5;N indexed,
+/* One SGR colour parameter: ;39/;49 default; the 16 ANSI colours in their
+   16-colour form (;30-37/;90-97 fg, ;40-47/;100-107 bg) -- the form every
+   terminal draws from its own palette, and the one the live encoder writes, so a
+   repaint and the live stream agree; ;38;5;N/;48;5;N for the rest of the 256;
    ;38;2;R;G;B / ;48;2;R;G;B truecolour. */
 static size_t
 sgr_color(char *buf, size_t cap, size_t off, const AxlConsoleColor *c, bool fg)
@@ -33,8 +36,14 @@ sgr_color(char *buf, size_t cap, size_t off, const AxlConsoleColor *c, bool fg)
         n = axl_snprintf(buf + off, cap - off, ";%u", fg ? 39u : 49u);
         break;
     case AXL_CONSOLE_COLOR_INDEXED:
-        n = axl_snprintf(buf + off, cap - off, ";%u;5;%u", fg ? 38u : 48u,
-                         (unsigned)c->idx);
+        if (c->idx < 8) {
+            n = axl_snprintf(buf + off, cap - off, ";%u", (fg ? 30u : 40u) + c->idx);
+        } else if (c->idx < 16) {
+            n = axl_snprintf(buf + off, cap - off, ";%u", (fg ? 90u : 100u) + c->idx - 8u);
+        } else {
+            n = axl_snprintf(buf + off, cap - off, ";%u;5;%u", fg ? 38u : 48u,
+                             (unsigned)c->idx);
+        }
         break;
     case AXL_CONSOLE_COLOR_RGB:
         n = axl_snprintf(buf + off, cap - off, ";%u;2;%u;%u;%u", fg ? 38u : 48u,

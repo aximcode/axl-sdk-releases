@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=11 local-only=0
+# test-meta: arch=x64 needs= est=11 local-only=0 builds=flushfail-fs-driver guest=plain
 # test-flushfail-tools-qemu.sh -- a TOOL's write path against media whose
 # flush fails.
 #
@@ -65,8 +65,8 @@ PASS=0; FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; [[ -n "${2:-}" ]] && echo "  $2"; FAIL=$((FAIL + 1)); }
 
-[[ -f "$DRV" ]] || make flushfail-fs-driver ARCH="$MAKE_ARCH" 2>&1 | tail -3
-[[ -f "$TAR" ]] || make tools ARCH="$MAKE_ARCH" 2>&1 | tail -3
+[[ -f "$DRV" ]] || "$PROJECT_DIR/scripts/axl-build.sh" flushfail-fs-driver ARCH="$MAKE_ARCH" 2>&1 | tail -3
+[[ -f "$TAR" ]] || "$PROJECT_DIR/scripts/axl-build.sh" tools ARCH="$MAKE_ARCH" 2>&1 | tail -3
 [[ -f "$DRV" ]] || { echo "FAIL: $DRV not found"; exit 1; }
 [[ -f "$TAR" ]] || { echo "FAIL: $TAR not found"; exit 1; }
 
@@ -75,17 +75,19 @@ LOG="$(mktemp)"
 trap 'rm -f "$NSH" "$LOG"' EXIT
 
 # One shell session throughout: `load` publishes AXLFF: and seeds the source,
-# then tar runs against it and %lasterror% is read in the same instance.
+# then tar runs against it and %lasterror% is read in the same instance. Its
+# files are named relatively (the Shell's current directory), so the script
+# runs on a leased guest too (run-qemu.sh's pooled mode).
 cat > "$NSH" <<'EOF'
 @echo -off
 fs0:
 cd \
-load fs0:\flushfail-fs-driver.efi
-fs0:\tar.efi -c AXLFF:\a.tar fs0:\ffsrc.txt
+load flushfail-fs-driver.efi
+tar.efi -c AXLFF:\a.tar ffsrc.txt
 echo TOOLS: TAR-CREATE-LASTERROR=[%lasterror%]
 ls AXLFF:\
-fs0:\tar.efi -c fs0:\ref.tar fs0:\ffsrc.txt
-fs0:\tar.efi -x fs0:\ref.tar -C AXLFF:\
+tar.efi -c ref.tar ffsrc.txt
+tar.efi -x ref.tar -C AXLFF:\
 echo TOOLS: TAR-EXTRACT-LASTERROR=[%lasterror%]
 reset -s
 EOF

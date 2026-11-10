@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=8 local-only=0
+# test-meta: arch=x64 needs= est=8 local-only=0 guest=standard
 # test-shell-pipe.sh — verify axl_stdin works as the RHS of a UEFI
 # Shell `|` pipe. Exercises hexdump and grep with stdin input.
 #
@@ -19,42 +19,13 @@ source "$SCRIPT_DIR/common-test.sh"
 TEST_ARCH="X64"
 test_setup
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/tools/hexdump.efi"
 test_add_efi "$NATIVE_DIR/tools/grep.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo ""
-    # Shell built-ins write \r\n line endings; hexdump should show
-    # 'h e l l o \r \n' for `echo hello`. Each PROBE-N marker frames
-    # the section so we can assert on the cleaned log.
-    echo "echo PROBE-1-START"
-    echo "echo hello | hexdump.efi"
-    echo "echo PROBE-1-END"
-    echo ""
-    echo "echo PROBE-2-START"
-    echo "echo line-with-needle | grep.efi needle"
-    echo "echo PROBE-2-END"
-    echo ""
-    echo "echo PROBE-3-START"
-    echo "echo nomatch | grep.efi needle"
-    echo "echo PROBE-3-END"
-    echo ""
-    # Pipe a multi-line shell-builtin output through grep. ver
-    # produces a couple of lines of UEFI version info; grep for a
-    # token that should always be present.
-    echo "echo PROBE-4-START"
-    echo "ver | grep.efi UEFI"
-    echo "echo PROBE-4-END"
-    echo ""
-    echo "echo === DONE ==="
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

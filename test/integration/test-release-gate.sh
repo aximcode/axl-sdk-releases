@@ -35,10 +35,12 @@ BASE=$(git rev-parse HEAD)
 
 # ── a stub `gh` ───────────────────────────────────────────────────────────
 #
-# The CI half of the gate asks GitHub whether a run went green at a commit.
-# Driven through a stub so it needs no network and no real run, and so the
-# REFUSING cases -- which are the ones that matter, since a false positive
-# tags code no suite ever ran -- can be produced on demand.
+# BOTH halves of the gate ask GitHub now: the CI half whether a run with the
+# suite went green, and the stamp half whether the CHEAP push jobs did
+# (AXL-CI-Release-Speed-Design.md §14). Driven through a stub so it needs no
+# network and no real run, and so the REFUSING cases -- which are the ones that
+# matter, since a false positive tags code no suite ever ran -- can be produced
+# on demand.
 #
 # THE STUB ANSWERS WHAT `gh --jq` WOULD PRINT, not raw JSON, and the decisions
 # are made in shell rather than inside a jq expression -- so every one of them
@@ -46,58 +48,147 @@ BASE=$(git rev-parse HEAD)
 mkdir -p "$TMP/bin"
 GH_RUNS="$TMP/gh-runs.tsv"
 GH_JOBS="$TMP/gh-jobs.txt"
+GH_FAIL="$TMP/gh-fail"
 cat > "$TMP/bin/gh" <<STUB
 #!/bin/bash
-# Two queries are made: the run list for a commit (TSV), and one run's job
-# conclusions (one per line).
+# Two queries are made: the run list for a commit (TSV), and one run's jobs
+# (one per line). \$GH_JOBS.<run-id>, when present, answers for that run alone,
+# which is how two runs at ONE commit -- a push run and a dispatched one --
+# can disagree. \$GH_FAIL makes every call fail the way an expired token does.
+[[ -e "$GH_FAIL" ]] && { echo "gh: HTTP 401: Bad credentials" >&2; exit 1; }
+prev=""
 for a in "\$@"; do
-    case "\$a" in
-        view) cat "$GH_JOBS"; exit 0 ;;
-    esac
+    if [[ "\$prev" == "view" ]]; then
+        if [[ -f "$GH_JOBS.\$a" ]]; then cat "$GH_JOBS.\$a"; else cat "$GH_JOBS"; fi
+        exit 0
+    fi
+    prev="\$a"
 done
 cat "$GH_RUNS"
 STUB
 chmod +x "$TMP/bin/gh"
+export PATH="$TMP/bin:$PATH"
 
 # gh_says <run-tsv-lines> <job-tsv-lines> -- newline-terminated, the way a
 # real `gh --jq` writes them. A job line is `<name>\t<conclusion>`: the NAME is
-# now part of the answer, because "every job passed" and "the suite ran" became
+# part of the answer, because "every job passed" and "the suite ran" became
 # different claims the moment a push could produce a partial run.
-gh_says() { printf '%s\n' "$1" > "$GH_RUNS"; printf '%s\n' "$2" > "$GH_JOBS"; }
+gh_reset() { rm -f "$GH_JOBS".* "$GH_FAIL"; }
+gh_says() { gh_reset; printf '%s\n' "$1" > "$GH_RUNS"; printf '%s\n' "$2" > "$GH_JOBS"; }
 # ...and the same without the final newline, which is what a truncated or
 # differently-buffered answer looks like. `read` returns non-zero on such a
 # line while still assigning it, so a bare `while read` drops it -- and here
 # that line IS the answer.
-gh_says_unterminated() { printf '%s' "$1" > "$GH_RUNS"; printf '%s' "$2" > "$GH_JOBS"; }
-run_row() { printf '%s\tcompleted\t%s\t4242' "$1" "$2"; }   # <sha> <conclusion>
-# job_rows <build-conclusion> <suite-conclusion>
-job_rows() { printf 'gcc x64\t%s\nQEMU integration (full suite)\t%s' "$1" "$2"; }
+gh_says_unterminated() { gh_reset; printf '%s' "$1" > "$GH_RUNS"; printf '%s' "$2" > "$GH_JOBS"; }
+run_row() { printf '%s\tcompleted\t%s\t%s' "$1" "$2" "${3:-4242}"; }   # <sha> <conclusion> [id]
+# job_rows <cheap-conclusion> <suite-conclusion> -- a DISPATCHED run's shape:
+# the three cheap jobs and the suite.
+job_rows() {
+    printf 'plan\tsuccess\ngcc x64\t%s\ngcc aa64\t%s\nclang-tidy\t%s\nQEMU integration (full suite)\t%s' \
+        "$1" "$1" "$1" "$2"
+}
+# push_rows <cheap-conclusion> -- a PUSH run's shape since §14: the cheap jobs
+# ran, and the suite job is listed SKIPPED (its `if:` wants workflow_dispatch).
+push_rows() { job_rows "$1" skipped; }
+# push_rows_without <job> -- a green push run with one cheap job missing.
+push_rows_without() { push_rows success | grep -vF -- "$1"$'\t'; }
 
-echo "=== release-gate ==="
 echo "=== release-gate ==="
 
 release_gate_covers "$BASE" >/dev/null 2>&1
 check "no stamp -> refuses" "$?" "1"
 
-release_gate_write "$BASE" X64 159 0
+# The stamp half's accepting cases need a green PUSH run of the cheap jobs at
+# the stamped commit -- see the section right below for why.
+gh_says "$(run_row "$BASE" success)" "$(push_rows success)"
+release_gate_write "$BASE" X64
 release_gate_covers "$BASE" >/dev/null 2>&1
-check "stamp on HEAD -> accepts" "$?" "0"
+check "stamp on HEAD + green cheap push CI -> accepts" "$?" "0"
 
-release_gate_write "$BASE" X64 158 1
+# ── a local stamp needs the CHEAP push CI too (§14) ──────────────────────
+#
+# Since 2026-10-21 a push runs only plan + gcc x64/aa64 + clang-tidy; the QEMU
+# suite runs on workflow_dispatch. So a release can be gated by a full local
+# uncached run INSTEAD of a dispatched suite -- but only alongside a green
+# push run of the cheap jobs on the same tree, because those are what catch
+# the 2026-08-18 class a dev box structurally cannot: a CLEAN CHECKOUT that
+# does not link (§11.2). A dev box always has the stale objects that hide it.
+GH_SAW_NOTHING="$(printf 'stamp matches HEAD (release-suite, X64, %s), but the cheap push CI does not cover it\nno green cheap push CI (gcc x64, gcc aa64, clang-tidy) at %s or an inert ancestor within 25 commits:\n  %s: no CI run' \
+    "$(sed -n 's/^when=//p' "$AXL_STAMP_FILE")" "$BASE" "${BASE:0:8}")"
+gh_says "" ""
+out=$(release_gate_covers "$BASE" 2>&1); rc=$?
+check "stamp on HEAD but NO push run -> refuses" "$rc" "1"
+check "...and says the cheap push CI is what is missing" "$out" "$GH_SAW_NOTHING"
+
+# Each cheap job is load-bearing on its own, so each one's absence refuses --
+# and the full set (the control above) accepts, so these are about the JOB.
+for _j in "gcc x64" "gcc aa64" "clang-tidy"; do
+    gh_says "$(run_row "$BASE" success)" "$(push_rows_without "$_j")"
+    release_gate_covers "$BASE" >/dev/null 2>&1
+    check "stamp ok, push run lacks '$_j' -> refuses" "$?" "1"
+done
+gh_says "$(run_row "$BASE" success)" "$(push_rows failure)"
 release_gate_covers "$BASE" >/dev/null 2>&1
-check "stamp from a FAILED run -> refuses" "$?" "1"
+check "stamp ok, cheap jobs FAILED -> refuses" "$?" "1"
+gh_says "$(run_row "$BASE" success)" "$(push_rows skipped)"
+release_gate_covers "$BASE" >/dev/null 2>&1
+check "stamp ok, cheap jobs SKIPPED (docs-only / release-cut shape) -> refuses" "$?" "1"
+
+# A push run STILL GOING is the commonest refusal right after a push, and the
+# remedy is to wait, not to push again -- so it says so.
+gh_says "$(printf '%s\tin_progress\t\t4242' "$BASE")" ""
+out=$(release_gate_covers "$BASE" 2>&1); rc=$?
+# Its own status (3), so a caller can WAIT rather than refuse outright.
+check "stamp ok, push run still in progress -> still running (3)" "$rc" "3"
+check "...and the header says the deciding run is still running" "$(sed -n 2p <<< "$out")" \
+    "the cheap push CI (gcc x64, gcc aa64, clang-tidy) deciding $BASE is still running:"
+check "...and says the run is still going" "$(sed -n 3p <<< "$out")" \
+    "  ${BASE:0:8}: a CI run is still in_progress -- wait for it"
+
+# "COULD NOT CHECK" IS NOT "NOT COVERED". Both refuse -- fail closed -- but a
+# missing or broken gh says so, in its own exit status (2), rather than telling
+# someone to push a commit that already has a green run.
+gh_says "$(run_row "$BASE" success)" "$(push_rows success)"
+# AXL_GH, not PATH=/nonexistent: the stamp half needs sed and git to get as
+# far as asking, and a PATH with no tools refuses as "malformed stamp" instead
+# -- the right exit status for the wrong reason.
+out=$(AXL_GH="$TMP/no-such-gh" release_gate_covers "$BASE" 2>&1); rc=$?
+check "stamp ok, no gh on PATH -> could not check (2)" "$rc" "2"
+check "...and says it could not check, not that CI is red" "$(sed -n 2p <<< "$out")" \
+    "could not check cheap push CI (gcc x64, gcc aa64, clang-tidy) for $BASE:"
+touch "$GH_FAIL"
+release_gate_covers "$BASE" >/dev/null 2>&1
+check "stamp ok, gh FAILS (expired token) -> could not check (2)" "$?" "2"
+gh_reset
+
+# ONLY scripts/release-suite.sh CERTIFIES (review ruling R-A). A stamp in the
+# old run-integration.sh format -- the suite alone, without the unit tests in
+# QEMU, the staged SDK or the harness self-tests CI's job also runs -- is
+# refused, and says why, rather than reading as "malformed".
+gh_says "$(run_row "$BASE" success)" "$(push_rows success)"
+printf 'sha=%s\narch=X64\npass=159\nfail=0\nwhen=2026-10-20T00:00:00Z\n' "$BASE" > "$AXL_STAMP_FILE"
+out=$(release_gate_covers "$BASE" 2>&1); rc=$?
+check "a run-integration.sh-format stamp -> refuses" "$rc" "1"
+check "...and names release-suite.sh as what certifies" "$out" \
+    "stamp was not written by scripts/release-suite.sh -- a bare run-integration.sh run does not certify a release"
+# Control: the same sha through release_gate_write is accepted, so the refusal
+# above is about the FORMAT and not the commit.
+release_gate_write "$BASE" X64
+release_gate_covers "$BASE" >/dev/null 2>&1
+check "control: the same sha stamped by release_gate_write -> accepts" "$?" "0"
 
 printf 'sha=\narch=X64\n' > "$AXL_STAMP_FILE"
 release_gate_covers "$BASE" >/dev/null 2>&1
 check "malformed stamp -> refuses" "$?" "1"
 
 # The release commit: only the three version files change.
-release_gate_write "$BASE" X64 159 0
+release_gate_write "$BASE" X64
+gh_says "$(run_row "$BASE" success)" "$(push_rows success)"
 echo 4.2.0 > VERSION; echo hdr2 > include/axl/axl-version.h; echo log2 > CHANGELOG.md
 git add -A >/dev/null; git commit -qm "release: v4.2.0"
 REL=$(git rev-parse HEAD)
 release_gate_covers "$REL" >/dev/null 2>&1
-check "release commit over a stamped parent -> accepts" "$?" "0"
+check "release commit over a stamped parent + green cheap CI at it -> accepts" "$?" "0"
 
 # The case that must never pass: real code changed after the stamp.
 echo changed > src.c; git add -A >/dev/null; git commit -qm "a real change"
@@ -107,9 +198,37 @@ check "source changed since the stamp -> refuses" "$?" "1"
 # A stamp for a commit that is not an ancestor at all.
 git checkout -q -b other "$BASE"; echo x > other.c
 git add -A >/dev/null; git commit -qm other
-release_gate_write "$(git rev-parse HEAD)" X64 159 0
+release_gate_write "$(git rev-parse HEAD)" X64
 release_gate_covers "$REL" >/dev/null 2>&1
 check "stamp from an unrelated commit -> refuses" "$?" "1"
+
+# ── a CANCELLED code run under a docs tip (review ruling R-C) ─────────────
+#
+# A docs-only push cancels the in-progress push run of the code commit below
+# it (cancel-in-progress). The tip's own run then skips the cheap jobs, and
+# the walk back reaches a CANCELLED run: the gate must say so -- and that the
+# fix is a re-dispatch or a re-push -- not refuse generically.
+echo code2 > other.c; git add -A >/dev/null; git commit -qm "code under docs" >/dev/null
+CXCODE=$(git rev-parse HEAD)
+mkdir -p docs; echo prose > docs/cancel-note.md
+git add -A >/dev/null; git commit -qm "docs on top" >/dev/null
+CXDOCS=$(git rev-parse HEAD)
+gh_says "$(printf '%s\n%s' "$(run_row "$CXDOCS" success 6002)" "$(run_row "$CXCODE" cancelled 6001)")" ""
+push_rows skipped > "$GH_JOBS.6002"
+push_rows cancelled > "$GH_JOBS.6001"
+release_gate_write "$CXDOCS" X64
+out=$(release_gate_covers "$CXDOCS" 2>&1); rc=$?
+check "docs tip over a CANCELLED code run -> refuses" "$rc" "1"
+check "...and names the cancellation and the remedy" "$(sed -n 4p <<< "$out")" \
+    "  ${CXCODE:0:8}: run 6001 was cancelled -- re-dispatch or re-push"
+# Control: the same shape with the code run green is accepted -- the walk
+# reaches it -- so the refusal above is about the cancellation.
+gh_says "$(printf '%s\n%s' "$(run_row "$CXDOCS" success 6002)" "$(run_row "$CXCODE" success 6001)")" ""
+push_rows skipped > "$GH_JOBS.6002"
+push_rows success > "$GH_JOBS.6001"
+release_gate_covers "$CXDOCS" >/dev/null 2>&1
+check "control: the same docs tip over a GREEN code run -> accepts" "$?" "0"
+gh_reset
 
 echo ""
 
@@ -154,8 +273,12 @@ check "no job carries the bare body-substring guard any more" "$?" "0"
 n_jobs=$(awk '/^jobs:/{inj=1;next} /^[^[:space:]]/{inj=0}
               inj && /^  [A-Za-z][A-Za-z0-9_-]*:[[:space:]]*$/{n++}
               END{print n+0}' "$CI")
-[[ "$n_guard" -eq "$n_jobs" && "$n_guard" -gt 0 ]]
-check "every ci.yml job is guarded by it ($n_guard of $n_jobs)" "$?" "0"
+# Counted on the job `if:` lines alone: the run-level `cancel-in-progress`
+# carries the same expression (a [release-cut] push must not cancel its
+# parent's run), and it is not a job.
+n_guard_if=$(grep -F -- "$GUARD_SUBJ" "$CI" | grep -c '^    if:')
+_ok=1; [[ "$n_guard_if" -eq "$n_jobs" && "$n_guard_if" -gt 0 ]] && _ok=0
+check "every ci.yml job is guarded by it ($n_guard_if of $n_jobs)" "$_ok" "0"
 
 # ...and the commit cut-release.sh actually writes must SATISFY that guard.
 # The two live in files that cannot import each other, so a subject convention
@@ -186,14 +309,11 @@ done
 
 echo ""
 echo "=== release-gate: reusing a green CI run ==="
-# WHY THIS HALF EXISTS. CI runs the identical uncached suite on every push to
-# main, on the same box, and goes green on the commit a release is cut from --
-# and the stamp half above cannot see any of that, because it reads a local
-# file. So the only way to satisfy the gate was to run the suite a second time
-# locally (~8.5 min, blocking a human), and `--ci-gate` would then dispatch a
-# THIRD run rather than consult the green one that already exists.
-
-export PATH="$TMP/bin:$PATH"
+# WHY THIS HALF EXISTS. A CI run with the suite in it -- since §14 that is a
+# DISPATCHED run (`gh workflow run ci.yml`, by hand or by cut-release.sh) --
+# is the same uncached suite on the same box, and the stamp half above cannot
+# see it, because it reads a local file. Without this, a green dispatched run
+# would still send the cut to a second local run, or `--ci-gate` to a THIRD.
 
 gh_says "$(run_row "$BASE" success)" "$(job_rows success success)"
 release_gate_ci_covers "$BASE" >/dev/null 2>&1
@@ -248,25 +368,67 @@ gh_says "$(run_row "$CIPARENT" success)" "$(job_rows success success)"
 release_gate_ci_covers "$CIREL2" >/dev/null 2>&1
 check "a green run at an ancestor with other changes -> refuses" "$?" "1"
 
-# THE SHAPE THE DOCS SPLIT CREATES, and the reason the gate had to learn job
-# NAMES. A docs-only push runs the docs job and nothing else; every job in that
-# run succeeds. "All jobs passed" and "the suite ran" stopped being the same
-# claim, and reading the first as the second tags code no suite ever touched --
-# reachable by cutting a release straight after a README fix.
-gh_says "$(run_row "$BASE" success)" "$(printf 'docs\tsuccess')"
+# THE SHAPE EVERY PUSH NOW HAS (§14), and the reason the gate learned job
+# NAMES. A push runs plan + the cheap jobs, the suite job is listed SKIPPED,
+# and the run concludes success. "The run passed" and "the suite ran" are
+# different claims, and reading the first as the second tags code no suite
+# ever touched -- by cutting a release after any ordinary push.
+gh_says "$(run_row "$BASE" success)" "$(push_rows success)"
+out=$(release_gate_ci_covers "$BASE" 2>&1); rc=$?
+check "a green PUSH run (suite skipped) -> refuses" "$rc" "1"
+# ...and it must say WHY and what to do, not just refuse: since §14 this is
+# the commonest refusal there is, and the fix is one command.
+check "...and names the missing job and the dispatch" "$out" \
+"$(printf "no green full CI run (with 'QEMU integration (full suite)') at %s or an inert ancestor within 25 commits:\n  %s: run 4242: 'QEMU integration (full suite)' concluded skipped\nthe suite runs only on workflow_dispatch: gh workflow run ci.yml --ref main, then wait for it" "$BASE" "${BASE:0:8}")"
+
+# A push run that does not LIST the suite job at all refuses the same way.
+gh_says "$(run_row "$BASE" success)" "$(push_rows success | grep -v 'QEMU')"
 release_gate_ci_covers "$BASE" >/dev/null 2>&1
 check "an all-green run WITHOUT the suite job -> refuses" "$?" "1"
 
-# ...and the control: the same run with the suite job present is accepted, so
-# the assertion above is about the JOB and not about the run being short.
-gh_says "$(run_row "$BASE" success)" "$(printf 'docs\tsuccess\nQEMU integration (full suite)\tsuccess')"
+# ...and the control: the same run with the suite job green is accepted, so
+# the assertions above are about the JOB and not about the run being short.
+gh_says "$(run_row "$BASE" success)" "$(job_rows success success)"
 release_gate_ci_covers "$BASE" >/dev/null 2>&1
 check "control: the same run WITH the suite job -> accepts" "$?" "0"
 
-# The job name is a second spelling of ci.yml's, so hold them equal here --
+# A FULL run needs the cheap jobs too, by name. A dispatched run always has
+# them, so this costs nothing -- and it keeps "covered by CI" from meaning
+# "the suite passed on a tree that clang-tidy or the aa64 build rejected".
+for _j in "gcc x64" "gcc aa64" "clang-tidy"; do
+    gh_says "$(run_row "$BASE" success)" "$(job_rows success success | grep -vF -- "$_j"$'\t')"
+    release_gate_ci_covers "$BASE" >/dev/null 2>&1
+    check "a suite run lacking '$_j' -> refuses" "$?" "1"
+done
+
+# TWO RUNS AT ONE COMMIT, and the push run is the newest. The gate used to
+# stop at the FIRST green run it listed, so a green push run (no suite) sitting
+# above a green dispatched run (suite) refused a commit the suite HAD covered.
+# Every green run is examined now.
+gh_says "$(printf '%s\n%s' "$(run_row "$BASE" success 5001)" "$(run_row "$BASE" success 5000)")" ""
+push_rows success > "$GH_JOBS.5001"
+job_rows success success > "$GH_JOBS.5000"
+release_gate_ci_covers "$BASE" >/dev/null 2>&1
+check "a push run ABOVE a dispatched suite run at the same commit -> accepts" "$?" "0"
+# Control: the same two runs with the dispatched one red -> refuses, so the
+# accept above came from run 5000 and not from reading run 5001 as green.
+job_rows success failure > "$GH_JOBS.5000"
+release_gate_ci_covers "$BASE" >/dev/null 2>&1
+check "control: ...with the dispatched run's suite FAILED -> refuses" "$?" "1"
+
+# The job names are a second spelling of ci.yml's, so hold them equal here --
 # same reason as the [release-cut] marker above.
-grep -qF "$AXL_CI_SUITE_JOB" "$PROJECT_DIR/.github/workflows/ci.yml"
+grep -qF "name: $AXL_CI_SUITE_JOB" "$PROJECT_DIR/.github/workflows/ci.yml"
 check "the suite job name matches ci.yml" "$?" "0"
+check "the cheap job list is exactly the three push jobs" \
+    "$(printf '%s|' "${AXL_CI_CHEAP_JOBS[@]}")" "gcc x64|gcc aa64|clang-tidy|"
+# `gcc x64`/`gcc aa64` are a matrix expansion, not a literal, so the template
+# and both matrix entries are what to hold equal.
+grep -qF 'name: gcc ${{ matrix.arch }}' "$PROJECT_DIR/.github/workflows/ci.yml" \
+    && grep -qE '^ +- arch: x64$' "$PROJECT_DIR/.github/workflows/ci.yml" \
+    && grep -qE '^ +- arch: aa64$' "$PROJECT_DIR/.github/workflows/ci.yml" \
+    && grep -qE '^    name: clang-tidy$' "$PROJECT_DIR/.github/workflows/ci.yml"
+check "the cheap job names match ci.yml (gcc matrix x64/aa64, clang-tidy)" "$?" "0"
 
 # ── the hole the docs-only skip opened in this very gate ──────────────────
 #
@@ -309,13 +471,302 @@ check "control: a C file anywhere in the range -> refuses" "$?" "1"
 # A machine with no gh cannot answer, and MUST NOT answer yes. "The tool could
 # not run" and "the tool ran and found nothing" are the same empty string and
 # opposite facts.
-( PATH="/nonexistent"; release_gate_ci_covers "$BASE" >/dev/null 2>&1 )
-check "no gh on PATH -> refuses" "$?" "1"
+# Both refuse, but as "could not check" (2), not "not covered" (1).
+gh_says "$(run_row "$BASE" success)" "$(job_rows success success)"
+AXL_GH="$TMP/no-such-gh" release_gate_ci_covers "$BASE" >/dev/null 2>&1
+check "no gh -> could not check (2)" "$?" "2"
+touch "$GH_FAIL"
+out=$(release_gate_ci_covers "$BASE" 2>&1); rc=$?
+check "gh FAILS (expired token) -> could not check (2)" "$rc" "2"
+check "...and says so, naming the call that failed" "$out" \
+"$(printf "could not check full CI run (with 'QEMU integration (full suite)') for %s:\n  %s: \`gh run list\` failed" "$BASE" "${BASE:0:8}")"
+gh_reset
+# ...and a jobs listing that cannot be read is "could not check" too, even
+# when the run list itself answered.
+gh_says "$(run_row "$BASE" success)" "$(job_rows success success)"
+printf '#!/bin/bash\n[[ " $* " == *" view "* ]] && exit 1\nexec %q "$@"\n' "$TMP/bin/gh" > "$TMP/gh-view-fails"
+chmod +x "$TMP/gh-view-fails"
+AXL_GH="$TMP/gh-view-fails" release_gate_ci_covers "$BASE" >/dev/null 2>&1
+check "gh run view FAILS -> could not check (2)" "$?" "2"
 
 # The last line of an answer must still count when nothing terminates it.
-gh_says_unterminated "$(run_row "$BASE" success)" "$(printf 'QEMU integration (full suite)\tsuccess')"
+gh_says_unterminated "$(run_row "$BASE" success)" "$(job_rows success success)"
 release_gate_ci_covers "$BASE" >/dev/null 2>&1
 check "an answer with no trailing newline is still read" "$?" "0"
+
+echo ""
+echo "=== ci.yml: cheap jobs on push, the suite on dispatch (§14) ==="
+# THE POLICY ITSELF, held structurally because a workflow runs only on GitHub:
+# no local gate can execute it, and the gate above is only right if the
+# workflow really has the shape it assumes.
+#
+# job_if <job-key> -- that job's own `if:` line (4-space indent), or nothing.
+job_if() {
+    awk -v j="  $1:" '/^jobs:/{inj=1;next} inj && /^  [A-Za-z][A-Za-z0-9_-]*:[[:space:]]*$/{cur=$0}
+         inj && cur==j && /^    if:/{print; exit}' "$CI"
+}
+DISPATCH_ONLY="github.event_name == 'workflow_dispatch'"
+_if=$(job_if integration)
+_ok=1; [[ -n "$_if" && "$_if" == *"$DISPATCH_ONLY"* ]] && _ok=0
+check "the integration job runs only on workflow_dispatch" "$_ok" "0"
+# ...and the cheap jobs did NOT pick the condition up, or a push would run
+# nothing at all and the 2026-08-18 class (a clean checkout that does not
+# link) would be back to five days undetected.
+for _job in plan build lint; do
+    _if=$(job_if "$_job")
+    _ok=1; [[ -n "$_if" && "$_if" != *"workflow_dispatch"* ]] && _ok=0
+    check "the $_job job still runs on push (its if: does not ask for a dispatch)" "$_ok" "0"
+done
+grep -qE '^  push:$' "$CI"
+check "ci.yml still triggers on push" "$?" "0"
+# A PUSH MUST NOT CANCEL A DISPATCHED SUITE. The workflow-level concurrency
+# group used to be one per ref with cancel-in-progress, so any push to main
+# killed a ~9-minute dispatched suite run -- including the one a release cut
+# is waiting on. One group per event keeps pushes collapsing among themselves.
+grep -qF 'group: ci-${{ github.ref }}-${{ github.event_name }}' "$CI"
+check "the run-level concurrency group is per event (a push cannot cancel a dispatch)" "$?" "0"
+
+echo ""
+echo "=== check-main-ci.sh: a push run is green without the suite ==="
+# Since §14 a push run never contains the suite, so the per-push health check
+# asks for the CHEAP jobs. Asking for the suite would report every push NOT
+# GREEN, and a check that is always red is read as noise.
+CMC="$PROJECT_DIR/scripts/check-main-ci.sh"
+gh_says "$(run_row "$BASE" success)" "$(push_rows success)"
+out=$("$CMC" "$BASE" 2>&1); rc=$?
+check "a green push run -> exit 0" "$rc" "0"
+check "...reported as the cheap jobs passing" "$out" \
+    "check-main-ci: green -- cheap push CI (gcc x64, gcc aa64, clang-tidy) is green on $BASE"
+gh_says "$(run_row "$BASE" success)" "$(push_rows_without clang-tidy)"
+"$CMC" "$BASE" >/dev/null 2>&1
+check "control: the same run without clang-tidy -> exit 1" "$?" "1"
+touch "$GH_FAIL"
+"$CMC" "$BASE" >/dev/null 2>&1
+check "gh FAILS -> exit 2 (could not check), not MISSING" "$?" "2"
+gh_reset
+
+# AN INERT TIP IS ANSWERED BY THE COMMIT BELOW IT (review ruling R-E). A
+# docs-only or [release-cut] tip's own run skips the cheap jobs; the walk
+# carries the code commit's green across it, as the release gate does.
+echo cmc-code > cmc.c; git add -A >/dev/null; git commit -qm "cmc code" >/dev/null
+CMCODE=$(git rev-parse HEAD)
+mkdir -p docs; echo prose > docs/cmc-note.md
+git add -A >/dev/null; git commit -qm "cmc docs" >/dev/null
+CMDOCS=$(git rev-parse HEAD)
+gh_says "$(printf '%s\n%s' "$(run_row "$CMDOCS" success 7002)" "$(run_row "$CMCODE" success 7001)")" ""
+push_rows skipped > "$GH_JOBS.7002"; push_rows success > "$GH_JOBS.7001"
+out=$("$CMC" "$CMDOCS" 2>&1); rc=$?
+check "an inert (docs) tip over a green code run -> exit 0" "$rc" "0"
+check "...naming the commit that answered" "$out" \
+    "check-main-ci: green -- cheap push CI (gcc x64, gcc aa64, clang-tidy) is green on $CMCODE, and everything since is prose or the version bump"
+
+# "PENDING" ONLY WHEN THE DECIDING RUN IS PENDING. The docs tip's run still
+# going decides nothing -- its cheap jobs will skip -- so a green code run
+# below it is GREEN, not pending...
+gh_says "$(printf '%s\tin_progress\t\t7002\n%s' "$CMDOCS" "$(run_row "$CMCODE" success 7001)")" ""
+push_rows success > "$GH_JOBS.7001"
+out=$("$CMC" "$CMDOCS" 2>&1); rc=$?
+check "a pending docs-tip run over a green code run -> green, not pending" "$(head -c 21 <<< "$out")" \
+    "check-main-ci: green "
+# ...while the CODE run still going is what decides, so that is pending.
+gh_says "$(printf '%s\tcompleted\tsuccess\t7002\n%s\tin_progress\t\t7001' "$CMDOCS" "$CMCODE")" ""
+push_rows skipped > "$GH_JOBS.7002"
+out=$("$CMC" "$CMDOCS" 2>&1); rc=$?
+check "the deciding (code) run pending -> exit 0" "$rc" "0"
+check "...reported as pending" "$(head -1 <<< "$out")" \
+    "check-main-ci: pending -- the run that decides $CMDOCS is still going"
+gh_reset
+
+echo ""
+echo "=== release_gate_decide: the gate ENFORCES by default (R-B) ==="
+# cut-release.sh asks this one function, in the normal flow AND on --resume,
+# so the refusal cannot be bypassed by the path you happen to take.
+gh_says "" ""
+rm -f "$AXL_STAMP_FILE"
+out=$(release_gate_decide "$CMDOCS" false false main 2>&1); rc=$?
+check "nothing covers, no flags -> REFUSES (1)" "$rc" "1"
+check "...naming the dispatch remedy" \
+    "$(grep -cxF '       gh workflow run ci.yml --ref main' <<< "$out")" "1"
+check "...naming the local release-suite remedy" \
+    "$(grep -cxF '       ./scripts/release-suite.sh' <<< "$out")" "1"
+check "...and the last line says it refuses and names the overrides" "$(tail -1 <<< "$out")" \
+    "refusing to tag: --ci-gate dispatches the suite and waits; --tag-untested overrides, and is recorded in the release notes"
+release_gate_decide "$CMDOCS" false false main >/dev/null 2>&1
+check "...and the decision is 'refuse'" "$RELEASE_GATE_DECISION" "refuse"
+
+out=$(release_gate_decide "$CMDOCS" true false main 2>&1); rc=$?
+check "nothing covers, --ci-gate -> proceeds (0)" "$rc" "0"
+release_gate_decide "$CMDOCS" true false main >/dev/null 2>&1
+check "...and the decision is 'dispatch'" "$RELEASE_GATE_DECISION" "dispatch"
+
+out=$(release_gate_decide "$CMDOCS" false true main 2>&1); rc=$?
+check "nothing covers, --tag-untested -> proceeds (0)" "$rc" "0"
+check "...with a loud WARNING as its last line" "$(tail -1 <<< "$out")" \
+    "WARNING: --tag-untested: tagging $CMDOCS with NOTHING certifying it; this is recorded in the release notes"
+release_gate_decide "$CMDOCS" false true main >/dev/null 2>&1
+check "...and the decision is 'untested'" "$RELEASE_GATE_DECISION" "untested"
+# Both flags: dispatching is the stronger answer, so it wins.
+release_gate_decide "$CMDOCS" true true main >/dev/null 2>&1
+check "--ci-gate AND --tag-untested -> dispatch wins" "$RELEASE_GATE_DECISION" "dispatch"
+
+# Covered by the local release suite + the cheap push CI -> no flags needed.
+gh_says "$(run_row "$CMCODE" success 7001)" "$(push_rows success)"
+release_gate_write "$CMCODE" X64
+release_gate_decide "$CMCODE" false false main >/dev/null 2>&1; rc=$?
+check "covered by the release-suite stamp -> 0" "$rc" "0"
+check "...decision 'covered-local'" "$RELEASE_GATE_DECISION" "covered-local"
+# Covered by a dispatched run -> 'covered-ci'.
+rm -f "$AXL_STAMP_FILE"
+gh_says "$(run_row "$CMCODE" success 7001)" "$(job_rows success success)"
+release_gate_decide "$CMCODE" false false main >/dev/null 2>&1; rc=$?
+check "covered by a dispatched suite run -> 0" "$rc" "0"
+check "...decision 'covered-ci'" "$RELEASE_GATE_DECISION" "covered-ci"
+gh_reset
+
+# The note --tag-untested records in the CHANGELOG section and the tag.
+check "the untested note is exact" "$(release_gate_untested_note "$CMDOCS")" \
+    "**Released untested (--tag-untested).** Neither a dispatched CI suite run nor a local scripts/release-suite.sh run certified $CMDOCS when this tag was cut."
+
+echo ""
+echo "=== release_gate_wait_push_run: wait, then fail closed (R-C) ==="
+# cut-release waits for the push run of the commit it is about to release to
+# finish BEFORE pushing the release commit, so the [release-cut] push never
+# races it -- and refuses if that run did not succeed.
+SEQ="$TMP/gh-seq"; SEQN="$TMP/gh-seq.n"
+cat > "$SEQ" <<STUB
+#!/bin/bash
+# Answers the Nth call with line N of \$GH_SEQ_FILE (the last line repeats).
+n=\$(( \$(cat "$SEQN" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$SEQN"
+[[ -s "\$GH_SEQ_FILE" ]] || exit 0
+total=\$(wc -l < "\$GH_SEQ_FILE")
+(( n > total )) && n=\$total
+sed -n "\${n}p" "\$GH_SEQ_FILE"
+STUB
+chmod +x "$SEQ"
+seq_says() { rm -f "$SEQN"; printf '%s\n' "$@" > "$TMP/seq.txt"; }
+export GH_SEQ_FILE="$TMP/seq.txt"
+W=$CMCODE
+seq_says "$(printf '%s\tin_progress\t\t8001' "$W")" "$(printf '%s\tcompleted\tsuccess\t8001' "$W")"
+out=$(AXL_GH="$SEQ" AXL_GATE_POLL_SECS=0 release_gate_wait_push_run "$W" 2>&1); rc=$?
+check "in progress, then success -> 0" "$rc" "0"
+check "...after polling more than once" "$(cat "$SEQN")" "2"
+seq_says "$(printf '%s\tcompleted\tfailure\t8001' "$W")"
+out=$(AXL_GH="$SEQ" AXL_GATE_POLL_SECS=0 release_gate_wait_push_run "$W" 2>&1); rc=$?
+check "a FAILED push run -> refuses (1)" "$rc" "1"
+check "...and says so" "$out" "push run 8001 at $W concluded failure -- refusing; fix it and push again"
+seq_says ""
+out=$(AXL_GH="$SEQ" AXL_GATE_POLL_SECS=0 release_gate_wait_push_run "$W" 2>&1); rc=$?
+check "no push run at all -> 0 (the gate decides without one)" "$rc" "0"
+check "...and says there was none" "$out" \
+    "no push run at $W (not pushed, or the event was dropped) -- the gate decides without one"
+seq_says "$(printf '%s\tin_progress\t\t8001' "$W")"
+AXL_GH="$SEQ" AXL_GATE_POLL_SECS=0 AXL_GATE_POLL_MAX=3 release_gate_wait_push_run "$W" >/dev/null 2>&1
+check "still running at the limit -> 3" "$?" "3"
+printf '#!/bin/bash\nexit 1\n' > "$TMP/gh-dead"; chmod +x "$TMP/gh-dead"
+AXL_GH="$TMP/gh-dead" AXL_GATE_POLL_SECS=0 release_gate_wait_push_run "$W" >/dev/null 2>&1
+check "gh FAILS -> could not check (2)" "$?" "2"
+unset GH_SEQ_FILE
+
+echo ""
+echo "=== ci.yml: the integration job IS scripts/release-suite.sh (R-A) ==="
+# job_block <job-key> -- that job's lines.
+job_block() {
+    awk -v j="  $1:" '/^jobs:/{inj=1;next} inj && /^  [A-Za-z][A-Za-z0-9_-]*:[[:space:]]*$/{cur=$0}
+         inj && cur==j' "$CI"
+}
+_ib=$(job_block integration | sed 's/#.*//')
+check "the integration job runs ./scripts/release-suite.sh --ci" \
+    "$(grep -cE 'run: \./scripts/release-suite\.sh --ci$' <<< "$_ib")" "1"
+# ...and runs none of its steps itself: one script, one list, or the local
+# release run and CI's job certify different things again.
+check "...and runs none of its steps directly" \
+    "$(grep -cE 'test-axl\.sh|run-integration\.sh|run-selftests\.sh|install\.sh' <<< "$_ib")" "0"
+# A [release-cut] push must not cancel its parent's cheap run.
+grep -qF "cancel-in-progress: \"\${{ !($GUARD_SUBJ && $GUARD_MARK) }}\"" "$CI"
+check "a [release-cut] push does not cancel an in-progress run" "$?" "0"
+
+echo ""
+echo "=== cut-release: one gate, enforced, on every path (R-B, R-C) ==="
+_cut_code=$(sed 's/#.*//' "$CUT")
+check "--tag-untested is a flag" "$(grep -cE '^ +--tag-untested\) +TAG_UNTESTED=true' <<< "$_cut_code")" "1"
+# The normal flow decides BEFORE it bumps anything, so a refusal leaves no
+# release commit stranded on main.
+_dec=$(grep -n 'release_gate_decide "\$(git rev-parse HEAD)"' <<< "$_cut_code" | head -1 | cut -d: -f1)
+_bump=$(grep -n '^scripts/bump-version.sh "\$VERSION"' <<< "$_cut_code" | head -1 | cut -d: -f1)
+_ok=1; [[ -n "$_dec" && -n "$_bump" && "$_dec" -lt "$_bump" ]] && _ok=0
+check "the normal flow decides the gate before the version bump" "$_ok" "0"
+_wait=$(grep -n 'release_gate_wait_push_run "\$(git rev-parse HEAD)"' <<< "$_cut_code" | head -1 | cut -d: -f1)
+_ok=1; [[ -n "$_wait" && -n "$_dec" && "$_wait" -lt "$_dec" ]] && _ok=0
+check "...after waiting for HEAD's push run" "$_ok" "0"
+_resume=$(awk '/^if \$RESUME; then$/{f=1} f{print} f&&/^fi$/{exit}' "$CUT" | sed 's/#.*//')
+check "--resume goes through the same gate" "$(grep -c 'release_gate_decide' <<< "$_resume")" "1"
+check "a refusal exits non-zero (both paths)" \
+    "$(grep -cF '[[ "$RELEASE_GATE_DECISION" != refuse ]] || exit 1' <<< "$_cut_code")" "2"
+check "the untested note is made once (the normal flow)" \
+    "$(grep -c 'release_gate_untested_note' <<< "$_cut_code")" "1"
+# Recorded through the shared helper, and the cut DIES if it did not land.
+check "the note is recorded by release_gate_record_untested, or the cut dies" \
+    "$(grep -v '^ *#' "$CUT" | sed -e ':a' -e '/\\$/{N;s/\\\n//;ba' -e '}' \
+       | grep -cE 'release_gate_record_untested CHANGELOG\.md .*\|\| die ')" "1"
+check "...and the tag message carries it" \
+    "$(awk '/^make_tag_message\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$CUT" | grep -c 'UNTESTED_NOTE')" "1"
+
+echo ""
+echo "=== --tag-untested refuses --resume ==="
+# On --resume the release commit is already pushed, and release.yml builds the
+# release notes from its CHANGELOG section ALONE -- so the note could reach the
+# tag message but not the notes a consumer reads. Refused at parse time.
+out=$("$CUT" not-a-version --resume --tag-untested 2>&1); rc=$?
+# The exit status alone cannot discriminate here: the invalid version exits 2
+# too. The MESSAGE is what proves the combination was refused.
+check "--resume --tag-untested -> 2" "$rc" "2"
+check "--resume --tag-untested: refused for the combination, saying why" "$(sed -n 1p <<< "$out")" \
+    "ERROR: --tag-untested cannot be used with --resume: the release commit is already pushed, and release.yml builds the release notes from its CHANGELOG section alone, so the note could not reach them."
+check "...and how to proceed" "$(sed -n 2p <<< "$out")" \
+    "       Certify the commit instead: --resume --ci-gate dispatches the suite and waits; or run scripts/release-suite.sh on it, then --resume."
+# Control: each flag ALONE is not refused for the combination. Driven with an
+# invalid version, so the run stops at argument validation (exit 2) whatever
+# the tree looks like -- a valid one would walk into the real preconditions.
+for _f in --resume --tag-untested; do
+    out=$("$CUT" not-a-version "$_f" 2>&1)
+    check "control: $_f alone is not refused for the combination" \
+        "$(grep -c 'cannot be used with --resume' <<< "$out")" "0"
+done
+
+echo ""
+echo "=== the untested note reaches the PUBLISHED notes (fixture) ==="
+# The real path, end to end on a sample file: cut-release's insertion
+# (release_gate_record_untested), then release.yml's OWN extraction
+# (scripts/changelog-section.sh, which the workflow calls -- not a copy).
+CLF="$TMP/CHANGELOG.md"
+printf '# Changelog\n\n## 9.9.9 — 2026-10-21\n\n### Fixed\n\n- **a fix.**\n\n## 9.9.8 — 2026-10-01\n\n- old\n' > "$CLF"
+NOTE=$(release_gate_untested_note "$CMDOCS")
+release_gate_record_untested "$CLF" "## 9.9.9 — 2026-10-21" "$NOTE"
+check "recording the note succeeds" "$?" "0"
+SECTION=$("$PROJECT_DIR/scripts/changelog-section.sh" 9.9.9 "$CLF"); rc=$?
+check "release.yml's extraction finds the section" "$rc" "0"
+check "...and the note is IN the published notes" "$(grep -cxF -- "$NOTE" <<< "$SECTION")" "1"
+check "...and nothing leaks in from the previous version" "$(grep -c 'old' <<< "$SECTION")" "0"
+# Control: a heading the file does not have -> the note did not land -> 1, so
+# cut-release's `|| die` has something to see.
+cp "$CLF" "$TMP/CL2.md"
+printf '# Changelog\n\n## 9.9.9 — 2026-10-21\n\n- x\n' > "$TMP/CL2.md"
+release_gate_record_untested "$TMP/CL2.md" "## 1.2.3 — 2000-01-01" "$NOTE"
+check "control: a heading that is not there -> 1 (the note did not land)" "$?" "1"
+check "release.yml calls scripts/changelog-section.sh (one extraction, not two)" \
+    "$(grep -cF 'scripts/changelog-section.sh "$V"' "$PROJECT_DIR/.github/workflows/release.yml")" "1"
+"$PROJECT_DIR/scripts/changelog-section.sh" 1.0.0 "$CLF" >/dev/null 2>&1
+check "control: an absent version -> the extraction fails (1)" "$?" "1"
+
+echo ""
+echo "=== cut-release's header describes the current flow ==="
+_hdr=$(sed -n '1,/^set -euo pipefail/p' "$CUT")
+check "the header names scripts/release-suite.sh as the local remedy" \
+    "$(grep -q 'scripts/release-suite.sh' <<< "$_hdr" && echo yes)" "yes"
+check "...and no longer advises run-integration.sh --no-cache" \
+    "$(grep -c 'run-integration.sh --no-cache' <<< "$_hdr")" "0"
+check "the stamp helper is not described as shared with run-integration.sh" \
+    "$(grep -c 'shared with run-integration.sh' "$CUT")" "0"
 
 echo ""
 echo "=== cut-release: the watch is opt-in ==="
@@ -347,6 +798,35 @@ if [[ $rc -eq 2 && "$out" == *"unknown flag"* ]]; then
     pass "control: an unknown flag still exits 2, so the check above discriminates"
 else
     fail "an unknown flag was accepted (rc=$rc): $out"
+fi
+
+# THE MEASURED WORKER COUNT, pinned as an exact string. cut-release.sh advised
+# `-j$(nproc)` in the branch it printed after every cut, and RELEASING.md
+# deleted that advice on 2026-09-02 with a measurement: on 8 cores it failed
+# test-task-pool-mp-qemu.sh twice ("slot reclaim: workers=2 expected=3") while
+# the default nproc-2 was green -- 474s against 477s. Three seconds, for a
+# false red on the one gate that decides whether to publish. The script was
+# then the last place still recommending it.
+# COMMENTS STRIPPED FIRST, the same treatment the [skip ci] check above needs
+# and for the identical reason it records: the comment explaining why we do NOT
+# advise this contains the string, so a raw scan finds its own rationale. "A
+# check that cannot survive its own subject being discussed" -- third instance
+# today, after the ci.yml skip guard and this file's own earlier one.
+if sed 's/#.*//' "$CUTREL" | grep -qF -- '-j\$(nproc)'; then
+    fail "cut-release.sh still advises -j\$(nproc), which RELEASING.md measured into a false red"
+    grep -nF -- '-j\$(nproc)' "$CUTREL" | grep -v '^ *#' | sed 's/^/      /'
+else
+    pass "cut-release.sh does not advise the worker count that produced a false red"
+fi
+
+# ...and it must not tell you the local suite is the gate right after telling
+# you CI satisfied it. The v4.7.1 cut printed both, four lines apart -- the
+# same self-contradicting-output defect fixed in `axl prune` the same day. The
+# note is now inside a branch that only runs when nothing covered the commit.
+if sed 's/#.*//' "$CUTREL" | grep -qF 'the LOCAL suite is the release gate now'; then
+    fail "the unconditional 'LOCAL suite is the gate' note is back; it contradicts the gate line above it"
+else
+    pass "no unconditional note claiming the local suite is the gate"
 fi
 
 # The default path must hand back the verification command, because that is

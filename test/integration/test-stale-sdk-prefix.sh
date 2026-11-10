@@ -229,8 +229,8 @@ fi
 
 # The distro layout that would be misread by a sloppier predicate: an SDK
 # installed to a prefix that HAS a src/ (/usr/src is on most systems). The
-# discriminator is this script sitting in scripts/ next to a Makefile, not the
-# presence of a src/ directory.
+# discriminator is this script sitting in scripts/ next to the checkout's
+# CMakePresets.json, not the presence of a src/ directory.
 mkdir -p "$PFX/src"
 out="$("$PFX/bin/axl-cc" --version 2>&1)" && rc=0 || rc=$?
 if [[ "$rc" -eq 0 && "$out" == "axl-cc 9.9.9 (gcc, built 2026-01-01)" ]]; then

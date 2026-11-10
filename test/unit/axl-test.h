@@ -295,4 +295,84 @@ test_print_results(void)
     return (test_fail_count > 0) ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Hex helpers for vector-driven tests.
+//
+// A 64-byte signature compared byte-by-byte with an && chain names no vector
+// when it fails, and passes for the wrong reason when a byte is left out; a
+// hand-picked subset ("byte 0, 1, 2 and 31") is worse still. These render the
+// whole buffer and do ONE comparison, so an assertion pins every byte and its
+// failure names the vector.
+// ---------------------------------------------------------------------------
+
+/** Format @p n bytes of @p b as lowercase hex into @p out, which must have
+    room for 2*n + 1 characters. */
+static inline void
+test_hex_format(
+    char          *out,  ///< destination, 2*@p n + 1 bytes
+    const uint8_t *b,    ///< source bytes
+    size_t         n     ///< number of source bytes
+)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i]     = digits[(b[i] >> 4) & 0xF];
+        out[2 * i + 1] = digits[b[i] & 0xF];
+    }
+    out[2 * n] = '\0';
+}
+
+/** Maximum byte count test_hex_equals() and test_hex_bytes() handle. 64 covers
+    an Ed25519 signature, the largest vector in the tree. */
+#define TEST_HEX_MAX 64u
+
+/**
+ * True iff @p b (@p n bytes) renders exactly as the lowercase hex string
+ * @p expect. Returns false for @p n above #TEST_HEX_MAX rather than
+ * truncating, so an oversized buffer fails loudly instead of comparing a
+ * prefix.
+ */
+static inline bool
+test_hex_equals(
+    const uint8_t *b,      ///< bytes to check
+    size_t         n,      ///< number of bytes
+    const char    *expect  ///< expected lowercase hex, no separators
+)
+{
+    char got[2 * TEST_HEX_MAX + 1];
+    if (n > TEST_HEX_MAX) {
+        return false;
+    }
+    test_hex_format(got, b, n);
+    return axl_strcmp(got, expect) == 0;
+}
+
+/**
+ * Parse the lowercase hex string @p hex into @p out, which must hold exactly
+ * @p n bytes. Lets a vector stay a readable hex constant instead of a 64-entry
+ * initialiser.
+ *
+ * @return true if @p hex was exactly 2*@p n hex digits and was decoded.
+ */
+static inline bool
+test_hex_bytes(
+    const char *hex,  ///< lowercase hex, no separators
+    uint8_t    *out,  ///< destination, @p n bytes
+    size_t      n     ///< expected byte count
+)
+{
+    if (hex == NULL || out == NULL || axl_strlen(hex) != 2 * n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int hi = axl_hex_nibble((unsigned char)hex[2 * i]);
+        int lo = axl_hex_nibble((unsigned char)hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
 #endif /* AXL_TEST_H */

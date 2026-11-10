@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=7 local-only=0
+# test-meta: arch=x64 needs= est=7 local-only=0 builds=kernel-poc guest=standard
 # axl-kernel POC integration test — boots AxlKernelPoc.efi in QEMU,
 # verifies that ping-pong + stress tests pass.
 #
@@ -13,23 +13,14 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     all kernel-poc 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/AxlKernelPoc.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Running AxlKernelPoc...
-AxlKernelPoc.efi
-
-reset -s
-NSHEOF
+test_use_nsh
 
 test_build_image
 

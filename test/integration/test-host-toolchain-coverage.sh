@@ -11,7 +11,7 @@
 # vendored code is unused -- so a simple source links with no libc at all and
 # proves nothing. sdk/examples/http-server.c is the shipped source that KEEPS
 # them, and it is what exposed the error. See
-# docs/AXL-Host-Toolchain-Design.md §7.2. `make check-examples` is
+# docs/AXL-Host-Toolchain-Design.md §7.2. `gate.check-examples` is
 # compile-only and would not have caught it; this gate links.
 #
 # Sources: sdk/examples/*.c and tools/*.c -- the SOURCE trees, not a staged
@@ -95,10 +95,10 @@ fi
 check 0 "resolved toolchain is 'host' (axl-cc --print-toolchain)"
 
 # The floor: a glob that matches nothing must FAIL, not report clean forever
-# (the same reason make check-examples carries CHECK_EX_MIN). 90 is a safety
+# (the same reason check-examples.sh carries its --min floor). 90 is a safety
 # margin below the 96 sources actually found as of 2026-09-03 (51
 # sdk/examples/*.c + 46 tools/*.c, minus fwtool.c) -- the same generous-margin
-# shape as check-examples' CHECK_EX_MIN (20 against 51 real examples).
+# shape as check-examples.sh's --min (20 against 51 real examples).
 MIN_SOURCES=90
 
 # The SECOND floor, on links ACTUALLY PERFORMED. MIN_SOURCES guards the
@@ -147,9 +147,9 @@ for src in "$PROJECT_DIR"/sdk/examples/*.c "$PROJECT_DIR"/tools/*.c; do
         # docstring calls it "NOT the shape a normal consumer wants". It
         # hand-declares its own _AxlEntry (a different UEFI ABI) and links
         # with raw ld against $(GCC_CRT0)+$(RELOC_OBJ) alone, never
-        # libaxl.a. "make hello-minimal" is its only build path; there is no
+        # libaxl.a. The hello-minimal goal is its only build path; there is no
         # axl-cc invocation, bare-metal OR host, that produces it.
-        check 0 "host: SKIP $base — bypasses axl-cc/libaxl by design (own _AxlEntry, no libaxl.a); built only via 'make hello-minimal'"
+        check 0 "host: SKIP $base — bypasses axl-cc/libaxl by design (own _AxlEntry, no libaxl.a); built only via the hello-minimal goal"
         continue
         ;;
     9p-common.c|9p-cmd-file.c|9p-cmd-serve.c|9p-cmd-mount.c)
@@ -159,6 +159,33 @@ for src in "$PROJECT_DIR"/sdk/examples/*.c "$PROJECT_DIR"/tools/*.c; do
         # #ifdef blocks). They are exercised as part of the 9p.c multi-file
         # link below, never standalone.
         check 0 "host: SKIP $base — no standalone entry point; linked only as part of the 9p.c launcher build below"
+        continue
+        ;;
+    sshd-bind.c)
+        # The sshd tool's pure console-binding core: no main(), no
+        # DriverEntry. It reaches the linker inside BOTH sshd links below
+        # (the sshd-svc.c driver and the sshd.c launcher), never standalone.
+        check 0 "host: SKIP $base — no standalone entry point; linked only as part of the sshd-svc.c driver and sshd.c launcher builds below"
+        continue
+        ;;
+    sshd-sftp-codec.c|sshd-sftp.c|sshd-sftp-relay.c)
+        # The SFTP pieces: no main(), no DriverEntry. The codec and the
+        # server reach the linker inside the sftp-server.c helper link below;
+        # the relay inside both sshd links (sshd-svc.c and sshd.c's driver).
+        check 0 "host: SKIP $base — no standalone entry point; linked only as part of the sftp-server.c helper or the sshd-svc.c driver builds below"
+        continue
+        ;;
+    sum.c)
+        # The shared body of md5sum and sha256sum: no main(). It reaches the
+        # linker inside both of their links below, never standalone.
+        check 0 "host: SKIP $base — no standalone entry point; linked only as part of the md5sum.c and sha256sum.c builds below"
+        continue
+        ;;
+    sshd-conf.c)
+        # The sshd launcher's sshd.conf settings module: no main(), no
+        # DriverEntry. It reaches the linker only inside the sshd.c launcher
+        # link below (the build links it into sshd.efi, not the driver).
+        check 0 "host: SKIP $base — no standalone entry point; linked only as part of the sshd.c launcher build below"
         continue
         ;;
 
@@ -175,12 +202,31 @@ for src in "$PROJECT_DIR"/sdk/examples/*.c "$PROJECT_DIR"/tools/*.c; do
         ;;
 
     # AXL_SERVICE_DRIVER(...) here is itself wrapped in
-    # #ifdef AXL_SERVICE_BUILD_DRIVER (the Makefile's own dual-compile flag
+    # #ifdef AXL_SERVICE_BUILD_DRIVER (the build's own dual-compile flag
     # for this pattern); without the define the file compiles to an empty
     # stub with no entry point at all.
     9p-serve-svc.c|9p-mount-svc.c)
         run_link "$log" "host links: $base (--type driver -DAXL_SERVICE_BUILD_DRIVER)" \
             "$AXL_CC" --type driver -DAXL_SERVICE_BUILD_DRIVER "$src" -o "$out"
+        ;;
+
+    # The sshd driver: the same dual-compile split, plus the binding core it
+    # shares with the launcher. No Ed25519 flag: axl_ssh_server_new() calls
+    # axl_pk_enable_ed25519() itself. sshd-bind.c counts here (it is
+    # SKIPped as a standalone source above).
+    sshd-svc.c)
+        n_linked=$((n_linked + 1))
+        run_link "$log" "host links: $base (--type driver -DAXL_SERVICE_BUILD_DRIVER + sshd-bind.c + sshd-sftp-relay.c)" \
+            "$AXL_CC" --type driver -DAXL_SERVICE_BUILD_DRIVER \
+            "$src" "$dir/sshd-bind.c" "$dir/sshd-sftp-relay.c" -o "$out"
+        ;;
+
+    # sshd's SFTP helper, SftpServer.efi: a driver (AXL_DRIVER) over the
+    # server and its codec.
+    sftp-server.c)
+        n_linked=$((n_linked + 1))
+        run_link "$log" "host links: $base (--type driver + sshd-sftp.c + sshd-sftp-codec.c)" \
+            "$AXL_CC" --type driver "$src" "$dir/sshd-sftp.c" "$dir/sshd-sftp-codec.c" -o "$out"
         ;;
 
     # -----------------------------------------------------------------
@@ -198,7 +244,7 @@ for src in "$PROJECT_DIR"/sdk/examples/*.c "$PROJECT_DIR"/tools/*.c; do
     mkrd.c)
         # Embeds the vendored RamDiskDxe.efi (third_party/edk2) as a
         # fallback for firmware without EFI_RAM_DISK_PROTOCOL -- the same
-        # blob the Makefile's EMBED_BLOB macro embeds in-tree.
+        # blob the build's axl_embed_blob embeds in-tree.
         run_link "$log" "host links: $base (--allow-uefi --embed ramdiskdxe)" \
             "$AXL_CC" --allow-uefi \
             --embed "$PROJECT_DIR/third_party/edk2/RamDiskDxe-x64.efi=ramdiskdxe" \
@@ -214,7 +260,7 @@ for src in "$PROJECT_DIR"/sdk/examples/*.c "$PROJECT_DIR"/tools/*.c; do
         # cross-iteration dependency on visitation order is not safe to
         # assume. Self-contained also matches how a real consumer would
         # actually do this -- two separate axl-cc invocations, exactly like
-        # the Makefile's own two-step recipe.
+        # the build's own two-step recipe.
         drv="$WORK/_prereq-fbcon-drv.efi"
         "$AXL_CC" --type driver "$dir/fbcon-drv.c" -o "$drv" \
             > "$WORK/_prereq-fbcon-drv.log" 2>&1
@@ -303,6 +349,36 @@ for src in "$PROJECT_DIR"/sdk/examples/*.c "$PROJECT_DIR"/tools/*.c; do
         ;;
 
     # -----------------------------------------------------------------
+    # The sshd launcher: the 9p shape at smaller scale -- sshd.c plus the
+    # app-side compile of sshd-svc.c and the binding core, embedding the
+    # driver built fresh here (the same visitation-order reasoning as 9p.c).
+    # -----------------------------------------------------------------
+    sshd.c)
+        drv_sshd="$WORK/_prereq-sshd-dxe.efi"
+        "$AXL_CC" --type driver -DAXL_SERVICE_BUILD_DRIVER \
+            "$dir/sshd-svc.c" "$dir/sshd-bind.c" "$dir/sshd-sftp-relay.c" -o "$drv_sshd" \
+            > "$WORK/_prereq-sshd-dxe.log" 2>&1
+        if [[ $? -ne 0 ]]; then
+            check 1 "host links: $base (multi-file launcher; the prerequisite driver build failed)"
+            tail -8 "$WORK/_prereq-sshd-dxe.log" | sed 's/^/      /'
+        else
+            run_link "$log" \
+                "host links: $base (multi-file launcher: sshd.c+sshd-svc.c+sshd-bind.c+sshd-conf.c, embedded sshd_dxe)" \
+                "$AXL_CC" --embed "$drv_sshd=sshd_dxe" \
+                "$src" "$dir/sshd-svc.c" "$dir/sshd-bind.c" "$dir/sshd-conf.c" -o "$out"
+        fi
+        ;;
+
+    # -----------------------------------------------------------------
+    # md5sum / sha256sum: a one-line entry point each over tools/sum.c (the
+    # build's AXL_TOOL_EXTRA_<n>, tools/CMakeLists.txt).
+    # -----------------------------------------------------------------
+    md5sum.c|sha256sum.c)
+        run_link "$log" "host links: $base (two-file tool: $base+sum.c)" \
+            "$AXL_CC" "$src" "$dir/sum.c" -o "$out"
+        ;;
+
+    # -----------------------------------------------------------------
     # http-server.c specifically: identical to the wildcard build below, but
     # the output path is stashed for the host-binutils PE/reloc inspection
     # after the loop (see there for why this source and not another).
@@ -330,8 +406,8 @@ check $? "host links: $n_linked sources reached the linker, at least $MIN_LINKED
 echo
 echo "=== AXL_TOOLCHAIN=host: the host binutils' own PE/reloc output, inspected ==="
 # NO GATE EVER INSPECTS A HOST-PRODUCED IMAGE otherwise. check-nx-compat,
-# check-no-avx, check-reloc-coverage and check-bss-clear (Makefile) all run
-# over $(PREFIX)/*.efi built by the SDK's own BARE-METAL binutils -- the only
+# check-no-avx, check-reloc-coverage and check-bss-clear (gate.check-*) all
+# run over <tree>/*.efi built by the SDK's own BARE-METAL binutils -- the only
 # host-produced image ever EXECUTED anywhere is hello.efi on OVMF, the
 # smallest workload in the tree. check-reloc-coverage exists because a
 # DT_RELA table split across two sections, or dropped by objcopy -j's

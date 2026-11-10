@@ -9,12 +9,32 @@
     became a tagged union and every entry point routes through the
     vtable below, selected by the key's algorithm.
 
-    A provider is reached through a WEAK symbol so that an algorithm
-    nothing calls costs an image nothing. That matters for exactly one
-    algorithm today: Ed25519's precomputed base-point table is 30,720
-    bytes of resident .rodata, and axl_pk_key_new() is a dispatcher
-    every AxlPk consumer calls, so a strong reference would pull the
-    table into every image. See the design spec §4.
+    Every provider is reached through a WEAK symbol so that an
+    algorithm nothing calls costs an image nothing: axl_pk_key_new() is
+    a dispatcher every AxlPk consumer calls, so a strong reference would
+    pull a provider into every image that touches any algorithm. The
+    opt-in is a CALL -- axl_pk_enable_mbedtls() / axl_pk_enable_ed25519(),
+    each defined in its provider's own object, so calling it makes the
+    linker take that object and the weak reference resolves. No `-u`
+    flag, no registration table, no run-time state.
+
+    - Ed25519's precomputed base-point table is 108,800 bytes of
+      resident .rodata (124,567 bytes for the whole opt-in, measured
+      x64 -Os 2026-09-05). The design spec's §4 says 30,720 -- that
+      figure assumed SUPERCOP's ref10, and what is vendored is `ref`,
+      whose field element is four times wider. See
+      deps/ed25519-ref10/README.md.
+    - The mbedTLS provider (ECDSA + RSA) drags in mbedTLS's generic PK
+      layer, and that layer reaches rsa.o on its own: pk_info_from_type
+      returns &mbedtls_rsa_info, pkparse and pkwrite call the RSA
+      parsers and writers. So the PROVIDER has to be weak, not merely
+      RSA inside it -- splitting RSA out alone left sshd-dxe with 37 of
+      its 38 rsa symbols (measured 2026-10-20). Made weak, an
+      Ed25519-only image carries none of pk / pkparse / pkwrite / ecdsa
+      / rsa: tools/sshd.efi x64 RELEASE went 220,160 -> 201,728 bytes
+      shipped. AXL's own JOSE code calls the enable function itself
+      (axl-jose.c), so a JOSE user never needs to; TLS never touches
+      AxlPk at all.
 
     Not a public header — do not include from outside src/net/.
 **/
@@ -53,8 +73,12 @@ typedef struct AxlPkKey AxlPkKey;
  * the one place that enforces which (mode, ctx, ctx_len) combinations
  * are legal — a provider never has to re-check this itself.
  *
- * Internal for now. E2b decides whether this becomes public, once
- * Ed25519 gives the mode something to select between.
+ * STAYS INTERNAL. E2b was to decide this once Ed25519 gave the mode
+ * something to select between, and Ed25519 shipped without giving it
+ * any: only pure Ed25519 is implemented, so a public mode selector
+ * would today offer callers exactly one choice. Revisit when Ed25519ph
+ * or Ed25519ctx is actually built, which is what this shape exists to
+ * make an addition rather than a redesign.
  */
 typedef enum {
     AXL_PK_SIG_MODE_PURE = 0  /**< sign/verify the message itself
@@ -170,8 +194,12 @@ typedef struct {
                 uint8_t *sig, size_t *sig_len);
 
     /** Verify @a sig over @a msg. Returns AXL_OK only on a good
-        signature. Same @a fmt handling as sign, and @a mode / @a ctx
-        / @a ctx_len are the same dispatcher-validated values. */
+        signature, and may return AXL_NO_RESOURCES when the check could
+        not be made for lack of memory -- which must mean the signature
+        was never examined (axl_pk_key_verify passes it straight to its
+        caller as "not a verdict"); everything else is AXL_ERR. Same
+        @a fmt handling as sign, and @a mode / @a ctx / @a ctx_len are the
+        same dispatcher-validated values. */
     int (*verify)(const AxlPkKey *key, const uint8_t *msg, size_t msg_len,
                   AxlPkSigFormat fmt, AxlPkSigMode mode,
                   const void *ctx, size_t ctx_len,
@@ -203,20 +231,22 @@ typedef struct {
     int  (*der_public_export)(const AxlPkKey *key, uint8_t *out, size_t *len);
 } AxlPkProvider;
 
-/* One extern per provider. The mbedTLS provider serves ECDSA and RSA
-   and is referenced strongly — every build has mbedTLS. Ed25519's is
-   weak and referenced only if the image opted in with
-   `-u _axl_pk_provider_ed25519`.
+/* One extern per provider, both weak at the dispatcher. The mbedTLS
+   provider serves ECDSA and RSA and is linked when the image calls
+   axl_pk_enable_mbedtls() -- AxlJose does -- or any other function
+   axl-pk-mbedtls.c defines (axl_pk_verify, axl_pk_key_from_ec_xy, ...),
+   since calling one puts that object in the link. Ed25519's is linked
+   when the image calls axl_pk_enable_ed25519() -- AxlSsh's server does.
 
-   When the image did not opt in, the symbol is unresolved and
-   `&_axl_pk_provider_ed25519` evaluates to NULL. Test the address
+   When the image did not opt in, the symbol is unresolved and its
+   address evaluates to NULL. Test the address
    before reading any member — there is no object to read, and under
    UEFI a load from address 0 succeeds and returns zero rather than
    faulting. This is also why AxlPkProvider carries no `alg` field: a
    dispatcher that read `provider->alg` to select a provider would
    read address 0 for an unlinked weak provider and get back 0, which
    is #AXL_PK_ED25519 — selecting the very provider that is absent. */
-extern const AxlPkProvider _axl_pk_provider_mbedtls;
+AXL_PK_PROVIDER_DECL extern const AxlPkProvider _axl_pk_provider_mbedtls;
 AXL_PK_PROVIDER_DECL extern const AxlPkProvider _axl_pk_provider_ed25519;
 
 /**

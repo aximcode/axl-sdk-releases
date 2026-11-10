@@ -6,7 +6,7 @@
 # 38**. AXL-Distribution-Design.md §14.3 counted it: the shipped tool set is
 # stated in four places, two are derived and correct for free, and the two
 # hand-maintained ones had both drifted. README.md's copy was fixed last cycle
-# by adding the missing rows behind `make check-tool-docs`; this one is fixed
+# by adding the missing rows behind `gate.check-tool-docs`; this one is fixed
 # by deriving it, because unlike README.md's table its entries are flat
 # ~40-character labels -- exactly what devkit.conf's gated `desc:` lines are.
 #
@@ -20,11 +20,15 @@
 #   - EVERY shipped tool appears, with a description. A generator that emits
 #     an empty or partial list is the defect that started this.
 #   - THE LICENCE TEXT SURVIVES REGENERATION. The file carries mbedTLS's
-#     Apache-2.0 election, EDK2's BSD-2-Clause-Patent notice, iPXE's
-#     GPL-2.0-or-later notice and a **GPL-2.0 §3(b) written offer**. Moving
-#     ~90 lines of heredoc into a generator is precisely the kind of refactor
-#     that silently drops a paragraph, and dropping that one is a licence
+#     Apache-2.0 election and EDK2's BSD-2-Clause-Patent notice. Moving ~90
+#     lines of heredoc into a generator is precisely the kind of refactor
+#     that silently drops a paragraph, and dropping one is a licence
 #     violation rather than a typo.
+#   - THE DRIVERS LISTED ARE THE ONES SHIPPED: each of the five EDK2 drivers
+#     on its own line, and no iPXE -- its driver, licence notice and GPL-2.0
+#     section 3(b) offer were removed together on 2026-10-21, and a README
+#     still promising a driver the archive lacks is the drift this file
+#     exists to stop.
 #
 # Host-only: no QEMU, no compiler, no build. It reads devkit.conf and a make
 # variable and prints text.
@@ -69,12 +73,12 @@ test_host_pass "generates a README for x64"
 # ---------------------------------------------------------------------------
 # Every shipped tool, with a description.
 # ---------------------------------------------------------------------------
-mapfile -t TOOLS < <(make -s -C "$PROJECT_DIR" print-TOOL_NAMES | tr ' ' '\n' | grep -v '^$')
+read -r -a TOOLS <<< "$("$PROJECT_DIR/scripts/axl-list.sh" TOOL_NAMES)"
 
 # A guard that checks nothing passes forever, so refuse a suspiciously short
 # answer the way release.yml's own tool-set check does.
 [[ "${#TOOLS[@]}" -ge 25 ]]
-check $? "print-TOOL_NAMES named ${#TOOLS[@]} tools (>= 25 expected)"
+check $? "TOOL_NAMES named ${#TOOLS[@]} tools (>= 25 expected)"
 
 missing=""
 undescribed=""
@@ -107,18 +111,33 @@ check $? "nothing listed that is not shipped${listed_extra:+ -- extra:$listed_ex
 # The licence payload. These are obligations, not prose.
 # ---------------------------------------------------------------------------
 declare -A OBLIGATION=(
-    ["GPL-2\\.0 section 3\\(b\\) written offer"]="iPXE's GPL-2.0 section 3(b) written offer"
     ["dual-licensed Apache-2.0 OR GPL-2.0-or-later"]="mbedTLS's dual licence"
     ["this[[:space:]]*distribution elects Apache-2.0"]="mbedTLS Apache-2.0 election"
     ["BSD-2-Clause-Patent"]="EDK2's BSD-2-Clause-Patent notice"
-    ["licensed GPL-2.0-or-later"]="iPXE's licence"
-    ["third_party/ipxe/COPYING.GPLv2"]="the iPXE licence-text pointer"
-    ["support@aximcode.com"]="the address the written offer names"
 )
 for pat in "${!OBLIGATION[@]}"; do
     tr '\n' ' ' < "$OUT" | grep -Eq "$pat"
     check $? "carries ${OBLIGATION[$pat]}"
 done
+
+# ---------------------------------------------------------------------------
+# The drivers: the five the tarball stages, each named once, and no iPXE.
+# ---------------------------------------------------------------------------
+for d in NetworkCommon.efi UsbCdcEcm.efi UsbCdcNcm.efi UsbRndis.efi RamDiskDxe.efi; do
+    n=$(grep -cE "^  ${d//./\\.} +[A-Z]" "$OUT" || true)
+    [[ "$n" == 1 ]]
+    check $? "lists the shipped driver $d once ($n)"
+done
+# sshd.conf ships beside sshd.efi; the README says what it is.
+for l in "  sshd.conf (beside sshd.efi) lists every setting sshd supports," \
+         "  commented out at its default, OpenSSH sshd_config style. Remove"; do
+    n=$(grep -cxF -- "$l" "$OUT" || true)
+    [[ "$n" == 1 ]]
+    check $? "describes the shipped sshd.conf: '$l' ($n)"
+done
+n=$(grep -ci 'ipxe' "$OUT" || true)
+[[ "$n" == 0 ]]
+check $? "names no iPXE: the bundle is not shipped ($n)"
 
 # ---------------------------------------------------------------------------
 # The sidecars. The tarball ships one JSON5 database per file in share/, and

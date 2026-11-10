@@ -79,6 +79,24 @@ axl_base64_encode(const void *data, size_t len)
     return out;
 }
 
+/* Free a decode's partial output, zeroed first: a caller decoding a secret
+   (an SSH private key) must not have half of it left in freed pool because a
+   character further on was bad. Volatile stores, so the zeroing of storage
+   freed on the next line cannot be elided. */
+static void
+free_partial(
+    uint8_t *raw,  ///< the partial output
+    size_t   len   ///< its allocated size
+    )
+{
+    volatile uint8_t *v = raw;
+
+    for (size_t k = 0; k < len; k++) {
+        v[k] = 0;
+    }
+    axl_free(raw);
+}
+
 int
 axl_base64_decode(const char *b64, void **out, size_t *out_len)
 {
@@ -124,17 +142,17 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
         d = (b64[i+3] != '=' && (uint8_t)b64[i+3] < 128) ? b64_dec[(uint8_t)b64[i+3]] : 0xFF;
 
         if (a == 0xFF || b == 0xFF) {
-            axl_free(raw);
+            free_partial(raw, raw_len + 1);
             return AXL_ERR;
         }
 
         raw[j++] = (uint8_t)((a << 2) | (b >> 4));
         if (j < raw_len) {
-            if (c == 0xFF && b64[i+2] != '=') { axl_free(raw); return AXL_ERR; }
+            if (c == 0xFF && b64[i+2] != '=') { free_partial(raw, raw_len + 1); return AXL_ERR; }
             raw[j++] = (uint8_t)((b << 4) | (c >> 2));
         }
         if (j < raw_len) {
-            if (d == 0xFF && b64[i+3] != '=') { axl_free(raw); return AXL_ERR; }
+            if (d == 0xFF && b64[i+3] != '=') { free_partial(raw, raw_len + 1); return AXL_ERR; }
             raw[j++] = (uint8_t)((c << 6) | d);
         }
     }
@@ -260,7 +278,7 @@ axl_base64url_decode(const char *s, size_t len, void **out, size_t *out_len)
         uint8_t c = b64url_val(s[i+2]);
         uint8_t d = b64url_val(s[i+3]);
         if (a == 0xFF || b == 0xFF || c == 0xFF || d == 0xFF) {
-            axl_free(raw);
+            free_partial(raw, raw_len + 1);
             return AXL_ERR;
         }
         raw[j++] = (uint8_t)((a << 2) | (b >> 4));
@@ -272,7 +290,7 @@ axl_base64url_decode(const char *s, size_t len, void **out, size_t *out_len)
         uint8_t a = b64url_val(s[i]);
         uint8_t b = b64url_val(s[i+1]);
         if (a == 0xFF || b == 0xFF) {
-            axl_free(raw);
+            free_partial(raw, raw_len + 1);
             return AXL_ERR;
         }
         raw[j++] = (uint8_t)((a << 2) | (b >> 4));
@@ -281,7 +299,7 @@ axl_base64url_decode(const char *s, size_t len, void **out, size_t *out_len)
         uint8_t b = b64url_val(s[i+1]);
         uint8_t c = b64url_val(s[i+2]);
         if (a == 0xFF || b == 0xFF || c == 0xFF) {
-            axl_free(raw);
+            free_partial(raw, raw_len + 1);
             return AXL_ERR;
         }
         raw[j++] = (uint8_t)((a << 2) | (b >> 4));

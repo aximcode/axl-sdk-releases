@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="6"
+	failures="0"
+	disabled="0"
+	skipped="0"
+	hostname=""
+	time="0"
+	timestamp="2026-11-08T23:46:22"
+	>
+	<testcase name="unit.one-boot" classname="unit.one-boot" time="0.00130029" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;unit-boot"/>
+		</properties>
+		<system-out>Results: 14824 passed, 0 failed, 12 group(s) SKIPPED (84 assertions) (X64) in 105.504s
+</system-out>
+	</testcase>
+	<testcase name="gate.lint" classname="gate.lint" time="0.00112884" status="run">
+		<properties>
+			<property name="cmake_labels" value="gate;lint"/>
+		</properties>
+		<system-out>lint: clean (clang-tidy over the x64-lint preset)
+</system-out>
+	</testcase>
+	<testcase name="gate.docs" classname="gate.docs" time="0.00100742" status="run">
+		<properties>
+			<property name="cmake_labels" value="docs;gate"/>
+		</properties>
+		<system-out>docs built, 0 warnings
+</system-out>
+	</testcase>
+	<testcase name="gate.check-a" classname="gate.check-a" time="0.00170393" status="run">
+		<properties>
+			<property name="cmake_labels" value="check;gate"/>
+		</properties>
+		<system-out>check-a: clean
+</system-out>
+	</testcase>
+	<testcase name="gate.check-b" classname="gate.check-b" time="0.00116369" status="run">
+		<properties>
+			<property name="cmake_labels" value="check;gate"/>
+		</properties>
+		<system-out>check-b: FAILED -- 2 offenders
+</system-out>
+	</testcase>
+	<testcase name="gate.check-img" classname="gate.check-img" time="0.00123998" status="run">
+		<properties>
+			<property name="cmake_labels" value="artifact;check;gate"/>
+		</properties>
+		<system-out>check-img: clean
+</system-out>
+	</testcase>
+</testsuite>

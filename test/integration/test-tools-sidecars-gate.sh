@@ -4,7 +4,8 @@
 #
 # WHY THIS EXISTS. share/ holds the JSON5 name databases the shipped tools
 # auto-discover beside their own .efi. Two places staged them and each kept its
-# own hand-maintained list; the workflow's said `pci-ids.json5 pci-class.json5`,
+# own hand-maintained list; the workflow's (now scripts/
+# the tarball staging) said `pci-ids.json5 pci-class.json5`,
 # written when PCI was the only tool with a database and never revisited when
 # lsusb and memspd grew theirs. Every published axl-sdk-uefi-tools-* up to
 # v4.6.0 therefore carries lsusb.efi and memspd.efi and neither of their
@@ -41,10 +42,12 @@ fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 # a gate is most worth testing before it is committed.
 build_tree() {
     local dst="$1"
-    mkdir -p "$dst/scripts" "$dst/.github/workflows" "$dst/share"
+    mkdir -p "$dst/scripts" "$dst/.github/workflows" "$dst/share" "$dst/cmake" \
+             "$dst/packaging/uefi-tools"
     cp "$PROJECT_DIR/$GATE_REL"                        "$dst/scripts/"
-    cp "$PROJECT_DIR/scripts/install.sh"               "$dst/scripts/"
+    cp "$PROJECT_DIR/cmake/AxlInstall.cmake"           "$dst/cmake/"
     cp "$PROJECT_DIR/scripts/make-uefi-tools-readme.py" "$dst/scripts/"
+    cp "$PROJECT_DIR/packaging/uefi-tools/CMakeLists.txt" "$dst/packaging/uefi-tools/"
     cp "$PROJECT_DIR/.github/workflows/release.yml"    "$dst/.github/workflows/"
     cp "$PROJECT_DIR"/share/*.json5                    "$dst/share/"
 }
@@ -66,15 +69,15 @@ echo "=== 2. the regression: a glob in a COMMENT must not satisfy it ==="
 T2="$WORK/comment"; build_tree "$T2"
 # Revert ONLY the staging code. The comment above it still contains the
 # literal `share/*.json5`, which is what fooled the first version.
-sed -i 's|SIDECARS=(share/\*\.json5)|SIDECARS=(share/pci-ids.json5)|' \
-    "$T2/.github/workflows/release.yml"
-if grep -q 'SIDECARS=(share/pci-ids.json5)' "$T2/.github/workflows/release.yml"; then
-    pass "fixture applied: workflow staging reverted to a one-file list"
+T2_SCRIPT="$T2/packaging/uefi-tools/CMakeLists.txt"
+sed -i 's|file(GLOB _axl_sidecars \\"\${AXL_ROOT}/share/\*\.json5\\")|file(GLOB _axl_sidecars \\"${AXL_ROOT}/share/pci-ids.json5\\")|' "$T2_SCRIPT"
+if grep -q 'share/pci-ids.json5' "$T2_SCRIPT"; then
+    pass "fixture applied: tarball staging reverted to a one-file list"
 else
     fail "fixture did NOT apply -- the sed matched nothing, so case 2 proves nothing"
 fi
 # The trap must still be present, or this tests the wrong thing.
-if grep -q '^\s*#.*share/\*\.json5' "$T2/.github/workflows/release.yml"; then
+if grep -q '^\s*#.*share/\*\.json5' "$T2_SCRIPT"; then
     pass "fixture intact: a comment still contains the literal share/*.json5"
 else
     fail "no commented glob left in the fixture -- case 2 is not the regression"
@@ -82,29 +85,30 @@ fi
 if out="$(run_gate "$T2")"; then
     fail "a one-file list passed because a COMMENT contained the glob"
     sed 's/^/      /' <<<"$out" | head -4
-elif grep -q 'release.yml' <<<"$out"; then
-    pass "reverting the workflow to a list FAILS the gate, naming release.yml"
+elif grep -q 'packaging/uefi-tools/CMakeLists.txt does not stage' <<<"$out"; then
+    pass "reverting the tarball rules to a list FAILS the gate, naming them"
 else
-    pass "reverting the workflow to a list FAILS the gate"
-    echo "      (note: failure did not name release.yml)"
+    fail "gate failed but never named packaging/uefi-tools/CMakeLists.txt"
+    sed 's/^/      /' <<<"$out" | head -4
 fi
 
 echo
 echo "=== 3. the second staging path is covered too ==="
+# The SDK's staging is the install() rules (cmake/AxlInstall.cmake): narrow
+# its install-time glob to one file.
 T3="$WORK/installer"; build_tree "$T3"
-sed -i 's|_sidecars=("$LIBAXL_DIR"/share/\*\.json5)|_sidecars=("$LIBAXL_DIR"/share/pci-ids.json5)|' \
-    "$T3/scripts/install.sh"
-if grep -q '_sidecars=("$LIBAXL_DIR"/share/pci-ids.json5)' "$T3/scripts/install.sh"; then
-    pass "fixture applied: installer staging reverted to a one-file list"
+sed -i 's|PATTERN "\*\.json5")|PATTERN "pci-ids.json5")|' "$T3/cmake/AxlInstall.cmake"
+if grep -q 'PATTERN "pci-ids.json5")' "$T3/cmake/AxlInstall.cmake"; then
+    pass "fixture applied: the install rules' sidecar glob narrowed to one file"
 else
     fail "fixture did NOT apply -- case 3 proves nothing"
 fi
 if out="$(run_gate "$T3")"; then
-    fail "the installer reverting to a list was reported CLEAN"
-elif grep -q 'install.sh' <<<"$out"; then
-    pass "reverting the installer to a list FAILS the gate, naming install.sh"
+    fail "the install rules narrowing to one file was reported CLEAN"
+elif grep -q 'cmake/AxlInstall.cmake does not stage' <<<"$out"; then
+    pass "narrowing the install rules' glob FAILS the gate, naming AxlInstall.cmake"
 else
-    fail "gate failed but never named install.sh"
+    fail "gate failed but never named cmake/AxlInstall.cmake"
     sed 's/^/      /' <<<"$out" | head -4
 fi
 
@@ -147,6 +151,28 @@ elif grep -qi 'renamed step\|no .* step' <<<"$out"; then
     pass "a step it cannot find FAILS and says so, rather than reporting clean"
 else
     fail "gate failed but not for the missing-step reason"
+    sed 's/^/      /' <<<"$out" | head -4
+fi
+
+echo
+echo "=== 7. release.yml staging inline again (not delegating) fails ==="
+T7="$WORK/inline"; build_tree "$T7"
+# The call becomes an inline list; the step's comment still NAMES the script,
+# so prose must not satisfy the delegation check either.
+sed -i 's|run: ./scripts/make-release-assets.sh uefi-tools .*|run: cp share/pci-ids.json5 .|' \
+    "$T7/.github/workflows/release.yml"
+if grep -q 'run: cp share/pci-ids.json5 \.' "$T7/.github/workflows/release.yml" \
+   && grep -q '^\s*#.*make-release-assets\.sh' "$T7/.github/workflows/release.yml"; then
+    pass "fixture applied: the step stages inline; a comment still names the script"
+else
+    fail "fixture did NOT apply -- case 7 proves nothing"
+fi
+if out="$(run_gate "$T7")"; then
+    fail "a workflow that no longer runs the tarball script was reported CLEAN"
+elif grep -q 'does not run scripts/make-release-assets.sh uefi-tools' <<<"$out"; then
+    pass "a step that stops delegating FAILS the gate, saying so"
+else
+    fail "gate failed but not for the delegation reason"
     sed 's/^/      /' <<<"$out" | head -4
 fi
 

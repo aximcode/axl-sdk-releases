@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=13 local-only=0
+# test-meta: arch=x64 needs= est=13 local-only=0 guest=fixture_net
 # test-mkfixture-post-qemu.sh -- end-to-end test for mkfixture's HTTP
 # write target (HF2.4): a disk-less / net-only capture that POSTs the
 # whole fixture as an in-memory ustar tarball to a collector.
@@ -39,7 +39,7 @@ fail() { echo "FAIL: $1"; [[ -n "${2:-}" ]] && echo "  $2"; FAIL=$((FAIL + 1)); 
 
 if [[ ! -x "$MKFIXTURE" ]]; then
     echo "Building tools..."
-    make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -3
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -3
 fi
 [[ -x "$MKFIXTURE" ]] || { echo "FAIL: mkfixture.efi not found at $MKFIXTURE"; exit 1; }
 

@@ -31,12 +31,127 @@
  *   MOUNT: RO-READ=1            -- printed ONLY when the read-only file's
  *                                   through-the-mount read byte-matches its
  *                                   known content
+ *   MOUNT: XDIR-RENAME=1        -- a move between directories by Trename
+ *   MOUNT: XDIR-EXDEV=1         -- one the server answers EXDEV is
+ *                                   AXL_UNSUPPORTED from axl_file_rename,
+ *                                   nothing changed
+ *   MOUNT: XDIR-MOVE=1          -- ...and axl_file_move copies it instead
+ *   MOUNT: MTIME=1              -- axl_file_set_mtime by Tsetattr
+ *   MOUNT: RENAME-INPLACE=1     -- a rename within one directory
+ *   MOUNT: TRUNCATE=1           -- axl_file_truncate by Tsetattr(SIZE)
+ *   MOUNT: RENAME-CASE=1        -- mnt2.txt renamed to MNT2.txt
+ *   MOUNT: LONG-LIST=1          -- /long lists its 400-byte, 200-unit name
+ *                                   whole, and skips a 300-unit name (over
+ *                                   FAT's 255) and an 800-byte one
  *   MOUNT: DONE                 -- always printed before exit
  */
 #include <axl.h>
 
 #define MOUNT_WRITE_CONTENT "mount-write-ok"
 #define READONLY_CONTENT    "read-only content\n"
+#define MOUNT_MTIME         1767225600ULL   /* 2026-01-01 00:00:00 UTC */
+
+/* True when @p path reads over the raw client as exactly @p want. */
+static bool
+raw_holds(Axl9pClient *c, const char *path, const char *want)
+{
+    AxlBytes *b = NULL;
+    if (axl_9p_read_file(c, path, &b) != AXL_OK || b == NULL) {
+        return false;
+    }
+    size_t      n = 0;
+    const void *d = axl_bytes_get_data(b, &n);
+    bool        ok = n == axl_strlen(want) && axl_memcmp(d, want, n) == 0;
+    axl_bytes_unref(b);
+    return ok;
+}
+
+/* True when @p path does not read over the raw client at all. */
+static bool
+raw_gone(Axl9pClient *c, const char *path)
+{
+    AxlBytes *b = NULL;
+    if (axl_9p_read_file(c, path, &b) == AXL_OK) {
+        axl_bytes_unref(b);
+        return false;
+    }
+    return true;
+}
+
+/* Provider version 2 through the mount: renames by Trename on the file's
+   own fid, times and sizes by Tsetattr. p9-server.py lets a Trename move
+   between directories only below /mv (as one POSIX filesystem would) and
+   answers EXDEV elsewhere; it refuses Tlcreate in /mv/b, so a COPY into it
+   fails and only a real rename can satisfy MOUNT: XDIR-RENAME. */
+static void
+mount_v2_checks(Axl9pClient *c, const char *fs)
+{
+    char a[96];
+    char b[96];
+    AxlFsEntry e;
+
+    axl_snprintf(a, sizeof(a), "%s:\\mv\\a\\x.txt", fs);
+    axl_snprintf(b, sizeof(b), "%s:\\mv\\b\\x.txt", fs);
+    if (axl_file_rename(a, b) == AXL_OK && raw_holds(c, "/mv/b/x.txt", "move-me\n")
+        && raw_gone(c, "/mv/a/x.txt")) {
+        axl_printf("MOUNT: XDIR-RENAME=1\n");
+    }
+
+    axl_snprintf(a, sizeof(a), "%s:\\dir\\a.txt", fs);
+    axl_snprintf(b, sizeof(b), "%s:\\a2.txt", fs);
+    if (axl_file_rename(a, b) == AXL_UNSUPPORTED && raw_holds(c, "/dir/a.txt", "alpha\n")
+        && raw_gone(c, "/a2.txt")) {
+        axl_printf("MOUNT: XDIR-EXDEV=1\n");
+    }
+
+    axl_snprintf(a, sizeof(a), "%s:\\dir\\b.txt", fs);
+    axl_snprintf(b, sizeof(b), "%s:\\b2.txt", fs);
+    if (axl_file_move(a, b) == AXL_OK && raw_holds(c, "/b2.txt", "bravo\n")
+        && raw_gone(c, "/dir/b.txt")) {
+        axl_printf("MOUNT: XDIR-MOVE=1\n");
+    }
+
+    axl_snprintf(a, sizeof(a), "%s:\\hello.txt", fs);
+    if (axl_file_set_mtime(a, MOUNT_MTIME) == AXL_OK
+        && axl_file_info(a, &e) == AXL_OK && e.mtime_unix == MOUNT_MTIME) {
+        axl_printf("MOUNT: MTIME=1\n");
+    }
+
+    axl_snprintf(a, sizeof(a), "%s:\\mnttest.txt", fs);
+    if (axl_file_rename(a, "mnt2.txt") == AXL_OK
+        && raw_holds(c, "/mnt2.txt", MOUNT_WRITE_CONTENT) && raw_gone(c, "/mnttest.txt")) {
+        axl_printf("MOUNT: RENAME-INPLACE=1\n");
+    }
+
+    axl_snprintf(a, sizeof(a), "%s:\\mnt2.txt", fs);
+    if (axl_file_truncate(a, 5) == AXL_OK && raw_holds(c, "/mnt2.txt", "mount")) {
+        axl_printf("MOUNT: TRUNCATE=1\n");
+    }
+
+    /* A rename that changes only the letter case. */
+    if (axl_file_rename(a, "MNT2.txt") == AXL_OK
+        && raw_holds(c, "/MNT2.txt", "mount") && raw_gone(c, "/mnt2.txt")) {
+        axl_printf("MOUNT: RENAME-CASE=1\n");
+    }
+
+    /* /long holds a 200 x U+00E9 name -- 400 bytes, 200 units: past the 256
+       bytes AxlFsEntry.name once held, inside FAT's 255 units -- a
+       300-character ASCII name (300 units: no FAT holds it) and an
+       800-byte one: listed whole, skipped, skipped. */
+    axl_snprintf(a, sizeof(a), "%s:\\long", fs);
+    AxlDir *d     = axl_dir_open(a);
+    size_t  n     = 0;
+    bool    whole = false;
+    while (d != NULL && axl_dir_read(d, &e)) {
+        n++;
+        whole = axl_strlen(e.name) == 400 && (uint8_t)e.name[0] == 0xC3
+                && (uint8_t)e.name[399] == 0xA9;
+    }
+    axl_dir_close(d);
+    if (n == 1 && whole) {
+        axl_printf("MOUNT: LONG-LIST=1\n");
+    }
+}
 
 int
 main(int argc, char **argv)
@@ -159,6 +274,8 @@ main(int argc, char **argv)
             }
             axl_free(robuf);
         }
+
+        mount_v2_checks(c, matched_fs);
     }
 
     axl_bytes_unref(oracle);

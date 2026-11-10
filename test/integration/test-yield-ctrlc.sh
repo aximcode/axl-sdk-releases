@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs=socat est=7 local-only=0
+# test-meta: arch=both needs=socat est=21 local-only=0 guest=none
+# guest=none: a real Ctrl-C over --serial-socket to a --background guest
+#   booted straight into the app (--boot-target).
 # arch=both since 2026-08-19: verified passing on AARCH64 unchanged. It was x64-only
 # with no stated reason -- never ported, not unportable.
 # test-yield-ctrlc.sh — end-to-end proof that Ctrl-C routes through
@@ -28,6 +30,17 @@
 #      g_axl_interrupted set → loop observes → axl_loop_run returns →
 #      main returns → _axl_cleanup → atexit list fires.
 #
+# It runs three times. YIELD_MODE=idle is the sequence above.
+# YIELD_MODE=defer-chain runs the demo with a deferred callback that re-queues
+# itself for ever, so the loop never waits -- it only CHECKS its events each
+# iteration -- and the QEMU CPU must be BUSY (>= 50%) rather than idle before
+# the 0x03 is sent: the serial Ctrl-C must still end the program. Under the
+# Shell, the Shell itself turns a serial 0x03 into its break, which the loop
+# reads every iteration, so that run passes even without the loop checking
+# the console. YIELD_MODE=defer-chain-boot boots the demo AS the boot loader
+# (--boot-target), with no Shell: there the only way a serial 0x03 is seen is
+# the loop's own check of ConIn for it.
+#
 # Usage:
 #   scripts/install.sh --arch x64     # one-time, produces stage/bin/axl-cc
 #   test/integration/test-yield-ctrlc.sh
@@ -36,8 +49,26 @@
 
 set -e
 
+if [[ -z "${YIELD_MODE:-}" ]]; then
+    rc=0
+    YIELD_MODE=idle "$0" "$@" || rc=1
+    YIELD_MODE=defer-chain "$0" "$@" || rc=1
+    YIELD_MODE=defer-chain-boot "$0" "$@" || rc=1
+    exit $rc
+fi
+echo "=== yield-ctrlc: $YIELD_MODE ==="
+EFI_ARGS=()
+QEMU_MODE=()
+CC_DEFS=()
+case "$YIELD_MODE" in
+    defer-chain)      EFI_ARGS=(defer-chain) ;;
+    defer-chain-boot) QEMU_MODE=(--boot-target); CC_DEFS=(-DYIELD_TEST_DEFER_CHAIN) ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/axl-common.sh
+source "$PROJECT_DIR/scripts/axl-common.sh"
 
 AXL_CC="$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/bin/axl-cc"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
@@ -74,7 +105,7 @@ fi
 
 # Build the demo (debug so AXL_MEM_DEBUG final leak report appears in
 # the serial log as an additional exit-path signal).
-"$AXL_CC" --debug "$DEMO_C" -o "$EFI" >/dev/null
+"$AXL_CC" --debug "${CC_DEFS[@]}" "$DEMO_C" -o "$EFI" >/dev/null
 
 # Launch QEMU in background. --serial-socket exposes the guest serial
 # as a UNIX socket. QEMU's chardev with server=on,wait=off accepts a
@@ -91,15 +122,22 @@ if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     qemu_timeout=240
 fi
 "$RUN_QEMU" \
-    --background --timeout "$qemu_timeout" \
+    --background --timeout "$qemu_timeout" "${QEMU_MODE[@]}" \
     --serial-socket "$SOCK" \
-    "$EFI" > "$RUN_LOG" 2>&1
+    "$EFI" "${EFI_ARGS[@]}" > "$RUN_LOG" 2>&1
 
 QEMU_PID=$(grep -oP '^QEMU_PID=\K\d+' "$RUN_LOG")
 if [[ -z "$QEMU_PID" ]]; then
     echo "ERROR: could not capture QEMU pid"; cat "$RUN_LOG"; exit 1
 fi
 echo "launched QEMU pid=$QEMU_PID (socket=$SOCK)"
+# run-qemu.sh's QEMU_PID is its `timeout` wrapper, not QEMU (see run-qemu.sh's
+# --background branch): sampling it reads ~0% whatever the guest does, which
+# made the idle check below pass without looking. The guest is its child.
+CPU_PID=$(qemu_real_pid "$QEMU_PID") || {
+    echo "ERROR: cannot find the qemu process under pid $QEMU_PID to sample"
+    exit 1
+}
 
 # Wait for QEMU to create the socket (should be sub-second)
 for _ in $(seq 1 50); do
@@ -167,18 +205,35 @@ read_cpu_pct() {
     awk "BEGIN{ printf \"%.0f\", ($t2-$t1) * 2.5 }"
 }
 
-for attempt in 1 2 3; do
-    cpu=$(read_cpu_pct "$QEMU_PID")
-    echo "  CPU sample $attempt: ${cpu}% of one core"
-    if [[ $cpu -lt 5 ]]; then
-        echo "CPU confirmed idle (<5%); sending Ctrl-C"
-        break
+if [[ "$YIELD_MODE" == defer-chain* ]]; then
+    # The control: the chain really keeps the loop from waiting.
+    for attempt in 1 2 3; do
+        cpu=$(read_cpu_pct "$CPU_PID")
+        echo "  CPU sample $attempt: ${cpu}% of one core"
+        if [[ $cpu -ge 50 ]]; then
+            echo "CPU confirmed busy (>=50%, the chain is running); sending Ctrl-C"
+            break
+        fi
+    done
+    if [[ $cpu -lt 50 ]]; then
+        echo "ERROR: QEMU CPU stayed <50% for 3 samples; the defer chain is not running"
+        tail -30 "$LOG"
+        exit 1
     fi
-done
-if [[ $cpu -ge 5 ]]; then
-    echo "ERROR: QEMU CPU stayed >=5% for 3 samples; not idling"
-    tail -30 "$LOG"
-    exit 1
+else
+    for attempt in 1 2 3; do
+        cpu=$(read_cpu_pct "$CPU_PID")
+        echo "  CPU sample $attempt: ${cpu}% of one core"
+        if [[ $cpu -lt 5 ]]; then
+            echo "CPU confirmed idle (<5%); sending Ctrl-C"
+            break
+        fi
+    done
+    if [[ $cpu -ge 5 ]]; then
+        echo "ERROR: QEMU CPU stayed >=5% for 3 samples; not idling"
+        tail -30 "$LOG"
+        exit 1
+    fi
 fi
 
 # Inject Ctrl-C (0x03, ETX) via the FIFO held open on fd 9.
@@ -207,7 +262,7 @@ if ! grep -qF "Interrupted (Ctrl-C)" "$LOG"; then
     tail -40 "$LOG"
     exit 1
 fi
-echo "=== PASS: Ctrl-C routed through yield → auto-exit → atexit, notice printed ==="
+echo "=== PASS ($YIELD_MODE): Ctrl-C routed through yield → auto-exit → atexit, notice printed ==="
 echo ""
 grep -E "yield-test:|SHUTDOWN-MARKER|Interrupted \(Ctrl-C\)|mem: no leaks" "$LOG" || true
 exit 0

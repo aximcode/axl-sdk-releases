@@ -10,7 +10,7 @@
     The ratio is portable across hardware (CI vs laptop vs dev box).
 
     This binary isn't in test-axl.sh's TEST_APPS -- it's exercised
-    only by the dedicated perf script. A normal 'make tests' build
+    only by the dedicated perf script. A normal `tests` goal build
     still produces the .efi, so CI can invoke the script separately.
 **/
 

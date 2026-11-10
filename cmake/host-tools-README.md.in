@@ -1,0 +1,32 @@
+# AXL SDK Host Tools v@AXL_VERSION@
+
+Host-side runtime tooling for testing axl-sdk apps in QEMU.
+See https://github.com/aximcode/axl-sdk for the full SDK.
+
+## Quick start
+
+```bash
+# 1. Install system QEMU + OVMF (one-time):
+#    Debian/Ubuntu: sudo apt install @AXL_HOST_DEPS_DEB@
+#    Fedora/RHEL:   sudo dnf install @AXL_HOST_DEPS_DNF@
+#    Arch:          sudo pacman -S @AXL_HOST_DEPS_PACMAN@
+#
+# 2. Run a UEFI app under QEMU:
+./bin/axl run-qemu path/to/your-app.efi
+
+# 3. Drop into the UEFI shell with the current dir mounted:
+./bin/axl run-qemu -i --mount .
+
+# Put bin/ on PATH and every command is 'axl <verb>':
+#   axl --help          list them
+#   axl rsod-decode     decode a crash dump
+#   axl gdb-syms        recover module load addresses
+```
+
+QEMU/firmware discovery is automatic via standard system paths.
+To override, set `QEMU_DIR`, `OVMF_CODE`, `AAVMF_CODE`, or
+`VIRTIOFSD`.
+
+## License
+
+Apache-2.0. See LICENSE and NOTICE.

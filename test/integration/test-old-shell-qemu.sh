@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=95 local-only=1
+# test-meta: arch=x64 needs= est=140 local-only=1 guest=none
+# test-meta: builds=ARCH=x64,sd-sibling,fs-path-selftest,fs-read,io-streams
+# guest=none: the boot is the subject: the EFI 1.x Shell (--shell) as the
+#   booted Shell, which no pool guest runs.
 # test-old-shell — pins the SDK's old EFI 1.x shell support (no
 # EDK2 EFI_SHELL_PROTOCOL) against the real EFI Toolkit "newshell"
 # (Shell106.efi), which QEMU's bundled OVMF shell can't reproduce.
@@ -16,6 +19,14 @@
 #      as an fsN and a write+read round-trip on it succeeds. A re-run says
 #      "reused" and asks for `map -r` only while the disk is unmounted,
 #      and `mkrd -d` names `map -r`, never `map -u` (this shell has none).
+#
+# Later scenarios add the file layer, a resident driver's file read, the
+# stdout/stderr split and (Scenario 8) this shell's `ifconfig` reading the
+# pre-UEFI-2.4 IPv4 protocols AXL publishes once netload brings a NIC up.
+# Without a DEBUG OVMF one Scenario 8 check -- that the protocols outlive
+# netload -- SKIPs: it prints a `SKIP:` line and counts in neither total of
+# the summary, so "N passed" is then one short of a DEBUG-OVMF run's.
+# AXL_REQUIRE_DEBUG_OVMF=1 turns that SKIP into a FAIL.
 #
 # The modern-shell regression halves of both findings are already
 # covered by test-sd-sibling-qemu.sh and test-ramdisk-map-qemu.sh (both
@@ -61,8 +72,8 @@ NATIVE_DIR="$(test_build_dir)"
 
 # Build the fixtures: the sibling-locate probe + driver, mkrd, the file-layer
 # path-resolution selftest, and the resident-driver file-read + setenv fixture.
-make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
-    sd-sibling tools fs-path-selftest fs-read 2>&1 | tail -2
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 \
+    sd-sibling tools fs-path-selftest fs-read io-streams 2>&1 | tail -2
 
 PROBE="$NATIVE_DIR/sd-sibling-probe.efi"
 DRIVER_A="$NATIVE_DIR/sd-sibling-driver-a.efi"
@@ -70,9 +81,10 @@ MKRD="$NATIVE_DIR/tools/mkrd.efi"
 FSSELF="$NATIVE_DIR/fs-path-selftest.efi"
 FSREAD_PROBE="$NATIVE_DIR/fs-read-probe.efi"
 FSREAD_DRIVER="$NATIVE_DIR/fs-read-driver.efi"
+IOSTREAMS="$NATIVE_DIR/io-streams.efi"
 
 if [[ ! -f "$PROBE" || ! -f "$DRIVER_A" || ! -f "$MKRD" || ! -f "$FSSELF" \
-   || ! -f "$FSREAD_PROBE" || ! -f "$FSREAD_DRIVER" ]]; then
+   || ! -f "$FSREAD_PROBE" || ! -f "$FSREAD_DRIVER" || ! -f "$IOSTREAMS" ]]; then
     echo "WARN: fixtures not built on this box; skipping."
     echo "old-shell test: SKIP"
     exit 0
@@ -402,7 +414,7 @@ echo "$FS_LOG" | grep -aE 'FSSELF:(results|info-rel|get-rel|set-contents=)' \
     | sed 's/^/  /'
 
 # Two "results" footers: root battery then sub battery. Both must be clean.
-if [[ $(echo "$FS_LOG" | grep -c 'FSSELF:results pass=29 fail=0') -eq 1 \
+if [[ $(echo "$FS_LOG" | grep -c 'FSSELF:results pass=36 fail=0') -eq 1 \
    && $(echo "$FS_LOG" | grep -c 'FSSELF:results pass=7 fail=0') -eq 1 ]]; then
     test_host_pass "file layer resolves all paths on the old shell (startup.nsh)"
 else
@@ -527,6 +539,172 @@ if echo "$FSREAD_LOG" | grep -qE '^\* +FSRVAR_drv : HELLO_LINE one two'; then
     test_host_pass "driver-set var persists into the shell (do -f<file> var)"
 else
     test_host_fail "driver-set var persists into the shell (do -f<file> var)"
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 7: stdout and stderr redirected apart. This shell publishes no
+# EFI_SHELL_PARAMETERS_PROTOCOL, so AXL cannot ask which stream is the
+# console; standard error keeps going to gST->StdErr, and `>` -- which
+# swaps gST->ConOut for the file -- must never receive it.
+# ---------------------------------------------------------------------------
+echo "=== old-shell stdout/stderr redirect ==="
+
+cat > "$WORK/redir.nsh" <<'NSH'
+fs0:
+cd \
+echo OUT_ONLY_BEGIN
+io-streams.efi text > o.txt
+echo OUT_ONLY_END
+echo TYPE_O_BEGIN
+type o.txt
+echo TYPE_O_END
+echo BOTH_BEGIN
+io-streams.efi text > o2.txt 2> e2.txt
+echo BOTH_END
+echo TYPE_E2_BEGIN
+type e2.txt
+echo TYPE_E2_END
+reset -s
+NSH
+
+REDIR_LOG=$(run_old_shell "$WORK/redir.nsh" "$IOSTREAMS" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr -d '\r')
+ow() { sed -n "/^$1_BEGIN\$/,/^$1_END\$/p" <<< "$REDIR_LOG"; }
+oc() { local w; w=$(ow "$1"); echo "$1{stdout=$(grep -c OUT:stdout <<< "$w" || true) stderr=$(grep -c ERR:stderr <<< "$w" || true) log=$(grep -c LOG:warn <<< "$w" || true)}"; }
+got="$(oc OUT_ONLY) $(oc TYPE_O) $(oc BOTH) $(oc TYPE_E2)"
+want="OUT_ONLY{stdout=0 stderr=1 log=1} TYPE_O{stdout=1 stderr=0 log=0} BOTH{stdout=0 stderr=0 log=0} TYPE_E2{stdout=0 stderr=1 log=1}"
+echo "  $got"
+if [[ "$got" == "$want" ]]; then
+    test_host_pass "stderr stays out of a > file and is captured by 2> on the old shell"
+else
+    test_host_fail "stderr stays out of a > file and is captured by 2> on the old shell (want $want)"
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 8: the old shell's `ifconfig` shows the address AXL brought up.
+# This shell's ifconfig predates UEFI 2.4: it lists the handles carrying
+# EFI_IP4_CONFIG_PROTOCOL and reads each one's EFI NIC IP4 config protocol,
+# neither of which current firmware produces -- so before AXL published them
+# it printed "Not configured." for a NIC netload had just leased. netload is
+# an APPLICATION that exits before ifconfig runs, so the protocols must live
+# in a resident image; `ifconfig -l` runs twice to read them again, and on a
+# DEBUG OVMF (its pool is cleared on free) a use-after-free would print
+# garbage or fault rather than repeat the block. WITHOUT a DEBUG OVMF that
+# check proves nothing, so it SKIPs (a visible `SKIP:` line, counted in
+# neither summary total) -- or FAILs under AXL_REQUIRE_DEBUG_OVMF=1.
+# `ifconfig -s` is the read-only boundary: it is refused, and the address is
+# unchanged afterwards.
+# ---------------------------------------------------------------------------
+echo "=== old-shell ifconfig after netload ==="
+
+NETLOAD="$NATIVE_DIR/tools/netload.efi"
+# The second read proves the protocols outlive netload only on a DEBUG OVMF,
+# whose pool is cleared on free: on a stock one a use-after-free can read back
+# the same bytes and pass. So without one that assertion is a visible SKIP,
+# not a PASS -- and a FAIL under AXL_REQUIRE_DEBUG_OVMF=1, through the same
+# debug_ovmf_unavailable every DEBUG-OVMF test uses (it exits, so it runs in
+# a subshell here: 77 = skip, anything else = this run required one). The
+# other assertions in this scenario do not depend on it and still run.
+LEGACY_OVMF=()
+LEGACY_UAF=checked
+if find_debug_ovmf; then
+    LEGACY_OVMF=(env OVMF_CODE="$DEBUG_OVMF_CODE" OVMF_VARS="$DEBUG_OVMF_VARS")
+    echo "  (DEBUG OVMF: freed pool is cleared, so a use-after-free shows)"
+else
+    LEGACY_UAF_RC=0
+    LEGACY_UAF_WHY=$(debug_ovmf_unavailable) || LEGACY_UAF_RC=$?
+    if [[ $LEGACY_UAF_RC -eq 77 ]]; then
+        LEGACY_UAF=skip
+    else
+        LEGACY_UAF=required
+    fi
+fi
+
+cat > "$WORK/legacy.nsh" <<'NSH'
+fs0:
+netload.efi
+echo LEGACY_READ1
+ifconfig -l
+echo LEGACY_READ2
+ifconfig -l
+echo LEGACY_SET
+ifconfig -s eth0 static 10.0.2.99 255.255.255.0 10.0.2.2
+echo LEGACY_READ3
+ifconfig -l
+echo LEGACY_END
+reset -s
+NSH
+
+# A guest fault makes run-qemu exit non-zero; keep going so the assertions
+# below say WHICH read broke instead of `set -e` ending the script silently.
+LEGACY_RC=0
+LEGACY_LOG=$(timeout 300 "${LEGACY_OVMF[@]}" "$RUN_QEMU" --arch X64 --shell "$OLD_SHELL" \
+    --net --timeout 240 --nsh "$WORK/legacy.nsh" "$NETLOAD" 2>&1 \
+    | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr -d '\r') || LEGACY_RC=$?
+if [[ $LEGACY_RC -ne 0 ]]; then
+    echo "  run-qemu exited $LEGACY_RC; the end of its log:"
+    tail -25 <<< "$LEGACY_LOG" | sed 's/^/  q| /'
+fi
+# A window between two echoed markers, minus the markers and the echoed
+# commands. Empty when the guest died before $2 (grep -v then exits 1, which
+# must not end the script under pipefail: the assertions report it).
+lw() { sed -n "/^$1\$/,/^$2\$/p" <<< "$LEGACY_LOG" | sed '1d;$d' | grep -v '^startup.nsh> ' || true; }
+
+# What this shell prints for a NIC leased by QEMU's user-mode network: the
+# address, mask and gateway SLIRP hands out, and the two routes IP4Config2
+# builds from them (the subnet, then the default route).
+LEGACY_WANT='eth0
+  MAC        : 52-54-00-12-34-56
+  Media State: Media present
+  Source     : DHCP
+  Perment    : TRUE
+
+  IP address : 10.0.2.15
+  Mask       : 255.255.255.0
+  Gateway    : 10.0.2.2
+
+  Routes (2 entries):
+    Entry[0]
+      Subnet : 10.0.2.0
+      Netmask: 255.255.255.0
+      Gateway: 0.0.0.0
+
+    Entry[1]
+      Subnet : 0.0.0.0
+      Netmask: 0.0.0.0
+      Gateway: 10.0.2.2
+'
+READ1=$(lw LEGACY_READ1 LEGACY_READ2)
+READ2=$(lw LEGACY_READ2 LEGACY_SET)
+SETOUT=$(lw LEGACY_SET LEGACY_READ3)
+READ3=$(lw LEGACY_READ3 LEGACY_END)
+echo "$READ1" | sed 's/^/  | /'
+
+if [[ "$READ1" == "${LEGACY_WANT%$'\n'}" ]]; then
+    test_host_pass "old ifconfig -l shows the address netload brought up"
+else
+    test_host_fail "old ifconfig -l shows the address netload brought up"
+fi
+LEGACY_OUTLIVE="a second old ifconfig -l reads the same (protocols outlive netload)"
+if [[ "$LEGACY_UAF" == skip ]]; then
+    echo "  SKIP: $LEGACY_OUTLIVE -- ${LEGACY_UAF_WHY#SKIP: }"
+elif [[ "$LEGACY_UAF" == required ]]; then
+    test_host_fail "$LEGACY_OUTLIVE -- ${LEGACY_UAF_WHY#FAIL: }"
+elif [[ -n "$READ1" && "$READ2" == "$READ1" ]]; then
+    test_host_pass "$LEGACY_OUTLIVE"
+else
+    test_host_fail "$LEGACY_OUTLIVE"
+    echo "$READ2" | sed 's/^/  2| /'
+fi
+if [[ "$SETOUT" == "IfConfig: Failed to set the NIC configure parameters, Unsupported" ]]; then
+    test_host_pass "old ifconfig -s is refused cleanly (read-only)"
+else
+    test_host_fail "old ifconfig -s is refused cleanly (read-only)"
+    echo "$SETOUT" | sed 's/^/  s| /'
+fi
+if [[ -n "$READ1" && "$READ3" == "$READ1" ]]; then
+    test_host_pass "the refused -s left the NIC's configuration alone"
+else
+    test_host_fail "the refused -s left the NIC's configuration alone"
 fi
 
 test_host_summary "old-shell test (X64)"

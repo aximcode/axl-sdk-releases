@@ -36,6 +36,7 @@
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include <axl/axl-net.h>
+#include <axl/axl-time.h>
 #include <axl/axl-wait.h>
 
 #include "axl-tcp-internal.h"
@@ -61,6 +62,8 @@ on_accept_complete(void *data)
     AxlLoop            *saved_loop       = listener->async_loop;
     AxlSourceId         saved_accept_src = listener->accept_source;
     AxlSourceId         saved_cancel_src = listener->accept_cancel_source;
+
+    _axl_net_latency_activity();
 
     axl_efi_call(listener->tcp4->Poll, 1, listener->tcp4);
 
@@ -118,6 +121,7 @@ on_accept_complete(void *data)
     sock->sb_handle  = listener->sb_handle;
     sock->is_listener = false;
     sock->listener_id = listener->listener_id;   /* for scoped deferred-close finalize */
+    _axl_net_latency_link(sock);
 
     //
     // Call user callback. Return value controls re-arming: true keeps
@@ -147,6 +151,7 @@ rearm:
         listener->acc_token.CompletionToken.Event  = ev;
         listener->acc_token.CompletionToken.Status = EFI_ABORTED;
 
+        _axl_net_latency_activity();
         status = axl_efi_call(listener->tcp4->Accept, 2,
                               listener->tcp4, &listener->acc_token);
         if (EFI_ERROR(status)) {
@@ -253,6 +258,7 @@ axl_tcp_accept_async(
     listener->acc_token.CompletionToken.Status = EFI_ABORTED;
     listener->acc_token.NewChildHandle         = NULL;
 
+    _axl_net_latency_activity();
     status = axl_efi_call(listener->tcp4->Accept, 2, listener->tcp4,
                            &listener->acc_token);
     if (EFI_ERROR(status)) {
@@ -293,6 +299,9 @@ axl_tcp_accept_async(
 
 // ---- recv async ------------------------------------------------------------
 
+/* The transmit pacer (below): a lingering member leaves with its receive. */
+static void tcp_pace_leave(AxlTcp *sock);
+
 static bool
 on_recv_complete(void *data)
 {
@@ -306,13 +315,25 @@ on_recv_complete(void *data)
        sock fields after cb — if cb returns false, it may have called
        axl_tcp_close on sock (freeing it). Contract for true: cb must
        NOT close sock. */
-    AxlLoop        *saved_loop       = sock->async_loop;
+    AxlLoop        *saved_loop       = sock->recv_loop;
     AxlSourceId     saved_recv_src   = sock->recv_source;
     AxlSourceId     saved_cancel_src = sock->recv_cancel_source;
 
+    _axl_net_latency_activity();
+
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
+    /* A linger waits for exactly this (AxlTcpPacing.linger_us): it ends here,
+       before the callback, which may close the socket or not re-arm. A reply
+       sent from the callback joins the pacer as an ordinary send. */
+    sock->stat_recvs++;
+    if (sock->pace_linger_us != 0) {
+        sock->stat_linger_recvs++;
+        tcp_pace_leave(sock);
+    }
+
     status = sock->rx_token.CompletionToken.Status;
+    sock->recv_end = status;
     if (EFI_ERROR(status)) {
         sock->recv_size = 0;
         cb_status = AXL_ERR;
@@ -323,6 +344,15 @@ on_recv_complete(void *data)
 
     cb = sock->on_recv;
     cb_data = sock->recv_data;
+
+    /* After a false return sock may be freed, so the ids are cleared NOW:
+       left set, a socket the callback kept open would carry ids of sources
+       removed below, and its next close or re-arm would remove them again
+       from a loop the caller may have finished with (axl_tcp_recv's
+       ephemeral loop does the same for the same reason). A kept receive
+       gets them back below. */
+    sock->recv_source        = 0;
+    sock->recv_cancel_source = 0;
 
     //
     // Call user callback. Return value controls re-arming: true
@@ -354,6 +384,29 @@ on_recv_complete(void *data)
         return AXL_SOURCE_REMOVE;
     }
 
+    /* Kept: the same sources go on serving this receive -- unless the
+       callback armed a new one (axl_tcp_recv_async), which replaces it. */
+    if (sock->recv_source != 0) {
+        if (saved_cancel_src > 0) {
+            axl_loop_remove_source(saved_loop, saved_cancel_src);
+        }
+        return AXL_SOURCE_REMOVE;
+    }
+    /* The saved ids go back only onto the socket that still names their loop.
+       A failed axl_tcp_recv_async leaves recv_loop alone, so this holds today;
+       were it ever not to, restoring them would record ids on saved_loop under
+       another loop's name, where a later close or drop could never remove them
+       (source ids are unique across loops: removal from the wrong one is a
+       no-op). Stop the receive instead of leaking its sources. */
+    if (sock->recv_loop != saved_loop) {
+        if (saved_cancel_src > 0) {
+            axl_loop_remove_source(saved_loop, saved_cancel_src);
+        }
+        return AXL_SOURCE_REMOVE;
+    }
+    sock->recv_source        = saved_recv_src;
+    sock->recv_cancel_source = saved_cancel_src;
+
     //
     // Re-arm: reset token and re-issue Receive into the same buffer.
     // The loop source stays registered; the rx event will fire again
@@ -370,6 +423,7 @@ on_recv_complete(void *data)
     sock->rx_token.CompletionToken.Status = EFI_ABORTED;
     sock->rx_token.Packet.RxData          = &sock->rx_data;
 
+    _axl_net_latency_activity();
     status = axl_efi_call(sock->tcp4->Receive, 2, sock->tcp4, &sock->rx_token);
     if (EFI_ERROR(status)) {
         /* Same race as the one axl_tcp_recv_async handles — peer FIN
@@ -380,10 +434,14 @@ on_recv_complete(void *data)
          * silently swallow the EOF. The recv_source is still
          * registered with the loop and the cached event is still live;
          * signal it ourselves so the loop dispatches us again on the
-         * next tick with rx_token.Status == EFI_ABORTED, which our
+         * next tick with rx_token.Status set to the error, which our
          * own error branch above translates to cb_status=-1.
-         * Caller sees the EOF and can axl_tcp_close cleanly. */
+         * Caller sees the EOF and can axl_tcp_close cleanly.
+         * The token was never queued, so its Status is ours to set: set
+         * it to the Receive's own status, so recv_end tells this FIN
+         * from a reset (_axl_tcp_recv_fin). */
         axl_debug("recv re-arm Receive: %llx", (unsigned long long)status);
+        sock->rx_token.CompletionToken.Status = status;
         axl_backend_event_signal(
             (AxlEventHandle)sock->rx_token.CompletionToken.Event);
     }
@@ -399,13 +457,18 @@ on_recv_complete(void *data)
 void
 axl_tcp_recv_drop_sources(AxlTcp *sock)
 {
+    /* A linger exists only for a receive armed on its loop: it ends with it,
+       so the pacer slot never outlives a loop the caller frees once the
+       receive is cancelled. */
+    if (sock->pace_linger_us != 0) {
+        tcp_pace_leave(sock);
+    }
     if (sock->recv_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->recv_source);
+        axl_loop_remove_source(sock->recv_loop, sock->recv_source);
         sock->recv_source = 0;
     }
     if (sock->recv_cancel_source > 0) {
-        axl_loop_remove_source(sock->async_loop,
-                               sock->recv_cancel_source);
+        axl_loop_remove_source(sock->recv_loop, sock->recv_cancel_source);
         sock->recv_cancel_source = 0;
     }
 }
@@ -448,22 +511,35 @@ axl_tcp_recv_async(
         return AXL_ERR;
     }
 
+    /* A linger exists only for a receive armed on its loop: one moving to
+       another loop ends it (the old receive's source is removed directly
+       below, not through axl_tcp_recv_drop_sources). */
+    if (sock->pace_linger_us != 0 && sock->pacer != NULL && sock->pacer->loop != loop) {
+        tcp_pace_leave(sock);
+    }
+
     //
-    // Cancel any pending recv before starting a new one
+    // Cancel any pending recv before starting a new one -- its cancel
+    // source too: left registered, it would cancel the NEW receive, and on
+    // its old loop no later drop could find it.
     //
     if (sock->recv_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->recv_source);
+        axl_loop_remove_source(sock->recv_loop, sock->recv_source);
         sock->recv_source = 0;
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->rx_token.CompletionToken);
     }
+    if (sock->recv_cancel_source > 0) {
+        axl_loop_remove_source(sock->recv_loop, sock->recv_cancel_source);
+        sock->recv_cancel_source = 0;
+    }
 
-    sock->on_recv       = cb;
-    sock->recv_data     = data;
-    sock->async_loop    = loop;
-    sock->recv_buf      = buf;
-    sock->recv_capacity = size;
-    sock->recv_size     = size;  /* rewritten to bytes-received by on_recv_complete */
+    /* The socket's receive state (callback, buffer, loop) is written only
+       once the receive is registered, so a call that fails leaves it as it
+       was. That matters from inside a receive callback: a re-arm that fails
+       and is followed by `return true` keeps the receive that just completed,
+       with its own buffer, callback and loop, and on_recv_complete restores
+       its source ids onto the loop that holds them. */
 
     //
     // Create the recv event if not already created. Some teardown
@@ -501,6 +577,7 @@ axl_tcp_recv_async(
     sock->rx_token.CompletionToken.Status = EFI_ABORTED;
     sock->rx_token.Packet.RxData          = &sock->rx_data;
 
+    _axl_net_latency_activity();
     status = axl_efi_call(sock->tcp4->Receive, 2, sock->tcp4, &sock->rx_token);
 
     /* Synchronous-failure path: most commonly EFI_CONNECTION_FIN if the
@@ -514,7 +591,7 @@ axl_tcp_recv_async(
      *
      * Register the source first, then signal the cached event so the
      * loop dispatches on_recv_complete on the next tick. The token's
-     * Status field stays at the EFI_ABORTED we set above (Receive
+     * Status field is set to the Receive's own error below (Receive
      * doesn't update it on synchronous error), so on_recv_complete
      * sees EFI_ERROR and translates to cb_status=-1 — exactly what
      * the user's callback expects for "peer closed". This preserves
@@ -539,6 +616,15 @@ axl_tcp_recv_async(
         return AXL_ERR;
     }
 
+    sock->recv_loop     = loop;
+    sock->async_loop    = loop;
+    sock->on_recv       = cb;
+    sock->recv_data     = data;
+    sock->recv_buf      = buf;
+    sock->recv_capacity = size;
+    sock->recv_size     = size;  /* rewritten to bytes-received by on_recv_complete */
+    sock->recv_end      = EFI_SUCCESS;   /* nothing has ended this recv yet */
+
     if (cancel != NULL) {
         sock->recv_cancel_source = axl_loop_add_event(
             loop,
@@ -550,7 +636,7 @@ axl_tcp_recv_async(
 
     /* If Receive failed synchronously (EFI_CONNECTION_FIN etc.), the
      * firmware will never signal the event. Signal it ourselves so the
-     * loop dispatches on_recv_complete with the existing EFI_ABORTED
+     * loop dispatches on_recv_complete with the Receive's own error
      * status — see comment on the Receive call above. The most
      * common cause is a peer FIN delivered between the previous
      * recv completing and this re-arm (normal end-of-stream), so
@@ -558,6 +644,9 @@ axl_tcp_recv_async(
     if (EFI_ERROR(status)) {
         axl_debug("async Receive sync-completed (peer EOF likely): %llx",
                   (unsigned long long)status);
+        /* Never queued: carry the Receive's own status to the
+           completion, so recv_end tells a FIN from a reset. */
+        sock->rx_token.CompletionToken.Status = status;
         axl_backend_event_signal(
             (AxlEventHandle)sock->rx_token.CompletionToken.Event);
     }
@@ -567,25 +656,391 @@ axl_tcp_recv_async(
 
 // ---- send async ------------------------------------------------------------
 
-/* Bound on a single UEFI Transmit. A larger async send is split into a chain
-   of Transmits of at most this many bytes so no one Transmit is unbounded —
-   an unbounded Transmit that a slow / stalled client can't drain monopolizes
-   the shared one-send-in-flight path and wedges the single-threaded loop. */
-#define TCP_SEND_CHUNK_MAX  (32u * 1024u)
+/* The largest piece of a send per UEFI Transmit is AxlTcpPacing.chunk_bytes
+   (axl-tcp.h has the measured reasons for its default and range). A larger
+   async send is split into a chain of Transmits of at most that size, for two
+   reasons: no one Transmit is unbounded (one a stalled client cannot drain
+   would monopolize the one-send-in-flight path), and it bounds the depth of
+   one output burst below iPXE's 15-frames-between-polls limit. It is read
+   when each piece is ARMED, and the piece is retired by the length it was
+   armed with (tx_armed), so a change mid-send is safe. */
 
-/* Arm the next Transmit for the active send: submit
-   min(TCP_SEND_CHUNK_MAX, remaining) bytes from where the last chunk stopped,
-   reusing tx_token/tx_event. Returns the EFI Transmit status. Does NOT touch
-   the loop source — the caller owns source lifecycle. */
+// ---- transmit pacing ---------------------------------------------------------
+//
+// A TcpDxe Transmit token completes only when the chunk's LAST byte is
+// segmentised, and the sub-MSS tail is held (SWS/Nagle, or cwnd) until the
+// host's ACKs for the rest have been PROCESSED. EDK2 MnpDxe processes one
+// received frame per Snp->Receive, driven by a 10 ms timer, so a loop asleep
+// in WaitForEvent drains a burst's ACKs at one per 10 ms: every chunk cost
+// ~10 ms x (segments - 1), and a 1 MiB send took 7-10 s on both arches with
+// every segment on the wire within a millisecond of its Transmit.
+//
+// Each Tcp4->Poll() drains one frame. So while a send is on the wire, the
+// loop polls every socket that has one, on every pass, from a BUSY idle
+// source (axl_loop_add_idle_busy: an idle source that also extends a
+// driver-mode tick, up to the loop's budget). It is not a spin inside a
+// callback -- every other source is still checked and dispatched each
+// pass, in the loop's normal round-robin -- and it goes away with the last
+// pending send, so a loop with nothing to transmit sleeps exactly as before.
+//
+// ONE source per loop, not per socket. AXL_MAX_SOURCES is 64 per loop and
+// every socket already spends its own on completions and cancellables; a
+// source per sending socket would scale with connections for no benefit,
+// because a single idle callback can poll every member. It is per LOOP, not
+// global, because a send's progress is driven from the loop its submitter
+// chose -- a sync axl_tcp_send nests an ephemeral loop, and a source on the
+// outer loop would not run while that one does.
+//
+// Back-off. A send can also be pending with nothing to drain: a peer that has
+// stopped reading holds it at a zero window for as long as it likes. A pacer
+// whose members have made no progress (no Transmit armed) for
+// AxlTcpPacing.idle_backoff_ms removes its source, and the loop sleeps again;
+// the next Transmit re-adds it. While backed off a send advances at the
+// firmware's own rate, which is exactly the pre-pacing behaviour. A clock
+// that cannot be read counts as no progress.
+//
+// Linger (AxlTcpPacing.linger_us, off by default). A socket whose last send
+// retires with a receive armed on the same loop stays a member that much
+// longer, so a request/response peer's next request is drained and answered
+// while the loop still polls. Its members leave the pacer when their time
+// is up, and the source goes with the last member.
+// ---------------------------------------------------------------------------
+
+/* Loops that can have a send pending AT ONCE: the server's own loop plus any
+   nested sync-send loops. A socket that finds the table full is sent
+   unpaced -- correct, only slow -- and says so once per process. */
+#define TCP_PACE_LOOPS_MAX  8u
+
+static AxlTcpPacer  g_tcp_pacers[TCP_PACE_LOOPS_MAX];
+static AxlTcpPacing g_tcp_pacing = {
+    .chunk_bytes     = AXL_TCP_PACING_CHUNK_DEFAULT_BYTES,
+    .idle_backoff_ms = AXL_TCP_PACING_IDLE_BACKOFF_DEFAULT_MS,
+    .linger_us       = AXL_TCP_PACING_LINGER_DEFAULT_US,
+};
+/* One warning per fallback per PROCESS (not per pacer slot, which is
+   recycled with every burst). */
+static bool         g_tcp_pacers_full_warned;
+static bool         g_tcp_pace_source_warned;
+/* The monotonic clock, probed once. A failed calibration is not memoised by
+   the backend and would cost a 10 ms stall on every read, so after one
+   failure pacing never reads it again (and never extends a spin). */
+static enum { TCP_CLOCK_UNKNOWN, TCP_CLOCK_OK, TCP_CLOCK_BROKEN } g_tcp_clock;
+
+void
+axl_tcp_pacing_defaults(AxlTcpPacing *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->chunk_bytes     = AXL_TCP_PACING_CHUNK_DEFAULT_BYTES;
+    out->idle_backoff_ms = AXL_TCP_PACING_IDLE_BACKOFF_DEFAULT_MS;
+    out->linger_us       = AXL_TCP_PACING_LINGER_DEFAULT_US;
+}
+
+bool
+_axl_tcp_pacer_bound(const AxlLoop *loop)
+{
+    for (size_t i = 0; i < TCP_PACE_LOOPS_MAX; i++) {
+        if (loop != NULL && g_tcp_pacers[i].loop == loop) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+_axl_tcp_lingering(const AxlTcp *sock)
+{
+    return sock != NULL && sock->pacer != NULL && sock->pace_linger_us != 0;
+}
+
+void
+axl_tcp_get_pacing(AxlTcpPacing *out)
+{
+    if (out != NULL) {
+        *out = g_tcp_pacing;
+    }
+}
+
+int
+axl_tcp_set_pacing(const AxlTcpPacing *cfg)
+{
+    if (cfg == NULL) {
+        axl_tcp_pacing_defaults(&g_tcp_pacing);
+        return AXL_OK;
+    }
+    if (cfg->chunk_bytes < AXL_TCP_PACING_CHUNK_MIN_BYTES
+        || cfg->chunk_bytes > AXL_TCP_PACING_CHUNK_MAX_BYTES
+        || cfg->idle_backoff_ms > AXL_TCP_PACING_IDLE_BACKOFF_MAX_MS
+        || cfg->linger_us > AXL_TCP_PACING_LINGER_MAX_US) {
+        return AXL_INVALID;
+    }
+    g_tcp_pacing = *cfg;
+    return AXL_OK;
+}
+
+static bool
+tcp_pace_now_us(uint64_t *out)
+{
+    AxlTimespec ts;
+
+    if (g_tcp_clock == TCP_CLOCK_BROKEN) {
+        return false;
+    }
+    if (axl_clock_gettime(AXL_CLOCK_MONOTONIC, &ts) != AXL_OK) {
+        g_tcp_clock = TCP_CLOCK_BROKEN;
+        return false;
+    }
+    g_tcp_clock = TCP_CLOCK_OK;
+    *out = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    return true;
+}
+
+static bool
+tcp_pace_now_ms(uint64_t *out)
+{
+    uint64_t us;
+
+    if (!tcp_pace_now_us(&us)) {
+        return false;
+    }
+    *out = us / 1000u;
+    return true;
+}
+
+/* Take @p sock off its pacer's member list; the caller decides what an
+   empty list means. */
+static void
+tcp_pace_unlink(AxlTcp *sock)
+{
+    AxlTcpPacer  *p = sock->pacer;
+    AxlTcp      **pp;
+
+    for (pp = &p->head; *pp != NULL; pp = &(*pp)->pace_next) {
+        if (*pp == sock) {
+            *pp = sock->pace_next;
+            break;
+        }
+    }
+    sock->pacer          = NULL;
+    sock->pace_next      = NULL;
+    sock->pace_linger_us = 0;
+}
+
+static bool
+tcp_pace_idle(void *data)
+{
+    AxlTcpPacer *p = data;
+    AxlTcp      *s;
+    uint64_t     now;
+
+    /* Assumes Tcp4->Poll does not call back into AxlTcp synchronously:
+       AxlTcp registers its completion events without notify functions, so
+       what Poll completes is only SIGNALLED here and dispatched by the loop
+       afterwards. If another image's notify ran AxlTcp code from inside
+       Poll, the member list could change underneath this walk. */
+    for (s = p->head; s != NULL; s = s->pace_next) {
+        axl_efi_call(s->tcp4->Poll, 1, s->tcp4);
+    }
+
+    /* No progress for idle_backoff_ms: this source goes, and the loop sleeps. */
+    bool backoff = !(p->progress_known && tcp_pace_now_ms(&now)
+                     && now - p->progress_ms < g_tcp_pacing.idle_backoff_ms);
+
+    /* Lingering members leave when their time is up -- all of them if the
+       clock cannot say, or when the pacer backs off: only this source
+       expires them, so a member left behind by it would stay linked, and
+       the slot bound to its loop, until that socket's next send or close. */
+    uint64_t now_us = 0;
+    bool     have   = tcp_pace_now_us(&now_us);
+    for (s = p->head; s != NULL;) {
+        AxlTcp *next = s->pace_next;
+        if (s->pace_linger_us != 0 && (!have || backoff || now_us >= s->pace_linger_us)) {
+            tcp_pace_unlink(s);
+        }
+        s = next;
+    }
+    if (p->head == NULL) {
+        axl_memset(p, 0, sizeof(*p));
+        return AXL_SOURCE_REMOVE;
+    }
+    if (!backoff) {
+        return AXL_SOURCE_CONTINUE;
+    }
+    p->idle = 0;      /* backed off; the next Transmit re-adds it */
+    return AXL_SOURCE_REMOVE;
+}
+
+/* A member armed a Transmit: record the progress, and resume polling if the
+   pacer had backed off. */
+static void
+tcp_pace_kick(AxlTcpPacer *p)
+{
+    p->progress_known = tcp_pace_now_ms(&p->progress_ms);
+    if (p->idle != 0 || g_tcp_pacing.idle_backoff_ms == 0) {
+        return;     /* already polling, or loop-driven polling is off */
+    }
+    p->idle = axl_loop_add_idle_busy(p->loop, tcp_pace_idle, p);
+    if (p->idle == 0 && !g_tcp_pace_source_warned) {
+        g_tcp_pace_source_warned = true;
+        axl_warning("async send: cannot add the transmit-pacing source "
+                    "(loop source table full) - sends on this loop drain "
+                    "at the firmware's 10 ms rate");
+    }
+}
+
+static void
+tcp_pace_leave(AxlTcp *sock)
+{
+    AxlTcpPacer *p = sock->pacer;
+
+    if (p == NULL) {
+        return;
+    }
+    tcp_pace_unlink(sock);
+
+    if (p->head == NULL) {
+        /* Last member gone: the loop has nothing left to pace, so it must go
+           back to sleeping. Removing the source here, rather than letting it
+           notice on its next run, also means the slot never outlives a loop
+           the caller frees right after its last send. A lingering member
+           (AxlTcpPacing.linger_us) keeps that true: it leaves no later than
+           the receive that justifies it -- dropped or cancelled
+           (axl_tcp_recv_drop_sources), or completed (on_recv_complete) --
+           and at the pacer's back-off, its expiry, or its close. */
+        if (p->idle != 0) {
+            axl_loop_remove_source(p->loop, p->idle);
+        }
+        axl_memset(p, 0, sizeof(*p));
+    }
+}
+
+static void
+tcp_pace_join(AxlTcp *sock, AxlLoop *loop)
+{
+    AxlTcpPacer *p = NULL;
+    size_t       i;
+
+    for (i = 0; i < TCP_PACE_LOOPS_MAX; i++) {
+        if (g_tcp_pacers[i].loop == loop) {
+            p = &g_tcp_pacers[i];
+            break;
+        }
+        if (p == NULL && g_tcp_pacers[i].loop == NULL) {
+            p = &g_tcp_pacers[i];     /* first free slot, if loop has none */
+        }
+    }
+    if (p == NULL) {
+        if (!g_tcp_pacers_full_warned) {
+            g_tcp_pacers_full_warned = true;
+            axl_warning("async send: more than %u loops sending at once - "
+                        "this send drains at the firmware's 10 ms rate",
+                        TCP_PACE_LOOPS_MAX);
+        }
+        return;
+    }
+    p->loop         = loop;
+    sock->pace_next = p->head;
+    p->head         = sock;
+    sock->pacer     = p;
+}
+
+/* Make @p sock's pacer membership match its active send: a member of the
+   active token's loop's pacer while a send is on the wire, of none otherwise.
+   Called wherever send_active changes. */
+static void
+tcp_pace_update(AxlTcp *sock)
+{
+    AxlLoop *want = NULL;
+
+    /* A send waiting behind an orphan piece needs the ACKs drained just as
+       much as one on the wire: the orphan completes only as TCP segments it. */
+    if (!sock->closed) {
+        if (sock->send_active != NULL) {
+            want = sock->send_active->loop;
+        } else if (sock->tx_orphan && sock->send_queued_head != NULL) {
+            want = sock->send_queued_head->loop;
+        }
+    }
+
+    if (sock->pacer != NULL && sock->pacer->loop != want) {
+        /* Its last send retired: linger (AxlTcpPacing.linger_us) while its
+           peer's next request may be on the way. A request/response peer
+           sends it the moment the reply arrives, and with nothing polling
+           the stack it would wait for MnpDxe's 10 ms timer, and under
+           driver mode for the next tick too. Only for a receive on this
+           same loop, which already ties the socket to it, and only while
+           the loop polls at all (an idle_backoff_ms of 0 means it never
+           does). A deadline already set is kept. */
+        uint64_t now_us = 0;
+        if (want == NULL && g_tcp_pacing.linger_us != 0 && sock->pace_linger_us == 0
+            && !sock->closed && sock->recv_source != 0
+            && sock->recv_loop == sock->pacer->loop && sock->pacer->idle != 0
+            && tcp_pace_now_us(&now_us)) {
+            sock->pace_linger_us = now_us + g_tcp_pacing.linger_us;
+            sock->stat_lingers++;
+        }
+        if (want != NULL || sock->pace_linger_us == 0 || sock->closed) {
+            tcp_pace_leave(sock);
+        }
+    }
+    if (want != NULL && sock->pacer == NULL) {
+        tcp_pace_join(sock, want);
+    }
+    if (want != NULL) {
+        sock->pace_linger_us = 0;    /* a send again: an ordinary member */
+    }
+}
+
+/* Arm the next Transmit for the active send: copy
+   min(AxlTcpPacing.chunk_bytes, uncommitted) bytes from where the last piece
+   stopped into the socket's bounce buffer and hand THAT to the firmware,
+   reusing tx_token/tx_event. On success the piece counts as committed.
+   Returns the EFI Transmit status. Does NOT touch the loop source — the
+   caller owns source lifecycle. */
 static EFI_STATUS
 tcp_send_arm_chunk(AxlTcp *sock)
 {
     AxlTcpToken *tok   = sock->send_active;
-    size_t       chunk = (tok->remaining < TCP_SEND_CHUNK_MAX)
-                         ? tok->remaining : TCP_SEND_CHUNK_MAX;
+    size_t       max   = g_tcp_pacing.chunk_bytes;
+    size_t       left  = tok->len - tok->committed;
+    size_t       chunk = (left < max) ? left : max;
+    EFI_STATUS   status;
 
+    /* The copy is what lets AxlTcp hand a caller its buffer back the moment
+       its send is cancelled or its connection reset, without ever cancelling
+       a Transmit the firmware is still processing (see tx_orphan). Grown only
+       here, between Transmits -- one is in flight at a time, so the old
+       buffer is no longer the firmware's. Sized to the pacing maximum in
+       force, so a later chunk_bytes change at most regrows it once. */
+    if (sock->tx_bounce_cap < chunk) {
+        axl_free(sock->tx_bounce);
+        sock->tx_bounce_cap = 0;
+        sock->tx_bounce     = axl_malloc(max);
+        if (sock->tx_bounce == NULL) {
+            axl_error("async send: cannot allocate the %zu-byte transmit buffer",
+                      max);
+            return EFI_OUT_OF_RESOURCES;
+        }
+        sock->tx_bounce_cap = max;
+    }
+    axl_memcpy(sock->tx_bounce, tok->buf + tok->committed, chunk);
+
+    /* Arming a Transmit IS progress: it follows either a new send or the
+       completion of the previous chunk. */
+    tcp_pace_update(sock);
+    if (sock->pacer != NULL) {
+        tcp_pace_kick(sock->pacer);
+    }
+
+    /* Poll once before every Transmit. The 15-frame limit above is per NIC,
+       not per connection: several sockets transmitting in one loop turn can
+       sum past it even with small chunks, and a poll reaps the TX ring. */
+    axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
+
+    sock->tx_armed               = chunk;
     sock->tx_frag.FragmentLength = (uint32_t)chunk;
-    sock->tx_frag.FragmentBuffer = (void *)(tok->buf + (tok->len - tok->remaining));
+    sock->tx_frag.FragmentBuffer = sock->tx_bounce;
 
     axl_memset(&sock->tx_data, 0, sizeof(sock->tx_data));
     sock->tx_data.Push             = true;
@@ -601,7 +1056,16 @@ tcp_send_arm_chunk(AxlTcp *sock)
     axl_backend_event_check(
         (AxlEventHandle)sock->tx_token.CompletionToken.Event);
 
-    return axl_efi_call(sock->tcp4->Transmit, 2, sock->tcp4, &sock->tx_token);
+    _axl_net_latency_activity();
+    status = axl_efi_call(sock->tcp4->Transmit, 2, sock->tcp4, &sock->tx_token);
+    if (!EFI_ERROR(status)) {
+        /* Handed over: it cannot be recalled, so it counts from now on even
+           if the send is cancelled or the connection fails before TCP has
+           taken all of it. A Transmit refused outright does not count. */
+        tok->committed    += chunk;
+        sock->tx_inflight  = true;
+    }
+    return status;
 }
 
 static bool on_send_complete(void *data);
@@ -609,11 +1073,12 @@ static bool on_send_token_cancel(void *data);
 static void tcp_send_promote(AxlTcp *sock);
 
 /* Append an accepted send. Port of EDK2 SockBufferToken into SndTokenList.
-   The caller's buffer is BORROWED, not copied — EDK2's NetbufFromExt wraps
-   rather than copies (design §3.1), so a send costs one small token and no
-   data copy. Every send lands here first, including the one that is about to
-   be promoted straight out again: that is what keeps the retirement path
-   allocation-free (see AxlTcpToken). */
+   The caller's buffer is BORROWED until the send's callback, not copied here:
+   each piece is copied into the socket's bounce buffer only as it is armed
+   (tcp_send_arm_chunk), so a queued send costs one small token and the
+   firmware never references the caller's memory. Every send lands here
+   first, including the one that is about to be promoted straight out again:
+   that is what keeps the retirement path allocation-free (see AxlTcpToken). */
 static int
 tcp_send_enqueue(
     AxlTcp         *sock,
@@ -634,7 +1099,8 @@ tcp_send_enqueue(
     tok->sock          = sock;
     tok->buf           = (const uint8_t *)buf;
     tok->len           = size;
-    tok->remaining     = size;
+    tok->committed     = 0;
+    tok->finished      = false;
     tok->cb            = cb;
     tok->cb_data       = data;
     tok->cancel        = cancel;
@@ -795,6 +1261,11 @@ tcp_send_deliver(AxlTcp *sock, AxlTcpToken *list)
         AxlStatus       status = tok->status;
 
         list = tok->next;
+        /* What axl_tcp_send_get_sent reports from inside this callback. Not
+           restored afterwards: the contract is "until the callback's next
+           axl_tcp_* call on the socket", and a nested delivery is one. */
+        sock->send_last_sent     = tok->committed;
+        sock->send_last_finished = tok->finished;
         tcp_send_free_token(tok);
         cb(sock, status, udata);  /* send is one-shot; return value ignored */
     }
@@ -803,10 +1274,11 @@ tcp_send_deliver(AxlTcp *sock, AxlTcpToken *list)
         return;      /* a nested delivery leaves the flags to the outermost */
     }
     sock->send_draining = false;
-    if (sock->free_deferred) {
+    if (sock->free_deferred && !sock->firmware_holds) {
         /* A close ran from one of the callbacks above and finished its
            teardown, but could not free the socket while this walk was still
-           handing it out. finalize_sock left that to us. */
+           handing it out. finalize_sock left that to us -- unless the
+           firmware may still hold parts of it (see firmware_holds). */
         axl_free(sock);
     }
 }
@@ -843,6 +1315,17 @@ tcp_send_done_timer_cb(void *data)
     return AXL_SOURCE_REMOVE;
 }
 
+/* A send retired part-way, whatever its status, left the peer holding a
+   message cut short -- remembered for the close (see stream_torn). A send
+   that never reached the firmware (0) did not. */
+static void
+tcp_send_note_torn(AxlTcp *sock, const AxlTcpToken *tok)
+{
+    if (tok->committed > 0 && tok->committed < tok->len) {
+        sock->stream_torn = true;
+    }
+}
+
 /* Park @p tok on the retired list with @p status. Never calls the callback,
    and never schedules one — the close path delivers what it parks itself. The
    token must already be off both the queue and the active slot. */
@@ -858,6 +1341,7 @@ tcp_send_park(AxlTcp *sock, AxlTcpToken *tok, AxlStatus status)
     }
     tok->status = status;
     tok->next   = NULL;
+    tcp_send_note_torn(sock, tok);
 
     if (sock->send_done_tail != NULL) {
         sock->send_done_tail->next = tok;
@@ -867,6 +1351,31 @@ tcp_send_park(AxlTcp *sock, AxlTcpToken *tok, AxlStatus status)
     sock->send_done_tail = tok;
 }
 
+/* axl_tcp_fail_next_send_schedule's counter. Process-wide, like
+   axl_mem_fail_next_alloc's: 0 = disabled. */
+static size_t mFailNextSendSchedule;
+
+void
+axl_tcp_fail_next_send_schedule(
+    size_t n
+    )
+{
+    mFailNextSendSchedule = n;
+}
+
+/* True when this retirement is the one axl_tcp_fail_next_send_schedule
+   armed. EVERY retirement counts -- a finished send, a cancelled one, an arm
+   failure -- because they all pass through tcp_send_retire. */
+static bool
+tcp_send_schedule_injected_fail(void)
+{
+    if (mFailNextSendSchedule == 0) {
+        return false;
+    }
+    mFailNextSendSchedule--;
+    return mFailNextSendSchedule == 0;
+}
+
 /* Retire @p tok: park it, then ask ITS OWN loop to deliver the callback on the
    loop's next iteration. */
 static void
@@ -874,6 +1383,15 @@ tcp_send_retire(AxlTcp *sock, AxlTcpToken *tok, AxlStatus status)
 {
     tcp_send_park(sock, tok, status);
 
+    if (tcp_send_schedule_injected_fail()) {
+        /* Parked unscheduled, exactly as below when both pools are full --
+           but said at DEBUG and in words of its own, so an injected hold is
+           never read as the real exhaustion the error line reports (the
+           same split axl_mem_fail_next_alloc keeps from a real OOM). */
+        axl_debug("async send: completion held (injected by "
+                  "axl_tcp_fail_next_send_schedule), status %d", (int)status);
+        return;
+    }
     tok->done_defer = axl_defer(tok->loop, tcp_send_done_defer_cb, tok);
     if (tok->done_defer != 0) {
         return;
@@ -906,7 +1424,12 @@ axl_tcp_send_drain_done(AxlTcp *sock)
 
 /* Arm @p tok as the active send. On failure the token is retired with
    AXL_ERR — a transport that refuses one send must still tell that send's
-   caller, and must not park every send behind it (design §6b defect 5). */
+   caller, and must not park every send behind it (design §6b defect 5).
+
+   The completion source is registered BEFORE the Transmit, so no failure
+   here ever leaves a Transmit armed with nothing watching it -- the one
+   exit that used to need EFI_TCP4.Cancel on an armed Transmit, which is
+   exactly what AxlTcp must never do (see tx_orphan). */
 static bool
 tcp_send_arm_token(AxlTcp *sock, AxlTcpToken *tok)
 {
@@ -922,22 +1445,19 @@ tcp_send_arm_token(AxlTcp *sock, AxlTcpToken *tok)
         sock->tx_token.CompletionToken.Event = tx_event;
     }
 
-    if (EFI_ERROR(tcp_send_arm_chunk(sock))) {
-        axl_debug("async Transmit failed to arm %zu byte(s)", tok->len);
-        goto arm_failed;
-    }
-
     sock->send_source = axl_loop_add_event(
         tok->loop,
         (AxlEventHandle)sock->tx_token.CompletionToken.Event,
         on_send_complete, sock);
     if (sock->send_source == 0) {
         axl_error("async send: cannot register event with loop");
-        /* The firmware still holds the token and would DMA the borrowed
-           buffer after we have declared the send dead, and the next send
-           would reuse tx_token while it is still outstanding. */
-        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                     &sock->tx_token.CompletionToken);
+        goto arm_failed;
+    }
+    sock->send_source_loop = tok->loop;
+
+    if (EFI_ERROR(tcp_send_arm_chunk(sock))) {
+        axl_debug("async Transmit failed to arm %zu byte(s)", tok->len);
+        axl_tcp_send_drop_sources(sock);
         goto arm_failed;
     }
     return true;
@@ -948,6 +1468,74 @@ arm_failed:
     return false;
 }
 
+static bool on_orphan_complete(void *data);
+
+/* The orphan piece's Transmit has signalled: the transport is free again. */
+static void
+tcp_send_orphan_finish(AxlTcp *sock)
+{
+    EFI_STATUS status = sock->tx_token.CompletionToken.Status;
+
+    if (EFI_ERROR(status)) {
+        /* Its send has already been reported; this failure belongs to no
+           caller, and the next send or recv sees the connection's state. */
+        axl_debug("async send: orphan piece of %zu byte(s) failed: %llx",
+                  sock->tx_armed, (unsigned long long)status);
+    }
+    sock->tx_orphan   = false;
+    sock->tx_inflight = false;
+    /* A watch left on some loop would otherwise fire for the NEXT send's
+       Transmit on the same event and steal its completion. */
+    axl_tcp_send_drop_sources(sock);
+}
+
+/* Has the orphan piece's Transmit completed? Consumes the signal if so. */
+static bool
+tcp_send_orphan_done(AxlTcp *sock)
+{
+    axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
+    if (axl_backend_event_check(
+            (AxlEventHandle)sock->tx_token.CompletionToken.Event) != 0) {
+        return false;
+    }
+    tcp_send_orphan_finish(sock);
+    return true;
+}
+
+/* Watch the orphan piece from the loop of the send waiting behind it -- the
+   loop that must run for that send to start -- and from no other. The loop the
+   orphan's own send came from may be gone (a sync axl_tcp_send frees its
+   ephemeral loop on return), and with nothing queued nobody needs to know:
+   the next submit checks the event itself. */
+static void
+tcp_send_orphan_watch(AxlTcp *sock)
+{
+    AxlLoop *want = (sock->send_queued_head != NULL)
+                    ? sock->send_queued_head->loop : NULL;
+
+    if (sock->send_source > 0 && sock->send_source_loop == want) {
+        return;
+    }
+    axl_tcp_send_drop_sources(sock);
+    if (want == NULL) {
+        return;
+    }
+    sock->send_source = axl_loop_add_event(
+        want, (AxlEventHandle)sock->tx_token.CompletionToken.Event,
+        on_orphan_complete, sock);
+    if (sock->send_source == 0) {
+        /* The completion itself is not lost -- the next submit or cancel on
+           this socket re-checks the event directly -- but nothing else does:
+           a send already queued behind the orphan, with no further submit,
+           waits until its own timeout or cancel ends it. Say so. */
+        axl_warning("async send: cannot watch the orphan piece (loop source "
+                    "table full); the send queued behind it waits for the "
+                    "next submit, its cancel or its timeout");
+        return;
+    }
+    sock->send_source_loop = want;
+}
+
 /* Hand the head of the queue to the transport. Port of EDK2
    SockProcessSndToken. AXL keeps exactly one EFI token in flight (design §2),
    so at most one send is armed here and the next promotion happens from that
@@ -955,13 +1543,28 @@ arm_failed:
 static void
 tcp_send_promote(AxlTcp *sock)
 {
+    /* A piece left armed by a cancel still owns the transport. Arming over it
+       would reuse tx_token while the firmware holds it; cancelling it is what
+       corrupts TcpDxe. So the queue waits for its token to signal. */
+    if (sock->tx_orphan && !sock->closed && !tcp_send_orphan_done(sock)) {
+        tcp_send_orphan_watch(sock);
+        tcp_pace_update(sock);
+        return;
+    }
+    if (sock->tx_orphan) {
+        return;     /* closed: the close owns what is left */
+    }
     while (sock->send_active == NULL && !sock->closed) {
         AxlTcpToken *tok = tcp_send_dequeue(sock);
 
         if (tok == NULL || tcp_send_arm_token(sock, tok)) {
-            return;
+            break;
         }
     }
+    /* Every path that empties the active slot comes through here (completion,
+       cancel, drop, arm failure), so this is where a socket that has nothing
+       left on the wire stops being paced. */
+    tcp_pace_update(sock);
 }
 
 static bool
@@ -971,19 +1574,18 @@ on_send_complete(void *data)
     AxlTcpToken *tok  = sock->send_active;
     EFI_STATUS   status;
 
+    _axl_net_latency_activity();
+
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
-    status = sock->tx_token.CompletionToken.Status;
+    status            = sock->tx_token.CompletionToken.Status;
+    sock->tx_inflight = false;
     if (!EFI_ERROR(status)) {
         /* UEFI Transmit tokens are all-or-nothing per submission: this
-           completion means the whole submitted chunk was accepted. Retire
-           exactly that chunk's length — identical to what tcp_send_arm_chunk
-           just submitted. */
-        size_t sent = (tok->remaining < TCP_SEND_CHUNK_MAX)
-                      ? tok->remaining : TCP_SEND_CHUNK_MAX;
-        tok->remaining -= sent;
-
-        if (tok->remaining > 0) {
+           completion means TCP has taken the whole piece. `committed` already
+           advanced by exactly the length it was ARMED with when the Transmit
+           was accepted, so the next piece starts there. */
+        if (tok->committed < tok->len) {
             /* More to go — re-arm the next chunk on the SAME tx_event and keep
                this loop source (AXL_SOURCE_CONTINUE); the user callback fires
                only after the final chunk completes. */
@@ -992,7 +1594,7 @@ on_send_complete(void *data)
                 return AXL_SOURCE_CONTINUE;
             }
             axl_error("async send: chunk re-arm failed at %zu/%zu: %llx",
-                      tok->len - tok->remaining, tok->len,
+                      tok->committed, tok->len,
                       (unsigned long long)status);
             /* fall through: report the re-arm failure as a send failure */
         }
@@ -1000,11 +1602,28 @@ on_send_complete(void *data)
         axl_error("async send failed: %llx", (unsigned long long)status);
     }
 
+    tok->finished     = !EFI_ERROR(status);
     sock->send_active = NULL;
     axl_tcp_send_drop_sources(sock);
     tcp_send_retire(sock, tok, EFI_ERROR(status) ? AXL_ERR : AXL_OK);
     /* Promote immediately: only the NOTIFICATION is deferred, so the wire
        keeps moving at full rate while the callback waits for the next tick. */
+    tcp_send_promote(sock);
+    return AXL_SOURCE_REMOVE;
+}
+
+/* The orphan piece's Transmit signalled, seen from the loop of the send
+   waiting behind it. */
+static bool
+on_orphan_complete(void *data)
+{
+    AxlTcp *sock = data;
+
+    /* The loop consumed the signal to dispatch us, and removes this source
+       on the REMOVE return -- forget it first so the finish does not remove
+       it twice. */
+    sock->send_source = 0;
+    tcp_send_orphan_finish(sock);
     tcp_send_promote(sock);
     return AXL_SOURCE_REMOVE;
 }
@@ -1020,15 +1639,64 @@ void
 axl_tcp_send_drop_sources(AxlTcp *sock)
 {
     if (sock->send_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->send_source);
+        axl_loop_remove_source(sock->send_source_loop, sock->send_source);
         sock->send_source = 0;
     }
+    sock->send_source_loop = NULL;
 }
 
-/* A cancellable fired on a send. Port of SockCancelToken, which handles a
-   token on either list: cancel the transport token if this send is the one on
-   the wire, then retire it with AXL_CANCELLED. Same contract as recv cancel —
-   the socket stays valid and connected. */
+bool
+axl_tcp_send_close_drops(const AxlTcp *sock)
+{
+    return sock->send_queued_head != NULL
+           || (sock->send_active != NULL
+               && sock->send_active->committed < sock->send_active->len)
+           || sock->stream_torn;
+}
+
+/* Stop the ACTIVE send where it stands, without touching the firmware: its
+   armed piece becomes the socket's orphan and goes out on its own. Returns
+   the status the send is retired with -- AXL_OK when every byte was already
+   handed over (nothing is left to stop), else AXL_CANCELLED.
+
+   The armed piece may ALREADY have signalled: its completion and the cancel
+   can become ready in one loop turn, and the round-robin dispatch runs
+   either first. Then there is no orphan -- the completion is taken here --
+   and a send whose last piece TCP has taken is FINISHED, with the status that
+   piece really completed with. Without this a sync axl_tcp_send whose final
+   Transmit completed just as its timeout fired reported AXL_TIMEOUT. */
+static AxlStatus
+tcp_send_stop_active(AxlTcp *sock)
+{
+    AxlTcpToken *tok = sock->send_active;
+    bool         signalled;
+
+    sock->send_active = NULL;
+    axl_tcp_send_drop_sources(sock);
+
+    axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
+    signalled = axl_backend_event_check(
+                    (AxlEventHandle)sock->tx_token.CompletionToken.Event) == 0;
+    if (!signalled) {
+        sock->tx_orphan = true;
+        return (tok->committed == tok->len) ? AXL_OK : AXL_CANCELLED;
+    }
+    sock->tx_inflight = false;
+    if (tok->committed < tok->len) {
+        return AXL_CANCELLED;   /* the rest was never handed over */
+    }
+    tok->finished = !EFI_ERROR(sock->tx_token.CompletionToken.Status);
+    return tok->finished ? AXL_OK : AXL_ERR;
+}
+
+/* A cancellable fired on a send. Port of SockCancelToken for a token still on
+   SndTokenList -- retired AXL_CANCELLED, nothing of it sent. For the token on
+   the wire it deliberately is NOT a port: SockCancelToken on a Transmit TcpDxe
+   is still processing frees the token and leaves its data queued, and the
+   next segmentation's SockDataSent ASSERTs on it (DEBUG) or signals freed
+   memory (RELEASE). So the active send stops at a piece boundary instead
+   (tcp_send_stop_active). Same contract as recv cancel — the socket stays
+   valid and connected. */
 static bool
 on_send_token_cancel(void *data)
 {
@@ -1036,17 +1704,17 @@ on_send_token_cancel(void *data)
     AxlTcp      *sock = tok->sock;
 
     if (sock->send_active == tok) {
-        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                     &sock->tx_token.CompletionToken);
-        sock->send_active = NULL;
-        axl_tcp_send_drop_sources(sock);
-        tcp_send_retire(sock, tok, AXL_CANCELLED);
+        tcp_send_retire(sock, tok, tcp_send_stop_active(sock));
         /* Without this the queue would stall: promotion otherwise only ever
            happens from a normal completion, so cancelling the ACTIVE send left
            every token behind it waiting for a callback that could not come. */
         tcp_send_promote(sock);
     } else if (tcp_send_unlink(sock, tok)) {
         tcp_send_retire(sock, tok, AXL_CANCELLED);
+        /* The queue head may have changed, and an orphan piece's watch and
+           the pacer follow it (the cancelled send's loop may be about to go
+           away -- a sync axl_tcp_send's is). */
+        tcp_send_promote(sock);
     }
     /* Neither list holds it: already retired, and its callback is queued or
        has run. Nothing to do. */
@@ -1058,13 +1726,13 @@ axl_tcp_send_drop_token(AxlTcp *sock, AxlTcpCallback cb, void *cb_data)
 {
     AxlTcpToken *tok = sock->send_active;
 
-    /* On the wire: cancel the transport token and start the next send — the
+    /* On the wire: stop it where it stands and start the next send — the
        same sequence a cancellable takes, minus the callback. */
     if (tok != NULL && tok->cb == cb && tok->cb_data == cb_data) {
-        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                     &sock->tx_token.CompletionToken);
-        sock->send_active = NULL;
-        axl_tcp_send_drop_sources(sock);
+        (void)tcp_send_stop_active(sock);
+        sock->send_last_sent     = tok->committed;
+        sock->send_last_finished = tok->finished;
+        tcp_send_note_torn(sock, tok);
         tcp_send_free_token(tok);
         tcp_send_promote(sock);
         return true;
@@ -1072,7 +1740,12 @@ axl_tcp_send_drop_token(AxlTcp *sock, AxlTcpCallback cb, void *cb_data)
     for (tok = sock->send_queued_head; tok != NULL; tok = tok->next) {
         if (tok->cb == cb && tok->cb_data == cb_data) {
             (void)tcp_send_unlink(sock, tok);
+            sock->send_last_sent     = 0;
+            sock->send_last_finished = false;
             tcp_send_free_token(tok);
+            /* Nothing may stay behind on the dying loop -- the orphan watch
+               and the pacer follow the queue head, which just changed. */
+            tcp_send_promote(sock);
             return true;
         }
     }
@@ -1082,6 +1755,8 @@ axl_tcp_send_drop_token(AxlTcp *sock, AxlTcpCallback cb, void *cb_data)
     for (tok = sock->send_done_head; tok != NULL; tok = tok->next) {
         if (tok->cb == cb && tok->cb_data == cb_data) {
             (void)tcp_send_done_unlink(sock, tok);
+            sock->send_last_sent     = tok->committed;
+            sock->send_last_finished = tok->finished;
             tcp_send_free_token(tok);
             return true;
         }
@@ -1090,7 +1765,7 @@ axl_tcp_send_drop_token(AxlTcp *sock, AxlTcpCallback cb, void *cb_data)
 }
 
 void
-axl_tcp_send_flush(AxlTcp *sock, AxlStatus status)
+axl_tcp_send_flush(AxlTcp *sock, bool graceful)
 {
     AxlTcpToken *tok = sock->send_active;
 
@@ -1100,14 +1775,33 @@ axl_tcp_send_flush(AxlTcp *sock, AxlStatus status)
        defer-ring churn for nothing.
 
        The ACTIVE send first — FIFO, it was accepted before everything queued
-       behind it. Its transport token is cancelled by the caller. */
+       behind it. Its Transmit is never cancelled: an abortive close's
+       Close(Abort) retires it, and a graceful close only happens when the
+       active send is fully armed, so TCP sends that last piece ahead of the
+       FIN and the send is done -- AXL_OK, or the failure its last Transmit
+       already completed with. An abortive close discards that piece with the
+       rest: AXL_CANCELLED, every byte still counted as committed. */
     if (tok != NULL) {
+        AxlStatus status = AXL_CANCELLED;
+
         sock->send_active = NULL;
+        if (graceful) {
+            status = AXL_OK;
+            if (axl_backend_event_check(
+                    (AxlEventHandle)sock->tx_token.CompletionToken.Event) == 0) {
+                tok->finished     = !EFI_ERROR(sock->tx_token.CompletionToken.Status);
+                status            = tok->finished ? AXL_OK : AXL_ERR;
+                sock->tx_inflight = false;
+            }
+        }
         tcp_send_park(sock, tok, status);
     }
     while ((tok = tcp_send_dequeue(sock)) != NULL) {
-        tcp_send_park(sock, tok, status);
+        tcp_send_park(sock, tok, AXL_CANCELLED);
     }
+    /* Nothing is on the wire any more: stop pacing this socket before any
+       callback below can free the loop it was paced on. */
+    tcp_pace_update(sock);
 
     /* One pass covers everything: no callback delivered here can add another
        retirement, because the socket is already marked closed and a send from
@@ -1208,6 +1902,8 @@ on_connect_complete(void *data)
 {
     AxlTcp      *sock = data;
     EFI_STATUS   status;
+
+    _axl_net_latency_activity();
 
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
@@ -1400,6 +2096,7 @@ axl_tcp_connect_addr_async(
     sock->on_connect   = cb;
     sock->connect_data = data;
     sock->async_loop   = loop;
+    _axl_net_latency_link(sock);
 
     //
     // Create connect event
@@ -1414,6 +2111,7 @@ axl_tcp_connect_addr_async(
     sock->conn_token.CompletionToken.Event  = conn_event;
     sock->conn_token.CompletionToken.Status = EFI_ABORTED;
 
+    _axl_net_latency_activity();
     status = axl_efi_call(tcp4->Connect, 2, tcp4, &sock->conn_token);
     if (EFI_ERROR(status)) {
         axl_error("async Connect: %llx", (unsigned long long)status);
@@ -1513,4 +2211,25 @@ axl_tcp_connect_async(
 {
     /* Legacy entry point — auto-pick the source interface. */
     return axl_tcp_connect_async_via(host, port, NULL, loop, cancel, cb, data);
+}
+
+size_t
+axl_tcp_send_get_sent(const AxlTcp *sock)
+{
+    return (sock != NULL) ? sock->send_last_sent : 0;
+}
+
+size_t
+axl_tcp_send_queued_bytes(const AxlTcp *sock)
+{
+    size_t n;
+
+    if (sock == NULL || sock->closed || sock->is_listener) {
+        return 0;
+    }
+    n = sock->send_queued_bytes;
+    if (sock->send_active != NULL) {
+        n += sock->send_active->len - sock->send_active->committed;
+    }
+    return n;
 }

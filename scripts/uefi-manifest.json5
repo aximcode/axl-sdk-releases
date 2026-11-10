@@ -313,6 +313,9 @@
     {"name": "EFI_TCP4_RECEIVE_DATA",         "kind": "struct"},
     {"name": "EFI_TCP4_TRANSMIT_DATA",        "kind": "struct"},
     {"name": "EFI_TCP4_IO_TOKEN",             "kind": "struct"},
+    {"name": "EFI_CONNECTION_FIN",            "kind": "define"},
+    {"name": "EFI_CONNECTION_RESET",          "kind": "define"},
+    {"name": "EFI_CONNECTION_REFUSED",        "kind": "define"},
     {"name": "EFI_TCP4_CLOSE_TOKEN",          "kind": "struct"},
     {"name": "EFI_TCP4_GET_MODE_DATA",        "kind": "funcptr"},
     {"name": "EFI_TCP4_CONFIGURE",            "kind": "funcptr"},
@@ -573,5 +576,16 @@
     {"name": "EFI_CPU_GET_TIMER_VALUE",             "kind": "funcptr"},
     {"name": "EFI_CPU_SET_MEMORY_ATTRIBUTES",       "kind": "funcptr"},
     {"name": "EFI_CPU_ARCH_PROTOCOL",               "kind": "struct"}
+  ],
+  // PI Vol 2 §12.10: the firmware's periodic tick. axl_timer_resolution_begin()
+  // raises it (Windows' timeBeginPeriod over SetTimerPeriod); the tick is the
+  // floor under every timer event and every network poll.
+  "timer-arch.h": [
+    {"name": "EFI_TIMER_NOTIFY",                    "kind": "funcptr"},
+    {"name": "EFI_TIMER_REGISTER_HANDLER",          "kind": "funcptr"},
+    {"name": "EFI_TIMER_SET_TIMER_PERIOD",          "kind": "funcptr"},
+    {"name": "EFI_TIMER_GET_TIMER_PERIOD",          "kind": "funcptr"},
+    {"name": "EFI_TIMER_GENERATE_SOFT_INTERRUPT",   "kind": "funcptr"},
+    {"name": "EFI_TIMER_ARCH_PROTOCOL",             "kind": "struct"}
   ]
 }

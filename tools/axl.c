@@ -17,7 +17,7 @@
         axl.efi --help        (lists every tool with one-line help)
         axl.efi <tool> --help (forwards --help to the named tool)
 
-    AXL_BUSYBOX is purely opt-in. The default `make tools` build
+    AXL_BUSYBOX is purely opt-in. The default `tools` goal build
     leaves each tool as its own .efi; this binary is an alternative
     deployment shape for users who'd rather copy one file to a USB
     stick than 18.
@@ -47,12 +47,14 @@ extern int axl_tool_ipmi_main(int argc, char **argv);
 extern int axl_tool_lspci_main(int argc, char **argv);
 extern int axl_tool_lsproto_main(int argc, char **argv);
 extern int axl_tool_lsusb_main(int argc, char **argv);
+extern int axl_tool_md5sum_main(int argc, char **argv);
 extern int axl_tool_memspd_main(int argc, char **argv);
 extern int axl_tool_mkfixture_main(int argc, char **argv);
 extern int axl_tool_mkrd_main(int argc, char **argv);
 extern int axl_tool_netinfo_main(int argc, char **argv);
 extern int axl_tool_rfbrowse_main(int argc, char **argv);
 extern int axl_tool_rndisfix_main(int argc, char **argv);
+extern int axl_tool_sha256sum_main(int argc, char **argv);
 extern int axl_tool_sysinfo_main(int argc, char **argv);
 extern int axl_tool_timetest_main(int argc, char **argv);
 extern int axl_tool_tr_main(int argc, char **argv);
@@ -79,12 +81,14 @@ static const Tool tools[] = {
     { "lspci",     axl_tool_lspci_main,     "List PCI devices + bridges"         },
     { "lsproto",   axl_tool_lsproto_main,   "List UEFI protocols by spec name"   },
     { "lsusb",     axl_tool_lsusb_main,     "List USB devices and topology"      },
+    { "md5sum",    axl_tool_md5sum_main,    "Print or check MD5 checksums"       },
     { "memspd",    axl_tool_memspd_main,    "Read DDR4 / DDR5 SPD via SMBus"     },
     { "mkfixture", axl_tool_mkfixture_main, "Build a test fixture image"        },
     { "mkrd",      axl_tool_mkrd_main,      "Create / list / remove RAM disks"   },
     { "netinfo",   axl_tool_netinfo_main,   "Network diagnostics + ping"         },
     { "rfbrowse",  axl_tool_rfbrowse_main,  "Redfish browser"                    },
     { "rndisfix",  axl_tool_rndisfix_main,  "RNDIS NIC quirk handler"            },
+    { "sha256sum", axl_tool_sha256sum_main, "Print or check SHA-256 checksums"   },
     { "sysinfo",   axl_tool_sysinfo_main,   "Firmware / SMBIOS / memory inventory"},
     { "timetest",  axl_tool_timetest_main,  "Time / monotonic clock probes"      },
     { "tr",        axl_tool_tr_main,        "Translate/squeeze/delete bytes"     },

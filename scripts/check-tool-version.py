@@ -9,7 +9,8 @@ TARGET tools answer through AXL_TOOL_MAIN, which routes argv into
 axl_version_handle() before the tool body ever runs. A tool that spells
 its entry point some other way silently loses --version, and nothing
 else about it looks wrong. Checked statically against TOOL_NAMES -- the
-Makefile's own list, not a second copy that would drift from it.
+build's own list (scripts/axl-lists.conf), not a second copy that would
+drift from it.
 
 HOST commands answer through axl_handle_version() (bash) or
 axl_version.py (argparse). Checked by RUNNING them: the flag existing in
@@ -66,16 +67,16 @@ def fail(msg: str) -> None:
 def main() -> int:
     errors = 0
 
-    # ---- target tools: AXL_TOOL_MAIN, from the Makefile's own list --------
-    out = subprocess.run(["make", "-s", "print-TOOL_NAMES"], cwd=ROOT,
+    # ---- target tools: AXL_TOOL_MAIN, from the build's own list ----------
+    out = subprocess.run(["bash", str(SCRIPTS / "axl-list.sh"), "TOOL_NAMES"], cwd=ROOT,
                          capture_output=True, text=True, check=False)
     if out.returncode != 0:
-        fail("could not read TOOL_NAMES from the Makefile")
+        fail("could not read TOOL_NAMES (scripts/axl-list.sh)")
         return 1
-    extra = subprocess.run(["make", "-s", "print-TOOL_EXTRA_APPS"], cwd=ROOT,
+    extra = subprocess.run(["bash", str(SCRIPTS / "axl-list.sh"), "TOOL_EXTRA_APPS"], cwd=ROOT,
                            capture_output=True, text=True, check=False)
     if extra.returncode != 0:
-        fail("could not read TOOL_EXTRA_APPS from the Makefile")
+        fail("could not read TOOL_EXTRA_APPS (scripts/axl-list.sh)")
         return 1
     names = out.stdout.split() + extra.stdout.split()
     if not names:
@@ -84,7 +85,7 @@ def main() -> int:
     for name in names:
         src = ROOT / "tools" / f"{name}.c"
         if not src.is_file():
-            fail(f"{name}: no tools/{name}.c for a name the Makefile builds")
+            fail(f"{name}: no tools/{name}.c for a name the build builds (TOOL_NAMES)")
             errors += 1
             continue
         # The INVOCATION, not the substring: "AXL_TOOL_MAIN" also occurs
@@ -172,14 +173,14 @@ def main() -> int:
     # The set ships in two layouts (install.sh -> <prefix>/libexec/axl,
     # release.yml -> the host-tools tarball). They were two hand-written lists
     # until axl_version.py went into one and not the other, which shipped a
-    # tarball whose four Python tools all died on import. The Makefile owns it
-    # now; this checks the owner is right AND that nobody has quietly gone back
+    # tarball whose four Python tools all died on import. scripts/axl-lists.conf
+    # owns it now; this checks the owner is right AND that nobody has quietly gone back
     # to a literal list.
-    ht = subprocess.run(["make", "-s", "print-HOST_TOOL_FILES"], cwd=ROOT,
+    ht = subprocess.run(["bash", str(SCRIPTS / "axl-list.sh"), "HOST_TOOL_FILES"], cwd=ROOT,
                         capture_output=True, text=True, check=False)
     files = ht.stdout.split()
     if ht.returncode != 0 or not files:
-        fail("could not read HOST_TOOL_FILES from the Makefile")
+        fail("could not read HOST_TOOL_FILES (scripts/axl-list.sh)")
         errors += 1
     else:
         if "axl_version.py" not in files:
@@ -196,11 +197,13 @@ def main() -> int:
     # DELEGATE rather than read the list itself, or a third copy could quietly
     # grow back inline where nothing but a release run would ever see it.
     for consumer, needle, why in (
-            (SCRIPTS / "install.sh", "print-HOST_TOOL_FILES",
+            # The SDK prefix's staging is install() rules since 2026-11-10.
+            (ROOT / "cmake/AxlInstallHostTools.cmake", "scripts/axl-list.sh HOST_TOOL_FILES",
              "it has its own copy of the host-tool list, which is how they drifted"),
-            (SCRIPTS / "make-host-tools-tarball.sh", "print-HOST_TOOL_FILES",
-             "it has its own copy of the host-tool list, which is how they drifted"),
-            (ROOT / ".github/workflows/release.yml", "make-host-tools-tarball.sh",
+            # The host-tools archive's rules call the same function.
+            (ROOT / "packaging/host-tools/CMakeLists.txt", "axl_install_host_tools(host_tools)",
+             "it stages the host tools its own way again, which is how the two drifted"),
+            (ROOT / ".github/workflows/release.yml", "make-release-assets.sh host-tools",
              "it assembles the host-tools tarball inline again, which puts the "
              "list back where only a release run can check it")):
         if needle not in consumer.read_text(encoding="utf-8"):
@@ -214,7 +217,7 @@ def main() -> int:
     # the expected output of each one.
     #
     # THE SOURCE MODE MUST AGREE WITH THE SHEBANG, and that is checked rather
-    # than assumed. `scripts/stage-host-tools.sh` decides what is staged as a
+    # than assumed. The install rule (cmake/AxlInstallHostTools.cmake) decides what is staged as a
     # command from the shebang -- a file that cannot be run is not a command --
     # while this gate reads the source's exec bit. Those are two spellings of
     # one question, and they disagreed: gdb-sample.py is loaded INSIDE gdb and
@@ -235,7 +238,7 @@ def main() -> int:
             if executable != shebang:
                 fail(f"{fname} is mode {src.stat().st_mode & 0o777:o} but "
                      f"{'has' if shebang else 'has no'} shebang -- the two must "
-                     f"agree, because stage-host-tools.sh stages by the shebang "
+                     f"agree, because the install rule stages by the shebang "
                      f"and this gate reads the mode")
                 errors += 1
             if not executable:

@@ -138,6 +138,7 @@ typedef struct _EFI_SYSTEM_CONTEXT_X64 EFI_SYSTEM_CONTEXT_X64;
 typedef struct _EFI_SYSTEM_CONTEXT_AARCH64 EFI_SYSTEM_CONTEXT_AARCH64;
 typedef union _EFI_SYSTEM_CONTEXT EFI_SYSTEM_CONTEXT;
 typedef struct _EFI_CPU_ARCH_PROTOCOL EFI_CPU_ARCH_PROTOCOL;
+typedef struct _EFI_TIMER_ARCH_PROTOCOL EFI_TIMER_ARCH_PROTOCOL;
 
 #include "tables.h"
 #include "console.h"
@@ -151,6 +152,7 @@ typedef struct _EFI_CPU_ARCH_PROTOCOL EFI_CPU_ARCH_PROTOCOL;
 #include "smbus.h"
 #include "i2c.h"
 #include "cpu-arch.h"
+#include "timer-arch.h"
 #include "guids.h"
 
 

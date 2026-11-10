@@ -3,7 +3,7 @@
 # test-host-tools-tarball.sh -- the host-tools tarball, built and unpacked.
 #
 # WHY THIS EXISTS. This archive was assembled INLINE in release.yml, and
-# make-sdk-tarball.sh's own header named that as the defect: "the host-tools
+# the retired make-sdk-tarball.sh's header named that as the defect: "the host-tools
 # tarball IS assembled inline below and is exactly the kind of thing that then
 # has no local reproduction." Everything about it -- its name, its layout, that
 # its commands run -- could only be checked by cutting a release.
@@ -35,7 +35,8 @@ source "$SCRIPT_DIR/common-test.sh"
 set +e
 set -uo pipefail
 
-MAKER="$PROJECT_DIR/scripts/make-host-tools-tarball.sh"
+# The release's own command: CPack over packaging/host-tools' install rules.
+MAKER="$PROJECT_DIR/scripts/make-release-assets.sh"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
 WORK="$(mktemp -d -t axl-httar.XXXXXXXX)"; trap 'rm -rf "$WORK"' EXIT
@@ -53,20 +54,20 @@ echo "=== host-tools tarball ==="
 echo ""
 
 if [[ ! -x "$MAKER" ]]; then
-    test_host_fail "scripts/make-host-tools-tarball.sh is executable"
+    test_host_fail "scripts/make-release-assets.sh is executable"
     test_host_summary "host-tools-tarball"
     exit 1
 fi
-test_host_pass "scripts/make-host-tools-tarball.sh is executable"
+test_host_pass "scripts/make-release-assets.sh is executable"
 
 OUT="$WORK/dist"
-if ! "$MAKER" --out "$OUT" > "$WORK/build.log" 2>&1; then
-    test_host_fail "make-host-tools-tarball.sh succeeds"
+if ! "$MAKER" host-tools --out "$OUT" > "$WORK/build.log" 2>&1; then
+    test_host_fail "make-release-assets.sh host-tools succeeds"
     tail -12 "$WORK/build.log" | sed 's/^/      /'
     test_host_summary "host-tools-tarball"
     exit 1
 fi
-test_host_pass "make-host-tools-tarball.sh succeeds"
+test_host_pass "make-release-assets.sh host-tools succeeds"
 
 TARBALL="$OUT/axl-sdk-host-tools-${VERSION}.tar.gz"
 [[ -f "$TARBALL" ]]
@@ -136,8 +137,8 @@ check $? "the staged install.sh is mode 0644, not a subcommand (got $perm)"
 # THE RULE WAS APPLIED, asserted against every tool rather than against a list
 # of names. `axl` offers exactly the EXECUTABLES in libexec/axl, so the mode
 # bit is not a detail of the copy -- it IS the declaration "this is a command"
-# -- and scripts/stage-host-tools.sh decides it from the file itself: a
-# shebang is the manifest. This archive is the OTHER staging path for the same
+# -- and the install rule (cmake/AxlInstallHostTools.cmake) decides it from
+# the file itself: a shebang is the manifest. This archive is the OTHER staging path for the same
 # file list, and it used to install everything 0755 with one hand-written
 # exception, so `axl common` (a sourced library) and `axl gdb-sample` (loaded
 # INSIDE gdb, no shebang at all) both shipped 0755 in v4.7.0 and were offered
@@ -146,10 +147,12 @@ check $? "the staged install.sh is mode 0644, not a subcommand (got $perm)"
 # Naming the two here would have made this test a FOURTH copy of the same list,
 # in the test for a change whose whole thesis is that the second copy is what
 # drifted -- and it would not notice an eleventh tool arriving shebang-less and
-# staged 755. Sourcing the rule and comparing against it is what proves the
-# rule was applied.
-# shellcheck source=../../scripts/stage-host-tools.sh
-source "$PROJECT_DIR/scripts/stage-host-tools.sh"
+# staged 755. So the RULE is restated here, as the oracle -- in shell, beside
+# the CMake that applies it, so a mistake in either shows as a disagreement:
+# a file that starts with #! is a command (755), anything else is not (644).
+axl_host_tool_mode() {
+    if [[ "$(head -c2 "$1" 2>/dev/null)" == '#!' ]]; then printf '755'; else printf '644'; fi
+}
 mode_bad=""
 mode_n=0
 while read -r _f; do
@@ -158,7 +161,7 @@ while read -r _f; do
     want="$(axl_host_tool_mode "$PROJECT_DIR/scripts/$_f")"
     got="$(stat -c '%a' "$ROOT/libexec/axl/$_f" 2>/dev/null)"
     [[ "$got" == "$want" ]] || mode_bad="$mode_bad $_f($got,want $want)"
-done < <(make -s -C "$PROJECT_DIR" print-HOST_TOOL_FILES | tr ' ' '\n')
+done < <("$PROJECT_DIR/scripts/axl-list.sh" HOST_TOOL_FILES | tr ' ' '\n')
 [[ "$mode_n" -gt 5 && -z "$mode_bad" ]]
 check $? "all $mode_n staged tools carry the mode the shebang rule gives them${mode_bad:+ --$mode_bad}"
 

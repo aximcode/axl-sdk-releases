@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=X64 needs= est=31 local-only=1
+# test-meta: arch=both needs= est=31 local-only=1 guest=plain
 # test-tools-qemu — behavioral coverage for the CLI tools that the
 # happy-path output test (test-tools.sh) doesn't reach: EXIT CODES
 # (%lasterror%), ERROR/failure paths (missing file, bad args), and the
@@ -43,7 +43,7 @@ _arch_lc=$(echo "$TEST_ARCH" | tr 'A-Z' 'a-z')
 NATIVE_DIR="$(test_build_dir)"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 
-make -C "$PROJECT_DIR" ARCH="$_arch_lc" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_arch_lc" \
     tools 2>&1 | tail -1
 
 TOOLS_DIR="$NATIVE_DIR/tools"
@@ -57,7 +57,9 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 # ---------------------------------------------------------------------------
-# Fixtures staged on the ESP root (fs0:).
+# Fixtures staged beside the tools. The cases name them relatively (the
+# Shell's current directory: the boot disk's root, or a pooled run's own
+# directory), so the battery runs on a leased guest too.
 # ---------------------------------------------------------------------------
 printf 'AximCode axl-sdk sample\nsecond line has axl in it\nthe quick brown fox\n' \
     > "$WORK/sample.txt"
@@ -89,20 +91,20 @@ tc() {
 #
 # Exit convention: 0 = success, 1 = "negative result" (no match / usage error
 # via the args layer), 2 = trouble (couldn't open a file). None show "Aborted".
-tc grep_match     0 "axl"            - -- grep.efi axl fs0:\\sample.txt
-tc grep_nomatch   1 -                Aborted -- grep.efi zzznope fs0:\\sample.txt
-tc grep_missing   2 "cannot open"    Aborted -- grep.efi axl fs0:\\nosuch.txt
+tc grep_match     0 "axl"            - -- grep.efi axl sample.txt
+tc grep_nomatch   1 -                Aborted -- grep.efi zzznope sample.txt
+tc grep_missing   2 "cannot open"    Aborted -- grep.efi axl nosuch.txt
 tc grep_badargs   1 "Usage"          Aborted -- grep.efi
 # --- find: nonexistent must NOT print the bogus path, must error ------------
-tc find_existing  0 "sample.txt"     - -- find.efi fs0:\\sample.txt
-tc find_missing   2 "no such"        - -- find.efi fs0:\\MIKE
+tc find_existing  0 "sample.txt"     - -- find.efi sample.txt
+tc find_missing   2 "no such"        - -- find.efi MIKE
 # --- generic tool failures explain themselves, no "Aborted" -----------------
-tc hexdump_missing 2 "annot"         Aborted -- hexdump.efi fs0:\\nosuch.txt
-tc cat_missing     2 "annot"         Aborted -- cat.efi fs0:\\nosuch.txt
-tc sed_missing     2 "annot"         Aborted -- sed.efi s/a/b/ fs0:\\nosuch.txt
+tc hexdump_missing 2 "annot"         Aborted -- hexdump.efi nosuch.txt
+tc cat_missing     2 "annot"         Aborted -- cat.efi nosuch.txt
+tc sed_missing     2 "annot"         Aborted -- sed.efi s/a/b/ nosuch.txt
 # --- tar -f (GNU/BSD compat): create then list, in sequence -----------------
-tc tar_create_f   0 -                Aborted -- tar.efi -cf fs0:\\t.tar sample.txt
-tc tar_list_f     0 "sample.txt"     Aborted -- tar.efi -tf fs0:\\t.tar
+tc tar_create_f   0 -                Aborted -- tar.efi -cf t.tar sample.txt
+tc tar_list_f     0 "sample.txt"     Aborted -- tar.efi -tf t.tar
 # --- dmidecode: runs, records grouped by type (Type 0 before Type 1) --------
 tc dmi_type0      0 "DMI type 0"     Aborted -- dmidecode.efi -t 0
 # --- universal -b / --page: accepted (never "unknown flag"), output still
@@ -114,9 +116,9 @@ tc pagebreak_b   0 "DMI type 0"     Aborted -- dmidecode.efi -b -t 0
 tc pagebreak_long 0 "DMI type 0"    Aborted -- dmidecode.efi --page -t 0
 # --- smoke: common tools run clean (exit 0) ---------------------------------
 tc sysinfo_smoke  0 -                Aborted -- sysinfo.efi arch
-tc hexdump_smoke  0 "00000000"       Aborted -- hexdump.efi fs0:\\sample.txt
-tc cat_smoke      0 "AximCode"       Aborted -- cat.efi fs0:\\sample.txt
-tc grep_count     0 -                Aborted -- grep.efi -c axl fs0:\\sample.txt
+tc hexdump_smoke  0 "00000000"       Aborted -- hexdump.efi sample.txt
+tc cat_smoke      0 "AximCode"       Aborted -- cat.efi sample.txt
+tc grep_count     0 -                Aborted -- grep.efi -c axl sample.txt
 
 # ---------------------------------------------------------------------------
 # Build the diagnostic nsh from the case table. Markers avoid '-' and '#'

@@ -1,0 +1,2 @@
+  FAIL: flaky
+TIMING: runner test=test-retry.sh attempt=1 via=boot wall=4.000 cpu=2.000 rc=1

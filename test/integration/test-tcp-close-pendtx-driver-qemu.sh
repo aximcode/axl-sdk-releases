@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=18 local-only=0
+# test-meta: arch=x64 needs= est=18 local-only=0 guest=standard
 # test-tcp-close-pendtx-driver-qemu.sh — a GRACEFUL EFI_TCP4.Close() must not
 # wedge a resident driver-tick loop when the connection still has un-flushed
 # outbound TCP data.
@@ -36,27 +36,13 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting HTTPS+WS pending-TX close server (resident driver-tick loop)...
-AxlTestNet.efi serve-tls-ws-close-pendtx-driver
-NSHEOF
+# The startup commands live in test-tcp-close-pendtx-driver-qemu.nsh
+test_use_nsh
 
 test_build_image
 
@@ -69,8 +55,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for HTTPS+WS server..."
 
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: server did not start within 60 seconds"
+if ! test_wait_boot "READY" 60; then
+    echo "FAIL: server did not start within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
@@ -87,7 +73,7 @@ pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 # Step 1 — baseline.
-RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" 2>/dev/null || true)
+RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" || true)
 CODE=$(echo "$RESP" | tail -1)
 [[ "$CODE" == "200" ]] && pass "HTTPS GET baseline returns 200" \
                        || fail "HTTPS GET baseline (got '$CODE')"
@@ -169,7 +155,7 @@ echo "$WS_RESULT" | grep -qE "WS_ATTEMPTS_OK|CONN_._ERROR" \
 
 # Step 3 — verdict: the loop must still serve after resetting conns with pending TX.
 sleep 1
-RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" 2>/dev/null || true)
+RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" || true)
 CODE=$(echo "$RESP" | tail -1)
 [[ "$CODE" == "200" ]] && pass "HTTPS GET after pending-TX closes returns 200 (loop NOT wedged)" \
                        || fail "HTTPS GET after pending-TX closes (got '$CODE') — LOOP WEDGED"

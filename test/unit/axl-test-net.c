@@ -13,6 +13,13 @@
 #include <axl/axl-console-mirror.h>
 #include <axl/axl-file-view.h>   /* read-back of the edited file (rung 3) */
 #include <axl/axl-9p.h>
+#include <axl/axl-ramdisk.h>  /* serve-davfs: a small volume a PUT can fill */
+#include "axl-test-flushfail-fs.h"  /* serve-davfs: a case-SENSITIVE volume */
+#include "../../src/fs/axl-fs-internal.h"         /* serve-fs: volume facts, Ctrl-C hook */
+#include "../../src/runtime/axl-signal-internal.h"  /* serve-fs COPY: a raised Ctrl-C */
+#include "../../src/net/axl-http-core-internal.h"  /* request line version, head */
+#include "../../src/net/axl-http-client-internal.h"  /* the request builder */
+#include "../../src/net/axl-tcp-internal.h"  /* linger seams */
 #include <uefi/axl-uefi.h>   /* gST + console protocols for mirror-selftest */
 
 AXL_LOG_DOMAIN("test");
@@ -31,6 +38,64 @@ AXL_LOG_DOMAIN("test");
    port so the guest-side test code can target it directly. */
 #define AXL_TEST_UDP_ECHO_HOST  "10.0.2.2"
 #define AXL_TEST_UDP_ECHO_PORT  35555
+
+// ---------------------------------------------------------------------------
+// Generated-header pointer-signature guards (compile-time only)
+//
+// scripts/generate-uefi-headers.py's clean_text() used to strip the `*`
+// from every "IN <scalar-type> *Name" parameter on the theory that a
+// scalar IN parameter is never a pointer. That theory is false: several
+// real UEFI/PI prototypes pass a scalar-typed OPTIONAL parameter BY
+// POINTER (NULL means "not supplied"), and the blanket regex silently
+// corrupted them. Pin the three signatures it used to get wrong so a
+// regenerate-time regression fails the build instead of shipping a
+// pass-by-value vtable slot where the firmware expects a pointer.
+// ---------------------------------------------------------------------------
+
+typedef
+EFI_STATUS
+(EFIAPI *AxlTestExpectedSnpTransmit) (
+    IN EFI_SIMPLE_NETWORK_PROTOCOL  *This,
+    IN UINTN                         HeaderSize,
+    IN UINTN                         BufferSize,
+    IN VOID                         *Buffer,
+    IN EFI_MAC_ADDRESS               *SrcAddr OPTIONAL,
+    IN EFI_MAC_ADDRESS               *DestAddr OPTIONAL,
+    IN UINT16                        *Protocol OPTIONAL
+    );
+_Static_assert(
+    __builtin_types_compatible_p(EFI_SIMPLE_NETWORK_TRANSMIT, AxlTestExpectedSnpTransmit),
+    "EFI_SIMPLE_NETWORK_TRANSMIT.Protocol must be UINT16 *, not UINT16 "
+    "(UEFI spec 24.1.13: 'IN UINT16 *Protocol OPTIONAL')");
+
+typedef
+EFI_STATUS
+(EFIAPI *AxlTestExpectedMpEnableDisableAp) (
+    IN EFI_MP_SERVICES_PROTOCOL  *This,
+    IN UINTN                      ProcessorNumber,
+    IN BOOLEAN                    EnableAP,
+    IN UINT32                    *HealthFlag OPTIONAL
+    );
+_Static_assert(
+    __builtin_types_compatible_p(EFI_MP_SERVICES_ENABLEDISABLEAP, AxlTestExpectedMpEnableDisableAp),
+    "EFI_MP_SERVICES_ENABLEDISABLEAP.HealthFlag must be UINT32 *, not UINT32 "
+    "(PI spec: 'If not NULL, a pointer to a value...')");
+
+typedef
+EFI_STATUS
+(EFIAPI *AxlTestExpectedDhcp4Build) (
+    IN EFI_DHCP4_PROTOCOL         *This,
+    IN EFI_DHCP4_PACKET           *SeedPacket,
+    IN UINT32                      DeleteCount,
+    IN UINT8                      *DeleteList OPTIONAL,
+    IN UINT32                      AppendCount,
+    IN EFI_DHCP4_PACKET_OPTION    *AppendList[] OPTIONAL,
+    OUT EFI_DHCP4_PACKET          **NewPacket
+    );
+_Static_assert(
+    __builtin_types_compatible_p(EFI_DHCP4_BUILD, AxlTestExpectedDhcp4Build),
+    "EFI_DHCP4_BUILD.DeleteList must be UINT8 *, not UINT8 "
+    "(UEFI spec: 'Ignored if DeleteCount is zero', NULL-checked)");
 
 // ---------------------------------------------------------------------------
 // URL Parsing Tests (no network needed)
@@ -422,6 +487,36 @@ test_http_parse_status(void)
     test_check(code == 200, "HTTP status code 200");
 }
 
+/* A status line holds no control character but HTAB (RFC 9112 4: the
+   reason phrase is HTAB / SP / VCHAR / obs-text), as the request line
+   holds none: a bare CR, NUL or another control inside it fails. */
+static int
+status_rc(
+    const char *line,
+    size_t      len
+    )
+{
+    size_t code = 0;
+    return axl_http_parse_status_line(line, len, &code);
+}
+
+static void
+test_http_parse_status_strict(void)
+{
+    static const char ok1[] = "HTTP/1.1 200 OK\tfine \x80";
+    static const char cr[]  = "HTTP/1.1 200 O\rK";
+    static const char nul[] = "HTTP/1.1 200 O\0K";
+    static const char ctl[] = "HTTP/1.1 200 O\x01K";
+    static const char del[] = "HTTP/1.1 200 O\x7fK";
+    test_check(status_rc(ok1, sizeof(ok1) - 1) == AXL_OK,
+               "HTTP status line: HTAB and obs-text in the reason are accepted");
+    test_check(status_rc(cr, sizeof(cr) - 1) == AXL_ERR
+               && status_rc(nul, sizeof(nul) - 1) == AXL_ERR
+               && status_rc(ctl, sizeof(ctl) - 1) == AXL_ERR
+               && status_rc(del, sizeof(del) - 1) == AXL_ERR,
+               "HTTP status line: a bare CR, NUL, another control or DEL fails it");
+}
+
 static void
 test_http_parse_request(void)
 {
@@ -465,6 +560,623 @@ test_http_parse_headers(void)
     }
 }
 
+/* axl_http_get_content_length never hands back a wrapped or partial
+   number: a value that is not all digits, or does not fit below SIZE_MAX,
+   is SIZE_MAX ("not a usable length"), at 2^64-1 and 2^64+1 alike --
+   2^64+1 used to wrap to 1, and "42abc" read as 42. */
+static size_t
+cl_of(const char *value)
+{
+    AxlHashTable *h = axl_hash_table_new_full(axl_str_hash, axl_str_equal,
+                                              axl_free_impl, axl_free_impl);
+    if (h != NULL && value != NULL) {
+        axl_hash_table_replace(h, axl_strdup("content-length"), axl_strdup(value));
+    }
+    size_t n = axl_http_get_content_length(h);
+    axl_hash_table_free(h);
+    return n;
+}
+
+static void
+test_http_content_length_strict(void)
+{
+    test_check(cl_of("42") == 42 && cl_of(NULL) == 0 && cl_of("0") == 0
+               && cl_of("18446744073709551614") == SIZE_MAX - 1,
+               "Content-Length: valid values read as themselves, absent is 0");
+    test_check(cl_of("18446744073709551615") == SIZE_MAX
+               && cl_of("18446744073709551617") == SIZE_MAX
+               && cl_of("99999999999999999999999") == SIZE_MAX,
+               "Content-Length: 2^64-1, 2^64+1 and longer are SIZE_MAX, never wrapped");
+    test_check(cl_of("42abc") == SIZE_MAX && cl_of("") == SIZE_MAX && cl_of("-1") == SIZE_MAX,
+               "Content-Length: a value not all digits is SIZE_MAX, not its prefix");
+
+    /* The strict form tells "refused" from a length: the server's 400. */
+    AxlHashTable *h = axl_hash_table_new_full(axl_str_hash, axl_str_equal,
+                                              axl_free_impl, axl_free_impl);
+    size_t n1 = 1, n2 = 1, n3 = 1, n4 = 1;
+    int    r1 = AXL_ERR, r2 = AXL_ERR, r3 = AXL_ERR, r4 = AXL_ERR;
+    if (h != NULL) {
+        r1 = axl_http_parse_content_length(h, &n1);   /* absent */
+        axl_hash_table_replace(h, axl_strdup("content-length"),
+                               axl_strdup("18446744073709551614"));
+        r2 = axl_http_parse_content_length(h, &n2);
+        axl_hash_table_replace(h, axl_strdup("content-length"),
+                               axl_strdup("18446744073709551615"));
+        r3 = axl_http_parse_content_length(h, &n3);
+        axl_hash_table_replace(h, axl_strdup("content-length"),
+                               axl_strdup("18446744073709551617"));
+        r4 = axl_http_parse_content_length(h, &n4);
+    }
+    axl_hash_table_free(h);
+    test_check(r1 == AXL_OK && n1 == 0 && r2 == AXL_OK && n2 == SIZE_MAX - 1
+               && r3 == AXL_INVALID && n3 == 0 && r4 == AXL_INVALID && n4 == 0,
+               "Content-Length strict: absent 0, 2^64-2 read, 2^64-1 and 2^64+1 AXL_INVALID");
+}
+
+/* axl_http_parse_headers parses a WHOLE header block or fails: it never
+   stops silently partway (a bare CR once ended it there, so the headers
+   behind it -- a Content-Length, a Transfer-Encoding -- were never read).
+   Lines end at CRLF and nowhere else; a bare CR or LF, NUL or another
+   control character (HTAB aside) in a value, a name that is not an RFC 9110
+   token, a line with no colon, and a second Content-Length or
+   Transfer-Encoding line all fail the block. */
+static int
+hdr_parse(const void *data, size_t len)
+{
+    AxlHashTable *t  = NULL;
+    int           rc = axl_http_parse_headers(data, len, &t);
+    axl_hash_table_free(t);
+    return rc;
+}
+
+static void
+test_http_parse_headers_strict(void)
+{
+    static const char ok1[] = "A: 1\r\nB: x\ty\r\nC: caf\xc3\xa9\r\n\r\n";
+    static const char cr1[] = "X: a\rContent-Length: 5\r\n\r\n";
+    static const char lf1[] = "X: a\nContent-Length: 5\r\n\r\n";
+    static const char nul[] = "X: a\0b\r\n\r\n";
+    static const char ctl[] = "X: a\x01" "b\r\n\r\n";
+    static const char del[] = "X: a\x7f\r\n\r\n";
+    static const char nm1[] = "Content(Length: 5\r\n\r\n";
+    static const char nm2[] = "Con\0tent: 5\r\n\r\n";
+    static const char nm3[] = "X@Y: 5\r\n\r\n";
+    static const char dup[] = "Content-Length: 5\r\nContent-Length: 5\r\n\r\n";
+    static const char dte[] = "Transfer-Encoding: chunked\r\ntransfer-encoding: chunked\r\n\r\n";
+    static const char nco[] = "NoColon\r\n\r\n";
+    static const char fol[] = "A: 1\r\n  folded\r\n\r\n";
+    static const char cut[] = "A: 1\r\nB: 2";
+    static const char cu2[] = "A: 1\r\nB: 2\r\n";
+    test_check(hdr_parse(ok1, sizeof(ok1) - 1) == AXL_OK,
+               "HTTP headers strict: HTAB and obs-text in a value are accepted");
+    test_check(hdr_parse(cr1, sizeof(cr1) - 1) == AXL_ERR
+               && hdr_parse(lf1, sizeof(lf1) - 1) == AXL_ERR,
+               "HTTP headers strict: a bare CR or a bare LF fails the block (not a silent stop)");
+    test_check(hdr_parse(nul, sizeof(nul) - 1) == AXL_ERR
+               && hdr_parse(ctl, sizeof(ctl) - 1) == AXL_ERR
+               && hdr_parse(del, sizeof(del) - 1) == AXL_ERR,
+               "HTTP headers strict: NUL, another control character or DEL in a value fails");
+    test_check(hdr_parse(nm1, sizeof(nm1) - 1) == AXL_ERR
+               && hdr_parse(nm2, sizeof(nm2) - 1) == AXL_ERR
+               && hdr_parse(nm3, sizeof(nm3) - 1) == AXL_ERR,
+               "HTTP headers strict: a name that is not a token fails");
+    test_check(hdr_parse(dup, sizeof(dup) - 1) == AXL_ERR
+               && hdr_parse(dte, sizeof(dte) - 1) == AXL_ERR
+               && hdr_parse(nco, sizeof(nco) - 1) == AXL_ERR
+               && hdr_parse(fol, sizeof(fol) - 1) == AXL_ERR,
+               "HTTP headers strict: a second CL or TE line, no colon, obs-fold fail");
+    test_check(hdr_parse(cut, sizeof(cut) - 1) == AXL_ERR
+               && hdr_parse(cu2, sizeof(cu2) - 1) == AXL_ERR,
+               "HTTP headers strict: a block cut before its empty line fails, not half-parsed");
+
+    char *m1 = NULL, *p1 = NULL, *q1 = NULL;
+    static const char rl_cr[]  = "GET /a\rb HTTP/1.1";
+    static const char rl_tab[] = "GET\t/a HTTP/1.1";
+    static const char rl_nul[] = "GET /a\0 HTTP/1.1";
+    int r1 = axl_http_parse_request_line(rl_cr, sizeof(rl_cr) - 1, &m1, &p1, &q1);
+    axl_free(m1); axl_free(p1); axl_free(q1); m1 = p1 = q1 = NULL;
+    int r2 = axl_http_parse_request_line(rl_tab, sizeof(rl_tab) - 1, &m1, &p1, &q1);
+    axl_free(m1); axl_free(p1); axl_free(q1); m1 = p1 = q1 = NULL;
+    int r3 = axl_http_parse_request_line(rl_nul, sizeof(rl_nul) - 1, &m1, &p1, &q1);
+    axl_free(m1); axl_free(p1); axl_free(q1);
+    test_check(r1 == AXL_ERR && r2 == AXL_ERR && r3 == AXL_ERR,
+               "HTTP request line: a bare CR, a tab or a NUL fails it");
+}
+
+/* A field value is read without its optional whitespace -- spaces and tabs
+   before and after it (RFC 9110 5.5); whitespace inside it stays. */
+static void
+test_http_parse_headers_ows(void)
+{
+    const char   *hdrs = "Content-Length: 5 \r\nX-Tab:\t7\r\nX-Both: \t a b \t\r\n"
+                         "X-Empty: \t \r\n\r\n";
+    AxlHashTable *table = NULL;
+    int           status = axl_http_parse_headers(hdrs, axl_strlen(hdrs), &table);
+    const char   *cl = (table != NULL) ? axl_hash_table_lookup(table, "content-length") : NULL;
+    const char   *tb = (table != NULL) ? axl_hash_table_lookup(table, "x-tab") : NULL;
+    const char   *bo = (table != NULL) ? axl_hash_table_lookup(table, "x-both") : NULL;
+    const char   *em = (table != NULL) ? axl_hash_table_lookup(table, "x-empty") : NULL;
+    test_check(status == 0 && cl != NULL && axl_strcmp(cl, "5") == 0
+               && tb != NULL && axl_strcmp(tb, "7") == 0
+               && bo != NULL && axl_strcmp(bo, "a b") == 0
+               && em != NULL && axl_strcmp(em, "") == 0,
+               "HTTP header values: leading and trailing spaces and tabs trimmed, inner kept");
+    axl_hash_table_free(table);
+}
+
+/* A RESPONSE is read with a user agent's rules (RFC 9112 2.2, 5.1, 5.2,
+   6.3): an obs-fold is unfolded to one SP, identical Content-Lengths
+   merge and differing ones fail, other control characters are kept,
+   whitespace before a colon is trimmed, any name is accepted, a second
+   Host is not checked, and a bare LF ends a line. A bare CR, a NUL, a cut
+   block and a second Transfer-Encoding still fail. @p want_name /
+   @p want_val: one field that must read back exactly (NULL = none). */
+static bool
+resp_hdr_is(
+    const void *data,
+    size_t      len,
+    const char *want_name,
+    const char *want_val
+    )
+{
+    AxlHashTable *t  = NULL;
+    int           rc = axl_http_parse_response_headers(data, len, &t);
+    const char   *v  = (t != NULL && want_name != NULL)
+                       ? axl_hash_table_lookup(t, want_name) : NULL;
+    bool ok = rc == AXL_OK && t != NULL
+              && (want_name == NULL || (v != NULL && axl_strcmp(v, want_val) == 0));
+    axl_hash_table_free(t);
+    return ok;
+}
+
+static int
+resp_hdr_rc(
+    const void *data,
+    size_t      len
+    )
+{
+    AxlHashTable *t  = NULL;
+    int           rc = axl_http_parse_response_headers(data, len, &t);
+    bool          nulled = (rc == AXL_OK) == (t != NULL);
+    axl_hash_table_free(t);
+    return nulled ? rc : 99;   /* a failure that left a table is its own error */
+}
+
+static void
+test_http_parse_response_headers(void)
+{
+    static const char fold[] = "X-Folded: a \t\r\n b\r\n\t c \r\nX-After: 1\r\n\r\n";
+    static const char fol0[] = " X: 1\r\nY: 2\r\n\r\n";
+    static const char cl2[]  = "Content-Length: 5\r\ncontent-length: 5\r\n\r\n";
+    static const char cll[]  = "Content-Length: 5, 5\r\n\r\n";
+    static const char clm[]  = "Content-Length: 5\r\nContent-Length: 5 ,5\r\n\r\n";
+    static const char cld[]  = "Content-Length: 5\r\nContent-Length: 6\r\n\r\n";
+    static const char cdl[]  = "Content-Length: 5, 6\r\n\r\n";
+    static const char clf[]  = "Content-Length: 5\r\n 6\r\n\r\n";
+    static const char ctl[]  = "X: a\x01" "b\x7f\r\n\r\n";
+    static const char sp[]   = "X-Foo : bar\r\n\r\n";
+    static const char odd[]  = "X(Y)@z: 1\r\n\r\n";
+    static const char host[] = "Host: a\r\nHost: b\r\n\r\n";
+    static const char lf[]   = "A: 1\nB: 2\r\nC: 3\n\n";
+    static const char cr[]   = "X: a\rContent-Length: 5\r\n\r\n";
+    static const char nul[]  = "X: a\0b\r\n\r\n";
+    static const char nnul[] = "X\0Y: 1\r\n\r\n";
+    static const char nco[]  = "NoColon\r\n\r\n";
+    static const char cut[]  = "A: 1\r\nB: 2\r\n";
+    static const char dte[]  = "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    test_check(resp_hdr_is(fold, sizeof(fold) - 1, "x-folded", "a b c")
+               && resp_hdr_is(fold, sizeof(fold) - 1, "x-after", "1"),
+               "HTTP response headers: an obs-fold is unfolded to one SP per fold");
+    test_check(resp_hdr_rc(fol0, sizeof(fol0) - 1) == AXL_ERR,
+               "HTTP response headers: a fold with no field above it fails");
+    test_check(resp_hdr_is(cl2, sizeof(cl2) - 1, "content-length", "5")
+               && resp_hdr_is(cll, sizeof(cll) - 1, "content-length", "5")
+               && resp_hdr_is(clm, sizeof(clm) - 1, "content-length", "5"),
+               "HTTP response headers: identical Content-Lengths (two lines, a list) merge to 5");
+    test_check(resp_hdr_rc(cld, sizeof(cld) - 1) == AXL_ERR
+               && resp_hdr_rc(cdl, sizeof(cdl) - 1) == AXL_ERR,
+               "HTTP response headers: differing Content-Lengths (two lines, a list) fail");
+    {
+        AxlHashTable *t  = NULL;
+        size_t        n  = 1;
+        int           rc = axl_http_parse_response_headers(clf, sizeof(clf) - 1, &t);
+        int           cr2 = axl_http_parse_content_length(t, &n);
+        test_check(rc == AXL_OK && cr2 == AXL_INVALID,
+                   "HTTP response headers: a folded Content-Length is '5 6', which the strict reader refuses");
+        axl_hash_table_free(t);
+    }
+    test_check(resp_hdr_is(ctl, sizeof(ctl) - 1, "x", "a\x01" "b\x7f"),
+               "HTTP response headers: a control character other than CR/LF/NUL is kept");
+    test_check(resp_hdr_is(sp, sizeof(sp) - 1, "x-foo", "bar")
+               && resp_hdr_is(odd, sizeof(odd) - 1, "x(y)@z", "1"),
+               "HTTP response headers: 'X-Foo : bar' is x-foo; a non-token name is kept lowercased");
+    test_check(resp_hdr_is(host, sizeof(host) - 1, NULL, NULL),
+               "HTTP response headers: a second Host is not checked");
+    test_check(resp_hdr_is(lf, sizeof(lf) - 1, "a", "1")
+               && resp_hdr_is(lf, sizeof(lf) - 1, "b", "2")
+               && resp_hdr_is(lf, sizeof(lf) - 1, "c", "3"),
+               "HTTP response headers: a bare LF ends a line, with CRLF mixed in");
+    test_check(resp_hdr_rc(cr, sizeof(cr) - 1) == AXL_ERR
+               && resp_hdr_rc(nul, sizeof(nul) - 1) == AXL_ERR
+               && resp_hdr_rc(nnul, sizeof(nnul) - 1) == AXL_ERR,
+               "HTTP response headers: a bare CR, a NUL in a value or a name fails");
+    test_check(resp_hdr_rc(nco, sizeof(nco) - 1) == AXL_ERR
+               && resp_hdr_rc(cut, sizeof(cut) - 1) == AXL_ERR
+               && resp_hdr_rc(dte, sizeof(dte) - 1) == AXL_ERR,
+               "HTTP response headers: no colon, a cut block, a second Transfer-Encoding fail");
+
+    /* Controls: the same inputs a server reads are refused, as before. */
+    test_check(hdr_parse(fold, sizeof(fold) - 1) == AXL_ERR
+               && hdr_parse(cl2, sizeof(cl2) - 1) == AXL_ERR
+               && hdr_parse(ctl, sizeof(ctl) - 1) == AXL_ERR
+               && hdr_parse(sp, sizeof(sp) - 1) == AXL_ERR
+               && hdr_parse(odd, sizeof(odd) - 1) == AXL_ERR
+               && hdr_parse(host, sizeof(host) - 1) == AXL_ERR
+               && hdr_parse(lf, sizeof(lf) - 1) == AXL_ERR,
+               "HTTP request headers: fold, two CLs, a control, 'name :', a non-token, two Hosts, bare LF still fail");
+    {
+        AxlHashTable *t = NULL;
+        size_t        n = 1;
+        int           rc = axl_http_parse_headers(cll, sizeof(cll) - 1, &t);
+        test_check(rc == AXL_OK && axl_http_parse_content_length(t, &n) == AXL_INVALID,
+                   "HTTP request headers: a '5, 5' list is not merged, so the server refuses it");
+        axl_hash_table_free(t);
+    }
+
+    static const char h1[] = "HTTP/1.1 200 OK\r\nA: 1\r\n\r\nbody";
+    static const char h2[] = "HTTP/1.1 200 OK\nA: 1\n\nbody";
+    static const char h3[] = "HTTP/1.1 200 OK\nA: 1\r\n\nbody";
+    static const char h4[] = "HTTP/1.1 200 OK\r\nA: 1\n\r\nbody";
+    static const char h5[] = "HTTP/1.1 200 OK\r\nA: 1\r\n";
+    test_check(axl_http_find_response_header_end(h1, sizeof(h1) - 1) == sizeof(h1) - 5
+               && axl_http_find_response_header_end(h2, sizeof(h2) - 1) == sizeof(h2) - 5
+               && axl_http_find_response_header_end(h3, sizeof(h3) - 1) == sizeof(h3) - 5
+               && axl_http_find_response_header_end(h4, sizeof(h4) - 1) == sizeof(h4) - 5
+               && axl_http_find_response_header_end(h5, sizeof(h5) - 1) == 0,
+               "HTTP response head end: CRLF CRLF, LF LF, LF CRLF, and none in a cut head");
+    test_check(axl_http_find_header_end(h2, sizeof(h2) - 1) == 0,
+               "HTTP request head end: a bare LF does not end it (control)");
+}
+
+/* A request line is exactly `method SP request-target SP HTTP/D.D`
+   (RFC 9112 3): a fourth part, a missing version, a target that only ends
+   like a version, or a version not spelled HTTP/DIGIT.DIGIT (case
+   included) is malformed. The major and minor numbers come back for the
+   server to judge (505 for a major other than 1). @return the parse's
+   status; @p major / @p minor / @p path set from it. */
+static int
+reqline(
+    const char *line,
+    unsigned   *major,
+    unsigned   *minor,
+    char       *path,
+    size_t      path_size
+    )
+{
+    char *m = NULL;
+    char *p = NULL;
+    char *q = NULL;
+    int   rc = _axl_http_parse_request_line_version(line, axl_strlen(line), &m, &p, &q,
+                                                     major, minor);
+    axl_strlcpy(path, (p != NULL) ? p : "(null)", path_size);
+    axl_free(m);
+    axl_free(p);
+    axl_free(q);
+    return rc;
+}
+
+static void
+test_http_parse_request_line_strict(void)
+{
+    unsigned M = 9;
+    unsigned m = 9;
+    char     p[32];
+    test_check(reqline("GET /a?b=1 HTTP/1.1", &M, &m, p, sizeof(p)) == AXL_OK
+               && M == 1 && m == 1 && axl_strcmp(p, "/a") == 0,
+               "HTTP request line: GET /a?b=1 HTTP/1.1 is 1.1, path /a");
+    test_check(reqline("GET / HTTP/1.0", &M, &m, p, sizeof(p)) == AXL_OK && M == 1 && m == 0,
+               "HTTP request line: HTTP/1.0 reads as major 1 minor 0");
+    test_check(reqline("GET / HTTP/2.0", &M, &m, p, sizeof(p)) == AXL_OK && M == 2 && m == 0,
+               "HTTP request line: HTTP/2.0 parses, major 2 (the server answers 505)");
+    test_check(reqline("GET / HTTP/1.1 junk", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET /a b c d", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET /HTTP/1.0", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET / http/1.1", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET /", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET / ", &M, &m, p, sizeof(p)) == AXL_ERR,
+               "HTTP request line: a fourth part, four parts, a target posing as the version, "
+               "lowercase http, no version, an empty version are malformed");
+    test_check(reqline("GET  / HTTP/1.1", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET  HTTP/1.1", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline(" / HTTP/1.1", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET / HTTP/1.10", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET / HTTP/3", &M, &m, p, sizeof(p)) == AXL_ERR
+               && reqline("GET / HTTP/x.1", &M, &m, p, sizeof(p)) == AXL_ERR,
+               "HTTP request line: two spaces, an empty target, no method, HTTP/1.10, HTTP/3, a non-digit are malformed");
+
+    char *m1 = NULL;
+    char *p1 = NULL;
+    char *q1 = NULL;
+    int   r1 = axl_http_parse_request_line("GET / HTTP/1.1 junk", 19, &m1, &p1, &q1);
+    test_check(r1 == AXL_ERR && m1 == NULL && p1 == NULL && q1 == NULL,
+               "HTTP request line (public): a fourth part is AXL_ERR with every output NULL");
+    axl_free(m1);
+    axl_free(p1);
+    axl_free(q1);
+}
+
+/* Running out of memory while a head is parsed is the server's failure,
+   not the client's: 500, never 400 -- and the parsers say so with
+   AXL_NO_RESOURCES, never AXL_ERR ("malformed"). Each sweep fails the
+   n-th allocation for every n until a run passes untouched, and requires
+   that run: then every allocation the parse makes lay inside the sweep. */
+#define HTTP_HEAD_OOM_SWEEP 64u
+
+static void
+http_req_head_free(
+    AxlHttpReqHead *h
+    )
+{
+    axl_free(h->method);
+    axl_free(h->path);
+    axl_free(h->query);
+    axl_hash_table_free(h->headers);
+}
+
+static void
+test_http_head_oom(void)
+{
+    static const char req[] = "GET /a?b=1 HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n";
+    static const char rsp[] = "Content-Length: 5\r\nX-F: a\r\n b\r\nContent-Length: 5\r\n\r\n";
+    size_t req_clean = 0;
+    size_t hdr_clean = 0;
+    size_t rsp_clean = 0;
+    bool   req_ok    = true;
+    bool   hdr_ok    = true;
+    bool   rsp_ok    = true;
+    for (size_t n = 1; n <= HTTP_HEAD_OOM_SWEEP; n++) {
+        AxlHttpReqHead h;
+        axl_mem_fail_next_alloc(n);
+        size_t st = _axl_http_request_head_parse(req, sizeof(req) - 1, &h);
+        axl_mem_fail_next_alloc(0);
+        http_req_head_free(&h);
+        if (req_clean == 0) {
+            req_ok = req_ok && (st == 500 || st == 0);
+            req_clean = (st == 0) ? n : 0;
+        }
+
+        AxlHashTable *t = NULL;
+        const char   *hb = req + axl_strlen("GET /a?b=1 HTTP/1.1\r\n");
+        axl_mem_fail_next_alloc(n);
+        int rc = axl_http_parse_headers(hb, axl_strlen(hb), &t);
+        axl_mem_fail_next_alloc(0);
+        hdr_ok = hdr_ok && (rc == AXL_OK || rc == AXL_NO_RESOURCES) && ((rc == AXL_OK) == (t != NULL));
+        axl_hash_table_free(t);
+        if (hdr_clean == 0 && rc == AXL_OK) {
+            hdr_clean = n;
+        }
+
+        t = NULL;
+        axl_mem_fail_next_alloc(n);
+        rc = axl_http_parse_response_headers(rsp, sizeof(rsp) - 1, &t);
+        axl_mem_fail_next_alloc(0);
+        rsp_ok = rsp_ok && (rc == AXL_OK || rc == AXL_NO_RESOURCES) && ((rc == AXL_OK) == (t != NULL));
+        axl_hash_table_free(t);
+        if (rsp_clean == 0 && rc == AXL_OK) {
+            rsp_clean = n;
+        }
+    }
+    test_check(req_ok && req_clean > 1,
+               "HTTP request head OOM: every failed allocation is 500 (never 400), "
+               "and the sweep reaches a clean parse");
+    test_check(hdr_ok && hdr_clean > 1 && rsp_ok && rsp_clean > 1,
+               "HTTP headers OOM: request and response blocks fail AXL_NO_RESOURCES "
+               "(never AXL_ERR), and each sweep reaches a clean parse");
+
+    char    *m  = NULL;
+    char    *p  = NULL;
+    char    *q  = NULL;
+    unsigned M  = 0;
+    unsigned mi = 0;
+    bool     lok = true;
+    size_t   lclean = 0;
+    for (size_t n = 1; n <= 8 && lclean == 0; n++) {
+        axl_mem_fail_next_alloc(n);
+        int rc = _axl_http_parse_request_line_version("GET /a?b=1 HTTP/1.1", 19,
+                                                      &m, &p, &q, &M, &mi);
+        axl_mem_fail_next_alloc(0);
+        lok = lok && (rc == AXL_OK || (rc == AXL_NO_RESOURCES && m == NULL && p == NULL && q == NULL));
+        lclean = (rc == AXL_OK) ? n : 0;
+        axl_free(m);
+        axl_free(p);
+        axl_free(q);
+        m = p = q = NULL;
+    }
+    test_check(lok && lclean > 1,
+               "HTTP request line OOM: AXL_NO_RESOURCES with every output NULL, until a clean parse");
+}
+
+/* tls.close_notify: "required" by default, "lenient" by choice, and no
+   other value -- a mistyped one is refused and changes nothing. */
+static void
+test_http_client_close_notify_option(void)
+{
+    AxlHttpClient *c = axl_http_client_new();
+    if (c == NULL) {
+        test_check(false, "close_notify option: client allocated");
+        return;
+    }
+    const char *d  = axl_http_client_get(c, "tls.close_notify");
+    bool        d_ok = d != NULL && axl_strcmp(d, "required") == 0;
+    int         r1 = axl_http_client_set(c, "tls.close_notify", "lenient");
+    const char *v1 = axl_http_client_get(c, "tls.close_notify");
+    bool        v1_ok = v1 != NULL && axl_strcmp(v1, "lenient") == 0;
+    int         r2 = axl_http_client_set(c, "tls.close_notify", "Lenient-ish");
+    const char *v2 = axl_http_client_get(c, "tls.close_notify");
+    bool        v2_ok = v2 != NULL && axl_strcmp(v2, "lenient") == 0;
+    int         r3 = axl_http_client_set(c, "tls.close_notify", "required");
+    const char *v3 = axl_http_client_get(c, "tls.close_notify");
+    bool        v3_ok = v3 != NULL && axl_strcmp(v3, "required") == 0;
+    test_check(d_ok && r1 == AXL_OK && v1_ok && r2 != AXL_OK && v2_ok && r3 == AXL_OK && v3_ok,
+               "tls.close_notify: default required; lenient and required set; another value refused, unchanged");
+    axl_http_client_free(c);
+}
+
+/* An IPv6 literal in a URL is bracketed (RFC 3986 3.2.2): the host is the
+   address without its brackets, a port may follow the ']', and
+   axl_url_build puts the brackets back. */
+static void
+test_url_parse_ipv6_literal(void)
+{
+    AxlUrl *u = NULL;
+    int     r1 = axl_url_parse("http://[::1]:8080/x?q=1", &u);
+    bool    ok1 = r1 == AXL_OK && u != NULL && axl_strcmp(u->host, "::1") == 0
+                  && u->port == 8080 && axl_strcmp(u->path, "/x") == 0
+                  && u->query != NULL && axl_strcmp(u->query, "q=1") == 0;
+    axl_url_free(u);
+    u = NULL;
+    int  r2 = axl_url_parse("https://[fe80::1]/", &u);
+    bool ok2 = r2 == AXL_OK && u != NULL && axl_strcmp(u->host, "fe80::1") == 0
+               && u->port == 443;
+    axl_url_free(u);
+    u = NULL;
+    test_check(ok1 && ok2, "URL: [::1]:8080 and [fe80::1] parse to the bare address and the port");
+    int r3 = axl_url_parse("http://[::1/x", &u);
+    axl_url_free(u);
+    u = NULL;
+    int r4 = axl_url_parse("http://[::1]x/", &u);
+    axl_url_free(u);
+    u = NULL;
+    int r5 = axl_url_parse("http://[]/", &u);
+    axl_url_free(u);
+    test_check(r3 == AXL_ERR && r4 == AXL_ERR && r5 == AXL_ERR,
+               "URL: an unclosed '[', a byte after ']', an empty literal are malformed");
+    char *b1 = axl_url_build("http", "::1", 8080, "/x");
+    char *b2 = axl_url_build("https", "::1", 443, "/");
+    test_check(b1 != NULL && axl_strcmp(b1, "http://[::1]:8080/x") == 0
+               && b2 != NULL && axl_strcmp(b2, "https://[::1]/") == 0,
+               "URL build: an IPv6 host is bracketed, the default port left out");
+    axl_free(b1);
+    axl_free(b2);
+}
+
+/* The request's Host is the URL's authority (RFC 9110 7.2): ":port"
+   exactly when the port is not the scheme's default, an IPv6 literal in
+   brackets. @return the whole request head built for GET @p url, or a
+   marker of what failed. */
+static char *
+host_req(
+    const char *url
+    )
+{
+    AxlUrl *u = NULL;
+    if (axl_url_parse(url, &u) != AXL_OK) {
+        return axl_strdup("(parse failed)");
+    }
+    char  *buf = NULL;
+    size_t len = 0;
+    int    rc  = _axl_http_build_request(&buf, &len, "GET", u, 0, false, NULL, true,
+                                         NULL, NULL);
+    axl_url_free(u);
+    if (rc != AXL_OK) {
+        return axl_strdup("(build failed)");
+    }
+    char *s = axl_strndup(buf, len);
+    axl_free(buf);
+    return s;
+}
+
+static bool
+host_req_is(
+    const char *url,
+    const char *want_host
+    )
+{
+    char *got  = host_req(url);
+    bool  ok   = false;
+    if (got != NULL) {
+        AxlString *w = axl_string_new(NULL);
+        if (w != NULL) {
+            axl_string_append_printf(w, "GET /a HTTP/1.1\r\nHost: %s\r\n"
+                                        "Connection: keep-alive\r\n\r\n", want_host);
+            ok = axl_strcmp(got, axl_string_str(w)) == 0;
+            if (!ok) {
+                axl_printf("  host_req(%s) = '%s'\n", url, got);
+            }
+            axl_string_free(w);
+        }
+    }
+    axl_free(got);
+    return ok;
+}
+
+static void
+test_http_request_host_authority(void)
+{
+    test_check(host_req_is("http://example.com/a", "example.com")
+               && host_req_is("http://example.com:80/a", "example.com")
+               && host_req_is("https://example.com:443/a", "example.com"),
+               "HTTP request Host: a default port (80 http, 443 https) is left out");
+    test_check(host_req_is("http://example.com:8080/a", "example.com:8080")
+               && host_req_is("https://example.com:8443/a", "example.com:8443")
+               && host_req_is("http://example.com:443/a", "example.com:443")
+               && host_req_is("https://example.com:80/a", "example.com:80"),
+               "HTTP request Host: a port other than the scheme's default is named");
+    test_check(host_req_is("http://[::1]:8080/a", "[::1]:8080")
+               && host_req_is("http://[::1]/a", "[::1]"),
+               "HTTP request Host: an IPv6 literal is bracketed, with or without a port");
+}
+
+/* A bracketed host is an IPv6 address (RFC 3986 3.2.2): it holds at least
+   one ':', so [abc] and [1.2.3.4] are refused; a zone ID (%25...) is not
+   supported; an unclosed '[' is malformed; an empty port after ']' means
+   the scheme's default. */
+static int
+url_rc(
+    const char *s
+    )
+{
+    AxlUrl *u  = NULL;
+    int     rc = axl_url_parse(s, &u);
+    axl_url_free(u);
+    return rc;
+}
+
+static void
+test_url_parse_ipv6_strict(void)
+{
+    test_check(url_rc("http://[abc]/") == AXL_ERR
+               && url_rc("http://[1.2.3.4]/") == AXL_ERR,
+               "URL: a bracketed host with no ':' ([abc], [1.2.3.4]) is refused");
+    test_check(url_rc("http://[fe80::1%25eth0]/") == AXL_ERR
+               && url_rc("http://[/") == AXL_ERR,
+               "URL: a zone ID, and a bare '[', are refused");
+    AxlUrl *u  = NULL;
+    int     rc = axl_url_parse("http://[::1]:/x", &u);
+    test_check(rc == AXL_OK && u != NULL && axl_strcmp(u->host, "::1") == 0 && u->port == 80
+               && axl_strcmp(u->path, "/x") == 0,
+               "URL: [::1]: with an empty port takes the scheme's default");
+    axl_url_free(u);
+}
+
+/* The scheme is case-insensitive (RFC 3986 3.1): it is stored lowercased,
+   so HTTPS:// and Http:// get their default port and compare as https and
+   http everywhere. */
+static void
+test_url_parse_scheme_case(void)
+{
+    AxlUrl *a  = NULL;
+    AxlUrl *b  = NULL;
+    int     ra = axl_url_parse("HTTPS://Example.com/x", &a);
+    int     rb = axl_url_parse("Http://h:8080/", &b);
+    test_check(ra == AXL_OK && a != NULL && axl_strcmp(a->scheme, "https") == 0 && a->port == 443
+               && rb == AXL_OK && b != NULL && axl_strcmp(b->scheme, "http") == 0 && b->port == 8080,
+               "URL: HTTPS:// and Http:// are stored as https (port 443) and http");
+    axl_url_free(a);
+    axl_url_free(b);
+}
+
 // ---------------------------------------------------------------------------
 // Network Tests (require networking in QEMU)
 // ---------------------------------------------------------------------------
@@ -478,6 +1190,192 @@ test_tls_available(void)
 {
     test_check(axl_tls_available() == true,
                "tls_available: true");
+}
+
+/* Read one DER tag + length at @p *off; on success leave *off at the value. */
+static bool
+der_read_header(
+    const uint8_t *der,
+    size_t         der_len,
+    size_t        *off,
+    uint8_t       *tag,
+    size_t        *value_len
+    )
+{
+    if (*off + 2 > der_len) {
+        return false;
+    }
+    *tag = der[(*off)++];
+    size_t len = der[(*off)++];
+    if (len & 0x80) {
+        size_t nbytes = len & 0x7F;
+        if (nbytes == 0 || nbytes > 2 || *off + nbytes > der_len) {
+            return false;
+        }
+        len = 0;
+        for (size_t i = 0; i < nbytes; i++) {
+            len = (len << 8) | der[(*off)++];
+        }
+    }
+    if (*off + len > der_len) {
+        return false;
+    }
+    *value_len = len;
+    return true;
+}
+
+/* Locate the serialNumber INTEGER of an X.509 certificate:
+   Certificate SEQUENCE -> tbsCertificate SEQUENCE -> [0] version -> INTEGER. */
+static bool
+der_cert_serial(
+    const uint8_t  *der,
+    size_t          der_len,
+    const uint8_t **serial,
+    size_t         *serial_len
+    )
+{
+    size_t  off = 0;
+    size_t  len = 0;
+    uint8_t tag = 0;
+    if (!der_read_header(der, der_len, &off, &tag, &len) || tag != 0x30
+        || !der_read_header(der, der_len, &off, &tag, &len) || tag != 0x30
+        || !der_read_header(der, der_len, &off, &tag, &len) || tag != 0xA0) {
+        return false;
+    }
+    off += len;   /* skip the explicit version */
+    if (!der_read_header(der, der_len, &off, &tag, &len) || tag != 0x02) {
+        return false;
+    }
+    *serial     = der + off;
+    *serial_len = len;
+    return true;
+}
+
+/* RFC 5280 4.1.2.2: the serial is a POSITIVE integer, and X.690 DER makes
+   its encoding minimal -- a leading 0x00 is legal only before a byte with
+   its top bit set. OpenSSL 3 rejects a certificate that breaks either rule
+   ("BAD INTEGER"), so curl answers the handshake with a bad_certificate
+   alert even under --insecure. The generator draws the serial at random,
+   and one draw in 256 used to come out 00 xx (xx < 0x80): every HTTPS
+   request to that server then failed for the whole boot. The header
+   promises more than DER: exactly 8 octets, so the check is the whole
+   promise -- length 8 and a first byte in 0x01..0x7F (positive, minimal,
+   non-zero). The old defect hits one certificate in 256, so a sweep of 1024
+   meets it with probability 1 - (255/256)^1024 = 98.2%. 2048 would be
+   99.97%, but costs ~20 s more on aa64 under TCG inside test-axl.sh's
+   single boot; the deterministic sabotage (a forced 00 xx serial) is what
+   proves the check can see the defect. */
+#define TLS_SERIAL_SWEEP  1024
+
+/* An HTTPS server can be created and freed again and again in one image -- a
+   consumer re-applying its configuration does exactly that -- and must not
+   cost anything that stays. axl_tls_server_set_cert re-attached the
+   certificate with mbedtls_ssl_conf_own_cert, which APPENDS a key_cert node
+   to the global config's list and frees none: one 24-byte node per
+   axl_http_server_use_tls after the first, never released, and a list every
+   handshake walks. The live count after the first cycle must equal the
+   count after the last. */
+#define TLS_REUSE_CYCLES  10
+
+static void
+test_tls_server_cert_reattach_no_growth(void)
+{
+    void       *cert = NULL;
+    void       *key = NULL;
+    size_t      cert_len = 0;
+    size_t      key_len = 0;
+    AxlMemStats first;
+    AxlMemStats last;
+    bool        ok = true;
+
+    if (axl_tls_init() != AXL_OK
+        || axl_tls_generate_self_signed("AXL-Reuse", NULL, 0, &cert,
+                                        &cert_len, &key, &key_len) != AXL_OK) {
+        test_fail("tls reattach: setup");
+        return;
+    }
+    for (int i = 0; i < TLS_REUSE_CYCLES; i++) {
+        AxlHttpServer *s = axl_http_server_new(8443);
+        if (s == NULL
+            || axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+            ok = false;
+        }
+        axl_http_server_free(s, AXL_TEARDOWN_RESET);
+        axl_mem_get_stats(i == 0 ? &first : &last);
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    test_check(ok, "tls reattach: every cycle created a TLS server");
+    if (first.count == last.count) {
+        test_pass("tls reattach: 10 create/use_tls/free cycles leave the heap as one did");
+    } else {
+        char msg[128];
+        axl_snprintf(msg, sizeof(msg),
+                     "tls reattach: live allocations %zu after one cycle, %zu after %d",
+                     first.count, last.count, TLS_REUSE_CYCLES);
+        test_fail(msg);
+    }
+}
+
+static void
+test_tls_self_signed_serial_der(void)
+{
+    if (axl_tls_init() != AXL_OK) {
+        test_fail("tls serial: axl_tls_init");
+        return;
+    }
+
+    size_t bad = 0;
+    size_t unparsed = 0;
+    size_t generated = 0;
+    char   first_bad[96] = "";
+    for (size_t i = 0; i < TLS_SERIAL_SWEEP; i++) {
+        void  *cert = NULL;
+        void  *key = NULL;
+        size_t cert_len = 0;
+        size_t key_len = 0;
+        if (axl_tls_generate_self_signed("AXL-Serial", NULL, 0, &cert,
+                                         &cert_len, &key, &key_len) != AXL_OK) {
+            break;
+        }
+        generated++;
+
+        const uint8_t *s = NULL;
+        size_t         n = 0;
+        if (!der_cert_serial(cert, cert_len, &s, &n)) {
+            unparsed++;
+        } else if (n != 8 || s[0] == 0x00 || (s[0] & 0x80) != 0) {
+            if (bad == 0) {
+                size_t off = (size_t)axl_snprintf(first_bad, sizeof(first_bad),
+                                                  "%zu bytes:", n);
+                for (size_t k = 0; k < n && k < 8 && off < sizeof(first_bad); k++) {
+                    off += (size_t)axl_snprintf(first_bad + off,
+                                                sizeof(first_bad) - off,
+                                                " %02x", s[k]);
+                }
+            }
+            bad++;
+        }
+        axl_free(cert);
+        axl_free(key);
+    }
+
+    test_check(generated == TLS_SERIAL_SWEEP,
+               "tls serial: every self-signed certificate generated");
+    test_check(unparsed == 0,
+               "tls serial: every certificate's serialNumber located");
+    if (bad == 0) {
+        test_pass("tls serial: every serial is 8 bytes, positive, minimal DER");
+    } else {
+        /* The bytes go in the FAIL line itself: test-axl.sh keeps only
+           PASS/FAIL lines, so a separate axl_printf never reached its log. */
+        char msg[192];
+        axl_snprintf(msg, sizeof(msg),
+                     "tls serial: every serial is 8 bytes, positive, minimal DER"
+                     " (%zu bad; first: %s)", bad, first_bad);
+        test_fail(msg);
+    }
 }
 
 static void
@@ -545,6 +1443,219 @@ test_tcp_echo(void)
     }
 
     axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+}
+
+// ---------------------------------------------------------------------------
+// A synchronous graceful close returns once the FIN exchange is done, not
+// after TIME_WAIT. With no loop to defer to, axl_tcp_close waits inline for
+// the close -- and EDK2's TCP4 signals an ACTIVE close only when TIME_WAIT
+// (2 s, TCP_TIME_WAIT_TIME) expires, so every client that closed first sat
+// out 2 s of bookkeeping after the last segment had crossed the wire: an
+// HTTP client freed on a keep-alive connection paid it per request. The echo
+// peer is reached through a slirp guestfwd, which ACKs our FIN but does not
+// pass it on as a close, so the peer never sends its own: this exercises the
+// FIN_WAIT_2 grace (measured 490-499 ms), where the old wait sat out its 3 s
+// bound. The 1000 ms bound fails both that and a close that waits for TIME_WAIT
+// (2000 ms). The TIME_WAIT exit itself -- a peer that DOES close -- needs a
+// real host peer, which this runner does not have; test-http-client.sh's
+// keep-alive cases take it.
+// Both sync branches: top level (the loop-based wait) and inside a loop
+// callback (the loop-free inline wait).
+// ---------------------------------------------------------------------------
+
+/* Connect to the echo peer and round-trip one message, so the close below is
+   an active close of a connection that carried data. NULL on failure. */
+static AxlTcp *
+tcp_close_timing_connect(void)
+{
+    AxlTcp *client = NULL;
+    char    buf[16];
+    size_t  got = sizeof(buf);
+
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        return NULL;
+    }
+    if (axl_tcp_send(client, "close-ping", 10, 0) != AXL_OK
+        || axl_tcp_recv(client, buf, &got, 0) != AXL_OK) {
+        axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+        return NULL;
+    }
+    return client;
+}
+
+typedef struct {
+    AxlLoop  *loop;
+    AxlTcp   *sock;
+    uint64_t  elapsed_us;
+} TcpCloseTimingCtx;
+
+static bool
+on_tcp_close_timing(void *data)
+{
+    TcpCloseTimingCtx *ctx = data;
+    uint64_t           t0  = axl_time_get_us();
+
+    axl_tcp_close(ctx->sock, AXL_TEARDOWN_GRACEFUL);
+    ctx->elapsed_us = axl_time_get_us() - t0;
+    axl_loop_quit(ctx->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_close_sync_skips_time_wait(void)
+{
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP sync close timing (no network)");
+        return;
+    }
+
+    AxlTcp *client = tcp_close_timing_connect();
+    if (client == NULL) {
+        test_skip_n(2, "TCP sync close timing (connect failed)");
+        return;
+    }
+    uint64_t t0 = axl_time_get_us();
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+    uint64_t top_ms = (axl_time_get_us() - t0) / 1000;
+    test_check(top_ms < 1000, "TCP sync close (top level): ends at the FIN_WAIT_2 "
+                              "grace, not TIME_WAIT or the 3 s bound");
+    if (top_ms >= 1000) {
+        axl_printf("  top-level close took %llu ms\n", (unsigned long long)top_ms);
+    }
+
+    TcpCloseTimingCtx ctx = { .loop = axl_loop_new() };
+    ctx.sock = tcp_close_timing_connect();
+    if (ctx.loop == NULL || ctx.sock == NULL
+        || axl_loop_add_timeout(ctx.loop, 1, on_tcp_close_timing, &ctx) == 0) {
+        axl_tcp_close(ctx.sock, AXL_TEARDOWN_GRACEFUL);
+        axl_loop_free(ctx.loop);
+        test_skip_n(1, "TCP sync close timing in a callback (setup failed)");
+        return;
+    }
+    axl_loop_run(ctx.loop);
+    axl_loop_free(ctx.loop);
+    uint64_t cb_ms = ctx.elapsed_us / 1000;
+    test_check(cb_ms < 1000, "TCP sync close (in a loop callback): ends at the "
+                             "FIN_WAIT_2 grace, not TIME_WAIT or the 3 s bound");
+    if (cb_ms >= 1000) {
+        axl_printf("  in-callback close took %llu ms\n", (unsigned long long)cb_ms);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A graceful close deferred to a running loop is finalized at the FIN
+// exchange too, not after TIME_WAIT. The loop's close sweeper used to wait
+// for the firmware's close token, which EDK2 signals for an active close only
+// when TIME_WAIT (2 s) or FIN_WAIT_2's own timer runs out, so every
+// connection a server closed first held its socket, firmware child, port and
+// three allocations for 2 s after its last segment -- what the HTTP leak test
+// had to sit out before every heap reading. As in the sync test above, the
+// echo peer ACKs our FIN without sending its own, so the close ends at the
+// 500 ms FIN_WAIT_2 grace; the 1000 ms bound fails a close that waits for the
+// firmware. axl_tcp_closes_pending() is how both this test and a consumer
+// see the close: 0 before it, 1 while the loop holds it -- the control that
+// shows the counter can see a pending close at all -- and 0 once finalized.
+// The count is process-wide, so a close an EARLIER test left unfinalized
+// fails this one too (and keeps the poll from reaching 0): look there first.
+// The TIME_WAIT exit, a peer that does close, is test-http-error-leak's.
+// ---------------------------------------------------------------------------
+
+#define TCP_CLOSE_ASYNC_LIMIT_MS  4000u   /* past every firmware timer */
+
+typedef struct {
+    AxlLoop  *loop;
+    AxlTcp   *sock;
+    size_t    pending_before;
+    size_t    pending_after;
+    uint64_t  closed_us;
+    uint64_t  finalized_ms;
+    bool      finalized;
+} TcpCloseAsyncCtx;
+
+static bool
+on_tcp_close_async_recv(AxlTcp *sock, AxlStatus status, void *data)
+{
+    (void)sock;
+    (void)status;
+    (void)data;
+    return false;   /* nothing is sent to it; the close retires it */
+}
+
+static bool
+on_tcp_close_async_poll(void *data)
+{
+    TcpCloseAsyncCtx *c = data;
+
+    if (axl_tcp_closes_pending() != 0) {
+        return AXL_SOURCE_CONTINUE;
+    }
+    c->finalized    = true;
+    c->finalized_ms = (axl_time_get_us() - c->closed_us) / 1000;
+    axl_loop_quit(c->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_close_async_close(void *data)
+{
+    TcpCloseAsyncCtx *c = data;
+
+    c->pending_before = axl_tcp_closes_pending();
+    c->closed_us      = axl_time_get_us();
+    axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
+    c->sock          = NULL;
+    c->pending_after = axl_tcp_closes_pending();
+    axl_loop_add_timer(c->loop, 5, on_tcp_close_async_poll, c);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_close_async_limit(void *data)
+{
+    axl_loop_quit(((TcpCloseAsyncCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_close_async_skips_time_wait(void)
+{
+    TcpCloseAsyncCtx c = { 0 };
+    char             buf[16];
+
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP deferred close timing (no network)");
+        return;
+    }
+    c.sock = tcp_close_timing_connect();
+    if (c.sock == NULL) {
+        test_skip_n(2, "TCP deferred close timing (connect failed)");
+        return;
+    }
+    /* Past the connect, a refusal is a defect in the paths under test, not
+       an environment that cannot run it: FAIL, never SKIP. */
+    c.loop = axl_loop_new();
+    if (c.loop == NULL
+        || axl_tcp_recv_async(c.sock, buf, sizeof(buf), c.loop, NULL,
+                              on_tcp_close_async_recv, &c) != AXL_OK
+        || axl_loop_add_timeout(c.loop, 1, on_tcp_close_async_close, &c) == 0
+        || axl_loop_add_timeout(c.loop, TCP_CLOSE_ASYNC_LIMIT_MS,
+                                on_tcp_close_async_limit, &c) == 0) {
+        axl_tcp_close(c.sock, AXL_TEARDOWN_RESET);
+        axl_loop_free(c.loop);
+        test_check(false, "TCP deferred close: loop, receive and timers set up");
+        test_check(false, "TCP deferred close: not run (setup failed)");
+        return;
+    }
+    axl_loop_run(c.loop);
+    axl_loop_free(c.loop);
+    test_check(c.pending_before == 0 && c.pending_after == 1,
+               "TCP deferred close: axl_tcp_closes_pending counts it (0 -> 1)");
+    test_check(c.finalized && c.finalized_ms < 1000,
+               "TCP deferred close: the loop finalizes it at the FIN_WAIT_2 grace, "
+               "not after TIME_WAIT");
+    axl_printf("  deferred close: pending %zu -> %zu, finalized %s after %llu ms\n",
+               c.pending_before, c.pending_after, c.finalized ? "yes" : "NO",
+               (unsigned long long)c.finalized_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -725,15 +1836,18 @@ test_tcp_send_async_queued(void)
 typedef struct {
     int       fires;
     AxlStatus last;
+    size_t    sent;       /* axl_tcp_send_get_sent() inside the callback */
+    size_t    queued;     /* axl_tcp_send_queued_bytes() inside the callback */
 } TcpFlushCtx;
 
 static bool
 on_tcp_flush_cb(AxlTcp *sock, AxlStatus status, void *data)
 {
     TcpFlushCtx *c = (TcpFlushCtx *)data;
-    (void)sock;
     c->fires++;
-    c->last = status;
+    c->last   = status;
+    c->sent   = axl_tcp_send_get_sent(sock);
+    c->queued = axl_tcp_send_queued_bytes(sock);
     return AXL_SOURCE_REMOVE;
 }
 
@@ -748,11 +1862,11 @@ test_tcp_send_async_flush_on_close(void)
     static const char b[] = "flush-queued-send";
 
     if (!axl_net_is_available()) {
-        test_skip_n(2, "TCP send_async close-flush (no network)");
+        test_skip_n(4, "TCP send_async close-flush (no network)");
         return;
     }
     if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
-        test_skip_n(2, "TCP send_async close-flush (connect failed)");
+        test_skip_n(4, "TCP send_async close-flush (connect failed)");
         return;
     }
 
@@ -776,7 +1890,231 @@ test_tcp_send_async_flush_on_close(void)
     test_check(active.fires == 1 && active.last == AXL_CANCELLED,
                "TCP send_async: close cancels the active send");
 
+    /* The byte counts. The queued send never reached the firmware: 0. The
+       active one was FULLY armed (one piece), so every byte was committed --
+       but the queued send behind it made this close abortive, and the RST
+       discards that piece: CANCELLED with the whole size committed. */
+    test_check(queued.sent == 0,
+               "TCP send_async: a queued send cancelled by close reports 0 bytes sent");
+    test_check(active.sent == sizeof(a) - 1,
+               "TCP send_async: a fully-armed send cancelled by an abortive close"
+               " reports its whole size sent");
+
     axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
+// A GRACEFUL close with only a FULLY-ARMED send outstanding stays graceful.
+//
+// Every byte of a one-piece send is the firmware's the moment it is submitted
+// (AxlTcp copies it into its own buffer first), so a close drops nothing: TCP
+// sends that piece ahead of the FIN. The send is retired AXL_OK with its whole
+// size, from inside the close. Until the bounce buffer, any pending send made
+// the close abortive, because the firmware still read the owner's buffer.
+// ---------------------------------------------------------------------------
+static void
+test_tcp_close_fully_armed_send_graceful(void)
+{
+    AxlTcp     *client = NULL;
+    TcpFlushCtx cb     = { 0 };
+    AxlLoop    *loop;
+    static const char msg[] = "fully-armed-at-close";
+
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP close with a fully-armed send (no network)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(2, "TCP close with a fully-armed send (connect failed)");
+        return;
+    }
+
+    loop = axl_loop_new();
+    axl_tcp_send_async(client, msg, sizeof(msg) - 1, loop, NULL,
+                       on_tcp_flush_cb, &cb);
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+
+    test_check(cb.fires == 1 && cb.last == AXL_OK,
+               "TCP close: a fully-armed send is retired AXL_OK by a graceful close");
+    test_check(cb.sent == sizeof(msg) - 1,
+               "TCP close: that send reports its whole size sent");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
+// axl_tcp_send_queued_bytes and axl_tcp_send_get_sent, exact values.
+//
+// queued_bytes counts what AxlTcp still holds: queued sends in full, plus the
+// ACTIVE send's unarmed remainder. The armed piece is the firmware's. Each
+// value below is read at a point where it is fully determined -- right after a
+// submit (no loop has run, so exactly one piece is armed), or from a callback
+// where every send still outstanding is fully armed.
+// ---------------------------------------------------------------------------
+#define TCP_QB_BIG_EXTRA  1000u
+
+typedef struct {
+    AxlLoop        *loop;
+    AxlLoop        *bg;       /* A's loop, run only once Q is settled */
+    AxlCancellable *cancel;
+    TcpFlushCtx     a;
+    TcpFlushCtx     q;
+    TcpFlushCtx     c;
+    int             want;     /* callbacks to wait for before quitting */
+    int             got;
+} TcpQbCtx;
+
+/* A's callback runs on the background loop, which it quits. */
+static bool
+on_tcp_qb_a(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpQbCtx *x = (TcpQbCtx *)data;
+    on_tcp_flush_cb(sock, status, &x->a);
+    axl_loop_quit(x->bg);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_qb_q(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpQbCtx *x = (TcpQbCtx *)data;
+    on_tcp_flush_cb(sock, status, &x->q);
+    if (++x->got >= x->want) {
+        axl_loop_quit(x->loop);
+    }
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_qb_c(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpQbCtx *x = (TcpQbCtx *)data;
+    on_tcp_flush_cb(sock, status, &x->c);
+    if (++x->got >= x->want) {
+        axl_loop_quit(x->loop);
+    }
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_qb_timeout(void *data)
+{
+    axl_loop_quit(((TcpQbCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_qb_bg_timeout(void *data)
+{
+    axl_loop_quit(((TcpQbCtx *)data)->bg);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_send_queued_bytes_and_sent(void)
+{
+    AxlTcp       *client   = NULL;
+    AxlTcp       *listener = NULL;
+    TcpQbCtx      x        = { 0 };
+    AxlTcpPacing  pacing;
+    size_t        chunk;
+    size_t        big_len;
+    size_t        after_submit;
+    int           rc;
+    static const char a[] = "qb-active-one-piece";
+    static char       q[500];
+    static uint8_t    big[3u * AXL_TCP_PACING_CHUNK_MAX_BYTES + TCP_QB_BIG_EXTRA];
+
+    test_check(axl_tcp_send_queued_bytes(NULL) == 0,
+               "TCP queued_bytes: NULL socket reads 0");
+
+    if (!axl_net_is_available()) {
+        test_skip_n(13, "TCP queued_bytes / get_sent (no network)");
+        return;
+    }
+    if (axl_tcp_listen(9123, &listener) == AXL_OK) {
+        test_check(axl_tcp_send_queued_bytes(listener) == 0,
+                   "TCP queued_bytes: a listener reads 0");
+        axl_tcp_close(listener, AXL_TEARDOWN_RESET);
+    } else {
+        test_skip_n(1, "TCP queued_bytes: listener (listen failed)");
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(12, "TCP queued_bytes / get_sent (connect failed)");
+        return;
+    }
+
+    axl_tcp_get_pacing(&pacing);
+    chunk   = pacing.chunk_bytes;
+    big_len = 3u * chunk + TCP_QB_BIG_EXTRA;
+    axl_memset(q, 'q', sizeof(q));
+    axl_memset(big, 'c', big_len);
+
+    test_check(axl_tcp_send_queued_bytes(client) == 0,
+               "TCP queued_bytes: an idle connected socket reads 0");
+
+    /* A (one piece, armed at once) with Q queued behind it. A's completion
+       is watched from `bg`, which does not run until Q is settled, so Q is
+       still QUEUED when its cancel is dispatched -- run on one loop, A could
+       complete first and promote Q, and a cancel of a fully-armed Q is
+       (correctly) an AXL_OK. */
+    x.loop   = axl_loop_new();
+    x.bg     = axl_loop_new();
+    x.cancel = axl_cancellable_new();
+    x.want   = 1;
+    axl_tcp_send_async(client, a, sizeof(a) - 1, x.bg, NULL, on_tcp_qb_a, &x);
+    axl_tcp_send_async(client, q, sizeof(q), x.loop, x.cancel, on_tcp_qb_q, &x);
+    test_check(axl_tcp_send_queued_bytes(client) == sizeof(q),
+               "TCP queued_bytes: a fully-armed send counts 0, a queued one in full");
+
+    axl_cancellable_cancel(x.cancel);
+    axl_loop_add_timeout(x.loop, 5000, on_tcp_qb_timeout, &x);
+    axl_loop_run(x.loop);
+    axl_loop_add_timeout(x.bg, 5000, on_tcp_qb_bg_timeout, &x);
+    axl_loop_run(x.bg);
+
+    test_check(x.q.fires == 1 && x.q.last == AXL_CANCELLED,
+               "TCP send_async: cancelling a queued send reports AXL_CANCELLED");
+    test_check(x.q.sent == 0,
+               "TCP get_sent: a cancelled queued send reports 0 bytes");
+    test_check(x.q.queued == 0,
+               "TCP queued_bytes: a cancelled queued send's bytes are gone");
+    test_check(x.a.fires == 1 && x.a.last == AXL_OK && x.a.sent == sizeof(a) - 1,
+               "TCP get_sent: a completed send reports its whole size");
+
+    /* C: three whole pieces plus a tail. Submitting arms exactly one piece. */
+    x.got  = 0;
+    x.want = 1;
+    rc = axl_tcp_send_async(client, big, big_len, x.loop, NULL, on_tcp_qb_c, &x);
+    after_submit = axl_tcp_send_queued_bytes(client);
+    test_check(rc == AXL_OK && after_submit == big_len - chunk,
+               "TCP queued_bytes: an active send counts its unarmed remainder");
+    if (after_submit != big_len - chunk) {
+        axl_printf("  queued_bytes=%zu expected %zu\n", after_submit,
+                   big_len - chunk);
+    }
+
+    axl_loop_add_timeout(x.loop, 10000, on_tcp_qb_timeout, &x);
+    axl_loop_run(x.loop);
+    test_check(x.c.fires == 1 && x.c.last == AXL_OK,
+               "TCP send_async: a multi-piece send completes AXL_OK");
+    test_check(x.c.sent == big_len,
+               "TCP get_sent: a multi-piece send reports its whole size");
+    test_check(x.c.queued == 0 && axl_tcp_send_queued_bytes(client) == 0,
+               "TCP queued_bytes: reads 0 once every send has retired");
+
+    /* The synchronous wrapper: its count is readable after it returns. */
+    rc = axl_tcp_send(client, a, sizeof(a) - 1, 3000);
+    test_check(rc == AXL_OK && axl_tcp_send_get_sent(client) == sizeof(a) - 1,
+               "TCP get_sent: after a successful axl_tcp_send, its whole size");
+    rc = axl_tcp_send(client, a, 0, 3000);
+    test_check(rc == AXL_ERR && axl_tcp_send_get_sent(client) == 0,
+               "TCP get_sent: after a refused axl_tcp_send, 0");
+
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+    axl_cancellable_free(x.cancel);
+    axl_loop_free(x.loop);
+    axl_loop_free(x.bg);
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +2213,79 @@ test_tcp_send_close_from_send_callback(void)
 
     /* No close here — on_tcp_closecb_a already closed the socket. */
     axl_loop_free(ctx.loop);
+}
+
+// ---------------------------------------------------------------------------
+// Close delivers a FINISHED send's owed callback with its ORIGINAL status.
+//
+// A send that finished is retired: parked, its callback scheduled for the
+// loop's next iteration. A close in between runs that callback from inside
+// the close -- and with the status the send finished with, AXL_OK, NOT the
+// AXL_CANCELLED every still-pending send gets. The SSH server once read "a
+// callback from inside close is AXL_CANCELLED" into the header's close
+// contract, treated AXL_OK as "the connection is live", flushed from inside
+// its own teardown and freed the connection twice. This pins the contract
+// that was misread.
+//
+// The window is normally one iteration wide; axl_tcp_fail_next_send_schedule
+// holds it open across any number of them, the way a full defer queue and
+// source table do. The loop is stepped with axl_loop_dispatch, which drains
+// the defer ring at the START of each call -- so a delivery that had been
+// scheduled after all would have run on the next step, and 500 ms of steps
+// would have shown it.
+// ---------------------------------------------------------------------------
+static bool
+on_tcp_owed_timeout(void *data)
+{
+    *(bool *)data = true;
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_close_delivers_held_send_status(void)
+{
+    AxlTcp     *client = NULL;
+    TcpFlushCtx cb     = { 0 };
+    AxlLoop    *loop;
+    bool        timed_out = false;
+    static const char msg[] = "held-until-close";
+
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP close delivers a held send (no network)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(2, "TCP close delivers a held send (connect failed)");
+        return;
+    }
+
+    loop = axl_loop_new();
+    axl_tcp_fail_next_send_schedule(1);
+    int rc = axl_tcp_send_async(client, msg, sizeof(msg) - 1, loop, NULL,
+                                on_tcp_flush_cb, &cb);
+    /* Many iterations: the send finishes early in them, and a delivery that
+       was scheduled after all would run on the very next one. */
+    axl_loop_add_timeout(loop, 500, on_tcp_owed_timeout, &timed_out);
+    while (!timed_out) {
+        if (axl_loop_dispatch(loop, true) < 0) {
+            break;
+        }
+    }
+    /* Disarm in case the send never finished and the counter is still
+       armed: it is process-wide and would fire on some later test's send. */
+    axl_tcp_fail_next_send_schedule(0);
+
+    test_check(rc == AXL_OK && cb.fires == 0,
+               "TCP send_async: a held send's callback stayed owed across"
+               " iterations");
+
+    axl_tcp_close(client, AXL_TEARDOWN_RESET);
+
+    test_check(cb.fires == 1 && cb.last == AXL_OK,
+               "TCP send_async: close delivers a held send's callback"
+               " with AXL_OK");
+
+    axl_loop_free(loop);
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +2403,418 @@ test_tcp_recv_async_rearm(void)
        first would dangle the pointer. */
     axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
     axl_loop_free(ctx.loop);
+}
+
+// ---------------------------------------------------------------------------
+// A receive's sources live on the loop it was armed on, whatever else happens
+// to the socket. Close and axl_tcp_recv_drop_sources remove them from the loop
+// the socket RECORDS for them, and source ids are unique across loops, so a
+// record naming the wrong loop makes that removal a silent no-op: the source
+// stays registered on its real loop -- a leak that outlives the socket and
+// can fire into it after close.
+//
+//   fail    a receive callback re-arms on a second loop whose source table
+//           is full, so the re-arm fails; the callback returns true (keep)
+//   ok      the same re-arm succeeds
+//   send    a receive armed on one loop, a send on a second (the send
+//           stamps the socket's loop too)
+//   cancel  a receive armed with a cancellable on one loop is re-armed
+//           without one on a second: the old cancel source must go with it
+//
+// Each case asserts where the live receive source is, then that after close
+// no receive source (or cancel source) remains on either loop.
+//
+// _axl_loop_has_source is defined in axl-loop.c; forward-declared here
+// because the loop's internal header is src/loop-only.
+// ---------------------------------------------------------------------------
+
+bool _axl_loop_has_source(const AxlLoop *loop, AxlSourceId id);
+
+typedef enum {
+    REARM_OTHER_FAIL,
+    REARM_OTHER_OK,
+    REARM_OTHER_SEND,
+    REARM_OTHER_CANCEL,
+} RearmOtherCase;
+
+typedef struct {
+    RearmOtherCase  kind;
+    AxlLoop        *loop;
+    AxlLoop        *loop2;
+    AxlCancellable *cancel;
+    char            buf[64];
+    char            buf2[64];
+    bool            fired;      ///< the case's operation completed OK
+    int             rearm_rc;   ///< axl_tcp_recv_async on loop2, from the callback
+    AxlSourceId     old_id;     ///< the first receive's source
+    AxlSourceId     old_cancel; ///< the first receive's cancel source
+} TcpRearmOtherCtx;
+
+static bool
+on_rearm_other_unused(AxlTcp *sock, AxlStatus status, void *data)
+{
+    (void)sock;
+    (void)status;
+    (void)data;
+    return false;
+}
+
+static bool
+on_rearm_other_recv(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpRearmOtherCtx *c = data;
+
+    if (status == AXL_OK && !c->fired) {
+        c->fired    = true;
+        c->rearm_rc = axl_tcp_recv_async(sock, c->buf2, sizeof(c->buf2), c->loop2, NULL,
+                                         on_rearm_other_unused, c);
+    }
+    axl_loop_quit(c->loop);
+    return status == AXL_OK;   /* keep, whatever the re-arm did */
+}
+
+static bool
+on_rearm_other_sent(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpRearmOtherCtx *c = data;
+
+    (void)sock;
+    c->fired = status == AXL_OK;
+    axl_loop_quit(c->loop2);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_rearm_other_timeout(void *data)
+{
+    axl_loop_quit(data);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_rearm_other_filler(void *data)
+{
+    (void)data;
+    return AXL_SOURCE_CONTINUE;
+}
+
+/* Runs one case up to the close. */
+static void
+rearm_other_run(TcpRearmOtherCtx *c, AxlTcp *sock)
+{
+    static const char msg[] = "rearm-other\n";
+
+    if (c->kind == REARM_OTHER_FAIL) {
+        /* An hour-long timer per slot: never fires, only occupies. */
+        while (axl_loop_add_timer(c->loop2, 3600000u, on_rearm_other_filler, NULL) != 0) {
+        }
+    }
+    if (axl_tcp_recv_async(sock, c->buf, sizeof(c->buf), c->loop,
+                           c->kind == REARM_OTHER_CANCEL ? c->cancel : NULL,
+                           on_rearm_other_recv, c) != AXL_OK) {
+        return;
+    }
+    c->old_id     = sock->recv_source;
+    c->old_cancel = sock->recv_cancel_source;
+    if (c->kind == REARM_OTHER_CANCEL) {
+        c->fired = c->old_cancel != 0
+                   && axl_tcp_recv_async(sock, c->buf2, sizeof(c->buf2), c->loop2, NULL,
+                                         on_rearm_other_unused, c) == AXL_OK;
+    } else if (c->kind == REARM_OTHER_SEND) {
+        if (axl_tcp_send_async(sock, msg, sizeof(msg) - 1, c->loop2, NULL,
+                               on_rearm_other_sent, c) == AXL_OK) {
+            axl_loop_add_timeout(c->loop2, 3000, on_rearm_other_timeout, c->loop2);
+            axl_loop_run(c->loop2);
+        }
+    } else if (axl_tcp_send(sock, msg, sizeof(msg) - 1, 3000) == AXL_OK) {
+        axl_loop_add_timeout(c->loop, 3000, on_rearm_other_timeout, c->loop);
+        axl_loop_run(c->loop);
+    }
+}
+
+static bool
+rearm_other_on_either(const TcpRearmOtherCtx *c, AxlSourceId id)
+{
+    return _axl_loop_has_source(c->loop, id) || _axl_loop_has_source(c->loop2, id);
+}
+
+/* A FAILED axl_tcp_recv_async made outside a callback, on a socket with a
+   receive and its cancellable armed: the call got past its argument checks,
+   so the armed receive is cancelled either way (axl-tcp.h) -- both its
+   sources leave the first loop, the socket holds no id, and neither the
+   receive nor its cancellable fires the old callback afterwards. */
+static int g_rearm_failed_calls;
+
+static bool
+on_rearm_failed_recv(AxlTcp *sock, AxlStatus status, void *data)
+{
+    (void)sock;
+    (void)status;
+    (void)data;
+    g_rearm_failed_calls++;
+    return false;
+}
+
+static void
+test_tcp_recv_rearm_failed_outside(void)
+{
+    char             buf[64];
+    char             buf2[64];
+    AxlTcp          *sock = NULL;
+    AxlLoop         *loop = axl_loop_new();
+    AxlLoop         *full = axl_loop_new();
+    AxlCancellable  *cancel = axl_cancellable_new();
+    AxlSourceId      old_id = 0;
+    AxlSourceId      old_cancel = 0;
+    int              rc = 1;   /* neither AXL_OK nor AXL_ERR until the call is made */
+    bool             ids_clear = false;
+
+    if (!axl_net_is_available()) {
+        test_skip_n(4, "TCP failed recv re-arm outside a callback (no network)");
+        axl_cancellable_free(cancel);
+        axl_loop_free(full);
+        axl_loop_free(loop);
+        return;
+    }
+    g_rearm_failed_calls = 0;
+    if (loop != NULL && full != NULL && cancel != NULL
+        && axl_tcp_connect(AXL_TEST_ECHO_HOST, 9997, &sock) == AXL_OK
+        && axl_tcp_recv_async(sock, buf, sizeof(buf), loop, cancel, on_rearm_failed_recv,
+                              NULL) == AXL_OK) {
+        old_id     = sock->recv_source;
+        old_cancel = sock->recv_cancel_source;
+        while (axl_loop_add_timer(full, 3600000u, on_rearm_other_filler, NULL) != 0) {
+        }
+        rc = axl_tcp_recv_async(sock, buf2, sizeof(buf2), full, NULL, on_rearm_failed_recv,
+                                NULL);
+        ids_clear = sock->recv_source == 0 && sock->recv_cancel_source == 0;
+        /* The old cancellable fires now; nothing may answer it. */
+        axl_cancellable_cancel(cancel);
+        axl_loop_add_timeout(loop, 200, on_rearm_other_timeout, loop);
+        axl_loop_run(loop);
+    }
+    test_check(old_id != 0 && old_cancel != 0 && rc == AXL_ERR,
+               "recv re-arm failed outside a callback: armed with a cancellable, the "
+               "re-arm onto a full loop returns AXL_ERR");
+    test_check(rc == AXL_ERR && ids_clear,
+               "recv re-arm failed outside a callback: the socket holds no source id");
+    test_check(rc == AXL_ERR && !_axl_loop_has_source(loop, old_id)
+                   && !_axl_loop_has_source(loop, old_cancel),
+               "recv re-arm failed outside a callback: neither old source is left on its loop");
+    test_check(rc == AXL_ERR && g_rearm_failed_calls == 0,
+               "recv re-arm failed outside a callback: the cancelled receive's callback "
+               "never fires");
+    if (sock != NULL) {
+        axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+    }
+    axl_loop_free(full);
+    axl_loop_free(loop);
+    axl_cancellable_free(cancel);
+}
+
+/* axl_tcp_recv interrupted: the shell's break (Ctrl-C) quits its ephemeral
+   loop while the receive is still armed. It returns AXL_ERR, and must leave
+   nothing queued in the firmware: a Receive token still pointing into the
+   caller's buffer would have a later segment written into memory the caller
+   owns again -- often a stack buffer long gone. Driven against the echo peer:
+   the buffer is poisoned, the break raised, the call made (it returns at
+   once); then a segment is sent and echoed back, the stack is polled for it,
+   and the poison must survive. The socket's next receive must then get that
+   segment. The buffers are static, so the defect, if present, writes into
+   memory this test still owns. g_axl_interrupted, which the break sets, is
+   cleared at once: left set, the library's next Ctrl-C poll would end the
+   test binary. */
+static char g_recv_int_buf[64];
+static char g_recv_int_buf2[64];
+
+static void
+test_tcp_recv_interrupted(void)
+{
+    static const char late[] = "late-segment\n";
+    AxlTcp         *sock = NULL;
+    AxlEventHandle  brk  = axl_backend_shell_break_event();
+    size_t          size = sizeof(g_recv_int_buf);
+    size_t          size2 = sizeof(g_recv_int_buf2);
+    int             rc   = 1;
+    int             rc2  = 1;
+    bool            interrupted = false;
+    bool            ids_clear   = false;
+    bool            poison_ok   = true;
+
+    if (!axl_net_is_available() || brk == NULL) {
+        test_skip_n(4, "TCP recv interrupted (no network or no Shell break event)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &sock) == AXL_OK) {
+        axl_memset(g_recv_int_buf, 0x5A, sizeof(g_recv_int_buf));
+        axl_backend_event_signal(brk);
+        rc          = axl_tcp_recv(sock, g_recv_int_buf, &size, 3000);
+        interrupted = g_axl_interrupted;
+        g_axl_interrupted = false;
+        ids_clear   = sock->recv_source == 0 && sock->recv_cancel_source == 0;
+    }
+    test_check(rc == AXL_ERR && interrupted,
+               "recv interrupted: the break quit it with the receive armed (AXL_ERR)");
+    test_check(rc == AXL_ERR && ids_clear,
+               "recv interrupted: the receive's source ids are cleared before the call returns");
+    if (sock == NULL || !ids_clear) {
+        /* Ids left set name sources on the call's ephemeral loop, already
+           freed: any further use of the socket -- a receive, or the close
+           itself -- would remove them from freed memory. Forget them, and
+           stop here. */
+        if (sock != NULL) {
+            sock->recv_source        = 0;
+            sock->recv_cancel_source = 0;
+            axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+        }
+        test_skip_n(2, "TCP recv interrupted: not interrupted, or source ids left set");
+        return;
+    }
+    if (axl_tcp_send(sock, late, sizeof(late) - 1, 3000) == AXL_OK) {
+        /* Let the echo come back and the stack hand it to any queued
+           Receive: 50 polls, 10 ms apart. */
+        for (int i = 0; i < 50; i++) {
+            axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
+            axl_usleep(10000);
+        }
+    }
+    for (size_t i = 0; i < sizeof(g_recv_int_buf); i++) {
+        poison_ok = poison_ok && (unsigned char)g_recv_int_buf[i] == 0x5Au;
+    }
+    /* A 50 ms receive: only a segment ALREADY buffered by the end of the
+       window above can satisfy it, which is what makes the poison check
+       mean something -- the segment arrived while the buffer was at risk. */
+    rc2 = axl_tcp_recv(sock, g_recv_int_buf2, &size2, 50);
+    test_check(poison_ok,
+               "recv interrupted: nothing is written into the caller's buffer afterwards");
+    test_check(rc2 == AXL_OK && size2 == sizeof(late) - 1
+                   && axl_memcmp(g_recv_int_buf2, late, sizeof(late) - 1) == 0,
+               "recv interrupted: the late segment arrived inside the window, and the "
+               "next receive gets it at once");
+    axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+}
+
+/* The other side of an interrupted axl_tcp_recv: a receive that COMPLETED
+   before the call took it down. With a segment already buffered, TcpDxe
+   completes the Receive synchronously (EFI_SUCCESS, SockRcv), and the call's
+   loop sees the Shell's break before it dispatches that completion -- so the
+   loop returns with r.done false and the bytes already in the buffer. They
+   are gone from the stream, so the call must report them: AXL_OK with
+   exactly that length and those bytes, not AXL_ERR. */
+static char g_recv_done_buf[64];
+
+static void
+test_tcp_recv_interrupted_completed(void)
+{
+    static const char seg[] = "buffered-segment\n";
+    AxlTcp         *sock = NULL;
+    AxlEventHandle  brk  = axl_backend_shell_break_event();
+    size_t          size = sizeof(g_recv_done_buf);
+    int             rc   = 1;
+    bool            interrupted = false;
+
+    if (!axl_net_is_available() || brk == NULL) {
+        test_skip_n(2, "TCP recv interrupted after completing (no network or no Shell break)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &sock) == AXL_OK
+        && axl_tcp_send(sock, seg, sizeof(seg) - 1, 3000) == AXL_OK) {
+        /* Let the echo arrive and sit in the socket's receive buffer. */
+        for (int i = 0; i < 50; i++) {
+            axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
+            axl_usleep(10000);
+        }
+        axl_memset(g_recv_done_buf, 0, sizeof(g_recv_done_buf));
+        axl_backend_event_signal(brk);
+        rc          = axl_tcp_recv(sock, g_recv_done_buf, &size, 3000);
+        interrupted = g_axl_interrupted;
+        g_axl_interrupted = false;
+    }
+    test_check(interrupted,
+               "recv interrupted after completing: the break quit the call's loop");
+    test_check(rc == AXL_OK && size == sizeof(seg) - 1
+                   && axl_memcmp(g_recv_done_buf, seg, sizeof(seg) - 1) == 0,
+               "recv interrupted after completing: AXL_OK with exactly the buffered bytes");
+    if (sock != NULL) {
+        axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+    }
+}
+
+static void
+test_tcp_recv_rearm_other_loop(void)
+{
+    static const char *const fired_names[] = {
+        "recv re-arm fail: the first receive completed",
+        "recv re-arm ok: the first receive completed",
+        "recv + send on another loop: the send completed",
+        "recv re-arm without a cancellable: armed with one, then re-armed",
+    };
+    static const char *const where_names[] = {
+        "recv re-arm fail: the kept receive stays on its first loop",
+        "recv re-arm ok: the new receive is on the second loop",
+        "recv + send on another loop: the receive stays on its own loop",
+        "recv re-arm without a cancellable: the new receive is on the second loop",
+    };
+    static const char *const close_names[] = {
+        "recv re-arm fail: close leaves no receive source on either loop",
+        "recv re-arm ok: close leaves no receive source on either loop",
+        "recv + send on another loop: close leaves no receive source on either loop",
+        "recv re-arm without a cancellable: no source of either receive outlives close",
+    };
+
+    if (!axl_net_is_available()) {
+        test_skip_n(15, "TCP recv re-arm on another loop (no network)");
+        return;
+    }
+    for (int k = REARM_OTHER_FAIL; k <= REARM_OTHER_CANCEL; k++) {
+        TcpRearmOtherCtx c = { 0 };
+        AxlTcp          *sock = NULL;
+        AxlSourceId      live_id = 0;
+        AxlSourceId      live_cancel = 0;
+        bool             peer_sinks = k == REARM_OTHER_SEND || k == REARM_OTHER_CANCEL;
+
+        c.kind     = (RearmOtherCase)k;
+        c.loop     = axl_loop_new();
+        c.loop2    = axl_loop_new();
+        c.cancel   = axl_cancellable_new();
+        c.rearm_rc = 1;   /* neither AXL_OK nor AXL_ERR until the callback sets it */
+        /* The sink (9997) for the cases no reply may complete the receive
+           in; the echo (9999) for the ones that wait for it. */
+        if (c.loop != NULL && c.loop2 != NULL && c.cancel != NULL
+            && axl_tcp_connect(AXL_TEST_ECHO_HOST, peer_sinks ? 9997 : 9999, &sock) == AXL_OK) {
+            rearm_other_run(&c, sock);
+            live_id     = sock->recv_source;
+            live_cancel = sock->recv_cancel_source;
+        }
+        test_check(c.fired, fired_names[k]);
+        if (k == REARM_OTHER_FAIL) {
+            test_check(c.rearm_rc == AXL_ERR,
+                       "recv re-arm fail: re-arming onto a full loop returns AXL_ERR");
+        } else if (k == REARM_OTHER_OK) {
+            test_check(c.rearm_rc == AXL_OK,
+                       "recv re-arm ok: re-arming onto another loop returns AXL_OK");
+        }
+        test_check(c.fired && live_id != 0
+                       && _axl_loop_has_source(k == REARM_OTHER_FAIL || k == REARM_OTHER_SEND
+                                                   ? c.loop : c.loop2,
+                                               live_id),
+                   where_names[k]);
+        if (k == REARM_OTHER_CANCEL) {
+            test_check(c.fired && live_cancel == 0,
+                       "recv re-arm without a cancellable: the socket holds no cancel source");
+        }
+        if (sock != NULL) {
+            axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+        }
+        test_check(c.fired && c.old_id != 0
+                       && !rearm_other_on_either(&c, c.old_id)
+                       && !rearm_other_on_either(&c, live_id)
+                       && !rearm_other_on_either(&c, c.old_cancel),
+                   close_names[k]);
+        axl_loop_free(c.loop2);
+        axl_loop_free(c.loop);
+        axl_cancellable_free(c.cancel);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +3212,181 @@ on_get_plain(
     return 0;
 }
 
+/* GET /big — a 1 MiB body, byte i = the top byte of (i * 2654435761) mod
+   2^32, for
+   test-http-throughput-qemu.sh. It goes out through the ordinary one-shot
+   response, i.e. ONE axl_tcp_send_async of the whole megabyte, so its wall
+   time is AxlTcp's transmit pacing and nothing else: before pacing, the
+   firmware's one-frame-per-10-ms receive drain made it 7-10 s. Static and
+   filled on first use, so there is nothing for the leak report to see. */
+#define TEST_BIG_BODY_SIZE  (1024u * 1024u)
+static uint8_t g_big_body[TEST_BIG_BODY_SIZE];
+static bool    g_big_body_ready;
+
+static const uint8_t *
+big_body(void)
+{
+    if (!g_big_body_ready) {
+        for (uint32_t i = 0; i < TEST_BIG_BODY_SIZE; i++) {
+            /* Knuth's multiplicative hash: NOT periodic at any power of
+               two a piece size could be, so a send that skipped or
+               repeated whole pieces cannot produce the same bytes (a
+               period-256 pattern once hid exactly that). */
+            g_big_body[i] = (uint8_t)((i * 2654435761u) >> 24);
+        }
+        g_big_body_ready = true;
+    }
+    return g_big_body;
+}
+
+static int
+on_get_big(
+    AxlHttpRequest *req,
+    AxlHttpResponse *resp,
+    void *data)
+{
+    (void)req;
+    (void)data;
+    axl_http_response_set_static(resp, big_body(), TEST_BIG_BODY_SIZE,
+                                 "application/octet-stream");
+    return 0;
+}
+
+/* GET /pacing?chunk=N&backoff=M[&latency=firmware|window|always] --
+   axl_tcp_set_pacing from a request handler, i.e. from a loop callback while
+   another connection's send may be on the wire. That is the mid-send change
+   the contract promises is safe. Either pacing key may be omitted (keeps the
+   value in force); `latency` sets axl_net_set_latency too -- a test that
+   needs the firmware's pace (back-off 0 crawling at 10 ms a frame) must ask
+   for it rather than rely on the library's default, since a latency policy
+   polls on its own. No query restores both defaults. Replies "rc=<OK|INVALID|ERR> chunk=<c> backoff=<b>"
+   with the pacing in force afterwards. */
+/* Update *out from "key=<u32>" in @p query; leave it alone if the key is
+   absent or unparseable. */
+static void
+pacing_query_u32(const char *query, const char *key, uint32_t *out)
+{
+    uint32_t    v;
+    const char *end;
+    size_t      klen = axl_strlen(key);
+    const char *q    = query;
+
+    while (q != NULL && *q != '\0') {
+        if (axl_strncmp(q, key, klen) == 0 && q[klen] == '=') {
+            /* An end pointer makes the parse stop at '&' rather than
+               reject the rest of the query as trailing garbage. */
+            if (axl_str_to_u32(q + klen + 1, 10, &v, &end) == AXL_OK) {
+                *out = v;
+            }
+            return;
+        }
+        q = axl_strchr(q, '&');
+        if (q != NULL) {
+            q++;
+        }
+    }
+}
+
+static int
+on_get_pacing(
+    AxlHttpRequest *req,
+    AxlHttpResponse *resp,
+    void *data)
+{
+    AxlTcpPacing cfg;
+    int          rc;
+    char         text[96];
+
+    (void)data;
+    if (req->query == NULL || req->query[0] == '\0') {
+        rc = axl_tcp_set_pacing(NULL);
+        if (rc == AXL_OK) {
+            rc = axl_net_set_latency(NULL);
+        }
+    } else {
+        axl_tcp_get_pacing(&cfg);
+        pacing_query_u32(req->query, "chunk", &cfg.chunk_bytes);
+        pacing_query_u32(req->query, "backoff", &cfg.idle_backoff_ms);
+        rc = axl_tcp_set_pacing(&cfg);
+        const char *lat = axl_strstr(req->query, "latency=");
+        if (rc == AXL_OK && lat != NULL) {
+            AxlNetLatency l = { 0 };
+            lat += 8;
+            if (axl_strncmp(lat, "window", 6) == 0) {
+                l.mode = AXL_NET_LATENCY_WINDOW;
+            } else if (axl_strncmp(lat, "always", 6) == 0) {
+                l.mode = AXL_NET_LATENCY_ALWAYS;
+            } else if (axl_strncmp(lat, "firmware", 8) != 0) {
+                l.mode = (AxlNetLatencyMode)99;   /* refused below: INVALID */
+            }
+            rc = axl_net_set_latency(&l);
+        }
+    }
+    axl_tcp_get_pacing(&cfg);
+    axl_snprintf(text, sizeof(text), "rc=%s chunk=%u backoff=%u",
+                 rc == AXL_OK ? "OK" : rc == AXL_INVALID ? "INVALID" : "ERR",
+                 (unsigned)cfg.chunk_bytes, (unsigned)cfg.idle_backoff_ms);
+    axl_http_response_set_text(resp, text);
+    return 0;
+}
+
+/* GET /big-stream -- g_big_body eight times over (8 MiB), produced by a
+   streamer. Big enough that a client which stops reading cannot have it all
+   absorbed by host socket buffers (a 1 MiB body can be: Linux autotunes the
+   forwarding socket's send buffer past it), so the guest's send really does
+   stall at a zero window. */
+#define TEST_BIG_STREAM_SIZE  (8u * TEST_BIG_BODY_SIZE)
+
+static int
+big_stream_fill(
+    void   *ctx,
+    void   *out_buf,
+    size_t  out_buf_size,
+    size_t *out_size)
+{
+    size_t *sent = ctx;
+    size_t  left = TEST_BIG_STREAM_SIZE - *sent;
+    size_t  off  = *sent % TEST_BIG_BODY_SIZE;
+    size_t  n    = out_buf_size;
+
+    if (n > left) {
+        n = left;
+    }
+    if (n > TEST_BIG_BODY_SIZE - off) {
+        n = TEST_BIG_BODY_SIZE - off;
+    }
+    axl_memcpy(out_buf, big_body() + off, n);
+    *sent    += n;
+    *out_size = n;
+    return AXL_OK;
+}
+
+static void
+big_stream_done(
+    void *ctx)
+{
+    axl_free(ctx);
+}
+
+static int
+on_get_big_stream(
+    AxlHttpRequest *req,
+    AxlHttpResponse *resp,
+    void *data)
+{
+    size_t *sent = axl_calloc(1, sizeof(*sent));
+
+    (void)req;
+    (void)data;
+    if (sent == NULL) {
+        return AXL_ERR;
+    }
+    axl_http_response_set_streamer(resp, big_stream_fill, sent,
+                                   big_stream_done, TEST_BIG_STREAM_SIZE,
+                                   "application/octet-stream");
+    return 0;
+}
+
 /* Static-asset route — exercises axl_http_response_set_static end-to-end.
    Returns the same .rodata buffer twice in a row; the integration test
    curls /static-asset twice and verifies both bodies match exactly. If
@@ -1494,6 +3492,203 @@ on_client_test(
     axl_http_response_set_json(resp, result_buf);
     axl_http_client_response_free(client_resp);
     axl_http_client_free(c);
+    return 0;
+}
+
+/* An empty streaming body: EOF at once. */
+static int
+client_path_empty_body(
+    void   *ctx,
+    void   *out_buf,
+    size_t  out_buf_size,
+    size_t *out_size
+    )
+{
+    (void)ctx;
+    (void)out_buf;
+    (void)out_buf_size;
+    *out_size = 0;
+    return AXL_OK;
+}
+
+// /client-path?port=P&n=N&mode=get|stream -- the UEFI client requests a
+// host URL whose request target is EXACTLY N bytes ("/path-echo/aaa...")
+// through axl_http_get (the async core) or axl_http_request_streaming (the
+// sync streaming path), and returns the host's reply: the length of the
+// target as it arrived. A target the client cut arrives shorter.
+static int
+on_client_path(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data
+    )
+{
+    (void)data;
+    uint32_t port   = 0;
+    uint32_t n      = 0;
+    bool     stream = req->query != NULL && axl_strstr(req->query, "mode=stream") != NULL;
+    size_t   pre    = axl_strlen("/path-echo/");
+    if (req->query != NULL) {
+        pacing_query_u32(req->query, "port", &port);
+        pacing_query_u32(req->query, "n", &n);
+    }
+    if (port == 0 || n <= pre || n > 4000) {
+        axl_http_response_set_status(resp, 400);
+        return 0;
+    }
+    AxlString *url = axl_string_new(NULL);
+    axl_string_append_printf(url, "http://10.0.2.2:%u/path-echo/", (unsigned)port);
+    for (size_t i = pre; i < n; i++) {
+        axl_string_append_c(url, 'a');
+    }
+    AxlHttpClient         *c  = axl_http_client_new();
+    AxlHttpClientResponse *cr = NULL;
+    int rc = AXL_ERR;
+    if (c != NULL && !stream) {
+        rc = axl_http_get(c, axl_string_str(url), &cr);
+    } else if (c != NULL) {
+        rc = axl_http_request_streaming(c, "PUT", axl_string_str(url),
+                                        client_path_empty_body, NULL, NULL, 0,
+                                        NULL, NULL, &cr);
+    }
+    if (rc == AXL_OK && cr != NULL && cr->body != NULL) {
+        char out[64];
+        axl_snprintf(out, sizeof(out), "%.*s", (int)cr->body_size, (const char *)cr->body);
+        axl_http_response_set_text(resp, out);
+    } else {
+        char out[32];
+        axl_snprintf(out, sizeof(out), "client rc %d", rc);
+        axl_http_response_set_text(resp, out);
+    }
+    axl_http_client_response_free(cr);
+    axl_http_client_free(c);
+    axl_string_free(url);
+    return 0;
+}
+
+/* Copy "key=<value>" (up to '&') from @p query into @p out; "" if absent. */
+static void
+query_str(
+    const char *query,
+    const char *key,
+    char       *out,
+    size_t      out_size
+    )
+{
+    size_t      klen = axl_strlen(key);
+    const char *q    = query;
+    out[0] = '\0';
+    while (q != NULL && *q != '\0') {
+        if (axl_strncmp(q, key, klen) == 0 && q[klen] == '=') {
+            const char *v   = q + klen + 1;
+            const char *amp = axl_strchr(v, '&');
+            size_t      n   = (amp != NULL) ? (size_t)(amp - v) : axl_strlen(v);
+            if (n >= out_size) {
+                n = out_size - 1;
+            }
+            axl_memcpy(out, v, n);
+            out[n] = '\0';
+            return;
+        }
+        q = axl_strchr(q, '&');
+        if (q != NULL) {
+            q++;
+        }
+    }
+}
+
+// /client-fetch?port=P&path=/resp/x&mode=get|stream&n=N&hdr=name&method=M
+//     &scheme=http|https&opt=key:value;key:value
+// -- ONE client, with the options in opt set, issues N requests (method
+// M, GET by default) for a host URL, through axl_http_request (the async core) or
+// axl_http_request_streaming (the sync path), and replies
+// "<status>:<body size>:<body>[:<value of hdr>]|" per response, or
+// "err:<rc>|" for a failed one. What a response's framing did to the client --
+// its body, whether the connection was reused -- reads back as text.
+static int
+on_client_fetch(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data
+    )
+{
+    (void)data;
+    uint32_t port = 0;
+    uint32_t n    = 1;
+    char     path[64];
+    char     mode[16];
+    char     hdr[32];
+    const char *q = (req->query != NULL) ? req->query : "";
+    pacing_query_u32(q, "port", &port);
+    pacing_query_u32(q, "n", &n);
+    query_str(q, "path", path, sizeof(path));
+    query_str(q, "mode", mode, sizeof(mode));
+    query_str(q, "hdr", hdr, sizeof(hdr));
+    if (port == 0 || path[0] != '/' || n == 0 || n > 4) {
+        axl_http_response_set_status(resp, 400);
+        return 0;
+    }
+    char method[16];
+    query_str(q, "method", method, sizeof(method));
+    if (method[0] == '\0') {
+        axl_strlcpy(method, "GET", sizeof(method));
+    }
+    char scheme[8];
+    query_str(q, "scheme", scheme, sizeof(scheme));
+    bool https = axl_strcmp(scheme, "https") == 0;
+    /* TLS is set up for every fetch, not only an https one: a redirect can
+       lead an http request to https. */
+    if (axl_tls_init() != AXL_OK && https) {
+        axl_http_response_set_text(resp, "tls init failed");
+        return 0;
+    }
+    char opts[128];
+    query_str(q, "opt", opts, sizeof(opts));
+    bool       stream = axl_strcmp(mode, "stream") == 0;
+    char       url[128];
+    AxlString *out = axl_string_new(NULL);
+    axl_snprintf(url, sizeof(url), "%s://10.0.2.2:%u%s", https ? "https" : "http",
+                 (unsigned)port, path);
+    AxlHttpClient *c = axl_http_client_new();
+    /* opt=key:value;key:value -- client options, set before any request. */
+    for (char *o = opts; c != NULL && *o != '\0';) {
+        char *semi  = axl_strchr(o, ';');
+        char *next  = (semi != NULL) ? semi + 1 : o + axl_strlen(o);
+        if (semi != NULL) {
+            *semi = '\0';
+        }
+        char *colon = axl_strchr(o, ':');
+        if (colon != NULL) {
+            *colon = '\0';
+            axl_http_client_set(c, o, colon + 1);
+        }
+        o = next;
+    }
+    for (uint32_t i = 0; c != NULL && out != NULL && i < n; i++) {
+        AxlHttpClientResponse *cr = NULL;
+        int rc = stream
+                 ? axl_http_request_streaming(c, method, url, client_path_empty_body,
+                                              NULL, NULL, 0, NULL, NULL, &cr)
+                 : axl_http_request(c, method, url, NULL, 0, NULL, NULL, &cr);
+        if (rc != AXL_OK || cr == NULL) {
+            axl_string_append_printf(out, "err:%d|", rc);
+            axl_http_client_response_free(cr);
+            continue;
+        }
+        axl_string_append_printf(out, "%u:%u:%.*s", (unsigned)cr->status_code,
+                                 (unsigned)cr->body_size,
+                                 (int)((cr->body_size < 64) ? cr->body_size : 64),
+                                 (cr->body != NULL) ? (const char *)cr->body : "");
+        if (hdr[0] != '\0') {
+            const char *v = axl_hash_table_lookup(cr->headers, hdr);
+            axl_string_append_printf(out, ":%s", (v != NULL) ? v : "(none)");
+        }
+        axl_string_append(out, "|");
+        axl_http_client_response_free(cr);
+    }
+    axl_http_response_set_text(resp, (out != NULL) ? axl_string_str(out) : "oom");
+    axl_http_client_free(c);
+    axl_string_free(out);
     return 0;
 }
 
@@ -1855,6 +4050,178 @@ test_reject_middleware(
     return AXL_OK;
 }
 
+/* Middleware shaped like a consumer's security-headers middleware: it sets
+   four response headers on EVERY response, in a table it allocates itself
+   (owning keys and values, as axl-http-server.h requires). With
+   X-Test-MW-Body: 1 it also sets a body. test-http-error-leak-qemu.sh
+   counts the heap across 404s, 401s and cache hits: the dispatcher's early
+   returns once dropped this state on the floor, 14 allocations a request. */
+static int
+test_headers_middleware(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    static const char *const kv[][2] = {
+        { "Strict-Transport-Security", "max-age=31536000" },
+        { "X-Content-Type-Options",    "nosniff" },
+        { "X-Frame-Options",           "DENY" },
+        { "Content-Security-Policy",   "default-src 'self'" },
+    };
+
+    (void)data;
+    if (resp->headers == NULL) {
+        resp->headers = axl_hash_table_new_full(axl_str_hash, axl_str_equal,
+                                                axl_free_impl, axl_free_impl);
+        if (resp->headers == NULL) {
+            return AXL_OK;
+        }
+    }
+    for (size_t i = 0; i < sizeof(kv) / sizeof(kv[0]); i++) {
+        char *k = axl_strdup(kv[i][0]);
+        char *v = axl_strdup(kv[i][1]);
+        if (k == NULL || v == NULL) {
+            axl_free(k);
+            axl_free(v);
+            continue;
+        }
+        axl_hash_table_replace(resp->headers, k, v);
+    }
+    if (req->headers != NULL) {
+        const char *flag = (const char *)axl_hash_table_lookup(
+            req->headers, "x-test-mw-body");
+        if (flag != NULL && axl_strcmp(flag, "1") == 0) {
+            axl_http_response_set_text(resp, "set by middleware");
+        }
+        /* Framing headers a middleware has no business setting: the
+           response writes its own, so they must be dropped -- on a bodyless
+           error a client would wait for 99 bytes that never come. */
+        flag = (const char *)axl_hash_table_lookup(req->headers,
+                                                   "x-test-mw-framing");
+        if (flag != NULL && axl_strcmp(flag, "1") == 0) {
+            char *k1 = axl_strdup("Content-Length");
+            char *v1 = axl_strdup("99");
+            char *k2 = axl_strdup("connection");
+            char *v2 = axl_strdup("keep-alive");
+            if (k1 != NULL && v1 != NULL && k2 != NULL && v2 != NULL) {
+                axl_hash_table_replace(resp->headers, k1, v1);
+                axl_hash_table_replace(resp->headers, k2, v2);
+            } else {
+                axl_free(k1); axl_free(v1); axl_free(k2); axl_free(v2);
+            }
+        }
+    }
+    return AXL_OK;
+}
+
+/* GET /bigheader -- a response header longer than the 2 KB header block:
+   the server must answer 500 (not run past its buffer, not send a truncated
+   block) and keep serving. */
+static int
+on_bigheader(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    (void)req;
+    (void)data;
+    char *v = axl_malloc(3001);
+    char *k = axl_strdup("X-Big");
+    if (v == NULL || k == NULL) {
+        axl_free(v);
+        axl_free(k);
+        return -1;
+    }
+    axl_memset(v, 'b', 3000);
+    v[3000] = '\0';
+    if (resp->headers == NULL) {
+        resp->headers = axl_hash_table_new_full(axl_str_hash, axl_str_equal,
+                                                axl_free_impl, axl_free_impl);
+    }
+    if (resp->headers == NULL) {
+        axl_free(v);
+        axl_free(k);
+        return -1;
+    }
+    axl_hash_table_replace(resp->headers, k, v);
+    axl_http_response_set_text(resp, "big");
+    return 0;
+}
+
+/* An upload handler that answers with a STATIC body: the upload's response
+   is released when sent, and that release must leave a body it does not own
+   alone (test-http-error-leak-qemu.sh). */
+static int
+on_upload_static(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    const void      *chunk,
+    size_t           chunk_size,
+    void            *data,
+    bool             aborted)
+{
+    static const char body[] = "{\"static\":true}";
+
+    (void)req;
+    (void)chunk;
+    (void)data;
+    if (!aborted && chunk_size == 0) {
+        axl_http_response_set_static(resp, body, sizeof(body) - 1, "application/json");
+    }
+    return 0;
+}
+
+/* One header on a /heap response; dropped quietly when out of memory. */
+static void
+heap_header_set(
+    AxlHashTable *headers,
+    const char   *name,
+    const char   *value)
+{
+    char *k = axl_strdup(name);
+    char *v = axl_strdup(value);
+
+    if (k != NULL && v != NULL) {
+        axl_hash_table_replace(headers, k, v);
+    } else {
+        axl_free(k);
+        axl_free(v);
+    }
+}
+
+/* GET /heap -- the live AxlMem allocation count, for the leak test, in an
+   X-Heap-Count response header and with NO body: the response cache stores
+   only responses with a body, so this can never be answered from it (a
+   cached reading would freeze). Sampled the same way each time, so its own
+   transient allocations cancel between two readings. X-Close-Pending is
+   axl_tcp_closes_pending() at the same instant: a reading taken while it
+   is non-zero still counts closes the loop has not finalized. */
+static int
+on_heap(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    AxlMemStats st;
+    char        heap[32];
+    char        pending[32];
+
+    (void)req;
+    (void)data;
+    axl_mem_get_stats(&st);
+    axl_snprintf(heap, sizeof(heap), "%zu", st.count);
+    axl_snprintf(pending, sizeof(pending), "%zu", axl_tcp_closes_pending());
+    if (resp->headers == NULL) {
+        resp->headers = axl_hash_table_new_full(axl_str_hash, axl_str_equal,
+                                                axl_free_impl, axl_free_impl);
+    }
+    if (resp->headers != NULL) {
+        heap_header_set(resp->headers, "X-Heap-Count", heap);
+        heap_header_set(resp->headers, "X-Close-Pending", pending);
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Cache policy test handlers — cache_max eviction, per-route TTL,
 // prefix invalidation. Each handler increments its own static counter
@@ -1882,6 +4249,25 @@ on_cm_route(
 
 static size_t ttl_short_count = 0;
 static size_t ttl_long_count  = 0;
+static size_t ttl_zero_count  = 0;
+
+/* GET /ttl-zero -- set_route_ttl(0): never cached. A TTL of 0 was stored as
+   the hash value itself, read back as "no override", and the route was
+   cached for the server default instead (test-http.sh). */
+static int
+on_ttl_zero(
+    AxlHttpRequest *req,
+    AxlHttpResponse *resp,
+    void *data)
+{
+    (void)req;
+    (void)data;
+    ttl_zero_count++;
+    char buf[64];
+    axl_snprintf(buf, sizeof(buf), "{\"route\":\"zero\",\"count\":%zu}", ttl_zero_count);
+    axl_http_response_set_json(resp, buf);
+    return 0;
+}
 
 static int
 on_ttl_short(
@@ -1953,6 +4339,9 @@ static int on_posts_1(AxlHttpRequest *req, AxlHttpResponse *resp, void *data) {
 
 static AxlHashTable *m_dav_fs = NULL;  /* path -> (void *)(uintptr_t)is_dir+1 */
 
+#define DAV_BIG_KIDS  5000u
+#define DAV_LONG_DIR  "/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
 static int
 test_webdav_init(void)
 {
@@ -1989,6 +4378,20 @@ test_webdav_init(void)
                            (void *)(uintptr_t)1);
     axl_hash_table_replace(m_dav_fs, axl_strdup("/copy-existing-target"),
                            (void *)(uintptr_t)1);
+    /* Two entries whose names differ only in letter case: the in-memory fs
+       is case-SENSITIVE, so they are distinct, and an Overwrite: F transfer
+       between them must be refused (412) by the SDK's default. */
+    axl_hash_table_replace(m_dav_fs, axl_strdup("/csx"), (void *)(uintptr_t)1);
+    axl_hash_table_replace(m_dav_fs, axl_strdup("/CSX"), (void *)(uintptr_t)1);
+    /* Synthetic PROPFIND directories (test_dav_list_dir): /big lists
+       DAV_BIG_KIDS children, more than the 4096 PROPFIND once cut at;
+       /oom lists without end, and makes the handler's next allocation
+       fail once asked for 256; DAV_LONG_DIR lists one child whose path is
+       longer than the 512 bytes PROPFIND once skipped a child past. */
+    axl_hash_table_replace(m_dav_fs, axl_strdup("/big"), (void *)(uintptr_t)2);
+    axl_hash_table_replace(m_dav_fs, axl_strdup("/oom"), (void *)(uintptr_t)2);
+    axl_hash_table_replace(m_dav_fs, axl_strdup(DAV_LONG_DIR), (void *)(uintptr_t)2);
+    axl_hash_table_replace(m_dav_fs, axl_strdup("/listfail"), (void *)(uintptr_t)2);
     return AXL_OK;
 }
 
@@ -2018,10 +4421,29 @@ test_dav_remove(void *user, const char *path)
     return AXL_OK;
 }
 
+/* A destination named "/op-err*" or "/op-unsupported*" makes MOVE and COPY
+   fail with that code, so the integration test can pin the status the SDK
+   maps each to. AXL_OK: no such name. */
+static int
+test_dav_op_fault(const char *dst)
+{
+    if (axl_str_has_prefix(dst, "/op-err")) {
+        return AXL_ERR;
+    }
+    if (axl_str_has_prefix(dst, "/op-unsupported")) {
+        return AXL_UNSUPPORTED;
+    }
+    return AXL_OK;
+}
+
 static int
 test_dav_move(void *user, const char *src, const char *dst, bool overwrite)
 {
     (void)user;
+    int fault = test_dav_op_fault(dst);
+    if (fault != AXL_OK) {
+        return fault;
+    }
     void *v = axl_hash_table_lookup(m_dav_fs, src);
     if (v == NULL) {
         return AXL_ERR;
@@ -2047,6 +4469,10 @@ test_dav_copy(void *user, const char *src, const char *dst,
 {
     (void)user;
     (void)depth;
+    int fault = test_dav_op_fault(dst);
+    if (fault != AXL_OK) {
+        return fault;
+    }
     void *v = axl_hash_table_lookup(m_dav_fs, src);
     if (v == NULL) {
         return AXL_ERR;
@@ -2137,6 +4563,32 @@ test_dav_list_dir(void *user, const char *path,
                   AxlFsEntry *out, size_t max, size_t *count)
 {
     (void)user;
+    bool big = axl_strcmp(path, "/big") == 0;
+    bool oom = axl_strcmp(path, "/oom") == 0;
+    if (big || oom) {
+        size_t n = big ? ((max < DAV_BIG_KIDS) ? max : DAV_BIG_KIDS) : max;
+        for (size_t i = 0; i < n; i++) {
+            axl_memset(&out[i], 0, sizeof(out[i]));
+            axl_snprintf(out[i].name, sizeof(out[i].name), "f%05u", (unsigned)i);
+            out[i].size = 1;
+        }
+        *count = n;
+        if (oom && max >= 256) {
+            axl_mem_fail_next_alloc(1);   /* the handler's next, bigger array */
+        }
+        return AXL_OK;
+    }
+    if (axl_strcmp(path, "/listfail") == 0) {
+        *count = 0;
+        return AXL_ERR;   /* a directory that cannot be listed */
+    }
+    if (axl_strcmp(path, DAV_LONG_DIR) == 0 && max > 0) {
+        axl_memset(&out[0], 0, sizeof(out[0]));
+        axl_memset(out[0].name, 'k', 250);
+        out[0].size = 1;
+        *count = 1;
+        return AXL_OK;
+    }
     DavListCtx ctx = {
         .parent     = path,
         .parent_len = axl_strlen(path),
@@ -2215,20 +4667,27 @@ static char  m_dav_last_put_path[256];
 static char  m_dav_last_put_body[4096];
 static size_t m_dav_last_put_len    = 0;
 static bool   m_dav_last_put_aborted = false;
+static uint64_t m_dav_last_put_length = 0;   /* what write_open was told */
 
 typedef struct {
-    char  *target_path;
-    size_t written;
+    char    *target_path;
+    size_t   written;
+    uint64_t length;
 } DavWriteCtx;
 
 static int
-test_dav_write_open(void *user, const char *path, void **out_ctx)
+test_dav_write_open(void *user, const char *path, uint64_t length, void **out_ctx,
+                    bool *in_place)
 {
     (void)user;
+    /* A target whose name holds "kept" stands in for a backend that writes
+       in place: it says so here, and its discard cannot restore. */
+    *in_place = axl_strstr(path, "kept") != NULL;
     DavWriteCtx *w = axl_calloc(1, sizeof(*w));
     if (w == NULL) {
         return AXL_ERR;
     }
+    w->length      = length;
     w->target_path = axl_strdup(path);
     if (w->target_path == NULL) {
         axl_free(w);
@@ -2242,6 +4701,13 @@ static int
 test_dav_write_chunk(void *vctx, const void *data, size_t len)
 {
     DavWriteCtx *w = vctx;
+    /* A target named "chunk-fails*" stands in for a backend that cannot
+       take a chunk (a device error mid-write): the PUT fails, and the
+       integration test pins that the failure releases the write and does
+       not wedge the next PUT on the mount. */
+    if (axl_strncmp(w->target_path, "/chunk-fails", 12) == 0) {
+        return AXL_ERR;
+    }
     size_t space = sizeof(m_dav_last_put_body) - w->written;
     size_t take  = (len < space) ? len : space;
     if (take > 0) {
@@ -2259,6 +4725,12 @@ test_dav_write_close(void *vctx, bool aborted)
                 sizeof(m_dav_last_put_path));
     m_dav_last_put_len     = w->written;
     m_dav_last_put_aborted = aborted;
+    m_dav_last_put_length  = w->length;
+    /* "kept" (in place): the discard cannot restore, and says so.
+       "discard-fails": an ATOMIC write whose discard fails (its temp could
+       not be removed) -- a return the SDK must ignore. */
+    bool kept = axl_strstr(w->target_path, "kept") != NULL
+                || axl_strstr(w->target_path, "discard-fails") != NULL;
     /* A target named "flush-fails*" stands in for a backend whose final
        flush could not make the bytes durable — every chunk was accepted
        and only the close fails. The integration test uses it to pin PUT
@@ -2275,7 +4747,7 @@ test_dav_write_close(void *vctx, bool aborted)
     }
     axl_free(w->target_path);
     axl_free(w);
-    return flush_fails ? AXL_ERR : AXL_OK;
+    return (flush_fails || (aborted && kept)) ? AXL_ERR : AXL_OK;
 }
 
 static const char *
@@ -2392,9 +4864,16 @@ on_dav_status(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
         body_preview[i] = (c >= 0x20 && c < 0x7f && c != '"' && c != '\\')
             ? (char)c : '?';
     }
+    char length[24];
+    if (m_dav_last_put_length == AXL_WEBDAV_LENGTH_UNKNOWN) {
+        axl_strlcpy(length, "\"unknown\"", sizeof(length));
+    } else {
+        axl_snprintf(length, sizeof(length), "%llu",
+                     (unsigned long long)m_dav_last_put_length);
+    }
     axl_snprintf(buf, sizeof(buf),
-        "{\"path\":\"%s\",\"len\":%llu,\"aborted\":%s,\"preview\":\"%s\"}",
-        m_dav_last_put_path,
+        "{\"path\":\"%s\",\"length\":%s,\"len\":%llu,\"aborted\":%s,\"preview\":\"%s\"}",
+        m_dav_last_put_path, length,
         (unsigned long long)m_dav_last_put_len,
         m_dav_last_put_aborted ? "true" : "false",
         body_preview);
@@ -2646,10 +5125,507 @@ on_ws_reject(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Transmit pacing settings (no network)
+// ---------------------------------------------------------------------------
+
+static bool
+pacing_is(const AxlTcpPacing *p, uint32_t chunk, uint32_t backoff, uint32_t linger)
+{
+    return p->chunk_bytes == chunk && p->idle_backoff_ms == backoff && p->linger_us == linger;
+}
+
+// axl_net_set_latency -- the policy itself (no network needed) and, with a
+// NIC, what it does to the firmware tick. Round-trip times are pinned by
+// test/integration/test-net-latency-qemu.sh.
+
+static bool
+net_latency_eq(
+    const AxlNetLatency *a,
+    AxlNetLatencyMode    mode,
+    uint32_t             window_ms,
+    uint32_t             tick_us
+    )
+{
+    return a->mode == mode && a->window_ms == window_ms && a->tick_us == tick_us;
+}
+
+static void
+test_net_latency_settings(void)
+{
+    AxlNetLatency d;
+    AxlNetLatency got;
+    axl_net_latency_defaults(&d);
+    test_check(net_latency_eq(&d, AXL_NET_LATENCY_FIRMWARE, 250, 1000),
+               "net latency: defaults are FIRMWARE (off), 250 ms, 1000 us");
+    axl_net_get_latency(&got);
+    test_check(net_latency_eq(&got, AXL_NET_LATENCY_FIRMWARE, 250, 1000),
+               "net latency: a process starts on the defaults");
+
+    AxlNetLatency zero = { 0 };
+    test_check(axl_net_set_latency(&zero) == AXL_OK,
+               "net latency: a zeroed policy is accepted");
+    axl_net_get_latency(&got);
+    test_check(net_latency_eq(&got, AXL_NET_LATENCY_FIRMWARE, 250, 1000),
+               "net latency: zeroed means FIRMWARE, zero fields take their defaults");
+
+    static const AxlNetLatency bad[] = {
+        { (AxlNetLatencyMode)3, 0, 0 },
+        { AXL_NET_LATENCY_WINDOW, 0, AXL_TIMER_RESOLUTION_MIN_US - 1 },
+        { AXL_NET_LATENCY_WINDOW, 0, AXL_NET_LATENCY_TICK_MAX_US + 1 },
+        { AXL_NET_LATENCY_WINDOW, AXL_NET_LATENCY_WINDOW_MAX_MS + 1, 0 },
+    };
+    bool all_refused = true;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        all_refused = all_refused && axl_net_set_latency(&bad[i]) == AXL_INVALID;
+    }
+    test_check(all_refused,
+               "net latency: an unknown mode or out-of-range field -> AXL_INVALID");
+    axl_net_get_latency(&got);
+    test_check(net_latency_eq(&got, AXL_NET_LATENCY_FIRMWARE, 250, 1000),
+               "net latency: a refused policy changes nothing");
+
+    test_check(axl_net_set_latency(NULL) == AXL_OK,
+               "net latency: NULL restores the defaults");
+    axl_net_get_latency(&got);
+    test_check(net_latency_eq(&got, AXL_NET_LATENCY_FIRMWARE, 250, 1000),
+               "net latency: and they are in force");
+}
+
+static void
+test_net_latency_tick(void)
+{
+    AxlTcp *listener = NULL;
+    if (!axl_net_is_available()) {
+        test_skip_n(8, "net latency tick (no network)");
+        return;
+    }
+    AxlNetLatency fw = { .mode = AXL_NET_LATENCY_FIRMWARE };
+    AxlNetLatency always = { .mode = AXL_NET_LATENCY_ALWAYS };
+    AxlNetLatency window = { .mode = AXL_NET_LATENCY_WINDOW, .window_ms = 100 };
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    test_check(axl_net_set_latency(&fw) == AXL_OK && axl_timer_period_us() == 10000,
+               "net latency: FIRMWARE leaves the tick at 10 ms");
+    if (axl_tcp_listen(9124, &listener) != AXL_OK) {
+        test_skip_n(7, "net latency tick (listen failed)");
+        if (axl_net_set_latency(NULL) != AXL_OK) {
+            axl_printf("net latency: could not restore the default policy\n");
+        }
+        return;
+    }
+    test_check(axl_timer_period_us() == 10000,
+               "net latency: FIRMWARE with a live socket: still 10 ms");
+
+    test_check(axl_net_set_latency(&always) == AXL_OK && axl_timer_period_us() == 1000,
+               "net latency: ALWAYS with a live socket: 1 ms at once");
+    axl_tcp_close(listener, AXL_TEARDOWN_RESET);
+    listener = NULL;
+    test_check(axl_timer_period_us() == 10000,
+               "net latency: ALWAYS: the last socket closing restores 10 ms");
+
+    test_check(axl_net_set_latency(&window) == AXL_OK && axl_timer_period_us() == 10000,
+               "net latency: WINDOW, nothing happening: 10 ms");
+    if (axl_tcp_listen(9124, &listener) != AXL_OK) {
+        test_skip_n(3, "net latency tick (second listen failed)");
+        if (axl_net_set_latency(NULL) != AXL_OK) {
+            axl_printf("net latency: could not restore the default policy\n");
+        }
+        return;
+    }
+    test_check(axl_timer_period_us() == 1000,
+               "net latency: WINDOW: activity (a socket created) -> 1 ms");
+    axl_msleep(400);   /* four windows, no activity */
+    test_check(axl_timer_period_us() == 10000,
+               "net latency: WINDOW: a window with no activity -> back to 10 ms");
+    axl_tcp_close(listener, AXL_TEARDOWN_RESET);
+    test_check(axl_net_set_latency(NULL) == AXL_OK && axl_timer_period_us() == 10000,
+               "net latency: back on the defaults, idle: 10 ms");
+}
+
+static void
+test_tcp_pacing_settings(void)
+{
+    AxlTcpPacing p;
+    AxlTcpPacing cur;
+
+    axl_memset(&p, 0xA5, sizeof(p));   /* every field must be written */
+    axl_tcp_pacing_defaults(&p);
+    test_check(pacing_is(&p, AXL_TCP_PACING_CHUNK_DEFAULT_BYTES,
+                         AXL_TCP_PACING_IDLE_BACKOFF_DEFAULT_MS,
+                         AXL_TCP_PACING_LINGER_DEFAULT_US),
+               "pacing: defaults are CHUNK_DEFAULT_BYTES / IDLE_BACKOFF_DEFAULT_MS / "
+               "LINGER_DEFAULT_US");
+    test_check(p.chunk_bytes == 8192u && p.idle_backoff_ms == 500u && p.linger_us == 0u,
+               "pacing: defaults are 8192 bytes / 500 ms / no linger");
+    axl_tcp_get_pacing(&cur);
+    test_check(pacing_is(&cur, 8192u, 500u, 0u), "pacing: in force at start = defaults");
+
+    /* Boundaries accepted. */
+    p.chunk_bytes = AXL_TCP_PACING_CHUNK_MIN_BYTES;
+    p.idle_backoff_ms = 0;
+    p.linger_us = 9000;
+    test_check(axl_tcp_set_pacing(&p) == AXL_OK,
+               "pacing: chunk MIN, backoff 0, linger 9000 accepted");
+    axl_tcp_get_pacing(&cur);
+    test_check(pacing_is(&cur, 1024u, 0u, 9000u), "pacing: get returns 1024 / 0 / 9000");
+    p.chunk_bytes = AXL_TCP_PACING_CHUNK_MAX_BYTES;
+    p.idle_backoff_ms = AXL_TCP_PACING_IDLE_BACKOFF_MAX_MS;
+    p.linger_us = AXL_TCP_PACING_LINGER_MAX_US;
+    test_check(axl_tcp_set_pacing(&p) == AXL_OK,
+               "pacing: chunk MAX, backoff MAX, linger MAX accepted");
+    axl_tcp_get_pacing(&cur);
+    test_check(pacing_is(&cur, 32768u, 10000u, 20000u),
+               "pacing: get returns 32768 / 10000 / 20000");
+
+    /* Out of range: refused, and nothing changes (all-or-nothing). */
+    p.chunk_bytes = AXL_TCP_PACING_CHUNK_MIN_BYTES - 1u;
+    p.idle_backoff_ms = 100;
+    test_check(axl_tcp_set_pacing(&p) == AXL_INVALID, "pacing: chunk MIN-1 is AXL_INVALID");
+    p.chunk_bytes = AXL_TCP_PACING_CHUNK_MAX_BYTES + 1u;
+    test_check(axl_tcp_set_pacing(&p) == AXL_INVALID, "pacing: chunk MAX+1 is AXL_INVALID");
+    p.chunk_bytes = 4096;
+    p.idle_backoff_ms = AXL_TCP_PACING_IDLE_BACKOFF_MAX_MS + 1u;
+    test_check(axl_tcp_set_pacing(&p) == AXL_INVALID, "pacing: backoff MAX+1 is AXL_INVALID");
+    p.idle_backoff_ms = 100;
+    p.linger_us = AXL_TCP_PACING_LINGER_MAX_US + 1u;
+    test_check(axl_tcp_set_pacing(&p) == AXL_INVALID, "pacing: linger MAX+1 is AXL_INVALID");
+    axl_tcp_get_pacing(&cur);
+    test_check(pacing_is(&cur, 32768u, 10000u, 20000u), "pacing: refused sets changed nothing");
+
+    /* NULL restores the defaults; NULL outputs are ignored. */
+    test_check(axl_tcp_set_pacing(NULL) == AXL_OK, "pacing: set(NULL) is AXL_OK");
+    axl_tcp_get_pacing(&cur);
+    test_check(pacing_is(&cur, 8192u, 500u, 0u), "pacing: set(NULL) restored the defaults");
+    axl_tcp_get_pacing(NULL);
+    axl_tcp_pacing_defaults(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Linger lifetime (AxlTcpPacing.linger_us)
+//
+// A lingering socket is a pacer member that stays on after its last send
+// retired, because a receive is armed on the same loop. Its membership must
+// end with the reason for it -- or the pacer slot outlives the loop, and a
+// caller that frees the loop after its last send leaves the slot bound to
+// freed memory (a later close then removes a source from it; a new loop at
+// the same address inherits the slot). Three ways it must end, each
+// examined through the test seams in axl-tcp-internal.h, against a host
+// peer that never answers (port 9997, echo-stream.py --sink), so no reply
+// can complete the receive and end the linger for another reason:
+//
+//   cancel    the receive is cancelled: the linger ends with it
+//   backoff   the pacer backs off (idle_backoff_ms shorter than the
+//             linger): the lingering member leaves with the polling source,
+//             since nothing else would ever expire it
+//   recv      the receive completes (against the echoing peer): the linger
+//             has done its job and ends before the callback runs -- and a
+//             callback that returns false leaves no stale source id on the
+//             socket (a later close or re-arm would remove it from a loop
+//             the caller may consider finished)
+//   rearm     the receive is re-armed on ANOTHER loop: the linger on the
+//             first one ends with it
+//
+// Each is tried up to LINGER_TRIES times, a try counting only once its
+// linger is seen to have begun (the send retired while the receive was
+// still armed).
+// ---------------------------------------------------------------------------
+
+#define LINGER_TEST_US      20000u
+#define LINGER_TRIES        3
+#define LINGER_WINDOW_MS    500u
+static const char g_linger_sink[] = "linger-sink\n";
+static const char g_linger_echo[] = "linger-echo\n";
+
+typedef enum {
+    LINGER_CANCEL,
+    LINGER_BACKOFF,
+    LINGER_RECV,
+    LINGER_REARM,
+} LingerCase;
+
+typedef struct {
+    LingerCase      kind;
+    AxlLoop        *loop;
+    AxlLoop        *loop2;      ///< LINGER_REARM: the receive's new loop
+    AxlTcp         *sock;
+    AxlCancellable *cancel;
+    char            buf[64];
+    bool            began;      ///< lingering seen in the send callback
+    bool            recv_first; ///< the receive completed before the send's callback
+    bool            ended;      ///< the case's moment came
+    bool            lingering;  ///< _axl_tcp_lingering at that moment
+    bool            bound;      ///< _axl_tcp_pacer_bound at that moment
+    int             recvs;      ///< receive completions before the moment
+    AxlStatus       recv_status;
+    size_t          recv_size;
+    bool            stale_ids;  ///< LINGER_RECV: a source id left after a false return
+} LingerCtx;
+
+static void
+linger_observe(LingerCtx *c)
+{
+    c->ended     = true;
+    c->lingering = _axl_tcp_lingering(c->sock);
+    c->bound     = _axl_tcp_pacer_bound(c->loop);
+}
+
+static bool
+linger_on_recv(AxlTcp *sock, AxlStatus status, void *data)
+{
+    LingerCtx *c = data;
+
+    if (!c->ended && status != AXL_CANCELLED) {
+        c->recvs++;
+        c->recv_status = status;
+        c->recv_size   = axl_tcp_recv_get_size(sock);
+    }
+    if (c->kind == LINGER_CANCEL && status == AXL_CANCELLED) {
+        linger_observe(c);
+        axl_loop_quit(c->loop);
+        return false;
+    }
+    if (c->kind == LINGER_RECV && status == AXL_OK) {
+        if (!c->began) {
+            c->recv_first = true;
+        }
+        linger_observe(c);
+        axl_loop_quit(c->loop);
+        return false;
+    }
+    return status == AXL_OK;   /* keep the receive armed */
+}
+
+static bool
+linger_on_sent(AxlTcp *sock, AxlStatus status, void *data)
+{
+    LingerCtx *c = data;
+
+    c->began = status == AXL_OK && _axl_tcp_lingering(sock);
+    if (c->kind == LINGER_CANCEL) {
+        axl_cancellable_cancel(c->cancel);
+    }
+    if (c->kind == LINGER_REARM) {
+        if (axl_tcp_recv_async(sock, c->buf, sizeof(c->buf), c->loop2, NULL, linger_on_recv,
+                               c) == AXL_OK) {
+            linger_observe(c);
+        }
+        axl_loop_quit(c->loop);
+    }
+    return AXL_SOURCE_REMOVE;
+}
+
+/* The back-off case's moment: the linger window has passed. */
+static bool
+linger_on_window(void *data)
+{
+    LingerCtx *c = data;
+
+    if (c->kind == LINGER_BACKOFF) {
+        linger_observe(c);
+    }
+    axl_loop_quit(c->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+/* One try of @p kind; false when the connection could not be set up. */
+static bool
+linger_try(LingerCase kind, LingerCtx *c)
+{
+    axl_memset(c, 0, sizeof(*c));
+    c->kind = kind;
+    /* The receive case wants the echo; the others the sink (9997, wired
+       by test-axl.sh), so no reply completes the receive under examination. */
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, kind == LINGER_RECV ? 9999 : 9997, &c->sock)
+        != AXL_OK) {
+        return false;
+    }
+    c->loop   = axl_loop_new();
+    c->loop2  = axl_loop_new();
+    c->cancel = axl_cancellable_new();
+    const char *msg = kind == LINGER_RECV ? g_linger_echo : g_linger_sink;
+    size_t      len = kind == LINGER_RECV ? sizeof(g_linger_echo) - 1
+                                          : sizeof(g_linger_sink) - 1;
+    bool ok = c->loop != NULL && c->loop2 != NULL && c->cancel != NULL
+              && axl_tcp_recv_async(c->sock, c->buf, sizeof(c->buf), c->loop,
+                                    kind == LINGER_CANCEL ? c->cancel : NULL,
+                                    linger_on_recv, c) == AXL_OK
+              && axl_tcp_send_async(c->sock, msg, len, c->loop, NULL,
+                                    linger_on_sent, c) == AXL_OK;
+    if (ok) {
+        axl_loop_add_timeout(c->loop, kind == LINGER_BACKOFF ? 100u : LINGER_WINDOW_MS,
+                             linger_on_window, c);
+        axl_loop_run(c->loop);
+    }
+    /* Close before freeing the loop, as AxlTcp's contract requires. What the
+       linger rules add is that no pacer slot names the loop by then; the
+       checks read that through the seam rather than by freeing the loop
+       first, which would also trip unrelated per-socket state. */
+    c->stale_ids = c->sock->recv_source != 0 || c->sock->recv_cancel_source != 0;
+    axl_tcp_close(c->sock, AXL_TEARDOWN_RESET);
+    axl_loop_free(c->loop2);
+    axl_loop_free(c->loop);
+    axl_cancellable_free(c->cancel);
+    return ok;
+}
+
+static void
+test_tcp_linger_lifetime(void)
+{
+    static const char *const names[] = { "cancel", "back-off", "receive", "re-arm" };
+    AxlTcpPacing p;
+
+    if (!axl_net_is_available()) {
+        test_skip_n(13, "TCP linger lifetime (no network)");
+        return;
+    }
+    for (int k = LINGER_CANCEL; k <= LINGER_REARM; k++) {
+        LingerCtx c = { 0 };
+        bool      valid = false;
+        bool      setup = true;
+
+        axl_tcp_pacing_defaults(&p);
+        p.linger_us = LINGER_TEST_US;
+        if (k == LINGER_BACKOFF) {
+            p.idle_backoff_ms = 5;   /* shorter than the 20 ms linger */
+        }
+        setup = axl_tcp_set_pacing(&p) == AXL_OK;
+        for (int t = 0; setup && t < LINGER_TRIES && !valid; t++) {
+            setup = linger_try((LingerCase)k, &c);
+            valid = setup && c.began && !c.recv_first && c.ended
+                    && (k == LINGER_RECV || c.recvs == 0);
+        }
+        test_check(axl_tcp_set_pacing(NULL) == AXL_OK && setup,
+                   k == LINGER_CANCEL ? "linger cancel: connected to the peer"
+                   : k == LINGER_BACKOFF ? "linger back-off: connected to the peer"
+                   : k == LINGER_RECV    ? "linger receive: connected to the peer"
+                                         : "linger re-arm: connected to the peer");
+        axl_printf("  linger %s: began %d, ended %d, lingering %d, pacer bound %d, "
+                   "receives before %d (last %d, %zu B)\n",
+                   names[k], c.began, c.ended, c.lingering, c.bound, c.recvs,
+                   (int)c.recv_status, c.recv_size);
+        test_check(valid,
+                   k == LINGER_CANCEL ? "linger cancel: the send retired into a linger"
+                   : k == LINGER_BACKOFF ? "linger back-off: the send retired into a linger"
+                   : k == LINGER_RECV    ? "linger receive: the send retired into a linger"
+                                         : "linger re-arm: the send retired into a linger");
+        test_check(valid && !c.lingering && !c.bound,
+                   k == LINGER_CANCEL
+                       ? "linger: a cancelled receive ends the linger and frees the pacer slot"
+                   : k == LINGER_BACKOFF
+                       ? "linger: a back-off shorter than the linger releases the member"
+                   : k == LINGER_RECV
+                       ? "linger: a completed receive ends the linger before its callback"
+                       : "linger: a receive re-armed on another loop ends the linger");
+        if (k == LINGER_RECV) {
+            test_check(valid && !c.stale_ids,
+                       "recv: a callback returning false leaves no source id on the socket");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A linger is only for a receive armed on the SEND's loop (the pacer's): a
+// receive on another loop is not served by that loop's polling, so a send
+// retiring there must not linger for it -- it would keep a loop polling for
+// a request it can never deliver, and bind a pacer slot to it. The same-loop
+// run is the control: it shows the send callback can see a linger at all.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlLoop *loop;
+    bool     sent;
+    bool     lingering;
+} LingerLoopCtx;
+
+static bool
+linger_loop_on_sent(AxlTcp *sock, AxlStatus status, void *data)
+{
+    LingerLoopCtx *c = data;
+
+    c->sent      = status == AXL_OK;
+    c->lingering = _axl_tcp_lingering(sock);
+    axl_loop_quit(c->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+linger_loop_on_timeout(void *data)
+{
+    axl_loop_quit(data);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_linger_needs_the_send_loop(void)
+{
+    AxlTcpPacing p;
+
+    if (!axl_net_is_available()) {
+        test_skip_n(5, "TCP linger needs the send's loop (no network)");
+        return;
+    }
+    axl_tcp_pacing_defaults(&p);
+    p.linger_us = LINGER_TEST_US;
+    bool paced = axl_tcp_set_pacing(&p) == AXL_OK;
+
+    for (int other = 0; other <= 1; other++) {
+        bool sent = true;
+        bool lingered = false;
+
+        /* As in linger_try, a linger is not seen on every try (the send must
+           retire while the receive is armed); every try must send, and the
+           same-loop control needs one linger among them. */
+        for (int t = 0; t < LINGER_TRIES; t++) {
+            LingerLoopCtx c = { 0 };
+            AxlLoop      *recv_loop = NULL;
+            AxlTcp       *sock = NULL;
+            char          buf[64];
+
+            c.loop    = axl_loop_new();
+            recv_loop = other ? axl_loop_new() : c.loop;
+            /* The sink (9997): no reply completes the receive. */
+            if (paced && c.loop != NULL && recv_loop != NULL
+                && axl_tcp_connect(AXL_TEST_ECHO_HOST, 9997, &sock) == AXL_OK
+                && axl_tcp_recv_async(sock, buf, sizeof(buf), recv_loop, NULL,
+                                      on_rearm_other_unused, NULL) == AXL_OK
+                && axl_tcp_send_async(sock, g_linger_sink, sizeof(g_linger_sink) - 1, c.loop,
+                                      NULL, linger_loop_on_sent, &c) == AXL_OK) {
+                axl_loop_add_timeout(c.loop, LINGER_WINDOW_MS, linger_loop_on_timeout, c.loop);
+                axl_loop_run(c.loop);
+            }
+            sent     = sent && c.sent;
+            lingered = lingered || c.lingering;
+            if (sock != NULL) {
+                axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+            }
+            if (other && recv_loop != NULL) {
+                axl_loop_free(recv_loop);
+            }
+            axl_loop_free(c.loop);
+            if (!other && lingered) {
+                break;
+            }
+        }
+        test_check(sent, other ? "linger other loop: every send completed"
+                               : "linger same loop: every send completed");
+        test_check(sent && lingered == !other,
+                   other ? "linger: a receive on another loop does not make a send linger"
+                         : "linger: a receive on the send's loop makes it linger");
+    }
+    test_check(axl_tcp_set_pacing(NULL) == AXL_OK && paced,
+               "linger needs the send loop: the linger was set and the defaults restored");
+}
+
 static int
 run_serve_mode(void)
 {
     AxlHttpServer *s;
+
+    /* Wait for DHCP rather than trusting the startup script's stall: a
+       server started before the lease lands has no TCP4 binding and exits.
+       Every other serve-* mode does the same. */
+    axl_net_auto_init(SIZE_MAX, 10);
 
     s = axl_http_server_new(8080);
     if (s == NULL) {
@@ -2662,9 +5638,14 @@ run_serve_mode(void)
     axl_http_server_add_route(s, "GET",  "/plain",        on_get_plain,    NULL);
     axl_http_server_add_route(s, "POST", "/echo",         on_echo,         NULL);
     axl_http_server_add_route(s, "GET",  "/client-test",  on_client_test,  NULL);
+    axl_http_server_add_route(s, "GET",  "/client-path",  on_client_path,  NULL);
+    axl_http_server_add_route(s, "GET",  "/client-fetch", on_client_fetch, NULL);
     axl_http_server_add_route(s, "GET",  "/streaming-put-test",
                               on_streaming_put_test, NULL);
     axl_http_server_add_route(s, "GET",  "/static-asset", on_get_static_asset, NULL);
+    axl_http_server_add_route(s, "GET",  "/big",          on_get_big,      NULL);
+    axl_http_server_add_route(s, "GET",  "/big-stream",   on_get_big_stream, NULL);
+    axl_http_server_add_route(s, "GET",  "/pacing",       on_get_pacing,   NULL);
 
     /*
      * Route lookup tests — verify exact and prefix routes coexist at the
@@ -2680,6 +5661,8 @@ run_serve_mode(void)
     /* Auth-protected route */
     axl_http_server_use_auth(s, test_auth_callback, NULL);
     axl_http_server_set_auth_challenge(s, "Basic", "axl-test");
+    axl_http_server_add_route_auth(s, "POST", "/secret-echo", on_echo, NULL,
+                                   AXL_ROUTE_AUTH);
     axl_http_server_add_route_auth(s, "GET", "/secret", on_secret, NULL,
                                    AXL_ROUTE_AUTH);
 
@@ -2705,6 +5688,8 @@ run_serve_mode(void)
        integration test that follows sleeps 2 s before the second
        request to give us at least one second-boundary crossing. */
     axl_http_server_set_route_ttl(s, "/ttl-short", 1500);
+    axl_http_server_add_route(s, "GET", "/ttl-zero", on_ttl_zero, NULL);
+    axl_http_server_set_route_ttl(s, "/ttl-zero", 0);
 
     axl_http_server_add_route(s, "GET", "/api/users/1", on_users_1, NULL);
     axl_http_server_add_route(s, "GET", "/api/users/2", on_users_2, NULL);
@@ -2716,6 +5701,9 @@ run_serve_mode(void)
        above; the integration test exercises it on /upload to verify
        middleware runs ahead of upload routes (was a silent bypass). */
     axl_http_server_use(s, test_reject_middleware, NULL);
+    axl_http_server_use(s, test_headers_middleware, NULL);
+    axl_http_server_add_route(s, "GET", "/heap", on_heap, NULL);
+    axl_http_server_add_route(s, "GET", "/bigheader", on_bigheader, NULL);
 
     /* WebDAV test mount under /dav. The test backend is an in-memory
        hash table keyed by full path; the integration test exercises
@@ -2731,6 +5719,11 @@ run_serve_mode(void)
        middleware-blocked vs aborted vs completed). */
     axl_http_server_set(s, "upload.chunk.size", "1024");
     axl_http_server_add_upload_route(s, "POST", "/upload", on_upload, NULL);
+    /* The same handler behind authentication, for the leak test's refused
+       upload (test-http-error-leak-qemu.sh). */
+    axl_http_server_add_upload_route_auth(s, "POST", "/upload-auth", on_upload,
+                                          NULL, AXL_ROUTE_AUTH);
+    axl_http_server_add_upload_route(s, "POST", "/upload-static", on_upload_static, NULL);
     axl_http_server_add_route(s, "GET", "/upload-status", on_upload_status, NULL);
 
     /* WebSocket echo endpoint */
@@ -2812,6 +5805,135 @@ run_serve_tls_mode(void)
     axl_printf("HTTPS server listening on port 8443\n");
     axl_printf("READY\n");
 
+    return axl_http_server_run(s);
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS certificate replacement on a live server — "serve-tls-rekey", driven
+// by test-tls-rekey-qemu.sh. axl_tls_server_set_cert used to free and
+// re-parse the ONE global certificate and key in place: a parse that failed
+// left the server with neither (every later handshake failed), and anything
+// still using the old pair read freed memory. POST /rekey installs a new
+// self-signed certificate (CN AXL-Rekey-N); /rekey-bad-cert and
+// /rekey-bad-key try a certificate, or a key, that does not parse;
+// /rekey-mismatch a valid certificate with ANOTHER pair's valid key; POST
+// /noop answers as /rekey does without touching the certificate (the heap
+// control); GET /heap is the live allocation count.
+// ---------------------------------------------------------------------------
+
+static unsigned rekey_n;
+
+static void
+rekey_reply(
+    AxlHttpResponse *resp,
+    int              rc)
+{
+    char buf[32];
+    axl_snprintf(buf, sizeof(buf), "{\"rc\":%d}", rc);
+    axl_http_response_set_json(resp, buf);
+}
+
+static int
+on_rekey(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    char   cn[32];
+
+    (void)req;
+    (void)data;
+    axl_snprintf(cn, sizeof(cn), "AXL-Rekey-%u", ++rekey_n);
+    int rc = axl_tls_generate_self_signed(cn, NULL, 0, &cert, &cert_len, &key, &key_len);
+    if (rc == AXL_OK) {
+        rc = axl_tls_server_set_cert(cert, cert_len, key, key_len);
+    }
+    axl_free(cert);
+    axl_free(key);
+    rekey_reply(resp, rc);
+    return 0;
+}
+
+/* data: 0 a junk certificate, 1 a junk key, 2 a certificate with another
+   pair's key. */
+static int
+on_rekey_bad(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    static const uint8_t junk[] = "not DER at all";
+    void  *cert = NULL, *key = NULL, *cert2 = NULL, *key2 = NULL;
+    size_t cert_len = 0, key_len = 0, cert2_len = 0, key2_len = 0;
+    uintptr_t how = (uintptr_t)data;
+
+    (void)req;
+    int rc = axl_tls_generate_self_signed("AXL-Unused", NULL, 0,
+                                          &cert, &cert_len, &key, &key_len);
+    if (rc == AXL_OK && how == 2) {
+        rc = axl_tls_generate_self_signed("AXL-Unused-2", NULL, 0,
+                                          &cert2, &cert2_len, &key2, &key2_len);
+    }
+    if (rc == AXL_OK) {
+        rc = how == 0 ? axl_tls_server_set_cert(junk, sizeof(junk), key, key_len)
+           : how == 1 ? axl_tls_server_set_cert(cert, cert_len, junk, sizeof(junk))
+           :            axl_tls_server_set_cert(cert, cert_len, key2, key2_len);
+    }
+    axl_free(cert);
+    axl_free(key);
+    axl_free(cert2);
+    axl_free(key2);
+    rekey_reply(resp, rc);
+    return 0;
+}
+
+static int
+on_noop_post(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    (void)req;
+    (void)data;
+    rekey_reply(resp, AXL_OK);
+    return 0;
+}
+
+static int
+run_serve_tls_rekey_mode(void)
+{
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK
+        || axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                        &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: TLS setup failed\n");
+        return -1;
+    }
+    AxlHttpServer *s = axl_http_server_new(8443);
+    if (s == NULL || axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: TLS server setup failed\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    axl_http_server_add_route(s, "GET",  "/plain",          on_get_plain, NULL);
+    axl_http_server_add_route(s, "GET",  "/heap",           on_heap,      NULL);
+    axl_http_server_add_route(s, "POST", "/rekey",          on_rekey,     NULL);
+    axl_http_server_add_route(s, "POST", "/rekey-bad-cert", on_rekey_bad, NULL);
+    axl_http_server_add_route(s, "POST", "/rekey-bad-key",  on_rekey_bad, (void *)1);
+    axl_http_server_add_route(s, "POST", "/rekey-mismatch", on_rekey_bad, (void *)2);
+    axl_http_server_add_route(s, "POST", "/noop",           on_noop_post, NULL);
+
+    axl_printf("HTTPS rekey server listening on port 8443\n");
+    axl_printf("READY\n");
     return axl_http_server_run(s);
 }
 
@@ -3141,6 +6263,38 @@ run_serve_hazard_driver_mode(void)
 // QEMU time out.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// "serve-big-driver" -- the throughput fixture in the resident-service
+// shape: plain HTTP on 8080 (/big, /plain) pumped ONLY by a 50 ms
+// axl_loop_attach_driver tick with every pacing and budget default, the
+// foreground idling. Driven by test-http-throughput-driver-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_big_driver_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8080);
+    if (loop == NULL || s == NULL) {
+        axl_printf("ERROR: server setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(s, "GET", "/big",   on_get_big,   NULL);
+    axl_http_server_add_route(s, "GET", "/plain", on_get_plain, NULL);
+    if (axl_http_server_start(s, loop) != 0
+        || axl_loop_attach_driver(loop, 50) != AXL_OK) {
+        axl_printf("ERROR: failed to start the driver-tick server\n");
+        return -1;
+    }
+    axl_printf("HTTP server (50 ms driver tick) on 8080\n");
+    axl_printf("READY\n");
+    for (;;) {
+        axl_msleep(1000);
+    }
+}
+
 static int
 run_serve_shell_coexist_mode(void)
 {
@@ -3460,6 +6614,68 @@ static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL g_fake_stderr = {
     .Mode              = NULL,
 };
 
+/* The physical ConOut devices, with their OutputString and SetCursorPosition
+   swapped for counters while a passthrough-off mirror holds the console: a
+   line exactly the mirror's width must reach the mirror alone. */
+#define CM_MAX_DEVICES  8
+
+static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *g_cm_dev[CM_MAX_DEVICES];
+static EFI_TEXT_STRING                  g_cm_dev_out[CM_MAX_DEVICES];
+static EFI_TEXT_SET_CURSOR_POSITION     g_cm_dev_pos[CM_MAX_DEVICES];
+static UINTN                            g_cm_ndev;
+static UINTN                            g_cm_dev_calls;
+
+static EFI_STATUS EFIAPI
+cm_dev_count_output(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+{
+    (void)This; (void)String;
+    g_cm_dev_calls++;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+cm_dev_count_pos(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
+{
+    (void)This; (void)Column; (void)Row;
+    g_cm_dev_calls++;
+    return EFI_SUCCESS;
+}
+
+/* Swap (@p hook) or put back the physical devices' two methods. */
+static void
+cm_hook_devices(bool hook)
+{
+    if (hook) {
+        EFI_HANDLE *handles = NULL;
+        UINTN       count   = 0;
+        g_cm_ndev      = 0;
+        g_cm_dev_calls = 0;
+        if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &gEfiConsoleOutDeviceGuid, NULL,
+                                              &count, &handles))) {
+            return;
+        }
+        for (UINTN i = 0; i < count && g_cm_ndev < CM_MAX_DEVICES; i++) {
+            EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *o = NULL;
+            if (!EFI_ERROR(gBS->HandleProtocol(handles[i], &gEfiSimpleTextOutputProtocolGuid,
+                                               (void **)&o))
+                && o != NULL) {
+                g_cm_dev[g_cm_ndev]     = o;
+                g_cm_dev_out[g_cm_ndev] = o->OutputString;
+                g_cm_dev_pos[g_cm_ndev] = o->SetCursorPosition;
+                o->OutputString      = cm_dev_count_output;
+                o->SetCursorPosition = cm_dev_count_pos;
+                g_cm_ndev++;
+            }
+        }
+        gBS->FreePool(handles);
+        return;
+    }
+    for (UINTN i = 0; i < g_cm_ndev; i++) {
+        g_cm_dev[i]->OutputString      = g_cm_dev_out[i];
+        g_cm_dev[i]->SetCursorPosition = g_cm_dev_pos[i];
+    }
+}
+
 static int
 run_mirror_selftest_mode(void)
 {
@@ -3478,6 +6694,8 @@ run_mirror_selftest_mode(void)
     bool got_clear = false, got_cursor = false, got_sgr = false, got_text = false;
     bool got_size = false, got_stderr = false;
     bool inj_up = false, inj_x = false, inj_f2 = false;
+    bool wrap_untouched = false, wrap_break = false;
+    UINTN wrap_ndev = 0;
 
     if (rc == AXL_OK) {
         EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = gST->ConOut;
@@ -3518,6 +6736,29 @@ run_mirror_selftest_mode(void)
                   && k2.ScanCode == 0 && k2.UnicodeChar == 'x');
         inj_f2 = (in->ReadKeyStroke(in, &k3) == EFI_SUCCESS
                   && k3.ScanCode == 0x0C && k3.UnicodeChar == 0);
+
+        /* A line exactly the mirror's 80 columns: its break is the
+           mirror's alone -- the physical devices, which passthrough off
+           promised not to touch, get nothing -- and the mirror sees the
+           wrap's CR LF and then the space and backspace that end it. */
+        char line[81];
+        for (int i = 0; i < 80; i++) {
+            line[i] = 'M';
+        }
+        line[80] = '\0';
+        axl_printf("\n");   /* the line starts at column 0 */
+        g_cm_cap_len = 0;
+        g_cm_cap[0]  = '\0';
+        cm_hook_devices(true);
+        axl_printf("%s\n", line);
+        cm_hook_devices(false);
+        wrap_ndev      = g_cm_ndev;
+        wrap_untouched = g_cm_ndev > 0 && g_cm_dev_calls == 0;
+        /* The whole capture, exactly: the line, the wrap's CR LF, then the
+           space and backspace that end it -- nothing before, nothing after. */
+        char want[96];
+        axl_snprintf(want, sizeof(want), "%s\r\n \b", line);
+        wrap_break = axl_strcmp(g_cm_cap, want) == 0;
 
         axl_console_mirror_uninstall(m);  /* restores the console */
     }
@@ -3561,11 +6802,14 @@ run_mirror_selftest_mode(void)
     axl_printf("MIRROR_SELFTEST: inject_up=%d\n", inj_up);
     axl_printf("MIRROR_SELFTEST: inject_printable=%d\n", inj_x);
     axl_printf("MIRROR_SELFTEST: inject_key_f2=%d\n", inj_f2);
+    axl_printf("MIRROR_SELFTEST: wrap_devices=%u\n", (unsigned)wrap_ndev);
+    axl_printf("MIRROR_SELFTEST: wrap_devices_untouched=%d\n", wrap_untouched);
+    axl_printf("MIRROR_SELFTEST: wrap_break=%d\n", wrap_break);
 
     bool all = (rc == AXL_OK) && dbl_blocked && got_size && got_clear
                && got_cursor && got_sgr && got_text && got_stderr
                && stderr_wrapped && stderr_restored
-               && inj_up && inj_x && inj_f2;
+               && inj_up && inj_x && inj_f2 && wrap_untouched && wrap_break;
     axl_printf("MIRROR_SELFTEST_DONE %s\n", all ? "PASS" : "FAIL");
 
     /* Do NOT return to the parent Shell (wrapping its console wedged it).
@@ -4011,6 +7255,251 @@ run_serve_multi_mode(void)
     return axl_loop_run(loop);
 }
 
+/* GET /fs-ls[?small | ?d=<dir>] -- the served directory as the FILESYSTEM
+   lists it, one name per line: FS0:\\davroot, a directory below it, or
+   with "small" the RAM disk the 8081 server's /small mount serves. A WebDAV listing hides a PUT's live
+   temp, so only this can show the host its name. */
+#define DAVFS_SMALL_ROOT "AXLPUTRD:"
+
+static int
+on_fs_ls(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data
+    )
+{
+    (void)data;
+    bool        small = req->query != NULL && axl_strcmp(req->query, "small") == 0;
+    bool        full  = req->query != NULL && axl_strcmp(req->query, "full") == 0;
+    bool        near  = req->query != NULL && axl_strcmp(req->query, "near") == 0;
+    bool        ip    = req->query != NULL && axl_strcmp(req->query, "ip") == 0;
+    bool        sub   = req->query != NULL && axl_strncmp(req->query, "d=", 2) == 0;
+    char        dir[256];
+    axl_snprintf(dir, sizeof(dir), "%s%s%s",
+                 small ? DAVFS_SMALL_ROOT : full ? "AXLFULRD:"
+                 : near ? "AXLNEARD:" : ip ? "AXLIPRD:" : "FS0:\\davroot",
+                 (small || full || near || ip || sub) ? "\\" : "", sub ? req->query + 2 : "");
+    AxlDir     *d     = axl_dir_open(dir);
+    AxlString  *out   = axl_string_new(NULL);
+    AxlFsEntry  e;
+
+    if (d == NULL || out == NULL) {
+        axl_dir_close(d);
+        axl_string_free(out);
+        resp->status_code = 500;
+        return 0;
+    }
+    while (axl_dir_read(d, &e)) {
+        if (axl_strcmp(e.name, ".") != 0 && axl_strcmp(e.name, "..") != 0) {
+            axl_string_append_printf(out, "%s\n", e.name);
+        }
+    }
+    axl_dir_close(d);
+    axl_http_response_set_text(resp, axl_string_str(out));
+    axl_string_free(out);
+    return 0;
+}
+
+/* A 1 MB RAM disk mapped as AXLFULRD: holding a.txt and, after it, one
+   file filling every byte still free -- a volume with no room for a single
+   directory entry more, for a MOVE refused before it changes anything.
+   AXL_ERR when the firmware has no RAM disk or the fill does not leave the
+   volume full. */
+#define DAVFS_FULL_ROOT "AXLFULRD:"
+
+static int
+davfs_full_volume(void)
+{
+    void    *dp       = NULL;
+    uint64_t free_now = 0;
+    if (axl_ramdisk_create("AXLFULRD", 1, &dp) != AXL_OK
+        || axl_volume_set_map(dp, "AXLFULRD") != AXL_OK
+        || axl_file_set_contents(DAVFS_FULL_ROOT "\\a.txt", "a\n", 2) != AXL_OK
+        || axl_volume_get_space(DAVFS_FULL_ROOT, NULL, &free_now) != AXL_OK) {
+        return AXL_ERR;
+    }
+    AxlFileWriter *w = axl_file_writer_open(DAVFS_FULL_ROOT "\\filler.bin", 0);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    static uint8_t zeros[4096];
+    uint64_t       left = free_now;
+    while (left > 0) {
+        size_t n = (left < sizeof(zeros)) ? (size_t)left : sizeof(zeros);
+        if (axl_file_writer_write(w, zeros, n) != AXL_OK) {
+            break;   /* the volume is full: what we wanted */
+        }
+        left -= n;
+    }
+    if (axl_file_writer_close(w) != AXL_OK) {
+        /* A close that cannot flush a full volume's last cluster is
+           expected; the space check below is what decides. */
+        axl_printf("davfs: filler close reported an error (volume full)\n");
+    }
+    if (axl_volume_get_space(DAVFS_FULL_ROOT, NULL, &free_now) != AXL_OK
+        || free_now != 0) {
+        axl_printf("davfs: AXLFULRD still has %llu bytes free\n",
+                   (unsigned long long)free_now);
+        return AXL_ERR;
+    }
+    return AXL_OK;
+}
+
+/* A 1 MB RAM disk mapped as AXLNEARD: holding tree\\big.bin (16 KiB) and
+   a filler that leaves exactly two clusters free -- room for a Depth: 0
+   COPY of tree (its new directory), not for a deep one. AXL_ERR when the
+   firmware has no RAM disk or the volume does not come out so. */
+#define DAVFS_NEAR_ROOT "AXLNEARD:"
+
+static int
+davfs_near_volume(void)
+{
+    static uint8_t zeros[4096];
+    void          *dp = NULL;
+    uint64_t       free0 = 0;
+    uint64_t       free1 = 0;
+    if (axl_ramdisk_create("AXLNEARD", 1, &dp) != AXL_OK
+        || axl_volume_set_map(dp, "AXLNEARD") != AXL_OK
+        || axl_dir_mkdir(DAVFS_NEAR_ROOT "\\tree") != AXL_OK) {
+        return AXL_ERR;
+    }
+    AxlFileWriter *w = axl_file_writer_open(DAVFS_NEAR_ROOT "\\tree\\big.bin", 0);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    bool wrote = true;
+    for (int i = 0; i < 4; i++) {
+        wrote = wrote && axl_file_writer_write(w, zeros, sizeof(zeros)) == AXL_OK;
+    }
+    if (axl_file_writer_close(w) != AXL_OK || !wrote) {
+        return AXL_ERR;
+    }
+    /* The cluster size, as the free space a one-byte file takes. */
+    if (axl_volume_get_space(DAVFS_NEAR_ROOT, NULL, &free0) != AXL_OK
+        || axl_file_set_contents(DAVFS_NEAR_ROOT "\\probe", "x", 1) != AXL_OK
+        || axl_volume_get_space(DAVFS_NEAR_ROOT, NULL, &free1) != AXL_OK
+        || axl_file_delete(DAVFS_NEAR_ROOT "\\probe") != AXL_OK
+        || free1 >= free0) {
+        return AXL_ERR;
+    }
+    uint64_t cl   = free0 - free1;
+    uint64_t left = free0 - 2u * cl;
+    w = axl_file_writer_open(DAVFS_NEAR_ROOT "\\filler.bin", 0);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    while (left > 0) {
+        size_t n = (left < sizeof(zeros)) ? (size_t)left : sizeof(zeros);
+        if (axl_file_writer_write(w, zeros, n) != AXL_OK) {
+            break;
+        }
+        left -= n;
+    }
+    uint64_t want = 2u * cl;
+    if (axl_file_writer_close(w) != AXL_OK
+        || axl_volume_get_space(DAVFS_NEAR_ROOT, NULL, &free1) != AXL_OK
+        || free1 != want) {
+        axl_printf("davfs: AXLNEARD has %llu bytes free, wanted %llu\n",
+                   (unsigned long long)free1, (unsigned long long)want);
+        return AXL_ERR;
+    }
+    return AXL_OK;
+}
+
+/* GET /req-id -- this request's request_id, in decimal. Registered on both
+   serve-davfs servers: the ids are one process-wide sequence. */
+/* GET /fs-free -- the AXLIPRD volume's free bytes and its allocation unit,
+   "<free> <unit>", for a PUT sized to the exact edge of its room. */
+static int
+on_fs_free(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data
+    )
+{
+    (void)req;
+    (void)data;
+    AxlFsVolumeFacts vf;
+    char             buf[48];
+    if (axl_fs_volume_facts("AXLIPRD:", &vf) != AXL_OK) {
+        resp->status_code = 500;
+        return 0;
+    }
+    axl_snprintf(buf, sizeof(buf), "%llu %u", (unsigned long long)vf.free_bytes,
+                 (unsigned)vf.block_size);
+    axl_http_response_set_text(resp, buf);
+    return 0;
+}
+
+static int
+on_req_id(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data
+    )
+{
+    (void)data;
+    char buf[32];
+    axl_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)req->request_id);
+    axl_http_response_set_text(resp, buf);
+    return 0;
+}
+
+/* A 2 MB RAM disk mapped as AXLPUTRD: holding old.txt, for a PUT that runs
+   out of room mid-body. AXL_ERR when the firmware has no RAM disk. */
+static int
+davfs_small_volume(void)
+{
+    void *dp = NULL;
+    if (axl_ramdisk_ensure_driver(NULL, 0, NULL) != AXL_OK
+        || axl_ramdisk_create("AXLPUTRD", 2, &dp) != AXL_OK
+        || axl_volume_set_map(dp, "AXLPUTRD") != AXL_OK) {
+        return AXL_ERR;
+    }
+    return axl_file_set_contents(DAVFS_SMALL_ROOT "\\old.txt", "old small\n", 10);
+}
+
+/* A 2 MB RAM disk mapped as AXLIPRD: holding big.bin (DAVFS_IP_BIG bytes
+   of 'A') and small.txt -- a volume that cannot hold a second copy of a
+   body near big.bin's size, for a PUT that goes in place only because of
+   that. AXL_ERR when the firmware has no RAM disk, or the volume does not
+   come out short of room for a 1,100,000-byte body beside big.bin. */
+#define DAVFS_IP_ROOT  "AXLIPRD:"
+#define DAVFS_IP_BIG   1200000u
+
+static int
+davfs_in_place_volume(void)
+{
+    static uint8_t fill[4096];
+    void          *dp       = NULL;
+    uint64_t       free_now = 0;
+    axl_memset(fill, 'A', sizeof(fill));
+    if (axl_ramdisk_create("AXLIPRD", 2, &dp) != AXL_OK
+        || axl_volume_set_map(dp, "AXLIPRD") != AXL_OK
+        || axl_file_set_contents(DAVFS_IP_ROOT "\\small.txt", "small v1\n", 9) != AXL_OK) {
+        return AXL_ERR;
+    }
+    AxlFileWriter *w = axl_file_writer_open(DAVFS_IP_ROOT "\\big.bin", 0);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    bool   wrote = true;
+    size_t left  = DAVFS_IP_BIG;
+    while (wrote && left > 0) {
+        size_t n = (left < sizeof(fill)) ? left : sizeof(fill);
+        wrote = axl_file_writer_write(w, fill, n) == AXL_OK;
+        left -= n;
+    }
+    if (axl_file_writer_close(w) != AXL_OK || !wrote
+        || axl_volume_get_space(DAVFS_IP_ROOT, NULL, &free_now) != AXL_OK
+        || free_now >= 1100000u) {
+        axl_printf("davfs: AXLIPRD has %llu bytes free, wanted < 1100000\n",
+                   (unsigned long long)free_now);
+        return AXL_ERR;
+    }
+    return AXL_OK;
+}
+
 /* serve-davfs — mount an axl-fs-backed WebDAV file server with
    axl_http_server_serve_fs: /dav read-write and /ro read-only, both
    over a clean subtree of the (writable) boot volume. Drives the
@@ -4068,6 +7557,14 @@ run_serve_davfs_common(bool tls)
         axl_printf("ERROR: serve_fs (readonly) failed\n");
         return -1;
     }
+    /* The same subtree with DELETE refused: an overwrite by MOVE or COPY
+       must not remove a collection there either. */
+    if (axl_http_server_serve_fs(s, "/nodel", "FS0:\\davroot",
+                                 AXL_SERVE_FS_NO_DELETE,
+                                 AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: serve_fs (no-delete) failed\n");
+        return -1;
+    }
 
     /* Auth-gated mount: every verb (GET / PROPFIND / ... and the
        streaming PUT) requires "Bearer test-token". Proves
@@ -4104,11 +7601,103 @@ run_serve_davfs_common(bool tls)
        span multiple TLS records are read to completion over HTTPS. */
     axl_http_server_add_route(s, "POST", "/echo", on_echo, NULL);
 
+    /* A second server on 8081 serving the same subtree with
+       AXL_SERVE_FS_NO_OVERWRITE: a server holds at most four WebDAV
+       mounts, and the four above are taken. Both run on one loop. */
+    AxlHttpServer *s2 = axl_http_server_new(8081);
+    if (s2 == NULL
+        || axl_http_server_serve_fs(s2, "/dav", "FS0:\\davroot",
+                                    AXL_SERVE_FS_NO_OVERWRITE,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: serve_fs (no-overwrite, 8081) failed\n");
+        return -1;
+    }
+    /* 8081 /small: a 2 MB volume a PUT can run out of room on. */
+    if (davfs_small_volume() != AXL_OK
+        || axl_http_server_serve_fs(s2, "/small", DAVFS_SMALL_ROOT, 0,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: the small RAM-disk volume (8081 /small) failed\n");
+        return -1;
+    }
+    /* 8081 /full: a volume with no free space at all. */
+    if (davfs_full_volume() != AXL_OK
+        || axl_http_server_serve_fs(s2, "/full", DAVFS_FULL_ROOT, 0,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: the full RAM-disk volume (8081 /full) failed\n");
+        return -1;
+    }
+    /* 8081 /near: a volume with two clusters free. */
+    if (davfs_near_volume() != AXL_OK
+        || axl_http_server_serve_fs(s2, "/near", DAVFS_NEAR_ROOT, 0,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: the near-full RAM-disk volume (8081 /near) failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(s, "GET", "/fs-ls", on_fs_ls, NULL);
+    axl_http_server_add_route(s, "GET", "/fs-free", on_fs_free, NULL);
+    axl_http_server_add_route(s,  "GET", "/req-id", on_req_id, NULL);
+    axl_http_server_add_route(s2, "GET", "/req-id", on_req_id, NULL);
+    /* 8082: a case-SENSITIVE volume (the provider fixture, names matched
+       exactly), where a.txt and A.txt are two entries: /cs, and /csnd with
+       DELETE refused. Seeded with two files and two directories that
+       differ only in letter case. */
+    AxlHttpServer *s3 = axl_http_server_new(8082);
+    if (s3 == NULL || !ff_fs_up()) {
+        axl_printf("ERROR: the case-sensitive volume (8082) failed\n");
+        return -1;
+    }
+    ff_set_flush_ok(true);
+    if (!ff_seed("a.txt", "lower\n", 6) || !ff_seed("A.txt", "UPPER\n", 6)
+        || !ff_seed_dir("dir") || !ff_seed_dir("DIR")
+        || axl_http_server_serve_fs(s3, "/cs", FF_MAP ":", 0,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK
+        || axl_http_server_serve_fs(s3, "/csnd", FF_MAP ":",
+                                    AXL_SERVE_FS_NO_DELETE,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK
+        /* The boot volume itself, given as the bare "FS0:" the
+           serve_fs docs show. */
+        || axl_http_server_serve_fs(s3, "/vol", "FS0:", AXL_SERVE_FS_READONLY,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: the case-sensitive volume's mounts (8082) failed\n");
+        return -1;
+    }
+    /* 8083: PUT in place. /ipat (atomic, the default) and /ips
+       (IN_PLACE_IF_SHORT) over the AXLIPRD volume, which cannot hold a
+       second copy of a body near big.bin's size; /ipa (IN_PLACE) and /ipno
+       (IN_PLACE with NO_OVERWRITE) over FS0:\davroot, beside the other
+       mounts' files. */
+    AxlHttpServer *s4 = axl_http_server_new(8083);
+    if (s4 == NULL || davfs_in_place_volume() != AXL_OK
+        || axl_http_server_serve_fs(s4, "/ipat", DAVFS_IP_ROOT, 0,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK
+        || axl_http_server_serve_fs(s4, "/ips", DAVFS_IP_ROOT,
+                                    AXL_SERVE_FS_PUT_IN_PLACE_IF_SHORT,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK
+        || axl_http_server_serve_fs(s4, "/ipa", "FS0:\\davroot",
+                                    AXL_SERVE_FS_PUT_IN_PLACE,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK
+        || axl_http_server_serve_fs(s4, "/ipno", "FS0:\\davroot",
+                                    AXL_SERVE_FS_PUT_IN_PLACE | AXL_SERVE_FS_NO_OVERWRITE,
+                                    AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: the in-place PUT mounts (8083) failed\n");
+        return -1;
+    }
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL
+        || axl_http_server_start(s, loop) != 0
+        || axl_http_server_start(s2, loop) != 0
+        || axl_http_server_start(s3, loop) != 0
+        || axl_http_server_start(s4, loop) != 0) {
+        axl_printf("ERROR: failed to start the WebDAV servers\n");
+        return -1;
+    }
+
     axl_printf("WebDAV file server (%s): /dav (rw) + /ro (readonly) + "
-               "/auth (gated) + POST /echo over FS0:\\davroot\n",
+               "/auth (gated) + POST /echo over FS0:\\davroot; "
+               "8081 /dav (no-overwrite)\n",
                tls ? "https" : "http");
     axl_printf("READY\n");
-    return axl_http_server_run(s);
+    return axl_loop_run(loop);
 }
 
 static int
@@ -4854,6 +8443,19 @@ test_ipv4_parse_format(void)
     test_check(axl_ipv4_parse(NULL, octets) == AXL_ERR, "ipv4 parse: NULL str");
     test_check(axl_ipv4_parse("1.2.3.4", NULL) == AXL_ERR, "ipv4 parse: NULL octets");
     test_check(axl_ipv4_parse("1.2.3.4.5", octets) == AXL_ERR, "ipv4 parse: 5 octets");
+    /* An octet of 2^32 or more used to wrap through %u's unsigned int store
+       BEFORE the > 255 check saw it: 4294967306 is 2^32 + 10, which arrived
+       as 10 (Task P review M-4). A field width of 3 stops it at the scanner. */
+    test_check(axl_ipv4_parse("4294967306.0.0.0", octets) == AXL_ERR,
+               "ipv4 parse: an octet of 2^32 + 10 is refused, not wrapped to 10");
+    test_check(axl_ipv4_parse("1.2.3.4294967296", octets) == AXL_ERR,
+               "ipv4 parse: a last octet of 2^32 is refused, not wrapped to 0");
+    test_check(axl_ipv4_parse("1111.2.3.4", octets) == AXL_ERR,
+               "ipv4 parse: a 4-digit octet is refused");
+    test_check(axl_ipv4_parse("010.000.000.001", octets) == AXL_OK
+               && octets[0] == 10 && octets[1] == 0 && octets[2] == 0
+               && octets[3] == 1,
+               "ipv4 parse: 3-digit zero-padded octets still parse (10.0.0.1)");
 
     /* Format */
     uint8_t addr[] = { 10, 0, 0, 1 };
@@ -5103,6 +8705,10 @@ test_ipv4_parse_cidr(void)
                "cidr: over-long address rejected");
     test_check(axl_ipv4_parse_cidr("256.0.0.1/24", oct, mask, &hp) == AXL_ERR,
                "cidr: bad octet rejected");
+    test_check(axl_ipv4_parse_cidr("4294967306.0.0.0", oct, mask, &hp) == AXL_ERR,
+               "cidr: a bare wrapping octet is refused (no /N, straight to axl_ipv4_parse)");
+    test_check(axl_ipv4_parse_cidr("4294967306.0.0.0/8", oct, mask, &hp) == AXL_ERR,
+               "cidr: a wrapping octet with a prefix is refused");
     test_check(axl_ipv4_parse_cidr(NULL, oct, mask, &hp) == AXL_ERR,
                "cidr: NULL str rejected");
     test_check(axl_ipv4_parse_cidr("1.2.3.4/24", NULL, mask, &hp) == AXL_ERR,
@@ -5120,9 +8726,8 @@ test_ipv4_parse_cidr(void)
 static void
 test_net_driver_is_ipxe(void)
 {
-    /* Recognized: the real driver names axl_net_ensure_drivers /
-       axl_net_try_driver actually see on staged volumes (see
-       net_drivers_ipxe[] in axl-net-dhcp.c), a full path, a bare
+    /* Recognized: the iPXE driver names netload and
+       axl_net_try_driver see on staged volumes, a full path, a bare
        mid-word occurrence, and case variants — case folding is
        ASCII-only, same as the axl_strcasestr this delegates to. */
     test_check(axl_net_driver_is_ipxe("ipxe-intel.efi"),
@@ -5162,6 +8767,30 @@ test_net_driver_is_ipxe(void)
        like iPXE" question has an honest false answer for "no string". */
     test_check(!axl_net_driver_is_ipxe(NULL),
                "is_ipxe: NULL -> false");
+}
+
+// ---------------------------------------------------------------------------
+// AxlNetDriverInfo.driver -- room for a release stick's driver path
+// ---------------------------------------------------------------------------
+
+static void
+test_net_driver_info_capacity(void)
+{
+    /* A disk-loaded driver is named by its whole file path. The longest a
+       release stick gives one: a test release's versioned directory and the
+       longest shipped driver name. No QEMU NIC is bound by a disk-loaded
+       driver that this suite can stage, so the field's capacity is pinned
+       here; netload's copies of it are checked end to end by
+       test-netload-qemu.sh (--_fwwin). The field once held 64 bytes and cut
+       this path at "\drivers\x6". */
+    static const char longest[] =
+        "\\axl-sdk-uefi-tools-99.99.99-test-20261021-0123abcd-aa64"
+        "\\drivers\\aa64\\UsbCdcNcm.efi";
+    AxlNetDriverInfo di;
+    test_check(sizeof di.driver == AXL_NET_DRIVER_NAME_MAX,
+               "driver_info: .driver holds AXL_NET_DRIVER_NAME_MAX bytes");
+    test_check(sizeof longest <= sizeof di.driver,
+               "driver_info: .driver holds a release stick's longest driver path");
 }
 
 // ---------------------------------------------------------------------------
@@ -6234,6 +9863,31 @@ run_sntp_query_mode(const char *host, const char *port_str)
 // DHCP lease exists; here we pin the safe negatives and the zero-init defaults,
 // which need no NIC and cannot perturb live firmware state.
 // ---------------------------------------------------------------------------
+
+/* The on_driver events of one auto_init_opts call, copied (the event is
+   borrowed for the callback only). */
+#define ND_EV_MAX 8
+typedef struct {
+    AxlNetDriverEvent ev[ND_EV_MAX];
+    size_t            n;
+    size_t            firmware_named;   ///< events whose driver was "firmware"
+} NdEvLog;
+
+static void
+nd_ev_record(const AxlNetDriverEvent *ev, void *ctx)
+{
+    NdEvLog *log = (NdEvLog *)ctx;
+
+    if (ev->driver != NULL && axl_strcmp(ev->driver, "firmware") == 0) {
+        log->firmware_named++;
+    }
+    if (log->n < ND_EV_MAX) {
+        log->ev[log->n] = *ev;
+        log->ev[log->n].driver = NULL;   /* borrowed: not kept */
+    }
+    log->n++;
+}
+
 static void
 test_auto_init_opts_validation(void)
 {
@@ -6262,6 +9916,70 @@ test_auto_init_opts_validation(void)
     st_no_mask.static_ipv4 = ip;             /* static_mask left NULL */
     test_check(axl_net_auto_init_opts(&st_no_mask, NULL) == AXL_ERR,
                "auto_init_opts: STATIC without static_mask -> AXL_ERR");
+
+    /* A deadline over the maximum is refused, not clamped -- before any
+       bring-up. The maximum itself is a valid value (pinned by the macro). */
+    AxlNetAutoOpts over = { 0 };
+    over.timeout_sec = AXL_NET_AUTO_TIMEOUT_MAX_SEC + 1u;
+    test_check(AXL_NET_AUTO_TIMEOUT_MAX_SEC == 86400u,
+               "auto_init_opts: the deadline maximum is one day");
+    test_check(axl_net_auto_init_opts(&over, NULL) == AXL_ERR,
+               "auto_init_opts: timeout_sec over the maximum -> AXL_ERR");
+
+    /* A cancellable already cancelled ends the bring-up before anything is
+       touched: AXL_CANCELLED, a zeroed result, and not one progress event --
+       the firmware pass, the first thing touched, announces itself. */
+    AxlCancellable *cc = axl_cancellable_new();
+    axl_cancellable_cancel(cc);
+    NdEvLog        cev = { .n = 0 };
+    AxlNetAutoOpts co  = { 0 };
+    co.cancel        = cc;
+    co.on_driver     = nd_ev_record;
+    co.on_driver_ctx = &cev;
+    AxlNetBringUpResult cres;
+    axl_memset(&cres, 0xA5, sizeof(cres));
+    test_check(axl_net_auto_init_opts(&co, &cres) == AXL_CANCELLED,
+               "auto_init_opts: a cancelled cancellable -> AXL_CANCELLED");
+    test_check(!cres.online && !cres.have_nic && cres.drivers_tried == 0
+                   && cres.drivers_quarantined == 0 && cres.via[0] == '\0',
+               "auto_init_opts: cancelled on entry -> zeroed result");
+    test_check(cev.n == 0, "auto_init_opts: cancelled on entry -> no pass started");
+    axl_cancellable_free(cc);
+
+    /* The opt-in hooks. The co-loader is one static object; the verifier
+       refuses a NULL opts and passes when nothing is asked of it. */
+    test_check(axl_net_sweep_deps_sidecar() != NULL
+                   && axl_net_sweep_deps_sidecar() == axl_net_sweep_deps_sidecar(),
+               "sweep_deps_sidecar: one static co-loader");
+    test_check(!axl_net_verify_reachable(NULL, NULL),
+               "verify_reachable: NULL opts -> false");
+    AxlNetAutoOpts no_checks = { 0 };
+    test_check(axl_net_verify_reachable(&no_checks, NULL),
+               "verify_reachable: no check asked for -> true");
+
+    /* axl_net_driver_dir: the safe negatives. The found / not-found answers
+       are pinned by netload's default-directory checks (flat and nested
+       sticks) and sshd's sweep, which print the path. */
+    char dd[4] = "zzz";
+    test_check(axl_net_driver_dir(NULL, 64) == AXL_ERR,
+               "driver_dir: NULL out -> AXL_ERR");
+    test_check(axl_net_driver_dir(dd, 0) == AXL_ERR && dd[0] == 'z',
+               "driver_dir: zero size -> AXL_ERR, out untouched");
+    /* Too small, measured against a full-size answer: one byte short of it
+       fails with "", exactly its size gives the same answer back. The full
+       call must answer at all (OK or NOT_FOUND, never ERR, for an image
+       loaded from a file), or the short one would pass for the wrong reason. */
+    char full[512];
+    char fit[512];
+    int  rc_full = axl_net_driver_dir(full, sizeof(full));
+    size_t need  = axl_strlen(full) + 1;
+    test_check((rc_full == AXL_OK || rc_full == AXL_NOT_FOUND) && need > 1,
+               "driver_dir: a full-size buffer gets an answer");
+    axl_memset(fit, 'z', sizeof(fit));
+    test_check(axl_net_driver_dir(fit, need - 1) == AXL_ERR && fit[0] == '\0',
+               "driver_dir: one byte short -> AXL_ERR, out \"\"");
+    test_check(axl_net_driver_dir(fit, need) == rc_full && axl_strcmp(fit, full) == 0,
+               "driver_dir: exactly the answer's size -> the same answer");
 
     /* Shared driver quarantine: clear is best-effort AXL_OK; the init helper
        rejects a NULL descriptor and binds a real one. */
@@ -6404,6 +10122,32 @@ run_net_diag_mode(void)
                      && res_mac.online
                      && axl_memcmp(res_mac.mac, od_if[0].mac, 6) == 0,
                  "auto_init_opts: SEL_MAC resolves eth0 and reports its MAC");
+
+        /* The link gate under a deadline, on the already-leased eth0: the
+           firmware pass announces itself, names eth0 as the link-up NIC it
+           configures, then reports the win -- exactly these three events. */
+        NdEvLog evs = { .n = 0 };
+        AxlNetAutoOpts gate = { 0 };
+        gate.link_wait_sec = 5;
+        gate.timeout_sec   = 20;
+        gate.on_driver     = nd_ev_record;
+        gate.on_driver_ctx = &evs;
+        AxlNetBringUpResult gres;
+        int grc = axl_net_auto_init_opts(&gate, &gres);
+        ND_CHECK(grc == AXL_OK && gres.online
+                     && axl_memcmp(gres.ipv4, bu_exp_addr, 4) == 0
+                     && axl_strcmp(gres.via, "firmware") == 0,
+                 "auto_init_opts: link gate + deadline -> online via firmware");
+        ND_CHECK(evs.n == 3
+                     && evs.ev[0].outcome == AXL_NET_DRV_EV_TRYING && !evs.ev[0].have_nic
+                     && evs.ev[1].outcome == AXL_NET_DRV_EV_CONFIGURING && evs.ev[1].have_nic
+                     && evs.ev[1].link_up
+                     && axl_memcmp(evs.ev[1].mac, od_if[0].mac, 6) == 0
+                     && evs.ev[2].outcome == AXL_NET_DRV_EV_UP
+                     && axl_memcmp(evs.ev[2].mac, od_if[0].mac, 6) == 0
+                     && evs.firmware_named == 3,
+                 "auto_init_opts: link gate events == TRYING, CONFIGURING eth0, UP eth0 "
+                 "(all \"firmware\")");
     }
 
     /* by-MAC lease accessor. In the single-NIC QEMU profile the IP4Config2 and
@@ -7552,6 +11296,87 @@ test_http_status_line(void)
     http_build_status_line(buf, sizeof(buf), 403);
     test_check(axl_strcmp(buf, "HTTP/1.1 403 Forbidden\r\n") == 0,
                "http status: 403 Forbidden");
+
+    /* Every status the server and its WebDAV adjunct answer has its own
+       reason phrase -- none goes out as "Unknown" (100 and 417: Expect). */
+    static const struct { size_t code; const char *line; } phrases[] = {
+        { 207, "HTTP/1.1 207 Multi-Status\r\n" },
+        { 412, "HTTP/1.1 412 Precondition Failed\r\n" },
+        { 414, "HTTP/1.1 414 URI Too Long\r\n" },
+        { 415, "HTTP/1.1 415 Unsupported Media Type\r\n" },
+        { 416, "HTTP/1.1 416 Range Not Satisfiable\r\n" },
+        { 423, "HTTP/1.1 423 Locked\r\n" },
+        { 501, "HTTP/1.1 501 Not Implemented\r\n" },
+        { 502, "HTTP/1.1 502 Bad Gateway\r\n" },
+        { 507, "HTTP/1.1 507 Insufficient Storage\r\n" },
+        { 100, "HTTP/1.1 100 Continue\r\n" },
+        { 417, "HTTP/1.1 417 Expectation Failed\r\n" },
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(phrases) / sizeof(phrases[0]); i++) {
+        http_build_status_line(buf, sizeof(buf), phrases[i].code);
+        if (axl_strcmp(buf, phrases[i].line) != 0) {
+            axl_printf("      %u -> %s", (unsigned)phrases[i].code, buf);
+            ok = false;
+        }
+    }
+    test_check(ok, "http status: 207 412 414 415 416 423 501 502 507 100 417 have their reason phrases");
+}
+
+// ---------------------------------------------------------------------------
+// Expect (RFC 9110 10.1.1): what a request's Expect field asks of the server.
+// 100-continue, compared case-insensitively and with the field's OWS, asks
+// for a 100 before the body; anything else (a list included) is an
+// expectation the server cannot meet -- 417. An HTTP/1.0 request's
+// 100-continue MUST be ignored. No field, or an empty one, asks nothing.
+// ---------------------------------------------------------------------------
+
+static void
+test_http_expect_check(void)
+{
+    static const struct {
+        const char   *value;
+        bool          http10;
+        AxlHttpExpect want;
+    } cases[] = {
+        { NULL,                  false, AXL_HTTP_EXPECT_NONE     },
+        { "",                    false, AXL_HTTP_EXPECT_NONE     },
+        { "  \t ",               false, AXL_HTTP_EXPECT_NONE     },
+        { "100-continue",        false, AXL_HTTP_EXPECT_CONTINUE },
+        { "100-Continue",        false, AXL_HTTP_EXPECT_CONTINUE },
+        { " 100-continue\t",     false, AXL_HTTP_EXPECT_CONTINUE },
+        { "100-continue, foo",   false, AXL_HTTP_EXPECT_FAILED   },
+        { "100-continued",       false, AXL_HTTP_EXPECT_FAILED   },
+        { "100",                 false, AXL_HTTP_EXPECT_FAILED   },
+        { "foo",                 false, AXL_HTTP_EXPECT_FAILED   },
+        { "100-continue",        true,  AXL_HTTP_EXPECT_NONE     },
+        { "foo",                 true,  AXL_HTTP_EXPECT_FAILED   },
+    };
+    bool ok = true;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        AxlHttpExpect got = _axl_http_expect_check(cases[i].value, cases[i].http10);
+        if (got != cases[i].want) {
+            axl_printf("      expect '%s' http10=%d -> %d, want %d\n",
+                       cases[i].value != NULL ? cases[i].value : "(null)",
+                       (int)cases[i].http10, (int)got, (int)cases[i].want);
+            ok = false;
+        }
+    }
+    test_check(ok, "http expect: 100-continue (any case, OWS) continues, others fail, "
+                   "HTTP/1.0 ignores 100-continue, none or empty asks nothing");
+
+    /* Two Expect lines are one list, so a second cannot replace the first. */
+    static const char req[] = "POST /x HTTP/1.1\r\nHost: h\r\nExpect: foo\r\n"
+                              "Expect: 100-continue\r\nContent-Length: 1\r\n\r\n";
+    AxlHttpReqHead h;
+    size_t         st = _axl_http_request_head_parse(req, sizeof(req) - 1, &h);
+    const char    *joined = (st == 0 && h.headers != NULL)
+                            ? axl_hash_table_lookup(h.headers, "expect") : NULL;
+    test_check(joined != NULL && axl_strcmp(joined, "foo, 100-continue") == 0
+               && _axl_http_expect_check(joined, false) == AXL_HTTP_EXPECT_FAILED,
+               "http expect: two Expect lines join into 'foo, 100-continue' -- 417, not 100");
+    http_req_head_free(&h);
 }
 
 static void
@@ -7994,6 +11819,1333 @@ run_serve_rebind_mode(const char *variant)
 }
 
 // ---------------------------------------------------------------------------
+// "serve-ws-held-101" -- a WebSocket connection torn down while its 101's
+// completion callback is still owed.
+//
+// axl_tcp_close delivers every send callback it still holds before it
+// returns, and one whose send had already FINISHED arrives with its real
+// status, AXL_OK -- not AXL_CANCELLED. The 101's completion is what fires the
+// app's AXL_WS_CONNECT, so a teardown that closes the socket with that
+// callback owed used to fire CONNECT from inside the teardown, AFTER the
+// DISCONNECT gate had already passed: the app registered a connection it
+// never heard DISCONNECT for, and the slot was then zeroed and reused.
+//
+// The window is one loop iteration wide in the ordinary case, so the seam
+// holds it open: axl_tcp_fail_next_send_schedule(1) is armed before the
+// server starts, and the host's FIRST request is the upgrade, so the first
+// send retirement of this boot is the 101's. Its callback then runs only
+// from the close.
+//
+// Serial protocol (test-ws-held-101-qemu.sh):
+//   READY
+//   WS-HELD: CONNECT       -- each AXL_WS_CONNECT the app sees
+//   WS-HELD: DISCONNECT    -- each AXL_WS_DISCONNECT
+//   WS-HELD: before-free connect=N disconnect=M
+//                          -- at GET /stop, before any teardown: connect=0
+//                             is what says the 101's callback really was
+//                             held (unheld, it runs on the next iteration)
+//   WS-HELD: after-free connect=N disconnect=M
+//   WS-HELD: MEM-CORRUPTION N
+//   WS-HELD: DONE
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlLoop  *loop;
+    uint32_t  connects;
+    uint32_t  disconnects;
+} WsHeldCtx;
+
+static WsHeldCtx g_ws_held;
+
+static int
+on_ws_held(
+    AxlWsConn  *conn,
+    AxlWsEvent  event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)conn;
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if (event == AXL_WS_CONNECT) {
+        g_ws_held.connects++;
+        axl_printf("WS-HELD: CONNECT\n");
+    } else if (event == AXL_WS_DISCONNECT) {
+        g_ws_held.disconnects++;
+        axl_printf("WS-HELD: DISCONNECT\n");
+    }
+    return 0;
+}
+
+static bool
+ws_held_quit_cb(void *data)
+{
+    axl_loop_quit(((WsHeldCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+/* GET /stop: report the counts as they stand before any teardown, then quit
+   the loop once this response has had time to leave. The server is freed
+   after axl_loop_run returns, with the upgraded connection still in its
+   table and its 101's callback still owed. */
+static int
+on_ws_held_stop(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    WsHeldCtx *c = (WsHeldCtx *)data;
+    (void)req;
+    axl_printf("WS-HELD: before-free connect=%u disconnect=%u\n",
+               c->connects, c->disconnects);
+    axl_http_response_set_text(resp, "stopping");
+    axl_loop_add_timeout(c->loop, 500, ws_held_quit_cb, c);
+    return 0;
+}
+
+static int
+run_serve_ws_held_101_mode(void)
+{
+    AxlHttpServer *s;
+
+    axl_memset(&g_ws_held, 0, sizeof(g_ws_held));
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    g_ws_held.loop = axl_loop_new();
+    s = axl_http_server_new(8080);
+    if (g_ws_held.loop == NULL || s == NULL) {
+        axl_printf("ERROR: ws-held setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_websocket_ex(s, "/ws-held", on_ws_held, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_route(s, "GET", "/stop", on_ws_held_stop, &g_ws_held);
+
+    /* Armed before anything can send, so the hold lands on this boot's first
+       send retirement. The seam reports firing at DEBUG in the "tcp" domain;
+       raise it so the harness can see the hold it asked for happened. */
+    axl_log_set_domain_level("tcp", AXL_LOG_DEBUG);
+    axl_tcp_fail_next_send_schedule(1);
+
+    if (axl_http_server_start(s, g_ws_held.loop) != 0) {
+        axl_printf("ERROR: ws-held start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+    axl_loop_run(g_ws_held.loop);
+
+    /* Disarm in case the upgrade never came: the counter is process-wide. */
+    axl_tcp_fail_next_send_schedule(0);
+    /* RESET, not GRACEFUL: both close the connection with its 101 owed, but a
+       graceful close parks its finalize on the loop, which is not pumped
+       again -- the leak gate would then see that, not the defect. */
+    axl_http_server_free(s, AXL_TEARDOWN_RESET);
+    axl_loop_free(g_ws_held.loop);
+
+    axl_printf("WS-HELD: after-free connect=%u disconnect=%u\n",
+               g_ws_held.connects, g_ws_held.disconnects);
+    /* A use-after-free WRITE is counted only when its block leaves the
+       quarantine, so drain it before reading the heap's verdict. */
+    axl_mem_set_quarantine(0);
+    axl_printf("WS-HELD: MEM-CORRUPTION %zu\n", axl_mem_corruption_count());
+    axl_printf("WS-HELD: DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "serve-ws-close-in-connect" -- a CONNECT handler that closes its own
+// connection.
+//
+// DISCONNECT is the app's cleanup hook for a connection it accepted. A CONNECT
+// handler may register the connection somewhere and then decide to close it
+// (axl_ws_conn_close) -- it must still get DISCONNECT, or the registration
+// leaks and later points at a recycled slot. It must NOT get it while the
+// CONNECT handler is still on the stack. A handler that REJECTS (returns
+// AXL_ERR) gets no DISCONNECT, closed or not.
+//
+// Serial protocol (test-http-teardown-hooks-qemu.sh):
+//   READY
+//   WS-CIC: ok CONNECT / ok DISCONNECT nested=N      -- /ws-close-ok
+//   WS-CIC: reject CONNECT / reject DISCONNECT       -- /ws-close-reject
+//   WS-CIC: counts ok=C/D reject=C/D                 -- at GET /stop
+//   WS-CIC: MEM-CORRUPTION N
+//   WS-CIC: DONE
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlLoop  *loop;
+    bool      reject;         /* this route's CONNECT returns AXL_ERR */
+    bool      in_connect;     /* its CONNECT handler is on the stack */
+    uint32_t  connects;
+    uint32_t  disconnects;
+} WsCicRoute;
+
+static AxlLoop   *g_ws_cic_loop;
+static WsCicRoute g_ws_cic_ok;
+static WsCicRoute g_ws_cic_reject;
+
+static int
+on_ws_cic(
+    AxlWsConn  *conn,
+    AxlWsEvent  event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    WsCicRoute *r    = (WsCicRoute *)data;
+    const char *name = r->reject ? "reject" : "ok";
+
+    (void)frame;
+    (void)frame_size;
+    if (event == AXL_WS_CONNECT) {
+        r->connects++;
+        axl_printf("WS-CIC: %s CONNECT\n", name);
+        r->in_connect = true;
+        axl_ws_conn_close(conn);
+        r->in_connect = false;
+        if (!r->reject) {
+            /* Closed as far as the app is concerned, although the teardown
+               itself waits for this CONNECT to return. */
+            int send_rc  = axl_ws_send(conn, AXL_WS_TEXT, "x", 1);
+            int close_rc = axl_ws_conn_close(conn);
+            axl_printf("WS-CIC: ok after-close send=%d close=%d\n",
+                       send_rc, close_rc);
+        }
+        return r->reject ? AXL_ERR : AXL_OK;
+    }
+    if (event == AXL_WS_DISCONNECT) {
+        r->disconnects++;
+        if (r->reject) {
+            axl_printf("WS-CIC: reject DISCONNECT\n");
+        } else {
+            axl_printf("WS-CIC: ok DISCONNECT nested=%d\n",
+                       r->in_connect ? 1 : 0);
+        }
+    }
+    return AXL_OK;
+}
+
+static bool
+ws_cic_quit_cb(void *data)
+{
+    axl_loop_quit((AxlLoop *)data);
+    return AXL_SOURCE_REMOVE;
+}
+
+static int
+on_ws_cic_stop(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    (void)req;
+    (void)data;
+    axl_printf("WS-CIC: counts ok=%u/%u reject=%u/%u\n",
+               g_ws_cic_ok.connects, g_ws_cic_ok.disconnects,
+               g_ws_cic_reject.connects, g_ws_cic_reject.disconnects);
+    axl_http_response_set_text(resp, "stopping");
+    axl_loop_add_timeout(g_ws_cic_loop, 500, ws_cic_quit_cb, g_ws_cic_loop);
+    return 0;
+}
+
+static int
+run_serve_ws_close_in_connect_mode(void)
+{
+    AxlHttpServer *s;
+
+    axl_memset(&g_ws_cic_ok, 0, sizeof(g_ws_cic_ok));
+    axl_memset(&g_ws_cic_reject, 0, sizeof(g_ws_cic_reject));
+    g_ws_cic_reject.reject = true;
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    g_ws_cic_loop = axl_loop_new();
+    s = axl_http_server_new(8080);
+    if (g_ws_cic_loop == NULL || s == NULL) {
+        axl_printf("ERROR: ws-cic setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_websocket_ex(s, "/ws-close-ok", on_ws_cic,
+                                     &g_ws_cic_ok, AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_websocket_ex(s, "/ws-close-reject", on_ws_cic,
+                                     &g_ws_cic_reject, AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_route(s, "GET", "/stop", on_ws_cic_stop, NULL);
+
+    if (axl_http_server_start(s, g_ws_cic_loop) != 0) {
+        axl_printf("ERROR: ws-cic start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+    axl_loop_run(g_ws_cic_loop);
+
+    axl_http_server_free(s, AXL_TEARDOWN_RESET);
+    axl_loop_free(g_ws_cic_loop);
+    axl_mem_set_quarantine(0);
+    axl_printf("WS-CIC: MEM-CORRUPTION %zu\n", axl_mem_corruption_count());
+    axl_printf("WS-CIC: DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "serve-upload-held" -- an upload torn down after its clean end.
+//
+// AxlUploadHandler promises the clean-EOF call and the abort call are
+// mutually exclusive. The server used to keep the connection marked as an
+// upload until the response's completion ran, so a teardown in between --
+// here, axl_http_server_free with that completion held by the seam -- called
+// the handler AGAIN, aborted=true, after it had already answered 201. A
+// handler whose abort path deletes a partial file would delete the finished
+// one.
+//
+// The host's FIRST request is the upload, so axl_tcp_fail_next_send_schedule(1)
+// holds that response's completion until the close.
+//
+// Serial protocol (test-http-teardown-hooks-qemu.sh):
+//   READY
+//   UP-HELD: before-free chunks=N eof=N abort=N   -- at GET /stop
+//   ("serve-upload-held fail": the handler answers 507 and returns AXL_ERR
+//    from its first chunk call, which ends the upload just as clean EOF does)
+//   UP-HELD: after-free chunks=N eof=N abort=N
+//   UP-HELD: MEM-CORRUPTION N
+//   UP-HELD: DONE
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlLoop  *loop;
+    bool      fail;           /* return AXL_ERR from the first chunk call */
+    uint32_t  chunks;
+    uint32_t  eofs;
+    uint32_t  aborts;
+    size_t    bytes;
+} UpHeldCtx;
+
+static UpHeldCtx g_up_held;
+
+static int
+on_up_held(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    const void      *chunk,
+    size_t           chunk_size,
+    void            *data,
+    bool             aborted)
+{
+    UpHeldCtx *c = (UpHeldCtx *)data;
+
+    (void)req;
+    if (aborted) {
+        c->aborts++;
+        return AXL_OK;
+    }
+    if (chunk != NULL) {
+        c->chunks++;
+        c->bytes += chunk_size;
+        if (c->fail) {
+            axl_http_response_set_status(resp, 507);
+            return AXL_ERR;    /* ends the upload: nothing may follow */
+        }
+        return AXL_OK;
+    }
+    c->eofs++;
+    axl_http_response_set_status(resp, 201);
+    axl_http_response_set_text(resp, "stored");
+    return AXL_OK;
+}
+
+static bool
+up_held_quit_cb(void *data)
+{
+    axl_loop_quit(((UpHeldCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static int
+on_up_held_stop(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    UpHeldCtx *c = (UpHeldCtx *)data;
+
+    (void)req;
+    axl_printf("UP-HELD: before-free chunks=%u eof=%u abort=%u bytes=%zu\n",
+               c->chunks, c->eofs, c->aborts, c->bytes);
+    axl_http_response_set_text(resp, "stopping");
+    axl_loop_add_timeout(c->loop, 500, up_held_quit_cb, c);
+    return 0;
+}
+
+static int
+run_serve_upload_held_mode(
+    bool fail  ///< the handler returns AXL_ERR from its first chunk call
+)
+{
+    AxlHttpServer *s;
+
+    axl_memset(&g_up_held, 0, sizeof(g_up_held));
+    g_up_held.fail = fail;
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    g_up_held.loop = axl_loop_new();
+    s = axl_http_server_new(8080);
+    if (g_up_held.loop == NULL || s == NULL) {
+        axl_printf("ERROR: up-held setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_upload_route(s, "PUT", "/up", on_up_held, &g_up_held);
+    axl_http_server_add_route(s, "GET", "/stop", on_up_held_stop, &g_up_held);
+
+    /* As serve-ws-held-101: armed before anything can send, so the hold lands
+       on the upload response's completion. */
+    axl_log_set_domain_level("tcp", AXL_LOG_DEBUG);
+    axl_tcp_fail_next_send_schedule(1);
+
+    if (axl_http_server_start(s, g_up_held.loop) != 0) {
+        axl_printf("ERROR: up-held start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+    axl_loop_run(g_up_held.loop);
+
+    axl_tcp_fail_next_send_schedule(0);
+    axl_http_server_free(s, AXL_TEARDOWN_RESET);
+    axl_loop_free(g_up_held.loop);
+
+    axl_printf("UP-HELD: after-free chunks=%u eof=%u abort=%u\n",
+               g_up_held.chunks, g_up_held.eofs, g_up_held.aborts);
+    axl_mem_set_quarantine(0);
+    axl_printf("UP-HELD: MEM-CORRUPTION %zu\n", axl_mem_corruption_count());
+    axl_printf("UP-HELD: DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "serve-free-in-handler" -- axl_http_server_free called from inside one of
+// the server's own handlers.
+//
+// A handler runs beneath the server's own loop callback, which still uses the
+// connection (and the server) after the handler returns. Freeing the server
+// there must not free that memory under it: the free is completed when the
+// server's outermost callback returns. RESET's promise holds from that point
+// -- a new server can bind the same port at once.
+//
+// One boot, seven rounds on port 8080, each a fresh server. In four, a
+// handler of one kind frees it (RESET): an ordinary route, a WebSocket
+// CONNECT, a WebSocket text frame, an upload chunk. "refree": the server is
+// freed from outside, and the WebSocket DISCONNECT that teardown fires frees
+// it AGAIN -- which must do nothing. "timer-close": the app's own timer calls
+// axl_ws_conn_close, outside every server callback, and the DISCONNECT that
+// fires frees the server. "run": the server runs under axl_http_server_run
+// and a route handler frees it -- run must return.
+//
+// Serial protocol (test-http-free-in-handler-qemu.sh):
+//   FREE: ready <kind>             -- the host now triggers <kind>
+//   FREE: <kind> handler freed the server
+//   FREE: <kind> rebind rc=N       -- a new server's start on the same port
+//   FREE: MEM-CORRUPTION N
+//   FREE: DONE
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlLoop       *loop;
+    AxlHttpServer *server;
+    const char    *kind;
+    bool           freed;
+    AxlWsConn     *ws;       /* "timer-close": the connection to close */
+} FreeInHandlerCtx;
+
+static FreeInHandlerCtx g_fih;
+
+static bool
+fih_quit_cb(void *data)
+{
+    axl_loop_quit(((FreeInHandlerCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+/* Free the server from inside its own handler, once; the loop ends shortly
+   after (the timeout runs after the server's callback has returned). */
+static void
+fih_free_now(void)
+{
+    if (g_fih.freed) {
+        return;
+    }
+    g_fih.freed = true;
+    axl_http_server_free(g_fih.server, AXL_TEARDOWN_RESET);
+    axl_printf("FREE: %s handler freed the server\n", g_fih.kind);
+    if (g_fih.loop != NULL) {   /* "run": the free itself ends run's loop */
+        axl_loop_add_timeout(g_fih.loop, 200, fih_quit_cb, &g_fih);
+    }
+}
+
+/* "timer-close": close the connection from the APP's own timer -- outside
+   every server callback -- so its DISCONNECT (which frees the server) runs
+   under axl_ws_conn_close itself. */
+static bool
+fih_close_cb(void *data)
+{
+    (void)data;
+    axl_ws_conn_close(g_fih.ws);
+    return AXL_SOURCE_REMOVE;
+}
+
+static int
+on_fih_route(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    void            *data)
+{
+    (void)req;
+    (void)data;
+    axl_http_response_set_text(resp, "bye");
+    fih_free_now();
+    return 0;
+}
+
+static int
+on_fih_ws(
+    AxlWsConn  *conn,
+    AxlWsEvent  event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if ((event == AXL_WS_CONNECT && axl_strcmp(g_fih.kind, "connect") == 0)
+        || (event == AXL_WS_TEXT && axl_strcmp(g_fih.kind, "frame") == 0)) {
+        fih_free_now();
+    }
+    if (axl_strcmp(g_fih.kind, "timer-close") == 0) {
+        if (event == AXL_WS_CONNECT) {
+            g_fih.ws = conn;
+            axl_loop_add_timeout(g_fih.loop, 100, fih_close_cb, NULL);
+        } else if (event == AXL_WS_DISCONNECT) {
+            fih_free_now();
+        }
+    }
+    if (axl_strcmp(g_fih.kind, "refree") == 0) {
+        if (event == AXL_WS_CONNECT) {
+            /* End the loop; the server is then freed from OUTSIDE any
+               handler, and that teardown fires this DISCONNECT. */
+            axl_loop_add_timeout(g_fih.loop, 200, fih_quit_cb, &g_fih);
+        } else if (event == AXL_WS_DISCONNECT) {
+            axl_http_server_free(g_fih.server, AXL_TEARDOWN_RESET);
+            axl_printf("FREE: refree DISCONNECT freed the server again\n");
+        }
+    }
+    return AXL_OK;
+}
+
+static int
+on_fih_upload(
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp,
+    const void      *chunk,
+    size_t           chunk_size,
+    void            *data,
+    bool             aborted)
+{
+    (void)req;
+    (void)resp;
+    (void)chunk_size;
+    (void)data;
+    if (chunk != NULL && !aborted) {
+        fih_free_now();
+    }
+    return AXL_OK;
+}
+
+static int
+run_serve_free_in_handler_mode(void)
+{
+    static const char *const kinds[] = { "route", "connect", "frame",
+                                         "upload", "refree", "timer-close",
+                                         "run" };
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        AxlHttpServer *again;
+        int            rc;
+
+        bool run_mode = axl_strcmp(kinds[k], "run") == 0;
+
+        axl_memset(&g_fih, 0, sizeof(g_fih));
+        g_fih.kind   = kinds[k];
+        g_fih.loop   = axl_loop_new();
+        g_fih.server = axl_http_server_new(8080);
+        if (g_fih.loop == NULL || g_fih.server == NULL
+            || axl_http_server_add_route(g_fih.server, "GET", "/free",
+                                         on_fih_route, NULL) != AXL_OK
+            || axl_http_server_add_websocket_ex(g_fih.server, "/ws",
+                                                on_fih_ws, NULL,
+                                                AXL_ROUTE_NO_AUTH) != AXL_OK
+            || axl_http_server_add_upload_route(g_fih.server, "PUT", "/up",
+                                                on_fih_upload,
+                                                NULL) != AXL_OK) {
+            axl_printf("ERROR: free-in-handler setup failed (%s)\n",
+                       g_fih.kind);
+            return -1;
+        }
+        if (run_mode) {
+            /* axl_http_server_run owns a private loop the handler cannot
+               quit; the free from inside the handler must end it. */
+            AxlLoop *mine = g_fih.loop;
+
+            g_fih.loop = NULL;
+            axl_printf("FREE: ready %s\n", g_fih.kind);
+            rc = axl_http_server_run(g_fih.server);
+            axl_printf("FREE: run returned rc=%d\n", rc);
+            g_fih.loop = mine;
+        } else {
+            if (axl_http_server_start(g_fih.server, g_fih.loop) != 0) {
+                axl_printf("ERROR: free-in-handler start failed (%s)\n",
+                           g_fih.kind);
+                return -1;
+            }
+            axl_printf("FREE: ready %s\n", g_fih.kind);
+            axl_loop_run(g_fih.loop);
+        }
+
+        /* A round whose handler did not free the server ("refree") frees
+           it here, from outside any handler. */
+        if (!g_fih.freed) {
+            axl_http_server_free(g_fih.server, AXL_TEARDOWN_RESET);
+        }
+        /* RESET's promise: the port is free the moment the free completed,
+           with no loop pumping. */
+        again = axl_http_server_new(8080);
+        rc    = (again != NULL) ? axl_http_server_start(again, g_fih.loop) : -1;
+        axl_printf("FREE: %s rebind rc=%d\n", g_fih.kind, rc);
+        axl_http_server_free(again, AXL_TEARDOWN_RESET);
+        axl_loop_free(g_fih.loop);
+    }
+    axl_mem_set_quarantine(0);
+    axl_printf("FREE: MEM-CORRUPTION %zu\n", axl_mem_corruption_count());
+    axl_printf("FREE: DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "serve-tcp-close-pending" -- a close with a send still on the wire: caller
+// memory must never reach the wire, and the close must be abortive.
+//
+// TcpDxe reads a Transmit's data until it has segmented it into its own send
+// queue. AxlTcp hands it a COPY of each piece (the socket's bounce buffer), so
+// a send's owner may free or reuse its buffer the moment its callback runs.
+// And a close that drops accepted bytes -- here, the unarmed rest of a large
+// send -- resets the connection rather than ending it with a FIN that would
+// make the truncated stream look complete.
+//
+// The fixture sends a large buffer of 'A' to a peer that reads nothing, so the
+// send stalls against a full window with a piece armed but not yet segmented.
+// It closes GRACEFULLY, and from inside the send callback overwrites the
+// buffer with 'Z', says so on the serial log, and stalls with the firmware
+// running. The peer starts reading when it sees that line, opening the window
+// DURING the stall: a firmware that still held the owner's buffer would
+// segment the rest of that piece from it now, and any 'Z' the peer (or the
+// wire capture) sees is exactly that.
+//
+// The callback also asks the socket for its peer address. Once the firmware
+// has let go of the connection that query fails, so AXL_ERR there is what says
+// the callback ran AFTER the firmware released the socket.
+//
+// Serial protocol (test-tcp-close-pending-qemu.sh):
+//   READY
+//   TCPCLOSE: accepted
+//   TCPCLOSE: cb-stall
+//   TCPCLOSE: send-cb status=<OK|ERR|CANCELLED> remote-addr=<OK|ERR>
+//   TCPCLOSE: closed callbacks=N
+//   TCPCLOSE: MEM-CORRUPTION N
+//   TCPCLOSE: DONE
+// ---------------------------------------------------------------------------
+
+#define TCP_CLOSE_PENDING_BYTES     (16u * 1024u * 1024u)
+#define TCP_CLOSE_PENDING_CLOSE_MS  3000u
+#define TCP_CLOSE_PENDING_LINGER_MS 8000u
+/* Long enough for the host to notice the stall line and open the window. */
+#define TCP_CLOSE_PENDING_CB_STALL_US (3000u * 1000u)
+
+typedef struct {
+    AxlLoop  *loop;
+    AxlTcp   *client;
+    uint8_t  *buf;
+    uint32_t  callbacks;
+} TcpClosePendingCtx;
+
+static TcpClosePendingCtx g_tcp_close_pending;
+
+static const char *
+tcp_close_pending_status_name(
+    AxlStatus status)
+{
+    if (status == AXL_OK) {
+        return "OK";
+    }
+    if (status == AXL_CANCELLED) {
+        return "CANCELLED";
+    }
+    return "ERR";
+}
+
+static bool
+on_tcp_close_pending_sent(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpClosePendingCtx *c = (TcpClosePendingCtx *)data;
+    char                addr[16];
+    uint16_t            port = 0;
+    int                 rc   = axl_tcp_get_remote_addr(sock, addr, sizeof(addr),
+                                                       &port);
+
+    c->callbacks++;
+    /* The owner reuses its buffer the moment it hears back -- exactly what
+       every AxlTcp consumer does (http, ws, tls, ssh, 9p, socket). */
+    axl_memset(c->buf, 'Z', TCP_CLOSE_PENDING_BYTES);
+    /* ...and keeps the CPU a while with the firmware's timers running while
+       the peer, told by this line, starts reading: a firmware still
+       transmitting from this buffer would put 'Z' on the wire now. */
+    axl_printf("TCPCLOSE: cb-stall\n");
+    axl_usleep(TCP_CLOSE_PENDING_CB_STALL_US);
+    axl_printf("TCPCLOSE: send-cb status=%s remote-addr=%s\n",
+               tcp_close_pending_status_name(status),
+               rc == AXL_OK ? "OK" : "ERR");
+    return true;
+}
+
+static bool
+tcp_close_pending_quit_cb(
+    void *data)
+{
+    axl_loop_quit(((TcpClosePendingCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+/* Close the connection GRACEFULLY with the send still on the wire, then keep
+   the loop running so whatever the firmware still transmits reaches the peer,
+   which starts reading only once it sees "closed". */
+static bool
+tcp_close_pending_close_cb(
+    void *data)
+{
+    TcpClosePendingCtx *c = (TcpClosePendingCtx *)data;
+
+    axl_tcp_close(c->client, AXL_TEARDOWN_GRACEFUL);
+    c->client = NULL;
+    axl_printf("TCPCLOSE: closed callbacks=%u\n", c->callbacks);
+    axl_loop_add_timeout(c->loop, TCP_CLOSE_PENDING_LINGER_MS,
+                         tcp_close_pending_quit_cb, c);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_close_pending_accept(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpClosePendingCtx *c = (TcpClosePendingCtx *)data;
+
+    if (status != AXL_OK || sock == NULL) {
+        axl_printf("ERROR: tcp-close-pending accept status=%d\n", (int)status);
+        return false;
+    }
+    axl_printf("TCPCLOSE: accepted\n");
+    c->client = sock;
+    if (axl_tcp_send_async(sock, c->buf, TCP_CLOSE_PENDING_BYTES, c->loop,
+                           NULL, on_tcp_close_pending_sent, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-close-pending send refused\n");
+        return false;
+    }
+    axl_loop_add_timeout(c->loop, TCP_CLOSE_PENDING_CLOSE_MS,
+                         tcp_close_pending_close_cb, c);
+    return false;   /* one client is all this fixture serves */
+}
+
+static int
+run_serve_tcp_close_pending_mode(void)
+{
+    AxlTcp *listener = NULL;
+
+    axl_memset(&g_tcp_close_pending, 0, sizeof(g_tcp_close_pending));
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    /* The close's promotion notice is DEBUG in the "tcp" domain. */
+    axl_log_set_domain_level("tcp", AXL_LOG_DEBUG);
+
+    g_tcp_close_pending.loop = axl_loop_new();
+    g_tcp_close_pending.buf  = axl_malloc(TCP_CLOSE_PENDING_BYTES);
+    if (g_tcp_close_pending.loop == NULL || g_tcp_close_pending.buf == NULL
+        || axl_tcp_listen(8080, &listener) != AXL_OK) {
+        axl_printf("ERROR: tcp-close-pending setup failed\n");
+        return -1;
+    }
+    axl_memset(g_tcp_close_pending.buf, 'A', TCP_CLOSE_PENDING_BYTES);
+
+    if (axl_tcp_accept_async(listener, g_tcp_close_pending.loop, NULL,
+                             on_tcp_close_pending_accept,
+                             &g_tcp_close_pending) != AXL_OK) {
+        axl_printf("ERROR: tcp-close-pending accept failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+    axl_loop_run(g_tcp_close_pending.loop);
+
+    axl_tcp_close(listener, AXL_TEARDOWN_RESET);
+    axl_loop_free(g_tcp_close_pending.loop);
+    axl_free(g_tcp_close_pending.buf);
+
+    axl_mem_set_quarantine(0);
+    axl_printf("TCPCLOSE: MEM-CORRUPTION %zu\n", axl_mem_corruption_count());
+    axl_printf("TCPCLOSE: DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "serve-tcp-send-cancel" -- cancelling a send the firmware already holds.
+//
+// AxlTcp never cancels a Transmit the firmware has accepted: on TcpDxe a
+// Cancel of a Transmit being processed unlinks its token while the data stays
+// queued, and the next segmentation then ASSERTs on a DEBUG firmware
+// (SockImpl.c, SockDataSent) or signals a freed token on a RELEASE one. So a
+// cancel stops a send at a PIECE boundary: the armed piece (the socket's
+// "orphan piece") goes out on its own, from AxlTcp's own copy, and the next
+// send waits for it.
+//
+// One connection, to a host peer that reads nothing until told to, walks
+// every case in order:
+//   1. A (16 MiB of 'A', cancellable) goes on the wire, Q (64 KiB of 'Q',
+//      cancellable) queues behind it. The window fills.
+//   2. Q is cancelled while queued: CANCELLED, 0 bytes, and no 'Q' may ever
+//      reach the wire.
+//   3. A is cancelled mid-send: CANCELLED, a whole number of pieces sent.
+//      Both callbacks overwrite their buffers with 'Z' at once -- the
+//      firmware may not read them any more.
+//   4. M ("MARK") is submitted behind A's orphan piece. The peer then reads:
+//      it must see exactly A's reported count of 'A', then "MARK".
+//   5. The peer answers "PONG" (the connection is still usable both ways);
+//      the guest then does a SYNCHRONOUS 16 MiB send of 'B' against the
+//      stalled peer, which times out (AXL_TIMEOUT) with a partial count, and
+//      overwrites its buffer with 'Z'.
+//   6. M2 ("MRK2") is submitted on the MAIN loop behind the sync send's
+//      orphan -- whose Transmit was armed from the sync call's own,
+//      now-freed, loop. The peer reads exactly the sync count of 'B', then
+//      "MRK2", and answers "PONG2".
+//   7. The guest closes GRACEFULLY. The stream was cut short (twice), so the
+//      close must be abortive: RST, no FIN.
+//
+// Serial protocol (test-tcp-send-cancel-qemu.sh):
+//   READY
+//   TCPCANCEL: accepted
+//   TCPCANCEL: queued-after-submit=N
+//   TCPCANCEL: q-cb status=S sent=N queued=N
+//   TCPCANCEL: a-cb status=S sent=N queued=N
+//   TCPCANCEL: queued-after-marker=N
+//   TCPCANCEL: marker-cb status=S sent=N
+//   TCPCANCEL: pong
+//   TCPCANCEL: sync rc=R sent=N
+//   TCPCANCEL: queued-after-marker2=N
+//   TCPCANCEL: marker2-cb status=S sent=N
+//   TCPCANCEL: pong2
+//   TCPCANCEL: closed
+//   TCPCANCEL: MEM-CORRUPTION N
+//   TCPCANCEL: DONE
+// ---------------------------------------------------------------------------
+
+#define TCP_SEND_CANCEL_BIG_BYTES   (16u * 1024u * 1024u)
+#define TCP_SEND_CANCEL_Q_BYTES     (64u * 1024u)
+#define TCP_SEND_CANCEL_STALL_MS    3000u
+#define TCP_SEND_CANCEL_SYNC_MS     3000u
+#define TCP_SEND_CANCEL_LINGER_MS   3000u
+
+typedef struct {
+    AxlLoop        *loop;
+    AxlTcp         *client;
+    uint8_t        *buf_a;
+    uint8_t        *buf_q;
+    uint8_t        *buf_b;
+    AxlCancellable *cancel_a;
+    AxlCancellable *cancel_q;
+    char            rx[16];
+    size_t          rx_len;
+    int             phase;      /* 1: waiting for PONG, 2: waiting for PONG2 */
+} TcpSendCancelCtx;
+
+static TcpSendCancelCtx g_tcp_send_cancel;
+
+static const char *
+tcp_status_name(
+    int status)
+{
+    switch (status) {
+    case AXL_OK:        return "OK";
+    case AXL_CANCELLED: return "CANCELLED";
+    case AXL_TIMEOUT:   return "TIMEOUT";
+    default:            return "ERR";
+    }
+}
+
+static bool tcp_send_cancel_on_recv(AxlTcp *sock, AxlStatus status, void *data);
+
+static bool
+tcp_send_cancel_quit_cb(
+    void *data)
+{
+    axl_loop_quit(((TcpSendCancelCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+tcp_send_cancel_arm_recv(
+    TcpSendCancelCtx *c,
+    int               phase)
+{
+    c->phase  = phase;
+    c->rx_len = 0;
+    if (axl_tcp_recv_async(c->client, c->rx, sizeof(c->rx), c->loop, NULL,
+                           tcp_send_cancel_on_recv, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel recv refused\n");
+    }
+}
+
+static bool
+tcp_send_cancel_on_marker2(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpSendCancelCtx *c = (TcpSendCancelCtx *)data;
+
+    axl_printf("TCPCANCEL: marker2-cb status=%s sent=%zu\n",
+               tcp_status_name(status), axl_tcp_send_get_sent(sock));
+    tcp_send_cancel_arm_recv(c, 2);
+    return true;
+}
+
+static bool
+tcp_send_cancel_on_marker(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpSendCancelCtx *c = (TcpSendCancelCtx *)data;
+
+    axl_printf("TCPCANCEL: marker-cb status=%s sent=%zu\n",
+               tcp_status_name(status), axl_tcp_send_get_sent(sock));
+    tcp_send_cancel_arm_recv(c, 1);
+    return true;
+}
+
+/* The synchronous half, run from the loop once PONG is in. */
+static void
+tcp_send_cancel_sync_phase(
+    TcpSendCancelCtx *c)
+{
+    static const char mark2[] = "MRK2";
+    int               rc;
+
+    rc = axl_tcp_send(c->client, c->buf_b, TCP_SEND_CANCEL_BIG_BYTES,
+                      TCP_SEND_CANCEL_SYNC_MS);
+    /* axl_tcp_send never references its data after returning. */
+    axl_memset(c->buf_b, 'Z', TCP_SEND_CANCEL_BIG_BYTES);
+    axl_printf("TCPCANCEL: sync rc=%s sent=%zu\n", tcp_status_name(rc),
+               axl_tcp_send_get_sent(c->client));
+
+    if (axl_tcp_send_async(c->client, mark2, sizeof(mark2) - 1, c->loop, NULL,
+                           tcp_send_cancel_on_marker2, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel marker2 refused\n");
+        return;
+    }
+    axl_printf("TCPCANCEL: queued-after-marker2=%zu\n",
+               axl_tcp_send_queued_bytes(c->client));
+}
+
+static bool
+tcp_send_cancel_on_recv(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpSendCancelCtx *c   = (TcpSendCancelCtx *)data;
+    const char       *want = (c->phase == 1) ? "PONG" : "PONG2";
+    size_t            n    = axl_strlen(want);
+
+    if (status != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel recv status=%s\n",
+                   tcp_status_name(status));
+        return false;
+    }
+    c->rx_len += axl_tcp_recv_get_size(sock);
+    if (c->rx_len < n) {
+        /* Partial: keep reading into the rest of the buffer. */
+        if (axl_tcp_recv_async(sock, c->rx + c->rx_len,
+                               sizeof(c->rx) - c->rx_len, c->loop, NULL,
+                               tcp_send_cancel_on_recv, c) != AXL_OK) {
+            axl_printf("ERROR: tcp-send-cancel recv re-arm refused\n");
+        }
+        return false;
+    }
+    if (c->rx_len != n || axl_memcmp(c->rx, want, n) != 0) {
+        axl_printf("ERROR: tcp-send-cancel got %zu unexpected byte(s)\n",
+                   c->rx_len);
+        return false;
+    }
+    if (c->phase == 1) {
+        axl_printf("TCPCANCEL: pong\n");
+        tcp_send_cancel_sync_phase(c);
+        return false;
+    }
+    axl_printf("TCPCANCEL: pong2\n");
+    axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
+    c->client = NULL;
+    axl_printf("TCPCANCEL: closed\n");
+    axl_loop_add_timeout(c->loop, TCP_SEND_CANCEL_LINGER_MS,
+                         tcp_send_cancel_quit_cb, c);
+    return false;
+}
+
+static bool
+tcp_send_cancel_on_a(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpSendCancelCtx *c = (TcpSendCancelCtx *)data;
+    static const char mark[] = "MARK";
+
+    axl_memset(c->buf_a, 'Z', TCP_SEND_CANCEL_BIG_BYTES);
+    axl_printf("TCPCANCEL: a-cb status=%s sent=%zu queued=%zu\n",
+               tcp_status_name(status), axl_tcp_send_get_sent(sock),
+               axl_tcp_send_queued_bytes(sock));
+
+    if (axl_tcp_send_async(sock, mark, sizeof(mark) - 1, c->loop, NULL,
+                           tcp_send_cancel_on_marker, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel marker refused\n");
+        return true;
+    }
+    axl_printf("TCPCANCEL: queued-after-marker=%zu\n",
+               axl_tcp_send_queued_bytes(sock));
+    return true;
+}
+
+static bool
+tcp_send_cancel_on_q(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpSendCancelCtx *c = (TcpSendCancelCtx *)data;
+
+    axl_memset(c->buf_q, 'Z', TCP_SEND_CANCEL_Q_BYTES);
+    axl_printf("TCPCANCEL: q-cb status=%s sent=%zu queued=%zu\n",
+               tcp_status_name(status), axl_tcp_send_get_sent(sock),
+               axl_tcp_send_queued_bytes(sock));
+    /* Now the ACTIVE one, still partly armed against the stalled window. */
+    axl_cancellable_cancel(c->cancel_a);
+    return true;
+}
+
+static bool
+tcp_send_cancel_stalled_cb(
+    void *data)
+{
+    TcpSendCancelCtx *c = (TcpSendCancelCtx *)data;
+
+    axl_cancellable_cancel(c->cancel_q);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+tcp_send_cancel_on_accept(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpSendCancelCtx *c = (TcpSendCancelCtx *)data;
+
+    if (status != AXL_OK || sock == NULL) {
+        axl_printf("ERROR: tcp-send-cancel accept status=%d\n", (int)status);
+        return false;
+    }
+    axl_printf("TCPCANCEL: accepted\n");
+    c->client = sock;
+    if (axl_tcp_send_async(sock, c->buf_a, TCP_SEND_CANCEL_BIG_BYTES, c->loop,
+                           c->cancel_a, tcp_send_cancel_on_a, c) != AXL_OK
+        || axl_tcp_send_async(sock, c->buf_q, TCP_SEND_CANCEL_Q_BYTES, c->loop,
+                              c->cancel_q, tcp_send_cancel_on_q, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel send refused\n");
+        return false;
+    }
+    axl_printf("TCPCANCEL: queued-after-submit=%zu\n",
+               axl_tcp_send_queued_bytes(sock));
+    axl_loop_add_timeout(c->loop, TCP_SEND_CANCEL_STALL_MS,
+                         tcp_send_cancel_stalled_cb, c);
+    return false;   /* one client is all this fixture serves */
+}
+
+static int
+run_serve_tcp_send_cancel_mode(void)
+{
+    TcpSendCancelCtx *c        = &g_tcp_send_cancel;
+    AxlTcp           *listener = NULL;
+
+    axl_memset(c, 0, sizeof(*c));
+    axl_net_auto_init(SIZE_MAX, 10);
+    /* The close's promotion notice is DEBUG in the "tcp" domain. */
+    axl_log_set_domain_level("tcp", AXL_LOG_DEBUG);
+
+    c->loop     = axl_loop_new();
+    c->buf_a    = axl_malloc(TCP_SEND_CANCEL_BIG_BYTES);
+    c->buf_q    = axl_malloc(TCP_SEND_CANCEL_Q_BYTES);
+    c->buf_b    = axl_malloc(TCP_SEND_CANCEL_BIG_BYTES);
+    c->cancel_a = axl_cancellable_new();
+    c->cancel_q = axl_cancellable_new();
+    if (c->loop == NULL || c->buf_a == NULL || c->buf_q == NULL
+        || c->buf_b == NULL || c->cancel_a == NULL || c->cancel_q == NULL
+        || axl_tcp_listen(8080, &listener) != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel setup failed\n");
+        return -1;
+    }
+    axl_memset(c->buf_a, 'A', TCP_SEND_CANCEL_BIG_BYTES);
+    axl_memset(c->buf_q, 'Q', TCP_SEND_CANCEL_Q_BYTES);
+    axl_memset(c->buf_b, 'B', TCP_SEND_CANCEL_BIG_BYTES);
+
+    if (axl_tcp_accept_async(listener, c->loop, NULL,
+                             tcp_send_cancel_on_accept, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-send-cancel accept failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+    axl_loop_run(c->loop);
+
+    if (c->client != NULL) {
+        axl_tcp_close(c->client, AXL_TEARDOWN_RESET);
+    }
+    axl_tcp_close(listener, AXL_TEARDOWN_RESET);
+    axl_loop_free(c->loop);
+    axl_cancellable_free(c->cancel_a);
+    axl_cancellable_free(c->cancel_q);
+    axl_free(c->buf_a);
+    axl_free(c->buf_q);
+    axl_free(c->buf_b);
+
+    axl_mem_set_quarantine(0);
+    axl_printf("TCPCANCEL: MEM-CORRUPTION %zu\n", axl_mem_corruption_count());
+    axl_printf("TCPCANCEL: DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "serve-tcp-close-armed <graceful|abortive>" -- closing with a FULLY-ARMED
+// send whose last Transmit has not completed.
+//
+// A one-piece send is fully armed the moment it is submitted: every byte is
+// the firmware's (from AxlTcp's own copy), so a close that drops nothing else
+// stays graceful -- TCP sends that piece ahead of the FIN -- and the send is
+// retired AXL_OK with its whole size. If the close is abortive anyway (here:
+// because a send is QUEUED behind it), the RST discards that piece: the send
+// is retired AXL_CANCELLED, still with its whole size committed.
+//
+// "Not yet completed" is made real rather than hoped for: the guest sends
+// one-piece sends back to back to a peer that reads nothing, each submitted
+// from the previous one's callback, until one's callback does not come --
+// its Transmit is stuck against the full window. That one is fully armed and
+// unsignalled when the close runs.
+//
+// Serial protocol (test-tcp-close-armed-qemu.sh), MODE = graceful|abortive:
+//   READY MODE
+//   TCPARMED MODE: accepted
+//   TCPARMED MODE: stuck completed=N queued=N
+//   TCPARMED MODE: queued-after-q=N               (abortive only)
+//   TCPARMED MODE: q-cb status=S sent=N           (abortive only)
+//   TCPARMED MODE: armed-cb status=S sent=N
+//   TCPARMED MODE: closed total-sent=N
+//   TCPARMED MODE: DONE
+// total-sent is the sum of every send's reported count, the stuck one
+// included -- what the peer must receive after a graceful close.
+// ---------------------------------------------------------------------------
+
+#define TCP_CLOSE_ARMED_PIECE      8192u
+#define TCP_CLOSE_ARMED_Q_BYTES    4096u
+#define TCP_CLOSE_ARMED_TICK_MS    200u
+#define TCP_CLOSE_ARMED_STUCK_MS   1500u
+#define TCP_CLOSE_ARMED_LINGER_MS  6000u
+
+typedef struct {
+    AxlLoop    *loop;
+    AxlTcp     *client;
+    bool        abortive;
+    const char *mode;
+    uint8_t     piece[TCP_CLOSE_ARMED_PIECE];
+    uint8_t     q[TCP_CLOSE_ARMED_Q_BYTES];
+    size_t      completed;       /* callbacks of sends that finished */
+    size_t      total_sent;
+    uint64_t    last_progress_ms;
+    bool        closed;
+    AxlSourceId tick;
+} TcpCloseArmedCtx;
+
+static TcpCloseArmedCtx g_tcp_close_armed;
+
+static uint64_t
+tcp_close_armed_now_ms(void)
+{
+    return axl_time_get_us() / 1000u;
+}
+
+static bool
+tcp_close_armed_quit_cb(
+    void *data)
+{
+    axl_loop_quit(((TcpCloseArmedCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+tcp_close_armed_on_q(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpCloseArmedCtx *c = (TcpCloseArmedCtx *)data;
+
+    c->total_sent += axl_tcp_send_get_sent(sock);
+    axl_printf("TCPARMED %s: q-cb status=%s sent=%zu\n", c->mode,
+               tcp_status_name(status), axl_tcp_send_get_sent(sock));
+    return true;
+}
+
+static bool
+tcp_close_armed_on_piece(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpCloseArmedCtx *c = (TcpCloseArmedCtx *)data;
+
+    c->total_sent += axl_tcp_send_get_sent(sock);
+    if (c->closed) {
+        /* The stuck send, retired by the close itself. */
+        axl_printf("TCPARMED %s: armed-cb status=%s sent=%zu\n", c->mode,
+                   tcp_status_name(status), axl_tcp_send_get_sent(sock));
+        return true;
+    }
+    if (status != AXL_OK) {
+        axl_printf("ERROR: tcp-close-armed send status=%s\n",
+                   tcp_status_name(status));
+        return true;
+    }
+    c->completed++;
+    c->last_progress_ms = tcp_close_armed_now_ms();
+    if (axl_tcp_send_async(sock, c->piece, sizeof(c->piece), c->loop, NULL,
+                           tcp_close_armed_on_piece, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-close-armed send refused\n");
+    }
+    return true;
+}
+
+/* Once no send has completed for a while, the one in flight is stuck against
+   the peer's full window -- fully armed, its Transmit not completed. */
+static bool
+tcp_close_armed_tick(
+    void *data)
+{
+    TcpCloseArmedCtx *c = (TcpCloseArmedCtx *)data;
+
+    if (tcp_close_armed_now_ms() - c->last_progress_ms < TCP_CLOSE_ARMED_STUCK_MS) {
+        return AXL_SOURCE_CONTINUE;
+    }
+    c->tick = 0;
+    axl_printf("TCPARMED %s: stuck completed=%zu queued=%zu\n", c->mode,
+               c->completed, axl_tcp_send_queued_bytes(c->client));
+    if (c->abortive) {
+        if (axl_tcp_send_async(c->client, c->q, sizeof(c->q), c->loop, NULL,
+                               tcp_close_armed_on_q, c) != AXL_OK) {
+            axl_printf("ERROR: tcp-close-armed q refused\n");
+        }
+        axl_printf("TCPARMED %s: queued-after-q=%zu\n", c->mode,
+                   axl_tcp_send_queued_bytes(c->client));
+    }
+    c->closed = true;
+    axl_tcp_close(c->client, AXL_TEARDOWN_GRACEFUL);
+    c->client = NULL;
+    axl_printf("TCPARMED %s: closed total-sent=%zu\n", c->mode, c->total_sent);
+    axl_loop_add_timeout(c->loop, TCP_CLOSE_ARMED_LINGER_MS,
+                         tcp_close_armed_quit_cb, c);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+tcp_close_armed_on_accept(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data)
+{
+    TcpCloseArmedCtx *c = (TcpCloseArmedCtx *)data;
+
+    if (status != AXL_OK || sock == NULL) {
+        axl_printf("ERROR: tcp-close-armed accept status=%d\n", (int)status);
+        return false;
+    }
+    axl_printf("TCPARMED %s: accepted\n", c->mode);
+    c->client           = sock;
+    c->last_progress_ms = tcp_close_armed_now_ms();
+    if (axl_tcp_send_async(sock, c->piece, sizeof(c->piece), c->loop, NULL,
+                           tcp_close_armed_on_piece, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-close-armed send refused\n");
+        return false;
+    }
+    c->tick = axl_loop_add_timer(c->loop, TCP_CLOSE_ARMED_TICK_MS,
+                                 tcp_close_armed_tick, c);
+    return false;   /* one client is all this fixture serves */
+}
+
+static int
+run_serve_tcp_close_armed_mode(
+    const char *mode)
+{
+    TcpCloseArmedCtx *c        = &g_tcp_close_armed;
+    AxlTcp           *listener = NULL;
+    bool              abortive = (axl_strcmp(mode, "abortive") == 0);
+
+    if (!abortive && axl_strcmp(mode, "graceful") != 0) {
+        axl_printf("ERROR: tcp-close-armed mode must be graceful|abortive\n");
+        return -1;
+    }
+    axl_memset(c, 0, sizeof(*c));
+    c->abortive = abortive;
+    c->mode     = abortive ? "abortive" : "graceful";
+    axl_memset(c->piece, 'A', sizeof(c->piece));
+    axl_memset(c->q, 'Q', sizeof(c->q));
+    axl_net_auto_init(SIZE_MAX, 10);
+    axl_log_set_domain_level("tcp", AXL_LOG_DEBUG);
+
+    c->loop = axl_loop_new();
+    if (c->loop == NULL
+        || axl_tcp_listen(abortive ? 8081 : 8080, &listener) != AXL_OK
+        || axl_tcp_accept_async(listener, c->loop, NULL,
+                                tcp_close_armed_on_accept, c) != AXL_OK) {
+        axl_printf("ERROR: tcp-close-armed setup failed\n");
+        return -1;
+    }
+    axl_printf("READY %s\n", c->mode);
+    axl_loop_run(c->loop);
+
+    if (c->client != NULL) {
+        axl_tcp_close(c->client, AXL_TEARDOWN_RESET);
+    }
+    axl_tcp_close(listener, AXL_TEARDOWN_RESET);
+    axl_loop_free(c->loop);
+    axl_printf("TCPARMED %s: DONE\n", c->mode);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // serve-rebind-load — the under-load port-release regression.
 //
 // Unlike serve-rebind (one accepted, delivered connection), this NEVER pumps
@@ -8350,6 +13502,1443 @@ run_serve_rebind_storm_mode(void)
 }
 
 // ---------------------------------------------------------------------------
+// Pre-UEFI-2.4 IPv4 configuration protocols (axl_net_legacy_ip4cfg_install)
+//
+// Driven through the protocols themselves -- they ARE the contract: an old
+// tool sees nothing else. Every value is compared with the NIC's own
+// EFI_IP4_CONFIG2_PROTOCOL data, read here independently.
+// ---------------------------------------------------------------------------
+
+#define LEGACY_CHECKS 52u   /* assertions the populated path makes */
+
+/* Handles carrying @p guid (0 when none). */
+static UINTN
+legacy_count(EFI_GUID *guid)
+{
+    UINTN       n = 0;
+    EFI_HANDLE *hs = NULL;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, guid, NULL, &n, &hs))) {
+        return 0;
+    }
+    gBS->FreePool(hs);
+    return n;
+}
+
+/* The first NIC handle whose IP4Config2 reports an address; its interface
+   info (caller FreePools) and policy through the out-params. NULL if none. */
+static EFI_HANDLE
+legacy_configured_nic(
+    EFI_IP4_CONFIG2_INTERFACE_INFO **info_out,
+    UINT32                          *policy_out
+    )
+{
+    UINTN       n = 0;
+    EFI_HANDLE *hs = NULL;
+    EFI_HANDLE  found = NULL;
+    *info_out = NULL;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+                                          NULL, &n, &hs))) {
+        return NULL;
+    }
+    for (UINTN i = 0; i < n && found == NULL; i++) {
+        EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
+        if (EFI_ERROR(gBS->HandleProtocol(hs[i], &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+                                          (void **)&cfg))) {
+            continue;
+        }
+        UINTN sz = 0;
+        if (cfg->GetData(cfg, Ip4Config2DataTypeInterfaceInfo, &sz, NULL)
+                != EFI_BUFFER_TOO_SMALL) {
+            continue;
+        }
+        EFI_IP4_CONFIG2_INTERFACE_INFO *info = NULL;
+        if (EFI_ERROR(gBS->AllocatePool(EfiBootServicesData, sz, (void **)&info))) {
+            continue;
+        }
+        UINTN psz = sizeof(*policy_out);
+        if (!EFI_ERROR(cfg->GetData(cfg, Ip4Config2DataTypeInterfaceInfo, &sz, info))
+            && !EFI_ERROR(cfg->GetData(cfg, Ip4Config2DataTypePolicy, &psz, policy_out))
+            && (info->StationAddress.Addr[0] | info->StationAddress.Addr[1]
+                | info->StationAddress.Addr[2] | info->StationAddress.Addr[3]) != 0) {
+            found = hs[i];
+            *info_out = info;
+        } else {
+            gBS->FreePool(info);
+        }
+    }
+    gBS->FreePool(hs);
+    return found;
+}
+
+/* A stand-in IP4Config2 for a NIC whose data cannot be read: GetData fails
+   with legacy_fake_status, or -- with legacy_fake_huge -- asks for a buffer no
+   pool can give. The driver only opens it on attach; nothing here is called
+   unless an old tool asks. */
+static EFI_STATUS legacy_fake_status = EFI_NOT_FOUND;
+static bool       legacy_fake_huge   = false;
+static bool       legacy_fake_addr   = false;   /* GetData answers with 10.9.8.7 */
+static EFI_EVENT  legacy_fake_events[4];        /* RegisterDataNotify'd, live */
+/* The address lands as the Nth RegisterDataNotify registers (0 = never):
+   Start registers ReconfigEvent first, then its DoneEvent watch, so 2 puts
+   the arrival after Start's own address check and before its watch. */
+static int        legacy_fake_addr_at_register = 0;
+
+static EFI_STATUS EFIAPI
+legacy_fake_cfg2_get(
+    EFI_IP4_CONFIG2_PROTOCOL  *this,
+    EFI_IP4_CONFIG2_DATA_TYPE  type,
+    UINTN                     *size,
+    VOID                      *data
+    )
+{
+    (void)this;
+    if (legacy_fake_huge) {
+        *size = (UINTN)1 << 46;
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    if (legacy_fake_addr && type == Ip4Config2DataTypeInterfaceInfo) {
+        if (data == NULL || *size < sizeof(EFI_IP4_CONFIG2_INTERFACE_INFO)) {
+            *size = sizeof(EFI_IP4_CONFIG2_INTERFACE_INFO);
+            return EFI_BUFFER_TOO_SMALL;
+        }
+        EFI_IP4_CONFIG2_INTERFACE_INFO *info = data;
+        axl_memset(info, 0, sizeof(*info));
+        info->StationAddress.Addr[0] = 10;
+        info->StationAddress.Addr[1] = 9;
+        info->StationAddress.Addr[2] = 8;
+        info->StationAddress.Addr[3] = 7;
+        return EFI_SUCCESS;
+    }
+    return legacy_fake_status;
+}
+
+static EFI_STATUS EFIAPI
+legacy_fake_cfg2_register(
+    EFI_IP4_CONFIG2_PROTOCOL  *this,
+    EFI_IP4_CONFIG2_DATA_TYPE  type,
+    EFI_EVENT                  event
+    )
+{
+    (void)this;
+    (void)type;
+    if (legacy_fake_addr_at_register > 0) {
+        legacy_fake_addr_at_register--;
+        if (legacy_fake_addr_at_register == 0) {
+            legacy_fake_addr = true;   /* no change is reported for it */
+        }
+    }
+    for (UINTN i = 0; i < 4; i++) {
+        if (legacy_fake_events[i] == NULL) {
+            legacy_fake_events[i] = event;
+            return EFI_SUCCESS;
+        }
+    }
+    return EFI_OUT_OF_RESOURCES;
+}
+
+static EFI_STATUS EFIAPI
+legacy_fake_cfg2_unregister(
+    EFI_IP4_CONFIG2_PROTOCOL  *this,
+    EFI_IP4_CONFIG2_DATA_TYPE  type,
+    EFI_EVENT                  event
+    )
+{
+    (void)this;
+    (void)type;
+    for (UINTN i = 0; i < 4; i++) {
+        if (legacy_fake_events[i] == event) {
+            legacy_fake_events[i] = NULL;
+            return EFI_SUCCESS;
+        }
+    }
+    return EFI_NOT_FOUND;
+}
+
+/* What IP4Config2 does when its data changes: signal every registered event. */
+static void
+legacy_fake_changed(void)
+{
+    for (UINTN i = 0; i < 4; i++) {
+        if (legacy_fake_events[i] != NULL) {
+            gBS->SignalEvent(legacy_fake_events[i]);
+        }
+    }
+}
+
+static EFI_IP4_CONFIG2_PROTOCOL legacy_fake_cfg2 = {
+    .GetData              = legacy_fake_cfg2_get,
+    .RegisterDataNotify   = legacy_fake_cfg2_register,
+    .UnregisterDataNotify = legacy_fake_cfg2_unregister,
+};
+
+/* A NIC that appears: IP4Config2 installed on a fresh handle -- no
+   ConnectController, so only the driver's protocol notify can see it. */
+static EFI_HANDLE
+legacy_fake_nic_add(void)
+{
+    EFI_HANDLE h = NULL;
+    if (EFI_ERROR(gBS->InstallProtocolInterface(&h, &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+                                                EFI_NATIVE_INTERFACE, &legacy_fake_cfg2))) {
+        return NULL;
+    }
+    return h;
+}
+
+/* The NIC going away: its IP4Config2 uninstalled, which the firmware lets
+   happen only after the driver's BY_DRIVER Stop took the old protocols off. */
+static bool
+legacy_fake_nic_remove(EFI_HANDLE h)
+{
+    void *p = NULL;
+    return gBS->UninstallProtocolInterface(h, &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+                                           &legacy_fake_cfg2) == EFI_SUCCESS
+           && EFI_ERROR(gBS->HandleProtocol(h, &gEfiIp4ConfigProtocolGuid, &p));
+}
+
+/* A NIC appearing after the driver gets both old protocols; one going away
+   takes them with it. */
+static bool
+legacy_late_nic_attaches(void)
+{
+    void      *p = NULL;
+    EFI_HANDLE h = legacy_fake_nic_add();
+    if (h == NULL) {
+        return false;
+    }
+    bool came = gBS->HandleProtocol(h, &gEfiIp4ConfigProtocolGuid, &p) == EFI_SUCCESS
+                && gBS->HandleProtocol(h, &gEfiNicIp4ConfigProtocolGuid, &p) == EFI_SUCCESS;
+    return legacy_fake_nic_remove(h) && came;
+}
+
+/* Where @p h falls among the handles carrying @p guid, or -1. */
+static int
+legacy_index_of(EFI_HANDLE h, EFI_GUID *guid)
+{
+    UINTN       n = 0;
+    EFI_HANDLE *hs = NULL;
+    int         at = -1;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, guid, NULL, &n, &hs))) {
+        return -1;
+    }
+    for (UINTN i = 0; i < n; i++) {
+        if (hs[i] == h) {
+            at = (int)i;
+        }
+    }
+    gBS->FreePool(hs);
+    return at;
+}
+
+/* Is @p name exactly the "ethN" the old shell would give @p h itself: N its
+   position among the MNP service-binding handles, or -- for a handle with no
+   MNP, like a stand-in NIC -- among the IP4Config2 handles. */
+static bool
+legacy_name_is(const CHAR16 *name, EFI_HANDLE h)
+{
+    int idx = legacy_index_of(h, &EFI_MANAGED_NETWORK_SERVICE_BINDING_PROTOCOL_GUID);
+    if (idx < 0) {
+        idx = legacy_index_of(h, &EFI_IP4_CONFIG2_PROTOCOL_GUID);
+    }
+    char want[16];
+    axl_snprintf(want, sizeof(want), "eth%d", idx);
+    size_t i = 0;
+    for (; want[i] != '\0'; i++) {
+        if (name[i] != (CHAR16)want[i]) {
+            return false;
+        }
+    }
+    return idx >= 0 && name[i] == 0;
+}
+
+static bool
+legacy_routes_equal(
+    const EFI_IP4_ROUTE_TABLE *a,
+    const EFI_IP4_ROUTE_TABLE *b,
+    UINT32                     n
+    )
+{
+    if (n > 0 && (a == NULL || b == NULL)) {
+        return false;
+    }
+    return n == 0 || axl_memcmp(a, b, n * sizeof(*a)) == 0;
+}
+
+static AxlNetLegacyIp4CfgMarker *legacy_marker(EFI_HANDLE *image);
+
+static void
+test_legacy_ip4cfg(void)
+{
+    EFI_IP4_CONFIG2_INTERFACE_INFO *want = NULL;
+    UINT32     policy = 0;
+    EFI_HANDLE nic = legacy_configured_nic(&want, &policy);
+    if (nic == NULL) {
+        test_skip_n(LEGACY_CHECKS, "legacy_ip4cfg: no configured NIC");
+        return;
+    }
+    UINTN routes = want->RouteTableSize;
+    UINTN cfg2_handles = legacy_count(&EFI_IP4_CONFIG2_PROTOCOL_GUID);
+
+    /* Install: the old protocols land on every IP4Config2 NIC, once. */
+    test_check(axl_net_legacy_ip4cfg_install() == AXL_OK,
+               "legacy_ip4cfg: install");                                   /* 1 */
+    test_check(axl_net_legacy_ip4cfg_install() == AXL_OK,
+               "legacy_ip4cfg: a second install is a no-op success");       /* 2 */
+    test_check(legacy_count(&gEfiIp4ConfigProtocolGuid) == cfg2_handles,
+               "legacy_ip4cfg: one EFI_IP4_CONFIG_PROTOCOL per IP4Config2 NIC"); /* 3 */
+    test_check(legacy_count(&gEfiNicIp4ConfigProtocolGuid) == cfg2_handles,
+               "legacy_ip4cfg: one NIC config protocol per IP4Config2 NIC"); /* 4 */
+
+    EFI_IP4_CONFIG_PROTOCOL     *ip4 = NULL;
+    EFI_NIC_IP4_CONFIG_PROTOCOL *nicp = NULL;
+    gBS->HandleProtocol(nic, &gEfiIp4ConfigProtocolGuid, (void **)&ip4);
+    gBS->HandleProtocol(nic, &gEfiNicIp4ConfigProtocolGuid, (void **)&nicp);
+    test_check(ip4 != NULL && nicp != NULL,
+               "legacy_ip4cfg: both protocols on the configured NIC");      /* 5 */
+    if (ip4 == NULL || nicp == NULL) {
+        test_skip_n(LEGACY_CHECKS - 5, "legacy_ip4cfg: protocols missing");
+        gBS->FreePool(want);
+        return;
+    }
+
+    /* EFI_IP4_CONFIG_PROTOCOL.GetData: size probe, too small, exact. */
+    UINTN need = sizeof(EFI_IP4_IPCONFIG_DATA) + routes * sizeof(EFI_IP4_ROUTE_TABLE);
+    UINTN sz = 0;
+    test_check(ip4->GetData(NULL, &sz, NULL) == EFI_INVALID_PARAMETER,
+               "legacy_ip4cfg: GetData(This=NULL) -> INVALID_PARAMETER");   /* 6 */
+    test_check(ip4->GetData(ip4, NULL, NULL) == EFI_INVALID_PARAMETER,
+               "legacy_ip4cfg: GetData(Size=NULL) -> INVALID_PARAMETER");   /* 7 */
+    sz = 0;
+    test_check(ip4->GetData(ip4, &sz, NULL) == EFI_BUFFER_TOO_SMALL,
+               "legacy_ip4cfg: GetData(0) -> BUFFER_TOO_SMALL");            /* 8 */
+    test_check(sz == need,
+               "legacy_ip4cfg: GetData reports struct + route table size"); /* 9 */
+    UINT8 buf[512];
+    axl_memset(buf, 0xA5, sizeof(buf));
+    sz = need - 1;
+    test_check(need <= sizeof(buf) && ip4->GetData(ip4, &sz, (EFI_IP4_IPCONFIG_DATA *)buf)
+                   == EFI_BUFFER_TOO_SMALL && sz == need,
+               "legacy_ip4cfg: GetData(need-1) -> BUFFER_TOO_SMALL, size"); /* 10 */
+    test_check(buf[0] == 0xA5,
+               "legacy_ip4cfg: a too-small GetData writes nothing");        /* 11 */
+    sz = need;
+    EFI_IP4_IPCONFIG_DATA *d = (EFI_IP4_IPCONFIG_DATA *)buf;
+    test_check(ip4->GetData(ip4, &sz, d) == EFI_SUCCESS && sz == need,
+               "legacy_ip4cfg: GetData(exact) -> SUCCESS, size kept");      /* 12 */
+    test_check(axl_memcmp(&d->StationAddress, &want->StationAddress, 4) == 0
+                   && axl_memcmp(&d->SubnetMask, &want->SubnetMask, 4) == 0,
+               "legacy_ip4cfg: GetData address + mask = IP4Config2's");     /* 13 */
+    test_check(d->RouteTableSize == routes,
+               "legacy_ip4cfg: GetData route count = IP4Config2's");        /* 14 */
+    test_check(routes == 0 ? d->RouteTable == NULL
+                           : d->RouteTable == (EFI_IP4_ROUTE_TABLE *)(d + 1),
+               "legacy_ip4cfg: GetData route table follows the struct");    /* 15 */
+    test_check(legacy_routes_equal(d->RouteTable, want->RouteTable, (UINT32)routes),
+               "legacy_ip4cfg: GetData routes = IP4Config2's");             /* 16 */
+    test_check(routes >= 1,
+               "legacy_ip4cfg: a configured NIC has at least one route");   /* 17 */
+
+    /* Start/Stop: change our state only, never the NIC. */
+    EFI_EVENT done = NULL, reconf = NULL;
+    gBS->CreateEvent(0, 0, NULL, NULL, &done);
+    gBS->CreateEvent(0, 0, NULL, NULL, &reconf);
+    test_check(ip4->Start(ip4, NULL, reconf) == EFI_INVALID_PARAMETER,
+               "legacy_ip4cfg: Start(DoneEvent=NULL) -> INVALID_PARAMETER"); /* 18 */
+    test_check(ip4->Start(ip4, done, NULL) == EFI_INVALID_PARAMETER,
+               "legacy_ip4cfg: Start(ReconfigEvent=NULL) -> INVALID_PARAMETER"); /* 19 */
+    test_check(ip4->Start(ip4, done, reconf) == EFI_ALREADY_STARTED,
+               "legacy_ip4cfg: Start on a configured NIC -> ALREADY_STARTED"); /* 20 */
+    test_check(ip4->Stop(NULL) == EFI_INVALID_PARAMETER,
+               "legacy_ip4cfg: Stop(NULL) -> INVALID_PARAMETER");           /* 21 */
+    test_check(ip4->Stop(ip4) == EFI_SUCCESS,
+               "legacy_ip4cfg: Stop -> SUCCESS");                           /* 22 */
+    test_check(ip4->Stop(ip4) == EFI_NOT_STARTED,
+               "legacy_ip4cfg: Stop again -> NOT_STARTED");                 /* 23 */
+    sz = need;
+    test_check(ip4->GetData(ip4, &sz, d) == EFI_NOT_STARTED,
+               "legacy_ip4cfg: GetData after Stop -> NOT_STARTED");         /* 24 */
+    AxlIPv4Address still;
+    test_check(axl_net_get_ip_address(&still) == AXL_OK && still.addr[0] != 0,
+               "legacy_ip4cfg: Stop left the NIC's address alone");         /* 25 */
+    test_check(gBS->CheckEvent(done) == EFI_NOT_READY,
+               "legacy_ip4cfg: DoneEvent not signalled before Start");      /* 26 */
+    test_check(ip4->Start(ip4, done, reconf) == EFI_SUCCESS,
+               "legacy_ip4cfg: Start after Stop -> SUCCESS");               /* 27 */
+    test_check(gBS->CheckEvent(done) == EFI_SUCCESS,
+               "legacy_ip4cfg: Start signals DoneEvent (already configured)"); /* 28 */
+    sz = need;
+    test_check(ip4->GetData(ip4, &sz, d) == EFI_SUCCESS
+                   && axl_memcmp(&d->StationAddress, &want->StationAddress, 4) == 0,
+               "legacy_ip4cfg: GetData works again after Start");           /* 29 */
+    /* Stop first: Start handed ReconfigEvent to the NIC's IP4Config2, which
+       would otherwise go on signalling an event closed under it. */
+    ip4->Stop(ip4);
+    gBS->CloseEvent(done);
+    gBS->CloseEvent(reconf);
+
+    /* The NIC protocol: what the old shell's ifconfig reads. */
+    CHAR16   name[IP4_NIC_NAME_LENGTH];
+    NIC_ADDR addr;
+    axl_memset(&addr, 0, sizeof(addr));
+    test_check(nicp->GetName(nicp, name, &addr) == EFI_SUCCESS,
+               "legacy_ip4cfg: GetName -> SUCCESS");                        /* 30 */
+    /* Both the rule and the golden value: the unit-test VM has one NIC, so
+       the computed index must also come out as the literal "eth0". */
+    test_check(legacy_name_is(name, nic)
+                   && name[0] == L'e' && name[1] == L't' && name[2] == L'h'
+                   && name[3] == L'0' && name[4] == 0,
+               "legacy_ip4cfg: GetName is exactly eth<its MNP index>, eth0"); /* 31 */
+    test_check(addr.Type == want->IfType && addr.Len == want->HwAddressSize
+                   && axl_memcmp(&addr.MacAddr, &want->HwAddress, want->HwAddressSize) == 0,
+               "legacy_ip4cfg: GetName link address = IP4Config2's");       /* 32 */
+    UINTN ineed = sizeof(NIC_IP4_CONFIG_INFO) + routes * sizeof(EFI_IP4_ROUTE_TABLE);
+    UINTN len = 0;
+    test_check(nicp->GetInfo(nicp, &len, NULL) == EFI_BUFFER_TOO_SMALL && len == ineed,
+               "legacy_ip4cfg: GetInfo(0) -> BUFFER_TOO_SMALL, exact size"); /* 33 */
+    len = ineed;
+    NIC_IP4_CONFIG_INFO *ci = (NIC_IP4_CONFIG_INFO *)buf;
+    test_check(ineed <= sizeof(buf) && nicp->GetInfo(nicp, &len, ci) == EFI_SUCCESS
+                   && len == ineed,
+               "legacy_ip4cfg: GetInfo(exact) -> SUCCESS");                 /* 34 */
+    UINT32 want_src = policy == 1 ? IP4_CONFIG_SOURCE_DHCP : IP4_CONFIG_SOURCE_STATIC;
+    test_check(ci->Source == want_src,
+               "legacy_ip4cfg: GetInfo Source follows the IP4Config2 policy"); /* 35 */
+    test_check(ci->Perment == TRUE,
+               "legacy_ip4cfg: GetInfo Perment (IP4Config2 policy persists)"); /* 36 */
+    test_check(axl_memcmp(&ci->NicAddr, &addr, sizeof(addr)) == 0,
+               "legacy_ip4cfg: GetInfo NicAddr = GetName's");               /* 37 */
+    test_check(axl_memcmp(&ci->Ip4Info.StationAddress, &want->StationAddress, 4) == 0
+                   && ci->Ip4Info.RouteTableSize == routes
+                   && ci->Ip4Info.RouteTable == (EFI_IP4_ROUTE_TABLE *)(ci + 1)
+                   && legacy_routes_equal(ci->Ip4Info.RouteTable, want->RouteTable,
+                                          (UINT32)routes),
+               "legacy_ip4cfg: GetInfo addresses + routes = IP4Config2's"); /* 38 */
+    test_check(nicp->SetInfo(nicp, ci, TRUE) == EFI_UNSUPPORTED
+                   && nicp->SetInfo(nicp, NULL, TRUE) == EFI_UNSUPPORTED,
+               "legacy_ip4cfg: SetInfo (set and clear) -> UNSUPPORTED");    /* 39 */
+
+    /* The firmware drives the binding: the network stack taking a NIC's
+       IP4Config2 away reaches the same Stop through DisconnectController, so
+       the driver must be the BY_DRIVER agent on IP4Config2 that the core
+       disconnects -- and a connect must bring it back. */
+    EFI_HANDLE agent = NULL;
+    EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *opens = NULL;
+    UINTN nopen = 0;
+    if (!EFI_ERROR(gBS->OpenProtocolInformation(nic, &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+                                                &opens, &nopen))) {
+        for (UINTN i = 0; i < nopen; i++) {
+            if (opens[i].Attributes & EFI_OPEN_PROTOCOL_BY_DRIVER) {
+                agent = opens[i].AgentHandle;
+            }
+        }
+        gBS->FreePool(opens);
+    }
+    test_check(agent != NULL,
+               "legacy_ip4cfg: the driver holds IP4Config2 BY_DRIVER");      /* 40 */
+    void *gone = NULL;
+    test_check(agent != NULL && gBS->DisconnectController(nic, agent, NULL) == EFI_SUCCESS
+                   && EFI_ERROR(gBS->HandleProtocol(nic, &gEfiIp4ConfigProtocolGuid, &gone))
+                   && EFI_ERROR(gBS->HandleProtocol(nic, &gEfiNicIp4ConfigProtocolGuid, &gone)),
+               "legacy_ip4cfg: DisconnectController stops it on that NIC");  /* 41 */
+    EFI_HANDLE drivers[2] = { agent, NULL };
+    gBS->ConnectController(nic, drivers, NULL, FALSE);
+    test_check(legacy_count(&gEfiIp4ConfigProtocolGuid) == cfg2_handles
+                   && legacy_count(&gEfiNicIp4ConfigProtocolGuid) == cfg2_handles,
+               "legacy_ip4cfg: ConnectController starts it again");          /* 42 */
+
+    /* An unload one NIC refuses leaves the driver whole. Two stand-in NICs
+       join the real one: A is started with events and refuses -- holding its
+       old protocol BY_DRIVER from an image with no binding makes its
+       uninstall, so the driver's Stop on it, so the Unload, fail -- and B
+       stops fine, so it must be re-attached afterwards. */
+    legacy_fake_status = EFI_NOT_FOUND;
+    legacy_fake_addr   = false;
+    EFI_HANDLE fa = legacy_fake_nic_add();
+    EFI_HANDLE fb = legacy_fake_nic_add();
+    EFI_IP4_CONFIG_PROTOCOL *ipa = NULL;
+    EFI_IP4_CONFIG_PROTOCOL *held = NULL;
+    EFI_EVENT  adone = NULL, areconf = NULL;
+    EFI_STATUS hold = EFI_NOT_STARTED;
+    gBS->CreateEvent(0, 0, NULL, NULL, &adone);
+    gBS->CreateEvent(0, 0, NULL, NULL, &areconf);
+    if (fa != NULL && fb != NULL
+        && gBS->HandleProtocol(fa, &gEfiIp4ConfigProtocolGuid, (void **)&ipa) == EFI_SUCCESS
+        && ipa->Stop(ipa) == EFI_SUCCESS && ipa->Start(ipa, adone, areconf) == EFI_SUCCESS) {
+        hold = gBS->OpenProtocol(fa, &gEfiIp4ConfigProtocolGuid, (void **)&held,
+                                 gImageHandle, fa, EFI_OPEN_PROTOCOL_BY_DRIVER);
+    }
+    test_check(hold == EFI_SUCCESS && axl_net_legacy_ip4cfg_uninstall() == AXL_ERR,
+               "legacy_ip4cfg: an unload a NIC refuses is reported");        /* 43 */
+    sz = need;
+    test_check(legacy_count(&gEfiIp4ConfigProtocolGuid) == cfg2_handles + 2
+                   && legacy_count(&gEfiNicIp4ConfigProtocolGuid) == cfg2_handles + 2
+                   && gBS->HandleProtocol(nic, &gEfiIp4ConfigProtocolGuid, (void **)&ip4)
+                          == EFI_SUCCESS
+                   && ip4->GetData(ip4, &sz, d) == EFI_SUCCESS,
+               "legacy_ip4cfg: a refused unload leaves every NIC served");   /* 44 */
+    void *pb = NULL;
+    test_check(fb != NULL
+                   && gBS->HandleProtocol(fb, &gEfiIp4ConfigProtocolGuid, &pb) == EFI_SUCCESS,
+               "legacy_ip4cfg: a NIC the refused unload stopped is re-attached"); /* 45 */
+    gBS->CheckEvent(areconf);
+    legacy_fake_changed();
+    test_check(gBS->CheckEvent(areconf) == EFI_SUCCESS,
+               "legacy_ip4cfg: the refusing NIC still signals its ReconfigEvent"); /* 46 */
+    if (hold == EFI_SUCCESS) {
+        gBS->CloseProtocol(fa, &gEfiIp4ConfigProtocolGuid, gImageHandle, fa);
+    }
+    if (ipa != NULL) {
+        ipa->Stop(ipa);
+    }
+    gBS->CloseEvent(adone);
+    gBS->CloseEvent(areconf);
+    /* The refused unload took the notify down first; it must be back, or a
+       NIC that appears from now on is never served. */
+    test_check(legacy_late_nic_attaches(),
+               "legacy_ip4cfg: after a refused unload a new NIC still attaches"); /* 47 */
+    test_check(fa != NULL && fb != NULL && legacy_fake_nic_remove(fa)
+                   && legacy_fake_nic_remove(fb),
+               "legacy_ip4cfg: the stand-in NICs go away cleanly");         /* 48 */
+    /* The unload takes the binding and the marker down before it stops a NIC
+       (so nothing can start one behind it); a refusal must put both back --
+       each exactly once: one marker handle, and one driver binding whose
+       image is the driver's. */
+    static EFI_GUID marker_guid = AXL_NET_LEGACY_IP4CFG_MARKER_GUID;
+    EFI_HANDLE mimg = NULL;
+    UINTN      markers = legacy_count(&marker_guid);
+    UINTN      bindings = 0;
+    if (legacy_marker(&mimg) != NULL) {
+        UINTN       nb = 0;
+        EFI_HANDLE *bs = NULL;
+        if (!EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &EFI_DRIVER_BINDING_PROTOCOL_GUID,
+                                               NULL, &nb, &bs))) {
+            for (UINTN i = 0; i < nb; i++) {
+                EFI_DRIVER_BINDING_PROTOCOL *db = NULL;
+                if (gBS->HandleProtocol(bs[i], &EFI_DRIVER_BINDING_PROTOCOL_GUID,
+                                        (void **)&db) == EFI_SUCCESS
+                    && db->ImageHandle == mimg) {
+                    bindings++;
+                }
+            }
+            gBS->FreePool(bs);
+        }
+    }
+    test_check(markers == 1 && bindings == 1,
+               "legacy_ip4cfg: a refused unload puts back one binding, one marker"); /* 49 */
+
+    /* Uninstall takes the protocols off every NIC; install puts them back. */
+    test_check(axl_net_legacy_ip4cfg_uninstall() == AXL_OK
+                   && legacy_count(&gEfiIp4ConfigProtocolGuid) == 0
+                   && legacy_count(&gEfiNicIp4ConfigProtocolGuid) == 0,
+               "legacy_ip4cfg: uninstall removes both protocols everywhere"); /* 50 */
+    test_check(axl_net_legacy_ip4cfg_uninstall() == AXL_OK,
+               "legacy_ip4cfg: uninstall with none resident -> AXL_OK");    /* 51 */
+    test_check(axl_net_legacy_ip4cfg_install() == AXL_OK
+                   && legacy_count(&gEfiIp4ConfigProtocolGuid) == cfg2_handles,
+               "legacy_ip4cfg: reinstall after uninstall");                 /* 52 */
+    gBS->FreePool(want);
+}
+
+/* A NIC whose IP4Config2 cannot be read must not cut the old shell's walk
+   short: that shell stops listing at the first GetName or GetInfo error it
+   does not expect. GetName still names it (link address zeroed) and GetInfo
+   says "not configured" (EFI_NOT_FOUND) whatever went wrong underneath. */
+static void
+test_legacy_ip4cfg_errors(void)
+{
+    EFI_NIC_IP4_CONFIG_PROTOCOL *nicp = NULL;
+    legacy_fake_status = EFI_DEVICE_ERROR;
+    legacy_fake_huge   = false;
+    EFI_HANDLE h = axl_net_legacy_ip4cfg_install() == AXL_OK ? legacy_fake_nic_add() : NULL;
+    test_check(h != NULL
+                   && gBS->HandleProtocol(h, &gEfiNicIp4ConfigProtocolGuid, (void **)&nicp)
+                          == EFI_SUCCESS,
+               "legacy_ip4cfg errors: an unreadable NIC is served");        /* 1 */
+    CHAR16   name[IP4_NIC_NAME_LENGTH];
+    NIC_ADDR addr;
+    NIC_ADDR zero;
+    axl_memset(name, 0, sizeof(name));
+    axl_memset(&addr, 0xA5, sizeof(addr));
+    axl_memset(&zero, 0, sizeof(zero));
+    test_check(nicp != NULL && nicp->GetName(nicp, name, &addr) == EFI_SUCCESS
+                   && legacy_name_is(name, h)
+                   && axl_memcmp(&addr, &zero, sizeof(addr)) == 0,
+               "legacy_ip4cfg errors: GetName names it, link address zeroed"); /* 2 */
+    UINTN len = 0;
+    test_check(nicp != NULL && nicp->GetInfo(nicp, &len, NULL) == EFI_NOT_FOUND,
+               "legacy_ip4cfg errors: GetInfo on a read error -> NOT_FOUND"); /* 3 */
+    legacy_fake_huge = true;
+    len = 0;
+    test_check(nicp != NULL && nicp->GetInfo(nicp, &len, NULL) == EFI_NOT_FOUND,
+               "legacy_ip4cfg errors: GetInfo out of pool -> NOT_FOUND");  /* 4 */
+    legacy_fake_huge = false;
+    test_check(h != NULL && legacy_fake_nic_remove(h),
+               "legacy_ip4cfg errors: the unreadable NIC goes away cleanly"); /* 5 */
+    legacy_fake_status = EFI_NOT_FOUND;
+}
+
+/* The one resident driver's marker and image handle (NULLs if not exactly
+   one is resident). */
+static AxlNetLegacyIp4CfgMarker *
+legacy_marker(EFI_HANDLE *image)
+{
+    static EFI_GUID guid = AXL_NET_LEGACY_IP4CFG_MARKER_GUID;
+    UINTN       n = 0;
+    EFI_HANDLE *hs = NULL;
+    AxlNetLegacyIp4CfgMarker *m = NULL;
+    *image = NULL;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &guid, NULL, &n, &hs))) {
+        return NULL;
+    }
+    if (n == 1 && gBS->HandleProtocol(hs[0], &guid, (void **)&m) == EFI_SUCCESS) {
+        *image = hs[0];
+    } else {
+        m = NULL;
+    }
+    gBS->FreePool(hs);
+    return m;
+}
+
+/* A driver left resident by a tool built against an OLDER SDK is replaced by
+   install(); one of this revision or newer is kept. The older one is planted
+   by lowering the resident driver's own marker -- exactly what an older
+   build's driver publishes. */
+static void
+test_legacy_ip4cfg_revision(void)
+{
+    EFI_HANDLE img0 = NULL, img1 = NULL, img2 = NULL;
+    UINTN      cfg2 = legacy_count(&EFI_IP4_CONFIG2_PROTOCOL_GUID);
+    AxlNetLegacyIp4CfgMarker *m0 = axl_net_legacy_ip4cfg_install() == AXL_OK
+                                       ? legacy_marker(&img0) : NULL;
+    test_check(m0 != NULL && m0->revision == AXL_NET_LEGACY_IP4CFG_REVISION,
+               "legacy_ip4cfg revision: the resident marker names this revision"); /* 1 */
+    if (m0 != NULL) {
+        m0->revision = AXL_NET_LEGACY_IP4CFG_REVISION - 1;
+    }
+    AxlNetLegacyIp4CfgMarker *m1 = axl_net_legacy_ip4cfg_install() == AXL_OK
+                                       ? legacy_marker(&img1) : NULL;
+    /* Replaced is proven by the revision alone: the resident marker was
+       lowered above, and install() never edits a marker it finds, so one
+       reading this revision is a new driver's. NOT by img1 != img0 -- the
+       firmware may hand the new image the very handle the unloaded one had,
+       and once did (a pool layout that shifted with an unrelated change). */
+    test_check(m1 != NULL && m1->revision == AXL_NET_LEGACY_IP4CFG_REVISION
+                   && legacy_count(&gEfiIp4ConfigProtocolGuid) == cfg2,
+               "legacy_ip4cfg revision: an older resident driver is replaced"); /* 2 */
+    if (m1 != NULL) {
+        m1->revision = AXL_NET_LEGACY_IP4CFG_REVISION + 1;
+    }
+    AxlNetLegacyIp4CfgMarker *m2 = axl_net_legacy_ip4cfg_install() == AXL_OK
+                                       ? legacy_marker(&img2) : NULL;
+    /* Kept: the marker raised above still reads the raised revision (a
+       replacement would publish this one), whatever handle it sits on. */
+    test_check(m2 != NULL && m2->revision == AXL_NET_LEGACY_IP4CFG_REVISION + 1,
+               "legacy_ip4cfg revision: a newer resident driver is kept");  /* 3 */
+    if (m2 != NULL) {
+        m2->revision = AXL_NET_LEGACY_IP4CFG_REVISION;
+    }
+    test_check(axl_net_legacy_ip4cfg_install() == AXL_OK && legacy_marker(&img0) != NULL
+                   && img0 == img1,
+               "legacy_ip4cfg revision: the same revision is kept");        /* 4 */
+}
+
+/* UEFI 2.3.1: DoneEvent is signalled when the configuration is done --
+   once. Started on a NIC with no address yet, the driver must signal it when
+   the address arrives and not again on a later change; ReconfigEvent keeps
+   firing on every change. */
+static void
+test_legacy_ip4cfg_done_once(void)
+{
+    EFI_IP4_CONFIG_PROTOCOL *ip4 = NULL;
+    EFI_EVENT done = NULL, reconf = NULL;
+    legacy_fake_status = EFI_NOT_FOUND;
+    legacy_fake_addr   = false;
+    EFI_HANDLE h = axl_net_legacy_ip4cfg_install() == AXL_OK ? legacy_fake_nic_add() : NULL;
+    gBS->CreateEvent(0, 0, NULL, NULL, &done);
+    gBS->CreateEvent(0, 0, NULL, NULL, &reconf);
+    test_check(h != NULL
+                   && gBS->HandleProtocol(h, &gEfiIp4ConfigProtocolGuid, (void **)&ip4)
+                          == EFI_SUCCESS
+                   && ip4->Stop(ip4) == EFI_SUCCESS
+                   && ip4->Start(ip4, done, reconf) == EFI_SUCCESS
+                   && gBS->CheckEvent(done) == EFI_NOT_READY,
+               "legacy_ip4cfg done: Start with no address waits");          /* 1 */
+    legacy_fake_addr = true;
+    legacy_fake_changed();
+    test_check(gBS->CheckEvent(done) == EFI_SUCCESS
+                   && gBS->CheckEvent(reconf) == EFI_SUCCESS,
+               "legacy_ip4cfg done: the address arriving signals DoneEvent"); /* 2 */
+    legacy_fake_changed();
+    test_check(gBS->CheckEvent(done) == EFI_NOT_READY
+                   && gBS->CheckEvent(reconf) == EFI_SUCCESS,
+               "legacy_ip4cfg done: a later change signals ReconfigEvent only"); /* 3 */
+    test_check(ip4 != NULL && ip4->Stop(ip4) == EFI_SUCCESS
+                   && legacy_fake_events[0] == NULL && legacy_fake_events[1] == NULL
+                   && legacy_fake_events[2] == NULL && legacy_fake_events[3] == NULL,
+               "legacy_ip4cfg done: Stop leaves nothing registered");       /* 4 */
+    /* An address that lands between Start's own check and its watch being
+       registered is signalled too: IP4Config2 never reports that change. */
+    legacy_fake_addr = false;
+    legacy_fake_addr_at_register = 2;
+    test_check(ip4 != NULL && ip4->Start(ip4, done, reconf) == EFI_SUCCESS
+                   && gBS->CheckEvent(done) == EFI_SUCCESS,
+               "legacy_ip4cfg done: an address arriving mid-Start is signalled"); /* 5 */
+    legacy_fake_addr_at_register = 0;
+    if (ip4 != NULL) {
+        ip4->Stop(ip4);
+    }
+    gBS->CloseEvent(done);
+    gBS->CloseEvent(reconf);
+    legacy_fake_addr = false;
+    test_check(h != NULL && legacy_fake_nic_remove(h),
+               "legacy_ip4cfg done: the stand-in NIC goes away cleanly");   /* 6 */
+}
+
+#define LEGACY_HOOK_CHECKS 5u
+
+/* Back to the DHCP policy the VM booted with, and wait for its lease, so the
+   tests after this one see the network they always have. */
+static bool
+legacy_restore_dhcp(EFI_HANDLE nic)
+{
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
+    UINT32 dhcp = 1;
+    if (EFI_ERROR(gBS->HandleProtocol(nic, &EFI_IP4_CONFIG2_PROTOCOL_GUID, (void **)&cfg))
+        || EFI_ERROR(cfg->SetData(cfg, Ip4Config2DataTypePolicy, sizeof(dhcp), &dhcp))) {
+        return false;
+    }
+    for (int i = 0; i < 100; i++) {
+        EFI_IP4_CONFIG2_INTERFACE_INFO *info = NULL;
+        UINT32 policy = 0;
+        if (legacy_configured_nic(&info, &policy) != NULL) {
+            gBS->FreePool(info);
+            if (policy == dhcp) {
+                return true;
+            }
+        }
+        axl_msleep(100);
+    }
+    return false;
+}
+
+/* Each public bring-up that leaves a NIC configured publishes the protocols
+   itself: take them away, call it, and they must be back. */
+static void
+test_legacy_ip4cfg_hooks(void)
+{
+    EFI_IP4_CONFIG2_INTERFACE_INFO *want = NULL;
+    UINT32     policy = 0;
+    EFI_HANDLE nic = legacy_configured_nic(&want, &policy);
+    if (nic == NULL || policy != 1) {
+        if (want != NULL) {
+            gBS->FreePool(want);
+        }
+        test_skip_n(LEGACY_HOOK_CHECKS, "legacy_ip4cfg hooks: no DHCP-configured NIC");
+        return;
+    }
+    UINTN cfg2 = legacy_count(&EFI_IP4_CONFIG2_PROTOCOL_GUID);
+#define LEGACY_GONE() (axl_net_legacy_ip4cfg_uninstall() == AXL_OK \
+                       && legacy_count(&gEfiIp4ConfigProtocolGuid) == 0)
+#define LEGACY_BACK() (legacy_count(&gEfiIp4ConfigProtocolGuid) == cfg2)
+
+    test_check(LEGACY_GONE() && axl_net_auto_init(AXL_NET_NIC_AUTO, 10) == AXL_OK
+                   && LEGACY_BACK(),
+               "legacy_ip4cfg: axl_net_auto_init publishes");               /* 1 */
+    test_check(LEGACY_GONE()
+                   && axl_net_bring_up(AXL_NET_NIC_AUTO, NULL, NULL, NULL, 10, NULL) == AXL_OK
+                   && LEGACY_BACK(),
+               "legacy_ip4cfg: axl_net_bring_up publishes");                /* 2 */
+    AxlNetAutoOpts opts;
+    axl_memset(&opts, 0, sizeof(opts));
+    test_check(LEGACY_GONE() && axl_net_auto_init_opts(&opts, NULL) == AXL_OK
+                   && LEGACY_BACK(),
+               "legacy_ip4cfg: axl_net_auto_init_opts publishes");          /* 3 */
+
+    /* The static setter, with the address the NIC already has, so nothing on
+       the wire changes; then the DHCP policy goes back. */
+    uint8_t ip[4], mask[4], gw[4] = { 0, 0, 0, 0 };
+    axl_memcpy(ip, &want->StationAddress, 4);
+    axl_memcpy(mask, &want->SubnetMask, 4);
+    for (UINT32 i = 0; i < want->RouteTableSize; i++) {
+        const EFI_IP4_ROUTE_TABLE *r = &want->RouteTable[i];
+        if ((r->SubnetAddress.Addr[0] | r->SubnetAddress.Addr[1] | r->SubnetAddress.Addr[2]
+             | r->SubnetAddress.Addr[3]) == 0) {
+            axl_memcpy(gw, &r->GatewayAddress, 4);
+        }
+    }
+    test_check(LEGACY_GONE() && axl_net_set_static_ip(0, ip, mask, gw) == AXL_OK
+                   && LEGACY_BACK(),
+               "legacy_ip4cfg: axl_net_set_static_ip publishes");           /* 4 */
+    test_check(legacy_restore_dhcp(nic),
+               "legacy_ip4cfg: DHCP policy restored after the static check"); /* 5 */
+#undef LEGACY_GONE
+#undef LEGACY_BACK
+    gBS->FreePool(want);
+}
+
+// ---------------------------------------------------------------------------
+// serve-fs PUT in place (AXL_SERVE_FS_PUT_IN_PLACE*) over the provider
+// fixture: which path a PUT takes, and what a failed in-place PUT leaves and
+// says. The fixture reports no free space, so IF_SHORT has nothing to
+// decide by and stays atomic; the near-full-volume cases run against a RAM
+// disk in test-webdav-fs-qemu.sh.
+// ---------------------------------------------------------------------------
+
+/* One PUT through the serve-fs ops on the fixture: open @p rel with
+   @p length, write @p chunk, count the temps while it is open, then close
+   it (@p aborted). @p log_msg receives the first serve-fs log line ("" for
+   none) and its level goes to @p log_level. */
+typedef struct {
+    int      open_rc;
+    int      chunk_rc;
+    int      close_rc;
+    bool     in_place;              /* what write_open declared */
+    size_t   temps;                 /* ~AP temps while the PUT was open */
+    unsigned log_hits;
+    int      log_level;
+    char     log_msg[160];
+} DavInPlaceRun;
+
+static void
+dav_in_place_run(
+    uint32_t       flags,
+    const char    *rel,
+    uint64_t       length,
+    const char    *chunk,
+    bool           aborted,
+    DavInPlaceRun *out
+    )
+{
+    axl_memset(out, 0, sizeof(*out));
+    out->log_level = -1;
+    AxlFsRoot          *root = axl_fs_root_new(FF_MAP ":\\", flags);
+    const AxlWebDavOps *ops  = axl_fs_webdav_ops();
+    void               *ctx  = NULL;
+    out->in_place = true;           /* write_open must say, either way */
+    out->open_rc  = (root != NULL)
+                    ? ops->write_open(root, rel, length, &ctx, &out->in_place) : AXL_ERR;
+    out->chunk_rc = AXL_ERR;
+    if (out->open_rc == AXL_OK) {
+        out->chunk_rc = (chunk[0] != '\0')
+                        ? ops->write_chunk(ctx, chunk, axl_strlen(chunk)) : AXL_OK;
+        out->temps    = ff_count_prefix("~AP");
+        test_log_quiet_begin("serve-fs");
+        out->close_rc  = ops->write_close(ctx, aborted);
+        out->log_hits  = test_log_quiet_hits;
+        out->log_level = test_log_quiet_first_level;
+        axl_strlcpy(out->log_msg, test_log_quiet_first_msg, sizeof(out->log_msg));
+        test_log_quiet_abort();
+    }
+    axl_fs_root_free(root);
+}
+
+/* An in-place PUT that completes: no temp ever, the new body in the file,
+   nothing logged. */
+static void
+test_serve_fs_put_in_place_commit(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(2, "PUT in place commit (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    DavInPlaceRun r;
+    bool seeded = ff_seed("ip.txt", "old content", 11);
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/ip.txt", 3, "new", false, &r);
+    test_check(seeded && r.open_rc == AXL_OK && r.chunk_rc == AXL_OK && r.in_place
+               && r.close_rc == AXL_OK && r.temps == 0 && r.log_hits == 0,
+               "PUT in place: declared in place, committed with no temp and no log line");
+    test_check(ff_content_is("ip.txt", "new", 3) && ff_count_prefix("~AP") == 0,
+               "PUT in place: the file holds the new body, no temp left");
+    ff_fs_down();
+}
+
+/* An in-place PUT that ends early (the client hung up): the discard
+   cannot restore the file, says so (AXL_ERR), and one error names the
+   file as partially written. The same with the whole body (a
+   Content-Digest mismatch) says the file holds a body the PUT did not
+   accept; and a chunked body states no length. */
+static void
+test_serve_fs_put_in_place_abort(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(3, "PUT in place abort (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    DavInPlaceRun r;
+    bool seeded = ff_seed("ip2.txt", "old content x", 13)
+                  && ff_seed("ip3.txt", "old content y", 13)
+                  && ff_seed("ip4.txt", "old content z", 13);
+
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/ip2.txt", 6, "new", true, &r);
+    bool ok = seeded && r.open_rc == AXL_OK && r.close_rc == AXL_ERR
+              && ff_content_is("ip2.txt", "new", 3)
+              && r.log_hits == 1 && r.log_level == AXL_LOG_ERROR
+              && axl_strcmp(r.log_msg, "PUT in place: '" FF_MAP ":\\ip2.txt' is "
+                            "partially written (3 of 6 bytes); its old content "
+                            "is gone") == 0;
+    if (!ok) {
+        axl_printf("      close %d, %u line(s): %s\n", r.close_rc, r.log_hits, r.log_msg);
+    }
+    test_check(ok, "PUT in place, hung up: partial file kept, discard AXL_ERR, error names it");
+
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/ip3.txt", 3, "bad", true, &r);
+    ok = r.open_rc == AXL_OK && r.close_rc == AXL_ERR
+         && ff_content_is("ip3.txt", "bad", 3)
+         && r.log_hits == 1 && r.log_level == AXL_LOG_ERROR
+         && axl_strcmp(r.log_msg, "PUT in place: '" FF_MAP ":\\ip3.txt' holds "
+                       "the whole body (3 bytes), which the PUT did not "
+                       "accept; its old content is gone") == 0;
+    if (!ok) {
+        axl_printf("      close %d, %u line(s): %s\n", r.close_rc, r.log_hits, r.log_msg);
+    }
+    test_check(ok, "PUT in place, whole body discarded: kept, error says it holds the body");
+
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/ip4.txt", AXL_WEBDAV_LENGTH_UNKNOWN,
+                     "new", true, &r);
+    ok = r.open_rc == AXL_OK && r.temps == 0 && r.close_rc == AXL_ERR
+         && ff_content_is("ip4.txt", "new", 3)
+         && r.log_hits == 1 && r.log_level == AXL_LOG_ERROR
+         && axl_strcmp(r.log_msg, "PUT in place: '" FF_MAP ":\\ip4.txt' is "
+                       "partially written (3 bytes of a chunked body); its "
+                       "old content is gone") == 0;
+    if (!ok) {
+        axl_printf("      close %d, temps %u, %u line(s): %s\n", r.close_rc,
+                   (unsigned)r.temps, r.log_hits, r.log_msg);
+    }
+    test_check(ok, "PUT in place, chunked body hung up: in place, error names it");
+    ff_fs_down();
+}
+
+/* A write in place that FAILS part-way may already have stored some of its
+   chunk: the error names the bytes the file really holds, not the ones the
+   failed write was refused for (2 of "new" stored, so "2 of 6"). */
+static void
+test_serve_fs_put_in_place_failed_write_count(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(1, "PUT in place failed-write count (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    DavInPlaceRun r;
+    bool seeded = ff_seed("ip6.txt", "old content", 11);
+    ff_write_limit = 2;
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/ip6.txt", 6, "new", true, &r);
+    ff_write_limit = 0;
+    bool ok = seeded && r.open_rc == AXL_OK && r.chunk_rc != AXL_OK && r.close_rc == AXL_ERR
+              && ff_size("ip6.txt") == 2
+              && r.log_hits == 1 && r.log_level == AXL_LOG_ERROR
+              && axl_strcmp(r.log_msg, "PUT in place: '" FF_MAP ":\\ip6.txt' is "
+                            "partially written (2 of 6 bytes); its old content "
+                            "is gone") == 0;
+    if (!ok) {
+        axl_printf("      chunk %d close %d size %u, %u line(s): %s\n", r.chunk_rc, r.close_rc,
+                   (unsigned)ff_size("ip6.txt"), r.log_hits, r.log_msg);
+    }
+    test_check(ok, "PUT in place, a write fails part-way: the error counts the bytes stored (2 of 6)");
+    ff_fs_down();
+}
+
+/* An in-place PUT whose final flush fails: AXL_ERR (a 500), and the
+   error says the file is partially written. */
+static void
+test_serve_fs_put_in_place_flush_fails(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(1, "PUT in place flush failure (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(false);
+    DavInPlaceRun r;
+    bool seeded = ff_seed("ip5.txt", "old", 3);
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/ip5.txt", 3, "new", false, &r);
+    bool ok = seeded && r.open_rc == AXL_OK && r.close_rc == AXL_ERR
+              && r.log_hits == 1 && r.log_level == AXL_LOG_ERROR
+              && axl_strcmp(r.log_msg, "PUT in place: '" FF_MAP ":\\ip5.txt' is "
+                            "partially written: its final flush failed; its old "
+                            "content is gone") == 0;
+    if (!ok) {
+        axl_printf("      close %d, %u line(s): %s\n", r.close_rc, r.log_hits, r.log_msg);
+    }
+    test_check(ok, "PUT in place, final flush fails: AXL_ERR, error says partially written");
+    ff_fs_down();
+}
+
+/* A file being written in place is busy process-wide: a second mount over
+   the same volume may not PUT it (AXL_BUSY -- by any spelling the volume
+   resolves to it: the fixture folds letter case here, as FAT does), DELETE
+   it, or MOVE or COPY onto it (AXL_BUSY); once the write ends it may. */
+static void
+test_serve_fs_put_in_place_busy(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(2, "PUT in place busy (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    ff_fold = true;   /* names found without letter case, as FAT finds them */
+    bool seeded = ff_seed("busy.txt", "old", 3) && ff_seed("other.txt", "oth", 3);
+    AxlFsRoot          *a   = axl_fs_root_new(FF_MAP ":\\", AXL_SERVE_FS_PUT_IN_PLACE);
+    AxlFsRoot          *b   = axl_fs_root_new(FF_MAP ":\\", 0);
+    const AxlWebDavOps *ops = axl_fs_webdav_ops();
+    void *ctx  = NULL;
+    void *ctx2 = NULL;
+    bool  ip   = false;
+    bool  ip2  = false;
+    int orc = (a != NULL && b != NULL) ? ops->write_open(a, "/busy.txt", 3, &ctx, &ip) : AXL_ERR;
+    int p1  = ops->write_open(b, "/busy.txt", 3, &ctx2, &ip2);
+    int p2  = ops->write_open(b, "/BUSY.TXT", 3, &ctx2, &ip2);
+    int d   = ops->remove(b, "/busy.txt");
+    int mv  = ops->move(b, "/other.txt", "/busy.txt", true);
+    int cp  = ops->copy(b, "/other.txt", "/busy.txt", true, -1);
+    int ms  = ops->move(b, "/busy.txt", "/moved.txt", true);
+    int crc = (orc == AXL_OK) ? ops->write_close(ctx, false) : AXL_ERR;
+    int d2  = ops->remove(b, "/busy.txt");
+    bool ok = seeded && orc == AXL_OK && ip && p1 == AXL_BUSY && p2 == AXL_BUSY
+              && d == AXL_BUSY && mv == AXL_BUSY && cp == AXL_BUSY && ms == AXL_BUSY
+              && crc == AXL_OK && ff_content_is("other.txt", "oth", 3);
+    if (!ok) {
+        axl_printf("      open %d ip %d put %d/%d del %d mv %d cp %d mvsrc %d close %d\n",
+                   orc, ip, p1, p2, d, mv, cp, ms, crc);
+    }
+    test_check(ok, "PUT in place: the target is busy for another mount (PUT, DELETE, MOVE, COPY)");
+    test_check(d2 == AXL_OK && !ff_exists("busy.txt"),
+               "PUT in place: once the write ends the target is free again");
+    axl_fs_root_free(a);
+    axl_fs_root_free(b);
+    ff_fs_down();
+}
+
+/* With a write in place busy on a volume, a request whose path on that
+   volume cannot be resolved to its stored names (the volume stops
+   answering) cannot be told apart from the busy file: it is AXL_IO_ERROR
+   (500), never AXL_BUSY (503 Retry-After, which would have the client
+   retry for ever) and never let through. */
+static void
+test_serve_fs_put_in_place_busy_unresolvable(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(1, "PUT in place busy, unresolvable (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    bool seeded = ff_seed("held.txt", "old", 3) && ff_seed("other.txt", "oth", 3);
+    AxlFsRoot          *a   = axl_fs_root_new(FF_MAP ":\\", AXL_SERVE_FS_PUT_IN_PLACE);
+    AxlFsRoot          *b   = axl_fs_root_new(FF_MAP ":\\", 0);
+    const AxlWebDavOps *ops = axl_fs_webdav_ops();
+    void *ctx  = NULL;
+    void *ctx2 = NULL;
+    bool  ip   = false;
+    bool  ip2  = false;
+    int orc = (a != NULL && b != NULL) ? ops->write_open(a, "/held.txt", 3, &ctx, &ip) : AXL_ERR;
+    ff_open_fail = true;
+    int p  = ops->write_open(b, "/other.txt", 3, &ctx2, &ip2);
+    int d  = ops->remove(b, "/other.txt");
+    int mv = ops->move(b, "/other.txt", "/moved.txt", true);
+    ff_open_fail = false;
+    int crc = (orc == AXL_OK) ? ops->write_close(ctx, false) : AXL_ERR;
+    bool ok = seeded && orc == AXL_OK && ip && p == AXL_IO_ERROR && d == AXL_IO_ERROR
+              && mv == AXL_IO_ERROR && crc == AXL_OK && ff_content_is("other.txt", "oth", 3);
+    if (!ok) {
+        axl_printf("      open %d put %d del %d mv %d close %d\n", orc, p, d, mv, crc);
+    }
+    test_check(ok, "PUT in place busy: a path that cannot be resolved -> AXL_IO_ERROR, not BUSY");
+    axl_fs_root_free(a);
+    axl_fs_root_free(b);
+    ff_fs_down();
+}
+
+/* Out of memory anywhere in an in-place write_open -- with no busy entry
+   on the volume, so the first stored-name read is the busy slot's own --
+   is a server error (AXL_IO_ERROR, 500): never AXL_ERR (a 409 that blames
+   the client), never AXL_BUSY (a 503 that has it retry), never a file
+   changed, and never a busy slot left taken: after every failure a clean
+   in-place open of the same file succeeds. Each of the first 64
+   allocations is failed in turn -- every one, not only up to the first
+   open that succeeds: an allocation that fails early (a stat, the volume's
+   free space) can let a later one through. */
+#define DAV_OOM_SWEEP 64u
+
+static void
+test_serve_fs_put_in_place_oom_sweep(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(1, "PUT in place OOM sweep (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    AxlFsRoot          *root = axl_fs_root_new(FF_MAP ":\\", AXL_SERVE_FS_PUT_IN_PLACE);
+    const AxlWebDavOps *ops  = axl_fs_webdav_ops();
+    bool     ok     = root != NULL;
+    bool     opened = false;
+    unsigned io     = 0;
+    test_log_quiet_begin("serve-fs");   /* each discard in place logs */
+    for (size_t n = 1; ok && n <= DAV_OOM_SWEEP; n++) {
+        void *ctx = NULL;
+        bool  ip  = false;
+        ok = ff_seed("oom.txt", "keep", 4);
+        axl_mem_fail_next_alloc(n);
+        int rc = ops->write_open(root, "/oom.txt", 4, &ctx, &ip);
+        axl_mem_fail_next_alloc(0);
+        if (rc == AXL_OK) {
+            /* The LAST of the sweep must open in place: then every
+               allocation write_open makes lies inside the sweep. */
+            opened = (n == DAV_OOM_SWEEP) && ip;
+            int crc = ops->write_close(ctx, true);
+            (void)crc;   /* a discard in place cannot restore: AXL_ERR by design */
+            continue;
+        }
+        io += (rc == AXL_IO_ERROR) ? 1u : 0u;
+        bool kept = ff_content_is("oom.txt", "keep", 4);
+        void *c2  = NULL;
+        bool  ip2 = false;
+        int   r2  = ops->write_open(root, "/oom.txt", 4, &c2, &ip2);
+        if (r2 == AXL_OK) {
+            int crc = ops->write_close(c2, true);
+            (void)crc;
+        }
+        if (rc != AXL_IO_ERROR || !kept || r2 != AXL_OK || !ip2) {
+            axl_printf("      allocation %u: open %d, file kept %d, next open %d in place %d\n",
+                       (unsigned)n, rc, kept, r2, ip2);
+            ok = false;
+        }
+    }
+    test_log_quiet_abort();
+    if (!(ok && opened && io > 0)) {
+        axl_printf("      ok %d, allocation %u failed nothing (opened in place) %d, AXL_IO_ERROR answers %u\n",
+                   ok, (unsigned)DAV_OOM_SWEEP, opened, io);
+    }
+    test_check(ok && opened && io > 0,
+               "PUT in place: OOM at any allocation of write_open -> AXL_IO_ERROR, file intact, no busy slot left");
+    axl_fs_root_free(root);
+    ff_fs_down();
+}
+
+/* The ATOMIC path by the same rule: out of memory anywhere in a PUT's
+   write_open (a new file: the temp path) is AXL_IO_ERROR (500), with no
+   temp left and no in-flight slot taken (64 failures would exhaust the
+   32 slots: the clean open after each must still succeed). (A parent
+   that does not exist stays the client's 409: test-webdav-fs section 12;
+   the provider fixture has no directories to leave out.) */
+static void
+test_serve_fs_put_atomic_oom_sweep(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(1, "PUT atomic OOM sweep (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    AxlFsRoot          *root = axl_fs_root_new(FF_MAP ":\\", 0);
+    const AxlWebDavOps *ops  = axl_fs_webdav_ops();
+    bool     ok   = root != NULL;
+    bool     last = false;
+    unsigned io   = 0;
+    size_t   fail_n = 0;
+    for (size_t n = 1; ok && n <= DAV_OOM_SWEEP; n++) {
+        void *ctx = NULL;
+        bool  ip  = true;
+        axl_mem_fail_next_alloc(n);
+        int rc = ops->write_open(root, "/fresh.txt", 4, &ctx, &ip);
+        axl_mem_fail_next_alloc(0);
+        if (rc == AXL_OK) {
+            last = (n == DAV_OOM_SWEEP) && !ip;
+            int crc = ops->write_close(ctx, true);
+            (void)crc;   /* an atomic discard: its return is not read */
+            continue;
+        }
+        io += (rc == AXL_IO_ERROR) ? 1u : 0u;
+        fail_n = (rc == AXL_IO_ERROR) ? n : fail_n;   /* the last failing allocation */
+        size_t temps = ff_count_prefix("~AP");
+        void  *c2    = NULL;
+        bool   ip2   = true;
+        int    r2    = ops->write_open(root, "/fresh.txt", 4, &c2, &ip2);
+        if (r2 == AXL_OK) {
+            int crc = ops->write_close(c2, true);
+            (void)crc;
+        }
+        if (rc != AXL_IO_ERROR || temps != 0 || r2 != AXL_OK || ff_exists("fresh.txt")) {
+            axl_printf("      allocation %u: open %d, temps %u, next open %d\n",
+                       (unsigned)n, rc, (unsigned)temps, r2);
+            ok = false;
+        }
+    }
+    /* A leaked in-flight slot does not block the next PUT -- temp names
+       differ -- until all 32 are gone: fail the same allocation 40 times
+       more, then a clean open must still get one. */
+    for (unsigned k = 0; ok && fail_n != 0 && k < 40u; k++) {
+        void *ctx = NULL;
+        bool  ip  = true;
+        axl_mem_fail_next_alloc(fail_n);
+        int rc = ops->write_open(root, "/fresh.txt", 4, &ctx, &ip);
+        axl_mem_fail_next_alloc(0);
+        if (rc == AXL_OK) {
+            int crc = ops->write_close(ctx, true);
+            (void)crc;
+        }
+    }
+    void *c4  = NULL;
+    bool  ip4 = true;
+    int   r4  = (ok && root != NULL) ? ops->write_open(root, "/fresh.txt", 4, &c4, &ip4) : AXL_ERR;
+    if (r4 == AXL_OK) {
+        int crc = ops->write_close(c4, true);
+        (void)crc;
+    }
+    test_check(ok && last && io > 0 && fail_n != 0 && r4 == AXL_OK,
+               "PUT atomic: OOM at any allocation of write_open -> AXL_IO_ERROR, no temp, no slot left");
+    axl_fs_root_free(root);
+    ff_fs_down();
+}
+
+/* What does NOT go in place: a NEW file (the temp costs no room and leaves
+   nothing on failure); any PUT under IF_SHORT on a volume that cannot say
+   how much room it has; and an existing file on a no-overwrite mount is
+   refused before it is touched. */
+static void
+test_serve_fs_put_in_place_not_taken(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(3, "PUT in place, paths not taken (no provider fixture)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    DavInPlaceRun r;
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE, "/fresh.txt", 3, "new", false, &r);
+    test_check(r.open_rc == AXL_OK && !r.in_place && r.temps == 1 && r.close_rc == AXL_OK
+               && ff_content_is("fresh.txt", "new", 3) && ff_count_prefix("~AP") == 0,
+               "PUT in place: a NEW file goes through the temp, declared not in place");
+
+    bool seeded = ff_seed("short.txt", "old", 3);
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE_IF_SHORT, "/short.txt", 3, "new", true, &r);
+    test_check(seeded && r.open_rc == AXL_OK && !r.in_place && r.temps == 1
+               && r.close_rc == AXL_OK
+               && ff_content_is("short.txt", "old", 3) && ff_count_prefix("~AP") == 0,
+               "PUT IF_SHORT, free space unknown: atomic, a discard keeps the old file");
+
+    seeded = ff_seed("keep.txt", "keep", 4);
+    dav_in_place_run(AXL_SERVE_FS_PUT_IN_PLACE | AXL_SERVE_FS_NO_OVERWRITE,
+                     "/keep.txt", 3, "new", false, &r);
+    test_check(seeded && r.open_rc == AXL_EXISTS && ff_content_is("keep.txt", "keep", 4),
+               "PUT in place on a no-overwrite mount: AXL_EXISTS, the file untouched");
+    ff_fs_down();
+}
+
+/* A root given as the volume itself -- "fs0:", "fs0:\", "fs0:/" -- lists
+   the volume's root directory. "fs0:" once mapped "/" to the bare "fs0:",
+   which on a FAT volume opens nothing, so such a mount listed nothing. (The
+   provider fixture resolves a bare map name to its root, so it cannot show
+   this: the boot volume does.) */
+#define DAV_VOLROOT_FILE "axl_volroot.txt"
+
+static void
+test_serve_fs_volume_root(void)
+{
+    static const char *const roots[] = { "fs0:", "fs0:\\", "fs0:/" };
+    const AxlWebDavOps *ops = axl_fs_webdav_ops();
+    bool ok = axl_file_set_contents("fs0:\\" DAV_VOLROOT_FILE, "r", 1) == AXL_OK;
+    for (size_t i = 0; ok && i < sizeof(roots) / sizeof(roots[0]); i++) {
+        AxlFsRoot  *root  = axl_fs_root_new(roots[i], 0);
+        size_t      max   = 512;
+        AxlFsEntry *out   = axl_calloc(max, sizeof(*out));
+        size_t      count = 0;
+        bool        found = false;
+        int         rc    = (root != NULL && out != NULL)
+                            ? ops->list_dir(root, "/", out, max, &count) : AXL_ERR;
+        for (size_t k = 0; rc == AXL_OK && k < count; k++) {
+            found = found || axl_strcasecmp(out[k].name, DAV_VOLROOT_FILE) == 0;
+        }
+        if (!found) {
+            axl_printf("      root '%s': rc %d, %u entries, no %s\n", roots[i], rc,
+                       (unsigned)count, DAV_VOLROOT_FILE);
+            ok = false;
+        }
+        axl_free(out);
+        axl_fs_root_free(root);
+    }
+    if (axl_file_delete("fs0:\\" DAV_VOLROOT_FILE) != AXL_OK) {
+        axl_printf("      could not remove fs0:\\%s\n", DAV_VOLROOT_FILE);
+    }
+    test_check(ok, "serve-fs: a root of 'fs0:', 'fs0:\\' or 'fs0:/' lists the volume root");
+}
+
+/* COPY is the library's tree copy: iterative (its stack does not grow with
+   the depth -- 66 levels, past the old recursion's 64), Ctrl-C-aware, and
+   undone exactly when it does not finish. Over a scratch tree on fs0:. */
+#define DAV_CP_ROOT    "fs0:\\axl_davcp"
+#define DAV_CP_LEVELS  66u   /* past the old recursion bound of 64 */
+
+/* DAV_CP_ROOT\src: @p levels nested "d" directories, leaf.txt at the
+   bottom, and @p wide files beside the top one. The path of the bottom
+   directory goes to @p deep. */
+static bool
+dav_cp_tree(
+    unsigned  levels,
+    unsigned  wide,
+    char     *deep,
+    size_t    cap
+    )
+{
+    char path[64];
+    if (axl_fs_remove_tree(DAV_CP_ROOT) == AXL_ERR
+        || axl_dir_mkdir(DAV_CP_ROOT) != AXL_OK
+        || axl_dir_mkdir(DAV_CP_ROOT "\\src") != AXL_OK) {
+        return false;
+    }
+    size_t n = axl_strlcpy(deep, DAV_CP_ROOT "\\src", cap);
+    for (unsigned i = 0; i < levels; i++) {
+        n += (size_t)axl_snprintf(deep + n, cap - n, "\\d");
+        if (n >= cap || axl_dir_mkdir(deep) != AXL_OK) {
+            return false;
+        }
+    }
+    char leaf[512];
+    axl_snprintf(leaf, sizeof(leaf), "%s\\leaf.txt", deep);
+    if (axl_file_set_contents(leaf, "leaf", 4) != AXL_OK) {
+        return false;
+    }
+    for (unsigned i = 0; i < wide; i++) {
+        axl_snprintf(path, sizeof(path), DAV_CP_ROOT "\\src\\w%u.txt", i);
+        if (axl_file_set_contents(path, "w", 1) != AXL_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* @p deep (a path under DAV_CP_ROOT\src) rewritten under DAV_CP_ROOT\dst. */
+static void
+dav_cp_dst_of(
+    const char *deep,
+    char       *out,
+    size_t      cap
+    )
+{
+    size_t skip = axl_strlen(DAV_CP_ROOT "\\src");
+    axl_snprintf(out, cap, DAV_CP_ROOT "\\dst%s", deep + skip);
+}
+
+static void
+test_serve_fs_copy_deep(void)
+{
+    char deep[512];
+    char got[512];
+    char leaf[512];
+    bool built = dav_cp_tree(DAV_CP_LEVELS, 0, deep, sizeof(deep));
+    AxlFsRoot          *root = axl_fs_root_new(DAV_CP_ROOT, 0);
+    const AxlWebDavOps *ops  = axl_fs_webdav_ops();
+    int rc = (built && root != NULL) ? ops->copy(root, "/src", "/dst", true, -1) : AXL_ERR;
+    dav_cp_dst_of(deep, got, sizeof(got));
+    axl_snprintf(leaf, sizeof(leaf), "%s\\leaf.txt", got);
+    void   *buf = NULL;
+    size_t  len = 0;
+    bool    there = axl_file_get_contents(leaf, &buf, &len) == AXL_OK
+                    && len == 4 && axl_memcmp(buf, "leaf", 4) == 0;
+    axl_free(buf);
+    if (!(rc == AXL_OK && there)) {
+        axl_printf("      built %d, copy rc %d, leaf at depth %u %s\n", built, rc,
+                   DAV_CP_LEVELS, there ? "there" : "MISSING");
+    }
+    test_check(built && rc == AXL_OK && there,
+               "serve-fs COPY: a 66-level tree (past the old bound of 64) copies whole");
+    axl_fs_root_free(root);
+    if (axl_fs_remove_tree(DAV_CP_ROOT) != AXL_OK) {
+        axl_printf("      could not remove %s\n", DAV_CP_ROOT);
+    }
+}
+
+/* Ctrl-C while a COPY walks the tree: AXL_CANCELLED, nothing of the copy
+   left, the source whole, and the interrupt still pending for the caller. */
+static AxlFsReplaceStep dav_cp_irq_at;
+
+static void
+dav_cp_irq_hook(
+    AxlFsReplaceStep step
+    )
+{
+    if (step == dav_cp_irq_at) {
+        g_axl_interrupted = true;
+    }
+}
+
+static void
+test_serve_fs_copy_ctrl_c(void)
+{
+    char deep[512];
+    char srcleaf[512];
+    bool built = dav_cp_tree(4, 40, deep, sizeof(deep));
+    AxlFsRoot          *root = axl_fs_root_new(DAV_CP_ROOT, 0);
+    const AxlWebDavOps *ops  = axl_fs_webdav_ops();
+    axl_fs_replace_test_hook = dav_cp_irq_hook;
+    dav_cp_irq_at            = AXL_FS_REPLACE_STEP_ENTRY;
+    int  rc      = (built && root != NULL) ? ops->copy(root, "/src", "/dst", true, -1) : AXL_ERR;
+    bool pending = g_axl_interrupted;
+    g_axl_interrupted        = false;
+    axl_fs_replace_test_hook = NULL;
+    AxlFsEntry e;
+    bool dst_gone = axl_file_info(DAV_CP_ROOT "\\dst", &e) != AXL_OK;
+    axl_snprintf(srcleaf, sizeof(srcleaf), "%s\\leaf.txt", deep);
+    bool src_whole = axl_file_info(srcleaf, &e) == AXL_OK
+                     && axl_file_info(DAV_CP_ROOT "\\src\\w39.txt", &e) == AXL_OK;
+    if (!(rc == AXL_CANCELLED && pending && dst_gone && src_whole)) {
+        axl_printf("      rc %d, pending %d, dst gone %d, src whole %d\n", rc, pending,
+                   dst_gone, src_whole);
+    }
+    test_check(built && rc == AXL_CANCELLED && pending && dst_gone && src_whole,
+               "serve-fs COPY: Ctrl-C mid-tree -> AXL_CANCELLED, no partial copy, source whole");
+    axl_fs_root_free(root);
+    if (axl_fs_remove_tree(DAV_CP_ROOT) != AXL_OK) {
+        axl_printf("      could not remove %s\n", DAV_CP_ROOT);
+    }
+}
+
+/* An allocation that fails inside axl_file_writer_open must leave an
+   existing file as it was: the open is what a PUT in place starts with, and
+   a writer that truncated the file before allocating itself emptied it on
+   OOM and reported only "no writer" (a 409, nothing logged). Every
+   allocation the open makes is failed in turn, until one open succeeds. */
+#define DAV_OOM_FILE "fs0:\\axl_wroom.txt"
+
+static void
+test_file_writer_open_oom_keeps_file(void)
+{
+    bool     ok     = true;
+    bool     opened = false;
+    unsigned fails  = 0;
+    for (size_t n = 1; n <= 16 && ok && !opened; n++) {
+        if (axl_file_set_contents(DAV_OOM_FILE, "keep me", 7) != AXL_OK) {
+            ok = false;
+            break;
+        }
+        axl_mem_fail_next_alloc(n);
+        AxlFileWriter *w = axl_file_writer_open(DAV_OOM_FILE, 0);
+        axl_mem_fail_next_alloc(0);
+        if (w != NULL) {
+            opened = true;
+            if (axl_file_writer_close(w) != AXL_OK) {
+                ok = false;
+            }
+            break;
+        }
+        fails++;
+        void  *buf = NULL;
+        size_t len = 0;
+        bool   kept = axl_file_get_contents(DAV_OOM_FILE, &buf, &len) == AXL_OK
+                      && len == 7 && axl_memcmp(buf, "keep me", 7) == 0;
+        axl_free(buf);
+        if (!kept) {
+            axl_printf("      allocation %u failed: the file now holds %u bytes\n",
+                       (unsigned)n, (unsigned)len);
+            ok = false;
+        }
+    }
+    if (axl_file_delete(DAV_OOM_FILE) != AXL_OK) {
+        axl_printf("      could not remove %s\n", DAV_OOM_FILE);
+    }
+    test_check(ok && opened && fails > 0,
+               "file writer: an OOM at any allocation of the open leaves the file intact");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -8362,6 +14951,35 @@ test_net_main(
 
     if (argc >= 3 && axl_strcmp(argv[1], "serve-rebind") == 0) {
         return run_serve_rebind_mode(argv[2]);
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-ws-held-101") == 0) {
+        return run_serve_ws_held_101_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-ws-close-in-connect") == 0) {
+        return run_serve_ws_close_in_connect_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-free-in-handler") == 0) {
+        return run_serve_free_in_handler_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-upload-held") == 0) {
+        return run_serve_upload_held_mode(
+            argc >= 3 && axl_strcmp(argv[2], "fail") == 0);
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tcp-close-pending") == 0) {
+        return run_serve_tcp_close_pending_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tcp-send-cancel") == 0) {
+        return run_serve_tcp_send_cancel_mode();
+    }
+
+    if (argc >= 3 && axl_strcmp(argv[1], "serve-tcp-close-armed") == 0) {
+        return run_serve_tcp_close_armed_mode(argv[2]);
     }
 
     if (argc >= 2 && axl_strcmp(argv[1], "serve-rebind-storm") == 0) {
@@ -8396,6 +15014,12 @@ test_net_main(
     //
     if (argc >= 2 && axl_strcmp(argv[1], "serve-tls") == 0) {
         return run_serve_tls_mode();
+    }
+
+    // "serve-tls-rekey" -- replace the certificate on a live HTTPS server
+    // (test-tls-rekey-qemu.sh)
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tls-rekey") == 0) {
+        return run_serve_tls_rekey_mode();
     }
 
     //
@@ -8437,6 +15061,10 @@ test_net_main(
     // "serve-shell-coexist" -- foreground real Shell.efi + background HTTP
     // pumped by axl_loop_attach_driver. The Console Mirror concurrency spike.
     //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-big-driver") == 0) {
+        return run_serve_big_driver_mode();
+    }
+
     if (argc >= 2 && axl_strcmp(argv[1], "serve-shell-coexist") == 0) {
         return run_serve_shell_coexist_mode();
     }
@@ -8569,6 +15197,11 @@ test_net_main(
     // Needs the firmware DevicePathToText protocol (always present under
     // OVMF) but no NIC / driver load.
     //
+    axl_printf("--- TCP Pacing ---\n");
+    test_net_latency_settings();
+    test_net_latency_tick();
+    test_tcp_pacing_settings();
+
     axl_printf("--- Driver Select ---\n");
     test_bus_location();
     test_driver_select_negatives();
@@ -8588,6 +15221,10 @@ test_net_main(
     test_url_parse_fragment_only();
     test_url_parse_no_fragment();
     test_url_parse_at_in_path_not_userinfo();
+    test_url_parse_ipv6_literal();
+    test_url_parse_ipv6_strict();
+    test_url_parse_scheme_case();
+    test_http_request_host_authority();
     test_url_parse_userinfo_colon_in_password();
     test_url_parse_fragment_after_host();
     test_url_parse_port_nondigit();
@@ -8606,14 +15243,36 @@ test_net_main(
     test_http_find_header_end();
     test_http_parse_status();
     test_http_status_line();
+    test_http_expect_check();
     test_http_auth_challenge();
     test_http_parse_request();
     test_http_parse_headers();
+    test_http_parse_headers_ows();
+    test_http_parse_headers_strict();
+    test_http_parse_response_headers();
+    test_http_parse_status_strict();
+    test_http_parse_request_line_strict();
+    test_http_head_oom();
+    test_http_client_close_notify_option();
+    test_http_content_length_strict();
     test_http_parse_range();
     test_http_accepts();
     test_http_request_helpers();
     test_http_response_get_json();
     test_http_add_routes_variadic();
+    test_serve_fs_put_in_place_commit();
+    test_serve_fs_put_in_place_abort();
+    test_serve_fs_put_in_place_flush_fails();
+    test_serve_fs_put_in_place_failed_write_count();
+    test_serve_fs_put_in_place_busy();
+    test_serve_fs_put_in_place_busy_unresolvable();
+    test_serve_fs_put_in_place_oom_sweep();
+    test_serve_fs_put_atomic_oom_sweep();
+    test_serve_fs_put_in_place_not_taken();
+    test_serve_fs_volume_root();
+    test_serve_fs_copy_deep();
+    test_serve_fs_copy_ctrl_c();
+    test_file_writer_open_oom_keeps_file();
 
     //
     // IPv4 parse / format (no network)
@@ -8633,6 +15292,7 @@ test_net_main(
     //
     axl_printf("\n--- Driver Selection ---\n");
     test_net_driver_is_ipxe();
+    test_net_driver_info_capacity();
 
     //
     // AxlNetOpts (no network — validation only)
@@ -8672,13 +15332,31 @@ test_net_main(
     //
     axl_printf("\n--- Network ---\n");
     test_tls_available();
+    test_tls_self_signed_serial_der();
+    test_tls_server_cert_reattach_no_growth();
     test_net_available();
+    test_legacy_ip4cfg();
+    test_legacy_ip4cfg_hooks();
+    test_legacy_ip4cfg_errors();
+    test_legacy_ip4cfg_revision();
+    test_legacy_ip4cfg_done_once();
     test_tcp_echo();
+    test_tcp_close_sync_skips_time_wait();
+    test_tcp_close_async_skips_time_wait();
     test_tcp_recv_async_rearm();
+    test_tcp_recv_rearm_other_loop();
+    test_tcp_recv_rearm_failed_outside();
+    test_tcp_recv_interrupted();
+    test_tcp_recv_interrupted_completed();
+    test_tcp_linger_lifetime();
+    test_tcp_linger_needs_the_send_loop();
     test_tcp_send_async_queued();
     test_tcp_send_async_flush_on_close();
     test_tcp_send_close_from_send_callback();
+    test_tcp_close_delivers_held_send_status();
     test_tcp_send_sync_behind_async();
+    test_tcp_close_fully_armed_send_graceful();
+    test_tcp_send_queued_bytes_and_sent();
     test_http_round_trip();
     test_http_response_set_static();
     test_http_response_set_bytes();

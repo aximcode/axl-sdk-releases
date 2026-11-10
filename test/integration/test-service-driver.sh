@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=7 local-only=0
+# test-meta: arch=x64 needs= est=7 local-only=0 builds=service-demo guest=standard
 # AxlService embedded-driver deployment integration test.
 #
 # Boots service_demo.efi (sdk/examples/service-demo.c, built via the
@@ -33,8 +33,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     service-demo 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -49,22 +49,7 @@ test_add_efi "$NATIVE_DIR/service_demo.efi"
 #     teardown, unregister, free)
 #   - second `service_demo launch --detach` sees no protocol →
 #     step-1 short-circuit doesn't fire → fresh LoadImage+StartImage
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "service_demo.efi start --detach"
-    echo "service_demo.efi stop"
-    # Short-flag + CHOICE round-trip (exercises AxlConfigDesc.short_name
-    # and AxlConfigDesc.choices passthrough in the axl_service_main
-    # synthesizer): -p 9090 short flag, -v short flag, --name alpha
-    # is a valid choice. Driver's setup log line should reflect all
-    # three values post-LoadOptions decode.
-    echo "service_demo.efi start -p 9090 -v --name alpha --detach"
-    echo "service_demo.efi stop"
-    echo "service_demo.efi start --detach"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

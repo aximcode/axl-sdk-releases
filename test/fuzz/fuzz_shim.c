@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <axl/axl-debug.h>
 #include <axl/axl-stream.h>
 
 //
@@ -70,7 +71,8 @@ axl_memdup_impl(const void *src, size_t size, const char *file, size_t line)
 }
 
 //
-// axl-str / axl-format are NOT shimmed — see AXL_BASE in the Makefile.
+// axl-str / axl-format are NOT shimmed — see AXL_BASE in
+// test/fuzz/CMakeLists.txt.
 //
 // They used to be: axl_strlen, axl_strcmp, axl_strncmp, axl_strndup,
 // axl_memcpy, axl_memcmp and axl_snprintf were thin libc wrappers here.
@@ -178,6 +180,25 @@ axl_stream_can_write(const AxlStream *s)
 void
 _axl_poll_break(void)
 {
+}
+
+//
+// axl-debug — a failed AXL_DEBUG_ASSERT is a FINDING under fuzz, not log
+// noise: abort so libFuzzer reports it with the input that reached it. (The
+// real one logs and continues, which a harness would never notice -- the
+// integration runs grade the marker for the same reason.)
+//
+
+void
+_axl_debug_assert_fail(const char *file, int line, const char *func,
+                       const char *expr, const char *msg)
+{
+    (void)file;
+    (void)line;
+    (void)func;
+    (void)expr;
+    (void)msg;
+    abort();
 }
 
 //

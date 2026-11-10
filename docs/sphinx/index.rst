@@ -74,6 +74,7 @@ AXL SDK
    modules/scram
    modules/jose
    modules/9p
+   modules/ssh
    modules/sys
    modules/cpu
    modules/port
@@ -125,6 +126,7 @@ AXL SDK
    guides/sdk
    guides/shared-driver
    guides/driver-authoring
+   guides/sshd
    guides/axlmm-design
    guides/display-design
    guides/porting

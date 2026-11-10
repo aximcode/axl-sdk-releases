@@ -17,6 +17,12 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-driver-deps.h>
 #include <axl/axl-driver-info.h>
+#include <axl/axl-image.h>
+#include <axl/axl-image-verify.h>
+#include <axl/axl-log.h>
+#include <axl/axl-runtime.h>
+#include <axl/axl-service.h>
+#include <axl/axl-shared-driver.h>
 
 //
 // <uefi/axl-uefi.h> declares gBS and the EFI types used to cross-check
@@ -381,6 +387,173 @@ test_buffer_identity_and_sibling(void)
     // directory has no 'definitely-not-here.efi'.)
     test_check(axl_driver_load_sibling("definitely-not-here.efi", &h) == AXL_NOT_FOUND,
                "load_sibling: well-formed missing sibling returns AXL_NOT_FOUND");
+}
+
+/* A load must never load the CALLING image: a driver that shares the
+   running image's file name would otherwise load (and, through ensure,
+   start) the image itself -- the test binary re-running inside itself.
+   test-axl.sh stages the unit binaries at fs0:\, so this binary is
+   fs0:\AxlTestDriver.efi. */
+static void
+test_self_load_refused(void)
+{
+    /* Every spelling below names THIS file; a driver load of it is refused.
+       Each is first shown to name an existing file, so an AXL_ERR is the
+       refusal and not a path that did not resolve (unrefused, the load of
+       the running image succeeds -- that is what RED showed). */
+    static const struct {
+        const char *path;
+        const char *what;
+    } spellings[] = {
+        { "fs0:\\AxlTestDriver.efi",             "its own path" },
+        { "FS0:/axltestdriver.EFI",              "another case and '/'" },
+        { "fs0:\\selfdir\\..\\AxlTestDriver.efi", "a '..' segment" },
+        { "fs0:\\.\\AxlTestDriver.efi",          "a '.' segment" },
+        { "fs0:\\AxlTestDriver.efi.",            "a trailing dot (FAT trims it)" },
+        { NULL,                                  "its 8.3 alias" },   /* found below */
+    };
+    /* The 8.3 alias depends on what else the disk holds (every AxlTest*.efi
+       shares the stem, and the numeric tail grows: AXLTES~9, then
+       AXLTE~10), so it is found by CONTENT: the alias whose bytes are this
+       image's. */
+    char   alias[32] = "";
+    void  *me        = NULL;
+    size_t me_len    = 0;
+    if (axl_file_get_contents("fs0:\\AxlTestDriver.efi", &me, &me_len) == AXL_OK) {
+        for (unsigned n = 1; n <= 99 && alias[0] == '\0'; n++) {
+            char   cand[32];
+            void  *b = NULL;
+            size_t bl = 0;
+            axl_snprintf(cand, sizeof(cand),
+                         n < 10 ? "fs0:\\AXLTES~%u.EFI" : "fs0:\\AXLTE~%u.EFI", n);
+            if (axl_file_get_contents(cand, &b, &bl) == AXL_OK && bl == me_len
+                && axl_memcmp(b, me, me_len) == 0) {
+                axl_strlcpy(alias, cand, sizeof(alias));
+            }
+            axl_free(b);
+        }
+    }
+    axl_free(me);
+    axl_dir_mkdir("fs0:\\selfdir");
+    for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+        const char *sp = spellings[i].path != NULL ? spellings[i].path : alias;
+        AxlFsEntry  e;
+        bool exists = sp[0] != '\0' && axl_file_info(sp, &e) == AXL_OK
+                      && !axl_fs_entry_is_dir(&e);
+        AxlDriverHandle h  = (AxlDriverHandle)0x1;
+        int             rc = exists ? axl_driver_load(sp, &h) : AXL_OK;
+        char name[128];
+        axl_snprintf(name, sizeof(name),
+                     "self load: axl_driver_load of the running image by %s is refused",
+                     spellings[i].what);
+        test_check(exists && rc == AXL_ERR && h == NULL, name);
+        if (rc == AXL_OK && h != NULL && h != (AxlDriverHandle)0x1) {
+            axl_driver_unload(h);
+        }
+    }
+
+    AxlDriverHandle h  = (AxlDriverHandle)0x1;
+    int             rc = axl_driver_load_sibling("AxlTestDriver.efi", &h);
+    test_check(rc == AXL_ERR && h == NULL,
+               "self load: axl_driver_load_sibling of the image's own name is refused");
+    if (rc == AXL_OK && h != NULL) {
+        axl_driver_unload(h);
+    }
+
+    /* ensure with the image's own name and a protocol nothing publishes:
+       the search must not load-and-start this binary; with no other copy it
+       finds none. NOTE for whoever sees this suite misbehave: if this guard
+       regresses, the check does not FAIL cleanly -- ensure STARTS this test
+       binary, which runs the whole suite again inside itself (about thirty
+       levels deep, then out of memory or the harness timeout). A recursion
+       in AxlTestDriver means this check failed. */
+    static const AxlGuid nobody = {
+        0x5e1f10ad, 0x0bad, 0x4c0d, { 0x9a, 0x11, 0x5e, 0x1f, 0x10, 0xad, 0x00, 0x01 }
+    };
+    test_check(axl_driver_ensure(&nobody, "AxlTestDriver.efi") == AXL_NOT_FOUND,
+               "self load: axl_driver_ensure with the image's own name finds nothing");
+
+    /* An APPLICATION load of its own path is the caller's choice and works:
+       a self-update probes the file it just staged over itself, and a
+       re-exec runs it (SoftBMC's upgrade does both). Loaded, not started. */
+    AxlImage *img = NULL;
+    rc = axl_image_load("fs0:\\AxlTestDriver.efi", &img);
+    test_check(rc == AXL_OK && img != NULL,
+               "self load: axl_image_load of the caller's own path still loads");
+    if (img != NULL) {
+        axl_image_unload(img);
+    }
+
+    /* Controls: the same bytes elsewhere are not this file and load -- under
+       another name, and under the SAME name in another directory (which a
+       basename comparison would wrongly refuse). */
+    static const char *const copies[] = {
+        "fs0:\\axl-self-copy.tmp",
+        "fs0:\\selfdir\\AxlTestDriver.efi",
+    };
+    void  *bytes  = NULL;
+    size_t nbytes = 0;
+    bool   read   = axl_file_get_contents("fs0:\\AxlTestDriver.efi", &bytes,
+                                          &nbytes) == AXL_OK;
+    for (size_t i = 0; i < sizeof(copies) / sizeof(copies[0]); i++) {
+        h  = NULL;
+        rc = AXL_ERR;
+        if (read && axl_file_set_contents(copies[i], bytes, nbytes) == AXL_OK) {
+            rc = axl_driver_load(copies[i], &h);
+        }
+        char name[128];
+        axl_snprintf(name, sizeof(name),
+                     "self load: a copy at %s loads (control)", copies[i]);
+        test_check(rc == AXL_OK && h != NULL, name);
+        if (h != NULL) {
+            axl_driver_unload(h);
+        }
+        axl_file_delete(copies[i]);
+    }
+    axl_free(bytes);
+    axl_dir_rmdir("fs0:\\selfdir");
+}
+
+/* The running image's identity is resolved ONCE per process: on BMC
+   virtual media every component open is a slow USB round trip, and the
+   search checks every candidate. Counted by the debug line the resolution
+   emits. Earlier tests may already have resolved it, so the window allows
+   at most one -- uncached, it is one per check. */
+static int g_self_resolves;
+
+static void
+self_resolve_capture(int level, const char *domain, const char *message,
+                     const AxlRealtime *stamp, void *data)
+{
+    (void)level;
+    (void)stamp;
+    (void)data;
+    static const char prefix[] = "driver: the running image resolved as ";
+    if (domain != NULL && axl_strcmp(domain, "driver") == 0
+        && axl_strncmp(message, prefix, sizeof(prefix) - 1) == 0) {
+        g_self_resolves++;
+    }
+}
+
+static void
+test_self_identity_cached(void)
+{
+    g_self_resolves = 0;
+    axl_log_set_domain_level("driver", AXL_LOG_DEBUG);
+    bool hooked = axl_log_add_handler(self_resolve_capture, NULL) == AXL_OK;
+    int  refused = 0;
+    for (int i = 0; i < 4; i++) {
+        AxlDriverHandle h = NULL;
+        if (axl_driver_load("fs0:\\AxlTestDriver.efi", &h) == AXL_ERR && h == NULL) {
+            refused++;
+        } else if (h != NULL) {
+            axl_driver_unload(h);
+        }
+    }
+    axl_log_remove_handler(self_resolve_capture);
+    axl_log_set_domain_level("driver", -1);
+    test_check(hooked && refused == 4 && g_self_resolves <= 1,
+               "self load: the running image is resolved once per process, not per check");
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1192,211 @@ test_failed_driver_load_is_quiet_at_info(void)
     }
 }
 
+// ---------------------------------------------------------------------------
+// UEFI 2.11 Table 7.3: LoadImage() and StartImage() only below TPL_CALLBACK.
+// Every public path that reaches either refuses at TPL_CALLBACK or above with
+// AXL_UNSUPPORTED, before touching the firmware -- so the refused calls below
+// are safe negatives even with arguments a real call could not survive. Each
+// is paired with the SAME call at TPL_APPLICATION, which gets past the guard
+// and fails (or succeeds) the way it always did: the refusal is the TPL's
+// doing, not the arguments'.
+// ---------------------------------------------------------------------------
+
+/* Not published by anything: an ensure for it must load. */
+static const AxlGuid TPL_UNREG_GUID = {
+    0x7d1c0a55, 0x2b3e, 0x4f61, { 0x9a, 0x0c, 0x1d, 0x2e, 0x3f, 0x40, 0x51, 0x62 }
+};
+
+static int
+tpl_svc_setup(AxlLoop *loop, void *user)
+{
+    (void)loop;
+    (void)user;
+    return AXL_OK;
+}
+
+static const AxlService TPL_SVC = {
+    .name  = "axl-test-tpl-svc",
+    .setup = tpl_svc_setup,
+};
+
+/* Every ERROR line in the "driver" domain, copied without allocating (a
+   log handler must not allocate). More than TPL_ERR_MAX lines is counted
+   but not kept. */
+#define TPL_ERR_MAX 32
+static char   g_tpl_err[TPL_ERR_MAX][256];
+static size_t g_tpl_err_n;
+
+static void
+tpl_err_capture(int level, const char *domain, const char *message,
+                const AxlRealtime *stamp, void *data)
+{
+    (void)stamp;
+    (void)data;
+    if (level != AXL_LOG_ERROR || domain == NULL
+        || axl_strcmp(domain, "driver") != 0) {
+        return;
+    }
+    if (g_tpl_err_n < TPL_ERR_MAX) {
+        size_t n = axl_strlen(message);
+        if (n >= sizeof(g_tpl_err[0])) {
+            n = sizeof(g_tpl_err[0]) - 1;
+        }
+        axl_memcpy(g_tpl_err[g_tpl_err_n], message, n);
+        g_tpl_err[g_tpl_err_n][n] = '\0';
+    }
+    g_tpl_err_n++;
+}
+
+#define TPL_N_CALLS 21
+
+/* Make every guarded call once, at whatever TPL the caller holds. */
+static void
+tpl_make_calls(int rc[TPL_N_CALLS], const unsigned char *zeros, size_t zeros_len)
+{
+    AxlDriverHandle h    = NULL;
+    AxlImage       *img  = NULL;
+    void           *ifc  = NULL;
+    size_t          n    = 0;
+    int             code = 0;
+    AxlServiceDeploy deploy = {
+        .service     = &TPL_SVC,
+        .driver_path = "fs99:\\axl-tpl-nonexistent.efi",
+    };
+
+    rc[0]  = axl_driver_load("fs99:\\axl-tpl-nonexistent.efi", &h);
+    rc[1]  = axl_driver_load_sibling("definitely-not-here.efi", &h);
+    rc[2]  = axl_driver_load_buffer(zeros, zeros_len, &h);
+    rc[3]  = axl_driver_load_buffer_with_image_info(zeros, zeros_len, NULL, &h);
+    rc[4]  = axl_driver_start(NULL);
+    rc[5]  = axl_driver_load_dir("fs99:\\axl-tpl-nodir", NULL, &n);
+    rc[6]  = axl_driver_ensure(&TPL_UNREG_GUID, "axl-tpl-nonexistent.efi");
+    rc[7]  = axl_driver_ensure_with_embedded(&TPL_UNREG_GUID, "axl-tpl-nonexistent.efi",
+                                             zeros, zeros_len, NULL, NULL, 0);
+    rc[8]  = axl_driver_ensure_from_path(&TPL_UNREG_GUID,
+                                         "fs99:\\axl-tpl-nonexistent.efi", NULL, 0);
+    rc[9]  = axl_driver_ensure_embedded_only(&TPL_UNREG_GUID, zeros, zeros_len,
+                                             "axl-tpl.efi", NULL, 0);
+    rc[10] = axl_image_load("fs99:\\axl-tpl-nonexistent.efi", &img);
+    rc[11] = axl_image_start(NULL, &code);
+    rc[12] = axl_image_run("fs99:\\axl-tpl-nonexistent.efi", NULL, &code);
+    rc[13] = axl_image_run_fv_file(&TPL_UNREG_GUID, NULL, &code);
+    rc[14] = axl_service_reload(&TPL_SVC, "fs99:\\axl-tpl-nonexistent.efi");
+    rc[15] = axl_service_reload_buffer(&TPL_SVC, zeros, zeros_len);
+    rc[16] = axl_service_start_embedded(&deploy);
+    rc[17] = axl_shared_driver_locate("axl-tpl-shared", "definitely-not-here.efi",
+                                      NULL, 0, &ifc);
+    rc[18] = axl_shared_driver_locate_sibling("axl-tpl-shared", "definitely-not-here.efi",
+                                              &ifc);
+    /* consult_db asks the firmware's LoadImage to judge the signature: a
+       verify that cannot ask must not answer as if it had (fail closed). */
+    AxlImageSignatureInfo sig;
+    rc[19] = axl_image_verify_signature("fs99:\\axl-tpl-nonexistent.efi", true, &sig);
+    axl_image_signature_info_free(&sig);
+    rc[20] = axl_shared_driver_locate_with_image_info("axl-tpl-shared",
+                                                      "definitely-not-here.efi",
+                                                      NULL, 0, NULL, 0, NULL, &ifc);
+    /* Premise-broke paths: nothing above may have loaded anything. */
+    if (h != NULL) {
+        axl_driver_unload(h);
+    }
+    if (img != NULL) {
+        axl_image_unload(img);
+    }
+}
+
+static void
+test_image_calls_refused_at_raised_tpl(void)
+{
+    static const char *const names[TPL_N_CALLS] = {
+        "axl_driver_load", "axl_driver_load_sibling", "axl_driver_load_buffer",
+        "axl_driver_load_buffer_with_image_info", "axl_driver_start",
+        "axl_driver_load_dir", "axl_driver_ensure", "axl_driver_ensure_with_embedded",
+        "axl_driver_ensure_from_path", "axl_driver_ensure_embedded_only",
+        "axl_image_load", "axl_image_start", "axl_image_run", "axl_image_run_fv_file",
+        "axl_service_reload", "axl_service_reload_buffer", "axl_service_start_embedded",
+        "axl_shared_driver_locate", "axl_shared_driver_locate_sibling",
+        "axl_image_verify_signature", "axl_shared_driver_locate_with_image_info",
+    };
+    /* What each returns at TPL_APPLICATION with the same arguments: the
+       guard is passed, and the call fails on what is (not) there -- or, for
+       a directory that does not exist, succeeds having loaded nothing. A
+       zero-filled buffer is no PE image: LoadImage refuses it cleanly. */
+    static const int at_app[TPL_N_CALLS] = {
+        AXL_ERR, AXL_NOT_FOUND, AXL_ERR, AXL_ERR, AXL_ERR,
+        AXL_OK, AXL_NOT_FOUND, AXL_NOT_FOUND, AXL_NOT_FOUND, AXL_NOT_FOUND,
+        AXL_ERR, AXL_ERR, AXL_ERR, AXL_ERR,
+        AXL_INVALID, AXL_INVALID, AXL_NOT_FOUND, AXL_NOT_FOUND, AXL_NOT_FOUND,
+        AXL_ERR, AXL_NOT_FOUND,
+    };
+    static unsigned char zeros[4096];
+    int raised[TPL_N_CALLS];
+    int app[TPL_N_CALLS];
+    char msg[160];
+
+    test_check(axl_log_add_handler(tpl_err_capture, NULL) == AXL_OK,
+               "tpl: the error-capture handler installs");
+    g_tpl_err_n = 0;
+
+    unsigned prev = axl_tpl_raise(AXL_TPL_CALLBACK);
+    tpl_make_calls(raised, zeros, sizeof(zeros));
+    axl_tpl_restore(prev);
+
+    for (size_t i = 0; i < TPL_N_CALLS; i++) {
+        axl_snprintf(msg, sizeof(msg), "tpl: %s at TPL_CALLBACK returns AXL_UNSUPPORTED (%d)",
+                     names[i], raised[i]);
+        test_check(raised[i] == AXL_UNSUPPORTED, msg);
+    }
+    /* One error line per refused call -- exactly TPL_N_CALLS -- each naming
+       the call that was made, then the rule. */
+    size_t nerr = g_tpl_err_n;
+    axl_snprintf(msg, sizeof(msg), "tpl: exactly %d refusal lines (%zu)", TPL_N_CALLS, nerr);
+    test_check(nerr == TPL_N_CALLS, msg);
+    for (size_t i = 0; i < TPL_N_CALLS && i < nerr && i < TPL_ERR_MAX; i++) {
+        char want[256];
+        axl_snprintf(want, sizeof(want),
+                     "%s: refused at TPL 8 -- UEFI allows LoadImage and StartImage "
+                     "only below TPL_CALLBACK (UEFI 2.11 Table 7.3); call it from an "
+                     "application, such as a Shell command", names[i]);
+        axl_snprintf(msg, sizeof(msg), "tpl: refusal line %zu names %s, exactly", i, names[i]);
+        test_check(axl_strcmp(g_tpl_err[i], want) == 0, msg);
+    }
+
+    /* Without consult_db a verify loads nothing, so it is not refused: the
+       missing file is the answer, as at TPL_APPLICATION. */
+    {
+        AxlImageSignatureInfo sig;
+        prev = axl_tpl_raise(AXL_TPL_CALLBACK);
+        int nodb = axl_image_verify_signature("fs99:\\axl-tpl-nonexistent.efi", false, &sig);
+        axl_tpl_restore(prev);
+        axl_image_signature_info_free(&sig);
+        test_check(nodb == AXL_ERR,
+                   "tpl: axl_image_verify_signature without consult_db at TPL_CALLBACK is "
+                   "not refused (AXL_ERR for the missing file)");
+    }
+    /* An ensure whose protocol is already published loads nothing, so it is
+       not refused: a callback may still ask "is it there?". */
+    AxlHandle reg = NULL;
+    test_check(axl_protocol_install(&TPL_UNREG_GUID, &g_iface, &reg) == AXL_OK,
+               "tpl: install the protocol the ensure looks for");
+    prev = axl_tpl_raise(AXL_TPL_CALLBACK);
+    int warm = axl_driver_ensure(&TPL_UNREG_GUID, "axl-tpl-nonexistent.efi");
+    axl_tpl_restore(prev);
+    test_check(warm == AXL_OK,
+               "tpl: axl_driver_ensure of a published protocol at TPL_CALLBACK is AXL_OK");
+    test_check(axl_protocol_uninstall(reg, &TPL_UNREG_GUID, &g_iface) == AXL_OK,
+               "tpl: uninstall the protocol again");
+
+    /* Control: the same calls at TPL_APPLICATION pass the guard. */
+    tpl_make_calls(app, zeros, sizeof(zeros));
+    for (size_t i = 0; i < TPL_N_CALLS; i++) {
+        axl_snprintf(msg, sizeof(msg), "tpl: %s at TPL_APPLICATION returns %d (%d)",
+                     names[i], at_app[i], app[i]);
+        test_check(app[i] == at_app[i], msg);
+    }
+    axl_log_remove_handler(tpl_err_capture);
+}
+
 int
 test_driver_main(int argc, char **argv)
 {
@@ -1029,6 +1407,8 @@ test_driver_main(int argc, char **argv)
     test_install_fresh_handle();
     test_install_null_safety();
     test_buffer_identity_and_sibling();
+    test_self_load_refused();
+    test_self_identity_cached();
     test_driver_binding();
     test_disconnect_handle_contract();
     test_driver_info();
@@ -1043,6 +1423,7 @@ test_driver_main(int argc, char **argv)
     test_deps_walk_missing_dep();
     test_deps_parse_errors();
     test_failed_driver_load_is_quiet_at_info();
+    test_image_calls_refused_at_raised_tpl();
 
     return test_print_results();
 }

@@ -129,6 +129,41 @@ axl_cancellable_reset(
     AxlCancellable *c  ///< cancellable (NULL-safe)
 );
 
+/**
+ * @brief Also cancel @p c when the Shell's Ctrl-C (break) arrives during a
+ *     synchronous wait that observes it -- even in resident code. NULL-safe.
+ *
+ * The counterpart of axl_loop_set_intercept_break() for a cancellable. A
+ * foreground application's waits end on Ctrl-C already; resident code's (a
+ * driver's) do not, because the Shell's break belongs to whatever the Shell
+ * is running and reading it consumes it. This is for resident code acting
+ * FOR a foreground command that waits on it: a driver's setup while the
+ * command that loaded it waits in its start.
+ *
+ * While set, each synchronous wait that takes @p c (`axl_wait_*`,
+ * axl_net_auto_init_opts()) also waits on the Shell's `ExecutionBreak`: a
+ * Ctrl-C then cancels @p c -- so every later wait on it ends at once too --
+ * and that wait returns AXL_CANCELLED. Async ops on a loop do not look at it.
+ *
+ * - **The wait consumes the break.** The Shell does not see that Ctrl-C:
+ *   clear the claim (@p on false) as soon as the foreground command has its
+ *   answer. Freeing @p c ends the claim too.
+ * - **A break already latched ends the first claiming wait at once.** The
+ *   Shell's event stays signalled until someone reads it, so a Ctrl-C pressed
+ *   earlier -- while the command ran a step that is not a wait, such as a
+ *   driver connect -- cancels @p c as soon as a claiming wait starts. That is
+ *   intended: it was pressed during the command it stops.
+ * - **Inert without the Shell protocol** (no Shell, or an EFI 1.x shell): the
+ *   waits then behave as without the claim.
+ * - **The waits must run at TPL_APPLICATION**, as every blocking wait must
+ *   (WaitForEvent).
+ */
+void
+axl_cancellable_set_cancel_on_break(
+    AxlCancellable *c,   ///< cancellable (NULL-safe)
+    bool            on   ///< true to claim the break, false to give it back
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=110 local-only=0
+# test-meta: arch=both needs= est=110 local-only=0 builds=crashhandler,crashtest guest=none
+# guest=none: the boot is the subject: it crashes the guest and reads what
+#   the crash handler left on the NEXT boot.
 # test-crashhandler.sh -- end-to-end test for the CrashHandler DXE driver
 # (drivers/crashhandler) + CrashTest app (tools/crashtest.c).
 #
@@ -50,7 +52,7 @@ CRASH_TEST="$(test_build_dir "$ARCH_LC")/tools/crashtest.efi"
 # Build if missing (warm tree: <2s).
 if [[ ! -f "$CRASH_HANDLER" || ! -f "$CRASH_TEST" ]]; then
     echo "Building CrashHandler + CrashTest ($TEST_ARCH)..."
-    make -C "$PROJECT_DIR" ARCH="$ARCH_LC" crashhandler crashtest 2>&1 | tail -3
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$ARCH_LC" crashhandler crashtest 2>&1 | tail -3
 fi
 [[ -f "$CRASH_HANDLER" ]] || { echo "FAIL: not found: $CRASH_HANDLER"; exit 1; }
 [[ -f "$CRASH_TEST" ]]    || { echo "FAIL: not found: $CRASH_TEST"; exit 1; }
@@ -106,7 +108,15 @@ run_boot() {
     # $1 = log path. Re-stages the disk from current TEST_STAGING and runs.
     test_build_image
     build_crash_qemu_cmd
-    timeout "$QEMU_TIMEOUT" "${CRASH_QEMU_CMD[@]}" > "$1" 2>&1 || true
+    _prof_launch crash "${CRASH_QEMU_CMD[@]}"
+    local rc=0 pid
+    # Backgrounded and waited, so the boot reading has a pid to watch.
+    test_timing_begin
+    timeout "$QEMU_TIMEOUT" "${CRASH_QEMU_CMD[@]}" > "$1" 2>&1 < /dev/null &
+    pid=$!
+    test_timing_watch "$pid" "$1"
+    wait "$pid" || rc=$?
+    test_timing_end "$rc"
 }
 
 echo "=== CrashHandler Integration Tests ($TEST_ARCH) ==="

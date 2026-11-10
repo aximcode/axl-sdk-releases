@@ -179,6 +179,21 @@ scenario_root(void)
     check("rmdir", axl_dir_rmdir("fs0:\\axltd") == AXL_OK
                    && !exists("fs0:\\axltd"));
 
+    // --- '/' is read as '\' (this shell's map lookup splits on '\' only)
+    check("slash-info", sized("fs0:/dof_in.txt", 6));
+    check("slash-rootrel", sized("/dof_in.txt", 6));
+    check("slash-nested", contents_are("fs0:/sub/nested.txt", "NESTED\n"));
+    check("slash-mixed", contents_are("fs0:\\sub/nested.txt", "NESTED\n"));
+    check("slash-isdir", axl_file_is_dir("fs0:/sub"));
+    check("slash-write", axl_file_set_contents("fs0:/axlslash.txt", "s", 1) == AXL_OK
+                         && contents_are("fs0:\\axlslash.txt", "s")
+                         && axl_file_delete("fs0:/axlslash.txt") == AXL_OK
+                         && !exists("fs0:\\axlslash.txt"));
+    check("slash-mkdir", axl_dir_mkdir("fs0:/axlsd") == AXL_OK
+                         && axl_file_is_dir("fs0:\\axlsd")
+                         && axl_dir_rmdir("fs0:/axlsd") == AXL_OK
+                         && !exists("fs0:\\axlsd"));
+
     // --- negatives (must fail cleanly, not resolve to the wrong file)
     check("neg-missing-file", !exists("fs0:\\nosuch.txt")
                               && axl_fopen("fs0:\\nosuch.txt", "r") == NULL);

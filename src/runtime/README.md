@@ -56,6 +56,8 @@ Headers:
 | Serialize a short critical section against a pump callback | `axl_tpl_raise(AXL_TPL_NOTIFY)` / `axl_tpl_restore(prev)` |
 | Ask what priority level I am running at | `axl_tpl_current()` |
 | Contain a suspect region that may leave the level raised | `axl_tpl_restore_baseline(&leaked)` |
+| Read a file shipped beside my `.efi`, wherever its directory was copied | `axl_app_image_dir_path("app.conf", buf, sizeof(buf))` |
+| Write a file at the root of the volume my `.efi` came from | `axl_app_boot_path("report.txt", buf, sizeof(buf))` |
 
 **Library re-entrancy guarantee.** `axl_yield()`, when a default loop exists,
 runs one non-blocking dispatch of it (the yield-as-scheduler idiom) — so it can
@@ -65,7 +67,12 @@ code calls `axl_yield()` directly. AXL's own long-running operations
 KCS polling) stay Ctrl-C responsive via an internal break-only poll
 (`_axl_poll_break`) that observes the interrupt **without** dispatching the
 loop — so a library call can never re-enter your callbacks from deep inside an
-unrelated operation.
+unrelated operation. In a driver image that poll does nothing: resident code
+does not own the Shell's break (reading it would take it from the Shell's
+script runner), and a resident image cannot exit. `axl_yield()` in a driver
+image leaves the Shell's Ctrl-C alone too: it polls no break, and the default
+loop it dispatches intercepts none there unless the driver opted in with
+`axl_loop_set_intercept_break(loop, true)`.
 
 ## Interrupt lifecycle
 
@@ -131,10 +138,19 @@ between them. `_axl_cleanup` has a reentrancy guard: if
    `_axl_mem_dump_leaks_at_exit`, the teardown-flavoured
    `axl_mem_dump_leaks` (its header omits the diagnostic form's
    `(live allocations)` infix, which is how the QEMU harness tells a
-   verdict from a running program's dump). Runs LAST on purpose:
-   everything above it is a reclaim step, so anything still live here
-   has no owner left. Release-mode auto-free of heap is
+   verdict from a running program's dump). Runs after every reclaim
+   step on purpose: everything above it reclaims `axl_malloc` memory,
+   so anything still live here has no owner left. (Step 6 follows it
+   only because the leak report never touches the C heap.) Release-mode auto-free of heap is
    deferred (see [`docs/AXL-Lifecycle.md` §10.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#101-release-mode-heap-auto-sweep)).
+6. **C library heap** — `_axl_libc_heap_release`. The page region
+   newlib's `malloc` (and so `operator new`) grows into goes back to
+   the firmware, which does not reclaim an image's pages at unload.
+   Strictly last, because every step above may still `free` into it.
+   A no-op for an image that never called `malloc`. Drivers take the
+   same step at the end of `axl_driver_cleanup`, a service driver at
+   the end of its unload stub, and a `--minimal-runtime` image after
+   `main` returns (see `axl-libc-heap-internal.h`).
 
 ## Caller attribution
 

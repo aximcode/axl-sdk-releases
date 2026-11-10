@@ -228,7 +228,7 @@ def main(argv: list[str]) -> int:
 
     # A missing input is a build problem, not an AVX finding. Reported under
     # its own banner so it cannot be misread as "an AVX instruction reached a
-    # produced image" -- the scanned path is the .so, which make builds as a
+    # produced image" -- the scanned path is the .so, which the build makes as a
     # side effect of the .efi rule and therefore cannot regenerate on its own.
     absent = [f for f in findings if f.endswith("(build it first)")]
     if absent:

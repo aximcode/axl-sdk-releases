@@ -22,6 +22,7 @@
 #include <axl/axl-log.h>
 #include "axl-9p-internal.h"
 #include "axl-9p-server-internal.h"
+#include "../fs/axl-fs-internal.h"   /* axl_fs_path_stat_named */
 
 AXL_LOG_DOMAIN("9p");
 
@@ -197,7 +198,7 @@ s9p_handle_twalk(S9pConn *conn, Axl9pReader *r, uint16_t tag)
     if (r->error) {
         return s9p_send_rlerror(conn, tag, P9_EINVAL);
     }
-    /* conn->msize is never below AXL_9P_MIN_MSIZE (512), so this can neither
+    /* conn->msize is never below AXL_9P_MIN_MSIZE (1024), so this can neither
        underflow nor land on a useless zero bound. */
     if (nwname > (conn->msize - AXL_9P_RWALK_HDR_LEN) / AXL_9P_QID_LEN) {
         /* reply couldn't fit msize */
@@ -243,7 +244,7 @@ s9p_handle_twalk(S9pConn *conn, Axl9pReader *r, uint16_t tag)
     axl_9p_w_u16(&w, 0);
 
     for (uint16_t i = 0; i < nwname; i++) {
-        char   comp[256];
+        char   comp[AXL_9P_NAME_MAX];
         size_t wire_n = axl_9p_r_str(r, comp, sizeof(comp));
         if (r->error) {
             /* Truncated request body -- nothing has been bound yet, so it's
@@ -255,26 +256,34 @@ s9p_handle_twalk(S9pConn *conn, Axl9pReader *r, uint16_t tag)
             break;   /* malformed component -- ordinary partial-walk failure */
         }
 
-        char next[sizeof(cur)];
-        if (axl_strcmp(comp, "..") == 0) {
+        char       next[sizeof(cur)];
+        AxlFsEntry next_entry;
+        if (axl_strcmp(comp, "..") == 0 || axl_strcmp(comp, ".") == 0) {
             axl_strlcpy(next, cur, sizeof(next));
-            if (!s9p_path_up(conn->srv->root, next, sizeof(next))) {
+            if (comp[1] == '.' && !s9p_path_up(conn->srv->root, next, sizeof(next))) {
                 break;   /* would escape the export root */
             }
-        } else if (axl_strcmp(comp, ".") == 0) {
-            axl_strlcpy(next, cur, sizeof(next));
+            if (axl_file_info(next, &next_entry) != AXL_OK) {
+                break;   /* vanished mid-walk */
+            }
         } else {
             if (!axl_fs_entry_is_dir(&cur_entry)) {
                 break;   /* can't walk into a non-directory */
             }
-            if (!s9p_path_append(next, sizeof(next), cur, comp)) {
-                break;   /* path too long */
+            if (!s9p_path_append(next, sizeof(next), cur, comp)
+                || axl_fs_path_stat_named(next, &next_entry) != AXL_OK) {
+                break;   /* too long, or the component doesn't exist */
             }
-        }
-
-        AxlFsEntry next_entry;
-        if (axl_file_info(next, &next_entry) != AXL_OK) {
-            break;   /* component doesn't exist (or vanished mid-walk) */
+            /* The fid keeps the path in the spelling the filesystem STORES:
+               on FAT "a.txt", "A.TXT" and an 8.3 alias are one entry, and
+               qid.path -- a hash of the fid's path -- must name the entry,
+               not the spelling walked, or a client cannot tell "the file
+               itself under another spelling" from "another file". */
+            if (next_entry.name[0] != '\0'
+                && axl_strcmp(next_entry.name, comp) != 0
+                && !s9p_path_append(next, sizeof(next), cur, next_entry.name)) {
+                break;
+            }
         }
         axl_strlcpy(cur, next, sizeof(cur));
         cur_entry = next_entry;

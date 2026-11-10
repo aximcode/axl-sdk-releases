@@ -1219,6 +1219,18 @@ axl_args_get_string(AxlArgs *args, const char *name)
 }
 
 bool
+axl_args_is_set(AxlArgs *args, const char *name)
+{
+    if (args == NULL || name == NULL) {
+        return false;
+    }
+    /* The slot the getters read; a default never marks it set
+       (register_descs clears .set after parsing a numeric default). */
+    ParsedArg *s = slot_by_name(args, name);
+    return s != NULL && s->set;
+}
+
+bool
 axl_args_get_bool(AxlArgs *args, const char *name)
 {
     if (args == NULL) {

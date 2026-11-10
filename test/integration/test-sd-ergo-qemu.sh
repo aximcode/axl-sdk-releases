@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=12 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0 builds=sd-ergo guest=standard
 # sd-ergo — end-to-end fixture built ENTIRELY from the turnkey
 # AXL_SHARED_DRIVER / AXL_SHARED_DRIVER_LAUNCHER macros (I/O-model Phase 3).
 #
@@ -36,8 +36,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     sd-ergo 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -53,17 +53,7 @@ fi
 
 test_add_efi "$LAUNCHER"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo ERGO_BEGIN"
-    echo "echo hello | sd-ergo-launcher.efi echotext"
-    echo "sd-ergo-launcher.efi status"
-    echo "echo ESTAT=%lasterror%"
-    echo "echo ERGO_DONE"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

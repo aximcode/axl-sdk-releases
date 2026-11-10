@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=stdio-bridge-liveness-test guest=standard
 # Handle-reuse false-alive regression: a stdio-bridge instance that fools the
 # pre-v2.7.1 LoadedImage-proto liveness match (alive image + matching proto)
 # must be rejected by the per-dispatch token gate and reaped. The fixture
@@ -23,20 +23,14 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     stdio-bridge-liveness-test 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/stdio-bridge-liveness-test.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "stdio-bridge-liveness-test.efi"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

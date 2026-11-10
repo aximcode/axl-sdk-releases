@@ -259,6 +259,17 @@ def clean_text(text: str) -> str:
         r"EFI_UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES(\s+InstallMultipleProtocolInterfaces)",
         r"EFI_INSTALL_MULTIPLE_PROTOCOL_INTERFACES\1", text)
     text = re.sub(r"}\s*FI_DHCP4_PACKET\s*;", "} EFI_DHCP4_PACKET;", text)
+    # EFI_MP_SERVICES_GET_PROCESSOR_INFO's spec code sample has a spurious
+    # pointer star on ProcessorNumber — the Parameters prose ("The handle
+    # number of processor") and the real EDK2 header both pass it by value.
+    # Scoped to this exact name+type pair, not a blanket "IN <scalar> * is
+    # never a pointer" rule: that rule also stripped the star from genuine
+    # pointers sharing a scalar type, e.g. EFI_SIMPLE_NETWORK_TRANSMIT's
+    # "IN UINT16 *Protocol OPTIONAL" (a real pointer per its Parameters
+    # prose: "the type of header to build") and
+    # EFI_MP_SERVICES_ENABLEDISABLEAP's "IN UINT32 *HealthFlag OPTIONAL"
+    # ("If not NULL, a pointer to a value...").
+    text = re.sub(r"(IN\s+UINTN\s+)\*(ProcessorNumber)\b", r"\1\2", text)
 
     # Fix missing space: "typedef struct_NAME" → "typedef struct _NAME"
     text = re.sub(r"typedef\s+struct_", "typedef struct _", text)
@@ -272,12 +283,6 @@ def clean_text(text: str) -> str:
     text = re.sub(r"^\*(.+)\*$", r"\1", text, flags=re.MULTILINE)
     # Inline: parameter names like *This* , *Handle* , *Type*
     text = re.sub(r"(?<=[\s(,])\*(\w+)\*(?=[\s),;])", r"\1", text)
-    # RST bold on IN scalar params: "IN UINTN *Name," → "IN UINTN Name,"
-    # A scalar IN parameter is never a pointer — the * is RST bold markup.
-    text = re.sub(
-        r"(IN\s+(?:UINTN|INTN|UINT\d+|INT\d+|BOOLEAN|EFI_TPL|"
-        r"EFI_STATUS|EFI_SMBIOS_TYPE|EFI_SMBIOS_HANDLE)\s+)\*(\w+)",
-        r"\1\2", text)
 
     # Pointer + bold: **Name* → *Name, ***Name,* → **Name,
     text = re.sub(r"\*\*\*(\w+),\*", r"**\1,", text)

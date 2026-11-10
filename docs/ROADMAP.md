@@ -28,18 +28,87 @@ enabling work before the work it enables, in both halves.
    change had just removed (`AXL-CI-Release-Speed-Design.md` §13.8). What
    shipped instead: the gate accepts CI's own green run (§13.1-13.2), watching
    `Release` became opt-in (§13.3), and a `plan` job classifies each push so
-   prose no longer pays for the full matrix (§13.6-13.7). Remaining: §13.8,
-   §13.9 and §13.10.
+   prose no longer pays for the full matrix (§13.6-13.7). Remaining: §13.9
+   and §13.10. §13.8 was answered on 2026-10-21 (§14): the suite moved to
+   `workflow_dispatch` only (not nightly), cheap jobs stay on push, and the
+   release gate composes a dispatched suite run, or a local uncached run plus
+   the cheap push CI.
 2. **Cut the release** carrying the `axl` output work (`b1c6fde6`) plus
    whatever 1 lands. Mike said **4.7.1**; note that `## Unreleased` currently
    holds an `### Added`, which `check-release-semver.sh` NOTEs as
    minor-shaped, so the number is worth a second look at cut time.
-3. **Ed25519 E2b** — [AxlCrypto track](#axlcrypto--ed25519-signingverification).
-   Vendor ref10 + RFC 8410 DER behind the finished E2a seam. Chosen over the
-   ECDSA shortcut for Task 6, so `AxlSsh` v1 advertises `ssh-ed25519` rather
-   than `ecdsa-sha2-nistp256`.
-4. **AxlSsh P1 Task 6** — key exchange, which 3 unblocks. Tasks 1-5 are
-   shipped; this is where the track stops today.
+3. ~~**Ed25519 E2b**~~ — **SHIPPED 2026-09-05** (`286f6323`..`3cd75dc1`),
+   security review passed. `AxlSsh` v1 can advertise `ssh-ed25519`.
+4. ~~**AxlSsh P1 Task 6**~~ — **SHIPPED 2026-09-05** (`967a1978`). P1 is
+   complete; a real `ssh(1)` completes the handshake, and P1's security review
+   (spec §11) is closed on its blocking findings.
+5. ~~**AxlSsh P2**~~ — **COMPLETE 2026-09-07** (`ddf8d517`..`9e7cb351`):
+   `userauth` publickey against `authorized_keys`, both RFC 4252 forms,
+   `ssh -i key` authenticating against the guest. **Security review (spec
+   §11's merge gate) is CLOSED**: the initial pass returned 2 HIGH / 2
+   MEDIUM / 6 LOW, both HIGH findings plus MEDIUM-1 and two of the LOWs
+   were fixed (`6d39ab11`, `a2f5eec4`), and a scoped re-review confirmed
+   all five addressed with no attacker-reachable regression. See the
+   AxlSsh section below for the residue the gate closed WITH, not blocked
+   on.
+   **Scope REVISED 2026-09-17** (spec §0): the actual requirement is one user,
+   possibly over several connections, reaching the **live UEFI Shell
+   interactively with a username and password**, served from inside SoftBMC.
+   That inverts two v1 non-goals (password auth; a shell instead of a command
+   table) and reorders what remains: **P3** password auth, **P4** session
+   channels **with rekey** (SHIPPED in P4d; before it a peer that asked to rekey was
+   disconnected; OpenSSH's default is data-only -- `RekeyLimit default none`, ~1 GiB for
+   chacha20-poly1305, *"no time based rekeying"*, `man 5 ssh_config` -- so
+   what reaches it is an explicit `RekeyLimit`, a large transfer, or a client
+   that is not OpenSSH), **P5** persistent host key, **P6** SoftBMC
+   integration *in the softbmc repo*. The
+   resident `AXL_SERVICE_DRIVER` phase dissolved and the client is
+   unscheduled. Each phase is its own plan with the same security review as a
+   merge gate. **Spec §13 lists open decisions** — two of them are live
+   SoftBMC defects found while revising it (a password timing oracle in its
+   web login, and no guessing throttle -- which AxlSsh now has for SSH, Task P
+   2026-09-18, while SoftBMC's web login still has none).
+6. **THEN the AxlTcp close path** — scheduled here, after AxlSsh, by Mike on
+   2026-09-06. It is a pre-existing defect (introduced `94a603b5`,
+   2026-07-19), not an AxlSsh one, and doing it inside AxlSsh means changing a
+   guarantee three subsystems were built around while a fourth is still being
+   written. `axl_tcp_close`'s abortive branch busy-polls
+   inline for up to a second (`AXL_TCP_ABORT_WAIT_US`), so a server tearing
+   down N connections from its own callbacks blocks its loop for N seconds.
+   **STILL TRUE, and deliberately not fixed there.** Two attempts failed and
+   both are worth knowing:
+   - changing which teardown mode AxlSsh *asked for* was a no-op — the
+     downgrade guard had already made those closes abortive;
+   - making abortive connection closes go async (`6c2f5995`) broke
+     AxlHttpServer and Axl9pServer, which free listener-first and rely on the
+     listener's sweep to finalize their children's deferred closes. Reverted
+     in `38585974`, with the reasoning recorded at the branch.
+
+   The constant's own comment has the answer: a RST "signals almost
+   immediately; this only bounds a **wedged firmware**". It is a backstop, not
+   the expected cost, and the interim fix for a server that can stall on N of
+   them is to bound N — `MAX_CONNS` plus a handshake grace, both already at
+   the SSH layer.
+
+   **What the real fix needs**, when it is picked up: HTTP and 9P in scope,
+   not just AxlSsh; the four `test-http-rebind-{load,churn,storm,multi}-qemu.sh`
+   tests plus `test-9p-server-qemu.sh` as the gate, because they are what
+   encode the port-release guarantee; and a way to reach the failing path,
+   which needs a running loop — every existing rebind test frees AFTER the
+   loop stops, which is exactly why none of them caught the broken version.
+   `test-service-reload-qemu.sh` is the closest existing shape and still
+   misses it (it reloads on a timer with no client connected). Options worth
+   weighing: reverse the free order in HTTP and 9P (connections first, as
+   AxlSsh does) so the listener sweep works; give the deferred abortive close
+   a bounded deadline so it cannot leak; or shorten the backstop, which the
+   constant's comment suggests is safe and which no test would notice either
+   way — that last one is a trap, not a fix.
+7. **`axl_malloc` wraps on a huge size** — found by E2b's review and NOT
+   fixed: `align_up()` rounds to a size_t boundary and wraps to 0 above
+   `SIZE_MAX - 7`, so `axl_malloc(SIZE_MAX)` returns a **header-sized
+   buffer** and reports success. Every caller that sizes an allocation from
+   attacker-influenced input shares this. `axl-pk-ed25519.c` guards itself at
+   `SIZE_MAX/2`; nothing else does. Needs a decision on scope.
 
 ---
 
@@ -48,9 +117,22 @@ enabling work before the work it enables, in both halves.
 Library / SDK foundations:
 - [AXL-Design.md](AXL-Design.md) — library design (phases, API spec, style)
 - [AXL-SDK-Design.md](AXL-SDK-Design.md) — SDK (toolchain, packaging)
-- [AXL-Build-System-Design.md](AXL-Build-System-Design.md) — **PROPOSED
-  2026-08-15; retargeted to 5.0.0 on 2026-08-16.** Replace the 3,579-line
-  Makefile with CMake. Decision (CMake over Meson) and the measured port
+- [AXL-Build-System-Design.md](AXL-Build-System-Design.md) — **DONE
+  2026-11-09 (slice 6, §10.12): the Makefile is retired; CMake + Ninja is the
+  only build**, for 5.0.0 (unreleased; `### Breaking (packaging)` in the
+  CHANGELOG). CTest replaced the test schedulers (run-integration.sh and
+  verify.sh are thin front ends); CPack was measured and NOT adopted -- the
+  three tarball scripts stay until the CMake minimum reaches 4.3 (§10.9).
+  Outside this tree: uefi-devkit's build.sh and Makefile, which ran `make -C
+  <axl-sdk> tools` (and `clean-tools`, `sshd-rtk`, with an `AXL_TLS=1` that
+  `scripts/axl-build.sh` refuses), build through `scripts/axl-build.sh` as of
+  uefi-devkit `fbad8e6` (2026-11-09; committed there, push pending). No
+  Makefile is left in this tree outside the vendored `deps/mbedtls`, whose
+  sources CMake compiles directly; `make` survives only in
+  `toolchain/x86_64-elf/build-toolchain.sh`, which builds the upstream
+  autotools projects (binutils, GCC, newlib).
+
+  History of the entry follows. Decision (CMake over Meson) and the measured port
   surface — the `.efi` pipeline (~180 images per arch), the
   ARCH x BUILD prefix rule, 17 gates, 149 make callers, and why
   `axl-cc` is NOT part of the port.
@@ -106,7 +188,7 @@ Library / SDK foundations:
   first, `DT_RELASZ` counted both, and the crt0 walk ran off the end and
   applied the following bytes as relocations. Naming the output section
   `.rela.dyn` makes ld absorb its own internal section instead of orphaning
-  it. `make check-reloc-coverage` is the standing guard, and RTTI now runs on
+  it. `gate.check-reloc-coverage` is the standing guard, and RTTI now runs on
   both arches
 - **C++ owning handle — DONE 2026-08-16.** `axl::unique_handle<T>`
   (`include/axl/axl-handle.hpp`), the class-member / movable / factory-returnable
@@ -118,7 +200,7 @@ Library / SDK foundations:
   makes the two exclusions structural: `AxlSurface` (borrowed node in a tree
   `axl_compositor_free` destroys whole) and `AxlJsonReader` (value struct, not a
   handle) are compile errors that state their ownership rule via
-  `AXL_DEFINE_NO_HANDLE`. Gated by `make check-handle-exclusions` (one fixture,
+  `AXL_DEFINE_NO_HANDLE`. Gated by `gate.check-handle-exclusions` (one fixture,
   three compiles, matches the poison text) and 12 run assertions per arch in
   `test-cxx-hosted-qemu.sh`. See AXL-Cxx-Design.md §9b.
 - **C++ seams over the C API — C2/C3/C5 DONE 2026-08-17.** Five headers, 67
@@ -540,7 +622,7 @@ Subsystems:
   Fuzzing of the read path was RESTORED 2026-08-02: `test/fuzz/json_fuzz` had
   not linked for months, so ASan/LSan coverage of JSON reads was zero for the
   whole redesign. It now builds against the real string substrate, runs a
-  matrix of read flags rather than two bare dialects, and `make check-fuzz-link`
+  matrix of read flags rather than two bare dialects, and `gate.check-fuzz-link`
   (in `scripts/verify.sh`) keeps it from rotting again. Extended the same day to
   fuzz BOTH directions with oracles (write -> re-read -> compare, and
   plain-vs-`ENSURE_ASCII` spellings must decode alike), which immediately found
@@ -715,30 +797,55 @@ seam following `axl-log-dispatch.h`) rather than land in every image.
       can no longer separate keygen and the DER writers from what a consumer
       calls (spec §10). That is E5's floor and it is the one number worth
       revisiting before E5 relies on it
-- [ ] **E2b** ref10 vendored + RFC 8410 DER behind the finished seam —
-      **planned, not started**:
+- [x] **E2b** ref10 vendored + RFC 8410 DER behind the finished seam —
+      **SHIPPED 2026-09-05**, `286f6323`..`3cd75dc1`, plan
       [2026-08-23-ed25519-e2b-ref10.md](superpowers/plans/2026-08-23-ed25519-e2b-ref10.md).
-      Done when RFC 8032 positive and negative vectors pass. **Parked
-      2026-08-23** — its only consumer is E5, and AxlSsh is itself a
-      five-phase project, so finishing it buys the ability to *start* one
-      rather than a working feature. The plan's grounding is durable: source
-      pinned at openssh-portable `V_10_5_P1` (`b3f73442`), vectors generated
-      against two independent implementations, DER structure established.
-      Nothing is half-built — E2b has zero code, so there is nothing on a
-      branch to rebase
+      `AXL_PK_ED25519` works in an image that opts in with
+      `-u _axl_pk_provider_ed25519`; RFC 8032 vectors 1-3 and the negative
+      set pass on both arches, and the dispatcher was not edited. **Task 2's
+      licence-parity gate was skipped by decision** — D7 deleted
+      `build-packages.sh` and the two remaining lists are legitimately
+      different artifacts, so a set-equality gate would fail on day one;
+      `test-sdk-tarball.sh` covers the staging and is sabotage-verified.
+      Five things the plan did not anticipate, all measured:
+      - the vendored source is SUPERCOP's **`ref`, not `ref10`** — base table
+        108,800 B, so opting in costs **124,567 B**, ~4× the assumed 30,720
+      - **ref10's small-order check covers only the identity.** An order-2
+        forgery (no private key, ~half of all messages) was ACCEPTED before
+        the fix; `ed25519_is_small_order()` now refuses all 14 torsion
+        encodings
+      - **`sm[63] & 224` is dead code** — subsumed by OpenSSH's later
+        `sc25519_inrange`, so it can never be the deciding check
+      - **`md_for_alg` / `ec_order_bytes`'s Ed25519 arms are STILL
+        unreachable** — E2a deferred them here on the theory an Ed25519 key
+        would reach them, and it does not: both are called only from the
+        mbedTLS provider
+      - a size_t overflow in the SM adapter, and **the same wrap in
+        `axl_malloc`** (see the AxlMem note below)
 - [ ] **E3** `check-ed25519-linkage` + the `check-no-avx.py` ADCX/ADOX
       extension, both proven able to fail
-- [ ] **E4** ADX/BMI2 field backend + aa64 `FEAT_SHA512` detection via
-      `MBEDTLS_SHA512_PROCESS_ALT`. **The ADX half is now an open question**,
+- [ ] **E4** ADX/BMI2 field backend + aa64 `FEAT_SHA512` via
+      `MBEDTLS_SHA512_PROCESS_ALT` -- **which means carrying BOTH SHA-512
+      compressors in AXL, not only detection** (corrected 2026-09-21): under
+      `PROCESS_ALT` mbedTLS compiles no compressor (`sha512.c:592`), and
+      `check_config.h:780` refuses to combine it with its own A64 kernel,
+      so ~330 lines of upstream's portable and FEAT_SHA512 compressors move
+      into AXL (spec §6). **The ADX half is now an open question**,
       not a plan: current OpenSSH ships one amalgamated `ed25519.c` with every
       field operation `static`, so a second field backend cannot be a
       link-time substitution. Spec §6b records the three options and their
       costs; §10's own note that the SSH workload is one signature per
-      connection argues that dropping it costs nothing
+      connection argues that dropping it costs nothing. **The `PROCESS_ALT`
+      half must not be able to fail** (2026-09-20): a failed hash inside
+      ref10 was a key-disclosing signature or a universal forgery. The glue
+      `#error`s on it unless `AXL_SHA512_PROCESS_ALT_CANNOT_FAIL` is defined,
+      and the provider refuses any operation during which a hash failed
+      (spec §6). Both compressors E4 carries are pure functions over one
+      block, so its dispatcher can make that promise
 - [ ] **E5** Consumed by `AxlSsh` — `AXL_PK_ED25519` host key; unblocks
       AxlSsh P1 Task 6
 
-### `AxlSsh` — an SSH server, built here, consumed by SoftBMC  *(P1 Tasks 1-5 SHIPPED; Task 6 blocked on Ed25519)*
+### `AxlSsh` — an SSH server, built here, consumed by SoftBMC  *(P1 COMPLETE 2026-09-05; P2 COMPLETE 2026-09-07 — implementation, security review, fix wave and re-review all done, gate CLOSED; scope REVISED 2026-09-17 for interactive password login to the UEFI Shell; P3 COMPLETE 2026-09-17 — implementation, security review, fix wave and re-review all done, gate CLOSED (its one MEDIUM residue, NEW-1, RESOLVED 2026-09-26: hooks stay strictly serial, and the hook watchdog plus the reaper that says why SHIPPED the same day -- spec section 12); Task G (settable login grace) SHIPPED 2026-09-17; Task P (per-source penalties) SHIPPED 2026-09-18; the OpenSSH parity audit's last two CLOSE items, D4 (settable password cap) and D9 (pre-authentication banner), SHIPPED 2026-09-25; P4-P6 below)*
 Same relationship AxlHttp and AxlTls already have with SoftBMC: the protocol
 lives in axl-sdk, the product consumes it. The lineage argues for it — this
 project began as **TelCon/Netcon**, a *telnet* console server, and telnet is the
@@ -759,9 +866,9 @@ axl-sdk is Apache-2.0 and **every dep LINKED INTO our binaries is permissive** �
 mbedtls Apache, libvterm MIT, freetype FTL, LZMA public domain, stb and sdefl
 public-domain-or-MIT. wolfSSH would be the first GPL code *linked* into an SDK
 that ships `.deb`/`.rpm`, and would relicense the combined work. The distinction
-is linking, not shipping: the tools tarball already carries iPXE's GPL
-`ipxe-all.efidrv` as **mere aggregation** (GPL-2.0 §3), linked into nothing of
-ours. wolfSSH could not be handled that way. Dropbear's licence is fine and its *architecture* is the problem: porting
+is linking, not shipping: the tools tarball carried iPXE's GPL
+`ipxe-all.efidrv` (until 2026-10-21) as **mere aggregation** (GPL-2.0 §3),
+linked into nothing of ours. wolfSSH could not be handled that way. Dropbear's licence is fine and its *architecture* is the problem: porting
 it means rewriting `svr-main`, `svr-chansession`, the `select` session loop and
 auth — most of the server — to land somewhere worse-fitting than our own
 primitives. UEFI has no processes; `src/service/README.md` says so outright.
@@ -773,15 +880,14 @@ vendored mbedtls) carries most of what a default `ssh(1)` negotiates:
 | SSH needs | AXL has | state |
 |---|---|---|
 | `curve25519-sha256` kex | `AXL_ECDH_X25519` (also `AXL_ECDH_P256`) | ready |
-| `ssh-ed25519` host key | `AXL_PK_ED25519` | **RESERVED, NOT IMPLEMENTED** — mbedTLS has no twisted-Edwards curve at all, so it is a vendoring project. E2b is planned and **parked**; see the Ed25519 track above. `ECDSA_P256/P384` and `RSA` host keys *are* ready |
-| `chacha20-poly1305@openssh.com` | ~~`AXL_AEAD_CHACHA20_POLY1305`~~ | **NOT the same construction.** OpenSSH's is raw ChaCha20 with a two-key split and a separately encrypted length field; ours is the RFC 8439 AEAD. `AxlCrypto` has no entry point for OpenSSH's variant |
-| `aes256-gcm@openssh.com` | `AXL_AEAD_AES_256_GCM` | ready — and it is OpenSSH's own documented fallback, enabled by default, so P1 can negotiate it and skip the row above entirely |
+| `ssh-ed25519` host key | `AXL_PK_ED25519` | **READY 2026-09-05** — E2b shipped it (vendored ref, opt-in -- since 2026-10-20 by calling `axl_pk_enable_ed25519()`, which `axl_ssh_server_new()` does itself; originally `-u _axl_pk_provider_ed25519`). See the Ed25519 track above |
+| `chacha20-poly1305@openssh.com` | `src/net/axl-ssh-crypt.c` | **BUILT 2026-09-05.** Correctly NOT `AXL_AEAD_CHACHA20_POLY1305`: OpenSSH's is raw ChaCha20 with a two-key split and a separately encrypted length field, and it is the ORIGINAL 64-bit-nonce ChaCha20 rather than RFC 8439's, so the SSH nonce becomes an mbedTLS nonce with four zero bytes in front. Built directly on `mbedtls_chacha20_*` + `mbedtls_poly1305_mac` |
+| `aes256-gcm@openssh.com` | `AXL_AEAD_AES_256_GCM` | ready, and NOT used — it was the cheaper route, but Task 4 had already shipped and pinned the ChaCha name, and changing a tested decision to save ~60 lines is a bad trade. Still the obvious fallback if a second cipher is ever wanted |
 | transport / event loop | `AxlTcp`, `AxlLoop`, `AXL_SERVICE_DRIVER` | ready |
 
-So the work is **mostly framing and a state machine — plus one real crypto
-dependency (Ed25519) that is planned but parked**. P1's transport phase does
-not need it; P1 Task 6 (key exchange) does, which is where the track currently
-stops.
+So the work is **mostly framing and a state machine**. The one real crypto
+dependency, Ed25519, shipped as E2b on 2026-09-05 and P1 completed the same
+day.
 
 **The precedent is measured.** `Axl9p` is **4,512 lines for client AND server,
 built in three days** (2026-07-19 → 07-22), on the identical primitives:
@@ -794,16 +900,38 @@ range — call it ~3–4k lines, at a materially higher correctness bar.
 guest via `--hostfwd` gives a real second implementation to test against, which
 most of our protocols never get.
 
-Scope for v1 — the non-goals are the security argument, not paperwork:
-- [ ] Server only; **publickey auth ONLY** (no password, no keyboard-interactive)
+Scope for v1 — the non-goals are the security argument, not paperwork.
+*Revised 2026-09-17 (spec §0): two items below inverted for SoftBMC's
+interactive-console requirement; each says what it was.*
+- [ ] Server only; **publickey AND password** auth, no keyboard-interactive.
+      *Was "publickey auth ONLY".* The password is checked by an application
+      callback, so AxlSsh stores no credential and hashes nothing — SoftBMC's
+      existing PBKDF2/SCRAM user database stays the owner
 - [ ] **One algorithm per slot** (curve25519-sha256 / ssh-ed25519 /
       chacha20-poly1305). Negotiation is a classic downgrade surface and we do
       not need the matrix
-- [ ] **No pty and no shell exec** — there is nothing to exec on UEFI anyway. A
-      session channel driving a REGISTERED COMMAND TABLE is simpler and far safer
-- [ ] No port forwarding, no SFTP/SCP subsystem, no agent forwarding
-- [ ] Rekeying is not optional (RFC 4253 wants it by ~1 GB / 1 h): implement it
-      or cap the session and say so
+- [ ] **No process spawning; AxlSsh executes nothing itself.** *Was "no pty and
+      no shell exec, a registered command table".* `pty-req`/`shell`/`exec`/
+      `window-change` are surfaced to the application; SoftBMC binds them to
+      its existing console take-over (`AxlConsoleDevice` + `AxlConsoleVtEnc`,
+      NOT `AxlConsoleMirror`), the same one its browser Terminal already serves
+- [ ] No port forwarding, no agent forwarding. *Was "no SFTP/SCP
+      subsystem" too:* the `sshd` tool serves SFTP since 2026-10 (design
+      `docs/superpowers/specs/2026-10-22-axl-sftp-design.md`) -- `sftp`, and
+      `scp` from OpenSSH 9.0 on, through the `SftpServer.efi` helper behind an
+      `exec`-style `subsystem` request. The library still serves no subsystem
+      itself; it surfaces the request and the application answers it.
+- [ ] Rekeying is not optional (RFC 4253 §9 RECOMMENDS it by ~1 GB / 1 h):
+      implement it or cap the session and say so. **That is the RFC's
+      recommendation, not what a stock peer does** — and conflating the two
+      is what put a wrong number in the spec, the ROADMAP's status
+      paragraph, a source comment and a handoff (all corrected 2026-09-20;
+      the ROADMAP's copy said "one-hour", which a sweep grepping for "1 h"
+      walked past, so sweep for the idea, not one spelling). OpenSSH's default
+      `RekeyLimit default none` is the cipher's DATA limit only, ~1 GiB for
+      chacha20-poly1305, with *"no time based rekeying"*
+      (`man 5 ssh_config`, the page for the client that would ask;
+      `sshd_config` carries the same sentence)
 - [ ] Host key persistence via `AxlNvstore`
 - [ ] **Security review is a GATE, not a phase.** This is network-facing crypto
       protocol code in firmware, before ExitBootServices, with no OS isolation
@@ -811,32 +939,1126 @@ Scope for v1 — the non-goals are the security argument, not paperwork:
       primitives are audited mbedtls rather than hand-rolled
 
 New protocol work: binary packet protocol (RFC 4253), version exchange, KEXINIT
-+ key derivation, userauth publickey (RFC 4252), channels (RFC 4254).
++ key derivation, userauth publickey and password (RFC 4252), session channels
+(RFC 4254).
 
 **Spec:** [`superpowers/specs/2026-08-21-axl-ssh-design.md`](superpowers/specs/2026-08-21-axl-ssh-design.md)
-— phased P1-P5, each phase its own plan, following the Axl9p pattern.
+— phased P1-P6 (revised 2026-09-17; P6 lives in the softbmc repo), each phase
+its own plan, following the Axl9p pattern. **P3 (password auth) implementation
+is SHIPPED 2026-09-17 -- see the "P3 plan" section below.** **Remaining, in
+order:**
+
+- [ ] **P4** session channels **+ rekey** — callbacks, §5.2 window flow control,
+      exit status, several channels and connections, idle timeout, answered
+      `GLOBAL_REQUEST`. The per-packet 35 KB payload allocation was pulled
+      FORWARD out of P4 and is **DONE**: the inbound buffer now has the
+      connection's lifetime, allocated once at the NEWKEYS transition. P4 owes
+      it one thing — rekey must not allocate a second one (the allocation is
+      guarded, and the guard's reason is written where it sits)
+
+      **DESIGNED 2026-09-27 — spec §12a.** Five sub-phases, each its own
+      plan, review and commit; the yardstick for every call is what sshd
+      does, and the deviations are listed in §12a.7 with their reasons:
+      - [x] **P4a** admission by eviction (`max_startups` 10 of 16
+            pre-auth; a full server evicts the connection least far along
+            in key exchange, the oldest among equals, and refuses only when
+            none is still in it) + `REQUEST_FAILURE` for
+            `GLOBAL_REQUEST` (**DONE 2026-09-27**: `REQUEST_FAILURE`, then
+            `axl_ssh_server_set_max_startups`, then admission wired into
+            `on_accept` -- the accept no longer pauses at the connection cap;
+            `test-ssh-admission-qemu.sh` proves the victim order, the refusal
+            with no victim, and that an authenticated connection is never
+            evicted)
+      - [x] **P4b** outbound coalescing (one send in flight per connection)
+            + a pooled padding RNG + output backpressure (**DONE
+            2026-10-08**: RELEASE, load 1-4, x64 61.4 → 7.8 µs per
+            pipelined round trip, aa64 277 → 53.5; padding costs one
+            firmware RNG call per 256 bytes; a peer that stops reading
+            pauses the connection's input at 128 KiB queued instead of
+            growing it without bound. Getting there fixed AxlTcp's large
+            sends -- 8 KB paced pieces, a bounce buffer, never cancelling an
+            armed Transmit -- which took a 1 MiB HTTP GET from 7-10 s to
+            ~0.06 s. Spec §12a.2 "As built (P4b)")
+      - [x] **P4c** session channels (**DONE 2026-10-09**): integer
+            `AxlSshChannel` handles, opt-in through
+            `axl_ssh_server_set_channel_ops()`, `session` type only;
+            all-or-nothing `axl_ssh_channel_write()` with `AXL_BUSY` and an
+            edge-triggered `writable` hook; 256 KB per channel, 4 MB server
+            wide, with a fair-share floor so stalled peers cannot starve the
+            rest; a retired handle keeps its wire slot until both CLOSEs;
+            sshd's inbound rules (window 0 until the session starts, 10%
+            overrun grace, nothing after the peer's CLOSE); contract-first.
+            Measured on both arches: 17 session scenarios with a real
+            ssh(1), 74 checks, including ten `ControlMaster` sessions on one
+            connection with the eleventh refused `resource shortage`; a
+            byte-level hostile suite of 14 scenarios, 43 checks; a
+            zero-window peer holds the guest at 9-56 milli-cores where a
+            sabotaged flush polling every iteration reads 996-997. Two
+            open-failure reason codes differ from sshd's (§12a.7). Spec
+            §12a.3 "As built (P4c)"
+      - [x] **P4d** rekey (**DONE 2026-10-09**), peer- and server-initiated
+            (`axl_ssh_server_set_rekey_limit()`, 1 GiB default, 2³¹ packets),
+            keys staged per direction. Every rule is OpenSSH 9.9p1's, read
+            from its source, which corrected the first design on four points:
+            connection-layer messages are still processed after the peer's
+            KEXINIT, refusals inside 1-49 and a second KEXINIT draw
+            UNIMPLEMENTED, 5/6/7 are held outbound with 50+, and the
+            counters reset per direction. One deviation: the held queue is
+            capped at 128 KiB (sshd's is not). Measured with a real ssh(1)
+            on both arches: 37 checks in the rekey suite (23 client-started
+            exchanges in the interactive session, 8 server-started with 6
+            sealing held packets) and 44 checks in a hostile-peer suite whose
+            peer runs its own second key exchange and polices the wire order
+            (the early-flush sabotage, which ssh(1) cannot see, fails it);
+            CPU after listen 3.3-5.6% mean on both arches. Spec §12a.4 "As
+            built (P4d)"
+      - [x] **P4e** idle handling (**DONE 2026-10-10**): the unused-connection
+            timeout (`axl_ssh_server_set_unused_timeout()`, 300 s) and
+            client-alive (`axl_ssh_server_set_client_alive()`, 60 s × 3),
+            both ON by default and both sshd's rules read from OpenSSH
+            9.9p1: bytes restart the clock, every decoded packet the count,
+            the count is incremented before it is compared, and the end is
+            silent and abortive (no DISCONNECT), with sshd's two log lines.
+            Three deviations: a probe due while output is paused is counted
+            but not queued, a probe goes out on every tick it is due, and
+            the reaper tick is the finest of 5 s and half of each period.
+            It bounds the paused peer that half-closes, P4b's open case:
+            ended 6.1-6.4 s (aa64) and 6.4-7.2 s (x64) after last heard
+            against a 9 s bound, where the control without client-alive held
+            its slot. Measured with a real ssh(1) and a byte-level peer on
+            both arches: 53 + 54 checks, CPU after listen 0.015-0.018 cores
+            (aa64) and 0.022-0.027 (x64) at a 1 s tick. Two library
+            defects found and fixed on the way: `resume()` lost a receive
+            wakeup when a hook dispatched the loop (`438b4918`) and the x86
+            TSC was calibrated from one overshooting 10 ms stall
+            (`87aeb576`; the 0.6 % fixed per-Stall bias that left was then
+            cancelled by differencing a short and a long Stall, kept within
+            2 % under the long Stall alone so a disturbed short Stall cannot
+            make the clock run fast without bound). Spec
+            §12a.5 "As built (P4e)"
+      - [x] **P4f — `sshd`: the live UEFI Shell over SSH in QEMU (the MVP,
+            added by the owner 2026-10-09).** A resident `sshd.efi` binding
+            session channels to `AxlConsoleDevice`'s take-over of the Shell
+            at the prompt: VT-encoded output to every session, typed input
+            injected, `pty-req`/`window-change` sizing the console, a full
+            repaint for a late joiner. `authorized_keys` read from the ESP,
+            an optional password. `scripts/ssh-demo.sh` boots QEMU with a
+            host port forward, so `ssh -p 2222 user@localhost` reaches the
+            Shell from the host. A real-`ssh(1)` suite drives the actual
+            Shell on both arches. The owner verifies it hands-on before the
+            security gate, P5 and P6. It is P6 rehearsed in axl-sdk.
+            **SHIPPED 2026-10-10** (spec §12a "As built (P4f)"): `sshd.efi`,
+            `scripts/ssh-demo.sh` (`--check` runs in CI as
+            `test-ssh-demo-script.sh`), `test-sshd-qemu.sh` and
+            `test-sshd-lifecycle-qemu.sh`. Follow-ups, none blocking:
+            - [ ] Reshape on request: treat `window-change` as a reshape
+                  request snapped to the nearest mode (spec §13.1 b). Today
+                  the console keeps its size: a larger terminal is confined
+                  to it by a scroll region, a smaller one is held behind a
+                  notice until it is enlarged.
+            - [x] A persistent host key (P5): `sshd` keeps it in a UEFI
+                  variable (NV+BS), made at the first start; `HostKey`,
+                  `sshd hostkey` [--regenerate|--import].
+            - [ ] The firmware-refused release and unload paths are unit-
+                  pinned only (the decisions), not run: a guest cannot make
+                  the firmware refuse.
+            - [ ] Other test helpers may share the stale-staging pattern a
+                  helper had (it staged an old `sshd.efi` on early aa64
+                  runs); grep before trusting a green run there.
+            - [ ] A refused, ordered control key re-fires its key notifies on
+                  every retry while the ring is full (a pasted `^S` may halt
+                  again per key); bounded and cosmetic.
+      - [x] **P4g — compressed `.efi` images, so `sshd` loads fast over a
+            slow link (added by the owner 2026-10-20, ahead of the P4
+            security gate; DONE 2026-10-20).** A remote user boots tools from a USB stick
+            attached through BMC virtual media, so every image crosses a slow
+            upload link each run, and `sshd.efi` is 534 KB. A self-extracting
+            wrapper (LZMA, the existing `AxlCompress` decoder) carries any
+            `.efi` compressed and loads the original in memory, preserving
+            argv, redirection, exit status and its own file identity. Every
+            release tool and staged driver it meaningfully shrinks ships
+            wrapped; AXL's driver loaders take wrapped or raw images alike,
+            by content; downstream builds opt in. Target: `sshd.efi` x64
+            around 200 KB or less. Security is out of scope (the gate
+            follows). Spec:
+            `docs/superpowers/specs/2026-10-20-axl-compressed-efi-design.md`.
+            **Measured (RELEASE):** `sshd.efi` x64 534,528 -> **201,728 B**
+            (target 204,800, limit 215,040), aa64 555,022 -> 184,334; all 39
+            tools x64 4,466,688 -> 2,866,688 (23 wrap), aa64 4,642,850 ->
+            2,615,842 (30 wrap); iPXE 1,149,440 -> 474,624 (x64), 1,150,464
+            -> 417,806 (aa64); the stub 16,896 B (x64), 16,910 B (aa64). The
+            per-tool table is in `src/pack/README.md`.
+            `test-efi-pack-release-qemu.sh` runs the wrapped release images
+            from a read-only USB stick on both arches (`sshd` key and
+            password logins, iPXE through `netload`, a wrapped crash decoded
+            by name). Follow-ups, none blocking:
+            - [ ] A hand-made file over 64 MiB that names `.axlpack` goes to
+                  the firmware, which loads the stub; the stub then refuses
+                  its payload with one line (`axl-efi-pack` cannot make one).
+            - [ ] **P4 security gate:** wrapped images and Secure Boot: sign
+                  the inner image; decide whether the packer should sign or
+                  refuse.
+            - [ ] Format tests: a fail-after-N allocator for the decoder's
+                  `SZ_ERROR_MEM` path and encoder OOM.
+            - [ ] Format tests: split the four-field check; add
+                  filter == NONE; comment the unreachable encoder OUTPUT_EOF.
+            - [ ] `axl_pack_find_payload`: two `.axlpack` sections (first
+                  wins) and a zero-size one untested.
+            - [ ] `pe_build_wrapped` (AxlTestPack) lacks a NULL check.
+            - [ ] `src/pack/README.md` nits: the NONE "not shipped" line;
+                  `headers_short` unmentioned; a heading splits the stub
+                  channel table.
+            - [ ] Host packer: `deps/lzma` headers are not prerequisites of
+                  its rule.
+            - [ ] `test-efi-pack-host.sh`: `synth_mixed`'s message when
+                  openssl is missing misleads; the unwritable-output case
+                  asserts only rc 2.
+            - [ ] `check-reloc-coverage.py` reports "objdump could not run"
+                  as "no RELA" (pre-existing; it now gates the stub).
+            - [ ] `test-efi-pack-qemu.sh`: the driver-load window is
+                  asserted by single-line greps.
+            - [ ] The stub's device-path-dup OOM path is untestable
+                  (accepted: pool exhaustion is not injectable).
+            - [ ] Tools: `.so` placement and wrapped-ness are asserted for
+                  `sshd` only.
+            - [ ] `$(PREFIX)/release-drivers` is not in the build-signature
+                  wipe; `clean-tools` leaves `pack/` intermediates.
+            - [ ] `axl-cc`: a stale `<out>.raw.efi` survives a later build
+                  without `--compress`.
+            - [ ] `axl-cc`: a packed `--service` launcher is never booted.
+            - [ ] `check-flag-parity`: no ld-flag parity for the stub link.
+            - [ ] `pack-toggle-raw.efi`: no error rule when the private raw
+                  is not staged.
+            - [ ] Release test: a `builds=` comment for `sshd`; a blank size
+                  echo when `stat` fails.
+            - [ ] Over-long CHANGELOG/ROADMAP lines from P4g.
+            - [x] iPXE: a stale `.unavailable` can leave a CACHED SKIP after
+                  a hand build. (Moot: the bundled iPXE was removed.)
+            - [x] iPXE: the test's own `make ipxe` retries inside the timed
+                  region when offline. (Moot: removed.)
+            - [x] iPXE: a failed rebuild after a pin bump keeps the old
+                  driver. (Moot: removed.)
+            - [ ] Pre-existing, not P4g: `kbtune-drv` hangs the Shell if left
+                  loaded after `kbtune` exits.
+            - [ ] Pre-existing: `verify.sh`'s x64 job overruns its 95 s
+                  wall-clock budget when all six jobs run (passes alone).
+                  Measured 2026-10-21, back to back on one box: 105 s before
+                  P4h (`3e5cd4be`) and 107 s after it with all six jobs;
+                  57 s and 59 s alone. P4h did not cause it.
+      - [x] **P4h — `sshd` that behaves like the real Shell: key fidelity,
+            `sshd.conf`, `lsusb` notes, test releases (added by the owner
+            2026-10-20, ahead of the P4 security gate; DONE 2026-10-21).** A
+            remote user reaching the Shell over `ssh` instead of a BMC
+            virtual console must find it behaving exactly like that console.
+            Spec: `docs/superpowers/specs/2026-10-20-sshd-fidelity-config-design.md`.
+            - **Keys:** every key `inject_text` decodes has the shape an
+              OVMF USB keyboard delivers (`KeyShiftState` VALID plus its
+              modifiers, `KeyToggleState` `0xC0`): C0 bytes are Ctrl chords,
+              xterm modifier parameters, SS3, `ESC[Z`, ESC-prefix Alt,
+              Ctrl+Space, CSI-u and modifyOtherKeys decode. Measured, not
+              tabulated: `test-sshd-keys-qemu.sh` (54 xterm rows) and
+              `test-sshd-keys-ext-qemu.sh` (10 CSI-u rows) press each on
+              QEMU's `usb-kbd` (the oracle, proved to be the only keyboard)
+              and over ssh through tmux, and the two `KEY` lines must be
+              byte-identical (67 + 30 checks, both arches).
+              Ctrl-End in `edit` shows "Unknown Command" over ssh, as on the
+              USB keyboard. An Alt chord (ESC + a key) forms only within
+              one ssh packet; across a packet boundary it stays Esc, then
+              the key (so `^C` is still the break, and Esc then `x` is two
+              keys).
+            - **Local type-ahead:** the console device splits a key's
+              arrival from its delivery (a 256-key holding queue behind the
+              63-key ring), so a long paste at the local console arrives
+              whole while `sshd` runs, and a local Ctrl-C or a consumer's
+              hotkey acts on arrival.
+            - **`sshd.conf`:** beside `sshd.efi`, OpenSSH `sshd_config(5)`
+              syntax and keywords (15 OpenSSH keywords plus four `Axl*`),
+              defaults < file < flags, the rest of OpenSSH 9.9p1's keywords
+              refused by name (the ones OpenSSH ignores are ignored, with
+              its warning), `sshd -T` in OpenSSH's format; `AxlConfigFile`
+              gained the OpenSSH grammar with line numbers,
+              `axl_args_is_set()` and `axl_ssh_penalty_range_check()` the
+              rest. `-k ""` / `-P ""` mean none.
+            - **`edit` over ssh:** open, modify, save (F2), exit (F3)
+              cycles with the file's exact bytes asserted after each
+              (`test-sshd-edit-qemu.sh`).
+            - **`lsusb`** says `no USB host controller found` / `no USB
+              devices found` (exit 0) instead of printing nothing, exits 1
+              on an unmatched filter, and is tested against a real QEMU
+              topology on both arches (`test-lsusb-qemu.sh`).
+            - **Test releases:** `scripts/make-test-release.sh` builds both
+              arches, gates each on the release-image test booting the very
+              tarball it publishes, and publishes a Pre-release tagged
+              `test-<YYYYMMDD>-<sha8>` on `aximcode/axl-sdk-releases`; no CI,
+              no `v*` tag. The release-image test also runs a compressed
+              tool, a pipe, `help` and an `edit` save over ssh.
+            - **Found and fixed on the way:** a DHCP bring-up returned as
+              soon as ANY NIC had an address (`e712db9a`; real servers have
+              several NICs); a Reset dropped keys typed while it ran; every
+              `axl-cc --embed` link printed an ld exec-stack warning (now
+              `-z noexecstack`, and in-tree links fail on any ld warning);
+              `qemu_stage_disk` returned 0 after a failed `dd` or
+              `mkfs.vfat`.
+            - **Measured:** `sshd.efi` x64 RELEASE 214,528 B after the third
+              fix wave (214,016 after the D8 fixes, 213,504 before them; P4g
+              201,728; limit 215,040 -- 512 B of headroom left), aa64
+              195,598 B (unchanged by the third wave; 195,086 before D8; P4g
+              184,334).
+            - **Limit raised to 219,136 B (214 KiB), 2026-10-21,** by owner
+              decision, for the start-up diagnostics (`-v`/`-d`, `LogLevel`,
+              the bounded network bring-up that skips link-down NICs, the
+              serving address): x64 RELEASE measured 217,088 B with them,
+              leaving 2,048 B of headroom.
+            - **`sshd` alone gets a box online (netload's engine), and the
+              limit is raised to 235,520 B (230 KiB), 2026-10-21,** by owner
+              decision ("don't worry about the size limit for now"). A
+              dual-socket server whose onboard NICs were all link-down and whose
+              firmware had no driver for the USB NIC showed the gap; `sshd`
+              now runs `axl_net_auto_init_opts` -- firmware-first, the link
+              gate, a crash-safe sweep of `drivers\<arch>` beside `sshd.efi`
+              with `netload-drivers.json5` companions, one 60 s deadline,
+              Ctrl-C -- instead of its own bring-up. The engine's companion
+              loader and reachability check became opt-in in code; `sshd`
+              installs the loader (the change is +15,872 B packed, about 8 KB
+              of it the JSON5 sidecar reader) and not the check. x64 RELEASE
+              232,960 B, aa64 211,982 B; the limit is x64
+              rounded up to the next 2,048 B plus 2,048 B.
+              Trimming candidates if the limit has to come back down: drop
+              the companion loader from `sshd` (about 8 KB packed) -- USB
+              CDC/RNDIS dongles would then need `netload` first.
+            - **`AxlNetworkTimeout` / `--net-timeout`, and the sweep's review
+              minors, 2026-10-21:** the bring-up's deadline is an `sshd.conf`
+              keyword (1-86400 s, default 60; `-T` prints it), so a box with
+              a slow USB NIC or many cabled ports is not stuck at 60 s. The
+              link gate now lists NICs afresh during its wait, so a NIC
+              whose interface appears then (a USB dongle still enumerating)
+              is found -- `test-net-gate-qemu.sh` hot-plugs QEMU's usb-net
+              into the wait (x64; aarch64's firmware binds no driver to it).
+              The same test sweeps a candidate whose Unload refuses: it stays
+              resident, its companions are unloaded, `dh -v` still walks the
+              box. `axl-net.h` says a companion the winner relies on without
+              declaring it is unloaded. `test-sshd-start` aarch64: 182 s ->
+              151 s (the no-lease boot is two NICs under a 25 s
+              `AxlNetworkTimeout`). Size unchanged: x64 RELEASE 232,960 B,
+              aa64 211,982 B; the limit stays 235,520 B.
+            - **`sshd-rtk.efi`, 2026-10-21:** sshd with Realtek's USB NIC
+              driver embedded (`make sshd-rtk RTK_USB_UNDI=...`, packed),
+              tried first after the firmware's NICs through the engine's new
+              `AxlNetAutoOpts.embedded`; one service with `sshd`; shipped only
+              by `--with-rtk DIR` on the release scripts. QEMU proves it with
+              an embedded e1000 driver (`test-sshd-rtk-qemu.sh`); the Realtek
+              driver itself is real-hardware territory.
+            - **DHCP on every link-up NIC at once, 2026-10-21:** the link
+              gate's pass sets DHCP on all its link-up NICs and waits one
+              budget for the first lease (Linux `ip=dhcp`, systemd-networkd,
+              dhcpcd); the losers' IP4Config2 policies are put back. Three
+              server-less firmware NICs plus a swept USB-class NIC: 49 s ->
+              19 s to serving (x64).
+            - **Measured after the three, 2026-10-21:** `sshd.efi` x64 RELEASE
+              235,008 B, aa64 214,030 B (after the review fix round); the
+              limit is 237,568 B (x64 rounded up to the next 2,048 B plus
+              2,048 B).
+            - **Hands-on pass and final review (D8), fixed in phase:**
+              a tool's error lines (StdErr) never reached a session -- the
+              console device now joins ConSplitter's StdErr fan-out
+              (`gEfiStandardErrorDeviceGuid`); a `Banner` or
+              `authorized_keys` written in the Shell (UTF-16LE + BOM) was
+              refused -- one decoder, `axl_text_to_utf8()`, reads every text
+              file sshd and `AxlConfigFile` read; the goodbye on a terminal
+              larger than the console landed on row 2 over the console's
+              text -- DECSC/DECRC around the region reset, erase to end of
+              line; "beside `sshd.efi`" meant the volume root, so a
+              `sshd.conf` in the release's versioned directory was ignored --
+              it is now `sshd.efi`'s directory, and a start names the file it
+              read or looked for; Esc then a key in the next packet became
+              Alt+key. Harness/gates: a SIGKILLed test no longer orphans its
+              QEMU (`setpriv --pdeathsig` in `test_run_background`);
+              `check-flag-parity` compares the two image links' ld flags; the
+              tools tarball stages `SHIPPED_TOOL_NAMES` by name, not
+              `tools/*.efi`; the sshd suites fail, not skip, under CI without
+              `ssh`/`ssh-keygen`.
+            - **Second hands-on pass, fixed in phase:** `sshd`'s own log
+              (`ssh: Accepted password ...`) was drawn in every session once
+              the device joined StdErr -- while it serves, sshd now logs to
+              the first serial port in the console's format, through the new
+              `axl_log_set_console_serial()` (OpenSSH logs to syslog, never
+              to the user's terminal); on firmware whose `ErrOut` lists the
+              display, a take-over now moves that screen off StdErr with
+              ConOut and back on uninstall, so an error line is drawn once
+              (`test-console-device-errout-qemu.sh`, which copies ConOut into
+              ErrOut to make OVMF such firmware); the StdErr check now reads
+              the session's RENDERED screen (tmux), with ground truth taken
+              from the GOP first -- the session and the screen agree;
+              `axl_ssh_server_load_authorized_keys` no longer returns
+              `AXL_NO_RESOURCES` (= "more than 16 keys") for out of memory;
+              `axl_text_to_utf8()` decodes UTF-16 in place and sets its
+              length outputs on every return; the release-image test stages
+              the stick with the tarball's versioned directory kept.
+            - **Third fix wave:** one "beside the running image",
+              `axl_app_image_dir_path()` in AxlApp, replaces sshd's and netload's
+              own copies (a relative name under the `.efi`'s directory, a
+              leading backslash from the volume root, a volume path as it
+              is); sshd's stop puts
+              the console log back as it found it
+              (`axl_log_get_console_enabled()`, new); a take-over's uninstall
+              re-tags a screen's ConOut before its StdErr, in separate calls,
+              so a StdErr tag that came back meanwhile cannot keep the screen
+              out of ConOut (`test-console-device-errout-qemu.sh` boot 3);
+              `test-log-redirect-qemu.sh` reads the redirect's raw bytes --
+              colourless, silenced by `set_console_enabled(false)`, standard
+              error's colour again after NULL; netload's nested-stick case
+              fails by name when the beside-image lookup is reverted, and
+              passes on aa64.
+            Follow-ups, none blocking:
+            - [x] OWNER DECISION: mid-screen, the Shell draws its next prompt
+                  over the first columns of a StdErr line (it places the
+                  prompt where IT left the cursor, which a StdErr write does
+                  not move). A real screen in `ErrOut` does the same -- the
+                  GOP shows `FS0:\> x bogus is not an IPv4 ...` exactly as the
+                  session does -- so the session is faithful; at the bottom
+                  of the screen the line stays whole on both. Fixed for
+                  every console (2026-10-22): on the console, standard
+                  error is written through ConOut, the stream the prompt
+                  is placed from (`src/stream/README.md`, *Standard error
+                  on the console*).
+            - [x] `netload`'s default driver directory is `drivers\<arch>`
+                  (then `drivers`) beside `netload.efi`, falling back to the
+                  volume root's forms for a flat stick; `--dir` overrides.
+            - [ ] `axl_net_get_driver_info()` names a disk-loaded driver by
+                  the FIRST `MEDIA_FILEPATH` node of its image's path
+                  (`resolve_driver_cb`): a firmware that splits a path across
+                  nodes, one per component, would report only the first.
+                  OVMF's Shell loads with one node.
+            - [x] Loading `ipxe-all.efidrv` from a USB stick takes the USB
+                  controller: after `netload -p ipxe-all.efidrv` both USB
+                  volumes leave the map (`map -r` shows only BLK0) and the
+                  Shell drops its current directory. A stick on BMC virtual
+                  media is USB too. Resolved by removing the bundled iPXE
+                  (2026-10-21).
+            - [ ] An out-of-memory base64 decode of an `authorized_keys`
+                  line reports `AXL_INVALID` ("malformed line"):
+                  `axl_base64_decode` returns `AXL_ERR` for both.
+            - [ ] PuTTY's `ESC[11~`..`ESC[14~` F-keys (a non-goal for P4h),
+                  Alt with a non-ASCII key, old xterm's `ESC ESC [A`
+                  Alt-arrows.
+            - [ ] `LoginGraceTime 0` (OpenSSH: no limit) is refused, as are a
+                  second `Port` and an `AuthorizedKeysFile` naming several
+                  files (sshd listens on one port and reads one file).
+            - [ ] A `Port` too large says `integer value too large.` where
+                  OpenSSH says `Badly formatted port number.`; `sshd -T`'s
+                  `rekeylimit` prints the byte limit in force where OpenSSH
+                  prints `0 0`.
+            - [ ] A live proof of every sshd driver setter (only some are
+                  driven end to end); the unnamed assertions that passed
+                  before Task 3's implementation (its RED was retroactive).
+            - [ ] `lsusb`'s `cannot enumerate USB devices` has no automated
+                  test (no injectable failure in QEMU); `test-lsusb-qemu.sh`'s
+                  est=60 per leg is tight against aa64's 150 s.
+            - [ ] The release suite's title-bar poll has no explicit failure
+                  message.
+            - [ ] Keys beyond the 256 held stay in the evicted firmware queue
+                  across a guest Reset; dropping the take-over discards up to
+                  319 arrived keys (teardown semantics).
+            - [ ] tmux 3.4's path through the edit and keys suites is not
+                  exercised in CI (the self-hosted runner finds 3.5).
+            - [ ] The release tarball's root directory is mode 0700
+                  (pre-existing): make it 755, as a CHANGELOG-noted change.
+            - [ ] `check-tool-docs` anchors on the exact `./scripts/`
+                  spelling (a `python3 scripts/...` rewrite would false-fail,
+                  the safe direction).
+            - [ ] An `LDFLAGS_EFI` change does not relink existing images
+                  (the build-state signature covers compile flags only).
+
+      **P4 has a measured throughput profile — use it instead of guessing**
+      (spike 2026-09-26, transport-level, x64 KVM + aa64 TCG, RELEASE; the
+      numbers and their caveats are in
+      `.superpowers/sdd/2026-09-17-axl-ssh-p3-password/task-throughput-spike-report.md`).
+      The use case it was built around is `idrac-push.sh`: bulk bytes through
+      an interactive pty because the peer has no sftp subsystem, 2.1 MB in
+      ~10 s by zmodem and ~32 s by base64 on real hardware.
+
+      - **The transport is not the constraint.** It fits a
+        **1.88 µs/packet + 34.7 MB/s** line on x64 (nearly flat from 64 B to
+        32 KB) and 16.0 µs + 8.60 MB/s on aa64/TCG. Projected against that
+        use case: 0.07-0.2 s on x64, 0.34-1.17 s on aa64, against a 10-32 s
+        reference. **So choose the window and packet size for correctness
+        and memory, not for speed.**
+      - **Window 2 MB** (OpenSSH's default). By default (ON_ARRIVAL) it is an
+        accounting number, not a buffer — inbound is consumed synchronously
+        in `pump`; an ON_CONSUME channel (W4) makes it the bound on what the
+        application holds — so bound
+        memory with `RX_BACKLOG_MAX`, not by shrinking it. Arithmetic over a
+        measured 5.7-9.6 ms RTT: anything under ~256 KB caps below the
+        transport, and 32 KB over a 50 ms WAN gives 0.66 MB/s.
+      - **Max packet 32 KB.** No cliff, and the connection already owns a
+        35,000-byte buffer.
+      - **Do NOT make the data path allocation-free.** Measured 0.23% of wall
+        time at 32 KB, 4.9% at 64 B on the slower guest. It is 1 allocation
+        inbound and 6 outbound; removing them buys under 1%.
+      - **BUILD FIRST: coalesce outbound.** An outbound packet costs ~95 µs
+        against ~4.5 µs inbound — **20x** — and ~97% of it is the
+        `axl_tcp_send_async` completion path, not CPU. A channel that emits
+        one SSH packet per application write caps near **10,500 writes/s at
+        any write size**, so pty output must be coalesced into ≤32 KB
+        packets.
+      - **Then buffer the padding RNG.** `axl_rng_bytes` in the seal is a
+        synchronous `EFI_RNG_PROTOCOL` call: 700 ns on x64, **18,170 ns on
+        aa64 — 52% of a small outbound packet**, and the only per-packet item
+        whose share GROWS as the target slows (26x between guests, against
+        8.5x for per-packet cost generally).
+      - **`RX_CHUNK` is not a throughput knob** — measured: EFI_TCP4 returns
+        about one MSS (1,463 B) per `Receive()` whatever buffer it is given,
+        so 2048/8192/32768 made no difference.
+      - **The sink does not dominate here, and that says less than it looks**:
+        2.1 MB through an AxlFs writer is ~16 ms on x64 (~1.3 ms of writes
+        plus a flat ~15 ms `close()`). But the per-byte rate is the host page
+        cache behind a virtual disk, so a P4 test that looks fast here proves
+        NOTHING about real eMMC or NVMe. Keep the two useful numbers — ~1.13 µs
+        fixed per write call, ~15 ms per close — and discard the bandwidth.
+      - **Allocator numbers taken from a test run overstate the shipped cost**:
+        the suite builds DEBUG, where the allocator is 8.7x dearer at 32 KB.
+- [x] **P5** persistent host key + disconnect hygiene -- `<axl/axl-ssh-host-key.h>`
+      (a UEFI variable, NV+BS, never regenerated silently; provider-free
+      parse/fingerprint), `axl_ssh_server_set_host_key()`, sshd `HostKey` /
+      `sshd hostkey`; every DISCONNECT on a healthy stream delivered, or reset
+      at `AXL_SSH_DISCONNECT_LINGER_MS`. Survives a reboot on both arches
+      (test-sshd-hostkey-qemu.sh); test-ssh-disconnect-qemu.sh
+- [ ] **P6** *(softbmc repo)* bind channels to the console take-over, password
+      callback over SoftBMC auth, the `console_ws` role gate, licence/config
+      gates
+      - Follow-up: a BMC application's console binding frees its encoder
+        after an ignored `axl_console_device_uninstall()` (its reload path,
+        from a tick). Handle `AXL_BUSY` (retry next tick) and `AXL_ERR`
+        (keep the encoder, stay loaded) as fbcon and `sshd` do; the call is
+        `AXL_WARN_UNUSED` now, so the build points at it.
+      - Follow-up: the encoder now writes EFI_YELLOW as SGR 93 (it was 33),
+        so a browser terminal (xterm.js) draws the Shell prompt in its
+        brightYellow, not its yellow -- in a theme where those differ
+        (#ffcc44 against #ffaa00), the dashboard's prompt changes colour.
+        Check the look when the binding lands.
+- [ ] **Open decisions** before P6 — spec §13: terminal geometry (SSH has no
+      server-to-client resize), SoftBMC's password timing oracle, and a
+      guessing throttle that backs off rather than locking out the only admin
+      -- for SSH, RESOLVED 2026-09-18 in AxlSsh (Task P, spec §13.4); SoftBMC's
+      web login still needs one.
+      (§13.2, how a publickey login gets a role, and the §13.5 defaults were
+      settled 2026-09-17.)
+- [x] **Inbound backpressure: withhold `WINDOW_ADJUST` until the application
+      consumes** (W4, DONE). `axl_ssh_channel_set_window_mode()` /
+      `axl_ssh_channel_consumed()` / `axl_ssh_channel_unconsumed()`:
+      `AXL_SSH_CHANNEL_WINDOW_ON_CONSUME` credits a byte only when the
+      application reports it; ON_ARRIVAL (today's behaviour) stays the
+      default. Adjusts follow OpenSSH's rule (three maximum packets). sshd's
+      `sftp` channel adopted it. **sshd's SHELL deliberately did not**
+      (controller ruling): ON_CONSUME would raise its input heap from the
+      64 KB queue to ~2.2 MB per session and lose "Ctrl-C breaks a script
+      behind a paste" (and `~.` at a zero window), so the shell keeps
+      dropping input past its 64 KB queue, logged at DEBUG.
 **P1 plan (transport):**
-[`superpowers/plans/2026-08-21-axl-ssh-p1-transport.md`](superpowers/plans/2026-08-21-axl-ssh-p1-transport.md).
-Five of its six tasks are shipped — `src/net/axl-ssh-{buf,packet,kex}.c` and
-`axl-ssh-internal.h`, 90 assertions:
+[`superpowers/plans/2026-08-21-axl-ssh-p1-transport.md`](superpowers/plans/2026-08-21-axl-ssh-p1-transport.md)
+— **ALL SIX TASKS SHIPPED 2026-09-05.** `src/net/axl-ssh-{buf,packet,kex,crypt,server}.c`,
+`axl-ssh-internal.h`, the two public headers, ~120 unit assertions and a
+9-assertion `ssh(1)` conformance test:
 
 - [x] **Task 1** SSH wire codec, attacker-controlled lengths checked (`2d2cea7a`)
 - [x] **Task 2** version exchange, `AXL_INCOMPLETE` distinct from malformed (`0e978806`)
 - [x] **Task 3** binary packet protocol, both length fields bounded (`3e58042c`)
 - [x] **Task 4** KEXINIT, one algorithm per slot, refusing rather than downgrading (`6c2427a6`)
 - [x] **Task 5** RFC 4253 key derivation, pinned to independently computed bytes (`4c005264`)
-- [ ] **Task 6** key exchange — **BLOCKED on Ed25519 (E2b, parked).** Task 4
-      already advertises `ssh-ed25519` in KEXINIT with nothing behind it, so
-      this is where the track stops. It could instead be unblocked by
-      negotiating an ECDSA host key, which *is* ready — an option worth
-      weighing against finishing E2b, since it needs no vendored crypto
+- [x] **Task 6** curve25519 kex + AEAD transport + the server (`967a1978`) —
+      **P1 COMPLETE 2026-09-05.** OpenSSH 9.9p1 completes the handshake against
+      the guest and is refused at userauth: 9 passed / 0 failed, both arches
+      (`test/integration/test-ssh-transport-qemu.sh`). Adds mpint, the host key
+      and signature blobs, the exchange hash, `KEX_ECDH_INIT`/`_REPLY`,
+      `chacha20-poly1305@openssh.com` and the state machine. Two sabotages that
+      leave every UNIT test green — the two ChaCha keys swapped, and `Q_C`/`Q_S`
+      swapped in the hash — fail against `ssh(1)` at two different boundaries,
+      which is the oracle argument stopping being a slogan.
+      **Step 7's security review is DONE and its blocking findings are
+      fixed** (`58fde4dc`, `6c2f5995`): two pre-auth denials of service, an
+      unbounded pre-auth outbound queue, K left unscrubbed in the UEFI pool,
+      a silently-ignored rekey, and an unread `first_kex_packet_follows`.
+      `test-ssh-hostile-qemu.sh` is the regression guard the review said was
+      missing — the conformance test drives one SUCCESSFUL session and so
+      never takes an error path.
+      A scoped re-review of the fixes (`38585974`) then found a denial of
+      service the connection cap had CREATED — 16 silent peers pinning the cap
+      forever, since only `conn_drop` re-armed the accept — plus a silently
+      lost accept re-arm, two unscrubbed key buffers on error paths, and
+      `first_kex_packet_follows` checking only half of what RFC 4253 §7.1
+      names. All fixed there.
+
+      **Five LOW findings remain open** and are the gate's residue, not
+      blockers: a V_C skew when an ident line contains a bare LF,
+      `packet_wrap` bounding the payload where `unwrap` bounds the frame,
+      `put_string(NULL, n>0)` returning OK, a caller-only overflow in
+      `aead_seal`, and a 35 KB per-packet allocation that could be hoisted to
+      the connection. **The sixth, `SSH_MSG_IGNORE`/`DEBUG` being fatal before
+      `ST_AUTH`, is CLOSED (2026-09-20)** — not by relaxing the parser but by
+      advertising `kex-strict-s-v00@openssh.com`, which makes terminating on
+      those messages during key exchange the *required* behaviour rather than
+      an over-strict one (OpenSSH `PROTOCOL` §1.10 rule (a); Terrapin,
+      CVE-2023-48795). Outside key exchange AxlSsh already tolerates them, so
+      RFC 4253 §11 is met where strict KEX does not override it.
+      **`SSH_MSG_UNIMPLEMENTED` is now SENT** (2026-09-20) for any message
+      AxlSsh does not implement, which RFC 4253 §11.4 makes a MUST and which
+      shipped as a silent ignore. Bounded at 8 replies per connection --
+      unbounded, it is the same pre-auth amplifier `MAX_SERVICE_REQUESTS`
+      closed -- and past the bound the message is ignored exactly as before,
+      so the cap bounds the reply and never the connection.
+      **`GLOBAL_REQUEST` is now answered with RFC 4254 §4's
+      `REQUEST_FAILURE`** (P4a, 2026-09-27) rather than this UNIMPLEMENTED
+      stand-in -- including `keepalive@openssh.com`, where the reply IS the
+      client's liveness signal.
+      Also worth a pass: five constants defined twice with no
+      compile-time link between the public header and the implementation
 
 The plan was materially wrong in places and was corrected while implementing:
 a census over its `axl_*`/`AXL_*` tokens found **12 symbols that do not
-exist** (`AxlStrBuf`, `axl_digest_*`, `AXL_INCOMPLETE` — the last was *added*
-to `AxlStatus` as −11 rather than renamed), and it named two registration
-points for a new test binary where there are three. Worth knowing before
-writing P2's plan.
+exist** (`AxlStrBuf` is `AxlString`, `axl_digest_*` is `axl_checksum_*`;
+`AXL_INCOMPLETE` was *added* to `AxlStatus` as −11 rather than renamed), and it
+named two registration points for a new test binary where there are three.
+Re-censused at Task 6 and the same 12 were still wrong. Two more things it got
+wrong, both found while implementing: its integration-test sketch used
+`run-qemu.sh --hostfwd auto:22` directly where every other test in the tree
+goes through `common-test.sh`'s `test_setup`/`test_port`/`test_add_port_forward`
+— and its `grep -q …` + `check "$?"` idiom CANNOT REPORT A FAILURE under the
+`set -euo pipefail` that file installs, which is how a sabotage came back
+"detected" with no FAIL line. Worth knowing before writing P2's plan.
+
+**P2 plan (userauth):**
+[`superpowers/plans/2026-09-07-axl-ssh-p2-userauth.md`](superpowers/plans/2026-09-07-axl-ssh-p2-userauth.md)
+— **ALL SIX TASKS SHIPPED 2026-09-07.** `src/net/axl-ssh-auth.{c,h}`, plus
+additions to `axl-ssh-internal.h`, `axl-ssh-kex.c`, `axl-ssh-buf.c` and
+`axl-ssh-server.c`, the two new public functions on `AxlSshServer`, and a
+purpose-built fake `ssh-agent` for the hostile-input test:
+
+- [x] **Task 1** `authorized_keys` store and its line parser — an options
+      prefix (`command=`, `no-pty`, `from=`) is refused rather than silently
+      dropped (`b2c55a85`, `e3804b8b`, `009acc4d`, `fe19f226`)
+- [x] **Task 2** blob parsers and the RFC 4252 signed blob (`534c439f`,
+      `0a17fdfd`)
+- [x] **Task 3** `axl_ssh_server_add_authorized_key` /
+      `_load_authorized_keys`, and `axl_ssh_server_listen` now refuses to
+      bind with no authorized key (`709991f4`, `c958ef38`)
+- [x] **Task 4** the userauth state machine, both RFC 4252 forms
+      (`8d678930`, `ee72184c`)
+- [x] **Task 5** `ssh -i key` as the P2 conformance test — a real key
+      authenticates, a wrong key does not: 7 passed / 0 failed, both arches
+      (`test/integration/test-ssh-auth-qemu.sh`) (`a7b3db3f`, `701a125d`,
+      `625edc16`)
+- [x] **Task 6** the auth phase under abuse, reached through a fake
+      `ssh-agent` (`test/integration/ssh-fake-agent.py`, stdlib only) —
+      the existing hostile driver speaks no crypto by design and cannot get
+      past key exchange on its own. `test-ssh-hostile-qemu.sh` is now 22
+      passed / 0 failed, both arches (`6fa298de`, `9e7cb351`)
+
+**The failure policy is asymmetric, and that is the point.** A key not in
+the authorized set is refused **without dropping the connection** — `ssh`
+walking its key list, not an attack — while a forged signature under an
+AUTHORIZED key ends the connection immediately, whether or not the client
+asked about the key first. A key
+that is well-formed but cryptographically unusable (a non-canonical
+encoding, a small-order point) loads successfully and is refused only at
+verify time, because the Ed25519 provider validates at the one door every
+signature passes through rather than at every import site.
+
+Commit range: `ddf8d517`..`9e7cb351`. **Task 7's security review (spec
+§11's merge gate) is CLOSED.** The initial pass returned 2 HIGH / 2 MEDIUM
+/ 6 LOW. It found no path to `USERAUTH_SUCCESS` without a verified
+signature, confirmed the signed region is the verbatim arrived bytes
+covering every attacker-alterable field, and confirmed authentication is
+bound to the session id — every finding was resource-lifetime or
+secret-hygiene around or beneath the new code, not in the authentication
+decision itself. HIGH-1 (an unbounded pre-auth outbound queue: an
+unanswered `SERVICE_REQUEST` had no per-connection cap, unlike the userauth
+free form right beside it), HIGH-2 (`born_ms == 0` meaning both
+"authenticated, never reap" and "the monotonic clock is unreadable" — on a
+platform whose clock cannot be read this made every connection look
+already-authenticated, silently disabling the login grace so that 16 idle
+connections could pin the connection cap forever), MEDIUM-1 (the shared
+secret and both directions' derived AEAD keys surviving, unscrubbed, in a
+freed digest context) and LOW-1/LOW-2 (an elidable `axl_memset` scrubbing
+session keys, and `signed_data` freed without scrubbing) were fixed
+(`6d39ab11`, `a2f5eec4`).
+
+A scoped re-review then attacked the fixes themselves rather than taking
+the reasoning on faith and confirmed all five addressed — including that
+neither HIGH fix reintroduces the previous phase's failure mode under
+attack, and that the `SERVICE_REQUEST` cap does not trip on any conforming
+client flow. It found four new LOW/informational findings. **NEW-2**
+(neither half of the HIGH-2 fix had a committed regression guard) is now
+half-closed: `axl_ssh_reap_reason()` (`src/net/axl-ssh-reap.h`) pulls the
+whole authenticated/deadline decision out of `on_reap` as a pure function
+of plain values, `AxlTestSsh` pins that an authenticated connection is
+exempt from reaping even past an expired deadline, and a sabotage that
+removes the exemption (so an authenticated connection falls through to the
+same deadline check as an unauthenticated one) turns exactly those two
+assertions red and no others. The listen-time clock-failure probe — NEW-2's
+other half — still has no injection seam and remains unguarded; building
+one to fake a hardware clock failure was judged not worth it for this pass.
+
+**MEDIUM-2 is FIXED** (`2787c468`, 2026-09-07). `axl_mbedtls_entropy_poll`
+no longer reports the clock-seeded fallback as gathered entropy. On a
+platform with no working `EFI_RNG_PROTOCOL` the per-source threshold now
+goes unmet, `mbedtls_ctr_drbg_seed()` fails, and every consumer the DRBG
+seeds -- `axl_pk_key_new()`, `axl_ecdh_new()`, `axl_tls_init()`,
+`axl_ssh_server_new()`, `axl_aead_seal()` -- returns its error or `NULL`
+sentinel instead of a predictable key. **Fail closed by default**: the
+tradeoff this item used to pose is resolved in favor of "a key nobody can
+generate beats a key an attacker can guess."
+
+An explicit, off-by-default opt-in exists on `<axl/axl-crypto.h>` for a
+platform that genuinely has no RNG whose operator accepts the risk:
+`axl_crypto_set_weak_entropy_allowed(bool)`, read back with
+`axl_crypto_is_weak_entropy_allowed()`. Seeding is lazy and cached for the
+process lifetime, so the call must precede `axl_pk_key_new()`,
+`axl_ecdh_new()`, `axl_aead_seal()`, `axl_tls_init()`,
+`axl_ssh_server_new()` or any TLS handshake. Every draw that actually
+falls back logs at `axl_warning`, every time it happens, not once.
+Measured before committing to fail-closed: `EFI_RNG_PROTOCOL` is present
+and working on both OVMF (x64) and AAVMF (aa64), so fail-closed costs this
+project's own test suite nothing.
+
+**What proving the fix uncovered is worse than what it fixed, and gets its
+own entry here rather than a footnote to a fixed item.** The hardware
+branch this fallback was supposedly a fallback FROM had never once
+worked: the poll called `((RNG_GET_RNG *)rng_proto)[0]` -- vtable member
+0. In `EFI_RNG_PROTOCOL`, member 0 is `GetInfo` and member 1 is `GetRNG`
+-- the tree's own tested binding says so at `src/util/axl-rng.c:24-34`.
+So the "hardware RNG" path was calling `GetInfo(This, NULL, output)`,
+which returns `EFI_INVALID_PARAMETER`, and falling through to the weak
+path -- **on every platform, for the entire life of that code.** Every
+key this SDK has ever generated came from the xorshift-from-clock
+fallback, not hardware: Ed25519 SSH host keys, X25519 ephemerals, and TLS
+session keys alike, not only on boards lacking an RNG -- on all of them.
+Fixed in the same commit by deleting the hand-rolled binding and calling
+`axl_rng_bytes()`, which has the struct right and is unit-tested on both
+arches -- one binding per protocol, the rule `gate.check-dogfood` exists
+for.
+
+**Any key persisted from an earlier build is clock-derived and must be
+rotated, not trusted.** SSH host key persistence is P4, not yet built, so
+today's blast radius is smaller than it could have been -- but say it
+anyway: the same DRBG backs every `axl_pk_key_new()` and `axl_tls_init()`
+caller in the SDK, and anything already exported or pinned by a consumer
+from a build before `2787c468` is suspect, regardless of algorithm.
+
+**The lesson, because it is the whole argument for fail-closed:** a
+silent fallback did not merely weaken the keys, it hid the fact that the
+strong path was broken. A fail-closed design would have surfaced this the
+first time anyone ran it. Weigh that the next time "should this degrade
+gracefully?" looks like the kind option -- a silent fallback and "the
+primary path can fail invisibly forever" are the same mechanism.
+
+**The residue, all LOW or informational and none blocking, deliberately
+left as-is:**
+- **LOW-3** `conn_drop`'s accept re-arm does not reset `s->accept_errs`,
+  so once `MAX_ACCEPT_ERRS` has been reached a re-arm from `conn_drop` is
+  immediately re-paused by the next failed accept; `on_reap` does reset
+  it, so recovery is bounded at one reap tick (5 s) — a degradation, not
+  an outage.
+- **LOW-4** V_C reconstruction in `pump` (walking back to the previous
+  bare LF) disagrees with `axl_ssh_parse_ident`'s strict CRLF split when a
+  peer's identification line contains a bare LF, so the two sides compute
+  different exchange hashes and the connection dies at the host-key
+  signature check — not a security hole (a client cannot make the two
+  sides *agree* on different transcripts), just a parser/reconstructor
+  disagreement worth removing.
+- **LOW-5** `ST_SESSION`'s `CHANNEL_OPEN_FAILURE` reply has no
+  per-connection cap (the HIGH-1 shape, post-auth), and 16
+  authenticated-but-idle connections could lock out the administrator.
+  Reaching `ST_SESSION` required a private key when this was written; P3
+  (2026-09-17) added password auth, so it no longer does -- still LOW
+  pending exposure, since it costs a completed login either way.
+  **P4 opens a real channel type and makes this live**, so it should be
+  settled before or during that phase rather than after.
+
+  *Wording corrected 2026-09-20.* This used to be filed as "no idle
+  timeout", which is not a divergence from OpenSSH at all: `man 5
+  sshd_config` gives `ClientAliveInterval` a default of 0 ("these messages
+  will not be sent to the client") and `UnusedConnectionTimeout` a default
+  of `none` ("never expire connections for having no open channels"). sshd
+  has no idle timeout either. **The divergence is the 16-slot cap**: sshd
+  has no total connection cap (`MaxStartups` counts unauthenticated
+  connections only), so an idle authenticated session costs it one process,
+  while AxlSsh's `MAX_CONNS` 16 is shared between authenticated and
+  unauthenticated connections and the reaper exempts the authenticated ones
+  unconditionally (correctly -- that exemption is the point of the
+  three-field split). So the fix P4 owes FIRST is splitting the cap, which
+  needs no channels; the `UnusedConnectionTimeout` analogue comes after,
+  because "no open channel" is only a real predicate once channels exist.
+- **LOW-6** Two lenient parsers are reachable from `authorized_keys`:
+  `axl_base64_decode` only checks for `=` in the last two positions of a
+  quantum (a mid-string `=` decodes to garbage instead of erroring), and
+  `axl_file_get_contents` has no size cap. Neither is exploitable here
+  (`axl_ssh_hostkey_blob_parse` rejects anything but the exact 51-byte
+  structure, and the file is local configuration) but both are shared
+  with the JOSE/JWK paths and worth tightening at the source.
+- **NEW-1** The reaper is silent in the one state where it examines
+  nothing: if its own clock read fails mid-run, every armed-deadline
+  connection is skipped with no log line — HIGH-2's outage shape again,
+  behind a door the re-review could not open (the clock frequency is
+  memoised after the first successful read on x64, and read raw with no
+  failure mode on aarch64), hence LOW rather than HIGH. Worth a log line
+  anyway: a reaper that examines nothing looks identical to a reaper with
+  nothing to do.
+- **NEW-3** `axl_ssh_string_free_secure` only scrubs the CURRENT buffer;
+  `axl_string_append_len`'s growth `realloc` frees the OLD block
+  unscrubbed, so a string assembled by appends leaves earlier copies of
+  its own prefix in the pool. Concrete for LOW-2's `signed_data`
+  (`string(session_id)` then the appended request — the growth realloc
+  serving the second append copies-and-frees a block holding the session
+  id), so that fix's exposure is reduced, not eliminated. Checked and
+  ruled out for the shared secret K itself: at both sites that hash K,
+  mpint(K) is appended last and `grow()` reallocs before the memcpy, so no
+  freed block ever holds K. Pre-existing, not introduced by this fix wave.
+- **NEW-4** (informational) The `axl_ssh_server_listen` clock probe proves
+  the monotonic clock is READABLE, not SANE — it accepts any successful
+  reading, and aarch64 takes `CNTFRQ_EL0` raw with no bounds check (x64
+  bounds the cached value to 1 MHz-100 GHz). A firmware that programs a
+  wildly wrong `CNTFRQ_EL0` passes the probe and then expires every
+  connection's deadline within milliseconds of accept. Not a regression —
+  the old predicate behaved identically on a fast clock — and a
+  broken-platform condition rather than an attack, but the probe reads as
+  a stronger guarantee than it actually gives.
+
+Following the P1 pattern, fixes and the re-review land as their own
+commits rather than amending this range.
+
+**P3 plan (password auth):**
+[`superpowers/plans/2026-09-17-axl-ssh-p3-password.md`](superpowers/plans/2026-09-17-axl-ssh-p3-password.md)
+— **implementation SHIPPED 2026-09-17.** New `src/net/axl-ssh-auth.{c,h}`,
+additions to `include/axl/axl-ssh-server.h` and `src/net/axl-ssh-server.c`,
+and the fixture/test files below:
+
+- [x] **Task 1** OpenSSH's minimum failure time as pure arithmetic -- 5 ms
+      plus a per-user 0-4.29 ms from `SHA-512(secret||user)`, doubling,
+      nothing past 5 s -- and the listen predicate (`a5492f3a`)
+- [x] **Task 2** the public contract: `AxlSshAuthOps`,
+      `axl_ssh_server_set_auth_ops`, `axl_ssh_auth_complete`, a per-server
+      timing secret, `listen` now requires an authorized key OR a password
+      hook (`7b8207ef`)
+- [x] **Task 3** the state machine: pending requests (no parsing while a
+      verdict or reply is pending, RFC 4252 §5.1), one server-wide reply
+      timer, the password method, the publickey principal hook after a
+      valid signature, 3 password failures disconnect, the change-password
+      form refused, the `CHANGE_FIRST` banner, decrypted payloads scrubbed
+      (`827b31ec`)
+- [x] **Task 4** fixture hooks + `ssh(1)` password conformance, both
+      completion paths, the 3-failure cap counted via askpass prompts with
+      `NumberOfPasswordPrompts=5` (`0198e9b6`)
+- [x] **Task 5** a hostile `auth-pending-drop`: a verdict that arrives after
+      its client left is refused as stale, and its principal is released
+      exactly once (`ac21e9e4`)
+- [x] **Not in the plan, added by the repo owner's decision after review:**
+      an authentication hook (or `release_principal`) may dispatch the
+      event loop -- which `axl-loop.h` documents as safe from any callback
+      -- and before this fix the server did not survive it: while the hook
+      dispatched the loop, the 60 s login grace could reap the very
+      connection whose hook was on the stack, and `issue_request`, `pump`
+      and `on_recv` then resumed on freed memory -- a remote client
+      triggers it by answering its password late in the grace. `conn_drop`
+      now defers a drop whose connection has its hook on the stack instead
+      of freeing it, and `on_reap` rescans after each drop and skips the
+      deferred one. The hostile `auth-hook-reenter` scenario proves it: an
+      askpass that sleeps 50 s, a fixture hook that dispatches the loop for
+      20 s, and a reaper tick landing inside that window (`a64b7757`)
+
+Commit range (implementation): `a5492f3a`..`a64b7757`.
+
+**Task 6's security review (spec §11's merge gate) ran and returned 4
+MEDIUM / 4 LOW / 5 INFO.** All four MEDIUMs and LOW-1 through LOW-3 were
+fixed in three commits: `d651a84d` (S1 -- `axl_loop_iterate_until` fails
+closed instead of waiting on a source it could not register, closing
+MED-2), `9adf11d2` (S2a -- a completion after `axl_ssh_server_free()` is
+refused rather than reading the freed server, MED-4's UAF and cross-instance
+match; handles are now issued from one image-wide counter; the listener is
+closed before connections are dropped, LOW-3) and `9aecf82f` (S2b -- the
+`app_calls` counter that lets `axl_ssh_server_free()` stop a server at once
+and finish freeing it from the loop once no application frame is left on
+the stack, closing MED-1's hang/UAF; the one-hook-at-a-time cap with its
+FIFO resume queue, closing MED-3's LIFO pinning; `axl_ssh_auth_complete()`
+no longer resumes parsing inline, closing LOW-1). LOW-4 was left open and
+deferred to P4. It was recorded as "an authenticated connection never times
+out"; *corrected 2026-09-20*, that is also OpenSSH's default
+(`ClientAliveInterval 0`, `UnusedConnectionTimeout none`), and the real
+divergence is that AxlSsh's 16-slot `MAX_CONNS` is shared with
+unauthenticated connections where sshd caps nothing in total. See LOW-5
+above for what P4 owes and in what order.
+
+**A scoped re-review of those three fix commits then confirmed all seven
+addressed** -- not merely attempted -- and found six further findings of
+its own (NEW-1..NEW-6), all smaller than anything they replaced: none is
+memory corruption in AXL, an authentication bypass, or a permanent
+pre-auth DoS. **NEW-2 and NEW-4 were fixed** in this pass (S3): the header's
+"no hook is called again" corrected to say a connection whose own hook is
+running is closed, and its principal released, after `axl_ssh_server_free()`
+has already returned rather than before (NEW-2); `axl_ssh_server_add_
+authorized_key()` and `axl_ssh_server_load_authorized_keys()` now refuse a
+non-live server the same way every other public entry point already did,
+and the free()/listen()/set_auth_ops() header comments now say plainly that
+the liveness check is by ADDRESS, so a server freed and replaced at the
+same address is acted on as if it were the new one -- true for those calls,
+though not for a completion, whose handles are image-global (NEW-4). NEW-3
+(release_principal nests up to the connection count, uncapped, because
+capping it would only defer teardown) and NEW-5/NEW-6 (two comments that
+overstated what they proved) were documented rather than changed, with the
+reasoning recorded next to each. **The gate is now CLOSED.**
+
+**NEW-1 — RESOLVED 2026-09-26 by the owner: hooks stay STRICTLY SERIAL;
+the work it owed SHIPPED the same day.**
+The decision and its reasoning are in spec §12, along with what shipped:
+`axl_ssh_server_set_auth_hook_budget_ms()` (logging only, default 1 s, 0
+to report nothing, latched at hook entry), a watchdog that writes one line
+when a hook returns over budget and a best-effort line while one is still
+running — riding the login-grace reaper's sweep, not a timer of its own —
+and a reaper that names what a still-queued connection was waiting on
+instead of reading like a silent peer. The one case none of it can see is
+recorded rather than glossed: a hook that blocks WITHOUT dispatching the
+loop produces no mid-hook line, because the sweep that would write it runs
+on the stack that hook is holding — that case needs a watchdog outside the
+loop (`axl_watchdog_set()`). The
+argument that produced it is below, kept because the trade is what a later
+reader will want, not the verdict alone. The one-hook-at-a-time
+cap that closed MED-3 turns LIFO pinning into FIFO starvation: a hook that
+waits W seconds by dispatching the loop (the fallback shape the header
+documents for a check that cannot be made asynchronous) holds every OTHER
+connection's authentication input unread for as long as it runs. A peer
+holding 15 of the 16 connection slots, each
+sending a password, queues 15*W of latency behind any hook that answers
+from a blocking wait -- so W above roughly `LOGIN_GRACE_SEC / MAX_CONNS`
+(about 3.7 s today) starts starving legitimate password logins past their
+60 s grace, and a hook that never returns denies authentication
+server-wide (not just for its own connection, as before this wave) until
+the image is rebooted -- fails safe rather than corrupting memory, since
+the counter can only leak upward and the server is never freed underneath
+it, but it is a durable, server-wide denial of service. The shape the
+header already recommends -- answer from `axl_ssh_auth_complete()` after
+hashing on another core, never block inside the hook -- is immune, because
+it never holds the one-hook slot for any measurable time. **The decision
+owed:** keep hooks strictly serial (today's behaviour, cheapest, but the
+one that starves), raise the cap above 1, bound how long a connection may
+wait in the queue before it is answered DENY on its own, or require
+non-blocking hooks outright and refuse `set_auth_ops` otherwise. Each is a
+real trade against a latency budget that should be set once, by the repo
+owner, rather than assumed here.
+
+Measured: `AxlTestSsh` 282/0, `test-ssh-hostile-qemu.sh` 50/0 and
+`test-ssh-auth-qemu.sh` 16/0, all three both arches; `test-ssh-transport-qemu.sh`
+9/0. Unit ratchet (`test/integration/.last-pass-count`): 11192.
+
+Not covered by any test that ran: the `schedule_drop` path; a client
+leaving during a failure reply's 5-9 ms window; `set_auth_ops` after
+`listen`; handle wrap after 2^32-1 requests; the per-request
+clock-failure fallbacks; a peer reset during a hook reached from `resume`
+(only a pipelining client reaches it; `ssh(1)` does not); a publickey hook
+dispatching the loop; the fail-closed `auth_apply` check and the
+`!running` parse check; the dead-connection check after a hook returns
+(defence in depth -- `raw_send` refuses first); and the new
+`axl_ssh_server_add_authorized_key()`/`_load_authorized_keys()` liveness
+checks added in this pass, which no test exercises.
+
+The optional `abandon(req, ud)` hook the original review recommended (so a
+consumer can cancel outstanding work and scrub its own password copy when
+a client leaves before its verdict) remains unbuilt. It and the hook
+watchdog were both written here as things that "would help NEW-1 without
+deciding it"; the 2026-09-26 decision made the watchdog PART of the answer
+rather than an adjunct to it -- serial hooks plus a stall an operator can
+see -- and it shipped that day. `abandon` stays the companion piece, worth
+most to SoftBMC, which holds a credential copy while it hashes.
+
+**Task G (settable login grace) SHIPPED 2026-09-17**, prompted by the final
+review's finding that the hostile suite spends ~140 s of its ~280 s
+waiting out the fixed 60 s constant twice (no single written "P4
+suggestion" bullet named this specific ask; NEW-1's residue above is the
+closest documented antecedent -- a settable grace is a lever NEW-1's own
+arithmetic assumed did not exist). `axl_ssh_server_set_login_grace()`
+(`include/axl/axl-ssh-server.h`) replaces `LOGIN_GRACE_SEC` with a
+per-server field, before-`listen()`-only like `set_auth_ops()`, refusing 0
+(the exact DoS the grace exists to prevent) and anything over one hour,
+and deriving the reaper's own tick down from the default 5 s for a short
+grace rather than leaving a fixed lag a 1 s grace would not survive. It
+does NOT resolve NEW-1 -- a queued connection's grace still runs down
+while it waits its turn behind a blocking hook, and the docstring says so.
+
+`test-ssh-hostile-qemu.sh` now sets a 40 s grace for its whole boot
+(`GRACE_SEC`) instead of waiting out the shipped default twice: `auth-stall`
+measured 44 s on x64 / 41 s on aa64 (was ~65 s) and `auth-hook-reenter`'s
+askpass sleep moved from 50 s to 30 s against the same margin arithmetic.
+The full default run (all nine scenarios, one boot) measured 3m24s on x64
+and 3m28s on aa64, both 50/0 -- down from an est=280 baseline, about a 27%
+cut. `auth-hook-nest`'s three `NEST_US` hooks (18 s in series) were left
+untouched -- they stay comfortably inside 40 s without retuning (both B
+and C still logged in, not dropped, on both arches), and retuning them was
+outside this task's scope; a much shorter grace would need that too.
+`AxlTestSsh` grew from 282/0 to 292/0 (the setter's own validation: NULL,
+zero, over-the-bound, exactly-the-bound, a freed server, and -- on both
+arches -- a real bind refusing the setter once listening).
+
+**Sabotage proved the timing assertions actually grade the grace, not just
+elapsed wall time.** A setter that keeps its argument's assignment but
+targets the wrong field (`s->login_grace_sec = s->login_grace_sec` for
+`= seconds`) leaves the server at the shipped 60 s default. `auth-stall`'s
+band against that shipped 60 s grace was `[45, 85]`; rescaling that shape
+to GRACE_SEC (40) gave `[25, 65]`, and that FIRST version did NOT catch
+the sabotage -- 64 s measured, inside `[25, 65]`, "the sabotage was NOT
+detected" -- because 64 s is also within one reap tick of the old 60 s
+default. Only the shipped grace's own ceiling carried over into that
+first rescale; the 25 floor was new, sized for 40 s, not inherited from
+anywhere. The band was tightened to [25, 50] (comfortably above every
+GRACE_SEC=40 measurement, comfortably below every 60 s one) and re-run
+detected it: `auth-stall: reaped at the login grace, not before or long
+after (65s, want 25-50)` FAILS, alone, everything else green.
+`auth-hook-reenter` needed no such tuning -- under the same sabotage the
+hook's 20 s dispatch never crosses a deadline stuck at 60 s, so the
+connection authenticates normally, failing `auth-hook-reenter: the
+connection reaped during its hook never authenticated` and (as a genuine
+consequence of the same root cause, not a second defect) `teardown: one
+principal release per successful login`.
+
+**Task P (per-source penalties) SHIPPED 2026-09-18**, asked for by Mike: "the
+real OpenSSH server kills the connection after 3 failed attempts, but if the
+client reconnects, it will allow them to retry possibly after a period of
+time... I want this to behave like the real OpenSSH server."
+`axl_ssh_server_set_penalties()` / `axl_ssh_server_set_penalty_exempt()`
+(`include/axl/axl-ssh-server.h`, `AxlSshPenalties`) implement OpenSSH 9.9p1's
+`PerSourcePenalties`, **on by default** at OpenSSH's numbers, with the pure
+decisions in `src/net/axl-ssh-penalty.c` pinned by unit tests the way
+`axl-ssh-reap.h` pins the login grace. Resolves spec §13.4 for SSH; SoftBMC's
+web login still has no throttle.
+
+**The contract was wrong after two reviews, and a measurement caught it.**
+It first said a source is refused "while remaining exceeds `min`". Measured
+against a throwaway `sshd` on this host (non-root, `LogLevel DEBUG1`): sshd
+logged `activating ipv4 penalty of 19 seconds` after four failed connections
+and refused a good key once a second for the next 20 s -- the WHOLE penalty,
+not the 4 s above `min`. `min` is an activation threshold. The same probe
+settled three more: a success after a failure on one connection accrues
+nothing; a success clears nothing; refusals accrue nothing. An independent
+re-read of the corrected model then found eviction still ranked by raw time
+left, which under the new model evicts a live refusal near the end of its
+decay in favour of a deferred entry that never refused anything; retention
+now ranks active first (ruling P4).
+
+`test-ssh-hostile-qemu.sh` gained a `penalty` scenario on a SECOND server (its
+own table, so it cannot poison the rest of the boot), while the first server
+exempts the one address every forwarded connection arrives from (10.0.2.2,
+measured from the guest's own activation line and asserted in the same run).
+Two wrong-password connections; a right-password login refused before
+identification; a 70-connection flood at the refused source with the other
+server still serving; the right password retried until it gets in, timed at
+~24 s on both arches against an expected ~23.8 s; then the same sequence
+against the exempt server, served. Six sabotages, each detected by the
+assertion aimed at it: accrue-but-never-refuse, never-decay, exempt list
+ignored, the old refuse-while-above-`min` model (unit AND integration),
+forgery charged `noauth` (unit), and ranking by raw time left (unit).
+`AxlTestSsh` grew from 298 to 406 assertions (108 new).
+
+**Fix round 1 (the Task P review: 0 critical, 3 important, 8 minor).** The
+headline DoS question was clean: EDK2 completes an abortive `Close()`
+synchronously, so a refusal costs less than serving the peer did. What
+changed:
+- the table went from 32 to **256** sources (ruling P5), because a full
+  table is a bypass for the next address, not a slowdown, and 32 had been
+  argued from the connection cap; the first dropped accrual per `max`
+  window now logs at INFO;
+- a connection the SERVER failed to set up, or could not time, is charged
+  nothing (P6) -- those two paths only; a parse-time failure of the server's
+  own is charged like a protocol error;
+- the stated reason for the RST was wrong. A graceful close from the accept
+  callback would not cost a loop source; it would wait inline for TIME_WAIT
+  on every refusal, which is worse, and the docs now say so;
+- `axl_ipv4_parse` stored each octet through `%u`'s unsigned int before
+  range-checking it, so a BARE `4294967306.0.0.0` parsed as though its first
+  octet were 10 (2^32 + 10 wrapped), and an exempt list accepted it. The reviewer's `/8` form was already refused by
+  the CIDR path's 16-byte copy. A field width of 3 fixes it for every
+  caller.
+
+The `penalty` scenario now:
+- makes its first failure a forged signature, so the forgery wiring has a
+  guard;
+- lets one silent connection's 3 s grace run out on the second server,
+  which must accrue grace-exceeded;
+- replaces its 70-connection burst with up to 40 sequential knocks, run
+  last, inside that second penalty. None may get through, most must be
+  refused by the server, and the guest's heartbeat must keep pace. A burst
+  under QEMU's user networking both misses `on_accept` (backlog) and
+  arrives late through SYN retransmits: three stragglers once activated a
+  penalty of their own mid-scenario. Knock latency is reported, not graded:
+  a first version graded it, passed alone, and failed under six suite
+  workers (median 19 ms unloaded, ~510 ms loaded).
+
+Two more sabotages were detected: deleting `pen_forged = true` fails the
+refusal assertions, and deleting the grace wiring fails the second
+activation's cause.
+
+**D4 (settable password cap) SHIPPED 2026-09-25**, the OpenSSH parity
+audit's row for sshd's `MaxAuthTries`.
+`axl_ssh_server_set_max_password_failures()` replaces the compile-time
+`MAX_PASSWORD_FAILURES` (3, now `AXL_SSH_PASSWORD_FAILURES_DEFAULT`) and
+accepts 1..`AXL_SSH_PASSWORD_FAILURES_MAX` (10), the ceiling tied to
+`MAX_AUTH_REQUESTS` by a `_Static_assert` rather than by a comment --
+the "five constants defined twice with no compile-time link" complaint
+above, paid down by one. **It is LIVE**, which departs from spec §13.6's
+before-`listen()` rule deliberately and is recorded as §13.7: the cap is
+copied into each connection at accept, so a change reaches connections
+accepted afterwards and leaves open ones alone, which is what sshd's
+fork-per-connection gives on a reload. Before-`listen()` would have cost
+SoftBMC's settings page a free + new + `listen()` to move one number --
+regenerating the host key (persistence is P5) and, from P4 on, dropping
+every logged-in session.
+
+**D9 (pre-authentication banner) SHIPPED 2026-09-25**, the audit's row for
+sshd's `Banner` and the last of its CLOSE items.
+`axl_ssh_server_set_banner()` sends `SSH_MSG_USERAUTH_BANNER` (RFC 4252
+§5.4) ahead of the reply to a connection's first authentication request,
+once per connection, whatever name or method it asks with. 4096 bytes,
+because the size is set by what it carries: the DoD Notice and Consent
+Banner is about 1.3 KB, which `AXL_SSH_AUTH_BANNER_MAX`'s 1024 refuses --
+and an over-long one is refused rather than truncated, since a truncated
+mandated notice is a non-compliant one that looks compliant. LIVE for the
+same reason sshd rereads its `Banner` file per connection (spec §13.8,
+which also records the four invariants that make freeing heap under a
+running server safe), and FAIL-CLOSED: a banner that cannot be sent drops
+the connection rather than authenticating without the notice. Its UTF-8
+check is the new public `axl_utf8_validate()` in `axl-str.h`, which
+incidentally makes `axl-stream.h`'s years-old reference to that function
+true.
+
+**How `ssh(1)` renders it was MEASURED, not guessed** -- the audit's D9 row
+carried an [UNVERIFIED] sentence, and the first measurement proposed for it
+went through `sshd`, which is circular: it assumes the very thing it would
+be checking. Against AxlSsh itself, with ssh's stderr captured to a FILE and
+read with `od -c` (OpenSSH 9.9p1, two locales, four log levels): TAB, LF and
+CR pass through unchanged, every other control byte becomes a
+four-character octal escape, non-ASCII survives only under a UTF-8 locale, a
+banner with no final newline leaves its last line unterminated, and both
+`-q` and `LogLevel=ERROR` suppress the banner. Those are the two sentences in
+the docstring that were placeholders, and `test-ssh-policy-qemu.sh`
+re-measures them on every suite run rather than leaving them a claim made
+once.
+
+**The first version of that last clause said "prints nothing at all", and
+the review measured it FALSE.** The render cells use a SUCCEEDING publickey
+login, so at `-q` and at `LogLevel=ERROR` they capture nothing -- and nothing
+cannot tell "ssh withheld the banner" from "ssh had nothing to say". Re-run
+against a login the server DENIES, same boot, same server: the default level
+gives 158 bytes (banner, then `Permission denied`), `LogLevel=ERROR` gives 58
+bytes (the error alone -- the banner gone, the error kept), and `-q` gives 0.
+Three cells were added for exactly that, with the default-level one as the
+control that proves a failing login is sent a banner at all. A textbook
+"empty is not an answer unless you know the question was asked", caught by a
+reviewer rather than by the test that was supposed to be the measurement.
+
+**`test-ssh-policy-qemu.sh` is new, and it is a file of its own for a
+reason.** `test-ssh-auth-qemu.sh` sits exactly on the shipped per-source
+penalty threshold, by its own long comment; D4 needs two connections that
+spend a whole cap and D9 needs one per measurement cell, and the first
+extra failing connection there would be REFUSED at accept and fail with a
+`kex_exchange_identification` transcript that has nothing to do with what
+it was testing. The new file exempts the one address every forwarded
+connection arrives from, so penalties never enter into it.
 
 ### Persistent-guest test runner — *(proposed 2026-08-21; NOT started)*
 **This does NOT want SSH**, and that separation is deliberate: the harness needs
@@ -1113,6 +2335,242 @@ never by path.
 
 ## Open backlog
 
+- [ ] **Upstream EDK2 defect: TerminalDxe's non-UTF-8 terminals print a
+  character's LOW BYTE (2026-10-10).** A VT100-family serial terminal (VT100,
+  VT100+, PC-ANSI, TTY-Term, Linux, XtermR6, VT400, SCO) is sent, for a
+  non-ASCII UCS-2 character, its low byte whenever that byte is printable
+  ASCII, and `?` only otherwise: `TerminalConOut.c` truncates first
+  (`GraphicChar = (CHAR8)*WString;`, line 233 in edk2-stable202505, the same
+  in 202408) and then tests the TRUNCATED byte with `TerminalIsValidAscii()`
+  (line 235) -- the CHAR16 parameter never sees 0x4E2D. So U+4E2D goes out as
+  `-`, U+65E5 (0xE5) as `?`. Seen on aa64 (ArmVirtQemu's serial console is
+  VT100) by the console-visual `wide` case, which now uses U+65E5 U+6587 so
+  its oracle shows `?` as `sshd` does; a real user of such a terminal sees
+  wrong ASCII where the firmware means a CJK character. Not ours to fix
+  here: report upstream (the fix is to test `*WString` before the cast).
+  AXL's own encoder sends `?` for every such codepoint on a
+  one-cell-per-codepoint console.
+
+- [ ] **AxlSsh P4c follow-ups (2026-10-09).**
+  - TcpDxe's behaviour toward a client that genuinely advertises a tiny
+    receive window is **untested**. QEMU's user network always shows the
+    guest a 65535 window whatever the peer does, so no test has made the
+    guest's TCP face a small one (`stall-investigation.md` in the P4c
+    workspace: guest-side windows stayed 65535 and TcpDxe's persist timer
+    never ran). Real-client impact: none measured.
+  - A channel flush that re-defers itself would cost about 100 wake-ups a
+    second, and the zero-window idle-CPU check cannot see it: deferred work
+    runs once per 10 ms loop tick, so the sabotage read 14-19 milli-cores
+    against the 500 limit. The check does catch a flush that polls every
+    loop iteration (996-997 milli-cores); the first shape would need a
+    wake-up count to be seen.
+  - **The ~24 s delivery stall seen with `ssh-peer.py --rcvbuf 4096` is a
+    host-loopback artifact, not an AxlSsh or TcpDxe defect** -- recorded so
+    nobody rediscovers it. A 4 KiB receive buffer on the peer caps the
+    Linux sender's MSS at 2048 and the peer's window at 2028, and Linux then
+    sends only on its ~200 ms probe timer (102 steps of +2028 bytes). It
+    reproduced with the x11 flood (10 of 12 runs with a 4096 buffer and a 2 s
+    hold), never with default buffers (0 of 29) or `--rcvbuf 8192` (0 of 3);
+    the guest finished sending within about 1.3 s even in stalled runs.
+    `--rcvbuf` is kept in `ssh-peer.py` for experiments, used by no test.
+  - From the final review, deferred as non-blocking: `src/net/README.md`
+    says twice that other channel types stay refused, and states the
+    NUL-in-exec/TERM and second-`pty-req` rules without the header's
+    "before the start" and "with a pty hook" qualifiers; a session
+    connection parked at the parse gate is handed its resume turn only with
+    no AUTHENTICATION hook of any connection on the stack
+    (`on_reply_timer`'s `hooks > 0` test), a latency coupling sshd does not
+    have -- exempt `ST_SESSION` there or document it; `chan_flush_lost`
+    stays set when `chan_schedule` finds no work, so the reaper re-calls it
+    every tick (harmless; clear it at the top of `chan_schedule`).
+
+- [ ] **AxlSsh P4d follow-ups (2026-10-09).**
+  - **The chacha nonce is a 64-bit counter where OpenSSH wraps at 32 bits**
+    (`axl-ssh-crypt.c`, `pump`'s `seq` comment; sshd's `seqnr` is a `u_int32_t`
+    that wraps, `packet.c`). On a NON-strict connection no NEWKEYS resets the
+    sequence, so after 2^32 packets the two nonces diverge and the connection
+    dies with a bad MAC. Not wrapping was deliberate before rekey existed
+    (a wrap meant nonce reuse); the 2^31-packet rekey now guarantees a key
+    never sees one, so wrapping like OpenSSH is safe to do.
+  - Deferred from the hostile-suite review, in `ssh-peer.py`:
+    `verify_reply` does not pin the host key to the first exchange's
+    (ssh(1) re-verifies every exchange; add `peer: host key changed`). The
+    rest of that list closed in P4e: the flood-writer deadlock is fixed
+    (and selftested), and the `Rekey.ours_first` comment is corrected.
+    Also closed: P4d's untested input-pause-during-rekey half, now proven
+    for a PEER-started `KEXINIT` waiting behind a pause; a SERVER-started
+    rekey cannot coexist with a pause, because its replies go to the held
+    queue and the output queue never reaches the pause mark.
+  - The rekey suite's allocation test sees only 1 of 9 server-started
+    exchanges holding output (most start from the read-side trigger, after
+    the client's WINDOW_ADJUST). If it falls to 0 the PRECONDITION fails
+    loudly; a wider margin needs a bigger flood or a fixture write path that
+    does not wait on writable.
+  - `chan_schedule` in `rekey_our_newkeys` is redundant by construction
+    (`on_sent` reschedules whenever a completion leaves the queue under
+    `TXQ_LOW`) and no test can see its removal. Kept, with a comment, as the explicit resume point.
+
+- [ ] **AxlSsh P4e follow-ups (2026-10-10).**
+  - **Session-suite headroom.** `test-ssh-session-qemu.sh` (est 210) and
+    `test-ssh-hostile-qemu.sh` (est 204) already exceed the 200 s ceiling
+    applied to new suites; the idle suites declare 190 and 185 against
+    measured 175 s and 172 s, so none of the four has room to grow.
+  - **The x64 wall-clock budget** (95 s) in `verify.sh` is exceeded under
+    contention (96-155 s, 0 assertion failures; 62 s alone).
+  - **K_S pin, the P5 entry criterion.** `ssh-peer.py` does not pin the host
+    key across exchanges (above); P5 is host-key persistence.
+  - **The x86 TSC frequency, what calibration cannot fix.** The fixed
+    per-Stall bias is gone and the fast side bounded to 2 % (the clock reads
+    0.999-1.002 idle, 0.989-1.000 under 12 burners, where it read
+    0.993-0.995 and as low as 0.22), so the
+    calibration work does NOT supersede the two items left open with it: a
+    CPUID 0x15/0x16 (bare metal) or 0x40000010 (hypervisor) fast path that
+    reads the frequency instead of measuring it, and re-validating a
+    published frequency -- one disturbed first calibration still sets the
+    clock for the whole boot.
+  - **`task-pool-mp`'s root cause** is still unknown: it failed once in CI
+    ("slot reclaim: cycle=19 workers=2 expected=3"), did not reproduce in
+    21 runs, and its grep now names the cause next time.
+  - Deferred from the reviews: a library line that times an input pause (the
+    paused-half-close scenarios read the fill from a 2 s quiet period and
+    the pause span from the host clock; adding the line touches one the
+    admission suite parses); `bytes_ms` and the `resume_due` term of the
+    input-held set are pinned by unit tests or not at all (spec §12a.5);
+    `run-integration.sh`'s cache keyed on no host helper script (fixed
+    2026-11-09, see the `run-integration.sh` entry below).
+
+- [ ] **OWNER DECISION — `axl_loop_run` returns -1 on ANY quit (found
+  2026-09-29).** `axl_loop_quit` and the Ctrl-C path both set
+  `quit_requested`, and the loop returns `quit_requested ? -1 : 0`, which
+  contradicts its own doc ("0 on normal exit, -1 on Ctrl-C") and has since
+  `8e023281` (Phase M4). `axl_http_server_run` passes it through. Fixing it
+  changes what every caller sees, so it is the owner's call: fix the code to
+  the doc, or the doc to the code.
+
+- [ ] **Timing checks that fail only under 6-way concurrent `verify.sh`
+  (2026-09-29; all pass run alone).** aa64 unit `loop: a busy source added
+  mid-tick extends that same tick` (a thin margin, flagged in its own
+  review: widen or re-anchor it); the x64 wall-clock budget (95 s) is
+  routinely 98-107 s under contention (101-104 s in P4d's full
+  `verify.sh` runs, 0 failures each time, 56-66 s run alone). The x64 `console read_key` early
+  return is its own entry below, and recurred the same day.
+  `test-http-throughput-driver-qemu.sh` joined them 2026-10-08: in a full
+  suite (10 workers) beside another session's mutation run, host load 9-11,
+  x64 GETs took 1.3-2.3 s against its 2.0 s bound and idle CPU read 0.072
+  against 0.07, on both attempts; run alone three times it passed 7/0 at
+  0.39-0.57 s, tracking the load. Its bounds are tight for a loaded box.
+
+- [ ] **Driver-mode single 1 MiB GET may land one 50 ms tick later since the
+  AxlTcp bounce buffer (2026-09-29).** 8 samples: 5 at 0.39 s and 3 at
+  0.34 s after, against 2 and 6 before. Re-measure with enough samples to
+  tell a shift from noise before calling it either way.
+
+- [ ] **AxlHttp, pre-existing, found during P4b's AxlTcp work.** Pipelined
+  keep-alive GETs get only the FIRST response (RFC 9112 §9.3.2 requires
+  every one, in order). A 16 KB pacing chunk with a multi-client WebSocket
+  broadcast stalls 1.6-2.6 s, cause unknown (the shipped 8 KB chunk does
+  not). `EFI_SIMPLE_NETWORK_RECEIVE_FILTERS.MCastFilter` carries a spec typo
+  that needs a manifest override.
+
+- [ ] **`run-integration.sh` (2026-09-29).** `--shard i/K` is 0-based and
+  accepts `i = K`, which runs an empty shard and exits 1 -- reject it.
+  (Its cache keying on no host helper script -- `ssh-peer.py`,
+  `ssh-hostile.py` -- is FIXED 2026-11-09: the key hashes the whole harness
+  by glob, `_tc_harness_files` in `test/integration/lib/test-cache.sh`.)
+
+- [ ] **Untested by design, stated in their commits (P4b round).** The
+  socket AxlTcp deliberately leaks when the firmware fails to release it
+  (no seam reaches that failure); AxlHttp's WebSocket-upgrade OOM path; the
+  `ws_out_on_sent` / `on_tls_handshake_data` / `on_accept_ready` dispatch
+  wrappers under a server free from inside a handler. Each needs a seam
+  before it can have a test.
+
+- [ ] **DO NOT DISMISS — a timed wait at raised TPL returned EARLY, once
+  (2026-09-18). Needs an owner.** During Task P's gate, one `verify.sh` run
+  failed `console read_key: honored the timeout at TPL_CALLBACK (raised-TPL
+  WaitForEvent fallback waited, not instant-fail)` (`test/unit/axl-test-io.c`,
+  `test_console_read_key_raised_tpl`): a 40 ms `axl_console_read_key` at
+  `TPL_CALLBACK` must take at least 20 ms, and it took less. It passed on the
+  immediate re-run.
+  - **What is ruled out: the change under test.** `AxlTestIO.efi` built from
+    that change was BYTE-IDENTICAL to the one built at its parent, `.text`,
+    `.data` and `.rodata` included — no SSH code is in that binary at all.
+  - **What is NOT ruled out: a real defect.** Returning EARLY is the wrong
+    direction for host load to push a wait — load makes a wait late, never
+    short. That points at the firmware's tick catching up (a burst of timer
+    interrupts delivered at once after the vCPU was descheduled, advancing
+    the clock the wait measures from faster than wall time), or at the
+    raised-TPL `CheckEvent` sweep seeing the timer event signalled early.
+    `verify.sh` was running both arches, lint and docs concurrently at the
+    time, which is exactly when a vCPU gets descheduled.
+  - **To capture it next time**, before re-running: keep the serial log
+    (`TEST_KEEP_LOG`), note the host load, and record `elapsed` itself — the
+    test prints only pass/fail, so a second occurrence would say no more than
+    this one did. Printing the measured `elapsed` on failure is the cheapest
+    first step.
+  - **Recurred 2026-09-29** under the same conditions (six-way concurrent
+    `verify.sh`), and passed twice run alone at load 9.9. A SHORTER-than-real
+    elapsed under contention points at the x64 monotonic clock's TSC
+    calibration having been taken on a starved vCPU.
+
+- [ ] **Console log timestamps go backwards within a second — now that an
+  audit log is read by them, revisit (seen 2026-09-20).** Two lines from
+  one hostile run's kept guest serial log, the second written after the
+  first:
+  `04:00:04.841566 [INFO]  ssh: Accepted password ...` then
+  `04:00:04.151361 [INFO]  ssh: maximum authentication attempts exceeded ...`
+  (two more in later runs: `03:00:43.795395` then `03:00:43.174371`, and
+  `04:34:43.941378` then `04:34:43.141115`). **It is a documented trade-off,
+  not an unknown:** `print_console_timestamp` (`src/log/axl-log.c`) takes
+  HH:MM:SS from the RTC and the fraction from the monotonic counter, whose
+  epoch is unrelated, and its comment calls that acceptable "for
+  human-eyeball debugging", pointing machine ordering at the ring handler's
+  `AxlLogEntry.timestamp`. What changed is the reader: the SSH audit log
+  (2026-09-20) is read on the console by an operator reconstructing the
+  ORDER of events, and a fraction that runs backwards inverts it. Options,
+  none chosen: derive the fraction from the same source as the seconds
+  (sub-second RTC is 0 on most firmware), anchor the monotonic fraction to
+  the RTC second at each tick, or print monotonic time alone. Out of scope
+  for the SSH work that noticed it.
+
+- [ ] **Doubled log domain prefixes (seen 2026-09-20).** A message that
+  starts with its own `AXL_LOG_DOMAIN` prints it twice, e.g.
+  `[ERROR] ssh: ssh: refusing to listen with no way to authenticate`
+  (`src/net/axl-ssh-server.c`, seven `axl_error("ssh: ...")` calls under
+  `AXL_LOG_DOMAIN("ssh")`). The Ed25519 glue's two
+  (`ed25519: ed25519: SHA-512 failed ...`) were rewritten on 2026-09-20 for
+  other reasons and no longer do it. A sweep for `axl_*("<domain>: ` against
+  each file's domain, and a gate once it is clean, would stop it
+  recurring; out of scope for the SSH work that noticed it.
+
+- [ ] **Refused SSH connections take ~520 ms on x64 only — diagnose (seen
+  2026-09-18, Task P).** `test-ssh-hostile-qemu.sh`'s penalty knocks are
+  refused by an RST from `on_accept`, and the peer's view of one refusal is a
+  median of ~20 ms on BOTH arches unloaded. On x64 only, a share of them
+  take ~520 ms; on aa64 none ever has (worst 20 ms), under the same user
+  network.
+  - **The platforms differ in more than the arch.** x64 runs q35 under KVM
+    with an e1000 NIC, whose UEFI driver is QEMU's iPXE option ROM
+    (`efi-e1000.rom`). aa64 runs TCG with virtio-net-pci
+    (`scripts/axl-common.sh`, `_test_nic_device` in `common-test.sh`).
+  - **Why it is NOT AxlSsh's close cap:**
+    - The ssh-level refusal that runs first, with nothing queued ahead of
+      it, already took 550 ms in one run.
+    - The guest's heartbeat kept exact pace through them under six
+      suite workers (4 ticks in 8.5 s, over 26 knocks).
+    - The cap would show ~1.01 s, not 520 ms, and it can only stall AFTER
+      the RST is on the wire.
+    - EDK2 completes an abortive close synchronously inside `Close()`.
+  - **Working hypothesis:** QEMU's user network does not act on the first
+    RST from this NIC path and closes the host side on its own 500 ms slow
+    timer.
+  - **Any one of these settles it:**
+    - a packet capture during the knocks (`-object
+      filter-dump,id=f0,netdev=net0,file=...`), looking for two RSTs ~500 ms
+      apart, or an RST followed by nothing;
+    - the same knocks on x64 with virtio-net, and on x64 without KVM;
+    - one-off guest timestamps around `axl_tcp_close` in the refusal branch.
+
 - [ ] **Cut a release without spending 15 minutes of a human's attention.**
   Two releases were cut on 2026-09-02 and each one blocked Mike for most of
   its duration. Measured, so the next attempt optimises the right thing:
@@ -1271,7 +2729,9 @@ Grouped, terse; **detail lives in the linked design doc or
   entry below ever happens.
 
 - **CMake as THE build system, replacing the Makefile** —
-  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)**, **PROPOSED
+  **[AXL-Build-System-Design.md](AXL-Build-System-Design.md)** — **DONE
+  2026-11-09** (slices 1-6; §10.12). The paragraphs below are the 2026-08
+  proposal, kept as history: **PROPOSED
   2026-08-15, retargeted to 5.0.0 on 2026-08-16 — NOT STARTED.** A branch
   `worktree-cmake-build-system` is reserved but carries **zero** commits main
   does not have, and is 123 commits behind it (checked 2026-08-20). This entry
@@ -1458,9 +2918,178 @@ Grouped, terse; **detail lives in the linked design doc or
 - **SDK/test:** consumer build verification (axl-webfs / uefi-devkit) in
   `test-axl.sh`; migrate tools' inline hex parsers onto `axl_hex_parse_u64`.
 
+- [ ] **Remote GDB debugging of UEFI apps on real hardware, over SSH.**
+  *(Proposed 2026-09-17; not started; wants a design doc first. Transport,
+  decided 2026-10-11: the `sshd` tool gains a single-user debug mode -- e.g.
+  `sshd --gdb` -- that accepts one authenticated connection and one channel,
+  takes no console, refuses `shell`, and serves exactly one `exec` (`gdbstub`)
+  whose channel data is piped to the in-firmware stub. The library's `exec`
+  hook already exists; the shipped `sshd` refuses `exec` only because its
+  console is shared. Workstation side: `gdb -ex 'target remote | ssh -p 2222
+  admin@bmc gdbstub'`.)* Attach a stock `gdb` from a workstation to a
+  UEFI app running on a physical machine — breakpoints, single-step,
+  registers, memory, backtrace — reached over SSH, with no debug probe, no
+  serial cable and no QEMU.
+
+  **What the tree has, and why it stops at QEMU.** `docs/DEBUGGING.md` already
+  documents GDB against QEMU, and none of that tooling transfers to a physical
+  box. Two library calls do:
+
+  | in tree | gives | on real hardware |
+  |---|---|---|
+  | `run-qemu.sh --gdb` / `--gdb-halt` | a GDB stub | it is QEMU's own stub; a physical machine has none |
+  | `scripts/gdb-syms.py` (`axl gdb-syms`) | image load addresses for `add-symbol-file` | scrapes OVMF DEBUG's debugcon `Loading driver at` lines, which production firmware never prints |
+  | `axl_cpu_register_exception` (`src/util/axl-cpu.c`) | a typed register snapshot on a CPU exception | **works, with a gap.** Single-step arrives as `AXL_CPU_EXCEPTION_DEBUG` (#DB), and an aa64 `brk` under the `SYNCHRONOUS` umbrella — but **x64 has no breakpoint kind**: the enum goes `DEBUG` (vector 1) to `OVERFLOW` (vector 4), skipping #BP (vector 3), so an `int3` cannot be registered today |
+  | `axl_efi_find_config_table` (`include/axl/axl-runtime.h`) | one-call lookup of a UEFI configuration table | **works** — its own docstring names `EFI_DEBUG_IMAGE_INFO_TABLE_GUID`, so finding the loaded-image table on target is already done; nothing walks the table yet |
+
+  **Prior art — borrow mechanisms, port nothing** (EDK2 items checked in the
+  local tree):
+
+  | | offers | take from it |
+  |---|---|---|
+  | EDK2 `SourceLevelDebugPkg` — `DebugAgent` with serial, USB and USB3 debug transports | a firmware-resident debug agent on real hardware | the transport lesson: its channels are polled, because nothing event-driven runs while the target is stopped. It speaks Intel's UDK debug protocol rather than GDB's, so it needs Intel's host bridge |
+  | EDK2 `BaseTools/Scripts/efi_gdb.py` and `efi_debugging.py` | a GDB extension that finds loaded images | it walks `EFI_DEBUG_IMAGE_INFO_TABLE` instead of parsing log lines — the mechanism that works on any conforming firmware, and what should replace `gdb-syms.py`'s debugcon scrape |
+  | GDB's remote serial protocol, attached through a command | `gdb` speaks it over any command's stdin and stdout | pointed at `ssh admin@bmc gdbstub`, it rides an SSH `exec` channel — so no port forwarding is needed, and the AxlSsh spec's no-forwarding non-goal survives |
+  | Windows KDNET | kernel debugging over a NIC while the kernel is halted | proof a polled network path under a stopped target is buildable — and its cost: a dedicated polled NIC driver separate from the OS network stack |
+
+  **The hard part, so a design starts from it: a stopped target does not run
+  its transport.** SSH rides on `AxlLoop` event dispatch and `AxlTcp`. A
+  breakpoint that parks the CPU inside an exception handler stops both — and on
+  a SoftBMC box the server and the debuggee share that CPU — so the stop reply
+  cannot be sent and `continue` cannot arrive. Two directions to spike before
+  designing:
+
+  - **Cooperative stop**, for code at `TPL_APPLICATION`: the exception callback
+    does not hold the CPU; it diverts the debuggee into a parking routine that
+    keeps events dispatching, so the loop and the SSH session keep running while
+    the app is logically paused. Small, and plausibly enough for *apps*; no use
+    for code at raised TPL or inside the firmware core.
+  - **A polled channel for true stop-the-world**: SSH stays the authenticated
+    attach path, and the stopped-state conversation moves to a transport that
+    works with events dead — the EDK2 and KDNET answer. Much larger.
+
+  Which is sufficient depends on what must be debuggable — the app alone, or
+  whatever it calls into at raised TPL. That is the design doc's first question.
+
+  **Symbols are the other prerequisite on hardware.** Every shipped `.efi` is
+  built with `--strip-all`; its symbols live in the ELF `.so` it was converted
+  from, and a deployed image carries no build identity to match the two — the
+  same gap already recorded for decoding RSOD crash dumps.
+
+  **Likely needs its own UEFI DXE driver** — a resident boot-service driver, as
+  CrashHandler is — rather than a stub compiled into the app being debugged.
+  Four reasons, each from this tree:
+
+  - **Lifetime.** A stub inside the debuggee dies with it: its exception
+    handlers point into freed code the moment the app exits or is unloaded —
+    the same hazard CrashHandler's teardown guards against for its image-load
+    notify (`drivers/crashhandler/entrypoint.c`). A resident driver outlives
+    each app, can catch a fault on the app's way out, and can debug one app
+    after another.
+  - **It must be armed before the debuggee starts.** A breakpoint on an app's
+    entry point has to exist before `StartImage` runs it. A driver sees every
+    image as it loads through `axl_image_watch_loads` — which CrashHandler
+    already uses to keep its loaded-image table — and that also gives gdb each
+    image's load address as it appears.
+  - **The exception vectors have one owner, and the last registrant silently
+    wins.** `axl_cpu_register_exception` unhooks whatever already owns a vector
+    before installing its own handler (`src/util/axl-cpu.c:368-373`). A stub
+    must hold the breakpoint and single-step vectors for a whole session; a
+    debuggee that registers its own handlers through that API would silently
+    take them. A deliberately loaded driver can arbitrate that; a stub inside
+    the app cannot.
+  - **There is precedent to build from.** `drivers/crashhandler/` is already a
+    resident driver that hooks CPU exceptions through
+    `axl_cpu_register_exception`, tracks image loads, and publishes a sentinel
+    protocol so a second instance refuses to load. The thin-launcher plus
+    resident-driver pattern (`axl-shared-driver.h`,
+    `docs/AXL-Shared-Driver-Recipe.md`) covers exposing such a driver to a
+    separate client.
+
+  **It collides with CrashHandler, and that must be designed rather than
+  discovered.** CrashHandler claims exactly the vectors a debugger needs:
+  `AXL_CPU_EXCEPTION_DEBUG` (#DB, single-step) on x64, and on aa64 the
+  `SYNCHRONOUS` umbrella where a `brk` arrives. With both drivers loaded,
+  whichever registers last owns them — so a breakpoint could be written to
+  NVRAM as a crash, or a real crash swallowed by an idle debugger. Detaching
+  cannot simply hand the vectors back either: `axl_cpu_unregister_exception`
+  works by kind, not by handler, so a detach would also remove a handler some
+  other driver registered afterwards — the reason CrashHandler deliberately
+  never unregisters. The likely shape is that the debug driver owns the vectors
+  and passes every exception it did not cause on to CrashHandler, which needs an
+  explicit hand-off between the two; load order is not a design.
+
+  **Where the driver lives is open:**
+
+  - **Inside SoftBMC's resident driver.** SSH is already there and no protocol
+    boundary is needed. But SoftBMC itself could then not be debugged, and no
+    debugger would exist on a machine without SoftBMC.
+  - **A standalone debug driver publishing a protocol**, which SoftBMC's
+    `exec gdbstub` handler relays the remote-protocol bytes to. Usable without
+    SoftBMC, over serial too, and able to debug SoftBMC itself — at the cost of
+    a protocol boundary and one more image to deploy.
+
 ---
 
 ## Done / decided (one-liners, full detail in Archive)
+
+- **Removed: bundled iPXE** (owner decision, 2026-10-21). The tools
+  tarball no longer carries `drivers/<arch>/ipxe-all.efidrv`: it never
+  brought a NIC up in practice where the EDK2 USB-network drivers did, and
+  loading it takes the USB host controller from the firmware, so a USB stick
+  (BMC virtual media included) leaves the map. Removed: `scripts/build-ipxe.sh`
+  (upstream pinned at `df4eec8cfb4fda2b4bc1ce87fd101b80205c1e92`), the
+  Makefile's `ipxe` target and `release-drivers`' iPXE half, the
+  `make-uefi-tools-tarball.sh` staging and `--ipxe-optional`, `release.yml`'s
+  iPXE build, `third_party/ipxe/`, its `THIRD_PARTY.md` entry, the README's
+  GPL notice and section 3(b) written offer, and the iPXE section of
+  `test-efi-pack-release-qemu.sh`; and (ruling R32, after a real-hardware
+  sshd hang with Ctrl-C dead on a BMC console) `axl_net_ensure_drivers`'
+  silent "Phase 2" iPXE fallback, which loaded `ipxe-*.efi` from any volume
+  when its core list brought up no SNP -- the library never auto-loads iPXE
+  now (`test-net-no-ipxe-autoload-qemu.sh`). Its long-driver-path coverage moved to
+  `test-netload-qemu.sh` (`--_fwwin`, `--_log`) and AxlTestNet. Kept: AXL's
+  tolerance of an iPXE someone else supplies or the firmware contains
+  (`axl_net_driver_is_ipxe()`, the try-it-last order and watchdog disarm,
+  AxlTcp's iPXE-SNP pacing, `run-qemu.sh --nic-no-rom`). **The last commit
+  with the bundle is `dca94436`**, the parent of the removal commit, whose
+  subject is "Remove the bundled iPXE; the library never auto-loads iPXE"
+  (find it with `git log --grep`). To restore the bundle,
+  `git revert` that commit -- keeping R32, so the library still never
+  auto-loads it -- or restore the files above from `dca94436`; the releases
+  up to then that shipped the driver carried
+  a three-year GPL-2.0 section 3(b) offer for its source, which the pinned
+  upstream commit above satisfies.
+
+- **`%.*s` bound the terminator scan by precision, not after it**
+  (`c90887f6`, 2026-09-07) -- non-conforming (C99 7.21.6.1p8) and a real
+  out-of-bounds read: AxlFormat's `'s'` case scanned for a NUL
+  unconditionally and applied the precision afterward, so any caller
+  passing a bounded, unterminated buffer -- exactly what `%.*s` exists to
+  allow -- read past the end of it. Reproduced under AddressSanitizer
+  before a line changed. A census of the tree's 31 precision-bounded `%s`
+  call sites found 18 reading out of bounds, none in `src/`; the worst was
+  `tools/rfbrowse.c` scanning past a network-controlled HTTP body
+  allocated at exactly content-length. The engine fix closes all 18 with
+  no caller changed. **No output assertion can catch this** -- the
+  emitted bytes are `min(first_nul, prec)` whether the scan is bounded or
+  not -- so the regression guard is a new ASan fuzz harness
+  (`test/fuzz/format_fuzz.c`), not the QEMU unit suite.
+
+- **Two ways `verify.sh` reported green over a red gate** (`6ef18424`,
+  2026-09-07). (1) The DETAIL column counted `': clean'` lines in a job's
+  log regardless of its exit code, so a failing `make` job printed "N
+  gate lines clean" beside a `SOMETHING FAILED` footer; a `fail_detail()`
+  helper outside the per-job `case` now makes that structurally
+  impossible for any future gate. (2) `check-libc-overlap` graded
+  whichever of the staged and build archives existed first rather than
+  the freshest, so it reported clean over a real `explicit_bzero`
+  regression for roughly two weeks while `verify.sh` was reported ALL
+  GREEN more than once. Both were reproduced by sabotage before being
+  fixed. Three further instances of the same failure class turned up
+  while proving these two, including one inside the gate itself where a
+  weak definition in a later archive member silently erased a strong
+  one.
 
 - **Library log levels: the rule, the gate, and the sweep** (2026-08-14/15,
   shipped as v3.2.1 → v3.2.3) — a consumer moving its default to
@@ -1469,7 +3098,7 @@ Grouped, terse; **detail lives in the linked design doc or
   because `axl_mem_dump_leaks` returns void and the QEMU leak gate greps it),
   then 213 of 358 `axl_warning`. Census 138/358/1/169 → 138/145/1/382. The
   durable half is the rule in [AXL-Coding-Style.md](AXL-Coding-Style.md) "Log
-  Levels in Library Code" plus `make check-log-levels`, which requires a
+  Levels in Library Code" plus `gate.check-log-levels`, which requires a
   `/* log-level: */` marker rather than guessing from vocabulary. The
   discriminator is *can the caller observe this any other way?* — and it is one
   frame deeper than it looks, since a status can be checked by the immediate

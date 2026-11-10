@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=16 local-only=0
+# test-meta: arch=both needs= est=16 local-only=0 builds=pin-svc guest=none
+# guest=none: driver_path pins an image at fs0:\, which on a leased guest is
+#   not the test's disk: the path is the subject.
 # test-service-pin-path-qemu.sh — AxlServiceDeploy.driver_path pins the
 # driver image: exactly one file, no 4-path search, no embedded fallback.
 #
@@ -45,7 +47,7 @@ declare -A _ARCH_DIR_MAP=([X64]=x64 [AARCH64]=aarch64)
 _arch_dir="${_ARCH_DIR_MAP[$TEST_ARCH]:-x64}"
 NATIVE_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" \
     pin-svc 2>&1 | tail -2
 
 test_add_efi "$NATIVE_DIR/pin-svc-launcher.efi"      "pin-svc-launcher.efi"
@@ -81,8 +83,8 @@ echo "=== AxlServiceDeploy.driver_path pin ($TEST_ARCH) ==="
 test_build_qemu_cmd
 test_run_background
 
-if ! test_wait_for "PINSVC_DONE" 90; then
-    echo "FAIL: fixture did not finish within 90s"
+if ! test_wait_boot "PINSVC_DONE" 90; then
+    echo "FAIL: fixture did not finish within ${TEST_WAITED_S}s"
     test_clean_log; echo "--- Serial ---"; tail -50 "$TEST_CLEAN_LOG"
     exit 1
 fi

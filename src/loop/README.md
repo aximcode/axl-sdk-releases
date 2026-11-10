@@ -33,6 +33,21 @@ UEFI applications are single-threaded and event-driven. The event loop
 is the central dispatcher: it waits for events (timers, keyboard input,
 network I/O, custom events) and calls registered callbacks.
 
+## Dispatch Order
+
+Each iteration dispatches **one** signalled source. Selection is
+round-robin: every wait starts just past the source picked last, so a
+source that is ready on every iteration — a listener under a
+connection flood, or a callback that re-signals its own event — takes
+its turn and then waits behind every other signalled source, instead
+of winning each time. The loop's own events (the poll timer that
+drains keypress sources, the serial Ctrl-C check) take part in the
+same rotation. Without it both `gBS->WaitForEvent` and the
+non-blocking check favour the lowest-numbered source, and an
+always-ready source starves everything registered after it. The
+shell's Ctrl-C is checked before every wait regardless of order. No
+other ordering is promised.
+
 ## Basic Pattern
 
 ```c
@@ -275,7 +290,8 @@ accept-rearm state machine and connections start failing.
 
 The pre-built helper drains every signaled event per tick (capped
 at `2 × AXL_MAX_SOURCES` as a runaway guard; hitting the cap is
-logged). Per-tick drain is what matches the consumer's expected
+logged), in the round-robin order described under
+[Dispatch Order](#dispatch-order). Per-tick drain is what matches the consumer's expected
 contract — under HTTP load a recv-data callback synchronously
 submits `axl_tcp_send_async`, TCP4 typically completes the
 Transmit inline, and the tx-event needs to be drained the same
@@ -297,11 +313,93 @@ non-blocking-only. Don't call `axl_loop_iterate_until` with a
 non-zero timeout from inside a source callback — it would try to
 WaitForEvent at the wrong TPL.
 
-**What to do with slow work.** Break it up. Use
-`axl_defer_call_later` to schedule work for the next tick instead
-of running it inline. Use a one-shot timer if the work needs
-delaying. Either pattern lets `TPL_CALLBACK` drop back to the
-firmware between iterations so co-located drivers can progress.
+**What to do with slow work.** Break it up, and yield between the
+pieces with a one-shot timer (`axl_loop_add_timeout`): it fires no
+earlier than the firmware's next timer interrupt, so in most ticks
+`TPL_CALLBACK` drops back to the firmware between pieces and co-located
+drivers (MNP, TCP4) progress. Not in a tick that is idle-extended past
+that interrupt: there the timer is signalled mid-tick and the same tick
+dispatches it, while the firmware's own timers still wait. A driver
+budget of 0 (`axl_loop_set_driver_budget_ms`) is the strict yield.
+`axl_defer` (`<axl/axl-defer.h>`) is NOT a yield here: deferred work
+keeps a tick going like a busy idle source, so a
+chain of deferred pieces runs back to back for up to the tick's
+budget -- 5 ms of a busy foreground's tick by default, up to nine
+tenths of the period while the foreground waits. Use it to run work
+outside the callback that queued it, in the same tick.
+
+**Busy idle sources and the tick budget.** A tick normally ends at
+the first pass that finds nothing signalled. Deferred work queued in a
+pass (work a deferred callback defers) and a busy idle source
+(`axl_loop_add_idle_busy` -- AxlTcp's transmit pacer is the one in
+the library) keep it iterating for the loop's driver budget
+(`axl_loop_set_driver_budget_ms`, 5 ms by default), clamped to half
+the tick period so a busy foreground keeps the other half.
+
+When the tick finds the foreground *waiting* instead -- a Shell at its
+prompt, anything halted in `gBS->WaitForEvent` -- that half would only
+idle the CPU, so the tick uses the idle budget
+(`axl_loop_set_driver_idle_budget_ms`): by default nine tenths of the
+period, never past `AXL_LOOP_DRIVER_BUDGET_MAX_MS`. "Waiting" means
+waiting through both periods before the tick without running once, so
+a Shell that goes idle at its prompt extends from the third tick on.
+EDK2 signals its idle-loop event group from every idle pass of
+`WaitForEvent` and then halts the CPU. The loop notes each pass, at
+TPL_NOTIFY ahead of the halt, and each halt's end. A period is idle
+when the foreground was waiting at the tick that began it, every pass
+in it came at once after that tick or a halt ended, and the last halt
+ended in the interrupt that queued this tick. A tick queued behind the
+loop's own previous one, which ran into its interrupt, is no evidence
+either way -- the foreground never had the CPU -- so it does not extend
+and changes nothing, and an extended tick stops starting passes in time
+for the next one (the last pass's length predicts the next).
+Sampling only at tick instants is not enough: EDK2 fires every timer on
+its 10 ms system tick, so a renderer's wakes land on driver ticks, and
+an extension there runs before the renderer resumes. Measured with
+that rule, a renderer doing 4 ms of work per frame beside a 10 ms tick
+ran at half its frame rate; with this one it keeps all of it. On
+firmware that does not signal the group, or orders its members
+otherwise, every tick keeps the clamp.
+
+The two settings are separate on purpose: the driver budget bounds
+what a busy foreground loses, the idle budget bounds how late a
+waiting one answers (a GUI host promising keypress latency sets it
+low). A driver budget of 0 turns off all extension; an idle budget of
+0 only the idle one. Measured with sshd's 10 ms tick on x64 QEMU
+(RELEASE): a 16 MiB SFTP download went from 7.7 to 11.5 MB/s on
+e1000 and from 9.2 to 13.5 MB/s on virtio-net.
+
+### Ctrl-C belongs to the Shell
+
+A driver-attached loop does not intercept Ctrl-C unless you ask it
+to. A resident driver is not the foreground: the Shell's break is
+meant for whatever the Shell is running, and the Shell's script
+runner polls the same `ExecutionBreak` event between lines. Reading
+that event consumes it, so a tick that checked it every 10 ms would
+swallow every Ctrl-C sent to the Shell, from the keyboard, the
+serial line or a remote console. A quit would also stop the
+driver's loop for good, because the tick re-arms `running` but
+never clears the quit request.
+
+So with no explicit choice, a loop intercepts only in the
+foreground: an application image's loop that is not
+driver-attached. It leaves the break alone while driver-attached,
+and a loop created anywhere in a driver image leaves it alone too,
+attached or not. That covers the short-lived loop a synchronous
+call builds (`axl_wait_ms`, the sync TCP/UDP/DNS wrappers): the
+Shell's break would otherwise end it, and reading it would take the
+break from the Shell. The library's own break poll under long
+operations (file copies, sorts, digests, the sync HTTP client) is
+skipped in a driver image as well; it would otherwise also try to
+exit an image that cannot exit. Detaching an app's loop restores
+the foreground default. An explicit
+`axl_loop_set_intercept_break()` wins either way. Opting a driver
+loop in means the Shell's next Ctrl-C stops it from dispatching for
+the rest of its residency.
+
+The cost is deliberate: a driver whose entry point blocks in a
+synchronous wait cannot be aborted with Ctrl-C. Bound such waits
+with a timeout or an `AxlCancellable`.
 
 ### Cleanup
 
@@ -399,7 +497,11 @@ axl_defer_cancel(loop, handle);  // no-op if already fired
 
 The queue is a fixed-capacity ring buffer with no dynamic allocation
 in the hot path. Deferred work is drained automatically at the start
-of each loop iteration.
+of each loop iteration. Work queued after that drain -- by a deferred
+callback itself -- runs on the very next iteration: while any is
+queued, the loop only checks its events instead of waiting on them, so
+it is never held until the 10 ms poll tick. Under
+`axl_loop_attach_driver` the next iteration is the next driver tick.
 
 ## AxlPubsub
 

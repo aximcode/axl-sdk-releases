@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=95 local-only=1
+# test-meta: arch=x64 needs= est=95 local-only=1 guest=none
+# test-meta: builds=ARCH=x64,console-device-smoke,console-device-restore-smoke,console-device-wide-smoke,console-device-passthrough-smoke,console-device-input-smoke,console-device-input-restore-smoke,console-device-wide-restore-smoke,console-device-cycle-smoke,fbcon
+# guest=none: not converted yet (pool design §6.7 step 8 item 10):
+#   --debugcon, --screenshot and --sendkey, a machine no class gives.
 # test-console-device-fbcon-qemu.sh — fbcon's rendering pipeline: a taken-over shell rendered as a cell grid, typing
 #
 # fbcon's rendering pipeline: a taken-over shell rendered as a cell grid, typing
@@ -18,7 +21,7 @@
 #
 # Ratchet-exempt (end-to-end scenario, not a unit binary's assertion count).
 #
-# Usage: [OVMF_CODE=/path/DEBUG/OVMF_CODE.fd OVMF_VARS=...] \
+# Usage: [AXL_OVMF_DEBUG_DIR=/path/to/DEBUG/FV] \
 #            ./test/integration/test-console-device-fbcon-qemu.sh [--arch X64]
 
 CD_NAME="console-device fbcon render test"

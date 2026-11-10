@@ -24,7 +24,7 @@
  * connection that `axl_service_main` packages internally.
  *
  * Build (in-tree):
- *     make service-demo-custom
+ *     scripts/axl-build.sh service-demo-custom
  *     # → service_demo_custom.efi + service_demo_custom-dxe.efi
  *
  * Build (consumer):
@@ -125,7 +125,7 @@ AXL_SERVICE_DRIVER(service_demo_custom);
 
 /* Foreground compile: hand-written main() with custom verb tree.
    The driver blob is embedded by `axl-cc --service` (or the
-   in-tree Makefile via EMBED_BLOB) under the symbol
+   in-tree build via axl_embed_blob) under the symbol
    axl_embedded_service_demo_custom. */
 AXL_EMBED_DECLARE(service_demo_custom);
 

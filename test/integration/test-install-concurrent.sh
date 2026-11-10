@@ -1,15 +1,15 @@
 #!/bin/bash
-# test-meta: arch=none needs= est=48 local-only=0
+# test-meta: arch=none needs= est=60 local-only=0
 # test-install-concurrent.sh — two install.sh runs do not build into one tree
 # at the same time.
 #
-# THE DEFECT. install.sh always builds into out/native-<arch>-release,
+# THE DEFECT. install.sh always builds into build/<arch>-release,
 # REGARDLESS of --prefix: --prefix says where to stage, not where to build.
 # Three integration tests invoke install.sh (test-jose-cc-qemu,
 # test-install-idempotent, test-host-deps-minimal), so under -j8 all three aim
-# `make -j$(nproc)` at the SAME tree. There is now exactly ONE tree -- the
+# a parallel build at the SAME tree. There is now exactly ONE tree -- the
 # AXL_TLS suffix is gone -- which makes that collision MORE likely, not less.
-# Two makes writing one target set is not safe: the observed symptoms are a
+# Two builds writing one target set is not safe: the observed symptoms are a
 # partial archive and "the input file ... is empty" from objcopy.
 #
 # It is not theoretical and it is not rare enough to ignore: test-jose-cc
@@ -57,10 +57,13 @@ command -v flock >/dev/null || {
     # Balanced SKIP count -- see feedback_balancer_count.
     for m in "install.sh names its build-tree lock" \
              "install.sh WAITS while another holds the build-tree lock" \
-             "install.sh proceeds once the lock is released"; do
+             "install.sh proceeds once the lock is released" \
+             "the staged copy happens inside the build-tree lock" \
+             "no scratch file is left in the prefix" \
+             "a symlinked destination is replaced"; do
         echo "SKIP: $m (flock not available)"
     done
-    echo; echo "install-concurrent: 0 passed, 0 failed, 3 skipped"; exit 0
+    echo; echo "install-concurrent: 0 passed, 0 failed, 6 skipped"; exit 0
 }
 
 # 1. install.sh must expose the lock path it will take, so a caller (and this
@@ -146,6 +149,58 @@ else
     tail -8 "$WORK/inst.log" | sed 's/^/      /'
 fi
 INST_PID=""
+
+# 4. The COPY is serialised too, not only the build. The staged libraries are
+#    copied out of the same tree the lock protects, so releasing it between
+#    the build and the copy let one install copy a half-written archive while
+#    another rebuilt that tree. AXL_INSTALL_TRACE records the lock's events in
+#    order; the copy must land strictly inside the lock.
+: > "$WORK/trace"
+if AXL_INSTALL_TRACE="$WORK/trace" "$PROJECT_DIR/scripts/install.sh"         --arch x64 --prefix "$WORK/sdk2" >"$WORK/inst2.log" 2>&1; then
+    got=$(tr '\n' ' ' < "$WORK/trace" | sed 's/ $//')
+    if [[ "$got" == "lock x64 build x64 copied x64 unlock x64" ]]; then
+        pass "the staged copy happens inside the build-tree lock ($got)"
+    else
+        fail "lock events out of order: '$got' (want 'lock x64 build x64 copied x64 unlock x64')"
+    fi
+else
+    fail "traced install failed"
+    tail -8 "$WORK/inst2.log" | sed 's/^/      /'
+fi
+
+# 5. Every changed file lands by RENAME, so a reader -- a test linking from
+#    the stage while another install refreshes it -- sees the old file or the
+#    new one, never a partial one. That is by construction, not a race this
+#    can force; what is checked is that the scratch files it renames from
+#    never survive an install.
+left=$(find "$WORK/sdk2" -name '*.axl-tmp.*' 2>/dev/null | head -3)
+if [[ -z "$left" && -f "$WORK/sdk2/lib/axl/x64/libaxl.a" ]]; then
+    pass "no scratch file is left in the prefix, and the archive landed"
+else
+    fail "scratch left or archive missing: ${left:-<archive missing>}"
+fi
+
+# 6. A SYMLINKED destination is replaced, never written through: the old
+#    `install -C` did that (it compares with lstat), and following the link
+#    would chmod -- or overwrite -- whatever it points at, which can be a file
+#    in someone's source tree.
+stagedobj="$WORK/sdk2/lib/axl/x64/axl-reloc.o"
+if [[ -f "$stagedobj" ]]; then
+    cp "$stagedobj" "$WORK/linktarget"
+    chmod 600 "$WORK/linktarget"
+    rm -f "$stagedobj"
+    ln -s "$WORK/linktarget" "$stagedobj"
+    if "$PROJECT_DIR/scripts/install.sh" --arch x64 --prefix "$WORK/sdk2" \
+            >"$WORK/inst3.log" 2>&1 \
+       && [[ ! -L "$stagedobj" && -f "$stagedobj" ]] \
+       && [[ "$(stat -c %a "$WORK/linktarget")" == 600 ]]; then
+        pass "a symlinked destination is replaced, its target left alone"
+    else
+        fail "symlink destination: link=$( [[ -L "$stagedobj" ]] && echo yes || echo no) target mode=$(stat -c %a "$WORK/linktarget")"
+    fi
+else
+    fail "no staged axl-reloc.o to test the symlink case with"
+fi
 
 echo
 echo "install-concurrent: $PASS passed, $FAIL failed"

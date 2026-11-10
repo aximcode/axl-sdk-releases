@@ -238,8 +238,9 @@ print_device_strings(
 
 /* Default Linux lsusb shape: one row per device, identifying it by
    bus + (synthesized) address. Verbose adds class triplet under
-   each interface plus per-device strings. */
-static void
+   each interface plus per-device strings. Returns the number of
+   devices listed (after filters). */
+static size_t
 list_default(
     void
     )
@@ -248,6 +249,7 @@ list_default(
     uint8_t      prev_bus = 0;
     uint8_t      prev_addr = 0;
     bool         have_prev = false;
+    size_t       shown = 0;
 
     while ((u = axl_usb_next(u)) != NULL) {
         uint16_t vid = 0;
@@ -298,10 +300,14 @@ list_default(
             }
         }
 
+        if (device_changed) {
+            shown++;
+        }
         prev_bus  = u->bus;
         prev_addr = u->addr;
         have_prev = true;
     }
+    return shown;
 }
 
 /* Tree view: walk the real USB hub-port chain via
@@ -318,6 +324,7 @@ typedef struct {
     uint8_t  prev_bus;
     uint8_t  prev_addr;
     bool     have_prev;
+    size_t   shown;      ///< devices rendered (after filters)
 } TreeRenderCtx;
 
 static int
@@ -363,6 +370,7 @@ tree_render_cb(
             }
         }
         axl_printf("\n");
+        t->shown++;
     }
 
     /* Per-interface row, indented one level past the device row. */
@@ -383,13 +391,33 @@ tree_render_cb(
     return 0;
 }
 
-static void
+/* Sets *shown to the number of devices rendered (after filters).
+   Returns AXL_ERR when the USB enumeration itself failed. */
+static int
 list_tree(
-    void
+    size_t  *shown
     )
 {
     TreeRenderCtx ctx = { 0 };
-    axl_usb_tree_for_each(tree_render_cb, &ctx);
+    if (axl_usb_tree_for_each(tree_render_cb, &ctx) != AXL_OK) {
+        return AXL_ERR;
+    }
+    *shown = ctx.shown;
+    return AXL_OK;
+}
+
+/* axl_usb_tree_for_each callback that only counts interfaces. */
+static int
+count_cb(
+    AxlUsbAddr   addr,
+    unsigned     depth,
+    void        *ctx
+    )
+{
+    (void)addr;
+    (void)depth;
+    (*(size_t *)ctx)++;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -482,10 +510,50 @@ run_lsusb(
         return 1;
     }
 
+    /* Count the interfaces through the tree walk rather than
+       axl_usb_next(): the walk's status tells a failed enumeration
+       apart from an empty one, which axl_usb_next()'s NULL cannot. */
+    size_t interfaces = 0;
+    if (axl_usb_tree_for_each(count_cb, &interfaces) != AXL_OK) {
+        axl_printf("lsusb: cannot enumerate USB devices\n");
+        return 1;
+    }
+
+    /* Say why the listing is empty rather than printing nothing:
+       "no controller" and "a controller with nothing on it" both
+       enumerate nothing, so count the controllers to tell them
+       apart. Asked only when there is no device, so a firmware whose
+       controller lacks USB2_HC still lists what it enumerated.
+       Neither note is an error (exit 0), and the usb-ids tip below
+       would be noise after either. */
+    if (interfaces == 0) {
+        size_t controllers = 0;
+        if (axl_usb_host_controller_count(&controllers) != AXL_OK) {
+            axl_printf("lsusb: cannot enumerate USB host controllers\n");
+            return 1;
+        }
+        axl_printf("lsusb: %s\n", controllers == 0
+                                      ? "no USB host controller found"
+                                      : "no USB devices found");
+        return 0;
+    }
+
+    size_t shown = 0;
     if (opt_tree) {
-        list_tree();
+        if (list_tree(&shown) != AXL_OK) {
+            axl_printf("lsusb: cannot enumerate USB devices\n");
+            return 1;
+        }
     } else {
-        list_default();
+        /* axl_usb_next() has no failure to report once the walk
+           above succeeded: both read the same cached enumeration. */
+        shown = list_default();
+    }
+
+    /* Nothing listed although devices exist: a -d/-s filter matched
+       nothing. usbutils prints nothing and exits 1. */
+    if (shown == 0) {
+        return 1;
     }
 
     /* Tip: only suggest the user grab usb-ids.json5 when names are

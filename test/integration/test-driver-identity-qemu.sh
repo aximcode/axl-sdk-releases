@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=10 local-only=0
+# test-meta: arch=both needs= est=10 local-only=0 builds=driver,driver-identity-test guest=standard
 # Embedded/buffer-loaded driver image identity.
 #
 # A buffer load (gBS->LoadImage with DevicePath=NULL) leaves the loaded
@@ -14,7 +14,9 @@
 # image's device path + FilePath are non-NULL and render to text. The
 # startup.nsh then runs `dh -p <marker>` / `dh -v -p <marker>` against that
 # exact handle; this script asserts no Synchronous Exception and that the
-# rendered device path appears.
+# rendered device path appears. Its Shell commands are
+# test-driver-identity-qemu.nsh; under `axlpool run` they run on a pooled
+# guest instead of a boot.
 #
 # RED (before the fix): aa64 raises a Synchronous Exception and the
 # in-process device-path assertions FAIL. GREEN (after the fix): no
@@ -36,8 +38,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     driver driver-identity-test 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -45,20 +47,9 @@ test_add_efi "$NATIVE_DIR/driver.efi"
 test_add_efi "$NATIVE_DIR/driver-identity-test.efi"
 
 # Run the test app (loads driver.efi as a buffer, tags the image handle),
-# then inspect that handle from the shell. `dh -v` over the NULL device
-# path is what faults on aa64 before the fix.
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "driver-identity-test.efi"
-    echo "echo DH_PLAIN_BEGIN"
-    echo "dh -p A11CE5ED-1DE4-7E57-B00B-5FDA84D40001"
-    echo "echo DH_VERBOSE_BEGIN"
-    echo "dh -v -p A11CE5ED-1DE4-7E57-B00B-5FDA84D40001"
-    echo "echo DH_DONE"
-    echo "reset -s"
-} | test_set_startup
+# then inspect that handle from the shell (test-driver-identity-qemu.nsh).
+# `dh -v` over the NULL device path is what faults on aa64 before the fix.
+test_use_nsh
 
 test_build_image
 

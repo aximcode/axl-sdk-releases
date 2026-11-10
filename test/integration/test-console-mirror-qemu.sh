@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=9 local-only=0
+# test-meta: arch=x64 needs= est=9 local-only=0 guest=standard
 # test-console-mirror-qemu.sh — AxlConsoleMirror positive proof (P1/P2 core).
 #
 # Exercises the full mirror mechanism in its OWN QEMU boot: install (wrap gST
@@ -25,18 +25,14 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-echo Running console-mirror self-test...
-AxlTestNet.efi mirror-selftest
-NSHEOF
+# The startup commands live in test-console-mirror-qemu.nsh.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh
 
 test_build_image
 
@@ -48,8 +44,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID"
 echo "  Waiting for self-test to finish..."
 
-if ! test_wait_for "MIRROR_SELFTEST_DONE" 60; then
-    echo "FAIL: self-test did not finish within 60 seconds"
+if ! test_wait_boot "MIRROR_SELFTEST_DONE" 60; then
+    echo "FAIL: self-test did not finish within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -40 "$TEST_CLEAN_LOG"
     exit 1
@@ -85,6 +81,13 @@ check stderr_restore      "distinct original StdErr restored exactly on uninstal
 check inject_up          "inject_text ESC[A -> Up scan 0x01"
 check inject_printable   "inject_text printable -> unicode key"
 check inject_key_f2      "inject_key(F2) round-trips via ConIn"
+check wrap_devices_untouched "a line exactly 80 wide: its break never reaches the physical devices (passthrough off)"
+check wrap_break         "a line exactly 80 wide: the mirror gets the wrap's CR LF, then a space and a backspace"
+if grep -qE "MIRROR_SELFTEST: wrap_devices=[1-9]" "$TEST_CLEAN_LOG"; then
+    pass "control: the wrap case found the physical devices to watch"
+else
+    fail "control: the wrap case found the physical devices to watch"
+fi
 
 if grep -q "MIRROR_SELFTEST_DONE PASS" "$TEST_CLEAN_LOG"; then
     pass "self-test overall PASS"

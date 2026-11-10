@@ -210,9 +210,39 @@ axl_checksum_reset(AxlChecksum *cs)
     }
 }
 
+/* A scrub the optimiser cannot elide -- see axl-pk-ed25519.c's copy for why
+   this is not axl_memset: a compiler may remove a memset to storage that is
+   dead afterwards, which is precisely the storage this is for. Duplicated per
+   translation unit rather than exported, by the reasoning recorded there. */
+static void
+secure_zero(
+    void   *p,  ///< buffer to scrub
+    size_t  n   ///< bytes to scrub
+)
+{
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n-- > 0) {
+        *v++ = 0;
+    }
+}
+
 void
 axl_checksum_free(AxlChecksum *cs)
 {
+    /* A digest context is sensitive BY CONSTRUCTION, whoever the caller is:
+       the algorithm state keeps the trailing partial block of the message
+       (each _final only pads from the write index up, so bytes below it
+       survive), and `digest`/`hex` keep the result. For an SSH key
+       derivation that trailing block is the ChaCha20 payload key and the
+       digest is the length key; for the exchange hash it is mpint(K), the
+       shared secret itself. HMAC and the JOSE/JWK paths have the same shape.
+
+       axl_free's fill is behind AXL_MEM_DEBUG, so without this a RELEASE
+       build hands all of that back to the UEFI pool intact -- and that pool
+       is later given to other DXE drivers and to the OS loader. */
+    if (cs != NULL) {
+        secure_zero(cs, sizeof *cs);
+    }
     axl_free(cs);
 }
 

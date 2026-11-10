@@ -25,6 +25,35 @@
     that connects mid-session with one self-contained burst — no consumer-side
     parallel parser to keep in sync. See `AXL-Console-Mirror-Design.md`.
 
+    **The terminal's cursor is followed, not asked.** The encoder tracks where
+    its output leaves the far terminal's cursor, so a move to where it already
+    is costs nothing, and it wraps at the console's right margin (CR LF after
+    the last column, as a UEFI console does) rather than leaving the terminal
+    in its deferred wrap. Known limits of that tracking:
+
+    - a TAB is one cell on a UEFI console, so it is sent as one space;
+    - any other control byte (besides CR, LF, BS and NUL) moves a terminal by
+      rules the console does not model: the position becomes unknown, the next
+      move is always sent, and until the next cursor move or clear the
+      terminal falls back to its own deferred wrap at the margin;
+    - how many cells a codepoint takes is the producer's cell rule
+      (@ref AxlConsoleOps::set_cell_rule, which the encoder binds). Under
+      @ref AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT -- the device and the tap, a
+      UEFI console, and the rule assumed until one is reported -- every
+      codepoint is one cell (GraphicsConsole widens a character only after a
+      WIDE_CHAR, which the Shell never sends), so one a terminal would draw
+      in two cells (CJK) or in none (a combining mark) is sent as one `?` --
+      as EDK2 TerminalDxe sends its non-UTF-8 terminals a character they
+      cannot show -- and the terminal's grid stays the console's. Under
+      @ref AXL_CONSOLE_CELLS_WIDTH_RESOLVED (@ref axl_vterm_new) the glyph is
+      sent as it is and followed by its @ref axl_vterm_char_width;
+    - a C1 control (U+0080..U+009F) is sent as one `?` under either rule:
+      to a terminal that honours C1 it is a control (U+009B is CSI), never a
+      glyph;
+    - a sequence that is not well-formed UTF-8 (an overlong form, an encoded
+      surrogate, a lead byte no codepoint has, one cut short) is sent as one
+      `?`: a terminal would draw one to four replacement characters for it.
+
     @code
     static void to_ws(const char *bytes, size_t len, void *user) {
         axl_ws_send(user, bytes, len);          // ship to the browser terminal
@@ -80,8 +109,8 @@ typedef void (*AxlConsoleVtSinkFn)(
 typedef struct {
     AxlConsoleVtSinkFn sink;   ///< receives the serialized stream (REQUIRED)
     void              *user;   ///< sink context, passed back verbatim
-    uint32_t           cols;   ///< late-join screen-model width  (0 = 80)
-    uint32_t           rows;   ///< late-join screen-model height (0 = 25)
+    uint32_t           cols;   ///< console width: screen model and wrap margin (0 = 80)
+    uint32_t           rows;   ///< console height: screen model and scroll row (0 = 25)
     /// Buffer the live stream instead of calling @c sink once per op. A single
     /// keystroke echo is >= 3 ConOut ops and a full-screen redraw is hundreds of
     /// tiny ops; with @c coalesce set, those accumulate and reach @c sink only on
@@ -135,9 +164,10 @@ axl_console_vt_enc_ops(
  *
  * Emits, through @p sink, one burst of VT bytes that — applied to a **blank terminal
  * of the encoder's current size** — reproduces what the console shows right now: the
- * visible glyphs and colours, the cursor position and visibility, and the
- * primary/alternate-screen state. Point @p sink at the newly-connected client, then
- * join it to the live stream.
+ * visible glyphs and colours, the cursor position and visibility, the
+ * primary/alternate-screen state, and the pen the console is writing with (so the
+ * joiner's next text is in the console's colours, not the last repainted cell's).
+ * Point @p sink at the newly-connected client, then join it to the live stream.
  *
  * The output is coalesced (blank cells and rows emit nothing) and the model is left
  * unchanged, so this may be called once per connecting client. Like the live stream
@@ -177,9 +207,13 @@ axl_console_vt_enc_flush(
 );
 
 /**
- * @brief Resize the late-join screen model. NULL-safe; a 0 axis is ignored.
+ * @brief Set the console's geometry. NULL-safe; a 0 axis is ignored.
  *
- * This is the MODEL's geometry only — what a snapshot repaints into. The size the
+ * Two things follow it: the late-join screen model (what a snapshot repaints into)
+ * and the right margin of the live stream -- text that reaches the last column is
+ * followed by CR LF, because a UEFI console wraps there at once while a VT terminal
+ * defers the wrap (and a terminal wider than the console would not wrap at all).
+ * It is not sent to the far terminal, whose own size is the consumer's. The size the
  * guest sees is the producer's (@ref axl_console_device_set_size /
  * @ref axl_console_tap_set_size), and the two are separate calls precisely because
  * a producer may resolve a configured 0 axis to the physical console. Feed the
@@ -193,9 +227,10 @@ axl_console_vt_enc_set_size(
 );
 
 /**
- * @brief Forget the emitted-cursor dedup baseline. NULL-safe.
+ * @brief Forget the tracked terminal cursor. NULL-safe.
  *
- * The encoder suppresses a cursor move to the cell it last emitted (full-screen apps
+ * The encoder follows the far terminal's cursor through every move, clear and run
+ * of text, and suppresses a move to where it already is (full-screen apps
  * re-position to blink). Call this when the far end may have been repainted behind
  * the encoder's back — a new session, or a producer reset — so the next position is
  * emitted rather than assumed. Does not touch the screen model.

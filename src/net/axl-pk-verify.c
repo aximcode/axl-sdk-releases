@@ -2,18 +2,24 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-pk-verify.c
-    Public-key dispatch (axl_pk_key_* family) and raw-bytes verification
-    (axl_pk_verify).
+    Public-key dispatch (the axl_pk_key_* family).
 
     AxlPkKey routes every operation through a per-algorithm provider
     (see axl-pk-provider.h): argument validation that does not depend
-    on a specific algorithm lives here, the mbedTLS-specific bodies
-    live in axl-pk-mbedtls.c. This is also the one translation unit
-    that references a provider by a possibly-unresolved weak symbol —
-    see the AXL_PK_PROVIDER_WEAK comment below.
+    on a specific algorithm lives here, the provider bodies live in
+    axl-pk-mbedtls.c and axl-pk-ed25519.c. This is also the one
+    translation unit that references a provider by a possibly-unresolved
+    weak symbol -- see the AXL_PK_PROVIDER_WEAK comment below -- so it
+    must reference no mbedTLS symbol itself: anything it named strongly
+    would be linked into every image that calls the dispatcher. The
+    raw-bytes axl_pk_verify() lives in axl-pk-mbedtls.c for that reason.
 **/
 
 #include <axl/axl-crypto.h>
+#include <axl/axl-log.h>
+#include <axl/axl-mem.h>
+#include <axl/axl-str.h>
+#include "axl-crypto-internal.h"
 
 /* This TU makes the (possibly weak) reference to each provider extern,
    so it -- and only it -- defines AXL_PK_PROVIDER_WEAK before pulling
@@ -22,6 +28,21 @@
    sees. */
 #define AXL_PK_PROVIDER_WEAK
 #include "axl-pk-provider.h"
+
+AXL_LOG_DOMAIN("pk");
+
+/* The one line an image gets when a call needs an algorithm whose
+   provider it did not enable. It names the function to call, so the
+   reader of a log can fix the image without opening a header. The
+   query, axl_pk_alg_available(), stays silent: it is how a caller asks
+   before committing. Pinned verbatim by AxlTestEd25519 (the mbedTLS
+   line) and AxlTestCrypto (the Ed25519 line). */
+#define PK_MBEDTLS_ABSENT_LINE \
+    "ECDSA/RSA unavailable: call axl_pk_enable_mbedtls() before using " \
+    "ECDSA/RSA keys"
+#define PK_ED25519_ABSENT_LINE \
+    "Ed25519 unavailable: call axl_pk_enable_ed25519() before using " \
+    "Ed25519 keys"
 
 bool
 axl_pk_available(void)
@@ -38,20 +59,24 @@ axl_pk_available(void)
 const AxlPkProvider *
 _axl_pk_provider_for(AxlPkAlg alg)
 {
+    /* Both providers are weak: the symbol is unresolved unless the image
+       linked it, and then its ADDRESS is NULL. Test the address -- there
+       is no object to read, and under UEFI a load from 0 returns zero
+       rather than faulting. */
     switch (alg) {
     case AXL_PK_ECDSA_P256:
     case AXL_PK_ECDSA_P384:
     case AXL_PK_RSA:
         /* One provider serves all three -- they differ only by the
-           curve, which the key already carries. */
-        return &_axl_pk_provider_mbedtls;
+           curve, which the key already carries. Linked by a call to
+           axl_pk_enable_mbedtls() or any other axl-pk-mbedtls.c
+           function (AxlJose makes one). */
+        return (&_axl_pk_provider_mbedtls != NULL)
+                   ? &_axl_pk_provider_mbedtls : NULL;
     case AXL_PK_ED25519:
-        /* Weak: the symbol is unresolved unless the image linked an
-           Ed25519 provider with `-u _axl_pk_provider_ed25519`, and
-           then its ADDRESS is NULL. Test the address -- there is no
-           object to read, and under UEFI a load from 0 returns zero
-           rather than faulting. The 30 KB base-point table must not
-           land in an image that never asked for it. */
+        /* Linked by a call to axl_pk_enable_ed25519() (AxlSsh makes
+           one). The ~109 KB base-point table must not land in an image
+           that never asked for it. */
         return (&_axl_pk_provider_ed25519 != NULL)
                    ? &_axl_pk_provider_ed25519 : NULL;
     }
@@ -64,90 +89,55 @@ axl_pk_alg_available(AxlPkAlg alg)
     return axl_pk_available() && _axl_pk_provider_for(alg) != NULL;
 }
 
-
-// ===================================================================
-// ECDSA P-256 raw-bytes verification (axl_pk_verify) via mbedTLS.
-// ===================================================================
-//
-// Distinct from the AxlPkKey family above: this takes a DER public key
-// directly, with no persistent key handle and no provider involved --
-// it predates the provider seam and is ECDSA-P256-only by contract.
-
-#include <axl/axl-digest.h>
-#include <axl/axl-mem.h>
-#include "axl-crypto-internal.h"
-
-#include <mbedtls/ecp.h>
-#include <mbedtls/md.h>
-#include <mbedtls/pk.h>
-
-/**
- * Verify a detached ECDSA-with-SHA-256 signature over @p msg using the
- * P-256 public key in @p pubkey (DER SubjectPublicKeyInfo) and the DER
- * ECDSA signature in @p sig. Returns AXL_OK only on a valid signature.
- */
-static int
-verify_ecdsa_p256(const uint8_t *pubkey, size_t pubkey_len,
-                  const uint8_t *msg, size_t msg_len,
-                  const uint8_t *sig, size_t sig_len)
+/* An entry point that named @a alg found no provider for it: say so --
+   once, naming the function that enables it. */
+static void
+report_missing_provider(AxlPkAlg alg)
 {
-    mbedtls_pk_context pk;
-    uint8_t            hash[32];
-    int                rc = AXL_ERR;
-
-    mbedtls_pk_init(&pk);
-
-    if (mbedtls_pk_parse_public_key(&pk, pubkey, pubkey_len) != 0) {
-        goto out;
-    }
-
-    /* Enforce the contracted algorithm: an EC key on NIST P-256. A key
-       on a different curve must not silently verify under this enum. */
-    if (!mbedtls_pk_can_do(&pk, MBEDTLS_PK_ECKEY) ||
-        mbedtls_ecp_keypair_get_group_id(mbedtls_pk_ec(pk)) !=
-            MBEDTLS_ECP_DP_SECP256R1) {
-        goto out;
-    }
-
-    /* ECDSA-with-SHA-256: verify over SHA-256(msg). */
-    if (axl_compute_checksum_digest(AXL_CHECKSUM_SHA256, msg, msg_len,
-                                    hash, sizeof(hash)) != AXL_OK) {
-        goto out;
-    }
-
-    if (mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash),
-                          sig, sig_len) == 0) {
-        rc = AXL_OK;
-    }
-
-out:
-    mbedtls_pk_free(&pk);
-    return rc;
-}
-
-int
-axl_pk_verify(AxlPkAlg alg,
-              const uint8_t *pubkey, size_t pubkey_len,
-              const uint8_t *msg, size_t msg_len,
-              const uint8_t *sig, size_t sig_len)
-{
-    /* Argument validation precedes any crypto. msg may be NULL only
-       when msg_len is 0 (an empty message is well-defined). */
-    if (pubkey == NULL || pubkey_len == 0 ||
-        sig == NULL || sig_len == 0 ||
-        (msg == NULL && msg_len != 0)) {
-        return AXL_ERR;
-    }
-
     switch (alg) {
     case AXL_PK_ECDSA_P256:
-        return verify_ecdsa_p256(pubkey, pubkey_len, msg, msg_len,
-                                 sig, sig_len);
+    case AXL_PK_ECDSA_P384:
+    case AXL_PK_RSA:
+        axl_error(PK_MBEDTLS_ABSENT_LINE);
+        return;
     case AXL_PK_ED25519:
-        /* Reserved; not supported by this mbedTLS build. */
-    default:
-        return AXL_ERR;
+        axl_error(PK_ED25519_ABSENT_LINE);
+        return;
     }
+}
+
+/* Whether DER bytes NAME an algorithm: the id-ecPublicKey,
+   rsaEncryption or id-Ed25519 OID, tag and length included. A substring
+   search, not a parse, and it decides nothing about acceptance -- it
+   only picks whether a refused import was refused for want of a
+   provider, so the diagnostic is not printed for DER that was simply
+   malformed or names an algorithm whose provider IS linked. A false
+   positive costs one log line. Returns true and sets @a *alg on a
+   match. */
+static bool
+der_names_alg(const uint8_t *der, size_t len, AxlPkAlg *alg)
+{
+    static const uint8_t ec_oid[] = {
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01
+    };
+    static const uint8_t rsa_oid[] = {
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01
+    };
+    static const uint8_t ed25519_oid[] = { 0x06, 0x03, 0x2b, 0x65, 0x70 };
+
+    if (axl_memmem(der, len, ec_oid, sizeof(ec_oid)) != NULL) {
+        *alg = AXL_PK_ECDSA_P256;
+        return true;
+    }
+    if (axl_memmem(der, len, rsa_oid, sizeof(rsa_oid)) != NULL) {
+        *alg = AXL_PK_RSA;
+        return true;
+    }
+    if (axl_memmem(der, len, ed25519_oid, sizeof(ed25519_oid)) != NULL) {
+        *alg = AXL_PK_ED25519;
+        return true;
+    }
+    return false;
 }
 
 // -------------------------------------------------------------------
@@ -158,7 +148,11 @@ AxlPkKey *
 axl_pk_key_new(AxlPkAlg alg)
 {
     const AxlPkProvider *p = _axl_pk_provider_for(alg);
-    if (p == NULL || p->key_init == NULL || p->keygen == NULL) {
+    if (p == NULL) {
+        report_missing_provider(alg);
+        return NULL;
+    }
+    if (p->key_init == NULL || p->keygen == NULL) {
         return NULL;
     }
 
@@ -190,30 +184,27 @@ axl_pk_key_new(AxlPkAlg alg)
 }
 
 /* A mismatched OID is an ordinary false, per axl-pk-provider.h's
-   contract, so the bytes go to each provider in turn until one claims
-   them. This is what lets a later algorithm (e.g. an Ed25519 DER
-   import in some future phase) join without editing this function --
-   the alternative, hardcoding _axl_pk_provider_mbedtls here, is
-   exactly the dispatcher surgery the DER vtable seat exists to avoid,
-   and would silently turn into a STRONG reference to a future
-   ref10-backed provider the day someone edited this function to add
-   it.
+   contract, so the bytes go to each linked provider in turn until one
+   claims them.
 
-   The Ed25519 slot is resolved through _axl_pk_provider_for(), the
-   one place that tests the weak symbol's address -- never by reading
-   a member off of it directly here. Reusing that resolver (rather
-   than repeating the `&_axl_pk_provider_ed25519 != NULL` test inline)
-   means this candidate list's correctness does not depend on the
-   compiler keeping a second, independent instance of the same
-   never-true-after-link-time comparison: _axl_pk_provider_for's is
-   the one every other entry point already relies on. */
+   BOTH candidates are resolved through _axl_pk_provider_for(), the one
+   place that tests a weak symbol's address -- never by naming a
+   provider here. Naming `_axl_pk_provider_mbedtls` directly is exactly
+   what kept mbedTLS's whole PK layer (and with it rsa.o) in every
+   Ed25519-only image before 2026-10-20; and reusing the resolver
+   rather than repeating the `!= NULL` test inline means this list's
+   correctness does not depend on the compiler keeping a second,
+   independent instance of the same comparison. */
 static AxlPkKey *
 der_import_any(const uint8_t *der, size_t len, bool want_private)
 {
     const AxlPkProvider *cands[2];
     size_t               n = 0;
 
-    cands[n++] = &_axl_pk_provider_mbedtls;
+    const AxlPkProvider *mbedtls = _axl_pk_provider_for(AXL_PK_ECDSA_P256);
+    if (mbedtls != NULL) {
+        cands[n++] = mbedtls;
+    }
     const AxlPkProvider *ed25519 = _axl_pk_provider_for(AXL_PK_ED25519);
     if (ed25519 != NULL) {
         cands[n++] = ed25519;
@@ -251,6 +242,11 @@ der_import_any(const uint8_t *der, size_t len, bool want_private)
         }
         axl_free(k);
     }
+    AxlPkAlg named;
+    if (der_names_alg(der, len, &named)
+        && _axl_pk_provider_for(named) == NULL) {
+        report_missing_provider(named);
+    }
     return NULL;
 }
 
@@ -276,7 +272,11 @@ AxlPkKey *
 axl_pk_key_from_raw_public(AxlPkAlg alg, const uint8_t *raw, size_t len)
 {
     const AxlPkProvider *p = _axl_pk_provider_for(alg);
-    if (p == NULL || p->key_init == NULL || p->raw_public_import == NULL
+    if (p == NULL) {
+        report_missing_provider(alg);
+        return NULL;
+    }
+    if (p->key_init == NULL || p->raw_public_import == NULL
         || raw == NULL || len == 0) {
         return NULL;
     }

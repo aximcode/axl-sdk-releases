@@ -430,7 +430,7 @@ AXL already does this for several protocols:
 
 | What the consumer writes | What AXL does behind the scenes |
 |--------------------------|--------------------------------|
-| `axl_fopen("file.txt", "r")` | Locates Shell protocol, calls OpenFileByName |
+| `axl_fopen("file.txt", "r")` | Resolves the path through the Shell's map and current directory as OpenFileByName would, opens it off the volume |
 | `axl_gfx_fill_rect(...)` | Locates GOP protocol, calls Blt |
 | `axl_tcp_connect(host, port, &sock)` | Locates TCP4 ServiceBinding, creates child, configures, connects |
 | `axl_smbios_find(type)` | Locates SMBIOS protocol (or walks config table), iterates entries |
@@ -592,8 +592,8 @@ The driver search path covers the image's own directory and
 
 **TCP close lifetime** — `axl_tcp_close` returns immediately on
 the async path (typical mid-loop case); the underlying `AxlTcp *`
-pointer outlives the call by up to TIME_WAIT (~2 s) while the
-firmware completes the close. Treat `sock` as freed once
+pointer outlives the call until the loop finalizes the close --
+normally a round trip, once both FINs are exchanged. Treat `sock` as freed once
 `axl_tcp_close` returns, and always close TCP sockets *before*
 freeing the loop they were registered with. The header doc in
 `<axl/axl-tcp.h>` describes this explicitly.

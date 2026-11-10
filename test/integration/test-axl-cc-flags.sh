@@ -59,7 +59,7 @@ SRC="$PROJECT_DIR/sdk/examples/hello.c"
 
 # The bare-metal cross, for the one assertion below that needs an object axl-cc
 # did NOT compile (axl-cc always passes -g, so it cannot produce a
-# debug-info-free object itself). Read from the same conf the Makefile and
+# debug-info-free object itself). Read from the same conf the CMake build and
 # axl-cc read, rather than a fourth spelling -- that is what check-flag-parity
 # and check-toolchain-conf exist to prevent.
 X64_GCC=""
@@ -606,8 +606,11 @@ int main(void) { return 0; }
 EOF
 
 # The image's link map is the reading, not the exit code: every one of these
-# links succeeds, and what differs is whether axl-log.o is in it.
-engine_linked() { grep -q 'libaxl\.a(axl-log\.o)' "$1"; }
+# links succeeds, and what differs is whether axl-log's member is in it.
+# Named axl-log.o in an archive make built, axl-log.c.obj in CMake's (the
+# SDK's since slice 5b, docs/AXL-Build-System-Design.md §10.9): the member is
+# the same object either way, and the map names it by the archive's spelling.
+engine_linked() { grep -qE 'libaxl\.a\(axl-log\.(o|c\.obj)\)' "$1"; }
 
 "$AXL_CC" --minimal-runtime "$ML/logs.c" -o "$ML/a.efi" >"$ML/bare.log" 2>&1
 ml_rc=$?

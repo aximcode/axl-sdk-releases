@@ -182,8 +182,9 @@ main(void)
         }
     }
 
-    unlink(FD_PATH);
+    check(unlink(FD_PATH) == 0, "unlink() of an existing file returns 0");
     check(open(FD_PATH, O_RDONLY) < 0, "unlink() removed the file");
+    check(unlink(FD_PATH) == -1, "unlink() of a missing file returns -1");
 
     axl_printf("=== fd: %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;

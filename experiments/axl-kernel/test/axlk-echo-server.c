@@ -12,7 +12,7 @@
  * shaped equivalent) to see the delta.
  *
  * Build with axl-cc once axl-kernel ships standalone. For now it
- * builds via the in-tree Makefile target `kernel-poc` alongside
+ * builds via the in-tree goal `kernel-poc` alongside
  * the K1+K2 driver. See experiments/axl-kernel/README.md.
  */
 

@@ -18,7 +18,7 @@
  *   ./scripts/run-qemu.sh --vnc gfx-window.efi              # serve VNC
  *   ./scripts/run-qemu.sh --vnc-reverse HOST:PORT gfx-window.efi
  *
- * Build with: make gfx-window
+ * Build with: scripts/axl-build.sh gfx-window
  */
 
 #include <axl.h>

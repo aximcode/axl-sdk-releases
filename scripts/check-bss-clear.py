@@ -13,11 +13,13 @@ the span it zeroes. A boot-time probe (test-bss-probe-qemu.sh) only proves the
 the test firmware happens to hand back zeroed pages. This check can.
 
 Usage: check-bss-clear.py <crt0.o> [<crt0.o> ...]
-  objdump is chosen per object from its name (x86_64 / aarch64).
+  objdump is $CROSS + objdump when CROSS is set (the build's binutils),
+  else chosen per object from its name (x86_64 / aarch64).
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -25,11 +27,16 @@ from pathlib import Path
 
 
 def objdump_for(obj: str) -> str:
+    """CROSS (the build's own binutils prefix -- the CTest gate passes the
+    tree's) wins: it is the objdump of the toolchain that produced @a obj.
+    Without it, a guess from the name -- which needs a Linux cross objdump
+    for aa64 that CI's containers no longer install."""
+    cross = os.environ.get("CROSS")
+    if cross:
+        return cross + "objdump"
     name = Path(obj).name
     if "aarch64" in name:
         return "aarch64-linux-gnu-objdump"
-    if "x86_64" in name:
-        return "objdump"
     return "objdump"
 
 
@@ -61,7 +68,8 @@ def check_object(obj: str) -> list[str]:
             check=True, capture_output=True, text=True,
         ).stdout
     except FileNotFoundError:
-        return [f"{obj}: {tool} not found"]
+        return [f"{obj}: CANNOT RUN -- {tool} not found, so the crt0 was NOT "
+                f"read (not a verdict on it; set CROSS to the build's binutils)"]
     except subprocess.CalledProcessError as exc:
         return [f"{obj}: {tool} failed: {exc.stderr.strip()}"]
 

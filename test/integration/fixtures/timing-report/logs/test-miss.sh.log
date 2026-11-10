@@ -1,0 +1,3 @@
+TIMING: guest kind=booted via=bg guest=7.000 boot=- rc=-
+TIMING: test=test-miss.sh total=9.000 setup=1.000 guest=7.000 boot=0.000 between=0.000 post=1.000 booted=1 pooled=0 start=- lease=-
+TIMING: runner test=test-miss.sh attempt=1 via=boot wall=9.100 cpu=4.100 rc=0

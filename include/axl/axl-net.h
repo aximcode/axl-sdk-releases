@@ -23,7 +23,9 @@
 
 #include <stdint.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-time.h>     /* AXL_TIMER_RESOLUTION_MIN_US -- AxlNetLatency.tick_us */
 #include <axl/axl-attempt.h>   /* AxlAttempt — shared driver-quarantine namespace */
+#include <axl/axl-cancellable.h>   /* AxlCancellable — AxlNetAutoOpts.cancel */
 
 /* AxlIPv4Address (legacy IPv4 type) is declared in axl-inet-address.h
  * alongside AxlInetAddress / AxlSocketAddress. Pull that in first so
@@ -283,6 +285,145 @@ axl_net_resolve_async(
 bool
 axl_net_is_available(void);
 
+// ---------------------------------------------------------------------------
+// Round-trip latency (AxlTcp)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief How AxlTcp trades CPU for round-trip latency; see axl_net_set_latency().
+ *
+ * Zero is AXL_NET_LATENCY_FIRMWARE, so a zeroed #AxlNetLatency asks for
+ * nothing extra.
+ */
+typedef enum {
+    AXL_NET_LATENCY_FIRMWARE = 0,  ///< nothing added (the default): a received frame waits for the firmware's
+                                   ///< tick and the network stack's own receive timer (~10 ms each on EDK2)
+    AXL_NET_LATENCY_WINDOW,        ///< fast for #AxlNetLatency.window_ms after the last AxlTcp activity
+    AXL_NET_LATENCY_ALWAYS         ///< fast for as long as any AxlTcp socket exists
+} AxlNetLatencyMode;
+
+/// Default #AxlNetLatency.window_ms: 250 ms (see axl_net_latency_defaults()
+/// for the measurement behind it).
+#define AXL_NET_LATENCY_WINDOW_DEFAULT_MS  250u
+/// Largest #AxlNetLatency.window_ms: 10 s.
+#define AXL_NET_LATENCY_WINDOW_MAX_MS      10000u
+/// Default #AxlNetLatency.tick_us: 1 ms.
+#define AXL_NET_LATENCY_TICK_DEFAULT_US    1000u
+/// Largest #AxlNetLatency.tick_us: 10 ms, the firmware's own pace.
+#define AXL_NET_LATENCY_TICK_MAX_US        10000u
+
+/**
+ * @brief Process-wide round-trip latency policy; see axl_net_set_latency().
+ *
+ * A field left 0 takes its default, and a field the mode does not use is
+ * ignored, so `{ .mode = AXL_NET_LATENCY_ALWAYS }` is complete.
+ */
+typedef struct {
+    AxlNetLatencyMode mode;       ///< see #AxlNetLatencyMode
+    uint32_t          window_ms;  ///< WINDOW: stay fast this long after the last activity;
+                                  ///< 0 = #AXL_NET_LATENCY_WINDOW_DEFAULT_MS, at most
+                                  ///< #AXL_NET_LATENCY_WINDOW_MAX_MS
+    uint32_t          tick_us;    ///< while fast: the firmware tick and the poll period;
+                                  ///< 0 = #AXL_NET_LATENCY_TICK_DEFAULT_US, from
+                                  ///< #AXL_TIMER_RESOLUTION_MIN_US to #AXL_NET_LATENCY_TICK_MAX_US
+} AxlNetLatency;
+
+/**
+ * @brief Fill @p out with the default policy: AXL_NET_LATENCY_FIRMWARE, with
+ *     #AXL_NET_LATENCY_WINDOW_DEFAULT_MS and #AXL_NET_LATENCY_TICK_DEFAULT_US
+ *     as the values a mode that is switched on would use.
+ *
+ * OFF by default. Without it an AxlTcp exchange pays up to the firmware's
+ * pace -- ~10-20 ms per round trip for an event-loop server on X64 (measured
+ * p90, 2026-11-03) -- and the cost of being fast is small (a QEMU guest idling
+ * with a listener: 0.015 cores at the firmware's pace, 0.090 while fast). But
+ * the faster tick it holds can break USB keyboards (axl_net_set_latency), so
+ * a program opts in where that is known not to matter: a test agent driven
+ * over the network, a service measured on its platform.
+ *
+ * Why 250 ms for a window, once one is chosen: exchanges spaced at typing pace stay fast. Measured on X64
+ * against a 50 ms window, with requests 20 / 100 / 200 / 400 ms apart: p90
+ * 1.1 / 1.1 / 1.0 / 3.1 ms at 250 against 1.2 / 1.9 / 2.8 / 2.8 at 50; and a
+ * session's first exchange 2-3 ms at 250 (the connection's own setup opens
+ * the window) against 22-29 ms at 50. NULL is ignored.
+ */
+void
+axl_net_latency_defaults(
+    AxlNetLatency *out   ///< receives the defaults
+);
+
+/**
+ * @brief Read the latency policy in force (zero fields resolved to their
+ *     defaults). NULL is ignored.
+ */
+void
+axl_net_get_latency(
+    AxlNetLatency *out   ///< receives the current policy
+);
+
+/**
+ * @brief Set how AxlTcp trades CPU for round-trip latency, for every socket
+ *        in this process.
+ *
+ * EDK2's network stack has no receive interrupt: a frame that arrives while
+ * the CPU is halted waits for the firmware's next timer tick, and then for
+ * the stack's own 10 ms receive timer, unless someone polls it -- ~10 ms per
+ * round trip on X64 whatever the NIC (measured). Neither a faster tick nor
+ * polling helps alone (measured); together they bring a round trip to ~1 ms.
+ * So "fast" means both, held together:
+ *
+ *   - an axl_timer_resolution_begin(`tick_us`) request, so events can fire
+ *     that often (firmware-global: ~0.1 core at 1 ms on an idle QEMU guest,
+ *     against ~0.013 at 10 ms -- paid only while fast);
+ *   - a firmware timer event every `tick_us`, at TPL_CALLBACK, polling every
+ *     live AxlTcp socket's TCP instance -- what the network stack's own
+ *     receive timer does every 10 ms. Being an event rather than a loop
+ *     source, it serves every loop alike: an application's, the nested loop
+ *     inside axl_tcp_send()/axl_tcp_recv(), a driver's;
+ *   - for a loop under axl_loop_attach_driver, its driver tick shortened to
+ *     `tick_us` as well, since that tick, not the event, dispatches what the
+ *     poll completes. Restored when fast ends.
+ *
+ * The modes:
+ *   - AXL_NET_LATENCY_WINDOW: fast from any AxlTcp ACTIVITY --
+ *     a socket created; an accept, receive, send or connect armed; any of
+ *     them completing -- until `window_ms` passes without any, process-wide.
+ *     The first frame after an idle spell still pays the firmware's pace; the
+ *     rest of its exchange does not. Linux's busy polling, bounded by a window.
+ *   - AXL_NET_LATENCY_ALWAYS: fast from the first live AxlTcp socket until
+ *     the last one has FINISHED closing -- a graceful close deferred to a
+ *     running loop finishes once both FINs are exchanged, normally a round
+ *     trip after axl_tcp_close(), ~500 ms for a peer that never sends its
+ *     own FIN (one with no loop to defer to finishes inside the call). For
+ *     a server that must answer the FIRST request
+ *     quickly too (a test agent), at the faster tick's cost while it listens.
+ *   - AXL_NET_LATENCY_FIRMWARE (the default): neither; the behaviour before
+ *     this existed.
+ *
+ * **A fast tick can break USB keyboards.** Measured 2026-11-03 on QEMU (OVMF,
+ * usb-kbd on qemu-xhci, ten key presses 0.5 s apart): at a 10 ms or 5 ms
+ * tick 10 of 10 arrived, at 2 ms 8, at 1 ms 1 -- with or without a hub.
+ * Whether OVMF's USB keyboard path, QEMU's device model or both are at fault,
+ * and whether real hardware is affected, is not yet known; until it is, do
+ * not hold a fast tick where someone types on a USB keyboard.
+ *
+ * AxlTcp only. Independent of the transmit pacer (axl_tcp_set_pacing()),
+ * which polls from the loop while a send is in flight. Everything fast is
+ * undone at exit and driver unload, and stays off for whatever runs after
+ * that (a later exit handler's socket work runs at the firmware's pace).
+ *
+ * May be called at any time, at TPL_APPLICATION: a change of mode or
+ * `tick_us` takes effect at once (fast ends, and starts again under the new
+ * policy at the next activity, or at once for ALWAYS with a live socket).
+ *
+ * @return AXL_OK; AXL_INVALID, with nothing changed, if a field is out of
+ *     range. NULL restores the defaults.
+ */
+AXL_WARN_UNUSED int
+axl_net_set_latency(
+    const AxlNetLatency *cfg   ///< the policy, or NULL for the defaults
+);
+
 /**
  * @brief Bring up networking: load drivers, run DHCP, wait for IP.
  *
@@ -341,13 +482,15 @@ typedef enum {
     AXL_NET_IP_STATIC,          ///< static from @c static_ipv4 / @c static_mask / …
 } AxlNetIpMode;
 
-/// Whether axl_net_auto_init_opts requires a reachability check, not just an
-/// address, to call a NIC "up" — the sweep keeps trying drivers until one both
-/// configures AND passes the check.
-typedef enum {
-    AXL_NET_VERIFY_NONE = 0,    ///< default: an address (lease/static) is success
-    AXL_NET_VERIFY_REACHABLE,   ///< also require the @c ping_* / @c resolve_host checks
-} AxlNetVerify;
+/// Largest AxlNetAutoOpts.timeout_sec: one day. A larger one is refused
+/// (AXL_ERR) rather than clamped.
+#define AXL_NET_AUTO_TIMEOUT_MAX_SEC  86400u
+
+/// One DHCP attempt's wait in a driver sweep, seconds: what `netload` and
+/// `sshd` give each link-up NIC (AxlNetAutoOpts.dhcp_timeout_sec) before
+/// moving on, so a NIC no DHCP server answers does not stop the sweep from
+/// reaching the driver of the NIC that would lease.
+#define AXL_NET_DHCP_ATTEMPT_SEC      15u
 
 /// Which drivers axl_net_auto_init_opts loads when firmware-first did not already
 /// bring a NIC up. Firmware-first (connecting NIC drivers the firmware already
@@ -367,13 +510,26 @@ typedef enum {
     AXL_NET_DRV_EV_UP = 0,        ///< this driver brought a NIC online (the win)
     AXL_NET_DRV_EV_LINK_NO_LEASE, ///< a NIC linked but got no lease/address
     AXL_NET_DRV_EV_NO_REACH,      ///< came online but a reachability check failed
-    AXL_NET_DRV_EV_NO_NIC,        ///< loaded/connected but bound no NIC (then unloaded)
+    AXL_NET_DRV_EV_NO_NIC,        ///< loaded/connected but bound no NIC (then unloaded);
+                                  ///<   with the link gate, also: every NIC it bound was
+                                  ///<   link-down (each reported by a LINK_DOWN first)
     AXL_NET_DRV_EV_LOAD_FAIL,     ///< load or start failed
     AXL_NET_DRV_EV_SKIPPED_QUAR,  ///< skipped: on the shared quarantine list
     AXL_NET_DRV_EV_TRYING,        ///< about to load/connect this candidate (fired BEFORE
                                   ///<   the load, so a UI can show progress / warn of a
                                   ///<   slow connect before it blocks); a result event
-                                  ///<   for the same driver follows
+                                  ///<   for the same driver follows. Also fired, with
+                                  ///<   @c driver "firmware", before the firmware-first
+                                  ///<   pass connects the firmware's own NIC drivers
+    AXL_NET_DRV_EV_LINK_DOWN,     ///< link gate only (@c link_wait_sec non-zero): this
+                                  ///<   NIC (@c mac) had no link when the link wait
+                                  ///<   ended, so no address is tried on it
+    AXL_NET_DRV_EV_CONFIGURING,   ///< link gate only: about to assign an address to this
+                                  ///<   link-up NIC (@c mac) -- fired BEFORE the DHCP wait
+                                  ///<   or the static set, so a UI can name the step
+                                  ///<   that may block. With DHCP, one per link-up NIC of
+                                  ///<   the pass, all before their ONE shared wait; one
+                                  ///<   result event for the pass follows
 } AxlNetDriverOutcome;
 
 /// One per-driver progress event (see AxlNetAutoOpts.on_driver). Every field is
@@ -390,18 +546,53 @@ typedef struct {
     bool                is_dependency; ///< this @c driver is a co-loaded dependency,
                                    ///<   not a swept candidate (@c outcome is UP or
                                    ///<   LOAD_FAIL); a UI can label it distinctly
+    bool                is_embedded; ///< this @c driver is one of
+                                   ///<   AxlNetAutoOpts.embedded, loaded from memory
+                                   ///<   rather than from the sweep directory
 } AxlNetDriverEvent;
+
+/// A NIC driver held in memory -- `.incbin`'d into the calling image -- that
+/// the SWEEP_DIR sweep offers as a candidate AHEAD of the sweep directory's
+/// (AxlNetAutoOpts.embedded). Every field is borrowed for the call.
+typedef struct {
+    const char *name;    ///< its file name, e.g. "RtkUsbUndiDxe.efi": the quarantine
+                         ///<   key (shared with a file of that name), the
+                         ///<   sidecar's key for its companions, on_driver's
+                         ///<   @c driver, and the loaded image's file-path leaf
+    const void *image;   ///< the driver image: raw PE/COFF, or packed by
+                         ///<   `axl-efi-pack` (unpacked when loaded)
+    size_t      size;    ///< bytes at @c image
+} AxlNetEmbeddedDriver;
 
 /// Callback shape for AxlNetAutoOpts.on_driver. @p ctx is opaque, passed through
 /// from AxlNetAutoOpts.on_driver_ctx.
 typedef void (*AxlNetDriverCb)(const AxlNetDriverEvent *ev, void *ctx) AXL_CB_NOEXCEPT;
 
+struct AxlNetAutoOpts;
+
+/// A reachability check (AxlNetAutoOpts.verifier): true when the NIC just
+/// configured counts as up. @p mac is that NIC's MAC, or NULL when the
+/// configured NIC is not known (a NIC-agnostic DHCP fallback). Called with the
+/// options it was installed in, so it reads its own inputs from them.
+typedef bool (*AxlNetVerifyFn)(const struct AxlNetAutoOpts *opts,
+                               const uint8_t *mac) AXL_CB_NOEXCEPT;
+
+/// Opaque: a companion-driver co-loader for the SWEEP_DIR sweep
+/// (AxlNetAutoOpts.deps). The library's one is axl_net_sweep_deps_sidecar().
+typedef struct AxlNetSweepDeps AxlNetSweepDeps;
+
 /// Options for axl_net_auto_init_opts. ZERO-INITIALIZE, then set only what you
 /// need: a zeroed struct means AUTO NIC + DHCP + firmware-first-then-SWEEP_DIR of
-/// the default driver directory. The struct is APPEND-ONLY — new fields are added
-/// at the end and default to 0, so a zero-initializing caller is never broken by
-/// a later field.
-typedef struct {
+/// the default driver directory, with no deadline, no link gate, no companion
+/// drivers and no reachability check. New fields are added at the end and
+/// default to 0, so a zero-initializing caller is not broken by a later field.
+///
+/// Two capabilities are OPT-IN IN CODE: companion-driver co-load (@c deps) and
+/// reachability checks (@c verifier). Each is a pointer the caller installs from
+/// the library (axl_net_sweep_deps_sidecar(), axl_net_verify_reachable());
+/// naming it is what links its code, so an image that installs neither carries
+/// neither the JSON5 sidecar reader nor ping/DNS.
+typedef struct AxlNetAutoOpts {
     AxlNetNicSelect nic_select;        ///< 0 = AUTO
     size_t          nic_index;         ///< SEL_INDEX: list_interfaces ordinal
     uint8_t         nic_mac[6];        ///< SEL_MAC: target NIC's MAC
@@ -412,26 +603,54 @@ typedef struct {
     const uint8_t  *static_gw;         ///< STATIC: 4 bytes, or NULL for none
     const uint8_t  *dns1;              ///< STATIC: 4 bytes, or NULL
     const uint8_t  *dns2;              ///< STATIC: 4 bytes, or NULL
-    size_t          dhcp_timeout_sec;  ///< DHCP: 0 = 10s default
+    size_t          dhcp_timeout_sec;  ///< DHCP: 0 = 10s default. With the link gate, the
+                                       ///<   one budget a pass's NICs share (see below)
     size_t          dhcp_retries;      ///< DHCP: re-attempt a no-lease NIC up to this
                                        ///<   many times (0/1 = a single attempt)
 
     AxlNetDriverStrategy driver_strategy;  ///< 0 = SWEEP_DIR
-    const char          *sweep_dir;        ///< SWEEP_DIR: NULL = the default
-                                           ///<   `\drivers\<arch>` (with `\drivers` fallback)
-    bool                 load_deps;        ///< SWEEP_DIR: co-load each driver's declared
-                                           ///<   dependencies from the sweep dir's sidecar first
+    const char          *sweep_dir;        ///< SWEEP_DIR: NULL = the directory
+                                           ///<   axl_net_driver_dir() names when it exists,
+                                           ///<   else `drivers\<arch>` on every volume
+    const AxlNetSweepDeps *deps;           ///< SWEEP_DIR: co-load each candidate's declared
+                                           ///<   companion drivers first, or NULL for none.
+                                           ///<   Install axl_net_sweep_deps_sidecar()
     bool                 skip_firmware_first; ///< skip the firmware-first probe (step 1) and
                                            ///<   go straight to the strategy — for a caller
                                            ///<   that ran its own firmware-first pass
 
-    AxlNetVerify    verify;            ///< 0 = NONE (an address is success)
-    const uint8_t  *ping_ipv4;        ///< REACHABLE: ping this host (4 bytes), or NULL
-    bool            ping_gateway;     ///< REACHABLE: also ping the resolved gateway
-    const char     *resolve_host;     ///< REACHABLE: also require DNS resolution of this name
+    AxlNetVerifyFn  verifier;          ///< NULL = an address is success; else a NIC is up
+                                       ///<   only if this returns true. Install
+                                       ///<   axl_net_verify_reachable(), which reads:
+    const uint8_t  *ping_ipv4;        ///< axl_net_verify_reachable: ping this host (4 bytes), or NULL
+    bool            ping_gateway;     ///< axl_net_verify_reachable: also ping the resolved gateway
+    const char     *resolve_host;     ///< axl_net_verify_reachable: also require DNS resolution of this name
 
     AxlNetDriverCb  on_driver;         ///< optional per-driver progress hook (NULL = none)
     void           *on_driver_ctx;     ///< opaque, passed to @c on_driver
+
+    size_t          timeout_sec;       ///< the WHOLE bring-up's deadline, seconds: every
+                                       ///<   wait in it (link, DHCP) is cut to what is left,
+                                       ///<   and no further driver is swept once it passes.
+                                       ///<   0 = none (each wait keeps its own timeout);
+                                       ///<   at most #AXL_NET_AUTO_TIMEOUT_MAX_SEC
+    AxlCancellable *cancel;            ///< ends the bring-up (AXL_CANCELLED), or NULL. Its
+                                       ///<   break claim (axl_cancellable_set_cancel_on_break)
+                                       ///<   is honoured between swept drivers too
+    size_t          link_wait_sec;     ///< the LINK GATE: 0 = off (an address is tried on
+                                       ///<   the NIC the selection names whatever its link).
+                                       ///<   N = wait up to N s (cut to the deadline) for a
+                                       ///<   link, then try only link-up NICs -- DHCP on
+                                       ///<   all of them at once, first lease wins --
+                                       ///<   reporting each with LINK_DOWN or CONFIGURING
+    const AxlNetEmbeddedDriver *embedded; ///< SWEEP_DIR: drivers in memory, swept FIRST,
+                                       ///<   in array order, before the directory's
+                                       ///<   (NULL = none). See "Embedded drivers"
+    size_t          embedded_count;    ///< entries in @c embedded
+    void           *device_handle;     ///< SWEEP_DIR: the volume (an AxlVolume handle)
+                                       ///<   an embedded driver is given as its
+                                       ///<   DeviceHandle when the sweep directory's
+                                       ///<   cannot be found, or NULL for none
 } AxlNetAutoOpts;
 
 /// What axl_net_auto_init_opts configured. On AXL_OK, @c online is true and the
@@ -458,29 +677,94 @@ typedef struct {
  * The library form of `netload -a`, without netload's findings table /
  * interactive picker / save-replay. It:
  *
- * 1. FIRMWARE-FIRST (always): connects NIC drivers the firmware already staged
- *    and checks whether that alone satisfies the request. Onboard/vendor NICs
- *    usually come up here with nothing loaded — the common case on a server whose
- *    vendor ships its own NIC drivers.
+ * 1. FIRMWARE-FIRST (always, unless @c skip_firmware_first): connects NIC
+ *    drivers the firmware already staged and checks whether that alone
+ *    satisfies the request. Onboard/vendor NICs usually come up here with
+ *    nothing loaded — the common case on a server whose vendor ships its own
+ *    NIC drivers.
  * 2. If not, ACQUIRES drivers per @p opts->driver_strategy:
- *    - SWEEP_DIR: loads each `*.efi` in @p opts->sweep_dir one at a time under a
- *      crash-culprit guard (see "Crash safety"), connecting and checking after
- *      each and STOPPING at the first NIC that comes up. A driver that binds no
- *      NIC is unloaded, so the box is not left carrying dead drivers.
+ *    - SWEEP_DIR: loads each `*.efi` in the sweep directory (@c sweep_dir, or
+ *      the default it names) one at a time under a crash-culprit guard (see
+ *      "Crash safety"), connecting and checking after each and STOPPING at the
+ *      first NIC that comes up. A driver that brings no NIC up is unloaded, so
+ *      the box is not left carrying dead drivers. iPXE-named candidates go last.
  *    - CURATED: loads a built-in list of common NIC drivers (the 2-arg
  *      axl_net_auto_init behavior).
  *    - FIRMWARE_ONLY: acquires nothing beyond step 1.
  * 3. RESOLVES the NIC per @p opts->nic_select (AUTO ladder / ordinal / MAC).
  * 4. ASSIGNS an address per @p opts->ip_mode (DHCP wait, or static).
- * 5. VERIFIES per @p opts->verify: with AXL_NET_VERIFY_REACHABLE a NIC counts as
- *    up only if the requested checks pass (ping @c ping_ipv4, ping the gateway,
- *    resolve @c resolve_host) — the SWEEP_DIR sweep keeps trying drivers until
- *    one both configures and is reachable. AXL_NET_VERIFY_NONE (default) treats
- *    an address as success.
+ * 5. VERIFIES with @c verifier when one is installed: a NIC then counts as up
+ *    only if it returns true, and the SWEEP_DIR sweep keeps trying drivers until
+ *    one both configures and verifies. With no verifier an address is success.
  *
- * With @p opts->load_deps, a SWEEP_DIR candidate's declared dependencies (from
- * the sweep dir's driver-dependency sidecar) are co-loaded first — needed by a
- * USB-RNDIS/CDC NIC whose driver depends on a companion.
+ * With @c deps installed, a SWEEP_DIR candidate's declared companion drivers
+ * are co-loaded first (axl_net_sweep_deps_sidecar() reads them from the sweep
+ * directory's `netload-drivers.json5`) — needed by a USB-RNDIS/CDC NIC whose
+ * driver depends on NetworkCommon. A companion is never swept as a candidate.
+ *
+ * @par Embedded drivers (embedded, embedded_count, device_handle)
+ * A tool that carries a NIC driver inside itself hands it to the SWEEP_DIR
+ * sweep as an AxlNetEmbeddedDriver. Each is a candidate like a file in the
+ * sweep directory -- the same crash guard and shared quarantine (keyed by
+ * its @c name), the same companions from the sidecar, deadline, cancellable,
+ * link gate and events, and unloaded the same way when it brings nothing up
+ * -- but loaded from memory, and tried before any file: the embedded drivers
+ * in array order, then the directory's files, then (as iPXE's LoadImage hook
+ * breaks later loads) the embedded iPXE-named ones and the directory's. A
+ * sidecar that names one as a companion does not keep it from being tried.
+ * Its events carry @c is_embedded. Its loaded image is named @c name, and
+ * its DeviceHandle is the sweep directory's volume, else @c device_handle
+ * (a tool with no drivers directory passes the volume it was run from), as
+ * a load of a file there would give it -- iPXE reads it at entry and will
+ * not start without one. Firmware-first still runs before them; a file in
+ * the directory with the same name is still tried after them. Ignored by
+ * the other strategies. @c embedded NULL or @c embedded_count 0 means none;
+ * an entry with a NULL @c name or @c image, or a zero @c size, is reported
+ * LOAD_FAIL and skipped.
+ *
+ * @par The link gate (link_wait_sec)
+ * With the gate on, each pass (the firmware-first one, then each swept driver)
+ * waits up to @c link_wait_sec for a link on a NIC it may use — every NIC the
+ * selection allows in the firmware pass, the NICs the candidate bound in a
+ * swept one. The NICs are listed afresh throughout the wait, so one whose
+ * interface appears during it (a USB NIC still enumerating, or the ordinal
+ * @c nic_index names) counts; the wait runs even when no such NIC exists when
+ * it starts. When it ends, the pass reports each such NIC: LINK_DOWN for one
+ * with no link (no address is tried on it), CONFIGURING before the address
+ * step on each link-up one -- and nothing when there is still none. With
+ * DHCP the pass runs it on EVERY link-up NIC AT ONCE -- as Linux's in-kernel
+ * `ip=dhcp`, systemd-networkd and dhcpcd do -- each NIC's CONFIGURING fired
+ * before ONE wait of @c dhcp_timeout_sec (cut to the deadline; repeated per
+ * @c dhcp_retries) that they share: the first NIC to get an address -- the
+ * first in ordinal order when several have one by the time the wait ends,
+ * and one @c verifier accepts -- wins. A NIC the verifier rejects is put
+ * back and leaves the race, which goes on waiting for the others within the
+ * same budget. Every NIC but the winner is put back as it was found, which
+ * stops its DHCP and drops any lease it got: its IP4Config2 policy and, for
+ * a NIC that was static, its ManualAddress, Gateway and DnsServer (which
+ * the firmware discards when the policy changes) -- each restored only if
+ * it had one; a NIC that was already DHCP is left so. A pass therefore costs
+ * the link wait plus one DHCP budget however many ports are cabled. A pass
+ * with no address reports LINK_NO_LEASE naming the last NIC raced. A static
+ * address is still tried on one NIC at a time, in ordinal order, until one
+ * is up, and so is DHCP on firmware with no IP4Config2. A box whose firmware
+ * NICs are all uncabled therefore reaches the sweep after the link wait, not
+ * after a DHCP timeout on a NIC that cannot lease. With the gate off (0, the
+ * default) the address step runs on the NIC the selection resolves whatever
+ * its link, and neither event fires.
+ *
+ * @par One deadline (timeout_sec) and a cancellable (cancel)
+ * With @c timeout_sec, every wait inside the bring-up (the link wait, each DHCP
+ * wait) is cut to what is left of ONE overall deadline, and once it has passed
+ * no further driver is loaded and no DHCP is started. @c cancel ends whichever
+ * wait is running and stops the sweep before its next driver; when the
+ * cancellable claims the Shell's break (axl_cancellable_set_cancel_on_break),
+ * a Ctrl-C does the same, including one pressed while a driver was loading.
+ * Firmware calls that block rather than wait — loading and connecting a
+ * driver, and DHCP on firmware with no IP4Config2 — cannot be cut short; the
+ * deadline and the cancellable are checked when each returns. A DHCP the
+ * bring-up started and gave up on (deadline or cancel) has the NIC's
+ * IP4Config2 policy put back as it found it, so the firmware stops asking.
  *
  * @par Crash safety — design to the hardware: a bad driver RSODs the box and it
  *      does NOT auto-reboot
@@ -503,22 +787,101 @@ typedef struct {
  *
  * @par Defaults
  * A zero-initialized @p opts means AUTO NIC + DHCP +
- * firmware-first-then-SWEEP_DIR of the default directory.
- *
- * @note On a box whose firmware NICs are all link-down (e.g. onboard NICs with
- *     no cable) and the working NIC needs a staged driver, the firmware-first
- *     DHCP attempt polls for @c dhcp_timeout_sec before the sweep runs. Lower
- *     @c dhcp_timeout_sec if that first-attempt latency matters on such a box.
+ * firmware-first-then-SWEEP_DIR of the default directory, unbounded, with no
+ * link gate, no companion drivers and no verifier.
  *
  * @param opts  configuration; must not be NULL. Zero-initialize, then override.
  * @param out   [out] what was configured, or NULL if not needed.
- * @return AXL_OK if a NIC has an IPv4 address, AXL_ERR otherwise (including a
- *     NULL @p opts, or a STATIC request missing @c static_ipv4 / @c static_mask).
+ * @return AXL_OK if a NIC has an IPv4 address. AXL_TIMEOUT when @c timeout_sec
+ *     passed first; AXL_CANCELLED when @c cancel (or a Ctrl-C it claims) ended
+ *     the bring-up -- neither is returned without a deadline or a cancellable.
+ *     AXL_ERR otherwise: no NIC came up, a NULL @p opts, a STATIC request
+ *     missing @c static_ipv4 / @c static_mask, or a @c timeout_sec over
+ *     #AXL_NET_AUTO_TIMEOUT_MAX_SEC. A @c cancel already cancelled on entry
+ *     returns AXL_CANCELLED before anything is touched.
  */
 int
 axl_net_auto_init_opts(
     const AxlNetAutoOpts *opts,   ///< configuration (not NULL)
     AxlNetBringUpResult  *out     ///< [out] result, or NULL
+);
+
+/**
+ * @brief The library's companion-driver co-loader, for AxlNetAutoOpts.deps.
+ *
+ * Reads the sweep directory's `netload-drivers.json5` sidecar (the format
+ * `netload` documents: each entry a NIC driver and the companion drivers it
+ * `requires`). For each swept candidate that declares companions, it loads
+ * them from the same directory first -- under the same crash guard and shared
+ * quarantine as the candidates, each once per sweep, reported to
+ * AxlNetAutoOpts.on_driver with @c is_dependency set -- and a driver that is
+ * only ever a companion is not swept as a candidate. A companion stays
+ * resident for the rest of the sweep, so the next candidate that needs it
+ * reuses it; when the sweep ends, every companion it loaded is unloaded,
+ * newest first, unless the winning driver depends on it -- so a failed or
+ * stopped bring-up leaves none behind. "Depends on" means DECLARED: the
+ * winner's own `requires` in the sidecar, followed transitively. A companion
+ * the winner relies on without declaring it (one another candidate's entry
+ * named) is unloaded at the sweep's end like any other, taking with it
+ * whatever it gave the winner (NetworkCommon takes a USB NIC's SNP) -- so a
+ * sidecar must name every companion a driver needs. A
+ * candidate that brought nothing up is unloaded too; one whose own unload
+ * fails (its Unload refuses) stays resident, and its companions are unloaded
+ * all the same. A companion image that was resident
+ * before the sweep is never touched. A directory without the
+ * sidecar, or with one that does not parse, sweeps as if none were installed.
+ * The multi-volume default sweep (no single directory) has no sidecar.
+ *
+ * Calling this is what links the JSON5 sidecar reader into an image.
+ *
+ * @return the co-loader (never NULL; static, not to be freed).
+ */
+const AxlNetSweepDeps *
+axl_net_sweep_deps_sidecar(void);
+
+/**
+ * @brief The library's reachability check, for AxlNetAutoOpts.verifier.
+ *
+ * True when every check @p opts asks for passes: ping @c ping_ipv4 when set;
+ * ping the gateway of the NIC @p mac names when @c ping_gateway is set and that
+ * NIC has one (no gateway skips the check rather than failing it); resolve
+ * @c resolve_host when set. With none asked for it is true. Each ping waits up
+ * to 2 s.
+ *
+ * Installing it is what links ping and the DNS resolver into an image.
+ *
+ * @return true if @p opts is non-NULL and every requested check passes.
+ */
+bool
+axl_net_verify_reachable(
+    const struct AxlNetAutoOpts *opts,  ///< the options it was installed in (its inputs)
+    const uint8_t               *mac    ///< the configured NIC's MAC, or NULL
+) AXL_CB_NOEXCEPT;
+
+/**
+ * @brief The NIC-driver directory for a tool run from a stick: the first of
+ *     `drivers\<arch>` beside the running image, `drivers` beside it, and
+ *     `\drivers\<arch>` at the root of its volume that exists.
+ *
+ * Beside the image comes first because a release tarball's versioned
+ * directory is what is copied to a stick, so its drivers sit next to the tool,
+ * not at the root; the root form serves a stick laid out flat (for an image at
+ * the root the first and last are the same place). `<arch>` is `x64` or
+ * `aa64`, the running image's. `netload` and `sshd` both find their drivers
+ * this way, and axl_net_auto_init_opts() sweeps it when AxlNetAutoOpts.sweep_dir
+ * is NULL. Paths are built with axl_app_image_dir_path().
+ *
+ * @return AXL_OK, @p out naming the directory found. AXL_NOT_FOUND when none of
+ *     them exists, @p out naming the root's `\drivers` -- where a flat stick
+ *     would put them, for a message to name. AXL_ERR, @p out `""` (when
+ *     @p out_size is non-zero), when @p out is NULL or @p out_size is 0, when
+ *     the path does not fit, or when the image was not loaded from a file (an
+ *     embedded driver started from memory has no directory).
+ */
+int
+axl_net_driver_dir(
+    char   *out,       ///< [out] the directory, NUL-terminated
+    size_t  out_size   ///< capacity of @p out in bytes
 );
 
 /**
@@ -569,8 +932,8 @@ typedef enum {
  * @brief Ensure network drivers are loaded and SNP is up.
  *
  * Locates and loads `NetworkCommon.efi` plus a known list of NIC
- * drivers (Realtek, Intel/iPXE, Broadcom/iPXE, USB-CDC ECM/NCM,
- * USB-RNDIS, ASIX-USB) from the standard driver search path used by
+ * drivers (USB-CDC ECM/NCM, USB-RNDIS, Realtek and ASIX-USB UNDI) from
+ * the standard driver search path used by
  * axl_driver_ensure() — the image's own directory (the sibling) first,
  * then drivers/&lt;arch&gt;/&lt;name&gt; on the booted volume, drivers/&lt;name&gt; at
  * the volume root, then drivers/&lt;arch&gt;/&lt;name&gt; on every other mounted
@@ -582,6 +945,12 @@ typedef enum {
  * missing entry is one file existence check. Drivers whose hardware
  * isn't present register their binding but never bind to a controller,
  * which is also fine.
+ *
+ * It never loads an iPXE driver (`ipxe-*.efi`, `ipxe-all.efidrv`), not even
+ * as a fallback when the list brings up no SNP: iPXE takes the USB host
+ * controller, so a USB keyboard and USB storage -- a BMC's virtual keyboard
+ * and virtual media included -- vanish. Load one only by naming it
+ * (axl_net_try_driver()).
  *
  * Short-circuits if an SNP handle already exists. Idempotent — safe to
  * call multiple times.
@@ -1017,6 +1386,101 @@ AxlNetConfigMethod
 axl_net_last_config_method(void);
 
 // ---------------------------------------------------------------------------
+// Pre-UEFI-2.4 IPv4 configuration protocols, for old tools
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Let tools from before UEFI 2.4 see the address of a NIC that is up.
+ *
+ * UEFI 2.4 replaced `EFI_IP4_CONFIG_PROTOCOL` with `EFI_IP4_CONFIG2_PROTOCOL`,
+ * and current firmware produces only the new one. A tool built against the
+ * old protocol -- the EFI 1.x shell's `ifconfig` is the common one -- then
+ * reports every NIC as "Not configured." even after AXL has brought it up.
+ *
+ * This loads, once per boot, a small resident driver that puts the old
+ * protocols on every NIC handle carrying `EFI_IP4_CONFIG2_PROTOCOL`:
+ * `EFI_IP4_CONFIG_PROTOCOL` (UEFI 2.3.1) and the NIC configuration protocol
+ * the pre-2.4 network stack installed beside it, which is what the old
+ * shell's `ifconfig` reads. Both answer from the NIC's live
+ * `EFI_IP4_CONFIG2_PROTOCOL` data on every call; nothing is cached.
+ *
+ *   - **Never shadows a real one.** A handle that already carries
+ *     `EFI_IP4_CONFIG_PROTOCOL` is left alone.
+ *   - **Read-only.** Reading works; the old protocols' ways of CHANGING the
+ *     configuration (the NIC protocol's SetInfo, behind `ifconfig -s` and
+ *     `ifconfig -c`) return `EFI_UNSUPPORTED`, and Start/Stop change nothing
+ *     on the NIC. Configure with `netload` or the modern Shell's `ifconfig`.
+ *   - **Follows the NICs.** A NIC that appears later gets the protocols when
+ *     its `EFI_IP4_CONFIG2_PROTOCOL` appears; one that goes away loses them
+ *     first. A NIC with no address reports "not configured", as before.
+ *   - **Outlives the caller.** The driver is its own image, so the protocols
+ *     stay valid after the application that called this exits.
+ *
+ * AXL's network bring-up (@c axl_net_auto_init, @c axl_net_auto_init_opts,
+ * @c axl_net_bring_up, @c axl_net_set_static_ip and the calls built on them)
+ * already calls this whenever it leaves a NIC configured. Call it yourself
+ * only when something else configured the NIC.
+ *
+ * One copy per boot: a resident driver of this SDK's revision or newer
+ * (@c AXL_NET_LEGACY_IP4CFG_REVISION, read from its marker) is kept; an
+ * older one -- loaded by a tool built against an earlier SDK -- is unloaded
+ * and this one loaded in its place.
+ *
+ * @return AXL_OK when a driver of this revision or newer is resident (loaded
+ *         now or by an earlier call), AXL_ERR when it could not be loaded --
+ *         or an older one could not be unloaded, which then stays.
+ */
+int
+axl_net_legacy_ip4cfg_install(void);
+
+/**
+ * @brief Unload the driver @c axl_net_legacy_ip4cfg_install loaded.
+ *
+ * Removes the old protocols from every NIC first, then unloads the driver.
+ * A protocol pointer an old tool fetched earlier is invalid afterwards, as
+ * with any unloaded UEFI driver.
+ *
+ * @return AXL_OK when no such driver is resident any more (including when
+ *         none was), AXL_ERR when the unload was refused.
+ */
+int
+axl_net_legacy_ip4cfg_uninstall(void);
+
+/**
+ * @brief GUID of the marker protocol the resident driver puts on its image.
+ *
+ * An initializer for an @c AxlGuid (or an `EFI_GUID`). It is a contract
+ * between AXL versions: an image built against one SDK finds the driver an
+ * image built against another loaded, reads its @c AxlNetLegacyIp4CfgMarker,
+ * and replaces it when it is older (see @c axl_net_legacy_ip4cfg_install).
+ * Locating it is also how other code can tell the driver is resident.
+ */
+#define AXL_NET_LEGACY_IP4CFG_MARKER_GUID \
+    { 0xba19f68d, 0xc9a5, 0x406e, { 0x8e, 0x78, 0x0c, 0xf2, 0xe4, 0x22, 0x9b, 0x40 } }
+
+/**
+ * @brief The driver revision this SDK builds.
+ *
+ * Raised whenever the driver's behaviour changes, so that
+ * @c axl_net_legacy_ip4cfg_install replaces an older resident copy.
+ */
+#define AXL_NET_LEGACY_IP4CFG_REVISION  2u
+
+/**
+ * @brief The marker protocol's interface: which revision is resident.
+ *
+ * FROZEN LAYOUT. Images built against different SDKs read each other's
+ * marker, so @c revision stays the first member, at offset 0, as a
+ * `uint32_t`, for good. A later revision may only APPEND members, and a
+ * reader touches an appended member only after checking that @c revision
+ * is at least the one that added it -- an older driver's marker is shorter
+ * than this structure.
+ */
+typedef struct {
+    uint32_t revision;   ///< the resident driver's AXL_NET_LEGACY_IP4CFG_REVISION
+} AxlNetLegacyIp4CfgMarker;
+
+// ---------------------------------------------------------------------------
 // Reverse DNS (PTR)
 // ---------------------------------------------------------------------------
 
@@ -1241,6 +1705,13 @@ axl_net_list_interfaces_alloc(
 // ===========================================================================
 
 /**
+ * @brief Capacity of AxlNetDriverInfo.driver, NUL included: room for a
+ *     driver's file path, a release's versioned directory on a stick
+ *     included (`\\axl-sdk-uefi-tools-<ver>-<arch>\\drivers\\<arch>\\<name>`).
+ */
+#define AXL_NET_DRIVER_NAME_MAX 256
+
+/**
  * @brief Bound-driver identity and bus location for one NIC.
  *
  * Resolved by axl_net_get_driver_info(). Kept separate from
@@ -1254,8 +1725,10 @@ axl_net_list_interfaces_alloc(
  */
 typedef struct {
     /// Bound driver's image name. Four states, distinguishable by value:
-    ///   - the `.efi` filename for a disk-loaded driver
-    ///     (e.g. "ipxe-intel.efi");
+    ///   - the file path a disk-loaded driver was loaded from, as its
+    ///     loaded image records it (e.g. "\\drivers\\x64\\ipxe-intel.efi");
+    ///     truncated, never overflowed, past #AXL_NET_DRIVER_NAME_MAX - 1
+    ///     bytes;
     ///   - "<firmware volume>" for a driver dispatched from a firmware
     ///     volume (e.g. OVMF's VirtioNetDxe — its image path is an FV
     ///     file GUID, not a printable name);
@@ -1263,7 +1736,7 @@ typedef struct {
     ///     resolved (the loaded image has no usable file path);
     ///   - "" only when no driver is bound to the NIC (no BY_DRIVER agent
     ///     on any of NII3.1 / NII / SNP). In that case @c layer is "" too.
-    char driver[64];
+    char driver[AXL_NET_DRIVER_NAME_MAX];
     /// Protocol layer the driver bound at — a closed set: "NII3.1" or
     /// "NII" when the binding installs EFI_NETWORK_INTERFACE_IDENTIFIER
     /// (UEFI driver-model NIC drivers — iPXE, vendor UNDI), "SNP" when the
@@ -1359,6 +1832,10 @@ typedef struct {
  *
  * Follows the query-count convention of axl_net_list_interfaces: call
  * with @p out = NULL to learn the count, then again with a sized buffer.
+ *
+ * A file whose name or full path does not fit AxlNetDriverFile's fields
+ * whole is skipped (and logged), never reported cut -- a cut path would
+ * name another file, or none.
  *
  * @return AXL_OK on success (including zero drivers found); AXL_ERR if
  *     @p count is NULL.

@@ -25,8 +25,19 @@
     ConSplitter (the tag's consumer), not ConPlatform (which holds the SimpleTextOut
     open) — so GraphicsConsole is never re-tagged.
 
+    The handle also carries the `gEfiStandardErrorDeviceGuid` tag, so ConSplitter
+    fans standard error (`gST->StdErr`, where a tool's error lines go) to us too,
+    as it does to a screen listed in `ErrOut`. A take-over moves the screen off
+    StdErr with ConOut: on firmware whose `ErrOut` lists the display, each SCREEN
+    console it evicts (a handle carrying a GOP or UGA, i.e. GraphicsConsole)
+    loses its StdErr tag too, so an error line is drawn once, by us, not a second
+    time over our picture. Every other StdErr device -- the serial terminal --
+    keeps its tag, and uninstall puts a screen's StdErr tag back with its ConOut
+    one. A passthrough_local device evicts nothing, so it joins StdErr only.
+
     **Portability:** this relies on EDK2's console-device model (ConSplitter, the
-    `gEfiConsoleOutDeviceGuid` tag, ConPlatform binding), which is not UEFI-spec.
+    `gEfiConsoleOutDeviceGuid` / `gEfiStandardErrorDeviceGuid` tags, ConPlatform
+    binding), which is not UEFI-spec.
     EDK2-family firmware (OVMF, AMI Aptio, Insyde) is fine; verify per target. See
     `AXL-Console-Device-Design.md`.
 **/
@@ -61,11 +72,36 @@ typedef struct {
                                 ///< axl_console_device_inject_key family and/or the internal
                                 ///< read loop below). false = output-only, the physical
                                 ///< keyboard still drives the shell.
+                                ///< Key notifies: EDK2's ConSplitter does not unregister
+                                ///< anything from a console-in device it drops, so an
+                                ///< evicted keyboard would keep every notify registered
+                                ///< before the take-over (the Shell's Ctrl-C/Ctrl-S) while
+                                ///< the registrant's unregister reaches only the members
+                                ///< left; after `exit` freed the Shell, the keyboard's next
+                                ///< 'c' would call freed code. So eviction removes from
+                                ///< each keyboard the notifies ConSplitter registered on
+                                ///< it -- the ones it registered on us when we joined --
+                                ///< by registering the same (key, function) pair there and
+                                ///< unregistering the handle that returns. While evicted,
+                                ///< the keyboard's keys reach the guest through our ring,
+                                ///< which fires our own copies; on uninstall ConSplitter
+                                ///< re-registers its current list on the restored
+                                ///< keyboard. This relies on EDK2's input drivers
+                                ///< returning the EXISTING handle for an identical pair
+                                ///< (TerminalConInRegisterKeyNotify, the PS/2
+                                ///< KeyboardRegisterKeyNotify and
+                                ///< USBKeyboardRegisterKeyNotify all do). On a driver that
+                                ///< adds a duplicate instead, the duplicate is removed and
+                                ///< the original stays -- no worse than without this.
     bool     read_physical;     ///< (take_input only) run an internal timer that reads the
                                 ///< evicted firmware keyboard and re-injects its keys, so a
                                 ///< resident take-over with no foreground input loop still
-                                ///< gets live typing. false = the device is a pure sink; the
-                                ///< consumer feeds keys via inject_*.
+                                ///< gets live typing. Each key fires the guest's key
+                                ///< notifies as its own keyboard driver would: a key with no
+                                ///< shift state (a serial terminal) matches by key alone, so
+                                ///< a serial Ctrl-C (0x03) still breaks the Shell. false =
+                                ///< the device is a pure sink; the consumer feeds keys via
+                                ///< inject_*.
     uint32_t input_poll_ms;     ///< (read_physical only) internal read-timer period in ms;
                                 ///< 0 = a sensible default.
     uint32_t debounce_ms;       ///< (read_physical only) drop a repeat of the SAME key within
@@ -78,7 +114,8 @@ typedef struct {
                                 ///< caveat as @a debounce_ms.
     bool (*key_filter)(void *user, const void *key) AXL_CB_NOEXCEPT;
                                 ///< (read_physical only) peek each physical key the read loop
-                                ///< reads BEFORE it is forwarded to the shell; return true to
+                                ///< reads BEFORE it is forwarded to the shell -- as it is read,
+                                ///< also while the guest is not reading; return true to
                                 ///< CONSUME it (the shell never sees it) -- e.g. a terminal
                                 ///< claiming Shift+PgUp for scrollback. NULL = forward all.
                                 ///< @a key points at the firmware key record (scan code /
@@ -140,9 +177,10 @@ typedef struct {
  * @brief Install the take-over device from a resident driver's DriverEntry
  *     (requires TPL_APPLICATION).
  *
- * Publishes our SimpleTextOut + a Vendor device path + a self-installed
- * `gEfiConsoleOutDeviceGuid` tag on a fresh handle, connects it so ConSplitter fans
- * to us, then evicts the other console-out devices — unless
+ * Publishes our SimpleTextOut + a Vendor device path + self-installed
+ * `gEfiConsoleOutDeviceGuid` and `gEfiStandardErrorDeviceGuid` tags on a fresh
+ * handle, connects it so ConSplitter fans console output and standard error to
+ * us, then evicts the other console-out devices (never a StdErr device) — unless
  * @ref AxlConsoleDeviceConfig::passthrough_local, which keeps them in the fan-out so
  * the local display keeps painting. `gST->ConOut`'s pointer value is
  * never touched; no NVRAM write. Output is reported as @p ops. The device OWNS the
@@ -176,31 +214,225 @@ axl_console_device_install(
  * The disconnect is load-bearing: ConSplitter holds a raw pointer to our
  * SimpleTextOut (which lives in the freed instance), so without it the next
  * `gST->ConOut` write jumps through a freed vtable. See AXL-Console-Device-Design.md.
+ *
+ * **Never frees under a call in flight.** The device counts the firmware's
+ * calls into it that have not returned yet -- every method of its
+ * SimpleTextOut, SimpleTextIn/InEx and pointer proxy, from its first statement
+ * to its return, which spans every @ref AxlConsoleOps callback the call makes.
+ * While one is live, uninstall changes NOTHING and returns #AXL_BUSY. That is
+ * the case of a loop callback or timer at `TPL_CALLBACK` that preempted the
+ * Shell part-way through its own output at `TPL_APPLICATION` (an op callback
+ * of yours is suspended mid-way, and freeing would resume it in freed
+ * memory), and of an uninstall made from inside an op callback. Retry from a
+ * later point, such as the next tick: the preempted call finishes as soon as
+ * the preempting callback returns. Keep the ops' target alive until uninstall
+ * returns #AXL_OK. A call the firmware had already dispatched to a method
+ * when the uninstall preempted it -- before the method's first statement --
+ * finds no device when it resumes, returns `EFI_DEVICE_ERROR` without
+ * touching the freed instance (TestString `EFI_UNSUPPORTED`, and the key
+ * notify pair `EFI_INVALID_PARAMETER`, the statuses their specs define),
+ * and leaves the count balanced. The pointer
+ * proxy's GetState (installed only with @c take_pointer) waits up to 4 ms
+ * inside the call, so while a guest polls it -- the UEFI `edit` does,
+ * continuously -- a call is in flight nearly all the time and a retry from
+ * a tick sees #AXL_BUSY almost every time, until that guest exits. Retry
+ * for as long as it takes; do not assume it converges within a few ticks.
+ * At `TPL_APPLICATION` outside every op callback -- a driver's Unload -- no
+ * call can be in flight, so #AXL_BUSY does not occur there.
+ *
+ * @return #AXL_OK when the device is gone, and for a NULL @p dev (nothing to
+ *     do); #AXL_BUSY when a call into the device is in flight -- nothing
+ *     changed, call again later; #AXL_INVALID when @p dev is not the
+ *     installed device; #AXL_ERR when the firmware would not let go --
+ *     the instance is then leaked deliberately rather than freed under a
+ *     holder, and a later call resumes from where this one stopped. What
+ *     the refusal leaves depends on where it came:
+ *     - ConSplitter could not be disconnected from our handle: the
+ *       console stays taken and the firmware keyboards stay evicted, so
+ *       the @c read_physical loop runs again and keys keep reaching the
+ *       guest through the device. On EDK2 this is rare: its
+ *       DisconnectController returns `EFI_NOT_FOUND` when NO binding
+ *       stopped (a total refusal), which counts as a successful
+ *       disconnect here, so an error comes only from a bad parameter or
+ *       a resource failure -- and the latter can come after some bindings
+ *       stopped, when the ConIn aggregate may already have dropped us and
+ *       keys the loop reads reach no guest until a retry succeeds.
+ *     - Our console protocols could not be uninstalled (ConIn or ConOut):
+ *       the firmware consoles and keyboards are already restored, so the
+ *       console is NOT taken any more and input reaches the guest through
+ *       them; only the instance is kept, for the protocols still pointing
+ *       into it. This is where an EDK2 total refusal is caught: a binding
+ *       that would not stop still holds our protocols, so their uninstall
+ *       is refused.
  */
-void
+AXL_WARN_UNUSED int
 axl_console_device_uninstall(
     AxlConsoleDevice *dev  ///< device handle (NULL-safe)
 );
+
+/**
+ * @brief Whether a take-over console device is installed ANYWHERE on the system —
+ *     by this image or by any other resident driver.
+ *
+ * The "a second install fails" singleton of @ref axl_console_device_install is PER
+ * IMAGE: each statically linked libaxl keeps its own instance, so it cannot see a
+ * device another image installed. This probe asks the firmware instead — it looks
+ * for a handle carrying `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL` whose device path is
+ * EXACTLY the device's own Vendor node (a prefix match does not count), so it sees
+ * every image's take-over alike. Use it to refuse a second take-over with a clear
+ * message BEFORE doing anything with side effects; an install racing another image
+ * still fails on its own, because the firmware refuses a duplicate device path.
+ *
+ * true from the moment install publishes the handle until uninstall removes it —
+ * and also after an uninstall that could not remove its protocols (it then leaks the
+ * instance deliberately, and the console is still taken). It does NOT see the swap
+ * producer (@ref axl_console_tap_install), which publishes no handle. Read-only:
+ * opens no protocol, allocates nothing, callable at any TPL up to `TPL_NOTIFY`.
+ *
+ * @return true if a take-over device's handle is present, false otherwise
+ *     (including when the firmware cannot be asked, e.g. no boot services).
+ */
+bool
+axl_console_device_present(void);
 
 /* --- Input relay (effective only when cfg.take_input=true) --------------------
  * Mirrors the tap's inject family exactly (same key shape, same Ctrl+letter fold via
  * shift_state, same VT decode). Implemented in the input increment; when
  * take_input=false these return AXL_ERR. */
 
-/** @brief Inject one keystroke. See @ref axl_console_tap_inject_key. */
+/**
+ * @brief Inject one keystroke. See @ref axl_console_tap_inject_key.
+ *
+ * Keys wait in a ring of 64 (63 usable) that drains only as the guest reads.
+ *
+ * Every notify the guest registered for the key fires when it is injected,
+ * EVEN WHEN THE RING IS FULL and the key itself is dropped -- as a keyboard
+ * driver fires them on the key press before it looks for room in its queue
+ * (EDK2 TerminalDxe does exactly this). So the Shell's Ctrl-C reaches it
+ * behind any amount of type-ahead into a command that never reads the
+ * console. The flip side: offering a refused key again fires its notifies
+ * again, so do not retry a key that is a notify chord (Ctrl-C); a plain key
+ * retried has no notify to repeat.
+ *
+ * @return #AXL_OK when queued; #AXL_BUSY when the ring is full (the key is
+ *     not queued, but its notifies have fired; a plain key can be offered
+ *     again once the guest has read); #AXL_ERR on a NULL @p dev or an
+ *     output-only device (take_input false).
+ */
 int
 axl_console_device_inject_key(AxlConsoleDevice *dev, uint16_t scan, uint16_t unicode);
 
-/** @brief Inject one keystroke with modifier / toggle state. See
- *     @ref axl_console_tap_inject_key_ex. */
+/**
+ * @brief Inject one keystroke with modifier / toggle state. See
+ *     @ref axl_console_tap_inject_key_ex.
+ *
+ * @return as @ref axl_console_device_inject_key.
+ */
 int
 axl_console_device_inject_key_ex(AxlConsoleDevice *dev, uint16_t scan, uint16_t unicode,
                                  uint32_t shift_state, uint8_t toggle_state);
 
-/** @brief Inject a run of terminal input bytes (xterm/VT). See
- *     @ref axl_console_tap_inject_text. */
+/**
+ * @brief Inject a run of terminal input bytes (xterm/VT). See
+ *     @ref axl_console_tap_inject_text.
+ *
+ * Takes the bytes in whole units, exactly as
+ * @ref axl_console_device_inject_text_partial does, and stops at the first
+ * unit whose keys do not all fit in the ring; the bytes from there on are
+ * NOT injected. Use the partial form to learn where that was.
+ *
+ * @return #AXL_OK when every byte was consumed; #AXL_BUSY when the ring
+ *     filled first; #AXL_ERR on a NULL @p dev / @p bytes or an output-only
+ *     device.
+ */
 int
 axl_console_device_inject_text(AxlConsoleDevice *dev, const char *bytes, size_t len);
+
+/**
+ * @brief Inject as much of a run of terminal input bytes as the key ring has
+ *     room for, and report how many bytes that was.
+ *
+ * The ring holds 63 keys and drains only as the guest reads them, so a paste
+ * longer than that cannot go in at once; this is the form that lets a caller
+ * hold the rest and offer it again. Bytes are taken in whole UNITS, each
+ * decoded exactly as @ref axl_console_tap_inject_text decodes it, to the key
+ * shape that function documents (KeyShiftState VALID plus the modifiers,
+ * KeyToggleState @ref AXL_CONSOLE_TOGGLE_KEYBOARD, as a USB keyboard reports
+ * them): one ASCII byte, one UTF-8 character, one complete CSI/SS3 escape
+ * sequence, an Alt chord (ESC followed by one byte that is not `[`, `O` or
+ * `>= 0x80`), a bare Esc (ESC alone, or before a byte `>= 0x80`), or the
+ * escape sequence still open at the end of @p bytes -- whose keys are a bare
+ * Esc plus each of its bytes as a literal key, because every call is
+ * self-contained. A
+ * unit is injected only if ALL of its keys fit, so a character or a sequence
+ * is never split between two calls; one that decodes to no key at all (an
+ * invalid UTF-8 byte, an unrecognized complete sequence) is consumed.
+ *
+ * Stops at the first unit that does not fit. @p consumed is then that unit's
+ * offset, always a unit boundary, so `bytes + *consumed` can be offered again
+ * later as a call of its own and decodes to the same keys it would have
+ * here. Exact when called from `TPL_CALLBACK` (a loop callback, the usual
+ * place): the guest's reads only ever free room, and the device's own
+ * physical-keyboard timer runs at that same TPL, so nothing can take the
+ * room between the check and the push. From a lower TPL that timer can, and
+ * a unit's keys that then miss are lost, as with
+ * @ref axl_console_device_inject_text.
+ *
+ * @return #AXL_OK when all @p len bytes were consumed (`*consumed == len`,
+ *     including @p len 0); #AXL_BUSY when the ring filled first
+ *     (`*consumed < len`, possibly 0); #AXL_ERR on a NULL @p dev, @p bytes or
+ *     @p consumed, or an output-only device -- with `*consumed` set to 0
+ *     whenever @p consumed is not NULL.
+ */
+int
+axl_console_device_inject_text_partial(
+    AxlConsoleDevice *dev,       ///< device handle
+    const char       *bytes,     ///< terminal input bytes (xterm/VT)
+    size_t            len,       ///< number of bytes
+    size_t           *consumed   ///< [out] bytes taken, a unit boundary
+);
+
+/**
+ * @brief How many keys the device holds that the guest has not read yet.
+ *
+ * Every key waiting in the ring counts -- injected through this API, or
+ * forwarded from an evicted physical keyboard -- until a ReadKeyStroke or
+ * ReadKeyStrokeEx takes it, and so does every physical key already read from
+ * its keyboard (read_physical) and waiting for room in the ring. 0 means the
+ * guest has read everything it was
+ * given. The unit is one entry per EFI key: an escape sequence injected as
+ * text (an arrow key's `ESC [ A`) is one key and counts once.
+ *
+ * That is what a caller needs before a key whose NOTIFY must act after the
+ * keys typed ahead of it. A registered notify fires when the key is PUSHED
+ * (the UEFI rule, which the inject calls follow), not when the guest reads
+ * it, so a notify chord pushed behind unread keys acts before the guest has
+ * seen them. The UEFI Shell's Ctrl-S is the case: its notify halts output,
+ * and the key that resumes it is the next one READ -- one of the unread keys
+ * ahead of the Ctrl-S, which is then lost from the command line. Holding the
+ * chord until this returns 0 puts its effect after them, as at a keyboard
+ * typed at human speed.
+ *
+ * The count falls only as the guest reads. A guest that is not reading
+ * ConIn -- a command running -- leaves it non-zero for as long as that
+ * lasts, so a caller waiting for 0 waits that long. For the Shell's Ctrl-S
+ * this loses nothing: pushed behind unread keys its halt would be resumed at
+ * once by one of them.
+ *
+ * Callable at any TPL up to `TPL_NOTIFY`. The count is a snapshot; it is
+ * stable within one `TPL_CALLBACK` callback provided that callback is the
+ * only injector: the guest reads at a lower TPL and cannot run until the
+ * callback returns, and the device's physical-keyboard timer, the other
+ * source, runs at that same TPL.
+ *
+ * @return the number of unread keys: 0..63 in the ring plus up to 256 held
+ *     physical keys; 0 for a NULL @p dev or an output-only device
+ *     (take_input false), which has no ring.
+ */
+size_t
+axl_console_device_queued_keys(
+    const AxlConsoleDevice *dev   ///< device handle (NULL-safe)
+);
 
 /* --- Runtime geometry + session (output side) -------------------------------- */
 

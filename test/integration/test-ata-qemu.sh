@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=11 local-only=0
+# test-meta: arch=x64 needs= est=11 local-only=0 guest=ata
 # test-ata-qemu.sh — AxlAta against an emulated AHCI/SATA disk.
 #
 # The unit suite (AxlAta) tests the pure decoders against fixed buffers.
@@ -15,23 +15,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/ata.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: ata.efi not built"; exit 1; }
 
 WORK="$(mktemp -d)"
 LOG="$WORK/serial.log"
-IMG="$WORK/sata.img"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-truncate -s 64M "$IMG"
+# The disks are QEMU's null-co -- zeros of a fixed size, no file (the tool
+# never needs their contents) -- so the machine is the same on every run and
+# is the `ata` pool class's (test/pool/classes.toml).
 
 # An AHCI controller with one SATA disk carrying a model + serial so the
 # IDENTIFY assertions have a concrete string to match.
 timeout 120s "$PROJECT_DIR/scripts/run-qemu.sh" --timeout 90 \
     --qemu-arg -device --qemu-arg "ich9-ahci,id=ahci" \
-    --qemu-arg -drive --qemu-arg "file=$IMG,if=none,id=satadisk,format=raw" \
+    --qemu-arg -drive --qemu-arg "driver=null-co,size=64M,read-zeroes=on,if=none,id=satadisk" \
     --qemu-arg -device \
     --qemu-arg "ide-hd,drive=satadisk,bus=ahci.0,model=AXLSATA,serial=ATA12345" \
     "$EFI" 2>&1 | tee "$LOG" \

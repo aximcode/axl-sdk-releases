@@ -121,7 +121,7 @@ SECTIONS
      zero byte as literal file content (an N-byte static array added N bytes to
      the .efi). The crt0 _start ZEROES [_bss, _bss_end) before any C code runs
      (src/crt0/axl-crt0-gcc-*.S) — the loader's zero-fill is NOT relied upon
-     (fresh AllocatePages memory can be dirty; `make check-bss-clear` guards the
+     (fresh AllocatePages memory can be dirty; `gate.check-bss-clear` guards the
      crt0 clear). _bss/_bss_end are the bounds the crt0 reads. Page-aligned so
      it lands on its own PE section boundary. */
   .bss (NOLOAD) :

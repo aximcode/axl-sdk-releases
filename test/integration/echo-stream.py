@@ -24,14 +24,15 @@ import sys
 import threading
 
 
-def handle(conn: socket.socket) -> None:
+def handle(conn: socket.socket, sink: bool = False) -> None:
     try:
         with conn:
             while True:
                 chunk = conn.recv(4096)
                 if not chunk:
                     return
-                conn.sendall(chunk)
+                if not sink:
+                    conn.sendall(chunk)
     except OSError:
         return
 
@@ -40,16 +41,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=55555)
     parser.add_argument("--bind", default="127.0.0.1")
+    parser.add_argument("--sink", action="store_true",
+                        help="TCP: read every byte and answer none (a peer "
+                             "that never replies)")
     parser.add_argument("--udp", action="store_true",
                         help="UDP datagram echo instead of TCP stream")
     args = parser.parse_args()
 
     if args.udp:
         return run_udp(args.bind, args.port)
-    return run_tcp(args.bind, args.port)
+    return run_tcp(args.bind, args.port, args.sink)
 
 
-def run_tcp(bind: str, port: int) -> int:
+def run_tcp(bind: str, port: int, sink: bool = False) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((bind, port))
@@ -65,14 +69,15 @@ def run_tcp(bind: str, port: int) -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    print(f"echo-stream: TCP listening on {bind}:{port}", flush=True)
+    kind = "sink" if sink else "echo"
+    print(f"echo-stream: TCP {kind} listening on {bind}:{port}", flush=True)
     try:
         while not stop.is_set():
             try:
                 conn, _ = sock.accept()
             except OSError:
                 break
-            t = threading.Thread(target=handle, args=(conn,), daemon=True)
+            t = threading.Thread(target=handle, args=(conn, sink), daemon=True)
             t.start()
     finally:
         try:

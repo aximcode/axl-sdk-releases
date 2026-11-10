@@ -11,6 +11,8 @@
 #include <axl/axl-sys.h>    /* AxlGuid */
 #include "axl-backend.h"    /* AxlFileHandle */
 
+/* The original bridge layout, 56 bytes on both arches, FROZEN: drivers built
+   before AxlStdioBridge2 read it under AXL_STDIO_BRIDGE_GUID. */
 typedef struct {
     AxlFileHandle  stdin_h;
     AxlFileHandle  stdout_h;
@@ -27,9 +29,32 @@ typedef struct {
     bool           has_pending;      /* true when a driver armed a status this dispatch */
 } AxlStdioBridge;
 
-/* uuid c8f517d7-36cc-458d-98d6-b116825e30bf — fixed identity of the
-   stdio-bridge protocol. */
+/* uuid c8f517d7-36cc-458d-98d6-b116825e30bf — the original bridge, an
+   AxlStdioBridge. A launcher still installs it, for drivers built before
+   AxlStdioBridge2; a driver no longer reads it -- one built since reading it
+   from an older launcher would read `target` past the end of that
+   launcher's static -- so a launcher that installs only this one lends a
+   newer driver nothing (EOF stdin, no bridging). */
 extern const AxlGuid AXL_STDIO_BRIDGE_GUID;
+
+/* The bridge drivers read, under AXL_STDIO_BRIDGE2_GUID. `base` is the very
+   AxlStdioBridge a launcher installs under the original GUID -- one copy, so
+   an exit status a driver of either age arms lands in the cell the launcher
+   reads. `size` is sizeof the launcher's struct: a field appended later is
+   read only when `size` covers it. */
+typedef struct {
+    uint32_t        size;     /* sizeof(AxlStdioBridge2) as the launcher built it */
+    AxlStdioBridge  base;
+    const void     *target;   /* the published interface this dispatch goes
+                                 through: only the image that published it
+                                 reads this bridge (NULL = no image does) */
+} AxlStdioBridge2;
+
+/* uuid ce4cacac-e9c8-4efc-926b-66be5876db55 — an AxlStdioBridge2. */
+extern const AxlGuid AXL_STDIO_BRIDGE2_GUID;
+
+/* How many published interfaces one image lends launchers' stdio to. */
+#define AXL_BRIDGE_TARGETS_MAX  8
 
 /* Driver-resident per-dispatch liveness reference. A resident driver installs
    exactly one of these (install-if-absent) at publish time on a dedicated
@@ -53,9 +78,20 @@ extern const AxlGuid AXL_DISPATCH_TOKEN_GUID;
    no crash, no wrong data, just no bridging). */
 int axl_backend_dispatch_token_ensure(void);
 
-/* Returns AXL_OK when the bridge is installed or there were no launcher
-   shell handles to bridge (no-op); AXL_ERR if the protocol install failed. */
-int  axl_backend_stdio_bridge_install(void);
+/* Install this launcher's bridge, aimed at @p target: the interface the
+   dispatch goes through, as the driver published it. Returns AXL_OK when the
+   bridge is installed or there were no launcher shell handles to bridge
+   (no-op); AXL_ERR if the protocol install failed. */
+int  axl_backend_stdio_bridge_install(const void *target);
+
+/* Driver side: @p iface is (@p published true) or is no longer (false) an
+   interface THIS image published for launchers to dispatch through. A bridge
+   is read only by the image that published its target, so a launcher's
+   handles never reach another resident image -- a service writing on its own
+   clock, a second shared driver. Returns false when @p published and the
+   image already lends to AXL_BRIDGE_TARGETS_MAX interfaces: @p iface is not
+   recorded, and its launchers' stdio does not reach it. */
+bool axl_backend_stdio_bridge_target(const void *iface, bool published);
 void axl_backend_stdio_bridge_uninstall(void);
 
 /* Uninstall every bridge instance whose launcher image has exited. A launcher

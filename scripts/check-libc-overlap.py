@@ -69,14 +69,14 @@ define, AXL's binding is weak unless the name is declared must-win with a
 reason. A new overlapping symbol appearing by accident fails here rather than
 at some future consumer's link.
 
-"Both sides" means `libaxl.a` AND the staged `axl-cxxrt-*.o` glue objects. The
+"Both sides" means `libaxl.a` AND the tree's `build/axl-cxxrt-*.o` glue objects. The
 allocator bridge lives in an object rather than the archive -- an object's
 definition displaces an archive member outright, which is the whole mechanism
 -- so a gate reading only the archive is blind to exactly the symbols most
 worth watching. It was: P1 added `_malloc_r`/`_free_r`/`_calloc_r`/`_realloc_r`
 and this reported "14 overlapping, clean" without seeing one of them.
 
-Usage: check-libc-overlap.py [--arch x64|aa64]
+Usage: check-libc-overlap.py [--arch x64|aa64] --tree <CMake build tree>
 """
 
 from __future__ import annotations
@@ -90,6 +90,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
 
 # Names AXL must define STRONGLY even though newlib also defines them, each with
 # the reason newlib's cannot serve under UEFI. A name here is asserted to be
@@ -138,11 +139,12 @@ MUST_WIN: dict[str, str] = {
     # one reference to either of these would have dragged newlib's version in
     # and multiply-defined the other two against ours. Owning the WHOLE member
     # is the rule; owning most of it is the bug.
-    # libc_a-mstats.o, ALL FIVE of it. The pinned x86_64-elf newlib fills a
-    # struct mallinfo of ten INT fields while its own <malloc.h> declares ten
-    # size_t, so a caller reads pairs of 32-bit fields as one 64-bit and 40
-    # bytes of stack after them -- fordblks came back as __stack_chk_guard.
-    # AXL's mallinfo reads it through a matching declaration and widens.
+    # libc_a-mstats.o, ALL FIVE of it. An x86_64-elf newlib built from the
+    # pre-axl3 recipe fills a struct mallinfo of ten INT fields while its own
+    # <malloc.h> declares ten size_t, so a caller reads pairs of 32-bit fields
+    # as one 64-bit and 40 bytes of stack after them -- fordblks came back as
+    # __stack_chk_guard. AXL's mallinfo reads it through a matching declaration
+    # and widens.
     #
     # The other four are here because a member is all-or-nothing: taking only
     # mallinfo would leave a consumer calling malloc_stats to pull mstats.o and
@@ -150,8 +152,9 @@ MUST_WIN: dict[str, str] = {
     # above -- owning MOST of a member is the bug.
     #
     # All five are compiled ONLY where a build-time probe says the toolchain's
-    # layout is wrong (AXL_NEWLIB_MALLINFO_INT). ARM's newlib is correct, so on
-    # aa64 AXL defines none of them and this gate sees no overlap at all.
+    # layout is wrong (AXL_NEWLIB_MALLINFO_INT). ARM's newlib and the pinned
+    # axl3 x86_64-elf one are correct, so with either AXL defines none of them
+    # and this gate sees no overlap at all.
     "mallinfo": (
         "newlib's fills int fields into a struct its own header declares as "
         "size_t; the numbers it returns are field-shifted garbage plus stack"
@@ -290,9 +293,18 @@ def nm_defined(nm: str, archive: Path) -> dict[str, str]:
     labels that both archives happen to name identically inside their own
     objects. A gate that loud about non-problems is one nobody reads.
 
-    Later members win, which is irrelevant here: a name defined twice INSIDE one
-    archive is a different defect, and `ar` would not have accepted it into one
-    link anyway.
+    THE STRONGEST BINDING WINS when several members define one name, and that
+    is load-bearing rather than tidy. The first draft let the LAST member win,
+    on the reasoning that "`ar` would not have accepted two definitions into
+    one archive anyway" -- which is simply false: `ar` accepts them happily,
+    and it is the LINKER that objects, and only if both members get pulled in.
+    The consequence was a hole the exact size of this gate's subject:
+    `libaxl.a` already carries a WEAK `explicit_bzero` in axl-ed25519-glue.o,
+    so a STRONG one added to axl-mem.o -- the real 286f6323 defect, replayed as
+    a sabotage -- was overwritten by the weak entry read afterwards and the
+    gate reported "8 overlapping symbols, clean". AXL has a strong provider for
+    a name the moment ANY member defines it strongly; that is the fact this
+    gate is asking about, so that is the letter it keeps.
 
     Raises RuntimeError if @a nm could not run at all (bad path, corrupt
     archive nm refuses to open, ...) rather than returning {} -- an empty dict
@@ -314,77 +326,124 @@ def nm_defined(nm: str, archive: Path) -> dict[str, str]:
     for line in out.stdout.splitlines():
         # "<addr> T name" or, for a bss symbol, "<addr> B name".
         m = re.match(r"^[0-9a-fA-F]*\s+([A-Z])\s+(\S+)$", line)
-        if m:
-            syms[m.group(2)] = m.group(1)
+        if not m:
+            continue
+        kind, name = m.group(1), m.group(2)
+        prev = syms.get(name)
+        # W = weak function, V = weak object. A strong definition anywhere in
+        # the archive is the answer; a weak one read later must not erase it.
+        if prev is None or (prev in ("W", "V") and kind not in ("W", "V")):
+            syms[name] = kind
     return syms
 
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="x64", choices=("x64", "aa64"))
+    ap.add_argument("--tree", type=Path, required=True,
+                    help="grade this CMake build tree (lib/libaxl.a, "
+                         "lib/libaxl-standin.a, build/axl-cxxrt-*.o), its "
+                         "freshness asked of ninja")
     args = ap.parse_args(argv)
+    return grade_tree(args.arch, args.tree.resolve())
 
-    # The archive a consumer actually links. Prefer the STAGED one; fall back to
-    # the build tree, which `make` produces without staging.
-    #
-    # Absence is a FAILURE, not a skip. This gate exists to catch a link error
-    # nobody sees until a consumer hits it, so a version of it that quietly
-    # passes on a tree it could not read would be the exact "gate that cannot
-    # see" shape it was written against -- and verify.sh does not stage, so the
-    # skip would have been the NORMAL path on a fresh clone rather than an edge
-    # case.
-    prefix = subprocess.run(
-        [str(REPO / "scripts" / "sdk-prefix.sh"), "--abs"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    candidates = [Path(prefix) / "lib" / "axl" / args.arch / "libaxl.a"]
-    built = subprocess.run(
-        ["make", "-s", f"ARCH={args.arch}", "BUILD=RELEASE", "print-prefix"],
-        cwd=REPO, capture_output=True, text=True,
-    ).stdout.strip()
-    if built:
-        candidates.append(REPO / built / "lib" / "libaxl.a")
-    candidates.append(REPO / "out" / f"native-{args.arch}" / "lib" / "libaxl.a")
 
-    # Same ladder, for the separate stand-in archive (§5.3). Resolved here so a
-    # missing archive is reported by check_standin() below with the exact path
-    # this gate looked for, not a generic "not found".
-    standin_candidates = [
-        Path(prefix) / "lib" / "axl" / args.arch / "libaxl-standin.a",
-    ]
-    if built:
-        standin_candidates.append(REPO / built / "lib" / "libaxl-standin.a")
-    standin_candidates.append(
-        REPO / "out" / f"native-{args.arch}" / "lib" / "libaxl-standin.a")
-    standin_archive = next(
-        (c for c in standin_candidates if c.exists()), standin_candidates[0])
+def _ninja_lines(tree: Path, args: list[str]) -> list[str] | None:
+    """`ninja -C TREE ARGS` stdout lines; None when ninja could not answer."""
+    out = subprocess.run(["ninja", "-C", str(tree), *args],
+                         capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        print(f"    ninja {' '.join(args[:2])}: exit {out.returncode}: "
+              f"{out.stderr.strip()[:300]}")
+        return None
+    return out.stdout.splitlines()
 
-    # The staged GLUE OBJECTS are checked alongside the archive, because the
-    # allocator bridge lives there rather than in libaxl.a and is exactly the
-    # two-provider case this gate exists for: `axl-cxxrt-alloc.o` defines
-    # `malloc`/`free` and (since P1) `_malloc_r`/`_free_r`/`_calloc_r`/
-    # `_realloc_r`, every one of which newlib also defines.
-    #
-    # Reading only libaxl.a made this gate blind to its own subject: P1 landed
-    # four new overlapping symbols and the gate reported "14 overlapping, clean"
-    # without seeing any of them.
-    glue = sorted((Path(prefix) / "lib" / "axl" / args.arch).glob("axl-cxxrt-*.o"))
 
-    libaxl = next((c for c in candidates if c.exists()), None)
-    if libaxl is None:
-        print(f"check-libc-overlap: FAIL ({args.arch}) — no libaxl.a to read.")
-        print("    Looked in:")
-        for c in candidates:
-            print(f"      {c}")
-        print("    Build or stage first, e.g. scripts/install.sh --arch all --cpp")
+def tree_freshness(tree: Path, arts: list[Path]) -> str | None:
+    """None when every artifact in @a arts is newer than everything NINJA
+    says it is made from, else why.
+
+    Not `ninja -n`: a tree with CONFIGURE_DEPENDS globs plans its glob check
+    and a CMake re-run first on every dry run, and a dry run stops there --
+    measured, it printed the same two steps over a touched source as over a
+    clean tree, so it could not see staleness at all. Instead, ninja's own
+    record of the inputs: `-t inputs` (every source and object, recursively)
+    and `-t deps` over the objects (every header each one included, from the
+    deps log), per artifact. One older than any of its own is stale. ninja
+    REFUSES an
+    unknown target, so a misspelt artifact fails rather than reading current.
+    """
+    stale: list[str] = []
+    for art in arts:
+        rel = str(art.relative_to(tree))
+        inputs = _ninja_lines(tree, ["-t", "inputs", rel])
+        if inputs is None:
+            return f"ninja -t inputs could not list what {rel} is made from"
+        # Compiled objects only (*.obj): the published build/*.o are copies
+        # made by a step with no depfile. EVERY one needs a VALID deps record
+        # -- a missing or stale one would contribute no headers, and a header
+        # edit to it would go unseen.
+        objs = [x for x in inputs if x.endswith(".obj")]
+        deps = _ninja_lines(tree, ["-t", "deps", *objs]) if objs else []
+        if deps is None:
+            return f"ninja -t deps could not list the headers of {rel}'s objects"
+        valid = sum(1 for x in deps
+                    if not x.startswith(" ") and x.rstrip().endswith("(VALID)"))
+        if valid != len(objs):
+            return (f"only {valid} of {len(objs)} objects of {rel} have a valid "
+                    "deps record -- their headers are unknown; rebuild the tree")
+        files = set(inputs) | {x.strip() for x in deps if x.startswith("    ")}
+        paths = [q if q.is_absolute() else tree / q for q in map(Path, files)]
+        paths = [q for q in paths if q.is_file()]
+        if not paths:
+            return f"ninja named no input file of {rel} -- cannot tell"
+        when = art.stat().st_mtime
+        newer = [q for q in paths if q.stat().st_mtime > when]
+        if newer:
+            newest = max(newer, key=lambda q: q.stat().st_mtime)
+            stale.append(f"{rel} is older than {len(newer)} of its {len(paths)} "
+                         f"input(s), e.g. {newest}")
+    if not stale:
+        return None
+    return "STALE against ninja's record of its inputs:\n" + \
+        "\n".join(f"      {x}" for x in stale)
+
+
+def grade_tree(arch: str, tree: Path) -> int:
+    """The CMake tree's archives and glue objects, current or refused."""
+    libaxl = tree / "lib" / "libaxl.a"
+    standin_archive = tree / "lib" / "libaxl-standin.a"
+    glue = sorted((tree / "build").glob("axl-cxxrt-*.o"))
+    missing = [str(a) for a in (libaxl, standin_archive) if not a.is_file()]
+    if missing or not glue:
+        print(f"check-libc-overlap: FAIL ({arch}) — the CMake tree {tree} "
+              "lacks what this gate reads:")
+        for m in missing:
+            print(f"    {m}")
+        if not glue:
+            print(f"    {tree / 'build'}/axl-cxxrt-*.o (the C++ glue)")
+        print(f"    Build first:  scripts/axl-build.sh ARCH={arch} all")
         return 1
+    print(f"check-libc-overlap: grading ({arch}) from the CMake tree {tree}")
+    why = tree_freshness(tree, [libaxl, standin_archive, *glue])
+    if why is not None:
+        print(f"check-libc-overlap: FAIL ({arch}) — {why}")
+        print(f"    Rebuild:  scripts/axl-build.sh ARCH={arch} all")
+        return 1
+    print(f"    libaxl.a, libaxl-standin.a, {len(glue)} glue object(s): "
+          "newer than every input ninja records")
+    return grade(arch, libaxl, standin_archive, glue)
 
+
+def grade(arch: str, libaxl: Path, standin_archive: Path,
+          glue: list[Path]) -> int:
+    """The overlap verdict over one tree's archives and glue objects."""
     conf = (REPO / "scripts" / "axl-toolchains.conf").read_text()
     # The OVERRIDE first, then the default -- the same ladder every other
     # consumer uses (see test/integration/test-cxx-exceptions-qemu.sh). Reading
     # only the default would compare against a toolchain the tree is not
     # building with.
-    stem = "AXL_X64_BINUTILS_PREFIX" if args.arch == "x64" \
+    stem = "AXL_X64_BINUTILS_PREFIX" if arch == "x64" \
         else "AXL_AA64_BINUTILS_PREFIX"
     prefix_tc = os.environ.get(stem)
     if not prefix_tc:
@@ -428,7 +487,7 @@ def main(argv: list[str]) -> int:
             axl_syms.update(nm_defined(nm, g))
         libc_syms = nm_defined(nm, Path(libc))
     except RuntimeError as exc:
-        print(f"check-libc-overlap: FAIL ({args.arch}) — {exc}")
+        print(f"check-libc-overlap: FAIL ({arch}) — {exc}")
         return 1
     overlap = sorted(set(axl_syms) & set(libc_syms))
 
@@ -475,18 +534,18 @@ def main(argv: list[str]) -> int:
     # reported separately rather than folded into `problems` above -- but in
     # the SAME invocation, so one `check-libc-overlap.py --arch X` run covers
     # both.
-    standin_problems, standin_count = check_standin(args.arch, nm, standin_archive)
+    standin_problems, standin_count = check_standin(arch, nm, standin_archive)
 
     if problems or standin_problems:
         if problems:
-            print(f"check-libc-overlap: FAIL ({args.arch}) — "
+            print(f"check-libc-overlap: FAIL ({arch}) — "
                   f"{len(problems)} of {len(overlap)} overlapping symbols")
             print("\n".join(problems))
         if standin_problems:
             print("\n".join(standin_problems))
         return 1
 
-    print(f"check-libc-overlap: clean ({args.arch}) — {len(overlap)} overlapping "
+    print(f"check-libc-overlap: clean ({arch}) — {len(overlap)} overlapping "
           f"symbols, {len(MUST_WIN)} must-win, rest weak; "
           f"standin {standin_count}/{len(STANDIN_EXPECTED)} weak")
     return 0

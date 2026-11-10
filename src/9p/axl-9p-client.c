@@ -219,7 +219,9 @@ int
 axl_9p_client_walk(Axl9pClient *c, const char *path, uint32_t *out_fid)
 {
     uint32_t new_fid = c->next_fid++;
-    uint8_t  req[1024];
+    /* Every component of a path up to AXL_9P_PATH_MAX, each with its
+       2-byte length: at worst one byte per component plus its separator. */
+    uint8_t  req[2u * AXL_9P_PATH_MAX + 32u];
     Axl9pWriter w;
     axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TWALK, 0);
     axl_9p_w_u32(&w, c->root_fid);
@@ -238,11 +240,12 @@ axl_9p_client_walk(Axl9pClient *c, const char *path, uint32_t *out_fid)
         if (seg == 0) {
             continue;
         }
-        char comp[256];
-        size_t clen = (seg < sizeof(comp) - 1) ? seg : sizeof(comp) - 1;
-        axl_memcpy(comp, start, clen);
-        comp[clen] = '\0';
-        axl_9p_w_str(&w, comp);
+        /* The component whole, length-counted: never cut to a buffer. */
+        if (seg > 0xFFFFu) {
+            return AXL_ERR;
+        }
+        axl_9p_w_u16(&w, (uint16_t)seg);
+        axl_9p_w_bytes(&w, start, seg);
         nwname++;
     }
     /* Patch nwname[2] little-endian. */
@@ -320,6 +323,72 @@ axl_9p_client_getattr(struct Axl9pClient *c, uint32_t fid, uint64_t *out_size,
     if (out_mtime) *out_mtime = mtime;
     if (out_mode)  *out_mode  = mode;
     return AXL_OK;
+}
+
+int
+axl_9p_client_qid_path(struct Axl9pClient *c, uint32_t fid, uint64_t *out_path)
+{
+    uint8_t req[24];
+    Axl9pWriter w;
+    axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TGETATTR, 0);
+    axl_9p_w_u32(&w, fid);
+    axl_9p_w_u64(&w, 0x000007ffULL);            /* P9_GETATTR_BASIC */
+    if (w.overflow
+        || axl_9p_transact(c, req, axl_9p_msg_finish(&w), AXL_9P_RGETATTR) != AXL_OK) {
+        return AXL_ERR;
+    }
+    Axl9pReader r;
+    axl_9p_r_init(&r, c->rbuf + 7, c->rlen - 7);
+    axl_9p_r_u64(&r);                             /* valid */
+    axl_9p_r_u8(&r);                              /* qid.type */
+    axl_9p_r_u32(&r);                             /* qid.version */
+    uint64_t path = axl_9p_r_u64(&r);
+    if (r.error) {
+        return AXL_ERR;
+    }
+    *out_path = path;
+    return AXL_OK;
+}
+
+int
+axl_9p_client_trename(struct Axl9pClient *c, uint32_t fid, uint32_t dfid,
+                      const char *name)
+{
+    uint8_t req[AXL_9P_NAME_REQ_MAX];
+    Axl9pWriter w;
+    axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TRENAME, 0);
+    axl_9p_w_u32(&w, fid);           /* fid  (the node being renamed) */
+    axl_9p_w_u32(&w, dfid);          /* dfid (new parent directory)   */
+    axl_9p_w_str(&w, name);          /* name (new basename)           */
+    if (w.overflow) {
+        c->last_errno = 0;
+        return AXL_ERR;
+    }
+    return axl_9p_transact(c, req, axl_9p_msg_finish(&w), AXL_9P_RRENAME);
+}
+
+int
+axl_9p_client_setattr(struct Axl9pClient *c, uint32_t fid, uint32_t valid,
+                      uint64_t size, uint64_t mtime_sec)
+{
+    uint8_t req[80];
+    Axl9pWriter w;
+    axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TSETATTR, 0);
+    axl_9p_w_u32(&w, fid);
+    axl_9p_w_u32(&w, valid);
+    axl_9p_w_u32(&w, 0);                          /* mode */
+    axl_9p_w_u32(&w, 0);                          /* uid */
+    axl_9p_w_u32(&w, 0);                          /* gid */
+    axl_9p_w_u64(&w, size);
+    axl_9p_w_u64(&w, 0);                          /* atime_sec */
+    axl_9p_w_u64(&w, 0);                          /* atime_nsec */
+    axl_9p_w_u64(&w, mtime_sec);
+    axl_9p_w_u64(&w, 0);                          /* mtime_nsec */
+    if (w.overflow) {
+        c->last_errno = 0;
+        return AXL_ERR;
+    }
+    return axl_9p_transact(c, req, axl_9p_msg_finish(&w), AXL_9P_RSETATTR);
 }
 
 int
@@ -423,7 +492,7 @@ int
 axl_9p_client_lcreate(Axl9pClient *c, uint32_t dfid, const char *name,
                       uint32_t flags, uint32_t mode)
 {
-    uint8_t req[512];
+    uint8_t req[AXL_9P_NAME_REQ_MAX];
     Axl9pWriter w;
     axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TLCREATE, 0);
     axl_9p_w_u32(&w, dfid);
@@ -450,7 +519,7 @@ axl_9p_write_file(Axl9pClient *c, const char *path, const void *buf, size_t len)
             return AXL_ERR;
         }
     } else {
-        char parent[512];
+        char parent[AXL_9P_PATH_MAX];
         const char *name = NULL;
         if (axl_9p_client_split_parent(path, parent, sizeof(parent), &name) != AXL_OK
             || axl_9p_client_walk(c, parent, &fid) != AXL_OK) {
@@ -528,12 +597,22 @@ axl_9p_parse_readdir(const uint8_t *body, size_t body_len,
         AxlFsEntry e = {0};
         e.struct_size = sizeof(AxlFsEntry);
         e.version     = AXL_FS_ENTRY_VERSION;
-        axl_9p_r_str(&r, e.name, sizeof(e.name));
+        size_t wire_n = axl_9p_r_str(&r, e.name, sizeof(e.name));
         if (dtype == 4) {           /* DT_DIR */
             e.attributes |= AXL_FS_ATTR_DIRECTORY;
         }
         if (r.error) {
             return AXL_ERR;         /* entry ran past the declared dcount window */
+        }
+        if (wire_n >= sizeof(e.name) || axl_strlen(e.name) != wire_n) {
+            /* A name AxlFsEntry cannot hold whole -- too long, or holding a
+               NUL that would end it early -- is SKIPPED, never cut: a cut
+               name can be a sibling's (axl-fs-provider.h, read_dir). */
+            /* log-level: the listing it is hidden from cannot say so itself. */
+            axl_warning("9p: skipped a %zu-byte name: longer than %zu, or holding "
+                        "a NUL", wire_n, sizeof(e.name) - 1);
+            last_off = next_off;
+            continue;
         }
         /* Skip "." and ".." -- not surfaced as volume entries. */
         if (axl_strcmp(e.name, ".") != 0 && axl_strcmp(e.name, "..") != 0) {
@@ -589,7 +668,7 @@ stat_list_entry(
                          ///< and attributes corrected if dtype lied
 )
 {
-    char     child[512];
+    char     child[AXL_9P_PATH_MAX];
     uint32_t child_fid;
 
     if (!join_child_path(dir, e->name, child, sizeof(child))) {
@@ -662,7 +741,7 @@ axl_9p_list(Axl9pClient *c, const char *path, AxlArray **out)
             axl_array_free(arr);
             goto done;
         }
-        if (axl_array_len(arr) > AXL_9P_MAX_DIR_ENTRIES) {
+        if (axl_array_len(arr) > AXL_9P_MAX_DIR_BYTES / sizeof(AxlFsEntry)) {
             axl_array_free(arr);
             goto done;
         }
@@ -724,7 +803,7 @@ axl_9p_mkdir(Axl9pClient *c, const char *path)
     if (c == NULL || path == NULL) {
         return AXL_ERR;
     }
-    char parent[512];
+    char parent[AXL_9P_PATH_MAX];
     const char *name = NULL;
     if (axl_9p_client_split_parent(path, parent, sizeof(parent), &name) != AXL_OK) {
         return AXL_ERR;
@@ -733,7 +812,7 @@ axl_9p_mkdir(Axl9pClient *c, const char *path)
     if (axl_9p_client_walk(c, parent, &dfid) != AXL_OK) {
         return AXL_ERR;
     }
-    uint8_t req[512];
+    uint8_t req[AXL_9P_NAME_REQ_MAX];
     Axl9pWriter w;
     axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TMKDIR, 0);
     axl_9p_w_u32(&w, dfid);          /* dfid */
@@ -874,7 +953,7 @@ axl_9p_rename(Axl9pClient *c, const char *from, const char *to)
     if (c == NULL || from == NULL || to == NULL) {
         return AXL_ERR;
     }
-    char parent[512];
+    char parent[AXL_9P_PATH_MAX];
     const char *name = NULL;
     if (axl_9p_client_split_parent(to, parent, sizeof(parent), &name) != AXL_OK) {
         return AXL_ERR;
@@ -887,14 +966,7 @@ axl_9p_rename(Axl9pClient *c, const char *from, const char *to)
         axl_9p_client_clunk(c, fid);
         return AXL_ERR;
     }
-    uint8_t req[512];
-    Axl9pWriter w;
-    axl_9p_msg_begin(&w, req, sizeof(req), AXL_9P_TRENAME, 0);
-    axl_9p_w_u32(&w, fid);           /* fid  (the node being renamed) */
-    axl_9p_w_u32(&w, dfid);          /* dfid (new parent directory)   */
-    axl_9p_w_str(&w, name);          /* name (new basename)           */
-    int rc = (w.overflow) ? AXL_ERR
-           : axl_9p_transact(c, req, axl_9p_msg_finish(&w), AXL_9P_RRENAME);
+    int rc = axl_9p_client_trename(c, fid, dfid, name);
     /* Snapshot the errno BEFORE the clunks: each clunk is itself a transact,
        and every transact clears last_errno on entry, so reading it after them
        would always see 0 and the fallback would never fire. */

@@ -250,6 +250,64 @@ Almost identical to `axl-backend-edk2.c` but:
 Works identically for applications and drivers — the backend doesn't
 care what image type loaded it.
 
+#### File paths under the modern Shell (axl-backend-native-shell.c)
+
+**Problem.** The EDK2 Shell returns the results of `GetCurDir`, `GetEnv`
+and `GetMapFromDevicePath` through `AddBufferToFreeList`, freed only when
+the current shell command ends; `GetDevicePathFromFilePath` (relative
+paths) and `OpenFileByName` / `CreateFile` (every path: `OpenRootByHandle`
+names the root through `GetMapFromDevicePath`) inherit that. One buffer per
+call, held for the command -- unbounded for a long-running image or a
+resident driver, whose calls all park onto whatever command is current.
+
+**Decision.** Resolve paths AXL-side from calls that park nothing,
+reproducing `EfiShellGetDevicePathFromFilePath` and
+`InternalOpenFileDevicePath` string for string: `NAME:` (up to the first
+`:` anywhere) through `GetDevicePathFromMap`, `LocateDevicePath`
+(SimpleFileSystem), the shared `axl_nosh_open_root`, then `Open(rest)` with
+the caller's mode and attributes; a path with no `:` is joined onto the
+current directory exactly as the Shell joins it. The special names
+`OpenFileByName` answers itself (`>i` `>o` `>e` `NUL` `>v...`) stay on the
+Shell; they park nothing. The returned `EFI_FILE_PROTOCOL *` is what the
+Shell's file handle is, so every handle call is unchanged.
+
+**The two answers only parking gives.**
+
+- The current directory is cached in static storage (an image's pool would
+  leak on every launch) and re-checked on every use against the Shell's
+  volatile `cwd` UEFI variable (`gShellVariableGuid`), which every
+  `SetCurDir` writes -- this image's, a child image's, the user's `cd`
+  while a resident driver runs. Reused only while the variable holds
+  exactly the cached answer and its volume is mapped; an answer the
+  variable does not vouch for is never kept. No list of invalidation points
+  (chdir, StartImage, Execute, map refresh) is kept, because none is
+  needed: the variable sees all of them.
+- A volume's `fs<n>` name -- the first `fs<n>` on the Shell's list of its
+  names -- is NOT cached: a `SetMap` of a name the volume already has
+  deletes and re-appends it, a reorder no non-parking call shows (a first
+  design cached the list and validated each name; the test caught another
+  image's re-set). Instead `FS0:`..`FS63:` are probed with
+  `GetDevicePathFromMap`; exactly one match is the answer whatever the
+  order, anything else asks the Shell. `axl_volume_map_alias` (the first
+  name of all) always asks the Shell.
+
+**Rejected.** Explicit invalidation at each place the directory can change
+(AXL's chdir, every StartImage, Execute, map refresh): it cannot see the
+user's `cd` at the prompt while a resident driver runs, and it is a list
+that grows a miss with every new caller. A time-based refresh: still
+O(time). `GetEnvEx`: parks too.
+
+**Residual.** Correct but still one parked buffer per call: a Shell with no
+`cwd` variable, a cwd whose volume is unmapped, a volume with no or several
+`fs<n>` names, `axl_volume_map_alias`, `axl_getenv`,
+`axl_volume_unmap_device`'s walk, `axl_shell_execute`, and a relative
+operation whose cwd is 512 characters or longer (twice FAT's path limit;
+the cache is static, so it cannot grow without leaking). Possibly different
+from the Shell: an `fs<n>` outside `FS0`..`FS63` beside one inside, a name
+set for a device path equal only as text, and a `cwd` variable restored
+without its list (EDK2 `Execute` with an `Environment`; AXL passes none).
+Measured and pinned by `test-shell-buffer-growth-qemu.sh`.
+
 ### Build system (Makefile.native)
 
 Two toolchain options:

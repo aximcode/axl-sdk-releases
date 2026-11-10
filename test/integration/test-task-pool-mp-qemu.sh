@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=24 local-only=0
+# test-meta: arch=both needs= est=24 cpu=2 local-only=0 builds=task-pool-mp-selftest guest=smp4
 # test-task-pool-mp-qemu.sh — multi-core AxlTaskPool race regression.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet). The
@@ -51,13 +51,19 @@ run_one() {
     efi="$out/task-pool-mp-selftest.efi"
 
     echo "=== AxlTaskPool multi-core race regression ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" task-pool-mp-selftest 2>&1 | tail -2
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" task-pool-mp-selftest 2>&1 | tail -2
 
     log="$(mktemp)"
     timeout 180s "$PROJECT_DIR/scripts/run-qemu.sh" \
         --arch "$arch" --timeout 150 \
         --qemu-arg -smp --qemu-arg 4 "$efi" 2>&1 | tee "$log" \
-        | grep -iE "MP-POOL:|EXCEPTION|ASSERT" || true
+        | grep -iE "MP-POOL:|EXCEPTION|ASSERT|\[(WARN|ERROR)\]" || true
+    # The [WARN]/[ERROR] lines are the pool's own account of a short worker
+    # count -- "AP #n was dispatched but is not running its worker loop",
+    # "failed to start AP #n", "retaining N worker slot(s)", "AP completion
+    # event(s) never signalled". A "slot reclaim: workers=2 expected=3"
+    # verdict has at least three causes and they are told apart only here;
+    # CI run 38011797542 failed that way with none of them in its log.
 
     local verdict
     verdict="$(grep -E "^MP-POOL: (PASS|FAIL|SKIP)" "$log" | tail -1 || true)"

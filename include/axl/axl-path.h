@@ -37,7 +37,10 @@ axl_path_get_basename(
  * @brief Return the directory portion of a path.
  *
  * Returns everything before the last separator. Returns "." if no
- * separator is found. Caller frees with axl_free(). NULL-safe.
+ * separator is found. At a filesystem root the separator is kept, since
+ * it IS the directory: "/foo" gives "/", and "fs0:\\foo" gives "fs0:\\"
+ * (not the bare "fs0:", which names a volume rather than a directory).
+ * Caller frees with axl_free(). NULL-safe.
  *
  * @return newly allocated string, or NULL if @p path is NULL or
  *     allocation fails.
@@ -84,8 +87,16 @@ axl_path_join(
  * If @p relative is absolute (starts with '/' or '\\'), @p base
  * is ignored. The output always uses '/' separators.
  *
+ * Any length resolves whole; a result that does not fit @p size is AXL_ERR,
+ * never cut. @p out must not overlap @p base or @p relative. Nothing is
+ * allocated, so it cannot fail for want of memory.
+ *
+ * The 256-component limit counts the components of the RESULT: a path that
+ * passes through more on the way ("a/b/../..") is fine if what remains is
+ * 256 or fewer.
+ *
  * @return AXL_OK on success, AXL_ERR on error (NULL args, buffer too small,
- *     or ".." underflow past root).
+ *     more than 256 components in the result, or ".." underflow past root).
  */
 int
 axl_path_resolve(

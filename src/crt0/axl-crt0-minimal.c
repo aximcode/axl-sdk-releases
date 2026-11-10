@@ -55,6 +55,10 @@
 
 #include <uefi/axl-uefi.h>
 
+/* Self-contained: one weak declaration and an inline, nothing of the
+ * runtime. */
+#include "../runtime/axl-libc-heap-internal.h"
+
 /* Hand-declare the two runtime hooks we need. We deliberately do
  * not call _axl_init / _axl_cleanup — that's the whole point. */
 /* ALL WEAK. --minimal-runtime means MINIMAL: firmware globals, main, exit
@@ -186,6 +190,10 @@ _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 #ifdef AXL_MEM_DEBUG
     _axl_mem_dump_leaks_at_exit();
 #endif
+
+    /* newlib's arena, if main ever malloc'd, back to the firmware -- the
+     * same last step _axl_cleanup takes. See axl-libc-heap-internal.h. */
+    _axl_libc_heap_release();
 
     /* A pending axl_set_exit_status (if any) overrides the rc->status map, so
      * a `return N` from a minimal-runtime main yields an exact EFI_STATUS —

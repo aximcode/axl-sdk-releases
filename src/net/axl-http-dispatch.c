@@ -224,6 +224,39 @@ http_check_route_auth(AxlHttpServer *s, uint32_t auth_flags,
     return 0;
 }
 
+/* The TTL a response to @p path is cached for: the route's override, else the
+   server default. The override is stored AS the hash value, so a TTL of 0
+   is a NULL value -- contains(), not lookup(), says whether one was set. */
+static size_t
+http_route_ttl(
+    const AxlHttpServer *s,
+    const char          *path
+    )
+{
+    if (s->route_ttls != NULL && axl_hash_table_contains(s->route_ttls, path)) {
+        return (size_t)(uintptr_t)axl_hash_table_lookup(s->route_ttls, path);
+    }
+    return s->cache_ttl_ms;
+}
+
+/* May this request's response be served from, or stored in, the cache? Only
+   a GET of an open route. The key is the method, path and query -- no body,
+   no caller identity -- so another method's repeat would skip its handler,
+   and an authenticated route's answer would reach the next caller. */
+static bool
+http_cacheable(
+    AxlHttpServer   *s,
+    const HttpRoute *route,
+    const char      *method_upper,
+    const char      *path
+    )
+{
+    return s->cache != NULL
+        && route->auth_flags == AXL_ROUTE_NO_AUTH
+        && axl_strcmp(method_upper, "GET") == 0
+        && http_route_ttl(s, path) != 0;   /* a TTL of 0: never cached */
+}
+
 // ---------------------------------------------------------------------------
 // Request dispatch
 // ---------------------------------------------------------------------------
@@ -249,6 +282,7 @@ dispatch_request(
     req.headers   = conn->headers;
     req.body      = conn->body;
     req.body_size = conn->body_bytes_read;
+    req.request_id = conn->request_id;
     axl_memcpy(req.client_addr, conn->client_addr, sizeof(req.client_addr));
 
     axl_memset(&resp, 0, sizeof(resp));
@@ -266,26 +300,20 @@ dispatch_request(
     //
     // Run middleware pipeline
     //
+    // EVERY exit from here on goes through `done`, which frees the response
+    // state the middleware (and later the handler) set. Only the dispatch
+    // tail used to: the 404, the 401/403 and the cache hit returned early
+    // and leaked it -- a header table per refused request, remote and
+    // unauthenticated (test-http-error-leak-qemu.sh).
+    //
     if (run_middleware(s, &req, &resp) != 0) {
         axl_warning("middleware rejected %s %s (status %zu)",
                     conn->method, conn->path, resp.status_code);
         if (resp.status_code == 200) {
             resp.status_code = 500;
         }
-
         send_response(conn, &resp);
-        /* The dispatch tail's body/headers free runs only on the
-           success path below. Mirror the cleanup here so middleware-
-           allocated response state (set_text, set_json, etc.) doesn't
-           leak on rejection. send_response already memcpy'd into
-           tx_buf, so the originals are safe to free. */
-        if (resp.body != NULL && !resp.body_static) {
-            axl_free(resp.body);
-        }
-        if (resp.headers != NULL) {
-            axl_hash_table_free(resp.headers);
-        }
-        return;
+        goto done;
     }
 
     //
@@ -295,13 +323,30 @@ dispatch_request(
     route = find_route(s, conn->method, conn->path);
 
     if (route == NULL) {
-        send_error_response(conn, 404);
-        return;
+        send_error_response_headers(conn, 404, &resp);
+        goto done;
     }
 
     //
-    // Cache lookup — serve cached response if available
+    // Authentication, BEFORE the cache: a cached response is the handler's
+    // answer, and serving it ahead of the check handed an auth-required
+    // route's body to anyone once an authorised request had filled the
+    // cache.
     //
+    size_t auth_status = http_check_route_auth(s, route->auth_flags, &req);
+    if (auth_status != 0) {
+        send_error_response_headers(conn, auth_status, &resp);
+        goto done;
+    }
+
+    //
+    // Cache lookup — serve cached response if available. Only for a GET of
+    // an open route (http_cacheable): the key holds no request body and no
+    // identity, so any other method would skip its handler on a repeat,
+    // and an authenticated route would serve one caller's answer to the
+    // next.
+    //
+    bool cacheable = http_cacheable(s, route, method_upper, conn->path);
     char cache_key[512];
     if (conn->query != NULL && conn->query[0] != '\0') {
         axl_snprintf(cache_key, sizeof(cache_key), "%s %s?%s",
@@ -311,7 +356,7 @@ dispatch_request(
                      method_upper, conn->path);
     }
 
-    if (s->cache != NULL) {
+    if (cacheable) {
         CachedResponse *cached = (CachedResponse *)axl_hash_table_lookup(
             s->cache, cache_key);
         if (cached != NULL) {
@@ -319,33 +364,26 @@ dispatch_request(
             uint64_t age = now - cached->timestamp_ms;
             if (cached->ttl_ms == AXL_CACHE_FOREVER ||
                 age < cached->ttl_ms) {
-                /* Cache hit */
-                resp.status_code = cached->status_code;
+                /* Cache hit. The cache owns its body: a body the
+                   middleware set is released first (pointing resp.body at
+                   the cached one used to drop it), and the cached one is
+                   marked static so `done` leaves it alone. The middleware's
+                   headers go out with the cached body. */
+                if (resp.body != NULL && !resp.body_static) {
+                    axl_free(resp.body);
+                }
+                http_response_drop_streamer(&resp);   /* the cached body is the answer */
+                resp.status_code  = cached->status_code;
                 resp.content_type = cached->content_type;
-                resp.body = cached->body;
-                resp.body_size = cached->body_size;
+                resp.body         = cached->body;
+                resp.body_size    = cached->body_size;
+                resp.body_static  = true;
                 send_response(conn, &resp);
-                /* Cache owns the body. The early return below means
-                   we don't reach the dispatch-tail axl_free, but
-                   defense-in-depth: also flag body_static so a
-                   future refactor that consolidates the cleanup
-                   path can't accidentally double-free. */
-                resp.body = NULL;
-                resp.body_static = true;
-                return;
+                goto done;
             }
             /* Expired — remove and re-fetch */
             axl_hash_table_remove(s->cache, cache_key);
         }
-    }
-
-    //
-    // Authentication check
-    //
-    size_t auth_status = http_check_route_auth(s, route->auth_flags, &req);
-    if (auth_status != 0) {
-        send_error_response(conn, auth_status);
-        return;
     }
 
     //
@@ -366,7 +404,7 @@ dispatch_request(
     //
     // Store in cache if caching is enabled and response has a body
     //
-    if (s->cache != NULL && resp.body != NULL && resp.body_size > 0 &&
+    if (cacheable && resp.body != NULL && resp.body_size > 0 &&
         resp.status_code >= 200 && resp.status_code < 300) {
         CachedResponse *entry = axl_calloc(1, sizeof(*entry));
         if (entry == NULL) {
@@ -379,14 +417,7 @@ dispatch_request(
                 entry->timestamp_ms = axl_time_get_ms();
                 entry->insert_seq = ++s->cache_seq;
 
-                /* Per-route TTL override, else server-wide default. */
-                entry->ttl_ms = s->cache_ttl_ms;
-                if (s->route_ttls != NULL) {
-                    void *v = axl_hash_table_lookup(s->route_ttls, conn->path);
-                    if (v != NULL) {
-                        entry->ttl_ms = (size_t)(uintptr_t)v;
-                    }
-                }
+                entry->ttl_ms = http_route_ttl(s, conn->path);
 
                 if (resp.content_type != NULL) {
                     axl_strlcpy(entry->content_type, resp.content_type,
@@ -411,11 +442,8 @@ dispatch_request(
         }
     }
 
-    if (resp.body != NULL && !resp.body_static) {
-        axl_free(resp.body);
-    }
-
-    if (resp.headers != NULL) {
-        axl_hash_table_free(resp.headers);
-    }
+done:
+    /* send_* has copied the response into the transmit buffer, so the
+       originals go now -- on every path past the middleware. */
+    http_response_release(&resp);
 }

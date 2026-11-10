@@ -17,7 +17,7 @@
  *      across the span (the crt0 clear) and writes a pattern + reads it back
  *      (the loader's mapping). NOTE: on firmware that DOES hand back zeroed
  *      pages, this passes even without the crt0 clear — so it is NOT the
- *      regression guard for the clear; `make check-bss-clear` is (it asserts
+ *      regression guard for the clear; `gate.check-bss-clear` is (it asserts
  *      _start zeroes [_bss, _bss_end) by disassembly, firmware-independent).
  *
  * Emits "BSS-PROBE: <N> passed, <M> failed" as the final line.

@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=X64 needs=gpu est=40 local-only=1
+# test-meta: arch=both needs=gpu est=40 local-only=1 guest=none
+# guest=none: not converted yet (pool design §6.7 step 8 item 10):
+#   --screenshot and --sendkey, a machine no class gives yet.
 # test-kbtune-qemu.sh — smoke test for the kbtune GOP UI (tools/kbtune.efi).
 #
 # kbtune is a full-screen GOP tool, so there is no text output to scrape; the
@@ -27,7 +29,7 @@ _arch_lc=$(echo "$TEST_ARCH" | tr 'A-Z' 'a-z'); [[ "$_arch_lc" == "aarch64" ]] &
 KBTUNE="$(test_build_dir "$_arch_lc")/tools/kbtune.efi"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 
-make -C "$PROJECT_DIR" ARCH="$_arch_lc" tools >/dev/null 2>&1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_arch_lc" tools >/dev/null 2>&1
 if [[ ! -f "$KBTUNE" ]]; then
     echo "WARN: kbtune not built at $KBTUNE; skipping."
     echo "test-kbtune: SKIP"; exit 0

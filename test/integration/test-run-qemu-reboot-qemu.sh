@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=44 local-only=0
+# test-meta: arch=both needs= est=44 local-only=0 guest=none
+# guest=none: the boot is the subject: a guest-initiated reset re-POSTs the
+#   same VM (--reboot).
 # test-run-qemu-reboot-qemu.sh — a guest-initiated reset must be able to
 # re-POST the SAME VM, so a consumer can test what its firmware does on the
 # NEXT boot (boot counters, rollback-on-next-boot, NVRAM that must survive).
@@ -37,7 +39,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 TOOLS="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools"
 
-make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 EFI="$TOOLS/hexdump.efi"
 [[ -f "$EFI" ]] || { echo "ERROR: $EFI not built"; exit 1; }
 

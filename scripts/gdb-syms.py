@@ -22,7 +22,7 @@ script which puts `.text` at a different offset (typically 0xa000).
 Usage:
     scripts/gdb-syms.py <debugcon.log> \\
         --build-dir /home/mgosha/uefi/Build/OvmfX64/DEBUG_GCC5/X64 \\
-        [--axl-efi out/native-x64/AxlTestNet.efi] \\
+        [--axl-efi build/x64-debug/AxlTestNet.efi] \\
         [--axl-base 0xHEX]              # AXL load address from serial log
 
 Output is a sequence of GDB commands suitable for `source` or
@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--axl-base", type=lambda s: int(s, 0),
                    help="AXL EFI runtime image base (parse from serial log)")
     p.add_argument("--axl-build-dir", type=Path,
-                   help="AXL build dir (e.g. out/native-x64). When set, any "
+                   help="AXL build dir (e.g. build/x64-debug). When set, any "
                         "`Loading driver at X NAME.efi` whose matching "
                         "NAME.so exists here is loaded automatically.")
     p.add_argument("--gdb-port", type=int, default=1234,

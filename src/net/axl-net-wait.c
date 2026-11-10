@@ -14,9 +14,6 @@
 
 #include <stdint.h>
 
-/* 10 ms tick keeps the driver-advancement hint without burning CPU
-   at the old idiom's 1 ms stall cadence. */
-#define AXL_NET_POLL_TICK_US  10000ULL
 
 // ---------------------------------------------------------------------------
 // UDP4 — the per-protocol wait helper is gone: axl_udp_send / _sendrecv now
@@ -39,6 +36,8 @@ AxlStatus
 _axl_tcp_wait(
     EFI_TCP4_PROTOCOL *tcp4,
     EFI_EVENT          event,
+    AxlCondFn          done_fn,
+    void              *done_ctx,
     uint64_t           timeout_us
     )
 {
@@ -47,7 +46,7 @@ _axl_tcp_wait(
     }
     return _axl_event_wait_timeout_with_tick(
         (AxlEventHandle)event,
-        NULL, NULL,
+        done_fn, done_ctx,
         tcp_poll_tick, tcp4,
         AXL_NET_POLL_TICK_US, NULL, timeout_us);
 }

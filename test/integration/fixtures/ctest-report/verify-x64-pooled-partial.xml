@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="5"
+	failures="0"
+	disabled="0"
+	skipped="1"
+	hostname=""
+	time="0"
+	timestamp="2026-11-08T23:46:23"
+	>
+	<testcase name="unit.counts-reset" classname="unit.counts-reset" time="0.00123993" status="run">
+		<properties>
+			<property name="cmake_labels" value="unit"/>
+		</properties>
+		<system-out>
+</system-out>
+	</testcase>
+	<testcase name="unit.AxlTestA" classname="unit.AxlTestA" time="0.00122987" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;unit"/>
+		</properties>
+		<system-out>Results: 5 passed, 0 failed (X64) in 1s
+</system-out>
+	</testcase>
+	<testcase name="unit.AxlTestB" classname="unit.AxlTestB" time="0.00176037" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;unit"/>
+		</properties>
+		<system-out>Results: 5 passed, 0 failed (X64) in 1s
+</system-out>
+	</testcase>
+	<testcase name="unit.inventory" classname="unit.inventory" time="0.00112582" status="run">
+		<properties>
+			<property name="cmake_labels" value="unit"/>
+		</properties>
+		<system-out>inventory: clean
+</system-out>
+	</testcase>
+	<testcase name="unit.ratchet" classname="unit.ratchet" time="0.00117135" status="notrun">
+		<skipped message="SKIP_RETURN_CODE=77"/>
+		<properties>
+			<property name="cmake_labels" value="unit"/>
+		</properties>
+		<system-out>PARTIAL: 1 of 2 unit binaries left a count this run (the others did not run, or failed before reporting); the ratchet judges only a whole run
+  no count: AxlTestB
+unit-counts: AxlTestA=5 AxlTestB=5
+</system-out>
+	</testcase>
+</testsuite>

@@ -147,9 +147,14 @@ connect storms** (GraphicsConsole confirmed silent, not co-painting).
 un-does the take-over in three steps, and the *order* matters:
 
 1. **Restore the evicted consoles.** For each handle we evicted, re-install the
-   `gEfiConsoleOutDeviceGuid` tag and `ConnectController` it, so ConSplitter's
-   `Start` re-adds the firmware GraphicsConsole to the fan-out. The local display
-   comes back.
+   `gEfiConsoleOutDeviceGuid` tag -- and, for a screen that was a StdErr device
+   (firmware whose `ErrOut` lists the display), the `gEfiStandardErrorDeviceGuid`
+   tag eviction moved off it -- and `ConnectController` it, so ConSplitter's
+   `Start` re-adds the firmware GraphicsConsole to both fan-outs. The local
+   display comes back. (Eviction moves a screen's StdErr tag because the device
+   joins the StdErr fan-out itself: a screen left in it would draw each error
+   line a second time over the take-over's picture. The serial terminal keeps
+   its StdErr tag throughout.)
 2. **`DisconnectController(ourHandle)` — before uninstalling our protocols.**
    ConSplitter opened our `SimpleTextOut` `BY_DRIVER` when it bound us, and holds
    a raw pointer to it in its fan-out list. `UninstallMultipleProtocolInterfaces`
@@ -270,6 +275,10 @@ firmware keyboard a consumer would otherwise read. So the device supports **both
   here, in the substrate, which is the right home for it.
 - the public `axl_console_device_inject_key{,_ex}` / `_inject_text` family (works
   whenever `take_input`): a foreground/remote consumer feeds synthesized keys.
+  `axl_console_device_queued_keys` says how many keys the guest has not read yet:
+  a key's notifies fire on the PUSH, so a consumer that must order a notify chord
+  after the keys ahead of it (sshd's Ctrl-S, which the Shell's halt would otherwise
+  resume with one of the unread keys) holds the chord until the count is 0.
 
 **The key-repeat gate** (`cfg.debounce_ms` / `min_gap_ms`) sits on the read_physical
 path and is **OFF by default** — present so the shipped defaults are tunable once the

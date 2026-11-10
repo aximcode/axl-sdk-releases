@@ -988,6 +988,10 @@ field. `rename()` is backed by `axl_file_move`, NOT `axl_file_rename`: the
 latter refuses a cross-directory request (FAT renames within one directory)
 while POSIX `rename()` is defined across directories on one filesystem, and
 `axl_file_move` tries the atomic rename first and falls back to copy+delete.
+**Changed 2026-10-23:** `rename()` is now `axl_file_replace(old, new, 0)` --
+rename(2) proper: it replaces an existing target and puts it back on
+failure, never copies, answers another volume with `errno = EXDEV` as POSIX
+does, and sets `errno` on every failure.
 
 ### FD-LAYER COVERAGE 2026-08-17 — the descriptors get their own fixture
 
@@ -1207,6 +1211,129 @@ map and placing explicitly is the supported answer rather than a workaround.
 and asked `AllocateMemorySpace` for Reserved memory; its `EFI_NOT_FOUND` meant
 nothing. The tells were DRAM printing as `MemoryMappedIo` and a 16-million-MiB
 total.
+
+### ARENA-RELEASE 2026-11-02 — the region outlived the image, from P1' until now
+
+§2-DECISION gave newlib a region and nothing gave it back. UEFI does not
+reclaim an image's page allocations when the image unloads, and `_sbrk` had no
+release path, so every launch of an image that had ever called `malloc` left
+its arena -- 256 pages, the 1 MiB initial commit -- in `EfiBootServicesData`
+until reset. Measured on both arches, ten launches each, against
+`EfiConventionalMemory` in the memory map: 256 pages per launch for a C
+program that mallocs, for a default C++ image, for a `--no-eh-frame` C++ image
+and for each load/unload cycle of a C++ driver; 0 for a C image that never
+mallocs; exactly 64 for a control that keeps 64 pages. Shipped from v4.2.0.
+
+**Why nothing saw it.** §2-DECISION took newlib's allocations out of AXL's
+leak gate on purpose -- that was the cost it listed -- and no test measured
+firmware free memory across launches. The C++ images were hit hardest
+because libsupc++'s emergency-pool constructor mallocs ~1.1 KiB before `main`
+in EVERY C++ image, which commits the arena even when the program never
+allocates; on a `--no-eh-frame` image that pool can never be used at all.
+
+**The fix keeps the decision and adds the missing half: teardown.** `_sbrk`
+arms a WEAK hook (`_axl_libc_heap_release_hook`,
+`src/runtime/axl-libc-heap-internal.h`) when it first takes the arena, and
+every teardown path calls it as its LAST step -- after atexit handlers, C++
+destructors, `__gnu_cxx::__freeres` and the registry sweep, any of which may
+still call `free`:
+
+| path | where |
+|---|---|
+| application | `_axl_cleanup` -- NOT for a driver image that reaches it through `axl_exit` in its entry, which then stays resident and still uses its heap (it faulted, RED) |
+| `--minimal-runtime` | the minimal crt0, after `main` |
+| driver | `axl_driver_cleanup` |
+| service driver | the unload stub, after its own registry sweep (it uses `_axl_driver_cleanup_keep_heap`) |
+
+The arena is freed piece by piece, as it was taken (the initial commit, then
+each extension): the spec promises `FreePages` for a range ONE `AllocatePages`
+returned, and EDK2 accepting adjacent pieces in one call is not a promise
+other firmware makes. Afterwards `_sbrk` refuses to take another arena; that
+does NOT make a later `malloc` safe (dlmalloc may serve one from chunks it
+holds inside the freed pages), which is why the call is last rather than
+merely late.
+
+Cost, measured with the staged SDK against 7cbc482e, both arches: 48-64 bytes
+of `.text` in an image that never mallocs (the null test); 288-384 bytes of
+`.text` and ~550 of `.bss` (the piece table; zero-filled at load, no file
+bytes) in one that does; the file grows by 0 or one 512-byte block. Guarded by `test-heap-release-qemu.sh`,
+which also proves the ORDER (a global destructor that must grow the heap
+during teardown) and the multi-piece release, and keeps a resident driver's
+heap; each release site, the order, the driver-image guard and the per-piece
+free were sabotaged and each detected.
+
+**Found on the way, and settled the same way (2026-11-02, second pass):**
+
+- *A driver whose entry exits with an EFI error* (`axl_exit_status` with an
+  error) is unloaded by EDK2 through `CoreUnloadAndCloseImage`, which never
+  calls its `Unload`, so `axl_driver_cleanup` never ran and the arena stayed
+  -- 2564 pages over 10 failed loads, measured. Only that exit unloads the
+  image: a non-error status (`axl_exit(1)`, which is what `std::terminate`
+  reaches) leaves the driver resident. So the AXL macros bracket the
+  consumer's entry (`_axl_driver_entry_begin/_end`; the service init does the
+  same), `axl_exit` notes whether its status is an EFI error, and inside that
+  bracket such an exit runs, in `_axl_cleanup`, the atexit drain
+  (destructors) and the heap release the macro's own error return would.
+  `axl_exit` then re-arms the status that decision was taken on, so a
+  destructor that arms another (a success would leave the image resident on
+  torn-down state) cannot reach `gBS->Exit`; and no exit qualifies while a
+  child image this one started is running (every `StartImage` and Shell
+  `Execute` in libaxl goes through `axl_backend_start_image` /
+  `axl_backend_child_image_enter`, which count it): a timer callback of the
+  image can run while the entry is inside a child's `StartImage`, where
+  `Exit` fails and spins. That count replaced a `TPL_APPLICATION` check that
+  stood in for it and kept the heap of an entry exiting from a raise it never
+  restored (2564 pages over 10 loads, measured). The count also covers the
+  calls that make the FIRMWARE start images on this one's behalf
+  (`ConnectController`, RamDisk `Register`, the Shell's `Execute`); its
+  balance is tested (an entry that ran a child and connected, then failed,
+  still gives back its heap). Not seen: a consumer's own `gBS->StartImage`
+  under `AXL_ALLOW_UEFI`.
+
+  The guarded case itself -- a callback exiting while a child runs -- was a
+  DEADLOCK before any of this: `gBS->Exit` fails for a non-current image,
+  `axl_exit` must not return, so it spun at callback TPL and starved the
+  child. It is now DEFERRED: every AXL notify callback is entered through
+  one trampoline that sets a `__builtin_setjmp` point (no C library -- the
+  host toolchain links none); `axl_exit` there records the exit and unwinds
+  to it, the callback is abandoned, the child finishes, and the exit runs
+  when the child count returns to zero (`axl_backend_child_image_leave`),
+  where `gBS->Exit` succeeds -- through the same teardown as any failing
+  entry. Tested for a driver (`heap-release-cbexit.c`: 6/6 callbacks fire
+  during the child, every child finishes, the driver unloads with its heap)
+  and for an app (`-DHEAP_REL_APP`); with the deferral sabotaged the guest
+  deadlocks as before and the test fails. The first exit's decision is LATCHED: a
+  destructor reaching `std::terminate` in the drain calls `axl_exit(1)`
+  again, which must not re-decide, and that nested exit -- which never
+  returns to the first cleanup -- releases the heap itself before
+  `gBS->Exit` (`_axl_cleanup_finish_exit`). A hand-written `DriverEntry`
+  never sets the bracket and keeps everything, the safe side. Such an exit
+  from a SERVICE's setup used to leave the service protocol installed on the
+  unloaded image (EDK2's `CoreUnloadAndCloseImage` removes only the
+  LoadedImage protocols), an interface pointer into freed memory; the
+  service entry now arms an atexit unwind right after publishing
+  (`service_entry_unwind`), which that exit's drain runs.
+- *An `AXL_MEM_DEBUG` driver* left AxlMem's free quarantine (up to 64 KiB)
+  undrained on every unload -- only the leak report drained it, and a plain
+  driver's unload prints none: ~2.9 pages per cycle. `axl_driver_cleanup`
+  drains it (`_axl_mem_quarantine_drain`, DEBUG builds only).
+- *The ~0.4 pages per driver load/unload cycle* is not a leak. Raw
+  `LoadImage`/`UnloadImage` lose 0, and AXL frees what it allocates. The EDK2
+  Shell parks the buffers its protocol calls return (`GetCurDir`, which a
+  relative path resolves through, and the map lookups) on a free list it
+  empties only when the current shell command ends, and every page returns
+  then. It does mean a LONG-RUNNING app started from the Shell accumulates
+  them per relative-path operation for its whole life -- recorded as an open
+  design question (a per-path-operation cwd), not changed here.
+- *`--no-eh-frame` images no longer carry the emergency pool.*
+  `axl-cxxrt-nothrow.o` defines the five symbols libsupc++'s `eh_alloc.o`
+  exports, so the member is never linked: no pool constructor, and an image
+  that never mallocs takes no C heap at all. A minimal `--no-eh-frame` image
+  shrank 63,488 -> 48,128 bytes (x64) and 66,062 -> 51,726 (aa64). The
+  storage keeps eh_alloc's 128-byte ABI header in front of the object (read
+  off both toolchains' `__cxa_allocate_exception`): with `-frtti`,
+  `std::make_exception_ptr` is real even under `-fno-exceptions`, and
+  libsupc++ writes that header -- without it, into the heap block before.
 
 ## 4b. OPEN — alternatives to newlib, and where the seam belongs
 

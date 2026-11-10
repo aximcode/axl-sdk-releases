@@ -7,7 +7,7 @@ them runs no cleanup at all, leaking every AXL_AUTO_FREE in the path and
 — worse — any RaiseTPL, which wedges the machine on return to the shell.
 AXL_CB_NOEXCEPT makes that a compile error for C++ consumers.
 
-The compile fixture in `make check-cb-noexcept` proves the macro REJECTS a
+The compile fixture in `gate.check-cb-noexcept` proves the macro REJECTS a
 throwing callback, but it can only speak for the two declarations it
 names. This is the structural half: it fails when a NEW callback is added
 without the macro, which the fixture would happily pass.

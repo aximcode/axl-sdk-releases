@@ -988,6 +988,17 @@ test_jose_main(int argc, char **argv)
 
     test_print_header("AxlJose");
 
+    /* THE PROOF that AxlJose users need no enable call: this binary
+       makes none, although it also mints ECDSA/RSA keys with
+       axl_pk_key_new() directly -- generic calls that by themselves
+       would NOT link the mbedTLS provider. Linking axl-jose.o must have
+       done it. Do not add axl_pk_enable_mbedtls() here; that would make
+       this check pass for the wrong reason. */
+    test_check(axl_pk_alg_available(AXL_PK_ECDSA_P256)
+               && axl_pk_alg_available(AXL_PK_ECDSA_P384)
+               && axl_pk_alg_available(AXL_PK_RSA),
+               "jose: ECDSA/RSA enabled by linking AxlJose, no enable call");
+
     test_jose_argval();
     test_jws_kat();
     test_jws_kat_es384_ps256();

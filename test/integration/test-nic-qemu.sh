@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=31 local-only=0
+# test-meta: arch=x64 needs= est=31 local-only=0 guest=plain
 # test-nic-qemu.sh — AxlNet driver-selection substrate against a real NIC.
 #
 # The AxlTestNet unit suite covers the bus-location trim against synthetic
@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/netinfo.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: netinfo.efi not built"; exit 1; }
 

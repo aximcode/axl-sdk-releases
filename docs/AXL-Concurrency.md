@@ -296,7 +296,8 @@ invariants, so the SDK breaks first — not the consumer. Five parts:
    bugs manifest as a *wedge*, so a positive liveness probe after each
    scenario turns a hang into a named failure. (The unit harness
    already names a stalled binary via `*** STALLED:` + the ratchet
-   "Culprit:" line; this is the integration-side equivalent.)
+   "Culprit:" line -- or `*** TRUNCATED:` when the harness's own timeout
+   was what ended the log; this is the integration-side equivalent.)
 5. **Make the hazard unrepresentable** — the deepest fix: eliminate the
    bug class structurally rather than guard each instance. Concrete win:
    loop source ids are now allocated from a single **process-global**

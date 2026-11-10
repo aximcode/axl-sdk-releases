@@ -179,7 +179,7 @@ asserted, not just the values. `test/integration/test-cxx-hosted-qemu.sh`.
 > included. Nobody had re-measured after the toolchain changed, so five files
 > were being maintained against a hazard that had already gone.
 >
-> `make check-no-avx` now scans those two archives directly, which is where
+> `gate.check-no-avx` now scans those two archives directly, which is where
 > the exposure actually lives once every C++ link carries them.
 >
 > Kept as written because the reasoning is still the right reasoning if a
@@ -214,7 +214,7 @@ PAIR — they share `_M_next_resize`, so taking one from each side links cleanly
 and then disagrees with itself about when to grow. `ld -y` asserts both
 resolved to `libaxl-cxx.a`.
 
-`make check-no-avx` is the standing guard, and it allowlists by SYMBOL with a
+`gate.check-no-avx` is the standing guard, and it allowlists by SYMBOL with a
 recorded justification, so a deliberately-dispatched kernel keeps its
 exemption while a second function in the same object acquiring VEX by accident
 still fails.
@@ -293,7 +293,7 @@ counted both it and the script-placed `.rela`, at non-contiguous addresses —
 so the crt0's relocation walk ran off the end of the first section and applied
 the bytes after it. Any aa64 image whose dynamic relocations split had this;
 RTTI was merely the first workload to split them. Fixed by naming the aa64
-output section `.rela.dyn`, and guarded by `make check-reloc-coverage`.
+output section `.rela.dyn`, and guarded by `gate.check-reloc-coverage`.
 
 The full measured picture — what works, what does not, and what each remaining
 "no" would cost in symbols — is `AXL-Cxx-Stdlib-Surface.md`.
@@ -986,7 +986,7 @@ compiling libsupc++ from source with AXL's flags, which needs no package.
 
 Every public callback typedef carries `AXL_CB_NOEXCEPT` — `noexcept` in
 C++, nothing in C. 88 of them across 46 headers, gated by
-`make check-cb-noexcept`.
+`gate.check-cb-noexcept`.
 
 The reason is measured, not stylistic. AXL invokes consumer callbacks from
 its own C frames, and those frames carry no landing pads, so an exception
@@ -1211,7 +1211,7 @@ compiler rather than reasoned about, having been wrong the first time:
   member its body compiles where the specialization is *defined*, firing the
   `static_assert` in every translation unit that merely includes the header.
 
-`make check-handle-exclusions` compiles one fixture three ways and matches the
+`gate.check-handle-exclusions` compiles one fixture three ways and matches the
 poison **text**, not just the exit status — a fixture typo fails to compile
 exactly like a working exclusion does.
 

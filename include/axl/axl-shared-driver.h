@@ -106,6 +106,11 @@ axl_shared_driver_guid(
  * paired teardown is @ref axl_shared_driver_unpublish from the
  * driver's unload callback.
  *
+ * Launchers' standard streams reach the first 8 interfaces one image
+ * publishes (@ref axl_shared_driver_install_stdio_bridge). A 9th still
+ * publishes, and launchers can dispatch through it, but their stdio does
+ * not reach it; publish logs a warning saying so.
+ *
  * @return AXL_OK on success, AXL_ERR on argument validation or
  *     install failure.
  */
@@ -150,6 +155,10 @@ axl_shared_driver_unpublish(
  * On success @p *out_iface points at the consumer's vtable struct
  * (consumer-owned types, AXL doesn't validate the layout — same ABI
  * contract as @c axl-service.h cross-image data).
+ *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (UEFI 2.11 Table 7.3).
  *
  * @return AXL_OK on success; AXL_NOT_FOUND when a usable vtable can't be
  *     obtained -- not resolvable from any candidate path or the embedded
@@ -229,6 +238,10 @@ axl_shared_driver_unload(
  * Pass @c load_options == NULL or @c load_options_size == 0 to skip
  * the install — equivalent to calling @ref axl_shared_driver_locate.
  *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (UEFI 2.11 Table 7.3).
+ *
  * @return AXL_OK on success; AXL_NOT_FOUND when a usable vtable can't be
  *     obtained -- not resolvable from any candidate path or the embedded
  *     blob, or a driver loaded but didn't start / publish the expected
@@ -267,6 +280,10 @@ axl_shared_driver_locate_with_load_options(
  * on a fresh load; both are skipped on the resident-driver
  * short-circuit.
  *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (UEFI 2.11 Table 7.3).
+ *
  * @return AXL_OK on success; AXL_NOT_FOUND when a usable vtable can't be
  *     obtained -- not resolvable from any candidate path or the embedded
  *     blob, or a driver loaded but didn't start / publish the expected
@@ -298,6 +315,10 @@ axl_shared_driver_locate_with_image_info(
  * NOTE: pinning governs only the COLD path. Once ANY driver of this identity is
  * resident, the warm short-circuit returns it regardless of version — the first
  * cold load pins for the boot. (Same model as do.efi today.)
+ *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (UEFI 2.11 Table 7.3).
  *
  * @return AXL_OK; AXL_NOT_FOUND if no usable vtable is obtained -- not staged
  *     beside the launcher, or it loaded but didn't start / publish the expected
@@ -356,6 +377,20 @@ axl_shared_driver_run_sibling(
  * Output redirection (@c >) needs no bridge — it already works via the
  * shell's @c ConOut handoff during the launcher window.
  *
+ * The bridge is AIMED at @a iface, the interface the launcher is about to
+ * dispatch through, exactly as the driver published it
+ * (@ref axl_shared_driver_publish): only the image that published @a iface
+ * reads the launcher's handles. Every other resident image -- a service
+ * writing on its own clock, another shared driver -- keeps its own standard
+ * streams, so a launcher's `2> f` never captures their lines. A bridge aimed
+ * at NULL is read by no image.
+ *
+ * Mixed SDK versions: the launcher installs the bridge in two layouts, so a
+ * driver built before the bridge was aimed still reads it. A driver built
+ * with this SDK reads only the aimed layout: a launcher built before it
+ * lends that driver nothing (stdin reads end-of-file, stdout and stderr
+ * are the driver's own) -- rebuild the launcher.
+ *
  * Re-publishes on each call (every launcher invocation carries its own
  * StdIn) and is auto-uninstalled at launcher exit via @c axl_atexit, so
  * the bridge never outlives the invocation. Read piped text through
@@ -367,7 +402,9 @@ axl_shared_driver_run_sibling(
  *     shell); AXL_ERR only if the bridge-protocol install itself failed.
  */
 int
-axl_shared_driver_install_stdio_bridge(void);
+axl_shared_driver_install_stdio_bridge(
+    const void *iface   ///< the published interface the dispatch goes through
+);
 
 /**
  * @brief Apply a resident driver's armed exit status to THIS launcher.

@@ -87,6 +87,45 @@ test_atexit_handles_unique_per_register(void)
     axl_atexit_remove(h3);
 }
 
+/* A registration the table cannot hold returns 0 -- never a handle that is
+ * someone else's. axl_atexit ignored axl_array_append's failure and returned
+ * the table length, which then named the LAST registered slot: removing that
+ * "handle" would have unregistered another caller's handler, and a caller
+ * checking for 0 (AXL_SERVICE_DRIVER does) could not see the failure.
+ *
+ * Every registration here runs with the next allocation failing, so the ones
+ * that need the table to grow must fail; the ones that land in existing
+ * capacity succeed. 64 is past any initial capacity, so both happen. */
+static void
+test_atexit_full_table_returns_zero(void)
+{
+    uint32_t got[64];
+    unsigned failed = 0;
+    bool     unique = true;
+
+    for (unsigned i = 0; i < 64; i++) {
+        axl_mem_fail_next_alloc(1);
+        got[i] = axl_atexit(atexit_cb_a, NULL);
+        axl_mem_fail_next_alloc(0);
+        if (got[i] == 0) {
+            failed++;
+            continue;
+        }
+        for (unsigned j = 0; j < i; j++) {
+            if (got[j] == got[i]) {
+                unique = false;
+            }
+        }
+    }
+    test_check(failed > 0,
+               "atexit: a registration that needs the table to grow can fail");
+    test_check(unique,
+               "atexit: a failed registration returns 0, never another slot's handle");
+    for (unsigned i = 0; i < 64; i++) {
+        axl_atexit_remove(got[i]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // registry counting
 // ---------------------------------------------------------------------------
@@ -255,6 +294,156 @@ test_signal_install_accepts_handler_and_null(void)
     test_pass("signal: install(fn) / install(NULL) / default() are safe");
     test_check(sig_handler_calls == 0,
                "signal: install does not invoke the handler");
+}
+
+// ---------------------------------------------------------------------------
+// The cycle-counter calibration's arithmetic (axl_backend_counter_freq_
+// from_samples). gBS->Stall never returns early, so a disturbed sample --
+// the vCPU descheduled, an SMI -- only ever counts MORE ticks than the
+// Stall's length is worth, and a frequency taken from it makes the
+// monotonic clock run slow for the rest of the boot. Every Stall also
+// costs the same few microseconds whatever its length (the call, the
+// reference timer's reads); differencing a short and a long Stall cancels
+// that. A 1 GHz counter is 100,000 ticks per 100 us and 1,900,000 per
+// 1900 us, so the difference is 1,800,000 per 1800 us.
+//
+// An overshoot on the SHORT Stall errs the other way, so the difference is
+// bounded by what the long Stall alone gives, which can only overstate:
+// never above it, and never more than 2 % below it.
+// ---------------------------------------------------------------------------
+
+static void
+test_counter_freq_from_samples(void)
+{
+    static const uint64_t s_equal[5] = {
+        100000, 100000, 100000, 100000, 100000
+    };
+    static const uint64_t l_equal[5] = {
+        1900000, 1900000, 1900000, 1900000, 1900000
+    };
+    /* Every Stall 12 us over, short and long alike: a fixed cost, which
+       read off the long Stall alone would be 0.6 % of the frequency. */
+    static const uint64_t s_fixed[5] = {
+        112000, 112000, 112000, 112000, 112000
+    };
+    static const uint64_t l_fixed[5] = {
+        1912000, 1912000, 1912000, 1912000, 1912000
+    };
+    /* One long Stall 10 ms over, first; one short Stall 10 ms over, last. */
+    static const uint64_t l_first_over[5] = {
+        11900000, 1900000, 1900000, 1900000, 1900000
+    };
+    static const uint64_t s_last_over[5] = {
+        100000, 100000, 100000, 100000, 10100000
+    };
+    /* Every sample a little over, as real Stalls are: the least of each. */
+    static const uint64_t s_jitter[5] = {
+        100300, 100050, 100900, 100000, 100120
+    };
+    static const uint64_t l_jitter[5] = {
+        1900400, 1900100, 1903000, 1900000, 1900250
+    };
+    static const uint64_t s_with_zero[3] = { 0, 100000, 0 };
+    static const uint64_t l_with_zero[3] = { 1900000, 0, 0 };
+    static const uint64_t zeros[5]       = { 0, 0, 0, 0, 0 };
+    /* A long sample no larger than the short one: the difference is nothing,
+       so the floor under the long Stall alone is what is left. 100,000
+       ticks per 1900 us is 52,631,578 Hz; 2 % under that is 51,578,947. */
+    static const uint64_t l_too_small[5] = {
+        100000, 100000, 100000, 100000, 100000
+    };
+    /* Every short Stall 1 ms over: differenced, 800,000 ticks per 1800 us
+       is 0.44 GHz, a clock running 2.25x fast. The long Stall alone says
+       1 GHz, and the result may sit no more than 2 % under that. */
+    static const uint64_t s_all_over[5] = {
+        1100000, 1100000, 1100000, 1100000, 1100000
+    };
+    /* The same with the 12 us fixed cost on every Stall: the long Stall
+       alone says 1,006,315,789 Hz, 2 % under that is 986,189,474 -- within
+       2 % of the truth, on the fast side. */
+    static const uint64_t s_all_over_fixed[5] = {
+        1112000, 1112000, 1112000, 1112000, 1112000
+    };
+    /* Every long Stall 10 ms over: differenced, 11,800,000 per 1800 us is
+       6.56 GHz, above the 6,263,157,894 the long Stall alone gives -- which
+       already overstates, so nothing above it can be right. */
+    static const uint64_t l_all_over[5] = {
+        11900000, 11900000, 11900000, 11900000, 11900000
+    };
+    /* 100 GHz, the ceiling the published value is bounded by: no overflow. */
+    static const uint64_t s_fast[1] = { 10000000ull };
+    static const uint64_t l_fast[1] = { 190000000ull };
+
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_equal, 5,
+                                                     100, 1900)
+                   == 1000000000ull,
+               "counter freq: five exact pairs -> exactly 1 GHz");
+    test_check(axl_backend_counter_freq_from_samples(s_fixed, l_fixed, 5,
+                                                     100, 1900)
+                   == 1000000000ull,
+               "counter freq: a fixed 12 us cost per Stall cancels exactly");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_first_over,
+                                                     5, 100, 1900)
+                   == 1000000000ull,
+               "counter freq: one long Stall 10 ms over -> still 1 GHz");
+    test_check(axl_backend_counter_freq_from_samples(s_last_over, l_equal,
+                                                     5, 100, 1900)
+                   == 1000000000ull,
+               "counter freq: one short Stall 10 ms over -> still 1 GHz");
+    test_check(axl_backend_counter_freq_from_samples(s_jitter, l_jitter, 5,
+                                                     100, 1900)
+                   == 1000000000ull,
+               "counter freq: every sample a little over -> the least of each");
+    test_check(axl_backend_counter_freq_from_samples(s_with_zero,
+                                                     l_with_zero, 3, 100,
+                                                     1900)
+                   == 1000000000ull,
+               "counter freq: a zero sample is not a measurement -> skipped");
+    test_check(axl_backend_counter_freq_from_samples(s_fast, l_fast, 1, 100,
+                                                     1900)
+                   == 100000000000ull,
+               "counter freq: one 100 GHz pair -> exactly 100 GHz");
+    test_check(axl_backend_counter_freq_from_samples(s_all_over, l_equal, 5,
+                                                     100, 1900)
+                   == 980000000ull,
+               "counter freq: every short Stall 1 ms over -> 2 % under the "
+               "long alone, not 0.44 GHz");
+    test_check(axl_backend_counter_freq_from_samples(s_all_over_fixed,
+                                                     l_fixed, 5, 100, 1900)
+                   == 986189474ull,
+               "counter freq: every short Stall 1 ms over, with the fixed "
+               "cost -> within 2 % of 1 GHz");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_all_over, 5,
+                                                     100, 1900)
+                   == 6263157894ull,
+               "counter freq: every long Stall 10 ms over -> no more than "
+               "the long alone");
+    test_check(axl_backend_counter_freq_from_samples(zeros, l_equal, 5, 100,
+                                                     1900) == 1000000000ull,
+               "counter freq: every short sample zero -> the long alone");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, zeros, 5, 100,
+                                                     1900) == 0,
+               "counter freq: every long sample zero -> 0");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_too_small,
+                                                     5, 100, 1900)
+                   == 51578947ull,
+               "counter freq: long no larger than short -> 2 % under the "
+               "long alone, not 0");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_equal, 0,
+                                                     100, 1900) == 0,
+               "counter freq: no samples -> 0");
+    test_check(axl_backend_counter_freq_from_samples(NULL, l_equal, 5, 100,
+                                                     1900) == 1000000000ull,
+               "counter freq: NULL short samples -> the long alone");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, NULL, 5, 100,
+                                                     1900) == 0,
+               "counter freq: NULL long samples -> 0");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_equal, 5,
+                                                     1900, 1900) == 0,
+               "counter freq: equal lengths -> 0");
+    test_check(axl_backend_counter_freq_from_samples(s_equal, l_equal, 5,
+                                                     1900, 100) == 0,
+               "counter freq: lengths reversed -> 0");
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +839,114 @@ test_tpl_restore_baseline_repairs_a_leaked_raise(void)
 }
 
 // ---------------------------------------------------------------------------
+// Deferred exit: which callback it may unwind
+//
+// An exit asked for while a child image runs is deferred by abandoning the
+// innermost AXL notify callback (axl_backend_exit_defer). Only a callback
+// entered AFTER the innermost child started may be abandoned: one that was
+// already running when the child started -- it opened the bracket itself, a
+// ConnectController whose binding Start calls axl_exit -- sits under the
+// firmware's frames for that child, and jumping to it would abandon them
+// and the bracket's own close, leaving the child count raised for good.
+// Both directions, with real trampolines (TPL_CALLBACK timer callbacks) and
+// a recording exit function in place of gBS->Exit.
+// ---------------------------------------------------------------------------
+
+static volatile int  g_dx_phase;        /* the case the next tick runs; 0 = none */
+static volatile bool g_dx_ran_to_end;   /* the callback was NOT abandoned */
+static volatile int  g_dx_exit_rc;      /* what the recording exit was given */
+static volatile int  g_dx_exit_calls;
+
+static void
+dx_record_exit(
+    int rc
+    )
+{
+    g_dx_exit_rc = rc;
+    g_dx_exit_calls++;
+}
+
+static void
+dx_tick(
+    void *ctx
+    )
+{
+    (void)ctx;
+    int phase = g_dx_phase;
+    if (phase == 0) {
+        return;
+    }
+    g_dx_phase = 0;
+    if (phase == 1) {
+        /* OLDER than the child: this callback opens the bracket itself. */
+        axl_backend_child_image_enter();
+        axl_backend_exit_defer(7, dx_record_exit);
+        axl_backend_child_image_leave();
+    } else {
+        /* NEWER: the bracket was opened in the foreground. */
+        axl_backend_exit_defer(9, dx_record_exit);
+    }
+    g_dx_ran_to_end = true;
+}
+
+/* Arm @p phase and wait (up to 2 s) for a tick to take it. */
+static bool
+dx_run(
+    int phase
+    )
+{
+    g_dx_ran_to_end = false;
+    g_dx_phase      = phase;
+    for (int i = 0; i < 400 && g_dx_phase != 0; i++) {
+        axl_msleep(5);
+    }
+    return g_dx_phase == 0;
+}
+
+static void
+test_deferred_exit_unwinds_only_newer_callbacks(void)
+{
+    AxlEventHandle ev = NULL;
+    g_dx_exit_rc    = -1;
+    g_dx_exit_calls = 0;
+    if (axl_backend_event_create_notify_timer(dx_tick, NULL, 100000, &ev) != AXL_OK) {
+        test_check(false, "deferred exit: the notify timer is created");
+        return;
+    }
+
+    /* A callback that opened the child bracket is not abandoned. */
+    bool took = dx_run(1);
+    test_check(took, "deferred exit (older callback): the tick ran");
+    test_check(g_dx_ran_to_end,
+               "deferred exit (older callback): not abandoned -- the exit cannot be deferred there");
+    if (!g_dx_ran_to_end) {
+        axl_backend_child_image_leave();   /* the abandoned bracket's close */
+    }
+    test_check(!axl_backend_child_images_running(),
+               "deferred exit (older callback): the bracket closed");
+    axl_backend_exit_if_deferred();
+    test_check(g_dx_exit_calls == 0,
+               "deferred exit (older callback): nothing was deferred");
+
+    /* A callback entered while the child runs is abandoned, and the exit
+       happens once the bracket closes, with that callback's code. */
+    axl_backend_child_image_enter();
+    took = dx_run(2);
+    test_check(took, "deferred exit (newer callback): the tick ran");
+    test_check(!g_dx_ran_to_end,
+               "deferred exit (newer callback): abandoned at the exit");
+    test_check(g_dx_exit_calls == 0,
+               "deferred exit (newer callback): not performed while the child runs");
+    axl_backend_child_image_leave();
+    axl_backend_exit_if_deferred();
+    test_check(g_dx_exit_calls == 1 && g_dx_exit_rc == 9,
+               "deferred exit (newer callback): performed once the child returned, rc 9");
+
+    axl_backend_event_close(ev);
+    axl_backend_clear_exit_status();   /* the deferral armed the status */
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -666,6 +963,7 @@ test_runtime_main(
     test_atexit_null_fn_fails();
     test_atexit_remove_is_idempotent();
     test_atexit_handles_unique_per_register();
+    test_atexit_full_table_returns_zero();
 
     test_registry_count_tracks_events();
     test_registry_count_tracks_mixed_kinds();
@@ -678,6 +976,7 @@ test_runtime_main(
 
     test_signal_install_accepts_handler_and_null();
     test_exit_status_resolver();
+    test_counter_freq_from_samples();
 
     test_app_argv0_is_stable();
     test_app_image_path_is_canonical();
@@ -692,6 +991,8 @@ test_runtime_main(
     test_tpl_current_is_application_in_foreground();
     test_tpl_restore_baseline_is_noop_when_balanced();
     test_tpl_restore_baseline_repairs_a_leaked_raise();
+
+    test_deferred_exit_unwinds_only_newer_callbacks();
 
     return test_print_results();
 }

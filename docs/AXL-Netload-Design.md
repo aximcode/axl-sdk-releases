@@ -312,6 +312,15 @@ address/mask/gateway/DNS/timeout/retries, `--mac` together with `--nic`, or a
 static IP with no selector under `-a`, each fails fast with a specific message
 before any driver is touched.
 
+**Old shells' `ifconfig`.** The EFI 1.x shell's `ifconfig` reads the
+pre-UEFI-2.4 IPv4 configuration protocols, which current firmware no longer
+produces, so it used to print `Not configured.` for the NIC netload had just
+leased. The bring-up netload rides now publishes them (read-only, from a small
+resident driver that outlives netload -- `axl_net_legacy_ip4cfg_install`, see
+the network module's "Old tools" section), so after netload an old
+`ifconfig -l` shows the address, mask, gateway and routes. Its `ifconfig -s`
+is refused (`Unsupported`); set a static address with netload's `--ip`.
+
 ## Firmware-first probe (try the firmware's own drivers)
 
 netload's staged-driver sweep only DHCPs interfaces its *own* drivers *newly*
@@ -524,6 +533,18 @@ For a selected driver `X.efi` at `<path>`:
    connect (the `connect -r` equivalent) so the firmware's SnpDxe/MnpDxe binds on
    top. **If the driver hangs / faults, the box dies here — and `NetloadTrying`
    already names it.**
+   `axl_driver_load` reads the driver file ITSELF, in reads of at most 64 KB,
+   and hands `LoadImage` the bytes together with the file's device path — so
+   the driver's `FilePath` / `DeviceHandle` are still the file's (iPXE needs
+   that), but the firmware never reads the file in one large call. On BMC
+   virtual media large single reads come back intermittently corrupt while
+   64 KB reads do not (measured: a packed tool loaded by the firmware's one
+   large read failed its CRC 7 times in 10; `sha256sum`'s 64 KB reads of the
+   same file were right 5 of 5), and a raw driver has no CRC to catch it. The
+   firmware reads the path itself only when AXL cannot open the file or learn
+   its size; a driver AXL cannot read whole is refused, with a warning, never
+   handed to the firmware's large read (`src/util/README.md`, "Reading the
+   File").
 3. Survived → `DeleteVariable(NetloadTrying)`; console: `✓ loaded`.
 4. **Interface diff.** Snapshot `axl_net_list_interfaces()` (by MAC) *before* step
    2 and *after* step 2; the new MACs are the NIC(s) this driver produced.

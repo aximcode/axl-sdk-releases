@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=16 local-only=0
+# test-meta: arch=x64 needs= est=16 local-only=0 guest=standard
 # test-ws-broadcast-tls-qemu.sh — rapid WS broadcast over TLS must not desync.
 #
 # Regression for the ws-broadcast-over-TLS stream-desync wedge (SoftBMC
@@ -31,27 +31,13 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting HTTPS+WS server (resident driver-tick loop)...
-AxlTestNet.efi serve-tls-ws-driver
-NSHEOF
+# The startup commands live in test-ws-broadcast-tls-qemu.nsh
+test_use_nsh
 
 test_build_image
 
@@ -64,8 +50,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for HTTPS+WS server..."
 
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: server did not start within 60 seconds"
+if ! test_wait_boot "READY" 60; then
+    echo "FAIL: server did not start within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
@@ -82,7 +68,7 @@ pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 # Step 1 — baseline GET.
-RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" 2>/dev/null || true)
+RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" || true)
 CODE=$(echo "$RESP" | tail -1)
 [[ "$CODE" == "200" ]] && pass "HTTPS GET /api/version returns 200 (pre-burst baseline)" \
                        || fail "HTTPS GET baseline (got '$CODE')"
@@ -185,7 +171,7 @@ echo "$WS_RESULT" | grep -q "BURST_OK 8" \
     || fail "TLS WS broadcast burst (got '$WS_RESULT')"
 
 # Step 3 — THE wedge check: the loop must still serve after the burst.
-RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" 2>/dev/null || true)
+RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" || true)
 CODE=$(echo "$RESP" | tail -1)
 [[ "$CODE" == "200" ]] && pass "HTTPS GET after burst returns 200 (loop not wedged)" \
                        || fail "HTTPS GET after burst (got '$CODE' — loop wedged)"

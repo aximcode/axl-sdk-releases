@@ -260,6 +260,30 @@ test_path(void)
         "path: get_dirname no dir");
     axl_free(result);
 
+    /* A file at a volume root: the parent is the ROOT, "fs0:\", which is a
+       directory UEFI can open -- not the bare "fs0:", which names the volume
+       but no directory, and which axl_path_join would silently re-separate
+       while a plain concatenation would not. */
+    result = axl_path_get_dirname("fs0:\\x.efi");
+    test_check(result != NULL && axl_strcmp(result, "fs0:\\") == 0,
+        "path: get_dirname of a file at a volume root keeps the root separator");
+    axl_free(result);
+
+    result = axl_path_get_dirname("fs0:/x.efi");
+    test_check(result != NULL && axl_strcmp(result, "fs0:/") == 0,
+        "path: get_dirname at a volume root keeps a forward-slash separator");
+    axl_free(result);
+
+    result = axl_path_get_dirname("fs0:\\dir");
+    test_check(result != NULL && axl_strcmp(result, "fs0:\\") == 0,
+        "path: get_dirname of a top-level directory is the volume root");
+    axl_free(result);
+
+    result = axl_path_companion("fs0:\\x.efi", "y.efi");
+    test_check(result != NULL && axl_strcmp(result, "fs0:\\y.efi") == 0,
+        "path: companion of a root-level file stays at the root");
+    axl_free(result);
+
     // Extension
     ext = axl_path_extension("file.efi");
     test_check(ext != NULL && axl_strcmp(ext, "efi") == 0,
@@ -1318,6 +1342,103 @@ test_time_sleep(void)
     test_pass("time: usleep(1000) completes");
 }
 
+// axl_timer_resolution_* -- the firmware tick. EDK2 boots OVMF and AAVMF at
+// 10 ms; a request moves it, the finest request wins, and the last end puts
+// back what was found. The cross-image and exit-path half is
+// test/integration/test-timer-resolution-qemu.sh.
+
+typedef struct {
+    uint32_t fires;
+} TimerFireCount;
+
+static bool
+timer_res_count(
+    void *data
+    )
+{
+    ((TimerFireCount *)data)->fires++;
+    return true;
+}
+
+static bool
+timer_res_quit(
+    void *data
+    )
+{
+    axl_loop_quit((AxlLoop *)data);
+    return false;
+}
+
+/* How often a 1 ms repeating loop timer fires in 100 ms: the tick, not the
+   timer's interval, decides. */
+static uint32_t
+timer_res_fires_in_100ms(void)
+{
+    TimerFireCount count = { 0 };
+    AxlLoop *loop = axl_loop_new();
+    axl_loop_add_timer(loop, 1, timer_res_count, &count);
+    axl_loop_add_timeout(loop, 100, timer_res_quit, loop);
+    axl_loop_run(loop);
+    axl_loop_free(loop);
+    return count.fires;
+}
+
+static void
+test_timer_resolution(void)
+{
+    test_check(axl_timer_period_us() == 10000,
+               "timer_res: the firmware ticks at 10 ms before any request");
+
+    AxlTimerResolutionId a = 0;
+    AxlTimerResolutionId b = 0;
+    uint32_t granted = 0;
+    test_check(axl_timer_resolution_begin(1000, NULL, NULL) == AXL_INVALID,
+               "timer_res: NULL id -> AXL_INVALID");
+    test_check(axl_timer_resolution_begin(0, &a, NULL) == AXL_INVALID && a == 0,
+               "timer_res: period 0 -> AXL_INVALID, id untouched");
+    test_check(axl_timer_resolution_begin(AXL_TIMER_RESOLUTION_MAX_US + 1, &a, NULL)
+                   == AXL_INVALID,
+               "timer_res: period over the maximum -> AXL_INVALID");
+    test_check(axl_timer_period_us() == 10000,
+               "timer_res: refused requests change nothing");
+
+    uint32_t slow = timer_res_fires_in_100ms();
+
+    test_check(axl_timer_resolution_begin(1000, &a, &granted) == AXL_OK
+                   && a != 0 && granted == 1000,
+               "timer_res: begin(1000) granted 1000");
+    test_check(axl_timer_period_us() == 1000,
+               "timer_res: the firmware now ticks at 1 ms");
+
+    uint32_t fast = timer_res_fires_in_100ms();
+    test_check(slow <= 15,
+               "timer_res: at 10 ms a 1 ms loop timer fires at most ~10x in 100 ms");
+    test_check(fast >= 50,
+               "timer_res: at 1 ms the same timer fires at least 50x in 100 ms");
+
+    test_check(axl_timer_resolution_begin(5000, &b, &granted) == AXL_OK
+                   && b != 0 && b != a && granted == 1000,
+               "timer_res: a coarser second request keeps the finer tick");
+    test_check(axl_timer_resolution_end(a) == AXL_OK
+                   && axl_timer_period_us() == 5000,
+               "timer_res: ending the finer request leaves the next finest");
+    test_check(axl_timer_resolution_end(b) == AXL_OK
+                   && axl_timer_period_us() == 10000,
+               "timer_res: ending the last request restores 10 ms");
+
+    test_check(axl_timer_resolution_end(b) == AXL_INVALID,
+               "timer_res: ending a request twice -> AXL_INVALID");
+    test_check(axl_timer_resolution_end(0) == AXL_INVALID,
+               "timer_res: ending id 0 -> AXL_INVALID");
+
+    test_check(axl_timer_resolution_begin(300, &a, &granted) == AXL_OK
+                   && granted == AXL_TIMER_RESOLUTION_MIN_US,
+               "timer_res: a period under 1 ms is rounded up to 1 ms");
+    test_check(axl_timer_resolution_end(a) == AXL_OK
+                   && axl_timer_period_us() == 10000,
+               "timer_res: and its end restores 10 ms");
+}
+
 static void
 test_time_get_us(void)
 {
@@ -1548,6 +1669,17 @@ test_cwd(void)
 static void
 test_path_resolve(void)
 {
+    {
+        /* It allocates nothing, so a failing allocation cannot make it
+           fail: callers (a provider's Open, serve-fs) read its AXL_ERR as
+           a bad path, and out of memory is not one. */
+        char ob[64];
+        axl_mem_fail_next_alloc(1);
+        int orc = axl_path_resolve("/base/x/..", "a/./b/../file.efi", ob, sizeof(ob));
+        axl_mem_fail_next_alloc(0);
+        test_check(orc == AXL_OK && axl_strcmp(ob, "/base/a/file.efi") == 0,
+                   "path_resolve: allocates nothing -- it resolves while every allocation fails");
+    }
     char buf[256];
 
     /* Simple join */
@@ -1600,11 +1732,101 @@ test_path_resolve(void)
     test_check(axl_path_resolve("/base", "file.efi", buf, 5) == AXL_ERR,
                "resolve: buffer too small");
 
+    /* A long path resolves whole, or not at all -- never cut. */
+    static char longrel[1200];
+    static char longout[1300];
+    for (size_t i = 0; i < 1000; i++) {
+        longrel[i] = (i % 100 == 99) ? '/' : 'k';
+    }
+    longrel[1000] = '\0';
+    test_check(axl_path_resolve("/base", longrel, longout, sizeof(longout)) == AXL_OK
+               && axl_strlen(longout) == 1005 && axl_str_has_prefix(longout, "/base/kkk")
+               && longout[105] == '/',
+               "resolve: a 1,000-byte relative path resolves whole");
+    test_check(axl_path_resolve("/base", longrel, longout, 600) == AXL_ERR,
+               "resolve: a result longer than the buffer -> AXL_ERR, not cut");
+    static char deep[700];
+    for (size_t i = 0; i < 200; i++) {
+        deep[2 * i]     = 'd';
+        deep[2 * i + 1] = '/';
+    }
+    deep[400] = '\0';
+    test_check(axl_path_resolve("/", deep, longout, sizeof(longout)) == AXL_OK
+               && axl_strlen(longout) == 400,
+               "resolve: 200 components resolve");
+    static char at_cap[600];
+    for (size_t i = 0; i < 256; i++) {
+        at_cap[2 * i]     = 'd';
+        at_cap[2 * i + 1] = '/';
+    }
+    at_cap[512] = '\0';
+    test_check(axl_path_resolve("/", at_cap, longout, sizeof(longout)) == AXL_OK
+               && axl_strlen(longout) == 512,
+               "resolve: 256 components resolve");
+    at_cap[512] = 'd';
+    at_cap[513] = '\0';
+    test_check(axl_path_resolve("/", at_cap, longout, sizeof(longout)) == AXL_ERR,
+               "resolve: 257 components -> AXL_ERR, not cut");
+
     /* Backslash handling */
     test_check(axl_path_resolve("/a\\b", "c\\d", buf, sizeof(buf)) == AXL_OK,
                "resolve: backslash");
     test_check(axl_strcmp(buf, "/a/b/c/d") == 0,
                "resolve: backslash normalized");
+
+    /* Exact size boundary: "/base/file.efi" is 14 bytes + NUL. */
+    char b15[15];
+    test_check(axl_path_resolve("/base", "file.efi", b15, 15) == AXL_OK
+               && axl_strcmp(b15, "/base/file.efi") == 0,
+               "resolve: a 14-byte result fits 15 bytes exactly");
+    test_check(axl_path_resolve("/base", "file.efi", b15, 14) == AXL_ERR,
+               "resolve: ...and is refused at 14, not cut");
+
+    /* No root: ".." past the start is dropped, as before. */
+    test_check(axl_path_resolve("a", "../../b", buf, sizeof(buf)) == AXL_OK
+               && axl_strcmp(buf, "b") == 0,
+               "resolve: (\"a\", \"../../b\") -> \"b\"");
+    test_check(axl_path_resolve("", "", buf, sizeof(buf)) == AXL_OK
+               && axl_strcmp(buf, ".") == 0,
+               "resolve: (\"\", \"\") -> \".\"");
+
+    /* The root alone needs two bytes. */
+    char b2[2];
+    test_check(axl_path_resolve("/", "", b2, 2) == AXL_OK && axl_strcmp(b2, "/") == 0,
+               "resolve: (\"/\", \"\") -> \"/\" in 2 bytes");
+    test_check(axl_path_resolve("/", "", b2, 1) == AXL_ERR,
+               "resolve: (\"/\", \"\") is refused at size 1");
+
+    /* Doubled and trailing separators collapse. */
+    test_check(axl_path_resolve("/a//b/", "c//", buf, sizeof(buf)) == AXL_OK
+               && axl_strcmp(buf, "/a/b/c") == 0,
+               "resolve: (\"/a//b/\", \"c//\") -> \"/a/b/c\"");
+
+    /* The limit is on the RESULT: 300 components then 100 ".." leave 200. */
+    {
+        static char deep[1024];
+        static char want[512];
+        size_t      n = 0;
+        for (int i = 0; i < 300; i++) {
+            deep[n++] = '/';
+            deep[n++] = 'x';
+        }
+        for (int i = 0; i < 100; i++) {
+            deep[n++] = '/';
+            deep[n++] = '.';
+            deep[n++] = '.';
+        }
+        deep[n] = '\0';
+        size_t w = 0;
+        for (int i = 0; i < 200; i++) {
+            want[w++] = '/';
+            want[w++] = 'x';
+        }
+        want[w] = '\0';
+        test_check(axl_path_resolve("/", deep, longout, sizeof(longout)) == AXL_OK
+                   && axl_strcmp(longout, want) == 0,
+                   "resolve: 300 components then 100 \"..\" -> the 200 that remain");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,10 +1986,28 @@ test_volume_enumerate(void)
                "vol enum: fill array");
     test_check(filled == count, "vol enum: filled matches count");
 
-    /* First volume has name "fs0" */
+    /* The Shell names the volumes; the enumeration's ORDER is the firmware's
+       handle order and no part of the contract. So: exactly ONE volume is
+       named fs0, and it is the running image's own -- the name
+       axl_app_boot_path gives it, spelled exactly as enumeration spells it.
+       ("first is fs0" held only where the image's disk is the only one --
+       booted; a pooled guest's own disk enumerates first.) */
     if (filled > 0) {
-        test_check(axl_strcmp(vols[0].name, "fs0") == 0,
-                   "vol enum: first is fs0");
+        size_t named_fs0 = 0;
+        for (size_t i = 0; i < filled; i++) {
+            if (axl_strcmp(vols[i].name, "fs0") == 0) {
+                named_fs0++;
+            }
+        }
+        test_check(named_fs0 == 1, "vol enum: exactly one volume is fs0");
+        /* A PATH keeps the shell's spelling of the volume (axl_app_boot_path,
+           verbatim: "FS0" under a shell), and enumeration lowercases its
+           .name by contract; volume names are case-insensitive, so the
+           volume part is compared so. */
+        char boot[32] = "";
+        test_check(axl_app_boot_path("x", boot, sizeof(boot)) == AXL_OK
+                   && axl_strcasecmp(boot, "fs0:\\x") == 0,
+                   "vol enum: fs0 is the image's own volume");
         test_check(vols[0].handle != NULL,
                    "vol enum: handle non-NULL");
     }
@@ -1830,11 +2070,23 @@ test_volume_get_space(void)
         return;
     }
 
-    /* Asserted, NOT used as a gate: an earlier revision let a failing
+    /* THE BOOT VOLUME: the one named fs0 -- the image's own (vol enum pins
+       that) -- not vols[0], which is the firmware's first handle: on a
+       pooled guest that is the virtio-fs share, whose free space is the
+       host disk's and moves between two queries, so "path and handle
+       agree exactly" would pass or fail on the host's timing.
+       Asserted, NOT used as a gate: an earlier revision let a failing
        query take the SKIP path, so a regression in the path spelling
        would have kept the suite green at an unchanged ratchet total. */
+    size_t bv = 0;
+    for (size_t i = 0; i < filled; i++) {
+        if (axl_strcmp(vols[i].name, "fs0") == 0) {
+            bv = i;
+            break;
+        }
+    }
     char path[24];
-    axl_snprintf(path, sizeof(path), "%s:", vols[0].name);
+    axl_snprintf(path, sizeof(path), "%s:", vols[bv].name);
     test_check(axl_volume_get_space(path, &total, &avail) == AXL_OK,
                "vol space: boot volume answers the path spelling");
     test_check(total > 0,
@@ -1844,7 +2096,7 @@ test_volume_get_space(void)
 
     uint64_t h_total = untouched;
     uint64_t h_avail = untouched;
-    test_check(axl_volume_get_space_by_handle(vols[0].handle,
+    test_check(axl_volume_get_space_by_handle(vols[bv].handle,
                                               &h_total, &h_avail) == AXL_OK,
                "vol space: the same volume answers by handle");
     test_check(h_total == total && h_avail == avail,
@@ -1856,7 +2108,7 @@ test_volume_get_space(void)
     uint64_t a_avail = untouched;
     char absent[64];
     axl_snprintf(absent, sizeof(absent), "%s:\\axl-no-such-file.zzz",
-                 vols[0].name);
+                 vols[bv].name);
     test_check(axl_volume_get_space(absent, &a_total, &a_avail) == AXL_OK
                    && a_total == total && a_avail == avail,
                "vol space: a not-yet-created file reports its volume");
@@ -2230,6 +2482,456 @@ test_config_file_string_round_trip(void)
     test_check(axl_config_file_to_string(big, buf, 0) == AXL_ERR,
                "config_file: to_string zero cap -> AXL_ERR");
     axl_config_file_free(big);
+}
+
+/* ---- AxlConfigFile OpenSSH syntax (sshd_config(5)) ------------------- */
+
+/* Parse @p len bytes into an OpenSSH map, reporting the status. */
+static AxlStatus
+cfo_parse(
+    AxlConfigFile      *cf,
+    const void         *bytes,
+    size_t              len,
+    AxlConfigFileError *err
+    )
+{
+    return axl_config_file_parse_bytes(cf, bytes, len, err);
+}
+
+/* True when entry @p i is exactly @p keyword on @p line with the @p argc
+   arguments in @p argv. */
+static bool
+cfo_entry_is(
+    AxlConfigFile      *cf,
+    size_t              i,
+    const char         *keyword,
+    size_t              line,
+    size_t              argc,
+    const char *const  *argv
+    )
+{
+    const AxlConfigFileEntry *e = axl_config_file_entry_at(cf, i);
+    if (e == NULL || axl_strcmp(e->keyword, keyword) != 0
+        || e->line != line || e->argc != argc) {
+        return false;
+    }
+    for (size_t a = 0; a < argc; a++) {
+        if (e->argv[a] == NULL || axl_strcmp(e->argv[a], argv[a]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* An error result: @p rc AXL_INVALID, @p line and @p reason exact. */
+static bool
+cfo_error_is(
+    AxlStatus                 rc,
+    const AxlConfigFileError *err,
+    size_t                    line,
+    const char               *reason
+    )
+{
+    return rc == AXL_INVALID && err->line == line && err->reason != NULL
+        && axl_strcmp(err->reason, reason) == 0;
+}
+
+static void
+test_config_file_openssh(void)
+{
+    AxlConfigFileError err;
+
+    /* openssh_basic */
+    AxlConfigFile *cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    test_check(cf != NULL, "cfo: new_syntax(OPENSSH) returns a map");
+    static const char basic[] = "Port 2222\n";
+    test_check(cfo_parse(cf, basic, sizeof basic - 1, &err) == AXL_OK,
+               "cfo: basic parse AXL_OK");
+    test_check(err.line == 0 && err.reason != NULL
+               && axl_strcmp(err.reason, "") == 0,
+               "cfo: success leaves err line 0, reason \"\"");
+    test_check(axl_config_file_entry_count(cf) == 1, "cfo: basic one entry");
+    static const char *const a2222[] = { "2222" };
+    test_check(cfo_entry_is(cf, 0, "Port", 1, 1, a2222),
+               "cfo: basic entry Port {2222} line 1");
+    test_check(axl_strcmp(axl_config_file_get(cf, "PORT", NULL), "2222") == 0,
+               "cfo: get is case-insensitive on an OpenSSH map");
+    test_check(axl_config_file_get_uint(cf, "port", 0) == 2222,
+               "cfo: typed getter reads the OpenSSH value");
+    test_check(axl_config_file_entry_at(cf, 1) == NULL,
+               "cfo: entry_at past the end is NULL");
+    axl_config_file_free(cf);
+
+    /* openssh_forms */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const char forms[] =
+        "  PasswordAuthentication=no\n"
+        "MaxAuthTries = 4\n"
+        "LoginGraceTime\t2m\n"
+        "# c\n"
+        "\n"
+        "Banner \"my banner.txt\"\n"
+        "RekeyLimit 1G 1h # tail\n"
+        "Port 22#x\n";
+    test_check(cfo_parse(cf, forms, sizeof forms - 1, &err) == AXL_OK,
+               "cfo: forms parse AXL_OK");
+    test_check(axl_config_file_entry_count(cf) == 6, "cfo: forms six entries");
+    static const char *const a_no[]  = { "no" };
+    static const char *const a_4[]   = { "4" };
+    static const char *const a_2m[]  = { "2m" };
+    static const char *const a_ban[] = { "my banner.txt" };
+    static const char *const a_rk[]  = { "1G", "1h" };
+    static const char *const a_22x[] = { "22#x" };
+    test_check(cfo_entry_is(cf, 0, "PasswordAuthentication", 1, 1, a_no),
+               "cfo: forms Keyword=arg with leading blanks");
+    test_check(cfo_entry_is(cf, 1, "MaxAuthTries", 2, 1, a_4),
+               "cfo: forms Keyword = arg");
+    test_check(cfo_entry_is(cf, 2, "LoginGraceTime", 3, 1, a_2m),
+               "cfo: forms tab separator");
+    test_check(cfo_entry_is(cf, 3, "Banner", 6, 1, a_ban),
+               "cfo: forms quoted argument, line 6 after comment+blank");
+    test_check(cfo_entry_is(cf, 4, "RekeyLimit", 7, 2, a_rk),
+               "cfo: forms two args, trailing # comment dropped");
+    test_check(cfo_entry_is(cf, 5, "Port", 8, 1, a_22x),
+               "cfo: forms # inside an argument is ordinary");
+    test_check(axl_strcmp(axl_config_file_get(cf, "rekeylimit", NULL),
+                          "1G 1h") == 0,
+               "cfo: map value is the args joined by one space");
+    axl_config_file_free(cf);
+
+    /* openssh_first_wins */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const char fw[] = "Port 1\nport 2\n";
+    test_check(cfo_parse(cf, fw, sizeof fw - 1, &err) == AXL_OK,
+               "cfo: first_wins parse AXL_OK");
+    static const char *const a1[] = { "1" };
+    static const char *const a2[] = { "2" };
+    test_check(axl_config_file_entry_count(cf) == 2
+               && cfo_entry_is(cf, 0, "Port", 1, 1, a1)
+               && cfo_entry_is(cf, 1, "port", 2, 1, a2),
+               "cfo: first_wins keeps both entries in order, case as written");
+    test_check(axl_strcmp(axl_config_file_get(cf, "Port", NULL), "1") == 0,
+               "cfo: first_wins map value is the first occurrence");
+    /* ... across parses too, and the first parse's strings survive it. */
+    const AxlConfigFileEntry *e0 = axl_config_file_entry_at(cf, 0);
+    const char *kw0   = e0->keyword;
+    const char *arg0  = e0->argv[0];
+    static const char fw2[] = "PORT 3\nX y\n";
+    test_check(cfo_parse(cf, fw2, sizeof fw2 - 1, &err) == AXL_OK,
+               "cfo: second parse AXL_OK");
+    static const char *const a3[] = { "3" };
+    static const char *const ay[] = { "y" };
+    test_check(axl_config_file_entry_count(cf) == 4
+               && cfo_entry_is(cf, 2, "PORT", 1, 1, a3)
+               && cfo_entry_is(cf, 3, "X", 2, 1, ay),
+               "cfo: a second parse appends, line numbers restart at 1");
+    test_check(axl_strcmp(axl_config_file_get(cf, "port", NULL), "1") == 0,
+               "cfo: first wins across parses");
+    test_check(axl_strcmp(kw0, "Port") == 0 && axl_strcmp(arg0, "1") == 0,
+               "cfo: an earlier parse's strings stay valid after another parse");
+    axl_config_file_free(cf);
+
+    /* openssh_quotes */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const char qt[] =
+        "A \"x \\\"y\\\" z\"\n"
+        "B 'a b' c\n"
+        "C fs0:\\keys\\ak\n"
+        "D a\\ b\n"
+        "E \"\" x\"y z\"w\n"
+        "\"Port\" 22\n"
+        "'K w'=v\n";
+    test_check(cfo_parse(cf, qt, sizeof qt - 1, &err) == AXL_OK,
+               "cfo: quotes parse AXL_OK");
+    static const char *const qa[] = { "x \"y\" z" };
+    static const char *const qb[] = { "a b", "c" };
+    static const char *const qc[] = { "fs0:\\keys\\ak" };
+    static const char *const qd[] = { "a b" };
+    static const char *const qe[] = { "", "xy zw" };
+    test_check(cfo_entry_is(cf, 0, "A", 1, 1, qa),
+               "cfo: escaped double quotes inside a double-quoted group");
+    test_check(cfo_entry_is(cf, 1, "B", 2, 2, qb),
+               "cfo: single quotes group");
+    test_check(cfo_entry_is(cf, 2, "C", 3, 1, qc),
+               "cfo: a backslash before an ordinary char is literal");
+    test_check(cfo_entry_is(cf, 3, "D", 4, 1, qd),
+               "cfo: backslash-space outside quotes joins");
+    test_check(cfo_entry_is(cf, 4, "E", 5, 2, qe),
+               "cfo: empty quoted arg; quotes mid-argument");
+    static const char *const q22[] = { "22" };
+    static const char *const qv[]  = { "v" };
+    test_check(cfo_entry_is(cf, 5, "Port", 6, 1, q22)
+               && axl_strcmp(axl_config_file_get(cf, "port", NULL), "22") == 0,
+               "cfo: a double-quoted keyword is unquoted (as strdelim does)");
+    test_check(cfo_entry_is(cf, 6, "K w", 7, 1, qv),
+               "cfo: a single-quoted keyword may hold a space, ends at =");
+    axl_config_file_free(cf);
+
+    /* openssh_errors -- all or nothing: an error changes nothing. */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const char pre[] = "Keep 1\n";
+    test_check(cfo_parse(cf, pre, sizeof pre - 1, &err) == AXL_OK,
+               "cfo: errors pre-parse AXL_OK");
+    static const char uq[] = "Port 1\nA \"open\n";
+    AxlStatus rc = cfo_parse(cf, uq, sizeof uq - 1, &err);
+    test_check(cfo_error_is(rc, &err, 2, "unterminated quoted string"),
+               "cfo: unterminated quote -> AXL_INVALID line 2");
+    test_check(axl_config_file_entry_count(cf) == 1,
+               "cfo: a failed parse adds no entry");
+    test_check(axl_config_file_get(cf, "Port", NULL) == NULL,
+               "cfo: a failed parse sets no value");
+    static const char *const akeep[] = { "1" };
+    test_check(axl_strcmp(axl_config_file_get(cf, "Keep", NULL), "1") == 0
+               && cfo_entry_is(cf, 0, "Keep", 1, 1, akeep),
+               "cfo: a failed parse leaves the earlier parse intact");
+    static const char mk[] = "=x\n";
+    rc = cfo_parse(cf, mk, sizeof mk - 1, &err);
+    test_check(cfo_error_is(rc, &err, 1, "missing keyword"),
+               "cfo: =x -> missing keyword line 1");
+    test_check(axl_config_file_entry_count(cf) == 1,
+               "cfo: missing keyword adds no entry");
+    static const char mkq[] = "\"\" x\n";
+    rc = cfo_parse(cf, mkq, sizeof mkq - 1, &err);
+    test_check(cfo_error_is(rc, &err, 1, "missing keyword"),
+               "cfo: an empty quoted keyword -> missing keyword");
+    static const char ukw[] = "\"Kw open\n";
+    rc = cfo_parse(cf, ukw, sizeof ukw - 1, &err);
+    test_check(cfo_error_is(rc, &err, 1, "unterminated quoted string"),
+               "cfo: an unterminated quote in the keyword is refused");
+    static const char kwonly[] = "Keyword\nOther=\n";
+    test_check(cfo_parse(cf, kwonly, sizeof kwonly - 1, &err) == AXL_OK,
+               "cfo: a keyword with no args parses");
+    test_check(cfo_entry_is(cf, 1, "Keyword", 1, 0, NULL)
+               && cfo_entry_is(cf, 2, "Other", 2, 0, NULL),
+               "cfo: no-arg keywords have argc 0");
+    test_check(axl_strcmp(axl_config_file_get(cf, "keyword", NULL), "") == 0,
+               "cfo: a no-arg keyword's map value is \"\"");
+    axl_config_file_free(cf);
+
+    /* line too long: the boundary is AXL_CONFIG_FILE_LINE_MAX. */
+    char *longl = axl_malloc(AXL_CONFIG_FILE_LINE_MAX + 2);
+    test_check(longl != NULL, "cfo: long-line buffer");
+    if (longl != NULL) {
+        axl_memset(longl, 'k', AXL_CONFIG_FILE_LINE_MAX);
+        longl[AXL_CONFIG_FILE_LINE_MAX] = '\n';
+        cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+        rc = cfo_parse(cf, longl, AXL_CONFIG_FILE_LINE_MAX + 1, &err);
+        test_check(cfo_error_is(rc, &err, 1, "line too long"),
+                   "cfo: a LINE_MAX-byte line is too long");
+        longl[AXL_CONFIG_FILE_LINE_MAX - 1] = '\n';
+        test_check(cfo_parse(cf, longl, AXL_CONFIG_FILE_LINE_MAX, &err)
+                       == AXL_OK
+                   && axl_config_file_entry_count(cf) == 1,
+                   "cfo: a LINE_MAX-1 byte line parses");
+        axl_config_file_free(cf);
+        axl_free(longl);
+    }
+
+    /* NUL byte, UTF-8 */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const char nul8[] = "Port 1\nA b\0c\n";
+    rc = cfo_parse(cf, nul8, sizeof nul8 - 1, &err);
+    test_check(cfo_error_is(rc, &err, 2, "NUL byte"),
+               "cfo: a NUL in UTF-8 input -> NUL byte line 2");
+    test_check(axl_config_file_entry_count(cf) == 0,
+               "cfo: NUL refusal adds no entry");
+    axl_config_file_free(cf);
+
+    /* openssh_bom_crlf */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const char bom[] = "\xEF\xBB\xBFPort 2\r\nMaxSessions 3\r\n";
+    test_check(cfo_parse(cf, bom, sizeof bom - 1, &err) == AXL_OK,
+               "cfo: BOM+CRLF parse AXL_OK");
+    static const char *const b3[] = { "3" };
+    test_check(cfo_entry_is(cf, 0, "Port", 1, 1, a2)
+               && cfo_entry_is(cf, 1, "MaxSessions", 2, 1, b3),
+               "cfo: BOM dropped, CR stripped");
+    axl_config_file_free(cf);
+
+    /* openssh_ucs2 */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    static const unsigned char u16[] = {
+        0xFF, 0xFE, 'P', 0, 'o', 0, 'r', 0, 't', 0, ' ', 0, '2', 0,
+        '\r', 0, '\n', 0,
+    };
+    test_check(cfo_parse(cf, u16, sizeof u16, &err) == AXL_OK,
+               "cfo: UTF-16LE parse AXL_OK");
+    test_check(axl_config_file_entry_count(cf) == 1
+               && cfo_entry_is(cf, 0, "Port", 1, 1, a2),
+               "cfo: UTF-16LE converted to Port {2}");
+    static const unsigned char lone[] = { 0xFF, 0xFE, 0x00, 0xD8, 0x20, 0x00 };
+    rc = cfo_parse(cf, lone, sizeof lone, &err);
+    test_check(cfo_error_is(rc, &err, 1, "invalid UTF-16"),
+               "cfo: a lone high surrogate -> invalid UTF-16");
+    static const unsigned char odd[] = {
+        0xFF, 0xFE, 'A', 0, '\n', 0, 'B', 0, 'x',
+    };
+    rc = cfo_parse(cf, odd, sizeof odd, &err);
+    test_check(cfo_error_is(rc, &err, 2, "invalid UTF-16"),
+               "cfo: an odd UTF-16 byte count -> invalid UTF-16 on its line");
+    static const unsigned char nul16[] = {
+        0xFF, 0xFE, 'A', 0, '\n', 0, 'B', 0, 0, 0, '\n', 0,
+    };
+    rc = cfo_parse(cf, nul16, sizeof nul16, &err);
+    test_check(cfo_error_is(rc, &err, 2, "NUL byte"),
+               "cfo: an encoded U+0000 -> NUL byte line 2");
+    static const unsigned char pair[] = {
+        0xFF, 0xFE, 'K', 0, ' ', 0, 0x3D, 0xD8, 0x00, 0xDE,
+    };
+    test_check(cfo_parse(cf, pair, sizeof pair, &err) == AXL_OK,
+               "cfo: a surrogate pair converts");
+    static const char *const apair[] = { "\xF0\x9F\x98\x80" };
+    test_check(cfo_entry_is(cf, 1, "K", 1, 1, apair),
+               "cfo: the surrogate pair is U+1F600 in UTF-8");
+    axl_config_file_free(cf);
+
+    /* kv_unchanged: no encoding handling leaks into key=value. */
+    AxlConfigFile *kv = axl_config_file_new();
+    static const char kvbom[] = "\xEF\xBB\xBFk=v\n";
+    test_check(cfo_parse(kv, kvbom, sizeof kvbom - 1, &err) == AXL_OK,
+               "cfo: kv parse_bytes AXL_OK");
+    test_check(axl_strcmp(axl_config_file_get(kv, "\xEF\xBB\xBFk", NULL),
+                          "v") == 0,
+               "cfo: kv keeps the BOM in its key");
+    test_check(axl_config_file_entry_count(kv) == 0,
+               "cfo: kv records no entries");
+    static const char kvbad[] = "a=1\nA \"open\n=x\n";
+    test_check(cfo_parse(kv, kvbad, sizeof kvbad - 1, &err) == AXL_OK
+               && err.line == 0,
+               "cfo: kv never reports a syntax error");
+    test_check(axl_strcmp(axl_config_file_get(kv, "a", NULL), "1") == 0
+               && axl_config_file_get(kv, "A", NULL) == NULL,
+               "cfo: kv stays case-sensitive");
+    axl_config_file_free(kv);
+
+    /* parse_string on an OpenSSH map */
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    test_check(axl_config_file_parse_string(cf, "\xEF\xBB\xBFPort 7\n")
+                   == AXL_OK
+               && cfo_entry_is(cf, 0, "Port", 1, 1,
+                               (const char *const[]){ "7" }),
+               "cfo: parse_string applies the OpenSSH grammar, BOM dropped");
+    test_check(axl_config_file_parse_string(cf, "Max 1\nA \"open\n") == AXL_ERR,
+               "cfo: parse_string syntax error -> AXL_ERR");
+    test_check(axl_config_file_entry_count(cf) == 1
+               && axl_config_file_get(cf, "Max", NULL) == NULL,
+               "cfo: parse_string syntax error changes nothing");
+
+    /* set on an OpenSSH map */
+    test_check(axl_config_file_set(cf, "PORT", "9") == AXL_OK
+               && axl_strcmp(axl_config_file_get(cf, "port", NULL), "9") == 0,
+               "cfo: set overwrites case-insensitively");
+    test_check(axl_config_file_entry_count(cf) == 1,
+               "cfo: set adds no entry");
+
+    /* openssh_serialize_refused */
+    char sbuf[64] = { 'S', '\0' };
+    test_check(axl_config_file_to_string(cf, sbuf, sizeof sbuf) == AXL_ERR
+               && sbuf[0] == 'S',
+               "cfo: to_string on an OpenSSH map -> AXL_ERR, buf untouched");
+    test_check(axl_config_file_save(cf, "axl-cfo-save.tmp") == AXL_ERR,
+               "cfo: save on an OpenSSH map -> AXL_ERR");
+    test_check(!axl_file_is_dir("axl-cfo-save.tmp")
+               && axl_file_get_bytes("axl-cfo-save.tmp") == NULL,
+               "cfo: a refused save writes no file");
+    axl_config_file_free(cf);
+
+    /* NULL / bad arguments */
+    test_check(axl_config_file_new_syntax((AxlConfigFileSyntax)7) == NULL,
+               "cfo: unknown syntax -> NULL");
+    err.line = 99;
+    test_check(axl_config_file_parse_bytes(NULL, "a", 1, &err) == AXL_INVALID
+               && err.line == 0,
+               "cfo: parse_bytes NULL cf -> AXL_INVALID, err line 0");
+    cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+    test_check(axl_config_file_parse_bytes(cf, NULL, 1, NULL) == AXL_INVALID,
+               "cfo: parse_bytes NULL data, len 1 -> AXL_INVALID");
+    test_check(axl_config_file_parse_bytes(cf, NULL, 0, NULL) == AXL_OK,
+               "cfo: parse_bytes len 0 -> AXL_OK");
+    test_check(axl_config_file_entry_count(NULL) == 0
+               && axl_config_file_entry_at(NULL, 0) == NULL,
+               "cfo: entry accessors NULL-safe");
+
+    /* read_status */
+    test_check(axl_config_file_read(cf, "axl-cfo-missing.conf", &err)
+                   == AXL_NOT_FOUND
+               && err.line == 0 && axl_config_file_entry_count(cf) == 0,
+               "cfo: read of a missing file -> AXL_NOT_FOUND, map empty");
+    /* The same absent file named through its volume's map name (`fsN:\x`),
+       the shape sshd reads: the `name:` branch must resolve the volume. */
+    char *cwd = axl_get_current_dir();
+    const char *colon = (cwd != NULL) ? axl_strchr(cwd, ':') : NULL;
+    test_check(colon != NULL, "cfo: the current directory names a volume");
+    if (colon != NULL) {
+        char vpath[96];
+        size_t plen = (size_t)(colon - cwd) + 1;
+        test_check(plen + sizeof "\\axl-cfo-missing.conf" <= sizeof vpath,
+                   "cfo: the volume prefix fits");
+        if (plen + sizeof "\\axl-cfo-missing.conf" <= sizeof vpath) {
+            axl_memcpy(vpath, cwd, plen);
+            axl_memcpy(vpath + plen, "\\axl-cfo-missing.conf",
+                       sizeof "\\axl-cfo-missing.conf");
+            test_check(axl_config_file_read(cf, vpath, &err) == AXL_NOT_FOUND,
+                       "cfo: read of fsN:\\missing -> AXL_NOT_FOUND");
+        }
+    }
+    axl_free(cwd);
+    test_check(axl_config_file_read(cf, "fs97:\\axl-cfo.conf", &err)
+                   == AXL_IO_ERROR,
+               "cfo: read on an unmapped volume -> AXL_IO_ERROR");
+    test_check(axl_dir_mkdir("axl-cfo-dir.tmp") == AXL_OK,
+               "cfo: made a directory to read");
+    test_check(axl_config_file_read(cf, "axl-cfo-dir.tmp", &err)
+                   == AXL_IO_ERROR,
+               "cfo: read of a directory -> AXL_IO_ERROR");
+    test_check(axl_dir_rmdir("axl-cfo-dir.tmp") == AXL_OK,
+               "cfo: removed the directory");
+    test_check(axl_config_file_read(cf, "", &err) == AXL_INVALID
+               && err.line == 0,
+               "cfo: read of \"\" -> AXL_INVALID");
+    test_check(axl_config_file_read(NULL, "x", &err) == AXL_INVALID,
+               "cfo: read NULL cf -> AXL_INVALID");
+    static const char rtext[] = "Port 5\n";
+    test_check(axl_file_set_contents("axl-cfo.conf", rtext,
+                                     sizeof rtext - 1) == AXL_OK,
+               "cfo: wrote the config file");
+    test_check(axl_config_file_read(cf, "axl-cfo.conf", &err) == AXL_OK
+               && axl_config_file_get_uint(cf, "port", 0) == 5,
+               "cfo: read of a real file -> AXL_OK");
+    static const char rbad[] = "Port 5\nB \"x\n";
+    test_check(axl_file_set_contents("axl-cfo.conf", rbad,
+                                     sizeof rbad - 1) == AXL_OK,
+               "cfo: wrote the bad config file");
+    rc = axl_config_file_read(cf, "axl-cfo.conf", &err);
+    test_check(cfo_error_is(rc, &err, 2, "unterminated quoted string"),
+               "cfo: read reports a syntax error's line");
+    test_check(axl_file_delete("axl-cfo.conf") == AXL_OK,
+               "cfo: removed the config file");
+    axl_config_file_free(cf);
+
+    /* openssh_oom: every allocation, failed in turn, is AXL_NO_RESOURCES
+       with the entries unchanged; the sweep ends on the first clean parse. */
+    bool oom_ok = true;
+    bool reached_ok = false;
+    for (size_t n = 1; n <= 64 && !reached_ok; n++) {
+        AxlConfigFile *om = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+        if (om == NULL) {
+            oom_ok = false;
+            break;
+        }
+        axl_mem_fail_next_alloc(n);
+        AxlStatus orc = cfo_parse(om, forms, sizeof forms - 1, &err);
+        axl_mem_fail_next_alloc(0);
+        if (orc == AXL_OK) {
+            reached_ok = axl_config_file_entry_count(om) == 6;
+        } else if (orc != AXL_NO_RESOURCES
+                   || axl_config_file_entry_count(om) != 0 || err.line != 0) {
+            oom_ok = false;
+        }
+        axl_config_file_free(om);
+    }
+    test_check(oom_ok && reached_ok,
+               "cfo: OOM at every allocation -> AXL_NO_RESOURCES, no entries");
 }
 
 static void
@@ -3567,6 +4269,32 @@ test_service_attach_driver(void)
     test_check(ctx2.teardown_calls == 0,
                "service: teardown still not called on no-op detach");
 
+    /* === A setup failure is AXL_ERR whatever setup returned ===
+       Setup's own code is not passed through: an AXL_BUSY (say, from
+       axl_serial_open) must not read as anything but "setup failed", and
+       its teardown must never run -- the setup already unwound. The same
+       holds for AXL_SERVICE_SETUP_HELD, which only the AXL_SERVICE_DRIVER
+       framework acts on. */
+    static const int SETUP_FAILS[] = { AXL_BUSY, AXL_NOT_FOUND, 1, AXL_SERVICE_SETUP_HELD };
+    for (size_t i = 0; i < sizeof(SETUP_FAILS) / sizeof(SETUP_FAILS[0]); i++) {
+        AxlLoop   *loop3 = axl_loop_new();
+        ServiceCtx ctx3  = { .setup_rc = SETUP_FAILS[i] };
+        AxlService svc3  = {
+            .name     = "attach-fail-code",
+            .setup    = service_test_setup,
+            .teardown = service_test_teardown,
+            .user     = &ctx3,
+        };
+        int  rc3 = axl_service_attach_driver(loop3, &svc3);
+        char name3[96];
+        axl_snprintf(name3, sizeof(name3),
+                     "service: a setup returning %d makes attach_driver AXL_ERR, "
+                     "no teardown", SETUP_FAILS[i]);
+        test_check(rc3 == AXL_ERR && ctx3.setup_calls == 1 && ctx3.teardown_calls == 0,
+                   name3);
+        axl_loop_free(loop3);
+    }
+
     axl_loop_free(loop);
     axl_loop_free(loop2);
 }
@@ -3586,6 +4314,56 @@ test_service_is_running(void)
                "service: is_running false for unpublished GUID");
     test_check(axl_service_is_running(NULL) == false,
                "service: is_running(NULL) returns false");
+
+    /* The state of a service nothing publishes, and the argument checks. */
+    test_check(axl_service_state(&dummy_svc) == AXL_SERVICE_STOPPED,
+               "service: state of an unpublished service is STOPPED");
+    test_check(axl_service_state(NULL) == AXL_SERVICE_STOPPED,
+               "service: state(NULL) is STOPPED");
+    static const AxlService nameless = { .setup = service_test_setup };
+    test_check(axl_service_state(&nameless) == AXL_SERVICE_STOPPED,
+               "service: state of a nameless service is STOPPED");
+
+    char why[16] = "x";
+    test_check(axl_service_state_reason(&dummy_svc, why, sizeof(why)) == AXL_NOT_FOUND
+               && axl_strcmp(why, "") == 0,
+               "service: no reason for a service that is not stopping or degraded");
+    test_check(axl_service_state_reason(NULL, why, sizeof(why)) == AXL_INVALID
+               && axl_service_state_reason(&dummy_svc, NULL, 4) == AXL_INVALID
+               && axl_service_state_reason(&dummy_svc, why, 0) == AXL_INVALID,
+               "service: state_reason rejects NULL arguments and a zero size");
+
+    /* A service NAMED like another's tag must not read as that tag: publish
+       the service "axl-test-tagclash/stopping" and the service
+       "axl-test-tagclash" must still read STOPPED, not STOPPING. */
+    static const AxlService clash   = { .name = "axl-test-tagclash/stopping",
+                                        .setup = service_test_setup };
+    static const AxlService clashed = { .name = "axl-test-tagclash",
+                                        .setup = service_test_setup };
+    AxlGuid   clash_guid;
+    AxlHandle clash_h   = NULL;
+    static int clash_iface;
+    test_check(axl_service_guid(&clash, &clash_guid) == AXL_OK
+               && axl_protocol_install(&clash_guid, &clash_iface, &clash_h) == AXL_OK,
+               "service: published a service named like another's stopping tag");
+    test_check(axl_service_state(&clashed) == AXL_SERVICE_STOPPED,
+               "service: a service named \"x/stopping\" does not make \"x\" STOPPING");
+    test_check(axl_service_state(&clash) == AXL_SERVICE_RUNNING,
+               "service: the \"x/stopping\" service itself reads RUNNING");
+    if (clash_h != NULL) {
+        axl_protocol_uninstall(clash_h, &clash_guid, &clash_iface);
+    }
+
+    /* The held setup return is a value nothing returns by accident: not 1
+       (`return true;`), and outside every AxlStatus. */
+    test_check(AXL_SERVICE_SETUP_HELD == 0x48454C44,
+               "service: AXL_SERVICE_SETUP_HELD is 'HELD' (0x48454C44)");
+
+    /* This unit binary is an application, not an AXL_SERVICE_DRIVER image:
+       it has no service to report on. */
+    test_check(axl_service_set_degraded(true, "x") == AXL_ERR
+               && axl_service_set_degraded(false, NULL) == AXL_ERR,
+               "service: set_degraded outside a service driver is AXL_ERR");
 }
 
 static void
@@ -3886,6 +4664,180 @@ test_service_reload_validates(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_service_stage validates untrusted bytes (they come off the network):
+// every header read is bounded by the buffer and by the header's own sizes,
+// and a header that lies about them is AXL_INVALID. The deploy pins a path on
+// a volume that does not exist, so an image that PASSES validation reaches
+// the write and fails there with AXL_ERR -- the two outcomes tell "refused as
+// malformed" from "accepted" without writing anything.
+// ---------------------------------------------------------------------------
+
+#if defined(__x86_64__)
+#define STAGE_TEST_MACHINE 0x8664u
+#else
+#define STAGE_TEST_MACHINE 0xAA64u
+#endif
+
+static void
+st_put16(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void
+st_put32(uint8_t *p, uint32_t v)
+{
+    st_put16(p, v);
+    st_put16(p + 2, v >> 16);
+}
+
+/* A minimal PE32+ boot-service driver in @p buf (zeroed, @p cap bytes):
+   DOS header, "PE\0\0" at 0x40, one section. Returns the image length. */
+static size_t
+st_make_pe(uint8_t *buf, size_t cap, uint32_t opt_size, uint32_t ndirs,
+           uint32_t sect_ptr, uint32_t sect_size, size_t len)
+{
+    axl_memset(buf, 0, cap);
+    buf[0] = 'M';
+    buf[1] = 'Z';
+    st_put32(buf + 0x3C, 0x40);
+    uint8_t *pe = buf + 0x40;
+    pe[0] = 'P';
+    pe[1] = 'E';
+    st_put16(pe + 4, STAGE_TEST_MACHINE);
+    st_put16(pe + 6, 1);                 /* NumberOfSections */
+    st_put16(pe + 20, opt_size);         /* SizeOfOptionalHeader */
+    uint8_t *opt = pe + 24;
+    st_put16(opt, 0x20B);                /* PE32+ */
+    st_put16(opt + 68, 11);              /* EFI boot-service driver */
+    st_put32(opt + 108, ndirs);          /* NumberOfRvaAndSizes */
+    size_t sect = 0x40 + 24 + opt_size;
+    if (sect + 40 <= cap) {
+        st_put32(buf + sect + 16, sect_size);
+        st_put32(buf + sect + 20, sect_ptr);
+    }
+    return len;
+}
+
+static void
+test_service_stage_malformed_pe(void)
+{
+    static const AxlService svc = { .name = "stage-malformed",
+                                    .setup = service_test_setup };
+    AxlServiceDeploy d = { .service = &svc, .driver_path = "fs99:\\stage-pe.efi" };
+    static uint8_t buf[0x400];
+    size_t len;
+
+    /* Control: a well-formed driver passes validation and fails at the write. */
+    len = st_make_pe(buf, sizeof(buf), 240, 16, 0x200, 0x200, 0x400);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_ERR,
+               "stage pe: a well-formed driver is accepted (fails only at the write)");
+
+    /* Few directories: no security entry exists, and none may be read. */
+    len = st_make_pe(buf, sizeof(buf), 128, 2, 0x200, 0x200, 0x400);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_ERR,
+               "stage pe: 2 data directories (no security entry) is well-formed");
+
+    /* NumberOfRvaAndSizes claims 16 directories in a 112-byte optional
+       header: the security entry would be read 40 bytes past it. */
+    len = st_make_pe(buf, sizeof(buf), 112, 16, 0x200, 0x200, 0x400);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_INVALID,
+               "stage pe: more directories than the optional header holds is AXL_INVALID");
+
+    /* The same lie at the very end of the buffer. */
+    len = st_make_pe(buf, sizeof(buf), 112, 5, 0x00, 0x0, 0x40 + 24 + 112 + 40);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_INVALID,
+               "stage pe: a security entry past a minimal header is AXL_INVALID");
+
+    /* An optional header cut short by the end of the buffer. */
+    len = st_make_pe(buf, sizeof(buf), 240, 16, 0x200, 0x200, 0x40 + 24 + 120);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_INVALID,
+               "stage pe: a truncated optional header is AXL_INVALID");
+
+    /* SizeOfOptionalHeader that lies far past the buffer. */
+    len = st_make_pe(buf, sizeof(buf), 0xFFFF, 16, 0x200, 0x200, 0x400);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_INVALID,
+               "stage pe: an optional header larger than the image is AXL_INVALID");
+
+    /* A section whose raw data runs past the end. */
+    len = st_make_pe(buf, sizeof(buf), 240, 16, 0x300, 0x200, 0x400);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_INVALID,
+               "stage pe: section data past the end is AXL_INVALID");
+
+    /* A certificate table that points past the end: an overlay the key
+       skips, not a read. Accepted. */
+    len = st_make_pe(buf, sizeof(buf), 240, 16, 0x200, 0x200, 0x400);
+    st_put32(buf + 0x40 + 24 + 112 + 32, 0x10000);
+    st_put32(buf + 0x40 + 24 + 112 + 36, 0x100);
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_ERR,
+               "stage pe: a certificate table past the end is skipped, not read");
+}
+
+// axl_service_upgrade_in_flight: true only while the launcher's trial and
+// promotion run in THIS boot, which it marks with a volatile variable in the
+// service's namespace. A trial/promote record is not that: one left by a dead
+// boot (or `start --no-staged`) may be staged over -- the next start resolves
+// it -- even with the service running. The test sets the record through
+// AxlAttempt and the marker directly, in the namespace axl-service-stage.c
+// names after the service GUID.
+static void
+test_service_stage_in_flight(void)
+{
+    static const AxlService svc = { .name = "stage-in-flight",
+                                    .setup = service_test_setup };
+    AxlServiceDeploy d = { .service = &svc, .driver_path = "fs99:\\stage-if.efi" };
+    static AxlGuid g;   /* AxlNvstore keeps the namespace's GUID by pointer */
+    static uint8_t buf[0x400];
+    static int     iface;
+    AxlServiceStagedResult r;
+    AxlAttempt at;
+    AxlHandle  h   = NULL;
+    uint8_t    one = 1;
+    char       ns[32];
+
+    test_check(axl_service_guid(&svc, &g) == AXL_OK, "in flight: the service has a GUID");
+    axl_snprintf(ns, sizeof(ns), "axlsvc-%08x%04x%04x", (unsigned)g.data1,
+                 (unsigned)g.data2, (unsigned)g.data3);
+    test_check(axl_attempt_init(&at, ns, &g) == AXL_OK, "in flight: the namespace opens");
+    size_t len = st_make_pe(buf, sizeof(buf), 240, 16, 0x200, 0x200, 0x400);
+
+    test_check(!axl_service_upgrade_in_flight(&svc), "in flight: nothing set -> false");
+    test_check(!axl_service_upgrade_in_flight(NULL), "in flight: NULL -> false");
+
+    /* A dead boot's record, with the service running (P started over it). */
+    test_check(axl_attempt_begin(&at, "trial:1:00000000:1024"), "in flight: a trial recorded");
+    test_check(axl_protocol_install(&g, &iface, &h) == AXL_OK,
+               "in flight: the service is published");
+    test_check(!axl_service_upgrade_in_flight(&svc),
+               "in flight: a record without the launcher's marker -> false");
+    test_check(axl_service_unstage(&d) == AXL_OK,
+               "in flight: unstage over a left-over record is AXL_OK");
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_ERR,
+               "in flight: stage over a left-over record reaches the write");
+    test_check(axl_service_last_upgrade(&svc, &r) == AXL_NOT_FOUND,
+               "in flight: last_upgrade over a left-over record is the stored one");
+
+    /* The launcher's marker: a trial running now. */
+    test_check(axl_nvstore_set(ns, "InFlight", &one, sizeof(one), AXL_NV_BOOT) == AXL_OK,
+               "in flight: the marker is set");
+    test_check(axl_service_upgrade_in_flight(&svc), "in flight: the marker -> true");
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_BUSY,
+               "in flight: stage is AXL_BUSY");
+    test_check(axl_service_unstage(&d) == AXL_BUSY, "in flight: unstage is AXL_BUSY");
+    test_check(axl_service_last_upgrade(&svc, &r) == AXL_BUSY,
+               "in flight: last_upgrade is AXL_BUSY (no verdict yet)");
+
+    test_check(axl_nvstore_delete(ns, "InFlight") == AXL_OK, "in flight: the marker is cleared");
+    axl_attempt_end(&at);
+    test_check(!axl_service_upgrade_in_flight(&svc), "in flight: cleared -> false");
+    test_check(axl_service_stage(&d, NULL, buf, len) == AXL_ERR,
+               "in flight: stage after the trial reaches the write again");
+    test_check(axl_protocol_uninstall(h, &g, &iface) == AXL_OK,
+               "in flight: the service is unpublished");
+}
+
+// ---------------------------------------------------------------------------
 // Protocol registry — register / find / enumerate / unregister round-trip
 // plus axl_protocol_register_name (custom name → consumer GUID binding).
 // ---------------------------------------------------------------------------
@@ -4106,6 +5058,73 @@ test_driver_load_buffer(void)
 // ---------------------------------------------------------------------------
 // axl_shared_driver_* — thin wrappers, identity-and-publish smoke test
 // ---------------------------------------------------------------------------
+
+static int  bridge_cap_warnings;
+static char bridge_cap_msg[192];
+
+static void
+bridge_cap_capture(int level, const char *domain, const char *message,
+                   const AxlRealtime *stamp, void *data)
+{
+    (void)stamp;
+    (void)data;
+    if (level == AXL_LOG_WARNING && domain != NULL
+        && axl_strcmp(domain, "shared-drv") == 0) {
+        bridge_cap_warnings++;
+        axl_snprintf(bridge_cap_msg, sizeof(bridge_cap_msg), "%s", message);
+    }
+}
+
+/* One image lends launchers' stdio for at most 8 published interfaces. The
+   9th still publishes -- a launcher can dispatch through it -- but its
+   launchers' stdio never reaches it, and that is said once, not silently
+   dropped. Unpublishing one frees its place. */
+static void
+test_shared_driver_bridge_cap(void)
+{
+    static int  ifaces[10];
+    static const char *const names[10] = {
+        "bridge-cap-0", "bridge-cap-1", "bridge-cap-2", "bridge-cap-3",
+        "bridge-cap-4", "bridge-cap-5", "bridge-cap-6", "bridge-cap-7",
+        "bridge-cap-8", "bridge-cap-9",
+    };
+    AxlHandle   h[10];
+    bool        published = true;
+
+    bridge_cap_warnings = 0;
+    bridge_cap_msg[0]   = '\0';
+    test_check(axl_log_add_handler(bridge_cap_capture, NULL) == AXL_OK,
+               "shared_driver bridge cap: capture handler installed");
+    for (int i = 0; i < 9; i++) {
+        h[i] = NULL;
+        published = published
+                    && axl_shared_driver_publish(names[i], &ifaces[i], &h[i]) == AXL_OK;
+    }
+    test_check(published, "shared_driver bridge cap: nine interfaces publish");
+    test_check(bridge_cap_warnings == 1
+               && axl_strcmp(bridge_cap_msg,
+                             "axl_shared_driver_publish: 'bridge-cap-8' is published, "
+                             "but launchers' stdio does not reach it: one image "
+                             "bridges at most 8 interfaces") == 0,
+               "shared_driver bridge cap: the 9th says so, exactly, once");
+
+    /* A freed place takes the next one, with no warning. */
+    test_check(axl_shared_driver_unpublish(names[0], &ifaces[0], h[0]) == AXL_OK,
+               "shared_driver bridge cap: unpublish the 1st");
+    bridge_cap_warnings = 0;
+    h[9] = NULL;
+    test_check(axl_shared_driver_publish(names[9], &ifaces[9], &h[9]) == AXL_OK
+               && bridge_cap_warnings == 0,
+               "shared_driver bridge cap: an unpublished place is reused, no warning");
+    axl_log_remove_handler(bridge_cap_capture);
+
+    bool unpublished = true;
+    for (int i = 1; i < 10; i++) {
+        unpublished = unpublished
+                      && axl_shared_driver_unpublish(names[i], &ifaces[i], h[i]) == AXL_OK;
+    }
+    test_check(unpublished, "shared_driver bridge cap: all unpublished");
+}
 
 static void
 test_shared_driver(void)
@@ -4346,6 +5365,82 @@ test_driver_locate(void)
         test_check(rc == -1, "driver_locate: skipped positive test");
     }
 
+    /* A driver named as the running image (test-axl.sh stages the unit
+       binaries at a volume's root, so this one is <vol>:\AxlTestUtil.efi): the search
+       never offers the image itself, so with no other copy there is none. */
+    char self[64];
+    test_check(axl_driver_locate("AxlTestUtil.efi", self, sizeof(self)) == -1,
+               "driver_locate: a name equal to the running image's does not find the image");
+
+    /* An image at a volume ROOT: its sibling, candidate 1, is spelled with
+       ONE separator and WINS over a drivers/<arch>/ copy, as the search order
+       promises; and a driver named as the image is found in drivers/<arch>/,
+       past the image itself. */
+#if defined(__x86_64__)
+#define LOC_ARCH "x64"
+#else
+#define LOC_ARCH "aa64"
+#endif
+    /* On the image's OWN volume (axl_app_boot_path): fs0 booted, wherever a
+       pooled run put it. Compared EXACTLY: driver_locate and
+       axl_app_boot_path name the image's volume the same way (the shell's
+       alias, verbatim), so they must agree byte for byte. */
+    char loc_sib[96], loc_drv[96], loc_dir[96], loc_dir_arch[96], loc_self[96];
+    bool named = axl_app_boot_path("axl-loc-sib.tmp", loc_sib, sizeof(loc_sib)) == AXL_OK
+                 && axl_app_boot_path("drivers\\" LOC_ARCH "\\axl-loc-sib.tmp",
+                                      loc_drv, sizeof(loc_drv)) == AXL_OK
+                 && axl_app_boot_path("drivers", loc_dir, sizeof(loc_dir)) == AXL_OK
+                 && axl_app_boot_path("drivers\\" LOC_ARCH, loc_dir_arch,
+                                      sizeof(loc_dir_arch)) == AXL_OK
+                 && axl_app_boot_path("drivers\\" LOC_ARCH "\\AxlTestUtil.efi",
+                                      loc_self, sizeof(loc_self)) == AXL_OK;
+    AxlFsEntry de;
+    bool had_drivers = named && axl_file_info(loc_dir, &de) == AXL_OK;
+    bool had_arch    = named && axl_file_info(loc_dir_arch, &de) == AXL_OK;
+    bool staged = named
+                  && axl_file_set_contents(loc_sib, "s", 1) == AXL_OK
+                  && (had_drivers || axl_dir_mkdir(loc_dir) == AXL_OK)
+                  && (had_arch || axl_dir_mkdir(loc_dir_arch) == AXL_OK)
+                  && axl_file_set_contents(loc_drv, "d", 1) == AXL_OK;
+    self[0] = '\0';
+    bool sib_ok = staged
+                  && axl_driver_locate("axl-loc-sib.tmp", self, sizeof(self)) == AXL_OK
+                  && axl_strcmp(self, loc_sib) == 0;
+    /* On a failure the name carries what was found: only PASS/FAIL/SKIP
+       lines reach the harness's report, so a separate diagnostic is lost. */
+    char why[256] = "";
+    if (!sib_ok) {
+        axl_snprintf(why, sizeof(why), " -- staged=%d got [%s] want [%s]",
+                     (int)staged, self, named ? loc_sib : "?");
+    }
+    char nm[384];
+    axl_snprintf(nm, sizeof(nm), "%s%s",
+                 "driver_locate: at a volume root the image's sibling wins over drivers/<arch>/", why);
+    test_check(sib_ok, nm);
+    self[0] = '\0';
+    bool self_ok = staged && axl_file_set_contents(loc_self, "d", 1) == AXL_OK
+                   && axl_driver_locate("AxlTestUtil.efi", self, sizeof(self)) == AXL_OK
+                   && axl_strcmp(self, loc_self) == 0;
+    why[0] = '\0';
+    if (!self_ok) {
+        axl_snprintf(why, sizeof(why), " -- got [%s] want [%s]", self, named ? loc_self : "?");
+    }
+    axl_snprintf(nm, sizeof(nm), "%s%s",
+                 "driver_locate: a driver named as the image is found past the image itself", why);
+    test_check(self_ok, nm);
+    if (named) {
+        axl_file_delete(loc_self);
+        axl_file_delete(loc_drv);
+        axl_file_delete(loc_sib);
+        if (!had_arch) {
+            axl_dir_rmdir(loc_dir_arch);
+        }
+        if (!had_drivers) {
+            axl_dir_rmdir(loc_dir);
+        }
+    }
+#undef LOC_ARCH
+
     /* Buffer-too-small: when the discovered path doesn't fit, locate
      * must return -1 rather than truncate. Use a 1-byte buffer to
      * force the failure path even on the shortest possible match. */
@@ -4496,6 +5591,41 @@ static const AxlGuid TEST_VENDOR_B = AXL_GUID(
     0xB0000002, 0x0002, 0x0002,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02);
 
+/* The vendor GUIDs the built-in "global" and "app" namespaces resolve to,
+   restated here so a test can read the SAME variable through axl_var_read
+   and tell "absent" from every other failure -- which axl_nvstore_get's
+   single AXL_ERR cannot. */
+static const AxlGuid NV_TEST_GLOBAL_GUID = AXL_GUID(
+    0x8BE4DF61, 0x93CA, 0x11D2,
+    0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C);
+static const AxlGuid NV_TEST_APP_GUID = AXL_GUID(
+    0xA1B2C3D4, 0xE5F6, 0x4789,
+    0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78);
+
+/* PlatformLangCodes is a variable UEFI 2.11 section 3.3 requires every
+   firmware to publish under the global GUID, so it is the one a test can
+   count on being present. True when @a ns_buf / @a ns_size (read through
+   AxlNvstore) are exactly what a raw read of it under the global GUID
+   returns. */
+static bool
+nv_matches_platform_lang_codes(
+    const void *ns_buf,
+    size_t      ns_size
+    )
+{
+    void   *raw      = NULL;
+    size_t  raw_size = 0;
+    bool    same     = false;
+
+    if (axl_var_read("PlatformLangCodes", &NV_TEST_GLOBAL_GUID, NULL,
+                     &raw, &raw_size) == AXL_OK) {
+        same = ns_buf != NULL && raw_size > 0 && ns_size == raw_size
+               && axl_memcmp(ns_buf, raw, raw_size) == 0;
+    }
+    axl_free(raw);
+    return same;
+}
+
 static void
 test_nvstore_namespaces(void)
 {
@@ -4552,12 +5682,18 @@ test_nvstore_namespaces(void)
     test_check(axl_nvstore_delete("never-registered", "x") == AXL_ERR,
                "nvstore: delete on unregistered ns returns -1");
 
-    /* Built-in "global" and "app" stay reachable. */
-    uint8_t  sb;
-    size_t   sb_sz = sizeof(sb);
-    int g_rc = axl_nvstore_get("global", "SecureBoot", &sb, &sb_sz);
-    test_check(g_rc == AXL_OK || g_rc == AXL_ERR,
-               "nvstore: get(global, SecureBoot) returns 0 or -1");
+    /* Built-in "global" reaches the EFI global-variable GUID. This used to
+       accept AXL_OK or AXL_ERR for SecureBoot, which held whether "global"
+       resolved to the right GUID, to the wrong one, or to nothing at all.
+       A variable every firmware must publish, compared byte for byte with
+       a raw read of it, fails unless "global" really is that GUID. */
+    void   *g_buf = NULL;
+    size_t  g_sz  = 0;
+    int     g_rc  = axl_nvstore_get_alloc("global", "PlatformLangCodes",
+                                          &g_buf, &g_sz);
+    test_check(g_rc == AXL_OK && nv_matches_platform_lang_codes(g_buf, g_sz),
+               "nvstore: \"global\" reads the EFI global-variable GUID");
+    axl_free(g_buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -4962,8 +6098,18 @@ test_nvstore_roundtrip(void)
     /* NULL-arg guards. */
     void   *xbuf = (void *)0x1234ul;
     size_t  xsz  = 7;
-    test_check(axl_nvstore_get_alloc(NULL, key, &xbuf, &xsz) == AXL_ERR,
-               "nvstore get_alloc: NULL ns rejected");
+    /* A NULL namespace is NOT rejected: it means "global". This assertion
+       used to read get_alloc(NULL, "AxlTestKey") == AXL_ERR as "NULL ns
+       rejected", and passed only because that key is absent under the
+       global GUID. Pin what NULL actually does, with a variable that is
+       present there. */
+    void   *nbuf = NULL;
+    size_t  nsz  = 0;
+    test_check(axl_nvstore_get_alloc(NULL, "PlatformLangCodes", &nbuf, &nsz)
+                   == AXL_OK
+               && nv_matches_platform_lang_codes(nbuf, nsz),
+               "nvstore get_alloc: NULL ns reads the global namespace");
+    axl_free(nbuf);
     test_check(axl_nvstore_get_alloc("app", NULL, &xbuf, &xsz) == AXL_ERR,
                "nvstore get_alloc: NULL key rejected");
     test_check(axl_nvstore_get_alloc("app", key, NULL, &xsz) == AXL_ERR,
@@ -4975,8 +6121,18 @@ test_nvstore_roundtrip(void)
        to 0, return -1. */
     void   *mbuf = (void *)0xC0DEul;
     size_t  msz  = 42;
-    test_check(axl_nvstore_get_alloc("app", "AxlNoSuchKey", &mbuf, &msz) == AXL_ERR,
+    /* AXL_ERR is also what an unreachable namespace or a firmware fault
+       returns, so the AXL_ERR alone does not say the key was missing. A
+       raw read of the same name under the same GUID does, and the
+       existing-key read above shows the "app" path itself works. */
+    void   *mraw  = NULL;
+    size_t  mrsz  = 0;
+    test_check(axl_var_read("AxlNoSuchKey", &NV_TEST_APP_GUID, NULL,
+                            &mraw, &mrsz) == AXL_NOT_FOUND
+               && axl_nvstore_get_alloc("app", "AxlNoSuchKey", &mbuf, &msz)
+                      == AXL_ERR,
                "nvstore get_alloc: missing key returns -1");
+    axl_free(mraw);
     test_check(mbuf == NULL && msz == 0,
                "nvstore get_alloc: out params cleared on failure");
 
@@ -5063,17 +6219,32 @@ test_nvstore_roundtrip(void)
                "nvstore set_str: NULL str rejected (use delete)");
 
     char *xstr = (char *)0x1234ul;
-    test_check(axl_nvstore_get_str(NULL, "k", &xstr) == AXL_ERR,
-               "nvstore get_str: NULL ns rejected");
+    /* NULL ns is "global", as for get_alloc above: this used to assert
+       get_str(NULL, "k") == AXL_ERR as a rejection, and passed only
+       because "k" is absent there. */
+    char *nstr = NULL;
+    test_check(axl_nvstore_get_str(NULL, "PlatformLangCodes", &nstr) == AXL_OK
+               && nstr != NULL
+               && nv_matches_platform_lang_codes(nstr, axl_strlen(nstr) + 1),
+               "nvstore get_str: NULL ns reads the global namespace");
+    axl_free(nstr);
     test_check(axl_nvstore_get_str("app", NULL, &xstr) == AXL_ERR,
                "nvstore get_str: NULL key rejected");
     test_check(axl_nvstore_get_str("app", "k", NULL) == AXL_ERR,
                "nvstore get_str: NULL out_str rejected");
 
     /* Missing key: out_str cleared to NULL, return -1. */
-    char *mstr = (char *)0xC0DEul;
-    test_check(axl_nvstore_get_str("app", "AxlNoSuchStrKey", &mstr) == AXL_ERR,
+    char   *mstr  = (char *)0xC0DEul;
+    void   *msraw = NULL;
+    size_t  msrsz = 0;
+    /* The raw read is what makes AXL_ERR mean "missing" here; see the
+       get_alloc case above. */
+    test_check(axl_var_read("AxlNoSuchStrKey", &NV_TEST_APP_GUID, NULL,
+                            &msraw, &msrsz) == AXL_NOT_FOUND
+               && axl_nvstore_get_str("app", "AxlNoSuchStrKey", &mstr)
+                      == AXL_ERR,
                "nvstore get_str: missing key returns -1");
+    axl_free(msraw);
     test_check(mstr == NULL,
                "nvstore get_str: out_str cleared on failure");
 
@@ -5081,8 +6252,16 @@ test_nvstore_roundtrip(void)
     test_check(axl_nvstore_delete("app", key) == AXL_OK,
                "nvstore: delete succeeds");
     sz = sizeof(buf);
-    test_check(axl_nvstore_get("app", key, buf, &sz) == AXL_ERR,
+    /* AXL_ERR alone would also follow a delete that did nothing and a get
+       that failed for another reason; the raw read says the variable is
+       really gone. */
+    void   *draw = NULL;
+    size_t  drsz = 0;
+    test_check(axl_nvstore_get("app", key, buf, &sz) == AXL_ERR
+               && axl_var_read(key, &NV_TEST_APP_GUID, NULL, &draw, &drsz)
+                      == AXL_NOT_FOUND,
                "nvstore: get after delete returns -1");
+    axl_free(draw);
 }
 
 // ---------------------------------------------------------------------------
@@ -5380,6 +6559,77 @@ test_app_boot_path(void)
     char tiny[4];
     test_check(axl_app_boot_path("crash-report.txt", tiny, sizeof(tiny)) == AXL_ERR,
                "boot_path: tiny out buffer -> AXL_ERR");
+}
+
+// ---------------------------------------------------------------------------
+// axl_app_image_dir_path
+// ---------------------------------------------------------------------------
+
+/* The unit binary is staged at the volume root, where the image's directory
+   IS the root -- so here "beside the image" must agree exactly with
+   axl_app_boot_path and with the image's own path. The nested case (an image
+   in a directory) is pinned by test-image-path-qemu.sh, which stages its
+   launcher in \app\. */
+static void
+test_app_image_dir_path(void)
+{
+    char        buf[128];
+    char        want[128];
+    const char *self = axl_app_image_path();
+    const char *sep  = NULL;   /* the image path's last separator */
+
+    for (const char *p = self; p != NULL && *p != '\0'; p++) {
+        if (*p == '\\') {
+            sep = p;
+        }
+    }
+
+    test_check(sep != NULL && sep > self && sep[-1] == ':',
+               "dir_path: precondition: the unit binary is at its volume's root");
+    if (sep == NULL || sep == self || sep[-1] != ':') {
+        test_skip_n(9, "dir_path: the unit binary is not at its volume's root");
+        return;
+    }
+
+    test_check(axl_app_image_dir_path(sep + 1, buf, sizeof(buf)) == AXL_OK
+                   && axl_strcmp(buf, self) == 0,
+               "dir_path: the image's own name, beside it, is its own path");
+    test_check(axl_app_image_dir_path("app.conf", buf, sizeof(buf)) == AXL_OK
+                   && axl_app_boot_path("app.conf", want, sizeof(want)) == AXL_OK
+                   && axl_strcmp(buf, want) == 0,
+               "dir_path: an image at the root: beside it is the root");
+    test_check(axl_app_image_dir_path("", buf, sizeof(buf)) == AXL_OK
+                   && axl_strlen(buf) == (size_t)(sep - self) + 1
+                   && axl_strncmp(buf, self, (size_t)(sep - self) + 1) == 0,
+               "dir_path: \"\" is the image's directory, the root \"<vol>:\\\"");
+    test_check(axl_app_image_dir_path("\\keys\\ak", buf, sizeof(buf)) == AXL_OK
+                   && axl_app_boot_path("keys\\ak", want, sizeof(want)) == AXL_OK
+                   && axl_strcmp(buf, want) == 0,
+               "dir_path: a leading backslash is the volume's root");
+    test_check(axl_app_image_dir_path("fs7:\\x.conf", buf, sizeof(buf)) == AXL_OK
+                   && axl_strcmp(buf, "fs7:\\x.conf") == 0,
+               "dir_path: a path naming a volume is copied as it is");
+
+    /* Safe negatives: out is "" after every refusal that has room for it. */
+    buf[0] = 'x';
+    test_check(axl_app_image_dir_path(NULL, buf, sizeof(buf)) == AXL_ERR && buf[0] == '\0',
+               "dir_path: NULL relative_path -> AXL_ERR, out \"\"");
+    test_check(axl_app_image_dir_path("x", NULL, sizeof(buf)) == AXL_ERR
+                   && axl_app_image_dir_path("x", buf, 0) == AXL_ERR,
+               "dir_path: NULL out or a zero size -> AXL_ERR");
+
+    /* The image's own path, exactly: its length + 1 fits, its length does not. */
+    size_t len = axl_strlen(self);
+    test_check(len + 1 <= sizeof(buf)
+                   && axl_app_image_dir_path(sep + 1, buf, len + 1) == AXL_OK
+                   && axl_app_image_dir_path(sep + 1, buf, len) == AXL_ERR
+                   && buf[0] == '\0',
+               "dir_path: an exact fit is written, one byte short is refused with out \"\"");
+    /* "fs7:\\x.conf" is 11 bytes: the volume form truncates the same way. */
+    test_check(axl_app_image_dir_path("fs7:\\x.conf", buf, 12) == AXL_OK
+                   && axl_app_image_dir_path("fs7:\\x.conf", buf, 11) == AXL_ERR
+                   && buf[0] == '\0',
+               "dir_path: a volume path one byte short is refused with out \"\"");
 }
 
 // ---------------------------------------------------------------------------
@@ -5718,7 +6968,10 @@ test_image(void)
        start it (would re-enter the test runtime). */
     int rc = axl_image_load("fs0:\\AxlTestRuntime.efi", &img);
     if (rc != AXL_OK) {
-        axl_printf("SKIP: image load (AxlTestRuntime.efi not found)\n");
+        /* A TOPOLOGY gate (the volume may not hold the binary), so the
+           count is declared: the 7 assertions below. A bare SKIP here made
+           AxlTestUtil run alone count 7 fewer than in the one-boot run. */
+        test_skip_n(7, "image load (AxlTestRuntime.efi not found)");
         return;
     }
     test_check(rc == AXL_OK, "image: load AxlTestRuntime.efi");
@@ -5911,6 +7164,44 @@ test_shell_execute(void)
                "shell_execute: NULL cmd -> AXL_ERR");
 }
 
+// axl_shell_execute_status -- the refusals, all decided before the Shell is
+// asked (safe in the combined unit boot, which is a NESTED Shell). Every
+// positive outcome is pinned against a -nonest and a nested guest by
+// test/integration/test-shell-status-qemu.sh.
+static void
+test_shell_execute_status_refusals(void)
+{
+    static const struct {
+        const char *cmd;
+        int         rc;     /* AXL_DENIED: the line itself is refused */
+        const char *why;
+    } refused[] = {
+        { "",            AXL_ERR,    "shell_execute_status: refuses empty (AXL_ERR), result untouched" },
+        { "  \t ",       AXL_ERR,    "shell_execute_status: refuses whitespace only (AXL_ERR), result untouched" },
+        { "exit",        AXL_DENIED, "shell_execute_status: refuses exit (AXL_DENIED), result untouched" },
+        { "exit 5",      AXL_DENIED, "shell_execute_status: refuses exit 5 (AXL_DENIED), result untouched" },
+        { "  EXIT /b 3", AXL_DENIED, "shell_execute_status: refuses EXIT, any case, leading space (AXL_DENIED), result untouched" },
+        { "exit\t1",     AXL_DENIED, "shell_execute_status: refuses exit, tab-separated (AXL_DENIED), result untouched" },
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        AxlShellResult r;
+        axl_memset(&r, 0x5A, sizeof(r));
+        int rc = axl_shell_execute_status(refused[i].cmd, &r);
+        const unsigned char *b = (const unsigned char *)&r;
+        bool untouched = true;
+        for (size_t j = 0; j < sizeof(r); j++) {
+            untouched = untouched && b[j] == 0x5A;
+        }
+        test_check(rc == refused[i].rc && untouched, refused[i].why);
+    }
+
+    AxlShellResult r;
+    test_check(axl_shell_execute_status(NULL, &r) == AXL_ERR,
+               "shell_execute_status: NULL cmd -> AXL_ERR");
+    test_check(axl_shell_execute_status("echo x", NULL) == AXL_ERR,
+               "shell_execute_status: NULL out -> AXL_ERR");
+}
+
 // ---------------------------------------------------------------------------
 // AxlConsoleMirror (P1) — argument guards only.
 //
@@ -5950,6 +7241,9 @@ extern void _axl_console_tap_test_conout_begin(AxlConsoleTap *t, bool passthroug
 extern void _axl_console_tap_test_teardown(void);
 extern bool _axl_console_tap_test_pop_key(AxlConsoleTap *t, uint16_t *scan,
                                           uint16_t *unicode);
+extern bool _axl_console_tap_test_pop_key_ex(AxlConsoleTap *t, uint16_t *scan,
+                                             uint16_t *unicode, uint32_t *shift,
+                                             uint8_t *toggle);
 /* The wrapped ConInEx, with its function pointers wired but nothing installed
    on gST/ConsoleInHandle — lets a test drive Register/UnregisterKeyNotify. */
 extern EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *
@@ -6008,6 +7302,18 @@ extern void _axl_console_device_test_uninstall_proxy(AxlConsoleDevice *d);
 extern int  _axl_console_device_test_proxy_forward(AxlConsoleDevice *d, void *state_out);
 extern bool _axl_console_device_test_add_evicted_conin(AxlConsoleDevice *d, void *handle);
 extern void _axl_console_device_test_read_tick(AxlConsoleDevice *d);
+extern void _axl_console_device_test_set_discard_hook(AxlConsoleDevice *d,
+        void (*hook)(void));
+extern void _axl_console_device_test_set_key_filter(AxlConsoleDevice *d,
+        bool (*filter)(void *, const void *), void *user);
+/* Output-side seams: wire the REAL SimpleTextOut vtable + emit engine of a bare
+   instance to caller ops (no protocol install), so a test can call into the device
+   the way ConSplitter does, and read which instance is the live one. */
+extern void _axl_console_device_test_begin_output(AxlConsoleDevice *d,
+        const AxlConsoleOps *ops, void *user);
+extern EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *_axl_console_device_test_conout(AxlConsoleDevice *d);
+extern EFI_SIMPLE_POINTER_PROTOCOL *_axl_console_device_test_proxy(AxlConsoleDevice *d);
+extern AxlConsoleDevice *_axl_console_device_test_current(void);
 
 /* axl-console-term seams (no public header): read the cell model + cursor. */
 extern bool _axl_console_term_test_cell(AxlConsoleTerm *t, uint32_t row, uint32_t col,
@@ -6272,28 +7578,39 @@ test_console_vt_enc(void)
     ops->output_text(ops_user, "hi", 2);
     test_check(axl_strcmp(cm_cap, "hi") == 0, "vt_enc: output_text passes bytes through");
 
-    /* Indexed pen -> the UEFI-mapped SGR. Index 14 maps to 33, NOT bright-yellow 93:
-       93 renders lime on many terminals and the EDK2 original chose 33. Pinning it
-       here so the refactor cannot quietly "fix" it. */
+    /* Indexed pen -> the UEFI-mapped SGR. UEFI 14 is EFI_YELLOW = EFI_BROWN |
+       EFI_BRIGHT, so it is BRIGHT yellow, 93 -- the 16-colour form the other
+       bright colours already used. It once went out as 33, which every terminal
+       draws as dark yellow/brown: each Shell prompt read as brown over sshd,
+       while the GOP draws it bright. (EDK2 TerminalDxe sends 1;33, which is
+       bright only where the terminal draws bold as bright -- not by default in
+       VTE, for one.) */
     cm_cap_reset();
     AxlConsolePen pen = { 0 };
     pen.fg.kind = AXL_CONSOLE_COLOR_INDEXED; pen.fg.idx = 14;
     pen.bg.kind = AXL_CONSOLE_COLOR_INDEXED; pen.bg.idx = 1;
     ops->set_pen(ops_user, &pen);
-    test_check(axl_strcmp(cm_cap, "\x1b[0;33;44m") == 0,
-               "vt_enc: indexed pen -> SGR (UEFI 14 -> 33, not 93)");
+    test_check(axl_strcmp(cm_cap, "\x1b[0;93;44m") == 0,
+               "vt_enc: indexed pen -> SGR (UEFI 14, EFI_YELLOW -> bright 93)");
 
     /* Alt-screen and cursor visibility ride set_term_prop, and must be ACCEPTED
        (return 1) or axl-vterm's grid desyncs from the parser. */
     AxlConsoleValue on  = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = true };
     AxlConsoleValue off = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = false };
     cm_cap_reset();
+    /* Each switch carries the screen on show across it (a UEFI console has one
+       screen): the switch, then a repaint of what the console shows -- "hi" at
+       (4,9) and the cursor after it -- and the console's pen last. */
     test_check(ops->set_term_prop(ops_user, AXL_CONSOLE_PROP_ALT_SCREEN, &on) == 1,
                "vt_enc: alt-screen prop accepted");
-    test_check(axl_strcmp(cm_cap, "\x1b[?1049h") == 0, "vt_enc: alt-screen enter -> 1049h");
+#define VT_ENC_REPAINT_HI "\x1b[m\x1b[2J\x1b[m\x1b[5;10Hhi\x1b[?25h\x1b[5;12H\x1b[0;93;44m"
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049h" VT_ENC_REPAINT_HI) == 0,
+               "vt_enc: alt-screen enter -> 1049h + the screen on show");
     cm_cap_reset();
     (void)ops->set_term_prop(ops_user, AXL_CONSOLE_PROP_ALT_SCREEN, &off);
-    test_check(axl_strcmp(cm_cap, "\x1b[?1049l") == 0, "vt_enc: alt-screen leave -> 1049l");
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049l" VT_ENC_REPAINT_HI) == 0,
+               "vt_enc: alt-screen leave -> 1049l + the screen on show");
+#undef VT_ENC_REPAINT_HI
     cm_cap_reset();
     (void)ops->set_term_prop(ops_user, AXL_CONSOLE_PROP_CURSOR_VISIBLE, &off);
     test_check(axl_strcmp(cm_cap, "\x1b[?25l") == 0, "vt_enc: cursor hide -> DECTCEM l");
@@ -6312,6 +7629,307 @@ test_console_vt_enc(void)
     test_check(cm_cap_len > 0 && axl_strstr(cm_cap, "LATE") != NULL,
                "vt_enc: snapshot repaints the on-screen text");
 
+    axl_console_vt_enc_free(e);
+}
+
+/* The encoder's tracked cursor must be where the TERMINAL's cursor is after every
+   op, or the dedup drops a move the terminal needs. Before this, text output did
+   not move the tracked cursor, so "CUP r;c, print, CUP r;c" lost the second CUP:
+   the Shell's editor painted its status line as 99 spaces + "File to Save" one row
+   down, and the line editor's Escape left the cursor at the end of the erased text.
+   The margin rule is a UEFI console's (EDK2 GraphicsConsole, and TerminalDxe's
+   TtyTerm): the cell in the last column wraps AT ONCE, so the encoder writes CR LF
+   there instead of leaving a VT terminal in its deferred-wrap state -- which is
+   also what keeps a terminal WIDER than the console wrapping at the console's
+   edge. A 10x3 console keeps the margins in reach. */
+static void
+vt_enc_expect(const AxlConsoleOps *ops, void *u, int32_t row, int32_t col,
+              const char *text, const char *want, const char *what)
+{
+    cm_cap_reset();
+    if (text != NULL) {
+        ops->output_text(u, text, axl_strlen(text));
+    } else {
+        ops->set_cursor(u, row, col);
+    }
+    test_check(axl_strcmp(cm_cap, want) == 0, what);
+}
+
+/* One colour mapping for the live stream and the repaint: a cell painted in
+   EFI_YELLOW on EFI_BLUE must reach a late joiner in the same SGR the live
+   stream used. The repaint re-encodes the model's pen (an ANSI index) and
+   wrote the 256-colour form, 38;5;3 for the live 33 -- two spellings, and for
+   yellow two different colours once the live one was fixed. Every UEFI colour
+   is checked both ways. */
+static void
+test_console_vt_enc_colour_live_equals_repaint(void)
+{
+    static const char *const fg_sgr[16] = {
+        "30", "34", "32", "36", "31", "35", "33", "37",
+        "90", "94", "92", "96", "91", "95", "93", "97" };
+    static const char *const bg_sgr[8] = { "40", "44", "42", "46", "41", "45", "43", "47" };
+    for (uint32_t fg = 0; fg < 16; fg++) {
+        uint32_t bg = (fg + 1) % 8;
+        AxlConsoleVtEncConfig cfg = { .sink = cm_cap_sink, .cols = 10, .rows = 2 };
+        AxlConsoleVtEnc      *e   = axl_console_vt_enc_new(&cfg);
+        void                 *u   = NULL;
+        const AxlConsoleOps  *ops = axl_console_vt_enc_ops(e, &u);
+        if (e == NULL || ops == NULL) {
+            test_check(false, "vt_enc colour: new");
+            axl_console_vt_enc_free(e);
+            return;
+        }
+        ops->clear_screen(u);
+        AxlConsolePen pen = { .fg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = (uint8_t)fg },
+                              .bg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = (uint8_t)bg } };
+        cm_cap_reset();
+        ops->set_pen(u, &pen);
+        char want[24];
+        axl_snprintf(want, sizeof(want), "\x1b[0;%s;%sm", fg_sgr[fg], bg_sgr[bg]);
+        char what[80];
+        axl_snprintf(what, sizeof(what), "vt_enc colour: live SGR for UEFI fg %u bg %u", fg, bg);
+        test_check(axl_strcmp(cm_cap, want) == 0, what);
+
+        ops->output_text(u, "C", 1);
+        cm_cap_reset();
+        test_check(axl_console_vt_enc_snapshot(e, cm_cap_sink, NULL) == AXL_OK,
+                   "vt_enc colour: snapshot");
+        char repaint[96];
+        axl_snprintf(repaint, sizeof(repaint), "\x1b[2J\x1b[m\x1b[1;1H%sC\x1b[?25h\x1b[1;2H%s",
+                     want, want);
+        axl_snprintf(what, sizeof(what), "vt_enc colour: repaint uses the live SGR, fg %u bg %u",
+                     fg, bg);
+        test_check(axl_strcmp(cm_cap, repaint) == 0, what);
+        axl_console_vt_enc_free(e);
+    }
+}
+
+static void
+test_console_vt_enc_cursor_tracking(void)
+{
+    AxlConsoleVtEncConfig cfg = { .sink = cm_cap_sink, .cols = 10, .rows = 3 };
+    AxlConsoleVtEnc      *e   = axl_console_vt_enc_new(&cfg);
+    void                 *u   = NULL;
+    const AxlConsoleOps  *ops = axl_console_vt_enc_ops(e, &u);
+    test_check(e != NULL && ops != NULL, "vt_enc track: new");
+    if (e == NULL || ops == NULL) {
+        return;
+    }
+    ops->clear_screen(u);
+
+    /* The edit status-line bug: position, print, position to the SAME cell. */
+    vt_enc_expect(ops, u, 2, 0, NULL, "\x1b[3;1H", "vt_enc track: first CUP emitted");
+    vt_enc_expect(ops, u, 0, 0, "abc", "abc", "vt_enc track: text passes through");
+    vt_enc_expect(ops, u, 2, 0, NULL, "\x1b[3;1H",
+                  "vt_enc track: CUP back to where the text began is emitted");
+
+    /* Printing advances the tracked cursor, so a move to where the text ended
+       is already true and costs nothing. */
+    vt_enc_expect(ops, u, 0, 0, "xy", "xy", "vt_enc track: print xy");
+    vt_enc_expect(ops, u, 2, 2, NULL, "", "vt_enc track: CUP to the text's end is free");
+    vt_enc_expect(ops, u, 2, 3, NULL, "\x1b[3;4H", "vt_enc track: a real move is emitted");
+
+    /* The right margin wraps at once: CR LF after the last column. */
+    vt_enc_expect(ops, u, 0, 5, NULL, "\x1b[1;6H", "vt_enc track: to (0,5)");
+    vt_enc_expect(ops, u, 0, 0, "abcde", "abcde\r\n",
+                  "vt_enc track: text that fills the last column wraps with CR LF");
+    vt_enc_expect(ops, u, 1, 0, NULL, "", "vt_enc track: the wrap is tracked");
+    vt_enc_expect(ops, u, 1, 8, NULL, "\x1b[2;9H", "vt_enc track: to (1,8)");
+    vt_enc_expect(ops, u, 0, 0, "wxyz", "wx\r\nyz",
+                  "vt_enc track: text across the margin wraps in the middle");
+    vt_enc_expect(ops, u, 2, 2, NULL, "", "vt_enc track: and continues on the next row");
+
+    /* On the last row the wrap scrolls; the row stays the last. */
+    vt_enc_expect(ops, u, 2, 9, NULL, "\x1b[3;10H", "vt_enc track: to (2,9)");
+    vt_enc_expect(ops, u, 0, 0, "q", "q\r\n", "vt_enc track: last cell of last row wraps");
+    vt_enc_expect(ops, u, 2, 0, NULL, "", "vt_enc track: the scroll keeps the last row");
+
+    /* The control characters a UEFI console passes: CR homes, LF moves down
+       (scrolling at the bottom), BS moves left and stops at column 0. */
+    vt_enc_expect(ops, u, 0, 4, NULL, "\x1b[1;5H", "vt_enc track: to (0,4)");
+    vt_enc_expect(ops, u, 0, 0, "\r\n", "\r\n", "vt_enc track: CR LF");
+    vt_enc_expect(ops, u, 1, 0, NULL, "", "vt_enc track: CR LF lands on (1,0)");
+    vt_enc_expect(ops, u, 0, 0, "ab\b", "ab\b", "vt_enc track: BS");
+    vt_enc_expect(ops, u, 1, 1, NULL, "", "vt_enc track: BS steps back one");
+    vt_enc_expect(ops, u, 0, 0, "\n\n\n", "\n\n\n", "vt_enc track: LF past the bottom");
+    vt_enc_expect(ops, u, 2, 1, NULL, "", "vt_enc track: LF keeps the column, stops at the last row");
+
+    /* One cell per codepoint, not per byte (box drawing, accents). */
+    vt_enc_expect(ops, u, 0, 0, NULL, "\x1b[1;1H", "vt_enc track: to (0,0)");
+    vt_enc_expect(ops, u, 0, 0, "\xc3\xa9\xe2\x94\x80", "\xc3\xa9\xe2\x94\x80",
+                  "vt_enc track: two codepoints in five bytes");
+    vt_enc_expect(ops, u, 0, 2, NULL, "", "vt_enc track: two cells");
+
+    /* A TAB is one cell on a UEFI console (GraphicsConsole draws it as a
+       glyph; nothing moves to a tab stop), so it goes out as one space and the
+       position stays known -- at the margin it wraps like any other cell. */
+    vt_enc_expect(ops, u, 0, 0, "a\tb", "a b", "vt_enc track: TAB goes out as one space");
+    vt_enc_expect(ops, u, 0, 5, NULL, "", "vt_enc track: TAB is one cell");
+    vt_enc_expect(ops, u, 0, 9, NULL, "\x1b[1;10H", "vt_enc track: to (0,9)");
+    vt_enc_expect(ops, u, 0, 0, "\tz", " \r\nz", "vt_enc track: TAB in the last column wraps");
+    vt_enc_expect(ops, u, 1, 1, NULL, "", "vt_enc track: and is tracked across the wrap");
+
+    /* A codepoint a terminal draws in TWO cells (CJK) or in NONE (a combining
+       mark, a C1 control) is still ONE cell on a UEFI console: GraphicsConsole
+       advances one column per character unless the string switches to wide
+       (WIDE_CHAR), which the Shell never does. Sent raw, the terminal's grid
+       slides off the console's at every such codepoint, so each goes out as
+       one '?' -- what TerminalDxe's own non-UTF-8 terminals get for a
+       character they cannot show. */
+    vt_enc_expect(ops, u, 0, 0, NULL, "\x1b[1;1H", "vt_enc wide: to (0,0)");
+    vt_enc_expect(ops, u, 0, 0, "\xe4\xb8\xad\xe6\x96\x87x", "??x",
+                  "vt_enc wide: each CJK codepoint goes out as one '?'");
+    vt_enc_expect(ops, u, 0, 3, NULL, "", "vt_enc wide: one cell each");
+    vt_enc_expect(ops, u, 0, 0, "e\xcc\x81", "e?",
+                  "vt_enc wide: a combining mark is a cell of its own, a '?'");
+    vt_enc_expect(ops, u, 0, 5, NULL, "", "vt_enc wide: the combining mark is tracked as a cell");
+    vt_enc_expect(ops, u, 0, 0, "\xc2\x9b", "?",
+                  "vt_enc wide: a C1 control (8-bit CSI) never reaches the terminal raw");
+    vt_enc_expect(ops, u, 0, 6, NULL, "", "vt_enc wide: and is one cell");
+    vt_enc_expect(ops, u, 0, 9, NULL, "\x1b[1;10H", "vt_enc wide: to (0,9)");
+    vt_enc_expect(ops, u, 0, 0, "\xe4\xb8\xadz", "?\r\nz",
+                  "vt_enc wide: a wide codepoint in the last column wraps like any cell");
+    vt_enc_expect(ops, u, 1, 1, NULL, "", "vt_enc wide: tracked across the wrap");
+    vt_enc_expect(ops, u, 0, 0, "\x0b\xe4\xb8\xad", "\x0b?",
+                  "vt_enc wide: substituted with the position unknown too");
+
+    /* Any other control byte moves a terminal by rules the console does not
+       model: the position becomes unknown, so the next move is always emitted. */
+    vt_enc_expect(ops, u, 0, 0, "\x0b", "\x0b", "vt_enc track: VT passes through");
+    vt_enc_expect(ops, u, 1, 1, NULL, "\x1b[2;2H",
+                  "vt_enc track: after an unmodelled control byte a move is emitted");
+
+    /* A resize moves the margin. */
+    axl_console_vt_enc_set_size(e, 12, 3);
+    vt_enc_expect(ops, u, 0, 8, NULL, "\x1b[1;9H", "vt_enc track: to (0,8) at 12 wide");
+    vt_enc_expect(ops, u, 0, 0, "abcd", "abcd\r\n", "vt_enc track: the margin follows a resize");
+
+    axl_console_vt_enc_free(e);
+}
+
+/* The '?' for a codepoint that is not one cell belongs to the producer's
+   cell rule, which the encoder now binds. Under ONE_PER_CODEPOINT (the device
+   and the tap: a UEFI console) a wide, combining or C1 codepoint is one '?';
+   under WIDTH_RESOLVED (axl-vterm: the producer has already laid the glyphs out
+   by axl_vterm_char_width) the glyph goes out as it is and the tracked cursor
+   moves by that width. A C1 control is a control under either rule: it never
+   reaches a terminal raw. */
+static void
+test_console_vt_enc_cell_rule(void)
+{
+    static const AxlConsoleCellRule rules[2] = {
+        AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT, AXL_CONSOLE_CELLS_WIDTH_RESOLVED };
+    for (int r = 0; r < 2; r++) {
+        bool                  res = rules[r] == AXL_CONSOLE_CELLS_WIDTH_RESOLVED;
+        AxlConsoleVtEncConfig cfg = { .sink = cm_cap_sink, .cols = 10, .rows = 3 };
+        AxlConsoleVtEnc      *e   = axl_console_vt_enc_new(&cfg);
+        void                 *u   = NULL;
+        const AxlConsoleOps  *ops = axl_console_vt_enc_ops(e, &u);
+        test_check(e != NULL && ops != NULL && ops->set_cell_rule != NULL,
+                   "vt_enc cell rule: the encoder binds set_cell_rule");
+        if (e == NULL || ops == NULL || ops->set_cell_rule == NULL) {
+            axl_console_vt_enc_free(e);
+            return;
+        }
+        ops->set_cell_rule(u, rules[r]);
+        ops->clear_screen(u);
+        if (res) {
+            vt_enc_expect(ops, u, 0, 0, "\xe4\xb8\xad\xe6\x96\x87x", "\xe4\xb8\xad\xe6\x96\x87x",
+                          "vt_enc width-resolved: CJK goes out as it is");
+            vt_enc_expect(ops, u, 0, 5, NULL, "", "vt_enc width-resolved: two cells each");
+            vt_enc_expect(ops, u, 0, 0, "e\xcc\x81", "e\xcc\x81",
+                          "vt_enc width-resolved: a combining mark goes out as it is");
+            vt_enc_expect(ops, u, 0, 6, NULL, "",
+                          "vt_enc width-resolved: and joins the cell before it");
+            vt_enc_expect(ops, u, 0, 0, "\xc2\x9b", "?",
+                          "vt_enc width-resolved: a C1 control is still a '?'");
+            vt_enc_expect(ops, u, 0, 7, NULL, "", "vt_enc width-resolved: the '?' is one cell");
+            vt_enc_expect(ops, u, 0, 8, NULL, "\x1b[1;9H", "vt_enc width-resolved: to (0,8)");
+            vt_enc_expect(ops, u, 0, 0, "\xe4\xb8\xadz", "\xe4\xb8\xad\r\nz",
+                          "vt_enc width-resolved: a wide glyph filling the last two "
+                          "columns wraps after it");
+            vt_enc_expect(ops, u, 1, 1, NULL, "",
+                          "vt_enc width-resolved: tracked across the wrap");
+        } else {
+            vt_enc_expect(ops, u, 0, 0, "\xe4\xb8\xad\xe6\x96\x87x", "??x",
+                          "vt_enc one-per-codepoint: each CJK codepoint is one '?'");
+            vt_enc_expect(ops, u, 0, 3, NULL, "", "vt_enc one-per-codepoint: one cell each");
+            vt_enc_expect(ops, u, 0, 0, "e\xcc\x81", "e?",
+                          "vt_enc one-per-codepoint: a combining mark is a '?' of its own");
+            vt_enc_expect(ops, u, 0, 5, NULL, "", "vt_enc one-per-codepoint: tracked as a cell");
+            vt_enc_expect(ops, u, 0, 0, "\xc2\x9b", "?",
+                          "vt_enc one-per-codepoint: a C1 control is a '?'");
+            vt_enc_expect(ops, u, 0, 6, NULL, "", "vt_enc one-per-codepoint: one cell");
+        }
+        axl_console_vt_enc_free(e);
+    }
+}
+
+/* A sequence that is not well-formed UTF-8 -- a lead byte no codepoint has
+   (0xC0, 0xC1, 0xF5..0xFF), an overlong form, an encoded surrogate, a value
+   past U+10FFFF, one cut short -- is one '?' with its continuation bytes, under
+   either cell rule. Raw, a terminal draws a U+FFFD per maximal subpart (one to
+   four cells) where the console drew one character, and the tracked cursor
+   could not know which. Well-formed neighbours of each case pass as they are. */
+static void
+test_console_vt_enc_utf8_malformed(void)
+{
+    static const struct { const char *in; const char *out; int32_t col; const char *what; } c[] = {
+        { "a\xf5\x80\x80\x80" "b", "a?b", 3, "vt_enc utf8: lead 0xF5 is one '?'" },
+        { "\xf7\xbf\xbf\xbf" "b",  "?b",  2, "vt_enc utf8: lead 0xF7 is one '?'" },
+        { "\xed\xa0\x80" "z",      "?z",  2, "vt_enc utf8: an encoded surrogate (U+D800) is one '?'" },
+        { "\xed\xbf\xbf" "z",      "?z",  2, "vt_enc utf8: an encoded surrogate (U+DFFF) is one '?'" },
+        { "\xee\x80\x80" "z",      "\xee\x80\x80" "z", 2,
+          "vt_enc utf8: U+E000, just past the surrogates, passes" },
+        { "\xc0\xaf" "z",          "?z",  2, "vt_enc utf8: an overlong '/' is one '?'" },
+        { "\xe0\x80\xaf" "z",      "?z",  2, "vt_enc utf8: a 3-byte overlong is one '?'" },
+        { "\xf4\x90\x80\x80" "z",  "?z",  2, "vt_enc utf8: past U+10FFFF is one '?'" },
+        { "\xc3" "z",              "?z",  2, "vt_enc utf8: a sequence cut short is one '?'" },
+        { "\xc3\xa9" "z",          "\xc3\xa9" "z", 2, "vt_enc utf8: U+00E9 passes" },
+        { "\xf8\x90\x80\x80" "z", "?z", 2, "vt_enc utf8: lead 0xF8 is one '?'" },
+        { "\xfb\xbf\xbf\xbf" "z", "?z", 2, "vt_enc utf8: lead 0xFB is one '?'" },
+        { "\xff" "z",             "?z",  2, "vt_enc utf8: lead 0xFF is one '?'" },
+        { "\x80" "z",             "?z",  2, "vt_enc utf8: a lone continuation 0x80 is one '?'" },
+        { "a\xbf" "z",            "a?z", 3, "vt_enc utf8: a lone continuation 0xBF is one '?'" },
+    };
+    AxlConsoleVtEncConfig cfg = { .sink = cm_cap_sink, .cols = 10, .rows = 3 };
+    AxlConsoleVtEnc      *e   = axl_console_vt_enc_new(&cfg);
+    void                 *u   = NULL;
+    const AxlConsoleOps  *ops = axl_console_vt_enc_ops(e, &u);
+    test_check(e != NULL && ops != NULL, "vt_enc utf8: new");
+    if (e == NULL || ops == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        ops->clear_screen(u);
+        vt_enc_expect(ops, u, 0, 0, c[i].in, c[i].out, c[i].what);
+        vt_enc_expect(ops, u, 0, c[i].col, NULL, "", c[i].what);
+    }
+    axl_console_vt_enc_free(e);
+}
+
+/* Under WIDTH_RESOLVED a two-cell glyph that does not fit in the cells left on
+   its row wraps BEFORE it, as xterm and libvterm do (the cell it could not use
+   stays blank), and the cursor lands two cells into the next row. */
+static void
+test_console_vt_enc_wide_at_last_column(void)
+{
+    AxlConsoleVtEncConfig cfg = { .sink = cm_cap_sink, .cols = 10, .rows = 3 };
+    AxlConsoleVtEnc      *e   = axl_console_vt_enc_new(&cfg);
+    void                 *u   = NULL;
+    const AxlConsoleOps  *ops = axl_console_vt_enc_ops(e, &u);
+    test_check(e != NULL && ops != NULL && ops->set_cell_rule != NULL,
+               "vt_enc wide-at-margin: new");
+    if (e == NULL || ops == NULL || ops->set_cell_rule == NULL) {
+        axl_console_vt_enc_free(e);
+        return;
+    }
+    ops->set_cell_rule(u, AXL_CONSOLE_CELLS_WIDTH_RESOLVED);
+    ops->clear_screen(u);
+    vt_enc_expect(ops, u, 0, 0, "abcdefghi\xe4\xb8\xad" "z", "abcdefghi\r\n\xe4\xb8\xad" "z",
+                  "vt_enc wide-at-margin: a wide glyph in the last column wraps before it");
+    vt_enc_expect(ops, u, 1, 3, NULL, "",
+                  "vt_enc wide-at-margin: the cursor is two cells in, plus the 'z'");
     axl_console_vt_enc_free(e);
 }
 
@@ -6432,6 +8050,200 @@ test_console_mirror(void)
 }
 
 // ---------------------------------------------------------------------------
+// inject_text key shape: every key a terminal byte stream decodes to must be
+// the EFI_KEY_DATA an OVMF USB keyboard delivers for the same key, read through
+// ReadKeyStrokeEx. The expected values are the measured USB table (P4h survey
+// Q2), byte for byte: "scan unicode shift toggle".
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char *bytes;
+    size_t      len;
+    const char *want;   /* NULL: the sequence decodes to no key at all */
+} CiRow;
+
+#define CI_ROW(lit, want) { (lit), sizeof(lit) - 1, (want) }
+
+static const CiRow ci_rows[] = {
+    CI_ROW("a",             "0000 0061 80000000 c0"),
+    CI_ROW("A",             "0000 0041 80000000 c0"),
+    CI_ROW("\x01",          "0000 0061 80000008 c0"),
+    CI_ROW("\x05",          "0000 0065 80000008 c0"),
+    CI_ROW("\x00",          "0000 0020 80000008 c0"),
+    CI_ROW("\x0a",          "0000 006a 80000008 c0"),
+    CI_ROW("\x1c",          "0000 005c 80000008 c0"),
+    CI_ROW("\x1d",          "0000 005d 80000008 c0"),
+    CI_ROW("\x08",          "0000 0008 80000000 c0"),
+    CI_ROW("\x7f",          "0000 0008 80000000 c0"),
+    CI_ROW("\x09",          "0000 0009 80000000 c0"),
+    CI_ROW("\x0d",          "0000 000d 80000000 c0"),
+    CI_ROW("\x1b",          "0017 0000 80000000 c0"),
+    CI_ROW("\x1b" "x",      "0000 0078 80000020 c0"),
+    CI_ROW("\x1b\x18",      "0000 0078 80000028 c0"),
+    CI_ROW("\x1b\x1b",      "0017 0000 80000020 c0"),
+    CI_ROW("\x1b\x7f",      "0000 0008 80000020 c0"),
+    CI_ROW("\x1b[Z",        "0000 0009 80000002 c0"),
+    CI_ROW("\x1b[A",        "0001 0000 80000000 c0"),
+    CI_ROW("\x1b[1;2A",     "0001 0000 80000002 c0"),
+    CI_ROW("\x1b[1;5A",     "0001 0000 80000008 c0"),
+    CI_ROW("\x1b[1;3A",     "0001 0000 80000020 c0"),
+    CI_ROW("\x1b[1;9A",     "0001 0000 80000080 c0"),
+    CI_ROW("\x1b[1;1A",     "0001 0000 80000000 c0"),
+    CI_ROW("\x1b[1;5D",     "0004 0000 80000008 c0"),
+    CI_ROW("\x1b[1;5C",     "0003 0000 80000008 c0"),
+    CI_ROW("\x1b[H",        "0005 0000 80000000 c0"),
+    CI_ROW("\x1b[1;5H",     "0005 0000 80000008 c0"),
+    CI_ROW("\x1b[1;2H",     "0005 0000 80000002 c0"),
+    CI_ROW("\x1b[F",        "0006 0000 80000000 c0"),
+    CI_ROW("\x1b[1;5F",     "0006 0000 80000008 c0"),
+    CI_ROW("\x1b[1;2F",     "0006 0000 80000002 c0"),
+    CI_ROW("\x1b[1;6F",     "0006 0000 8000000a c0"),
+    CI_ROW("\x1b[1;7F",     "0006 0000 80000028 c0"),
+    CI_ROW("\x1b[1~",       "0005 0000 80000000 c0"),
+    CI_ROW("\x1b[4~",       "0006 0000 80000000 c0"),
+    CI_ROW("\x1b[5;5~",     "0009 0000 80000008 c0"),
+    CI_ROW("\x1b[5;2~",     "0009 0000 80000002 c0"),
+    CI_ROW("\x1b[6;5~",     "000a 0000 80000008 c0"),
+    CI_ROW("\x1b[2;5~",     "0007 0000 80000008 c0"),
+    CI_ROW("\x1b[3;5~",     "0008 0000 80000008 c0"),
+    CI_ROW("\x1b[3;2~",     "0008 0000 80000002 c0"),
+    CI_ROW("\x1bOP",        "000b 0000 80000000 c0"),
+    CI_ROW("\x1bOS",        "000e 0000 80000000 c0"),
+    CI_ROW("\x1b[1;2P",     "000b 0000 80000002 c0"),
+    CI_ROW("\x1b[1;5P",     "000b 0000 80000008 c0"),
+    CI_ROW("\x1b[1;3P",     "000b 0000 80000020 c0"),
+    CI_ROW("\x1b[1;6P",     "000b 0000 8000000a c0"),
+    CI_ROW("\x1b[15~",      "000f 0000 80000000 c0"),
+    CI_ROW("\x1b[24;2~",    "0016 0000 80000002 c0"),
+    CI_ROW("\x1b[24;5~",    "0016 0000 80000008 c0"),
+    CI_ROW("\x1bOA",        "0001 0000 80000000 c0"),
+    CI_ROW("\x1bOH",        "0005 0000 80000000 c0"),
+    CI_ROW("\x1bOF",        "0006 0000 80000000 c0"),
+    CI_ROW("\x1b[9;5u",     "0000 0009 80000008 c0"),
+    CI_ROW("\x1b[9;2u",     "0000 0009 80000002 c0"),
+    CI_ROW("\x1b[13;5u",    "0000 000d 80000008 c0"),
+    CI_ROW("\x1b[13;2u",    "0000 000d 80000002 c0"),
+    CI_ROW("\x1b[49;5u",    "0000 0031 80000008 c0"),
+    CI_ROW("\x1b[105;5u",   "0000 0069 80000008 c0"),
+    CI_ROW("\x1b[97;6u",    "0000 0041 80000008 c0"),
+    CI_ROW("\x1b[32;2u",    "0000 0020 80000002 c0"),
+    CI_ROW("\x1b[127;5u",   "0000 0008 80000008 c0"),
+    CI_ROW("\x1b[27;3u",    "0017 0000 80000020 c0"),
+    CI_ROW("\x1b[91;5u",    "0000 005b 80000008 c0"),
+    CI_ROW("\x1b[27;5;9~",  "0000 0009 80000008 c0"),
+    CI_ROW("\xc3\xa9",      "0000 00e9 80000000 c0"),
+    CI_ROW("\x1b[1;99A",    NULL),
+    CI_ROW("\x1b[99999999A", NULL),
+    CI_ROW("\x1b[1;5X",     NULL),
+    CI_ROW("\x1b[0;5u",     NULL),
+    CI_ROW("\x1b[55296;5u", NULL),
+};
+
+static void
+ci_hex(const char *bytes, size_t len, char *out, size_t cap)
+{
+    size_t n = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < len && n + 3 < cap; i++) {
+        n += (size_t)axl_snprintf(out + n, cap - n, "%02x", (unsigned char)bytes[i]);
+    }
+}
+
+/* Inject `bytes` into a fresh tap and render EVERY key it decodes to through
+   the Ex view, "scan unicode shift toggle" joined by " | " ("" for none). */
+static int
+ci_keys(const char *bytes, size_t len, char *out, size_t cap)
+{
+    AxlConsoleTap *tt = _axl_console_tap_new_for_test();
+    size_t         n  = 0;
+    uint16_t       scan = 0;
+    uint16_t       uni = 0;
+    uint32_t       shift = 0;
+    uint8_t        toggle = 0;
+
+    out[0] = '\0';
+    if (tt == NULL) {
+        return AXL_ERR;
+    }
+    int rc = axl_console_tap_inject_text(tt, bytes, len);
+    while (_axl_console_tap_test_pop_key_ex(tt, &scan, &uni, &shift, &toggle)
+           && n + 24 < cap) {
+        n += (size_t)axl_snprintf(out + n, cap - n, "%s%04x %04x %08x %02x",
+                                  n > 0 ? " | " : "", (unsigned)scan, (unsigned)uni,
+                                  (unsigned)shift, (unsigned)toggle);
+    }
+    axl_free(tt);
+    return rc;
+}
+
+static void
+test_console_input_modifiers(void)
+{
+    /* ci_rows decode to one key or none -- a second key fails the exact match.
+       These decode to several: a sequence the next byte breaks off, ones still
+       open at the end of the call, and Esc just before an arrow. */
+    static const CiRow multi[] = {
+        CI_ROW("\x1b\x1b[B",  "0017 0000 80000000 c0 | 0002 0000 80000000 c0"),
+        CI_ROW("\x1b[\x03",   "0017 0000 80000000 c0 | 0000 005b 80000000 c0"
+                              " | 0000 0063 80000008 c0"),
+        CI_ROW("\x1b[1;5",    "0017 0000 80000000 c0 | 0000 005b 80000000 c0"
+                              " | 0000 0031 80000000 c0 | 0000 003b 80000000 c0"
+                              " | 0000 0035 80000000 c0"),
+        CI_ROW("\x1bO",       "0017 0000 80000000 c0 | 0000 004f 80000000 c0"),
+    };
+    const CiRow *tables[2]  = { ci_rows, multi };
+    size_t       counts[2]  = { AXL_ARRAY_SIZE(ci_rows), AXL_ARRAY_SIZE(multi) };
+
+    for (size_t t = 0; t < 2; t++) {
+        for (size_t r = 0; r < counts[t]; r++) {
+            const CiRow *row = &tables[t][r];
+            const char  *want = row->want != NULL ? row->want : "";
+            char hex[48];
+            char got[200];
+            char name[300];
+            ci_hex(row->bytes, row->len, hex, sizeof(hex));
+            int rc = ci_keys(row->bytes, row->len, got, sizeof(got));
+            axl_snprintf(name, sizeof(name), "inject_text modifiers: %s -> [%s]", hex, want);
+            bool ok = rc == AXL_OK && axl_strcmp(got, want) == 0;
+            if (!ok) {
+                axl_printf("  got: [%s] (rc %d)\n", got, rc);
+            }
+            test_check(ok, name);
+        }
+    }
+
+    /* The SIMPLE view of the same keys: ReadKeyStroke folds Ctrl+letter to its
+       C0 code (as ConSplitter does), leaves Ctrl+backslash a backslash, and a
+       scan key loses its modifiers. */
+    static const struct {
+        const char *bytes;
+        size_t      len;
+        uint16_t    scan;
+        uint16_t    uni;
+        const char *name;
+    } simple[] = {
+        { "\x01", 1, 0, 0x01, "inject_text simple: 01 -> unicode 0x01 (Ctrl+A folded)" },
+        { "\x1c", 1, 0, 0x5c, "inject_text simple: 1c -> unicode 0x5c (Ctrl+\\ not folded)" },
+        { "\x1b[1;5A", 6, 1, 0, "inject_text simple: ESC[1;5A -> scan 1, unicode 0" },
+    };
+    for (size_t r = 0; r < sizeof(simple) / sizeof(simple[0]); r++) {
+        AxlConsoleTap *tt = _axl_console_tap_new_for_test();
+        if (tt == NULL) {
+            test_fail("inject_text simple: bare test tap constructed");
+            return;
+        }
+        uint16_t scan = 0xFFFF;
+        uint16_t uni = 0xFFFF;
+        axl_console_tap_inject_text(tt, simple[r].bytes, simple[r].len);
+        bool one = _axl_console_tap_test_pop_key(tt, &scan, &uni);
+        bool second = _axl_console_tap_test_pop_key(tt, NULL, NULL);
+        axl_free(tt);
+        test_check(one && !second && scan == simple[r].scan && uni == simple[r].uni,
+                   simple[r].name);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AxlConsoleTap public-API guards. The tap is the new substrate entry point, so
 // pin its argument validation and NULL-safety (none of these install anything,
 // so the live console is untouched).
@@ -6516,8 +8328,8 @@ test_console_device_guards(void)
     test_check(gc == 0 && gr == 0, "console_device: get_size(NULL) zeroes both outputs");
     axl_console_device_get_size(NULL, NULL, NULL);   /* no crash on NULL outputs */
 
-    /* NULL-safe session / geometry / alt-screen accessors. */
-    axl_console_device_uninstall(NULL);
+    /* NULL-safe session / geometry / alt-screen accessors (uninstall(NULL) is
+       pinned to AXL_OK in the uninstall test). */
     axl_console_device_reset(NULL);
     axl_console_device_set_size(NULL, 100, 40);
     axl_console_device_enter_alt_screen(NULL);
@@ -6692,6 +8504,44 @@ test_console_tap_key_notify_passthrough_not_owned(void)
     cm_tap_end(t);
 }
 
+/* The tap shares the device's input engine: a run the ring cannot hold whole is
+   reported (AXL_ERR, the tap's full-ring code) and stops at a whole key. */
+static void
+test_console_tap_inject_full_ring(void)
+{
+    AxlConsoleTap *t = cm_tap_begin(80, 25, false, /*input_capture=*/true, false);
+    char           paste[70];
+    uint16_t       scan = 0;
+    uint16_t       uni  = 0;
+    size_t         n    = 0;
+
+    axl_memset(paste, 'p', sizeof(paste));
+    test_check(axl_console_tap_inject_text(t, paste, sizeof(paste)) == AXL_ERR,
+               "tap inject_text: a 70-byte run into a 63-key ring is AXL_ERR");
+    while (_axl_console_tap_test_pop_key(t, &scan, &uni)) {
+        n++;
+    }
+    test_check(n == 63, "tap inject_text: the 63 keys that fit are queued");
+    for (size_t i = 0; i < 62; i++) {
+        axl_console_tap_inject_key(t, 0, 'f');
+    }
+    test_check(axl_console_tap_inject_text(t, "\x1b[", 2) == AXL_ERR,
+               "tap inject_text: a 2-key unit with room for 1 is refused");
+    n = 0;
+    while (_axl_console_tap_test_pop_key(t, &scan, &uni)) {
+        n++;
+    }
+    test_check(n == 62, "tap inject_text: and queued no half of itself");
+    for (size_t i = 0; i < 63; i++) {
+        axl_console_tap_inject_key(t, 0, 'f');
+    }
+    test_check(axl_console_tap_inject_key_ex(t, 0, 'z', 0, 0) == AXL_ERR,
+               "tap inject_key_ex: a full ring is still AXL_ERR");
+    while (_axl_console_tap_test_pop_key(t, &scan, &uni)) {
+    }
+    cm_tap_end(t);
+}
+
 /* inject_key_ex must reject a NULL tap like every other public entry point. */
 static void
 test_console_tap_inject_key_ex_guards(void)
@@ -6771,6 +8621,27 @@ test_console_device_input(void)
     test_check(notify_calls == 1,
                "device_input: injected Ctrl+C fires the registered notify once");
     ex->ReadKeyStrokeEx(ex, &kd);   /* drain the queued key */
+
+    /* A physical key from a source that reports no shift state (a serial
+       terminal: no EFI_SHIFT_STATE_VALID) fires the notifies by key alone, as
+       that source's own IsKeyRegistered (TerminalDxe) did before the take-over
+       evicted it. Otherwise a Ctrl-C typed on the local serial console never
+       reaches the Shell's break. The key handed to the notify is unchanged. */
+    notify_calls = 0;
+    notify_last  = key_data(0, 0, 0xFFFFu, 0);
+    _axl_console_device_test_feed_physical(d, NULL, NULL, 0, 3, 0);
+    test_check(notify_calls == 1 && notify_last.Key.UnicodeChar == 3
+                   && notify_last.KeyState.KeyShiftState == 0,
+               "device_input: a serial 0x03 (no shift state) fires the Ctrl+C notify once");
+    /* A keyboard that DOES report shift state keeps the exact rule: 0x03 with
+       VALID and no Ctrl bit does not match, its real Ctrl chord does. */
+    notify_calls = 0;
+    _axl_console_device_test_feed_physical(d, NULL, NULL, 0, 3, EFI_SHIFT_STATE_VALID);
+    test_check(notify_calls == 0,
+               "device_input: a reported shift state without Ctrl does not fire Ctrl+C");
+    _axl_console_device_test_feed_physical(d, NULL, NULL, 0, 3, CTRL_C_SHIFT);
+    test_check(notify_calls == 1,
+               "device_input: a reported Ctrl+C from a keyboard fires it once");
     test_check(ex->UnregisterKeyNotify(ex, h) == EFI_SUCCESS,
                "device_input: UnregisterKeyNotify accepts our handle");
 
@@ -6789,6 +8660,399 @@ test_console_device_input(void)
                "device key_filter: NULL filter forwards everything");
 
     _axl_console_device_test_end(d);
+}
+
+/* Count the keys queued on a device, draining them. */
+static size_t
+dev_ring_drain_count(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *in)
+{
+    EFI_INPUT_KEY k = {0};
+    size_t        n = 0;
+    while (in->ReadKeyStroke(in, &k) == EFI_SUCCESS) {
+        n++;
+    }
+    return n;
+}
+
+/* Fill the ring until exactly @a room slots are left (the ring holds 63). */
+static void
+dev_ring_fill_to_room(AxlConsoleDevice *d, EFI_SIMPLE_TEXT_INPUT_PROTOCOL *in, size_t room)
+{
+    dev_ring_drain_count(in);
+    for (size_t i = 0; i < 63 - room; i++) {
+        axl_console_device_inject_key(d, 0, 'f');
+    }
+}
+
+/* The key ring holds 63 keys and drains only as the guest reads, so a paste must
+   be offered in pieces: the partial form reports how many bytes it took, at a
+   unit boundary, never splitting a character or an escape sequence. */
+static void
+test_console_device_inject_partial(void)
+{
+    static const char e_acute[] = { (char)0xC3, (char)0xA9 };
+    char   paste[100];
+    size_t used = 99;
+
+    AxlConsoleDevice *off = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(off, /*take_input=*/false);
+    test_check(axl_console_device_inject_text_partial(off, "x", 1, &used) == AXL_ERR
+                   && used == 0,
+               "inject_partial: an output-only device refuses, consumed 0");
+    _axl_console_device_test_end(off);
+
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL *in = _axl_console_device_test_conin(d);
+    EFI_INPUT_KEY                   k  = {0};
+
+    test_check(axl_console_device_inject_text_partial(d, "x", 1, NULL) == AXL_ERR,
+               "inject_partial: a NULL consumed is refused");
+    used = 99;
+    test_check(axl_console_device_inject_text_partial(d, "", 0, &used) == AXL_OK
+                   && used == 0,
+               "inject_partial: len 0 is AXL_OK, consumed 0");
+
+    /* A 100-byte paste: 63 keys fit, the call says so, the rest is the caller's. */
+    axl_memset(paste, 'a', sizeof(paste));
+    used = 0;
+    test_check(axl_console_device_inject_text_partial(d, paste, sizeof(paste), &used)
+                   == AXL_BUSY,
+               "inject_partial: a 100-byte paste into an empty ring is AXL_BUSY");
+    test_check(used == 63, "inject_partial: it consumed exactly the 63 that fit");
+    test_check(dev_ring_drain_count(in) == 63, "inject_partial: 63 keys are queued");
+
+    /* An open trailing sequence is Esc + '[' (2 keys): with room for 1 it is not
+       split -- nothing goes in. */
+    dev_ring_fill_to_room(d, in, 1);
+    used = 99;
+    test_check(axl_console_device_inject_text_partial(d, "\x1b[", 2, &used) == AXL_BUSY
+                   && used == 0,
+               "inject_partial: a 2-key unit with room for 1 consumes nothing");
+    test_check(dev_ring_drain_count(in) == 62,
+               "inject_partial: the refused unit queued no half of itself");
+
+    /* A UTF-8 character is one key: room 1 takes both bytes; room 0 takes none. */
+    dev_ring_fill_to_room(d, in, 1);
+    used = 0;
+    test_check(axl_console_device_inject_text_partial(d, e_acute, 2, &used) == AXL_OK
+                   && used == 2,
+               "inject_partial: a 2-byte character fits in one slot, both bytes consumed");
+    used = 99;
+    test_check(axl_console_device_inject_text_partial(d, e_acute, 2, &used) == AXL_BUSY
+                   && used == 0,
+               "inject_partial: a full ring takes no byte of a character");
+
+    /* The remainder, offered later as its own call, decodes to the same keys. */
+    dev_ring_fill_to_room(d, in, 2);
+    static const char run[] = "ab\x1b[Ac";
+    used = 0;
+    test_check(axl_console_device_inject_text_partial(d, run, 6, &used)
+                   == AXL_BUSY && used == 2,
+               "inject_partial: room 2 takes 'ab' and stops at the escape sequence");
+    dev_ring_drain_count(in);
+    test_check(axl_console_device_inject_text_partial(d, &run[used], 6 - used,
+                                                      &used) == AXL_OK && used == 4,
+               "inject_partial: the remainder goes in whole once there is room");
+    test_check(in->ReadKeyStroke(in, &k) == EFI_SUCCESS && k.ScanCode == 0x01 /*SCAN_UP*/,
+               "inject_partial: the resumed remainder starts with Up");
+    test_check(in->ReadKeyStroke(in, &k) == EFI_SUCCESS && k.UnicodeChar == 'c',
+               "inject_partial: then 'c'");
+    test_check(in->ReadKeyStroke(in, &k) == EFI_NOT_READY,
+               "inject_partial: and nothing else");
+
+    /* The whole-run forms report a full ring instead of hiding it. */
+    dev_ring_fill_to_room(d, in, 0);
+    test_check(axl_console_device_inject_text(d, "z", 1) == AXL_BUSY,
+               "inject_text: a full ring is AXL_BUSY, not a silent AXL_OK");
+    test_check(axl_console_device_inject_key_ex(d, 0, 'z', 0, 0) == AXL_BUSY,
+               "inject_key_ex: a full ring is AXL_BUSY");
+    test_check(axl_console_device_inject_key(d, 0, 'z') == AXL_BUSY,
+               "inject_key: a full ring is AXL_BUSY");
+    dev_ring_drain_count(in);
+
+    _axl_console_device_test_end(d);
+}
+
+/* The ring's unread-key count: what injects add, what the guest's reads take. */
+static void
+test_console_device_queued_keys(void)
+{
+    EFI_INPUT_KEY k = {0};
+
+    test_check(axl_console_device_queued_keys(NULL) == 0, "queued_keys: NULL is 0");
+
+    AxlConsoleDevice *off = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(off, /*take_input=*/false);
+    test_check(axl_console_device_queued_keys(off) == 0,
+               "queued_keys: an output-only device is 0");
+    _axl_console_device_test_end(off);
+
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL *in = _axl_console_device_test_conin(d);
+
+    test_check(axl_console_device_queued_keys(d) == 0, "queued_keys: a new ring is 0");
+    axl_console_device_inject_key(d, 0, 'a');
+    axl_console_device_inject_key_ex(d, 0, 's',
+                                    EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED, 0);
+    test_check(axl_console_device_queued_keys(d) == 2,
+               "queued_keys: two injected keys are 2");
+    /* A text run counts keys, not bytes: ESC [ A is one Up. */
+    axl_console_device_inject_text(d, "x\x1b[A", 4);
+    test_check(axl_console_device_queued_keys(d) == 4,
+               "queued_keys: 'x' + an Up sequence add 2 keys, not 4 bytes");
+    test_check(in->ReadKeyStroke(in, &k) == EFI_SUCCESS
+                   && axl_console_device_queued_keys(d) == 3,
+               "queued_keys: a guest read takes one off");
+    dev_ring_drain_count(in);
+    test_check(axl_console_device_queued_keys(d) == 0,
+               "queued_keys: 0 once the guest has read everything");
+
+    /* Full: 63, and a refused key adds nothing. */
+    dev_ring_fill_to_room(d, in, 0);
+    test_check(axl_console_device_queued_keys(d) == 63, "queued_keys: a full ring is 63");
+    test_check(axl_console_device_inject_key(d, 0, 'z') == AXL_BUSY
+                   && axl_console_device_queued_keys(d) == 63,
+               "queued_keys: a key the full ring refused is not counted");
+    /* Across the ring's wrap: read 10, add 5. */
+    for (int i = 0; i < 10; i++) {
+        in->ReadKeyStroke(in, &k);
+    }
+    for (int i = 0; i < 5; i++) {
+        axl_console_device_inject_key(d, 0, 'w');
+    }
+    test_check(axl_console_device_queued_keys(d) == 58,
+               "queued_keys: 63 - 10 read + 5 injected across the wrap is 58");
+    dev_ring_drain_count(in);
+
+    _axl_console_device_test_end(d);
+}
+
+/* Uninstall never frees the instance under a call into it that has not returned.
+   The fixture forces the race deterministically: an op callback -- reached from
+   inside the device's own OutputString, exactly where a preempting TPL_CALLBACK
+   tick would find the Shell -- attempts the uninstall. */
+static AxlConsoleDevice *un_dev;
+static int               un_rc;
+static int               un_ops;
+
+static void
+un_output_text(void *u, const char *utf8, size_t len)
+{
+    (void)u;
+    (void)utf8;
+    (void)len;
+    if (un_ops++ == 0) {
+        un_rc = axl_console_device_uninstall(un_dev);
+        /* Judged HERE, inside the call: if the instance was freed, the call
+           resumes in freed memory when this returns and may never come back. */
+        test_check(un_rc == AXL_BUSY,
+                   "device_uninstall: from inside a live OutputString it is AXL_BUSY");
+    }
+}
+
+static void
+test_console_device_uninstall_in_call(void)
+{
+    static const AxlConsoleOps ops = { .output_text = un_output_text };
+
+    test_check(axl_console_device_uninstall(NULL) == AXL_OK,
+               "device_uninstall: NULL is AXL_OK (nothing to do)");
+
+    un_dev = _axl_console_device_new_for_test();
+    un_rc  = 12345;
+    un_ops = 0;
+    _axl_console_device_test_begin_output(un_dev, &ops, NULL);
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *co = _axl_console_device_test_conout(un_dev);
+
+    test_check(axl_console_device_uninstall((AxlConsoleDevice *)&un_rc) == AXL_INVALID,
+               "device_uninstall: a handle that is not the installed device is AXL_INVALID");
+
+    co->OutputString(co, (CHAR16 *)L"ab");
+    test_check(un_ops == 1, "device_uninstall: the op callback ran inside OutputString");
+    bool alive = _axl_console_device_test_current() == un_dev;
+    test_check(alive, "device_uninstall: the refused uninstall left the device installed");
+    if (!alive) {
+        return;   /* freed under the call: nothing left to clean up or probe */
+    }
+
+    test_check(axl_console_device_uninstall(un_dev) == AXL_OK,
+               "device_uninstall: once the call returned, it completes");
+    test_check(_axl_console_device_test_current() == NULL,
+               "device_uninstall: the device is gone");
+}
+
+/* A keyboard driver fires a key's notifies when the key is PRESSED, even when its
+   queue is full and the key itself is dropped (EDK2 TerminalDxe
+   EfiKeyFiFoInsertOneKey runs the notify scan before its full check). Without
+   that, a Ctrl-C typed behind a long type-ahead into a command that never reads
+   the console could never break it. A text unit the ring cannot take is not
+   pressed at all -- it is offered again later -- so it fires nothing, and a
+   retry cannot fire anything twice. */
+static void
+test_console_device_notify_full_ring(void)
+{
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_device_test_coninex(d);
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL    *in = _axl_console_device_test_conin(d);
+    void         *hc    = NULL;
+    void         *ha    = NULL;
+    EFI_KEY_DATA  reg_c = key_data(0, 'c', CTRL_C_SHIFT, 0);
+    EFI_KEY_DATA  reg_a = key_data(0, 'a', 0, 0);
+    size_t        used  = 99;
+
+    ex->RegisterKeyNotify(ex, &reg_c, on_key_notify, &hc);
+    ex->RegisterKeyNotify(ex, &reg_a, on_key_notify, &ha);
+
+    dev_ring_fill_to_room(d, in, 0);
+    notify_calls = 0;
+    test_check(axl_console_device_inject_key_ex(d, 0, 'c', CTRL_C_SHIFT, 0) == AXL_BUSY,
+               "notify_full_ring: Ctrl-C into a full ring is AXL_BUSY (not queued)");
+    test_check(notify_calls == 1,
+               "notify_full_ring: the Ctrl-C notify fires although the ring is full");
+    test_check(notify_last.Key.UnicodeChar == 'c'
+                   && notify_last.KeyState.KeyShiftState == CTRL_C_SHIFT,
+               "notify_full_ring: the notify is handed the pressed key");
+
+    notify_calls = 0;
+    test_check(axl_console_device_inject_text_partial(d, "a", 1, &used) == AXL_BUSY
+                   && used == 0,
+               "notify_full_ring: a text unit the full ring cannot take is refused");
+    test_check(notify_calls == 0,
+               "notify_full_ring: a refused text unit fires no notify (a retry cannot "
+               "fire twice)");
+    test_check(dev_ring_drain_count(in) == 63,
+               "notify_full_ring: the ring holds only the 63 fillers");
+
+    ex->UnregisterKeyNotify(ex, hc);
+    ex->UnregisterKeyNotify(ex, ha);
+    _axl_console_device_test_end(d);
+}
+
+/* A call that reaches a method after the uninstall freed the instance -- the
+   firmware had already dispatched it -- touches nothing and returns a status
+   that method's spec defines for a device that cannot serve it, and its count
+   still balances: the next device uninstalls cleanly. Copies of the four
+   vtables stand in for the freed ones. */
+typedef struct {
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL   co;
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL    ci;
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL cx;
+    EFI_SIMPLE_POINTER_PROTOCOL       sp;
+} LateVt;
+
+/* ConInEx's Reset and SetState are untyped in the hand-written header. */
+typedef EFI_STATUS (EFIAPI *LateExReset)(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *, BOOLEAN);
+typedef EFI_STATUS (EFIAPI *LateExSetState)(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *, uint8_t *);
+
+static EFI_STATUS EFIAPI
+late_notify_fn(EFI_KEY_DATA *k)
+{
+    (void)k;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+late_invoke(LateVt *v, int i)
+{
+    UINTN                    cols = 0;
+    UINTN                    rows = 0;
+    EFI_INPUT_KEY            key;
+    EFI_KEY_DATA             kd;
+    uint8_t                  toggle = 0;
+    EFI_SIMPLE_POINTER_STATE ps;
+    void                    *nh = NULL;
+
+    axl_memset(&kd, 0, sizeof(kd));
+    kd.Key.UnicodeChar = 'c';
+    switch (i) {
+    case 0:  return v->co.Reset(&v->co, FALSE);
+    case 1:  return v->co.OutputString(&v->co, (CHAR16 *)L"late");
+    case 2:  return v->co.TestString(&v->co, (CHAR16 *)L"late");
+    case 3:  return v->co.QueryMode(&v->co, 0, &cols, &rows);
+    case 4:  return v->co.SetMode(&v->co, 0);
+    case 5:  return v->co.SetAttribute(&v->co, 0x07);
+    case 6:  return v->co.ClearScreen(&v->co);
+    case 7:  return v->co.SetCursorPosition(&v->co, 0, 0);
+    case 8:  return v->co.EnableCursor(&v->co, TRUE);
+    case 9:  return v->ci.Reset(&v->ci, FALSE);
+    case 10: return v->ci.ReadKeyStroke(&v->ci, &key);
+    case 11: return ((LateExReset)v->cx.Reset)(&v->cx, FALSE);
+    case 12: return v->cx.ReadKeyStrokeEx(&v->cx, &kd);
+    case 13: return ((LateExSetState)v->cx.SetState)(&v->cx, &toggle);
+    case 14: return v->cx.RegisterKeyNotify(&v->cx, &kd, late_notify_fn, &nh);
+    case 15: return v->cx.UnregisterKeyNotify(&v->cx, nh);
+    case 16: return v->sp.Reset(&v->sp, FALSE);
+    case 17: return v->sp.GetState(&v->sp, &ps);
+    default: return EFI_ABORTED;
+    }
+}
+
+static void
+test_console_device_late_call(void)
+{
+    /* Each method's late status is one its spec lists: TestString knows only
+       SUCCESS/UNSUPPORTED, and the notify pair reports a bad request as
+       INVALID_PARAMETER; every other method has DEVICE_ERROR. */
+    static const struct {
+        const char *name;
+        EFI_STATUS  want;
+    } cases[] = {
+        { "ConOut.Reset",                  EFI_DEVICE_ERROR },
+        { "ConOut.OutputString",           EFI_DEVICE_ERROR },
+        { "ConOut.TestString",             EFI_UNSUPPORTED },
+        { "ConOut.QueryMode",              EFI_DEVICE_ERROR },
+        { "ConOut.SetMode",                EFI_DEVICE_ERROR },
+        { "ConOut.SetAttribute",           EFI_DEVICE_ERROR },
+        { "ConOut.ClearScreen",            EFI_DEVICE_ERROR },
+        { "ConOut.SetCursorPosition",      EFI_DEVICE_ERROR },
+        { "ConOut.EnableCursor",           EFI_DEVICE_ERROR },
+        { "ConIn.Reset",                   EFI_DEVICE_ERROR },
+        { "ConIn.ReadKeyStroke",           EFI_DEVICE_ERROR },
+        { "ConInEx.Reset",                 EFI_DEVICE_ERROR },
+        { "ConInEx.ReadKeyStrokeEx",       EFI_DEVICE_ERROR },
+        { "ConInEx.SetState",              EFI_DEVICE_ERROR },
+        { "ConInEx.RegisterKeyNotify",     EFI_INVALID_PARAMETER },
+        { "ConInEx.UnregisterKeyNotify",   EFI_INVALID_PARAMETER },
+        { "SimplePointer.Reset",           EFI_DEVICE_ERROR },
+        { "SimplePointer.GetState",        EFI_DEVICE_ERROR },
+    };
+    static const AxlConsoleOps ops = { .output_text = NULL };
+    LateVt            v;
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+
+    _axl_console_device_test_begin_output(d, &ops, NULL);
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    v.co = *_axl_console_device_test_conout(d);
+    v.ci = *_axl_console_device_test_conin(d);
+    v.cx = *_axl_console_device_test_coninex(d);
+    v.sp = *_axl_console_device_test_proxy(d);
+
+    test_check(axl_console_device_uninstall(d) == AXL_OK,
+               "late_call: the device uninstalls");
+    for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+        EFI_STATUS got = late_invoke(&v, i);
+        char       name[128];
+        axl_snprintf(name, sizeof(name), "late_call: %s after the uninstall is %s",
+                     cases[i].name,
+                     cases[i].want == EFI_UNSUPPORTED ? "EFI_UNSUPPORTED"
+                     : cases[i].want == EFI_INVALID_PARAMETER ? "EFI_INVALID_PARAMETER"
+                     : "EFI_DEVICE_ERROR");
+        if (got != cases[i].want) {
+            axl_printf("  got 0x%llx\n", (unsigned long long)got);
+        }
+        test_check(got == cases[i].want, name);
+    }
+
+    AxlConsoleDevice *d2 = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin_output(d2, &ops, NULL);
+    test_check(axl_console_device_uninstall(d2) == AXL_OK,
+               "late_call: the late calls left the in-call count balanced (a fresh "
+               "device uninstalls, not AXL_BUSY)");
+    test_check(_axl_console_device_test_current() == NULL,
+               "late_call: and it is gone");
 }
 
 // ---------------------------------------------------------------------------
@@ -6991,6 +9255,323 @@ test_console_device_read_loop_revalidate(void)
 
     _axl_console_device_test_end(d);
     gBS->UninstallProtocolInterface(kh, &keeper_guid, &keeper);
+}
+
+/* A synthetic firmware keyboard holding g_backlog_total keys typed ahead:
+   'a'..'z' in turn, handed out in order until none are left. */
+static size_t g_backlog_total;
+static size_t g_backlog_next;
+
+static EFI_STATUS EFIAPI
+backlog_readkeyex(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *kd)
+{
+    (void)This;
+    if (g_backlog_next == g_backlog_total) {
+        return EFI_NOT_READY;
+    }
+    EFI_KEY_DATA k = {0};
+    k.Key.UnicodeChar         = (CHAR16)('a' + g_backlog_next % 26);
+    k.KeyState.KeyShiftState  = EFI_SHIFT_STATE_VALID;
+    k.KeyState.KeyToggleState = EFI_TOGGLE_STATE_VALID | EFI_KEY_STATE_EXPOSED;
+    *kd = k;
+    g_backlog_next++;
+    return EFI_SUCCESS;
+}
+
+/* Type-ahead longer than the device ring at an evicted keyboard. ARRIVAL: the
+   read timer reads up to 256 keys past the ring, and the consumer's key_filter
+   and the guest's notifies see each one as it is read, while the guest reads
+   nothing (a terminal's escape hotkey, the Shell's Ctrl-C behind type-ahead).
+   DELIVERY: the 63-key ring fills as the guest reads; nothing beyond the
+   holding queue is read, so the rest waits in the keyboard's own queue and
+   no key is ever lost. */
+static size_t g_backlog_filtered;
+static size_t g_backlog_notified;
+
+static bool
+backlog_filter(void *user, const void *key)
+{
+    (void)user;
+    (void)key;
+    g_backlog_filtered++;
+    return false;
+}
+
+static EFI_STATUS EFIAPI
+backlog_notify(EFI_KEY_DATA *kd)
+{
+    (void)kd;
+    g_backlog_notified++;
+    return EFI_SUCCESS;
+}
+
+static void
+test_console_device_read_backpressure(void)
+{
+    EFI_GUID ex_guid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
+    static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL kb;
+    kb.Reset           = synth_conin_reset;
+    kb.ReadKeyStrokeEx = backlog_readkeyex;
+
+    EFI_HANDLE kh = NULL;
+    if (gBS->InstallProtocolInterface(&kh, &ex_guid, EFI_NATIVE_INTERFACE, &kb)
+        != EFI_SUCCESS) {
+        test_fail("read-backpressure: synthetic keyboard installs");
+        return;
+    }
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    _axl_console_device_test_set_key_filter(d, backlog_filter, NULL);
+    test_check(_axl_console_device_test_add_evicted_conin(d, kh),
+               "read-backpressure: synthetic keyboard evicted into the read list");
+
+    /* A notify on 'z' (any shift state): the 26th key of every 26. */
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_device_test_coninex(d);
+    EFI_KEY_DATA reg = {0};
+    reg.Key.UnicodeChar = 'z';
+    void *nh = NULL;
+    test_check(ex != NULL && ex->RegisterKeyNotify(ex, &reg, backlog_notify, &nh)
+                   == EFI_SUCCESS,
+               "read-backpressure: a key notify on 'z' registers");
+
+    g_backlog_total    = 400;
+    g_backlog_next     = 0;
+    g_backlog_filtered = 0;
+    g_backlog_notified = 0;
+    _axl_console_device_test_read_tick(d);
+    test_check(g_backlog_next == 319 && g_backlog_filtered == 319,
+               "read-backpressure: a tick reads 319 of 400 keys (63 ring + 256 held), "
+               "and key_filter sees every one as it is read");
+    test_check(g_backlog_notified == 319 / 26,
+               "read-backpressure: the notifies of all 319 fire on arrival, the guest "
+               "reading nothing (12 of 'z')");
+    test_check(axl_console_device_queued_keys(d) == 319,
+               "read-backpressure: queued_keys counts the ring and the held keys (319)");
+    _axl_console_device_test_read_tick(d);
+    test_check(g_backlog_next == 319,
+               "read-backpressure: with the holding queue full a tick reads nothing more");
+
+    /* The guest reads; each tick then delivers what fits and reads what it can
+       hold, and every key arrives once, in order. */
+    size_t got = 0;
+    bool   in_order = true;
+    for (int round = 0; round < 12 && ex != NULL; round++) {
+        EFI_KEY_DATA kd;
+        while (ex->ReadKeyStrokeEx(ex, &kd) == EFI_SUCCESS) {
+            if (kd.Key.UnicodeChar != (CHAR16)('a' + got % 26)) {
+                in_order = false;
+            }
+            got++;
+        }
+        _axl_console_device_test_read_tick(d);
+    }
+    test_check(got == 400 && in_order && g_backlog_next == 400 && g_backlog_filtered == 400,
+               "read-backpressure: all 400 keys reach the guest once, in order");
+    test_check(g_backlog_notified == 400 / 26,
+               "read-backpressure: each 'z' notify fired exactly once over all 400 (15)");
+
+    if (ex != NULL && nh != NULL) {
+        ex->UnregisterKeyNotify(ex, nh);
+    }
+    _axl_console_device_test_end(d);
+    gBS->UninstallProtocolInterface(kh, &ex_guid, &kb);
+}
+
+/* A Reset discards only what was typed BEFORE it. The read timer runs at
+   TPL_CALLBACK, so a tick pending while Reset holds TPL raised runs the moment
+   Reset restores it; the seam signals one from inside that raised section,
+   the way a timer interrupt landing there does. Keys the tick reads -- typed
+   after the Reset began -- must survive, not be dropped by a drain that runs
+   after TPL is restored. */
+static AxlConsoleDevice *g_discard_dev;
+static EFI_EVENT         g_discard_tick;
+
+static void EFIAPI
+discard_tick_cb(EFI_EVENT Event, void *Context)
+{
+    (void)Event;
+    (void)Context;
+    _axl_console_device_test_read_tick(g_discard_dev);
+}
+
+static void
+discard_gap_hook(void)
+{
+    g_backlog_total += 3;   /* three keys typed while the Reset runs */
+    gBS->SignalEvent(g_discard_tick);
+}
+
+static void
+test_console_device_discard_keeps_late_keys(void)
+{
+    EFI_GUID ex_guid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
+    static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL kb;
+    kb.Reset           = synth_conin_reset;
+    kb.ReadKeyStrokeEx = backlog_readkeyex;
+
+    EFI_HANDLE kh = NULL;
+    if (gBS->InstallProtocolInterface(&kh, &ex_guid, EFI_NATIVE_INTERFACE, &kb)
+        != EFI_SUCCESS) {
+        test_fail("discard-late: synthetic keyboard installs");
+        return;
+    }
+    if (gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, discard_tick_cb, NULL,
+                         &g_discard_tick) != EFI_SUCCESS) {
+        test_fail("discard-late: tick event created");
+        gBS->UninstallProtocolInterface(kh, &ex_guid, &kb);
+        return;
+    }
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    g_discard_dev = d;
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    test_check(_axl_console_device_test_add_evicted_conin(d, kh),
+               "discard-late: synthetic keyboard evicted into the read list");
+
+    /* Five keys typed ahead ('a'..'e') reach the ring. */
+    g_backlog_total = 5;
+    g_backlog_next  = 0;
+    _axl_console_device_test_read_tick(d);
+    test_check(axl_console_device_queued_keys(d) == 5,
+               "discard-late: five typed-ahead keys queued before the Reset");
+
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_device_test_coninex(d);
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL    *in = _axl_console_device_test_conin(d);
+    _axl_console_device_test_set_discard_hook(d, discard_gap_hook);
+    test_check(in != NULL && in->Reset(in, FALSE) == EFI_SUCCESS,
+               "discard-late: Reset succeeds");
+    _axl_console_device_test_set_discard_hook(d, NULL);
+
+    /* The five are gone; the three typed during the Reset ('f'..'h') remain. */
+    char   got[8] = {0};
+    size_t n = 0;
+    EFI_KEY_DATA kd;
+    while (ex != NULL && n < sizeof(got) - 1 && ex->ReadKeyStrokeEx(ex, &kd) == EFI_SUCCESS) {
+        got[n++] = (char)kd.Key.UnicodeChar;
+    }
+    test_check(axl_strcmp(got, "fgh") == 0,
+               "discard-late: Reset drops the 5 typed before it, keeps the 3 typed during it");
+
+    _axl_console_device_test_end(d);
+    g_discard_dev = NULL;
+    gBS->CloseEvent(g_discard_tick);
+    gBS->UninstallProtocolInterface(kh, &ex_guid, &kb);
+}
+
+/* An evicted keyboard's own notify list, deduplicating like EDK2's TerminalDxe,
+   Ps2KeyboardDxe and UsbKbDxe: an identical (key, function) registration hands
+   back the EXISTING handle. */
+#define SCRUB_SLOTS 4
+static struct {
+    EFI_KEY_DATA            key;
+    EFI_KEY_NOTIFY_FUNCTION fn;
+    bool                    used;
+} scrub_kb_notify[SCRUB_SLOTS];
+
+static EFI_STATUS EFIAPI
+scrub_kb_register(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *kd,
+                  EFI_KEY_NOTIFY_FUNCTION fn, void **h)
+{
+    (void)This;
+    for (int i = 0; i < SCRUB_SLOTS; i++) {
+        if (scrub_kb_notify[i].used && scrub_kb_notify[i].fn == fn
+            && scrub_kb_notify[i].key.Key.ScanCode == kd->Key.ScanCode
+            && scrub_kb_notify[i].key.Key.UnicodeChar == kd->Key.UnicodeChar) {
+            *h = &scrub_kb_notify[i];
+            return EFI_SUCCESS;
+        }
+    }
+    for (int i = 0; i < SCRUB_SLOTS; i++) {
+        if (!scrub_kb_notify[i].used) {
+            scrub_kb_notify[i].key  = *kd;
+            scrub_kb_notify[i].fn   = fn;
+            scrub_kb_notify[i].used = true;
+            *h = &scrub_kb_notify[i];
+            return EFI_SUCCESS;
+        }
+    }
+    return EFI_OUT_OF_RESOURCES;
+}
+
+static EFI_STATUS EFIAPI
+scrub_kb_unregister(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *h)
+{
+    (void)This;
+    for (int i = 0; i < SCRUB_SLOTS; i++) {
+        if (h == &scrub_kb_notify[i] && scrub_kb_notify[i].used) {
+            scrub_kb_notify[i].used = false;
+            return EFI_SUCCESS;
+        }
+    }
+    return EFI_INVALID_PARAMETER;
+}
+
+static int
+scrub_kb_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < SCRUB_SLOTS; i++) {
+        n += scrub_kb_notify[i].used ? 1 : 0;
+    }
+    return n;
+}
+
+/* ConSplitter registers every notify on every member and, when a member is
+   removed, unregisters NOTHING from it (ConSplitterTextInExDeleteDevice). So a
+   keyboard the device evicted would keep the Shell's Ctrl-C/Ctrl-S notifies; the
+   Shell's exit unregisters them only from the members left, and once the Shell's
+   image is freed the keyboard's next 'c' calls freed code (its key match ignores
+   the shift state). Evicting a keyboard removes from it every notify the device
+   holds -- what ConSplitter registered on both. */
+static void
+test_console_device_notify_scrub(void)
+{
+    EFI_GUID ex_guid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
+    static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL kb;
+    kb.Reset               = synth_conin_reset;
+    kb.ReadKeyStrokeEx     = synth_conin_readkeyex;
+    kb.RegisterKeyNotify   = scrub_kb_register;
+    kb.UnregisterKeyNotify = scrub_kb_unregister;
+    axl_memset(scrub_kb_notify, 0, sizeof(scrub_kb_notify));
+
+    EFI_HANDLE kh = NULL;
+    test_check(gBS->InstallProtocolInterface(&kh, &ex_guid, EFI_NATIVE_INTERFACE, &kb)
+                   == EFI_SUCCESS,
+               "notify-scrub: a deduplicating keyboard installs");
+
+    /* Before the take-over: ConSplitter registered the Shell's Ctrl+C and
+       Ctrl+S on the keyboard, and something of the keyboard's own owner too. */
+    EFI_KEY_DATA reg_c   = key_data(0, 'c', CTRL_C_SHIFT, 0);
+    EFI_KEY_DATA reg_s   = key_data(0, 's', CTRL_C_SHIFT, 0);
+    EFI_KEY_DATA reg_own = key_data(0, 'q', 0, 0);
+    void        *h       = NULL;
+    kb.RegisterKeyNotify(&kb, &reg_c, on_key_notify, &h);
+    kb.RegisterKeyNotify(&kb, &reg_s, on_key_notify, &h);
+    kb.RegisterKeyNotify(&kb, &reg_own, on_key_notify, &h);
+
+    /* The take-over: the device joins, so ConSplitter registers its list -- the
+       Shell's two -- on the device too; then the keyboard is evicted. */
+    AxlConsoleDevice                  *d  = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_device_test_coninex(d);
+    void *dh = NULL;
+    ex->RegisterKeyNotify(ex, &reg_c, on_key_notify, &dh);
+    ex->RegisterKeyNotify(ex, &reg_s, on_key_notify, &dh);
+    test_check(scrub_kb_count() == 3, "notify-scrub: the keyboard holds three notifies");
+    _axl_console_device_test_add_evicted_conin(d, kh);
+    test_check(scrub_kb_count() == 1,
+               "notify-scrub: eviction removes the notifies ConSplitter registered on it");
+    test_check(scrub_kb_notify[2].used && scrub_kb_notify[2].key.Key.UnicodeChar == 'q',
+               "notify-scrub: and leaves one ConSplitter did not");
+
+    /* The Shell's copies on the device itself are untouched: its Ctrl-C still
+       works while the keyboard is evicted. */
+    notify_calls = 0;
+    axl_console_device_inject_key_ex(d, 0, 'c', CTRL_C_SHIFT, 0);
+    test_check(notify_calls == 1,
+               "notify-scrub: an injected Ctrl+C still fires the device's own copy");
+
+    _axl_console_device_test_end(d);
+    gBS->UninstallProtocolInterface(kh, &ex_guid, &kb);
 }
 
 /* AxlConsoleTerm — the local AxlConsoleOps sink. This pins the cell model + op
@@ -7630,6 +10211,14 @@ test_console_tap_shift_state_aliases(void)
                "shift_alias: AXL_CONSOLE_RIGHT_ALT_PRESSED == EFI_RIGHT_ALT_PRESSED");
     test_check(AXL_CONSOLE_LEFT_ALT_PRESSED == EFI_LEFT_ALT_PRESSED,
                "shift_alias: AXL_CONSOLE_LEFT_ALT_PRESSED == EFI_LEFT_ALT_PRESSED");
+    test_check(AXL_CONSOLE_LEFT_LOGO_PRESSED == EFI_LEFT_LOGO_PRESSED,
+               "shift_alias: AXL_CONSOLE_LEFT_LOGO_PRESSED == EFI_LEFT_LOGO_PRESSED");
+    test_check(AXL_CONSOLE_TOGGLE_STATE_VALID == EFI_TOGGLE_STATE_VALID,
+               "shift_alias: AXL_CONSOLE_TOGGLE_STATE_VALID == EFI_TOGGLE_STATE_VALID");
+    test_check(AXL_CONSOLE_KEY_STATE_EXPOSED == EFI_KEY_STATE_EXPOSED,
+               "shift_alias: AXL_CONSOLE_KEY_STATE_EXPOSED == EFI_KEY_STATE_EXPOSED");
+    test_check(AXL_CONSOLE_TOGGLE_KEYBOARD == 0xC0u,
+               "shift_alias: AXL_CONSOLE_TOGGLE_KEYBOARD == 0xC0 (VALID | EXPOSED)");
 }
 
 // ---------------------------------------------------------------------------
@@ -7645,9 +10234,10 @@ test_console_mirror_altscreen_input(void)
                                     /*input_capture=*/false, /*passthrough=*/false);
     cm_cap_reset();
     test_check(!axl_console_mirror_in_alt_screen(cm_enc), "altscreen: starts outside");
+    /* The switch, then the screen on show (here blank, cursor home). */
     axl_console_mirror_enter_alt_screen(cm_enc);
-    test_check(axl_strcmp(cm_cap, "\x1b[?1049h") == 0,
-               "altscreen: enter emits exactly ESC[?1049h");
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049h\x1b[m\x1b[2J\x1b[m\x1b[?25h\x1b[1;1H") == 0,
+               "altscreen: enter emits exactly ESC[?1049h + the blank screen");
     test_check(axl_console_mirror_in_alt_screen(cm_enc), "altscreen: in_alt after enter");
 
     cm_cap_reset();
@@ -7656,8 +10246,8 @@ test_console_mirror_altscreen_input(void)
 
     cm_cap_reset();
     axl_console_mirror_leave_alt_screen(cm_enc);
-    test_check(axl_strcmp(cm_cap, "\x1b[?1049l") == 0,
-               "altscreen: leave emits exactly ESC[?1049l");
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049l\x1b[m\x1b[2J\x1b[m\x1b[?25h\x1b[1;1H") == 0,
+               "altscreen: leave emits exactly ESC[?1049l + the blank screen");
     test_check(!axl_console_mirror_in_alt_screen(cm_enc), "altscreen: out after leave");
 
     cm_cap_reset();
@@ -7788,8 +10378,8 @@ test_console_tap_sanitize(void)
 
     cm_cap_reset();
     _axl_console_tap_test_puts("a\bb\tc\rd\ne");
-    test_check(axl_strcmp(cm_cap, "a\bb\tc\rd\ne") == 0,
-               "sanitize: BS/TAB/CR/LF pass through (the EFI control chars)");
+    test_check(axl_strcmp(cm_cap, "a\bb c\rd\ne") == 0,
+               "sanitize: BS/CR/LF pass through, a TAB is one space (the EFI control chars)");
 
     /* The substituted '?' is printable, so it advances the cursor like EDK2's does. */
     _axl_console_tap_test_set_cursor(0, 0);
@@ -8060,18 +10650,22 @@ test_console_mirror_golden_vt(void)
     _axl_console_tap_test_puts("Hi");       /* raw UTF-8                */
     _axl_console_tap_test_set_attr(0x1F);   /* fg 15 -> 97, bg 1 -> 44  */
     _axl_console_tap_test_enable_cursor(false); /* ESC[?25l             */
-    axl_console_mirror_enter_alt_screen(cm_enc);/* ESC[?1049h           */
-    axl_console_mirror_leave_alt_screen(cm_enc);/* ESC[?1049l           */
+    axl_console_mirror_enter_alt_screen(cm_enc);/* ESC[?1049h + repaint */
+    axl_console_mirror_leave_alt_screen(cm_enc);/* ESC[?1049l + repaint */
 
+    /* A 1049 switch carries the screen on show: default pen, clear, "Hi", the
+       cursor (hidden) after "Hi", then the console's pen. */
+#define GOLDEN_REPAINT "\x1b[m\x1b[2J\x1b[m\x1b[6;11HHi\x1b[?25l\x1b[6;13H\x1b[0;97;44m"
     test_check(axl_strcmp(cm_cap,
                           "\x1b[2J\x1b[H"
                           "\x1b[6;11H"
                           "Hi"
                           "\x1b[0;97;44m"
                           "\x1b[?25l"
-                          "\x1b[?1049h"
-                          "\x1b[?1049l") == 0,
+                          "\x1b[?1049h" GOLDEN_REPAINT
+                          "\x1b[?1049l" GOLDEN_REPAINT) == 0,
                "golden_vt: emitted stream is byte-identical to the pinned golden");
+#undef GOLDEN_REPAINT
     cm_tap_end(t);
 }
 
@@ -9880,6 +12474,7 @@ test_args_s64_bounds(void)
 static void test_args_numeric_default_value_applied(void);
 static void test_args_get_uint_offset(void);
 static void test_args_help_prolog_epilog(void);
+static void test_args_is_set(void);
 
 static void
 test_args(void)
@@ -9920,6 +12515,7 @@ test_args(void)
     test_args_numeric_default_value_applied();
     test_args_get_uint_offset();
     test_args_help_prolog_epilog();
+    test_args_is_set();
 }
 
 /* Regression: AXL_ARG_U16/U32/U64 with .default_value="N" should
@@ -10123,6 +12719,193 @@ test_args_help_prolog_epilog(void)
                    "args help prolog: bare --help still emits Usage section");
         test_check(!has_xyzzy && !has_plugh,
                    "args help prolog: NULL prolog/epilog → nothing extra printed");
+    }
+}
+
+/* axl_args_is_set: given on the command line vs absent or only defaulted.
+   The capture runs in the handler, where the parsed argv is live. */
+typedef struct {
+    int      calls;
+    bool     port;      ///< is_set("port")
+    bool     ro;        ///< is_set("ro")
+    bool     multi;     ///< is_set("exempt")
+    bool     pos;       ///< is_set("file")
+    bool     unknown;   ///< is_set("nosuch")
+    bool     null_name; ///< is_set(a, NULL)
+    uint64_t port_val;
+    bool     ro_val;
+} IsSetCapture;
+
+static int
+is_set_handler(AxlArgs *a)
+{
+    IsSetCapture *c = (IsSetCapture *)axl_args_user_data(a);
+    c->calls++;
+    c->port      = axl_args_is_set(a, "port");
+    c->ro        = axl_args_is_set(a, "ro");
+    c->multi     = axl_args_is_set(a, "exempt");
+    c->pos       = axl_args_is_set(a, "file");
+    c->unknown   = axl_args_is_set(a, "nosuch");
+    c->null_name = axl_args_is_set(a, NULL);
+    c->port_val  = axl_args_get_uint(a, "port");
+    c->ro_val    = axl_args_get_bool(a, "ro");
+    return 0;
+}
+
+static const AxlArgDesc is_set_flags[] = {
+    { .name = "port", .short_name = 'p', .type = AXL_ARG_U64,
+      .default_value = "22", .help = "port" },
+    { .name = "ro", .short_name = 'r', .type = AXL_ARG_BOOL, .help = "ro" },
+    { .name = "exempt", .short_name = 'x', .type = AXL_ARG_MULTI, .help = "x" },
+    {0}
+};
+static const AxlArgDesc is_set_pos[] = {
+    { .name = "file", .type = AXL_ARG_STRING, .help = "file" },
+    {0}
+};
+
+static IsSetCapture
+run_is_set(bool compact, int argc, char **argv, int *rc)
+{
+    IsSetCapture c = { 0 };
+    AxlArgsNode app = {
+        .name = "t", .flags = is_set_flags, .positionals = is_set_pos,
+        .handler = is_set_handler, .compact_flags = compact, .user_data = &c,
+    };
+    *rc = axl_args_run(argc, argv, &app);
+    return c;
+}
+
+/* Nested: the root declares `port` and `verbose`; the leaf redeclares
+   `port`, so its own (unset) slot shadows the root's. */
+typedef struct {
+    int  calls;
+    bool port;
+    bool verbose;
+} IsSetNested;
+
+static int
+is_set_nested_leaf(AxlArgs *a)
+{
+    IsSetNested *c = (IsSetNested *)axl_args_user_data(a);
+    c->calls++;
+    c->port    = axl_args_is_set(a, "port");
+    c->verbose = axl_args_is_set(a, "verbose");
+    return 0;
+}
+
+static void
+test_args_is_set(void)
+{
+    int rc = -1;
+
+    {
+        char *argv[] = { (char *)"t", (char *)"-p", (char *)"2222" };
+        IsSetCapture c = run_is_set(false, 3, argv, &rc);
+        test_check(rc == 0 && c.calls == 1, "args is_set: -p 2222 runs");
+        test_check(c.port && c.port_val == 2222, "args is_set: -p 2222 is set");
+        test_check(!c.ro, "args is_set: an absent bool is not set");
+        test_check(!c.multi, "args is_set: an absent multi is not set");
+        test_check(!c.pos, "args is_set: an absent positional is not set");
+        test_check(!c.unknown, "args is_set: an unknown name is not set");
+        test_check(!c.null_name, "args is_set: a NULL name is not set");
+    }
+    {
+        char *argv[] = { (char *)"t" };
+        IsSetCapture c = run_is_set(false, 1, argv, &rc);
+        test_check(rc == 0 && !c.port && c.port_val == 22,
+                   "args is_set: a defaulted flag is not set, getter reads 22");
+    }
+    {
+        /* A value equal to the default still counts as given. */
+        char *argv[] = { (char *)"t", (char *)"--port=22" };
+        IsSetCapture c = run_is_set(false, 2, argv, &rc);
+        test_check(rc == 0 && c.port && c.port_val == 22,
+                   "args is_set: --port=22 (the default) is set");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"--ro=false" };
+        IsSetCapture c = run_is_set(false, 2, argv, &rc);
+        test_check(rc == 0 && c.ro && !c.ro_val,
+                   "args is_set: --ro=false is set, and reads false");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"-r" };
+        IsSetCapture c = run_is_set(false, 2, argv, &rc);
+        test_check(rc == 0 && c.ro && c.ro_val, "args is_set: -r is set");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"-r:false" };
+        IsSetCapture c = run_is_set(true, 2, argv, &rc);
+        test_check(rc == 0 && c.ro && !c.ro_val,
+                   "args is_set: compact -r:false is set, and reads false");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"-rfalse" };
+        IsSetCapture c = run_is_set(true, 2, argv, &rc);
+        test_check(rc == 0 && c.ro && !c.ro_val,
+                   "args is_set: compact -rfalse is set, and reads false");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"-p", (char *)"1",
+                         (char *)"-p", (char *)"2" };
+        IsSetCapture c = run_is_set(false, 5, argv, &rc);
+        test_check(rc == 0 && c.port && c.port_val == 2,
+                   "args is_set: a repeated flag is set, getter reads the last");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"-x", (char *)"10.0.2.2/32" };
+        IsSetCapture c = run_is_set(false, 3, argv, &rc);
+        test_check(rc == 0 && c.multi, "args is_set: one -x sets the multi");
+    }
+    {
+        char *argv[] = { (char *)"t", (char *)"f.txt" };
+        IsSetCapture c = run_is_set(false, 2, argv, &rc);
+        test_check(rc == 0 && c.pos, "args is_set: a given positional is set");
+    }
+    test_check(!axl_args_is_set(NULL, "port"), "args is_set: NULL args is false");
+
+    /* Nested: the leaf's own `port` shadows the root's. */
+    static const AxlArgDesc root_flags[] = {
+        { .name = "port", .type = AXL_ARG_U64, .help = "root port" },
+        { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL, .help = "v" },
+        {0}
+    };
+    static const AxlArgDesc leaf_flags[] = {
+        { .name = "port", .type = AXL_ARG_U64, .help = "leaf port" },
+        {0}
+    };
+    {
+        IsSetNested c = { 0 };
+        AxlArgsNode leaf[] = {
+            { .name = "go", .flags = leaf_flags, .handler = is_set_nested_leaf,
+              .help = "leaf" },
+            {0}
+        };
+        AxlArgsNode root = { .name = "t", .flags = root_flags, .verbs = leaf,
+                             .user_data = &c };
+        char *argv[] = { (char *)"t", (char *)"--port=5", (char *)"-v",
+                         (char *)"go" };
+        rc = axl_args_run(4, argv, &root);
+        test_check(rc == 0 && c.calls == 1, "args is_set nested: dispatches");
+        test_check(!c.port,
+                   "args is_set nested: a root --port is not the leaf's port");
+        test_check(c.verbose,
+                   "args is_set nested: a root-only -v is visible from the leaf");
+    }
+    {
+        IsSetNested c = { 0 };
+        AxlArgsNode leaf[] = {
+            { .name = "go", .flags = leaf_flags, .handler = is_set_nested_leaf,
+              .help = "leaf" },
+            {0}
+        };
+        AxlArgsNode root = { .name = "t", .flags = root_flags, .verbs = leaf,
+                             .user_data = &c };
+        char *argv[] = { (char *)"t", (char *)"go", (char *)"--port=5" };
+        rc = axl_args_run(3, argv, &root);
+        test_check(rc == 0 && c.port && !c.verbose,
+                   "args is_set nested: the leaf's own --port is set");
     }
 }
 
@@ -10815,6 +13598,85 @@ test_rand_stream(void)
         "rand: zero seed -> non-degenerate reference word");
 }
 
+/* The 32 bytes at physical (= virtual, on UEFI) address 0 -- where a
+   generator's state lands when it is written through a NULL pointer. On
+   firmware that maps page 0 writable that write is silent, so the return
+   value alone cannot show it. */
+#if defined(__x86_64__)
+#define RAND_LOW_BYTES 32
+
+static void
+rand_low_bytes(
+    uint8_t *out
+    )
+{
+    for (uintptr_t i = 0; i < RAND_LOW_BYTES; i++) {
+        if (axl_mem_phys_read8(i, &out[i]) != AXL_OK) {
+            out[i] = 0;
+        }
+    }
+}
+
+/* Put back what a NULL write changed, so the rest of the run is not on a
+   clobbered page 0 even when the test fails. */
+static bool
+rand_low_bytes_same(
+    const uint8_t *before
+    )
+{
+    uint8_t after[RAND_LOW_BYTES];
+    bool    same = true;
+    rand_low_bytes(after);
+    for (uintptr_t i = 0; i < RAND_LOW_BYTES; i++) {
+        if (after[i] != before[i]) {
+            same = false;
+            if (axl_mem_phys_write8(i, before[i]) != AXL_OK) {
+                axl_printf("rand oom: could not restore byte %u at 0\n", (unsigned)i);
+            }
+        }
+    }
+    return same;
+}
+#endif
+
+/* An allocation failure is a NULL generator, not a write through NULL.
+   On x64 OVMF maps page 0, so a write through NULL lands silently and the
+   page-0 probe is what sees it. On AArch64 page 0 is not RAM: a write
+   through NULL faults and takes the image down -- that fault is this
+   test's failure there -- and the probe itself cannot read it, so only the
+   return value is checked. */
+static void
+test_rand_oom(void)
+{
+    bool same = true;
+#if defined(__x86_64__)
+    uint8_t before[RAND_LOW_BYTES];
+    rand_low_bytes(before);
+#endif
+    axl_mem_fail_next_alloc(1);
+    AxlRand *r = axl_rand_new_seeded(0x1234);
+#if defined(__x86_64__)
+    same = rand_low_bytes_same(before);
+#endif
+    test_check(r == NULL && same,
+               "rand: new_seeded under OOM -> NULL, nothing written through it");
+    axl_rand_free(r);
+
+    AxlRand *src = axl_rand_new_seeded(0x1234);
+#if defined(__x86_64__)
+    rand_low_bytes(before);
+#endif
+    axl_mem_fail_next_alloc(1);
+    AxlRand *copy = axl_rand_copy(src);
+#if defined(__x86_64__)
+    same = rand_low_bytes_same(before);
+#endif
+    test_check(src != NULL && copy == NULL && same,
+               "rand: copy under OOM -> NULL, nothing written through it");
+    axl_rand_free(copy);
+    axl_rand_free(src);
+}
+
 static void
 test_rand_derived(void)
 {
@@ -11190,8 +14052,8 @@ test_tar_reader_rejects_bad(void)
     axl_fseek(buf, 0, AXL_SEEK_SET);
     AxlTarReader *r = axl_tar_reader_new(buf);
     AxlTarEntry e;
-    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
-               "tar: garbage/truncated input rejected");
+    test_check(axl_tar_reader_next(r, &e) == AXL_INCOMPLETE,
+               "tar: 100 bytes -- a header cut short -- is AXL_INCOMPLETE");
     axl_tar_reader_free(r);
     axl_fclose(buf);
 
@@ -11210,8 +14072,8 @@ test_tar_reader_rejects_bad(void)
     axl_write(b3, raw, n);
     axl_fseek(b3, 0, AXL_SEEK_SET);
     AxlTarReader *r3 = axl_tar_reader_new(b3);
-    test_check(axl_tar_reader_next(r3, &e) == AXL_ERR,
-               "tar: corrupted header (bad checksum) rejected");
+    test_check(axl_tar_reader_next(r3, &e) == AXL_INVALID,
+               "tar: corrupted header (bad checksum) is AXL_INVALID");
     axl_tar_reader_free(r3);
     axl_fclose(b3);
     axl_free(raw);
@@ -11219,6 +14081,708 @@ test_tar_reader_rejects_bad(void)
     /* NULL guards. */
     test_check(axl_tar_writer_new(NULL) == NULL, "tar: writer_new(NULL) -> NULL");
     test_check(axl_tar_reader_new(NULL) == NULL, "tar: reader_new(NULL) -> NULL");
+}
+
+/* Write one raw 512-byte tar header to @p s, for the records the writer
+   never produces (GNU 'L'/'K', pax 'x'/'g', links). @p name is copied as
+   @p name_len bytes so a test can embed a NUL; @p posix picks the POSIX
+   magic ("ustar" NUL "00") over GNU's ("ustar  " NUL). @p gnu_extra, when
+   non-NULL, is written at offset 345 -- where a GNU header keeps its
+   atime/ctime, and a POSIX one its prefix. */
+static void
+tar_raw_header(
+    AxlStream   *s,
+    const char  *name,
+    size_t       name_len,
+    char         type,
+    uint64_t     size,
+    bool         posix,
+    const char  *gnu_extra
+    )
+{
+    uint8_t hdr[AXL_TAR_BLOCK];
+    axl_memset(hdr, 0, sizeof hdr);
+    axl_memcpy(hdr, name, name_len);
+    axl_memcpy(hdr + 100, "0000644", 7);
+    axl_memcpy(hdr + 108, "0000000", 7);
+    axl_memcpy(hdr + 116, "0000000", 7);
+    for (int i = 10; i >= 0; i--) {             /* 11 octal digits + NUL */
+        hdr[124 + i] = (uint8_t)('0' + (size & 7));
+        size >>= 3;
+    }
+    axl_memcpy(hdr + 136, "00000000000", 11);
+    hdr[156] = (uint8_t)type;
+    if (posix) {
+        axl_memcpy(hdr + 257, "ustar\0" "00", 8);
+    } else {
+        axl_memcpy(hdr + 257, "ustar  ", 8);   /* 7 chars + NUL */
+    }
+    if (gnu_extra != NULL) {
+        axl_memcpy(hdr + 345, gnu_extra, axl_strlen(gnu_extra));
+    }
+    axl_memset(hdr + 148, ' ', 8);
+    unsigned sum = 0;
+    for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) { sum += hdr[i]; }
+    for (int i = 5; i >= 0; i--) {              /* 6 octal digits, NUL, ' ' */
+        hdr[148 + i] = (uint8_t)('0' + (sum & 7));
+        sum >>= 3;
+    }
+    hdr[154] = '\0';
+    hdr[155] = ' ';
+    axl_write(s, hdr, sizeof hdr);
+}
+
+/* Write @p len data bytes, zero-padded to the block size. */
+static void
+tar_raw_data(
+    AxlStream   *s,
+    const void  *data,
+    size_t       len
+    )
+{
+    uint8_t zeros[AXL_TAR_BLOCK];
+    axl_memset(zeros, 0, sizeof zeros);
+    if (len > 0) { axl_write(s, data, len); }
+    size_t pad = (AXL_TAR_BLOCK - (len % AXL_TAR_BLOCK)) % AXL_TAR_BLOCK;
+    if (pad > 0) { axl_write(s, zeros, pad); }
+}
+
+/* Two zero blocks: end of archive. */
+static void
+tar_raw_end(
+    AxlStream  *s
+    )
+{
+    tar_raw_data(s, NULL, 0);
+    uint8_t zeros[2 * AXL_TAR_BLOCK];
+    axl_memset(zeros, 0, sizeof zeros);
+    axl_write(s, zeros, sizeof zeros);
+}
+
+/* Append one pax record "LEN key=value\n" to @p out (LEN counts itself).
+   Returns the new length. */
+static size_t
+tar_pax_record(
+    char        *out,
+    size_t       at,
+    const char  *key,
+    const char  *value
+    )
+{
+    size_t base = axl_strlen(key) + axl_strlen(value) + 3;  /* ' ' '=' '\n' */
+    size_t len  = base + 1;
+    for (;;) {
+        size_t digits = 0;
+        for (size_t v = len; v > 0; v /= 10) { digits++; }
+        if (len == base + digits) { break; }
+        len++;
+    }
+    return at + (size_t)axl_snprintf(out + at, len + 1, "%zu %s=%s\n",
+                                     len, key, value);
+}
+
+/* A run of @p n copies of @p c, NUL-terminated, in @p buf. */
+static char *
+tar_fill(
+    char    *buf,
+    size_t   n,
+    char     c
+    )
+{
+    axl_memset(buf, c, n);
+    buf[n] = '\0';
+    return buf;
+}
+
+static void
+test_tar_gnu_long_name(void)
+{
+    char longname[160];
+    tar_fill(longname, 150, 'n');
+    AxlStream *s = axl_bufopen();
+    tar_raw_header(s, "././@LongLink", 13, 'L', 151, false, NULL);
+    tar_raw_data(s, longname, 151);                    /* name + its NUL */
+    tar_raw_header(s, longname, 100, '0', 3, false, NULL);   /* the cut name */
+    tar_raw_data(s, "abc", 3);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    char          data[8];
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, longname) == 0 && !e.name_refused
+               && e.type == AXL_TAR_TYPE_FILE && e.size == 3,
+               "tar: a GNU 'L' record names the member after it, whole");
+    test_check(tar_read_all(r, data, sizeof data) == 3
+               && axl_memcmp(data, "abc", 3) == 0,
+               "tar: the GNU long-named member's data follows");
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: no stray @LongLink entry; end of archive");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+static void
+test_tar_pax_long_name(void)
+{
+    char longname[160];
+    tar_fill(longname, 150, 'p');
+    char   rec[512];
+    size_t n = tar_pax_record(rec, 0, "mtime", "1700000000.5");
+    n = tar_pax_record(rec, n, "path", longname);
+    n = tar_pax_record(rec, n, "size", "3");
+
+    AxlStream *s = axl_bufopen();
+    tar_raw_header(s, "pax_global_header", 17, 'g', 0, true, NULL);
+    tar_raw_header(s, "PaxHeaders.1/x", 14, 'x', n, true, NULL);
+    tar_raw_data(s, rec, n);
+    tar_raw_header(s, longname, 100, '0', 0, true, NULL);  /* size from pax */
+    tar_raw_data(s, "xyz", 3);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    char          data[8];
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.type == AXL_TAR_TYPE_GLOBAL && !e.name_refused,
+               "tar: a pax 'g' header is reported as AXL_TAR_TYPE_GLOBAL");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, longname) == 0 && !e.name_refused
+               && e.type == AXL_TAR_TYPE_FILE && e.size == 3,
+               "tar: pax 'path' names the member whole; pax 'size' wins");
+    test_check(tar_read_all(r, data, sizeof data) == 3
+               && axl_memcmp(data, "xyz", 3) == 0,
+               "tar: the pax-named member's data is sized by the pax 'size'");
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: no stray PaxHeaders entry; end of archive");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+static void
+test_tar_refused_names(void)
+{
+    char big[310];
+    tar_fill(big, 300, 'q');
+    char   rec[512];
+    size_t n = tar_pax_record(rec, 0, "path", big);
+
+    AxlStream *s = axl_bufopen();
+    /* 1: a GNU long name over AXL_TAR_NAME_MAX - 1 bytes. */
+    tar_raw_header(s, "././@LongLink", 13, 'L', 301, false, NULL);
+    tar_raw_data(s, big, 301);
+    tar_raw_header(s, big, 100, '0', 3, false, NULL);
+    tar_raw_data(s, "abc", 3);
+    /* 2: the same as a pax path. */
+    tar_raw_header(s, "PaxHeaders.1/q", 14, 'x', n, true, NULL);
+    tar_raw_data(s, rec, n);
+    tar_raw_header(s, big, 100, '0', 3, true, NULL);
+    tar_raw_data(s, "abc", 3);
+    /* 3: a name field with bytes after its NUL. */
+    tar_raw_header(s, "abc\0def", 7, '0', 3, true, NULL);
+    tar_raw_data(s, "abc", 3);
+    /* 4: a GNU header keeps atime at offset 345 -- not a prefix. */
+    tar_raw_header(s, "g.txt", 5, '0', 0, false, "12345670123");
+    /* 5: a GNU 'K' long link name, then the symlink it belongs to. */
+    tar_raw_header(s, "././@LongLink", 13, 'K', 4, false, NULL);
+    tar_raw_data(s, "tgt", 4);
+    tar_raw_header(s, "lnk", 3, '2', 0, false, NULL);
+    /* 6: an ordinary member still reads after all of the above. */
+    tar_raw_header(s, "next.txt", 8, '0', 2, true, NULL);
+    tar_raw_data(s, "ok", 2);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    char          data[8];
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.name_refused && e.name[0] == '\0',
+               "tar: a 300-byte GNU long name is refused, the name left empty");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.name_refused && e.name[0] == '\0',
+               "tar: a 300-byte pax path is refused, the name left empty");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.name_refused && e.name[0] == '\0',
+               "tar: a name field with bytes after its NUL is refused, not cut");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK && !e.name_refused
+               && axl_strcmp(e.name, "g.txt") == 0,
+               "tar: a GNU header's offset-345 data is not read as a prefix");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK && !e.name_refused
+               && e.type == '2' && axl_strcmp(e.name, "lnk") == 0,
+               "tar: a GNU 'K' is consumed; the symlink keeps its typeflag");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK && !e.name_refused
+               && axl_strcmp(e.name, "next.txt") == 0 && e.size == 2
+               && tar_read_all(r, data, sizeof data) == 2
+               && axl_memcmp(data, "ok", 2) == 0,
+               "tar: the members after refused ones read intact");
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: end of archive after the refused names");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+/* Each ustar name boundary: round-trips whole, or AXL_ERR. */
+static void
+test_tar_ustar_boundaries(void)
+{
+    char n100[110];
+    char n101[110];
+    char p155[300];
+    char p156[300];
+    char d99[110];
+    char d100[110];
+    tar_fill(n100, 100, 'a');
+    tar_fill(n101, 101, 'b');
+    tar_fill(p155, 155, 'p');
+    p155[155] = '/';
+    tar_fill(p155 + 156, 100, 'n');             /* 155 + 1 + 100 = 256 */
+    tar_fill(p156, 156, 'p');
+    axl_memcpy(p156 + 156, "/f", 3);
+    tar_fill(d99, 99, 'd');
+    tar_fill(d100, 100, 'e');
+
+    AxlStream    *s = axl_bufopen();
+    AxlTarWriter *w = axl_tar_writer_new(s);
+    test_check(axl_tar_writer_add(w, n100, 0644, "x", 1) == AXL_OK,
+               "tar: a 100-byte name fits the name field");
+    test_check(axl_tar_writer_add(w, n101, 0644, "x", 1) == AXL_ERR,
+               "tar: a 101-byte name with no '/' is refused");
+    test_check(axl_tar_writer_add(w, p155, 0644, "x", 1) == AXL_OK,
+               "tar: a 155-byte prefix + '/' + 100-byte name (256) splits");
+    test_check(axl_tar_writer_add(w, p156, 0644, "x", 1) == AXL_ERR,
+               "tar: a 156-byte prefix is refused");
+    test_check(axl_tar_writer_add_dir(w, d99, 0755) == AXL_OK,
+               "tar: a 99-byte directory fits (100 with its '/')");
+    test_check(axl_tar_writer_add_dir(w, d100, 0755) == AXL_ERR,
+               "tar: a 100-byte directory is refused (101 with its '/')");
+    axl_tar_writer_finish(w);
+    axl_tar_writer_free(w);
+
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    char          d99s[110];
+    axl_snprintf(d99s, sizeof d99s, "%s/", d99);
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, n100) == 0,
+               "tar: the 100-byte name reads back whole");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, p155) == 0,
+               "tar: the 256-byte split name reads back whole");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, d99s) == 0 && e.type == AXL_TAR_TYPE_DIR,
+               "tar: the 99-byte directory reads back with its '/'");
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: nothing was written for the refused names");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+/* An archive of one metadata record (@p type, @p n bytes of @p data), the
+   member "m.txt" (header size @p m_size, holding @p m_size bytes of 'm'),
+   then "after.txt" ("ok"), then the end. Positioned at the start. */
+static AxlStream *
+tar_meta_archive(
+    char         type,
+    const char  *data,
+    size_t       n,
+    uint64_t     m_size
+    )
+{
+    char m_data[600];
+    axl_memset(m_data, 'm', sizeof m_data);
+    AxlStream *s = axl_bufopen();
+    tar_raw_header(s, "PaxHeaders.1/m", 14, type, n, type != 'L', NULL);
+    tar_raw_data(s, data, n);
+    tar_raw_header(s, "m.txt", 5, '0', m_size, true, NULL);
+    tar_raw_data(s, m_data, (size_t)m_size);
+    tar_raw_header(s, "after.txt", 9, '0', 2, true, NULL);
+    tar_raw_data(s, "ok", 2);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    return s;
+}
+
+/* The record refuses "m.txt" -- name empty, its size the HEADER's -- and
+   "after.txt" still reads whole, then the archive ends. */
+static void
+tar_expect_refused(
+    AxlStream   *s,
+    uint64_t     m_size,
+    const char  *what
+    )
+{
+    char          msg[160];
+    char          data[8];
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    bool ok = axl_tar_reader_next(r, &e) == AXL_OK && e.name_refused
+              && e.name[0] == '\0' && e.size == m_size;
+    ok = ok && axl_tar_reader_next(r, &e) == AXL_OK && !e.name_refused
+         && axl_strcmp(e.name, "after.txt") == 0 && e.size == 2
+         && tar_read_all(r, data, sizeof data) == 2
+         && axl_memcmp(data, "ok", 2) == 0;
+    ok = ok && axl_tar_reader_next(r, &e) == AXL_ERR;
+    axl_snprintf(msg, sizeof msg,
+                 "tar: %s refuses the member; the next reads intact", what);
+    test_check(ok, msg);
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+static void
+test_tar_pax_malformed(void)
+{
+    /* Each a hand-spelled record set ("LEN key=value\n", LEN counting
+       the whole record) that is wrong in exactly one way -- and nowhere
+       else, so the check under test is the only one that can refuse it.
+       The length-0 record comes SECOND: first, the byte before it would
+       be outside the buffer. Without its check it never advances. The
+       past-the-end length guards memory only: without that check the
+       reader reads past the record buffer, which only ASan can see. */
+    static const struct { const char *data; size_t n; const char *what; } bad[] = {
+        { "7 a=bc\n0 path=x\n", 16, "a pax record of length 0" },
+        { "9x key=v\n",     9, "a pax length with a non-digit in it" },
+        { "99 path=x\n",   10, "a pax length past the record set" },
+        { "9 path=xy",      9, "a pax record not ending in a newline" },
+        { "9 pathxx\n",     9, "a pax record with no '='" },
+        { "12 path=a\0b\n", 12, "a NUL inside a pax path" },
+        { "11 size=1x\n",  11, "a pax size that is not a number" },
+        { "29 size=99999999999999999999\n", 29, "a pax size past 2^64" },
+        { "28 size=9223372036854775808\n", 28,
+          "a pax size past the 2^63 - 1 bound" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        tar_expect_refused(tar_meta_archive('x', bad[i].data, bad[i].n, 5),
+                           5, bad[i].what);
+    }
+
+    /* A WELL-FORMED record set over the 64 KiB the reader holds -- a 64 KiB
+       comment, then a path -- is stepped over, not parsed: the member is
+       refused, not named "xname". */
+    char *comment = axl_malloc(64u * 1024u + 1u);
+    char *big     = axl_malloc(64u * 1024u + 64u);
+    test_check(comment != NULL && big != NULL, "tar: 64 KiB test buffers");
+    if (comment != NULL && big != NULL) {
+        tar_fill(comment, 64u * 1024u, 'c');
+        size_t big_n = tar_pax_record(big, 0, "comment", comment);
+        big_n = tar_pax_record(big, big_n, "path", "xname");
+        tar_expect_refused(tar_meta_archive('x', big, big_n, 5), 5,
+                           "a well-formed pax record set over 64 KiB");
+    }
+    axl_free(comment);
+    axl_free(big);
+
+    /* A GNU 'L' of size 0 names nothing. */
+    tar_expect_refused(tar_meta_archive('L', "", 0, 5), 5,
+                       "a GNU 'L' of size 0");
+
+    /* P2: a malformed record after a valid size= drops that size too --
+       the member is refused and keeps its HEADER size, 5, not 3. */
+    char   rec[128];
+    size_t n = tar_pax_record(rec, 0, "size", "3");
+    axl_memcpy(rec + n, "9 pathxx\n", 9);
+    tar_expect_refused(tar_meta_archive('x', rec, n + 9, 5), 5,
+                       "a malformed pax set after a valid size");
+}
+
+/* P1: a pax size whose padding would wrap size + pad to 0 must not make
+   the reader parse the member's DATA as the next header. */
+static void
+test_tar_pax_size_wrap(void)
+{
+    char   rec[128];
+    size_t n = tar_pax_record(rec, 0, "size", "18446744073709551600");
+
+    AxlStream *fake = axl_bufopen();              /* a header, as data */
+    tar_raw_header(fake, "fake.txt", 8, '0', 0, true, NULL);
+    size_t   fake_n = 0;
+    uint8_t *fake_b = (uint8_t *)axl_bufsteal(fake, &fake_n);
+    axl_fclose(fake);
+
+    AxlStream *s = axl_bufopen();
+    tar_raw_header(s, "PaxHeaders.1/w", 14, 'x', n, true, NULL);
+    tar_raw_data(s, rec, n);
+    tar_raw_header(s, "w.txt", 5, '0', AXL_TAR_BLOCK, true, NULL);
+    tar_raw_data(s, fake_b, fake_n);
+    tar_raw_header(s, "after.txt", 9, '0', 2, true, NULL);
+    tar_raw_data(s, "ok", 2);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    axl_free(fake_b);
+
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    bool          saw_fake = false;
+    int           count    = 0;
+    bool          refused_first = false;
+    while (axl_tar_reader_next(r, &e) == AXL_OK && count < 8) {
+        if (count == 0) { refused_first = e.name_refused && e.size == AXL_TAR_BLOCK; }
+        if (axl_strcmp(e.name, "fake.txt") == 0) { saw_fake = true; }
+        count++;
+    }
+    test_check(refused_first,
+               "tar: a pax size that would wrap size + padding is refused");
+    test_check(!saw_fake && count == 2,
+               "tar: the header hidden in that member's data is never listed");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+static void
+test_tar_meta_chains(void)
+{
+    AxlTarReader *r;
+    AxlTarEntry   e;
+    AxlStream    *s;
+
+    /* An 'L' immediately before the end, and an 'x' likewise: a clean
+       end, no entry made of the record itself. */
+    s = axl_bufopen();
+    tar_raw_header(s, "././@LongLink", 13, 'L', 6, false, NULL);
+    tar_raw_data(s, "lname", 6);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: a GNU 'L' right before the end ends the archive cleanly");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+
+    char   rec[128];
+    size_t n = tar_pax_record(rec, 0, "path", "xname");
+    s = axl_bufopen();
+    tar_raw_header(s, "PaxHeaders.1/x", 14, 'x', n, true, NULL);
+    tar_raw_data(s, rec, n);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: a pax 'x' right before the end ends the archive cleanly");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+
+    /* 'x' then 'L': the last record wins, as GNU tar and libarchive. */
+    s = axl_bufopen();
+    tar_raw_header(s, "PaxHeaders.1/x", 14, 'x', n, true, NULL);
+    tar_raw_data(s, rec, n);
+    tar_raw_header(s, "././@LongLink", 13, 'L', 6, false, NULL);
+    tar_raw_data(s, "lname", 6);
+    tar_raw_header(s, "cut", 3, '0', 2, false, NULL);
+    tar_raw_data(s, "ok", 2);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK && !e.name_refused
+               && axl_strcmp(e.name, "lname") == 0
+               && axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: a GNU 'L' after a pax 'x' wins; the archive then ends");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+
+    /* 'x' then 'g': the 'x' is not applied to the global header (a size
+       of 600 would make the reader skip the member's header). */
+    n = tar_pax_record(rec, 0, "size", "600");
+    n = tar_pax_record(rec, n, "path", "xname");
+    s = axl_bufopen();
+    tar_raw_header(s, "PaxHeaders.1/x", 14, 'x', n, true, NULL);
+    tar_raw_data(s, rec, n);
+    tar_raw_header(s, "pax_global_header", 17, 'g', 0, true, NULL);
+    tar_raw_header(s, "m.txt", 5, '0', 2, true, NULL);
+    tar_raw_data(s, "ok", 2);
+    tar_raw_end(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.type == AXL_TAR_TYPE_GLOBAL && e.size == 0
+               && !e.name_refused && axl_strcmp(e.name, "pax_global_header") == 0,
+               "tar: a 'g' after an 'x' keeps its own name and size");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, "m.txt") == 0 && e.size == 2,
+               "tar: the member after that 'g' reads intact");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+/* A member whose data the stream ends inside: reading it fails, never a
+   clean short end. */
+/* A WELL-FORMED pax set refused only for its name keeps its size: the
+   member is refused, but reported (and stepped over) at the pax size 3,
+   not the header's 5. */
+static void
+test_tar_pax_name_only_keeps_size(void)
+{
+    char   rec[64];
+    size_t n = tar_pax_record(rec, 0, "size", "3");   /* size, THEN the name */
+    axl_memcpy(rec + n, "12 path=a\0b\n", 12);
+    n += 12;
+    AxlStream    *s = tar_meta_archive('x', rec, n, 5);
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    char          data[8];
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK && e.name_refused
+               && e.name[0] == '\0' && e.size == 3,
+               "tar: a pax set refused only for its name keeps its size (3, not 5)");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, "after.txt") == 0
+               && tar_read_all(r, data, sizeof data) == 2,
+               "tar: the member after it reads intact");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+/* Read a tar from the first @p cut bytes of @p raw: the names it lists,
+   joined with ',', into @p names, and the status the reading ended on. */
+static int
+tar_read_cut(
+    const uint8_t  *raw,
+    size_t          cut,
+    char           *names,
+    size_t          cap
+    )
+{
+    AxlStream *s = axl_bufopen();
+    axl_write(s, raw, cut);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    int           rc;
+    names[0] = '\0';
+    while ((rc = axl_tar_reader_next(r, &e)) == AXL_OK) {
+        size_t at = axl_strlen(names);
+        axl_snprintf(names + at, cap - at, "%s%s", at > 0 ? "," : "", e.name);
+    }
+    /* A reader that has stopped stays stopped, on the same status. */
+    if (axl_tar_reader_next(r, &e) != rc) { rc = 99; }
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+    return rc;
+}
+
+/* The reader tells a real end of archive from a stream that ends early.
+   Layout (as GNU tar's for the same two files): a.txt header 0, data
+   512..1512, padding to 1536; b.txt header 1536, data 2048..2051, padding
+   to 2560; end blocks after. */
+static void
+test_tar_end_vs_truncation(void)
+{
+    char a[1000];
+    axl_memset(a, 'a', sizeof a);
+    AxlStream    *b = axl_bufopen();
+    AxlTarWriter *w = axl_tar_writer_new(b);
+    axl_tar_writer_add(w, "a.txt", 0644, a, sizeof a);
+    axl_tar_writer_add(w, "b.txt", 0644, "bb\n", 3);
+    axl_tar_writer_finish(w);
+    axl_tar_writer_free(w);
+    size_t   n   = 0;
+    uint8_t *raw = (uint8_t *)axl_bufsteal(b, &n);
+    axl_fclose(b);
+    test_check(raw != NULL && n >= 3584, "tar: built the two-member archive");
+    if (raw == NULL || n < 3584) { axl_free(raw); return; }
+
+    static const struct { size_t cut; int rc; const char *names; const char *what; } c[] = {
+        { 3584, AXL_ERR,        "a.txt,b.txt", "two end blocks: a clean end" },
+        { 3072, AXL_ERR,        "a.txt,b.txt", "one end block: a clean end, as GNU tar" },
+        { 2560, AXL_ERR,        "a.txt,b.txt", "EOF at a header boundary: a clean end, as GNU tar" },
+        { 1536, AXL_ERR,        "a.txt",       "EOF at the first header boundary: a clean end" },
+        { 1700, AXL_INCOMPLETE, "a.txt",       "EOF inside a header: truncated" },
+        { 1520, AXL_INCOMPLETE, "a.txt",       "EOF inside padding: truncated" },
+        { 700,  AXL_INCOMPLETE, "a.txt",       "EOF inside data: truncated" },
+        { 2048, AXL_INCOMPLETE, "a.txt,b.txt", "EOF right after a header with data owed: truncated" },
+    };
+    for (size_t i = 0; i < sizeof c / sizeof c[0]; i++) {
+        char names[64];
+        char msg[160];
+        int  rc = tar_read_cut(raw, c[i].cut, names, sizeof names);
+        axl_snprintf(msg, sizeof msg, "tar: %s (cut %zu)", c[i].what, c[i].cut);
+        test_check(rc == c[i].rc && axl_strcmp(names, c[i].names) == 0, msg);
+    }
+
+    /* A header that fails its checksum: AXL_INVALID, not an end. */
+    raw[1536] ^= 0x01;
+    char names[64];
+    test_check(tar_read_cut(raw, n, names, sizeof names) == AXL_INVALID
+               && axl_strcmp(names, "a.txt") == 0,
+               "tar: a header failing its checksum is AXL_INVALID, not an end");
+    axl_free(raw);
+
+    /* A GNU 'L' record whose data the stream ends inside: truncated. */
+    AxlStream *s = axl_bufopen();
+    tar_raw_header(s, "././@LongLink", 13, 'L', 100, false, NULL);
+    axl_write(s, "lname", 5);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    test_check(axl_tar_reader_next(r, &e) == AXL_INCOMPLETE,
+               "tar: a GNU 'L' record cut short is AXL_INCOMPLETE");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+
+    /* A whole 'L' record, then the stream ends at the block boundary: the
+       member it names is missing -- truncated, not a clean end. */
+    s = axl_bufopen();
+    tar_raw_header(s, "././@LongLink", 13, 'L', 6, false, NULL);
+    tar_raw_data(s, "lname", 6);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_INCOMPLETE,
+               "tar: a stream ending after an 'L', before its member, is AXL_INCOMPLETE");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+
+    /* The same for the records that leave nothing to apply: a 'K' (its
+       link name is dropped) and an 'x' holding only an ignored key. Each
+       announced a member; the stream ending before it is a truncation. */
+    s = axl_bufopen();
+    tar_raw_header(s, "././@LongLink", 13, 'K', 4, false, NULL);
+    tar_raw_data(s, "tgt", 4);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_INCOMPLETE,
+               "tar: a stream ending after a 'K', before its member, is AXL_INCOMPLETE");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+
+    char   krec[64];
+    size_t kn = tar_pax_record(krec, 0, "mtime", "1700000000");
+    s = axl_bufopen();
+    tar_raw_header(s, "PaxHeaders.1/k", 14, 'x', kn, true, NULL);
+    tar_raw_data(s, krec, kn);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    r = axl_tar_reader_new(s);
+    test_check(axl_tar_reader_next(r, &e) == AXL_INCOMPLETE,
+               "tar: a stream ending after an 'x' of ignored keys is AXL_INCOMPLETE");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
+}
+
+static void
+test_tar_truncated_data(void)
+{
+    AxlStream *s = axl_bufopen();
+    tar_raw_header(s, "t.bin", 5, '0', 1000, true, NULL);
+    char d[300];
+    axl_memset(d, 'd', sizeof d);
+    axl_write(s, d, sizeof d);                       /* 300 of 1000 bytes */
+    axl_fseek(s, 0, AXL_SEEK_SET);
+
+    AxlTarReader *r = axl_tar_reader_new(s);
+    AxlTarEntry   e;
+    char          buf[2048];
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK && e.size == 1000,
+               "tar: a truncated member's header reads");
+    axl_ssize_t got = 0;
+    axl_ssize_t k;
+    while ((k = axl_tar_reader_read(r, buf, sizeof buf)) > 0) { got += k; }
+    test_check(got == 300 && k == -1,
+               "tar: reading past the end of a truncated archive is -1, not 0");
+    test_check(axl_tar_reader_next(r, &e) == AXL_INCOMPLETE,
+               "tar: the advance after a truncated member is AXL_INCOMPLETE");
+    axl_tar_reader_free(r);
+    axl_fclose(s);
 }
 
 static void
@@ -11398,6 +14962,7 @@ test_util_main(int argc, char **argv)
 
     test_rand_stream();
     test_rand_derived();
+    test_rand_oom();
     test_rand_reproducible();
     test_rand_ranges();
     test_rand_global();
@@ -11432,6 +14997,7 @@ test_util_main(int argc, char **argv)
     test_var_enumerate();
     test_boot();
     test_app_boot_path();
+    test_app_image_dir_path();
     test_image_enumerate();
     test_image_watch();
     test_cpu_register_exception();
@@ -11445,9 +15011,16 @@ test_util_main(int argc, char **argv)
     test_shell_sources();
     test_shell_kind();
     test_shell_execute();
+    test_shell_execute_status_refusals();
     test_console_ops_tee();
     test_console_vt_enc();
+    test_console_vt_enc_cursor_tracking();
+    test_console_vt_enc_cell_rule();
+    test_console_vt_enc_utf8_malformed();
+    test_console_vt_enc_wide_at_last_column();
+    test_console_vt_enc_colour_live_equals_repaint();
     test_console_mirror();
+    test_console_input_modifiers();
     test_console_tap_guards();
     test_console_device_guards();
     test_console_tap_key_notify();
@@ -11455,8 +15028,16 @@ test_util_main(int argc, char **argv)
     test_console_tap_key_notify_passthrough_not_owned();
     test_console_tap_inject_key_ex_guards();
     test_console_device_input();
+    test_console_device_inject_partial();
+    test_console_device_queued_keys();
+    test_console_device_uninstall_in_call();
+    test_console_device_notify_full_ring();
+    test_console_device_late_call();
+    test_console_device_notify_scrub();
     test_console_device_pointer_evict();
     test_console_device_read_loop_revalidate();
+    test_console_device_read_backpressure();
+    test_console_device_discard_keeps_late_keys();
     test_console_term_output();
     test_console_term_utf8();
     test_console_term_scrollback();
@@ -11472,6 +15053,7 @@ test_util_main(int argc, char **argv)
     test_console_mirror_altscreen_input();
     test_console_tap_sanitize();
     test_console_tap_utf8();
+    test_console_tap_inject_full_ring();
     test_console_mirror_owned_mode();
     test_tap_reports_one_cell_per_codepoint();
     test_tap_set_attribute_becomes_indexed_pen();
@@ -11486,6 +15068,7 @@ test_util_main(int argc, char **argv)
     test_time_wakeup();
     test_memmap_snapshot();
     test_time_get_us();
+    test_timer_resolution();
     test_clock_gettime();
     test_time_sleep();
     test_config();
@@ -11505,6 +15088,7 @@ test_util_main(int argc, char **argv)
     test_config_descs_net_round_trip();
     test_config_file();
     test_config_file_string_round_trip();
+    test_config_file_openssh();
     test_config_multi();
     test_config_to_from_string();
     test_config_target_to_string_round_trip();
@@ -11521,11 +15105,14 @@ test_util_main(int argc, char **argv)
     test_service_guid();
     test_service_driver_init_status_width();
     test_service_reload_validates();
+    test_service_stage_malformed_pe();
+    test_service_stage_in_flight();
     test_args();
     test_protocol_registry();
     test_driver_ensure();
     test_driver_load_buffer();
     test_shared_driver();
+    test_shared_driver_bridge_cap();
     test_driver_locate();
     test_diag_probe_protocol();
     test_qsort_basic();
@@ -11545,6 +15132,16 @@ test_util_main(int argc, char **argv)
     test_tar_long_name();
     test_tar_dir_entry();
     test_tar_reader_rejects_bad();
+    test_tar_gnu_long_name();
+    test_tar_pax_long_name();
+    test_tar_refused_names();
+    test_tar_ustar_boundaries();
+    test_tar_pax_malformed();
+    test_tar_pax_size_wrap();
+    test_tar_meta_chains();
+    test_tar_truncated_data();
+    test_tar_end_vs_truncation();
+    test_tar_pax_name_only_keeps_size();
     test_autoptr_util();
 
     return test_print_results();

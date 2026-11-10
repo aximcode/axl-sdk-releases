@@ -103,6 +103,25 @@ axl_usb_next(
     AxlUsbAddr  *prev   ///< previous result, or NULL to start
 );
 
+/**
+ * @brief Count the USB host controllers the firmware exposes
+ *     (`EFI_USB2_HC_PROTOCOL` handles).
+ *
+ * Lets a caller tell "no controller" from "a controller with nothing
+ * attached" -- axl_usb_next() returns NULL for both. A count of 0
+ * means no `EFI_USB2_HC_PROTOCOL` handles are installed, not
+ * necessarily that the machine has no USB hardware (the firmware may
+ * lack a driver for it). Not cached: each call asks the firmware.
+ *
+ * @return #AXL_OK with @p count set (possibly 0); #AXL_INVALID on a NULL
+ *     @p count; #AXL_ERR when the firmware cannot be asked. `*count` is
+ *     0 on #AXL_ERR.
+ */
+AXL_WARN_UNUSED int
+axl_usb_host_controller_count(
+    size_t *count   ///< [out] host controllers found
+);
+
 // ---------------------------------------------------------------------------
 // Per-device introspection
 // ---------------------------------------------------------------------------

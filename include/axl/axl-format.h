@@ -15,6 +15,11 @@
  * Flags: 0 - + (space)
  * Width: N or *
  * Precision: .N or .*
+ *
+ * A precision on %s bounds the READ as well as the write: the
+ * terminator scan stops at the precision, so the argument may be a
+ * bounded run of bytes with no NUL in it (C99 7.21.6.1p8). A
+ * negative precision from `.*` means "as if omitted".
  */
 
 #ifndef AXL_FORMAT_H

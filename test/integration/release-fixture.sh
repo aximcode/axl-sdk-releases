@@ -16,6 +16,9 @@
 # because compiling is not what any caller of this file is asking about.
 #
 # Expects from the sourcing test: $PROJECT_DIR, $INSTALLER, $WORK.
+# FIXTURE_AXL / FIXTURE_INSTALLER, when set, replace the dispatcher and the
+# installer a tree carries -- a RELEASED version's (`git show v4.7.5:...`), so
+# a test can make an existing user's manager do an upgrade.
 #
 # Not executable, not a test: sourced only.
 
@@ -24,7 +27,7 @@ make_tree() {  # make_tree <dir> <version>
     mkdir -p "$d/bin" "$d/share/axl" "$d/libexec/axl"
     # The REAL dispatcher, not a stub: §20's self-heal lives in it, and a
     # fixture that stubs the thing under test proves nothing about it.
-    install -m 0755 "$PROJECT_DIR/scripts/axl" "$d/bin/axl"
+    install -m 0755 "${FIXTURE_AXL:-$PROJECT_DIR/scripts/axl}" "$d/bin/axl"
     echo "placeholder" > "$d/bin/.axl-stub-marker"
     printf '#!/bin/sh\necho "axl-cc %s"\n' "$v" > "$d/bin/axl-cc"
     # THE REAL INSTALLER, under the name a real prefix gives it
@@ -35,10 +38,11 @@ make_tree() {  # make_tree <dir> <version>
     install -m 0755 "$PROJECT_DIR/scripts/install-toolchain.sh" \
                     "$d/bin/axl-install-toolchain"
     printf 'not-a-script\n' > "$d/bin/pe-set-debug"
-    chmod +x "$d/bin/axl-cc" "$d/bin/pe-set-debug"
+    printf 'not-a-script\n' > "$d/bin/axl-efi-pack"
+    chmod +x "$d/bin/axl-cc" "$d/bin/pe-set-debug" "$d/bin/axl-efi-pack"
     echo "$v" > "$d/share/axl/version"
     make_toolchain_conf "$d/share/axl/axl-toolchains.conf" "$v"
-    cp "$INSTALLER" "$d/libexec/axl/install.sh"
+    cp "${FIXTURE_INSTALLER:-$INSTALLER}" "$d/libexec/axl/install.sh"
     chmod 0644 "$d/libexec/axl/install.sh"
     mark_installer "$d/libexec/axl/install.sh" "$v"
     stage_libexec "$d"
@@ -80,7 +84,7 @@ CONF
 }
 
 # The libexec commands, READ BACK from the same make variable
-# make-host-tools-tarball.sh uses ("ONE OWNER FOR THE FILE LIST"). Naming them
+# the host-tools archive's install rule uses ("ONE OWNER FOR THE FILE LIST"). Naming them
 # here by hand is the drift this tree keeps paying for -- and it bites
 # immediately: `axl prune` is a libexec COMMAND discovered by the scan, not a
 # verb in the dispatcher, so staging none of them made `axl prune` an unknown
@@ -91,16 +95,17 @@ stage_libexec() {  # stage_libexec <prefix-dir>
     local d="$1" f
     mkdir -p "$d/libexec/axl"
     local -a files=()
-    mapfile -t files < <(make -s -C "$PROJECT_DIR" print-HOST_TOOL_FILES \
-                         | tr ' ' '\n' | grep -v '^$')
+    local _ht
+    _ht="$("$PROJECT_DIR/scripts/axl-list.sh" HOST_TOOL_FILES)" || return 1
+    read -r -a files <<< "$_ht"
     # A gate that checks nothing passes forever: refuse a suspiciously short
     # answer the way release.yml refuses one for the tool set.
     [[ "${#files[@]}" -ge 5 ]] || {
-        echo "release-fixture: print-HOST_TOOL_FILES named ${#files[@]} file(s);" \
+        echo "release-fixture: HOST_TOOL_FILES named ${#files[@]} file(s);" \
              "refusing to build a fixture against that" >&2
         return 1
     }
-    # They are BARE NAMES under scripts/, which is how make-host-tools-tarball.sh
+    # They are BARE NAMES under scripts/, which is how the host-tools install rule
     # resolves them (`$SDK_DIR/scripts/$_f`). Treating them as paths relative to
     # the repo root skipped all ten silently, and the count guard above did not
     # notice: it counted the LIST, not what actually landed. Count the result.
@@ -140,9 +145,9 @@ make_legacy_host_tools() {  # make_legacy_host_tools <dir> <version>
 make_manager_tree() {  # make_manager_tree <dir> <version>
     local d="$1" v="$2"
     mkdir -p "$d/bin" "$d/share/axl" "$d/libexec/axl"
-    install -m 0755 "$PROJECT_DIR/scripts/axl" "$d/bin/axl"
+    install -m 0755 "${FIXTURE_AXL:-$PROJECT_DIR/scripts/axl}" "$d/bin/axl"
     stage_libexec "$d"
-    install -m 0644 "$INSTALLER" "$d/libexec/axl/install.sh"
+    install -m 0644 "${FIXTURE_INSTALLER:-$INSTALLER}" "$d/libexec/axl/install.sh"
     mark_installer "$d/libexec/axl/install.sh" "$v"
     echo "$v" > "$d/share/axl/version"
 }

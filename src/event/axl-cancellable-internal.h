@@ -25,4 +25,13 @@ _axl_cancellable_event(
     AxlCancellable *c   ///< cancellable (NULL-safe, returns NULL)
 );
 
+/**
+ * Whether a wait observing @p c should also end on the Shell's break
+ * (axl_cancellable_set_cancel_on_break). NULL-safe: false.
+ */
+bool
+_axl_cancellable_on_break(
+    const AxlCancellable *c   ///< cancellable (NULL-safe)
+);
+
 #endif /* AXL_CANCELLABLE_INTERNAL_H */

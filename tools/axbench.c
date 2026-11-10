@@ -23,7 +23,7 @@
  * AP kernels are pure arithmetic (AP-safe: no Boot Services, no alloc,
  * no print, no protocol calls).
  *
- * Run: scripts/run-qemu.sh --qemu-arg -smp --qemu-arg N out/native-x64/axbench.efi
+ * Run: scripts/run-qemu.sh --qemu-arg -smp --qemu-arg N build/x64-debug/tools/axbench.efi
  */
 
 #include <axl.h>

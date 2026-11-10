@@ -47,8 +47,8 @@
 // Globals
 // ---------------------------------------------------------------------------
 
-/* Embedded 9p-mount-dxe.efi blob - spliced in by the Makefile's
-   EMBED_BLOB(mount9p_dxe, ...). */
+/* Embedded 9p-mount-dxe.efi blob - spliced in by the build's
+   axl_embed_blob(mount9p_dxe ...). */
 AXL_EMBED_DECLARE(mount9p_dxe);
 
 // ---------------------------------------------------------------------------

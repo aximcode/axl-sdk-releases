@@ -89,6 +89,14 @@ axl_shared_driver_publish(
     if (rc != AXL_OK) {
         axl_warning("axl_shared_driver_publish: install failed for '%s'",
                     name);
+    } else {
+        /* A launcher's stdio bridge aimed at this interface is ours to read. */
+        if (!axl_backend_stdio_bridge_target(iface, true)) {
+            axl_warning("axl_shared_driver_publish: '%s' is published, but "
+                        "launchers' stdio does not reach it: one image "
+                        "bridges at most %d interfaces",
+                        name, AXL_BRIDGE_TARGETS_MAX);
+        }
     }
     /* Ensure the driver-resident dispatch-token cell exists so launchers can
        stamp per-dispatch liveness tokens the bridge gate reads. Best-effort:
@@ -115,6 +123,8 @@ axl_shared_driver_unpublish(
     if (rc != AXL_OK) {
         axl_warning("axl_shared_driver_unpublish: uninstall failed for '%s'",
                     name);
+    } else {
+        axl_backend_stdio_bridge_target(iface, false);
     }
     return rc;
 }
@@ -175,8 +185,9 @@ axl_shared_driver_unload(
     return rc;
 }
 
-int
-axl_shared_driver_locate_with_image_info(
+static int
+shared_locate_impl(
+    const char                 *api,
     const char                 *name,
     const char                 *driver_filename,
     const unsigned char        *embed_blob,
@@ -206,8 +217,15 @@ axl_shared_driver_locate_with_image_info(
        call, not through LoadOptions. On the embedded path, @p info
        (defaulting the leaf name to driver_filename) gives the loaded
        image a non-NULL device path. */
+    /* Warm (already published) is an answer at any TPL; a cold load is not
+       (UEFI 2.11 Table 7.3), and the refusal names this call. */
+    void *warm = NULL;
+    if ((axl_protocol_find_guid(&guid, &warm) != AXL_OK || warm == NULL)
+        && _axl_image_tpl_refused(api)) {
+        return AXL_UNSUPPORTED;
+    }
     int _rc = _axl_driver_ensure_with_embedded_info(
-        &guid, driver_filename, embed_blob, embed_len,
+        api, &guid, driver_filename, embed_blob, embed_len,
         /* override_name */ NULL, load_options, load_options_size, info);
     if (_rc != AXL_OK) {
         axl_debug("axl_shared_driver_locate: failed to load '%s'",
@@ -235,8 +253,25 @@ axl_shared_driver_locate_with_image_info(
        run carries its own handles; zero consumer code. A bridge
        install failure is non-fatal to the locate contract (the vtable
        resolved) — the driver simply falls back to EOF stdin. */
-    axl_backend_stdio_bridge_install();
+    axl_backend_stdio_bridge_install(*out_iface);
     return AXL_OK;
+}
+
+int
+axl_shared_driver_locate_with_image_info(
+    const char                 *name,
+    const char                 *driver_filename,
+    const unsigned char        *embed_blob,
+    size_t                      embed_len,
+    const void                 *load_options,
+    size_t                      load_options_size,
+    const AxlEmbeddedImageInfo *info,
+    void                      **out_iface
+    )
+{
+    return shared_locate_impl("axl_shared_driver_locate_with_image_info",
+                              name, driver_filename, embed_blob, embed_len,
+                              load_options, load_options_size, info, out_iface);
 }
 
 int
@@ -250,10 +285,10 @@ axl_shared_driver_locate_with_load_options(
     void                **out_iface
     )
 {
-    return axl_shared_driver_locate_with_image_info(
-        name, driver_filename, embed_blob, embed_len,
-        load_options, load_options_size,
-        /* info */ NULL, out_iface);
+    return shared_locate_impl("axl_shared_driver_locate_with_load_options",
+                              name, driver_filename, embed_blob, embed_len,
+                              load_options, load_options_size,
+                              /* info */ NULL, out_iface);
 }
 
 int
@@ -265,10 +300,10 @@ axl_shared_driver_locate(
     void                **out_iface
     )
 {
-    return axl_shared_driver_locate_with_load_options(
-        name, driver_filename, embed_blob, embed_len,
-        /* load_options */ NULL, 0,
-        out_iface);
+    return shared_locate_impl("axl_shared_driver_locate",
+                              name, driver_filename, embed_blob, embed_len,
+                              /* load_options */ NULL, 0,
+                              /* info */ NULL, out_iface);
 }
 
 int
@@ -292,11 +327,15 @@ axl_shared_driver_locate_sibling(
     void *warm = NULL;
     if (axl_protocol_find_guid(&guid, &warm) == AXL_OK && warm != NULL) {
         *out_iface = warm;
-        axl_backend_stdio_bridge_install();
+        axl_backend_stdio_bridge_install(warm);
         return AXL_OK;
     }
-    /* Cold: SIBLING-ONLY. Return the load rc verbatim so callers keep
+    /* Cold: SIBLING-ONLY -- a load, so not at TPL_CALLBACK or above (UEFI
+       2.11 Table 7.3). Return the load rc verbatim so callers keep
        AXL_NOT_FOUND ("not staged beside us") / AXL_INVALID. */
+    if (_axl_image_tpl_refused("axl_shared_driver_locate_sibling")) {
+        return AXL_UNSUPPORTED;
+    }
     AxlDriverHandle h = NULL;
     int lrc = axl_driver_load_sibling(driver_filename, &h);
     if (lrc != AXL_OK) {
@@ -325,18 +364,20 @@ axl_shared_driver_locate_sibling(
         *out_iface = NULL;
         return AXL_NOT_FOUND;
     }
-    axl_backend_stdio_bridge_install();
+    axl_backend_stdio_bridge_install(*out_iface);
     return AXL_OK;
 }
 
 int
-axl_shared_driver_install_stdio_bridge(void)
+axl_shared_driver_install_stdio_bridge(
+    const void *iface
+    )
 {
     /* Thin export of the backend installer that axl_shared_driver_locate*
        already calls on the auto-install path — the escape hatch for
        launchers that resolve the resident driver themselves. See the
        header docstring and docs/AXL-Shared-Driver-Recipe.md. */
-    return axl_backend_stdio_bridge_install();
+    return axl_backend_stdio_bridge_install(iface);
 }
 
 int
@@ -363,7 +404,7 @@ axl_shared_driver_dispatch(
     /* Install the launcher-context bridge (stdin + exit-status channel),
        run the verb in the driver image, then pull any status it armed onto
        this launcher. apply is a no-op (AXL_ERR, ignored) when none armed. */
-    axl_shared_driver_install_stdio_bridge();
+    axl_shared_driver_install_stdio_bridge(vt);
     int rc = vt->run(argc, argv);
     axl_shared_driver_apply_exit_status();
     return rc;

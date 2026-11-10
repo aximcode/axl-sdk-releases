@@ -34,12 +34,15 @@ AXL_LOG_DOMAIN("backend");
    per iteration, making this the exact per-AP cost of the fallback. */
 #define MP_BLOCKING_DISPATCH_TIMEOUT_US  1000u
 
-/* Bound on waiting for the firmware to retire a stopped worker before
-   its completion event may be closed. MpInitLib signals from a periodic
-   timer (PcdCpuApStatusCheckIntervalInMicroSeconds, 100 ms by default),
-   so allow several intervals. Drained concurrently, so this bounds
-   teardown as a whole, not per AP. */
-#define MP_EVENT_DRAIN_TIMEOUT_US        1000000u
+/* Waiting for the firmware to retire a stopped worker before its
+   completion event may be closed is bounded by AXL_AP_ANSWER_TIMEOUT_US
+   (axl-backend.h), in wall-clock time: the worker has to get from
+   acknowledging quit back to MpInitLib's idle loop, which a descheduled
+   virtual AP does only when its host runs it -- the old 1 s bound was
+   seen to expire on a loaded host. MpInitLib then signals from a periodic
+   timer (PcdCpuApStatusCheckIntervalInMicroSeconds, 100 ms by default).
+   Drained concurrently, so the bound covers teardown as a whole, not per
+   AP; an abandoned AP (axl_backend_mp_abandon_ap) is not waited for. */
 #define MP_EVENT_DRAIN_STEP_US           10000u
 
 // ---------------------------------------------------------------------------
@@ -50,6 +53,7 @@ struct AxlMpContext {
     EFI_MP_SERVICES_PROTOCOL  *mp;
     UINTN                     *ap_numbers;  ///< maps index to processor number
     EFI_EVENT                 *ap_events;   ///< per-AP completion event, or NULL
+    bool                      *abandoned;   ///< per-AP: do not wait to retire it
     size_t                     count;
 };
 
@@ -57,7 +61,8 @@ struct AxlMpContext {
 // Function prototypes (static)
 // ---------------------------------------------------------------------------
 
-static void mp_release_events(EFI_EVENT *events, size_t count);
+static void mp_release_events(EFI_EVENT *events, const bool *abandoned,
+                              size_t count);
 
 // ---------------------------------------------------------------------------
 // AxlBackend public surface — MP services
@@ -112,7 +117,10 @@ axl_backend_mp_init(
 
     ctx->ap_events = axl_backend_alloc_zero(
                          (num_enabled - 1) * sizeof(EFI_EVENT));
-    if (ctx->ap_events == NULL) {
+    ctx->abandoned = axl_backend_alloc_zero((num_enabled - 1) * sizeof(bool));
+    if (ctx->ap_events == NULL || ctx->abandoned == NULL) {
+        axl_backend_free(ctx->abandoned);
+        axl_backend_free(ctx->ap_events);
         axl_backend_free(ctx->ap_numbers);
         axl_backend_free(ctx);
         return NULL;
@@ -139,6 +147,7 @@ axl_backend_mp_init(
 
     ctx->count = slot;
     if (ctx->count == 0) {
+        axl_backend_free(ctx->abandoned);
         axl_backend_free(ctx->ap_events);
         axl_backend_free(ctx->ap_numbers);
         axl_backend_free(ctx);
@@ -254,6 +263,18 @@ axl_backend_mp_get_ap_number(
     return (size_t)ctx->ap_numbers[ap_index];
 }
 
+void
+axl_backend_mp_abandon_ap(
+    AxlMpContext  *ctx,
+    size_t         ap_index
+    )
+{
+    if (ctx == NULL || ap_index >= ctx->count) {
+        return;
+    }
+    ctx->abandoned[ap_index] = true;
+}
+
 /* Close the completion events of workers that have already stopped.
 
    The caller must have stopped the workers first. Even then the firmware
@@ -264,8 +285,9 @@ axl_backend_mp_get_ap_number(
    the firmware, which then signals freed pool memory -- the very bug the
    retained handle exists to avoid. So wait for the signal, then close.
 
-   All events are drained concurrently, so the bound covers teardown as a
-   whole rather than accumulating per AP.
+   An abandoned AP's event gets one check and no wait: the caller has no
+   sign its worker ever returned, and it has already failed to answer for
+   AXL_AP_ANSWER_TIMEOUT_US.
 
    An event that is never signalled is deliberately LEAKED rather than
    closed: a leaked handle costs one firmware pool allocation for the life
@@ -274,44 +296,65 @@ axl_backend_mp_get_ap_number(
 static
 void
 mp_release_events(
-    EFI_EVENT  *events,
-    size_t      count
+    EFI_EVENT   *events,
+    const bool  *abandoned,
+    size_t       count
     )
 {
     EFI_STATUS  status;
-    uint64_t    waited;
+    uint64_t    start_us;
+    uint64_t    stepped_us;
     size_t      remaining;
+    size_t      leaked_abandoned;
     size_t      i;
+    bool        waiting;
 
-    remaining = 0;
-    for (i = 0; i < count; i++) {
-        if (events[i] != NULL) {
-            remaining++;
-        }
-    }
-
-    for (waited = 0; remaining > 0 && waited < MP_EVENT_DRAIN_TIMEOUT_US;
-         waited += MP_EVENT_DRAIN_STEP_US) {
+    /* Without a usable clock, fall back to summing the stall steps. */
+    start_us         = axl_backend_get_monotonic_us();
+    stepped_us       = 0;
+    leaked_abandoned = 0;
+    waiting          = true;
+    for (;;) {
+        remaining = 0;
         for (i = 0; i < count; i++) {
             if (events[i] == NULL) {
                 continue;
             }
             status = gBS->CheckEvent(events[i]);
             if (status == EFI_NOT_READY) {
-                continue;          /* firmware has not retired it yet */
+                /* The firmware has not retired it yet. */
+                if (abandoned[i]) {
+                    leaked_abandoned++;
+                    events[i] = NULL;   /* leaked, see above */
+                } else {
+                    remaining++;        /* waited for, or leaked below */
+                }
+                continue;
             }
             if (status == EFI_SUCCESS) {
                 gBS->CloseEvent(events[i]);
             }
             /* Any other status means the handle is not ours to close. */
             events[i] = NULL;
-            remaining--;
         }
-        if (remaining > 0) {
-            axl_backend_stall(MP_EVENT_DRAIN_STEP_US);
+        if (remaining == 0 || !waiting) {
+            break;
+        }
+        axl_backend_stall(MP_EVENT_DRAIN_STEP_US);
+        stepped_us += MP_EVENT_DRAIN_STEP_US;
+        if (start_us != 0) {
+            waiting = axl_backend_get_monotonic_us() - start_us
+                      < AXL_AP_ANSWER_TIMEOUT_US;
+        } else {
+            waiting = stepped_us < AXL_AP_ANSWER_TIMEOUT_US;
         }
     }
 
+    if (leaked_abandoned > 0) {
+        axl_warning("%llu abandoned AP(s) not yet retired by the firmware; "
+                    "leaking their completion event(s) rather than freeing "
+                    "them under it", (unsigned long long)leaked_abandoned);
+    }
     if (remaining > 0) {
         axl_warning("%llu AP completion event(s) never signalled; leaking "
                     "the handles rather than freeing them under the firmware",
@@ -329,9 +372,10 @@ axl_backend_mp_cleanup(
     }
 
     if (ctx->ap_events != NULL) {
-        mp_release_events(ctx->ap_events, ctx->count);
+        mp_release_events(ctx->ap_events, ctx->abandoned, ctx->count);
         axl_backend_free(ctx->ap_events);
     }
+    axl_backend_free(ctx->abandoned);
 
     axl_backend_free(ctx->ap_numbers);
     axl_backend_free(ctx);

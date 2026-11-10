@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=76 local-only=0
+# test-meta: arch=both needs= est=76 local-only=0 guest=plain
 # test-cxx-hosted-qemu.sh — the standard containers under UEFI, end to end.
 #
 # THE NAME IS HISTORICAL. There is no hosted MODE any more: task T3 dropped
@@ -19,11 +19,11 @@
 #      bits/requires_hosted.h -- the same failure, now the failing case.
 #
 #      SCOPE, because "three build paths" would be a false claim: this drives
-#      axl-cc only. The Makefile path is covered by `make check-examples`,
-#      which compiles sdk/examples/containers.cpp with CXXFLAGS_EXAMPLE --
-#      derived from the Makefile's own CXXFLAGS_BASE by filter-out -- and that
-#      source includes <map>/<string>/<vector>, none of them in the C++23
-#      freestanding subset. (NOT cxx-streams-selftest, which an earlier
+#      axl-cc only. The in-tree path is covered by `gate.check-examples`,
+#      which compiles sdk/examples/containers.cpp with the tree's own C++
+#      flags (scripts/compile-like.py) -- and that source includes
+#      <map>/<string>/<vector>, none of them in the C++23 freestanding
+#      subset. (NOT cxx-streams-selftest, which an earlier
 #      version of this note named: everything it includes IS in the
 #      freestanding subset, so it compiles cleanly WITH -ffreestanding --
 #      verified -- and cannot catch the regression. The genuinely
@@ -48,7 +48,7 @@
 #      instructions -- the #UD that gates x64 (docs/AXL-Cxx-Stdlib-Handoff.md
 #      section 3). AXL's own substitutes used to be the answer; since P4 the
 #      answer is that the hermetic toolchain's libstdc++ is measured clean,
-#      and `make check-no-avx` scans that archive. This asserts the produced
+#      and `gate.check-no-avx` scans that archive. This asserts the produced
 #      IMAGE, which is the claim that actually matters.
 #   5. The image RUNS and prints exact lines. Compile is not link; link is not
 #      run -- each of those three steps produced a wrong conclusion in the
@@ -472,7 +472,7 @@ run_one() {
     # relocations. Naming the output section `.rela.dyn` makes ld absorb its
     # own internal section instead of orphaning it.
     #
-    # `make check-reloc-coverage` is the structural guard; this is the
+    # `gate.check-reloc-coverage` is the structural guard; this is the
     # behavioural one. RTTI is the workload that first split the table, so it
     # stays the workload that proves it is not split again.
     if [[ -f "$WORK/rtti-$cc_arch.efi" ]]; then
@@ -534,7 +534,7 @@ run_one() {
     # ---------------------------------------------------------------
     # 5f. axl::unique_handle owns a REAL object and gives the memory back.
     # ---------------------------------------------------------------
-    # `make check-handle-exclusions` covers the compile-time contract —
+    # `gate.check-handle-exclusions` covers the compile-time contract —
     # which types get a handle, which are refused, and what the refusal
     # says. What it cannot see is whether the deleter reaches the destroy
     # function the header named, so this runs the four cases AXL_AUTOPTR

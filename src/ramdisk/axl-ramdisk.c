@@ -491,14 +491,20 @@ axl_ramdisk_create(
     format_disk(buf, (size_t)disk_bytes, padded);
 
     EFI_DEVICE_PATH_PROTOCOL *dev_path = NULL;
+    /* Counted as a child: RamDiskDxe's Register connects the new handle,
+       which can start images -- see axl_backend_start_image. */
+    axl_backend_child_image_enter();
     EFI_STATUS status = rd_proto->Register(
         phys_addr, disk_bytes,
         (EFI_GUID *)&EFI_VIRTUAL_DISK_GUID,
         NULL, &dev_path);
+    axl_backend_child_image_leave();
     if (EFI_ERROR(status)) {
         axl_free_pages(phys_addr, pages);
+        axl_backend_exit_if_deferred();     /* after the pages: raw, ours */
         return AXL_IO_ERROR;
     }
+    axl_backend_exit_if_deferred();
 
     /* Settle for firmware that binds its FAT driver from an event rather than
        inside Register (EDK2's RamDiskDxe ConnectController()s the new handle
@@ -551,9 +557,12 @@ axl_ramdisk_register_image(
         : (const EFI_GUID *)&EFI_VIRTUAL_DISK_GUID;
 
     EFI_DEVICE_PATH_PROTOCOL *dev_path = NULL;
+    axl_backend_child_image_enter();    /* as above */
     EFI_STATUS status = rd_proto->Register(
         (uint64_t)(uintptr_t)image, size_bytes,
         (EFI_GUID *)type_guid, NULL, &dev_path);
+    axl_backend_child_image_leave();
+    axl_backend_exit_if_deferred();
     if (EFI_ERROR(status)) {
         return AXL_IO_ERROR;
     }

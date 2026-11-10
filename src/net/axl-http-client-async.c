@@ -33,6 +33,7 @@
 #include "axl-net-internal.h"
 #include "axl-tcp-internal.h"          /* axl_tcp_connect_addr_async, AxlTcp */
 #include "axl-http-client-internal.h"  /* struct AxlHttpClient, TLS ops accessor */
+#include "axl-http-core-internal.h"    /* response head + framing */
 
 AXL_LOG_DOMAIN("http");
 
@@ -45,15 +46,6 @@ AXL_LOG_DOMAIN("http");
    are tiny in practice; this only fires on a malformed/hostile response. */
 #define HTTP_ASYNC_HDR_MAX  (1u << 20)   /* 1 MiB of headers = malformed */
 
-/* Whole-body sanity ceiling. A KNOWN Content-Length body is allowed to grow to
-   its declared size (the response buffer is pre-reserved to exactly that, so an
-   absurd declaration fails the one allocation cleanly — like the old sync
-   do_request's malloc(content_len)); this ceiling rejects an absurd declaration
-   up front and bounds the unknown-size (chunked) case. 256 MiB is far above any
-   realistic firmware image / API response the client fetches, so it does not
-   bite real use — it is purely an OOM-by-declaration guard. (The earlier 1 MiB
-   cap here silently truncated a ~1 MB gBS->LoadImage GET to an error.) */
-#define HTTP_ASYNC_BODY_MAX  (256u * 1024u * 1024u)
 
 typedef struct {
     AxlHttpClient        *client;
@@ -80,6 +72,7 @@ typedef struct {
     bool                  body_sent;
     bool                  reused;         /* this hop started on a kept-alive conn */
     bool                  retried;        /* stale-conn replay already attempted */
+    size_t                interim;        /* interim 1xx heads skipped this hop */
 
     /* receive accumulation */
     uint8_t              *rx;
@@ -93,6 +86,8 @@ typedef struct {
     AxlHashTable         *resp_headers;
     bool                  have_framing;
     bool                  chunked;
+    bool                  to_close;      /* body runs until the close */
+    bool                  reusable;      /* framing lets the connection carry more */
     size_t                content_len;
     void                 *resp_body;
     size_t                resp_body_size;
@@ -245,8 +240,10 @@ req_complete_ok(HttpAsyncReq *req)
     req->resp_body      = NULL;
     req->resp_body_size = 0;
 
-    /* Keep-alive unless disabled or the server asked to close. */
-    bool keep = req->client->keep_alive;
+    /* Keep-alive unless disabled, the server asked to close, or the
+       framing forbids it (Content-Length beside Transfer-Encoding, or a
+       body that ran to the close). */
+    bool keep = req->client->keep_alive && req->reusable;
     if (keep) {
         const char *conn_hdr =
             (const char *)axl_hash_table_lookup(r->headers, "connection");
@@ -361,28 +358,31 @@ req_process(HttpAsyncReq *req)
 
     /* 1. Parse status line + headers once the blank line arrives. */
     if (req->header_end == 0) {
-        size_t he = axl_http_find_header_end((char *)req->rx, req->rx_len);
-        if (he == 0) {
-            return (req->rx_len >= HTTP_ASYNC_HDR_MAX) ? REQ_ERROR : REQ_NEED_MORE;
-        }
-        req->header_end = he;
-
-        size_t first_line_end = 0;
-        for (size_t j = 0; j + 1 < he; j++) {
-            if (req->rx[j] == '\r' && req->rx[j + 1] == '\n') {
-                first_line_end = j;
+        /* Interim 1xx heads come before the final one (RFC 9110 15.2):
+           each is parsed, dropped from rx, and the next head read. */
+        size_t he = 0;
+        for (;;) {
+            he = axl_http_find_response_header_end((char *)req->rx, req->rx_len);
+            if (he == 0) {
+                return (req->rx_len >= HTTP_ASYNC_HDR_MAX) ? REQ_ERROR : REQ_NEED_MORE;
+            }
+            if (_axl_http_response_head_parse((char *)req->rx, he, &req->status_code,
+                                              &req->resp_headers) != AXL_OK) {
+                return REQ_ERROR;
+            }
+            int im = _axl_http_client_interim(req->status_code, &req->interim);
+            if (im < 0) {
+                return REQ_ERROR;   /* a 101, or past the cap: the connection drops */
+            }
+            if (im == 0) {
                 break;
             }
+            axl_hash_table_free(req->resp_headers);
+            req->resp_headers = NULL;
+            axl_memmove(req->rx, req->rx + he, req->rx_len - he);
+            req->rx_len -= he;
         }
-        if (axl_http_parse_status_line((char *)req->rx, first_line_end,
-                                       &req->status_code) != AXL_OK) {
-            return REQ_ERROR;
-        }
-        size_t hdr_start = first_line_end + 2;
-        if (axl_http_parse_headers((char *)req->rx + hdr_start,
-                                   he - hdr_start, &req->resp_headers) != AXL_OK) {
-            return REQ_ERROR;
-        }
+        req->header_end = he;
 
         /* Redirect? Reported before framing — a 3xx body is irrelevant. */
         if ((req->status_code == 301 || req->status_code == 302 ||
@@ -401,11 +401,20 @@ req_process(HttpAsyncReq *req)
             }
         }
 
-        /* Framing: chunked wins over Content-Length (RFC 7230 §3.3.3). */
-        const char *te = (const char *)axl_hash_table_lookup(
-            req->resp_headers, "transfer-encoding");
-        req->chunked     = (te != NULL && axl_strcasecmp(te, "chunked") == 0);
-        req->content_len = axl_http_get_content_length(req->resp_headers);
+        /* Framing (RFC 9112 6.3): no body for HEAD, 1xx, 204 or 304; else
+           a Transfer-Encoding wins over Content-Length -- chunked when its
+           last coding is, else the body runs until the close; then a
+           Content-Length (one that is not a usable length fails the
+           response); with neither, the body runs until the close. */
+        AxlHttpFraming fr;
+        if (_axl_http_response_framing(req->resp_headers, req->method,
+                                       req->status_code, &fr) != AXL_OK) {
+            return REQ_ERROR;
+        }
+        req->chunked      = fr.kind == AXL_HTTP_BODY_CHUNKED;
+        req->to_close     = fr.kind == AXL_HTTP_BODY_TO_CLOSE;
+        req->content_len  = fr.length;
+        req->reusable     = fr.reusable;
         req->have_framing = true;
 
         /* For a known Content-Length: reject an absurd declaration up front, then
@@ -414,10 +423,10 @@ req_process(HttpAsyncReq *req)
            than growing by doubling, and a legitimate multi-MB body — e.g. a
            gBS->LoadImage whole-image read — is NOT capped). */
         if (!req->chunked && req->content_len > 0) {
-            if (req->content_len > HTTP_ASYNC_BODY_MAX) {
+            if (req->content_len > HTTP_CLIENT_BODY_MAX) {
                 axl_error("response Content-Length %llu exceeds the %u-byte cap",
                           (unsigned long long)req->content_len,
-                          (unsigned)HTTP_ASYNC_BODY_MAX);
+                          (unsigned)HTTP_CLIENT_BODY_MAX);
                 return REQ_ERROR;
             }
             size_t want = req->header_end + req->content_len;
@@ -443,11 +452,16 @@ req_process(HttpAsyncReq *req)
         if (rc == REQ_COMPLETE) {
             req->resp_body      = decoded;
             req->resp_body_size = dsize;
-        } else if (rc == REQ_NEED_MORE && req->rx_len >= HTTP_ASYNC_BODY_MAX) {
+        } else if (rc == REQ_NEED_MORE && req->rx_len >= HTTP_CLIENT_BODY_MAX) {
             /* Chunked has no declared size — bound the accumulation. */
             return REQ_ERROR;
         }
         return rc;
+    }
+
+    if (req->to_close) {
+        /* Complete at the close (on_recv_eof); bound the accumulation. */
+        return (req->rx_len >= HTTP_CLIENT_BODY_MAX) ? REQ_ERROR : REQ_NEED_MORE;
     }
 
     if (req->content_len > 0) {
@@ -496,8 +510,11 @@ req_reset_hop(HttpAsyncReq *req)
     req->resp_body_size = 0;
     req->status_code = 0;
     req->header_end = 0;
+    req->interim = 0;
     req->have_framing = false;
     req->chunked = false;
+    req->to_close = false;
+    req->reusable = false;
     req->content_len = 0;
     req->headers_sent = false;
     req->body_sent = false;
@@ -537,7 +554,8 @@ req_retry(HttpAsyncReq *req)
 static void
 req_transport_fail(HttpAsyncReq *req)
 {
-    if (req->reused && !req->retried && req->rx_len == 0) {
+    /* Not after an interim 1xx: the server has the request already. */
+    if (req->reused && !req->retried && req->rx_len == 0 && req->interim == 0) {
         req_retry(req);
         return;
     }
@@ -593,14 +611,35 @@ req_advance(HttpAsyncReq *req)
     }
 }
 
-/* Peer EOF / transport error during the receive phase. A response framed by
-   connection close (no Content-Length, not chunked) is complete at EOF;
-   anything else is truncated — replay if it was a stale reused connection,
+/* Peer EOF / transport error during the receive phase. A response whose
+   body runs to the close (a Transfer-Encoding not ending in chunked) is
+   complete here at an ORDERLY close, with every byte after the head, and
+   AXL_INCOMPLETE at any other ending; one with no body is complete too.
+   Anything else is truncated — replay if it was a stale reused connection,
    else fail. */
 static void
 on_recv_eof(HttpAsyncReq *req)
 {
-    if (req->header_end != 0 && !req->chunked && req->content_len == 0) {
+    if (req->header_end != 0 && req->to_close) {
+        AxlStatus cs = _axl_http_client_close_status(req->client,
+                                                     req->rx_len - req->header_end);
+        if (cs != AXL_OK) {
+            /* A reset or a TLS cut part-way: the body is short, and a short
+               body is never returned as a whole one (the cause is logged). */
+            req_fail(req, cs);
+            return;
+        }
+        size_t n = req->rx_len - req->header_end;
+        if (n > 0) {
+            req->resp_body = axl_memdup(req->rx + req->header_end, n);
+            if (req->resp_body == NULL) {
+                req_fail(req, AXL_ERR);
+                return;
+            }
+        }
+        req->resp_body_size = n;
+        req_complete_ok(req);
+    } else if (req->header_end != 0 && !req->chunked && req->content_len == 0) {
         req_complete_ok(req);
     } else {
         req_transport_fail(req);
@@ -737,39 +776,21 @@ on_send_done(AxlTcp *sock, AxlStatus status, void *data)
 // Request build
 // ---------------------------------------------------------------------------
 
-#define HTTP_ASYNC_REQ_BUF  2048
-
 static int
 req_build(HttpAsyncReq *req)
 {
     AxlHttpClient *c      = req->client;
     AxlUrl        *parsed = req->parsed;
 
-    char *buf = axl_malloc(HTTP_ASYNC_REQ_BUF);
-    if (buf == NULL) {
-        return AXL_ERR;
-    }
-
-    const char *req_path = parsed->path;
-    if (req_path == NULL || req_path[0] == '\0') {
-        req_path = "/";
-    }
-    char full_path[512];
-    if (parsed->query != NULL && parsed->query[0] != '\0') {
-        axl_snprintf(full_path, sizeof(full_path), "%s?%s", req_path, parsed->query);
-    } else {
-        axl_snprintf(full_path, sizeof(full_path), "%s", req_path);
-    }
-
     size_t content_len = (req->body != NULL && req->body_size > 0)
                          ? req->body_size : 0;
-    if (_axl_http_build_request(buf, HTTP_ASYNC_REQ_BUF, &req->req_len,
-                                req->method, full_path, parsed->host,
-                                content_len, /*chunked=*/false,
-                                req->content_type, c->keep_alive,
-                                c->default_headers, req->extra_headers) != AXL_OK) {
-        axl_free(buf);
-        return AXL_ERR;
+    char *buf = NULL;
+    int   rc  = _axl_http_build_request(&buf, &req->req_len, req->method, parsed,
+                                        content_len, /*chunked=*/false,
+                                        req->content_type, c->keep_alive,
+                                        c->default_headers, req->extra_headers);
+    if (rc != AXL_OK) {
+        return rc;
     }
     req->req_buf = buf;
     return AXL_OK;
@@ -778,8 +799,9 @@ req_build(HttpAsyncReq *req)
 static void
 req_start_send(HttpAsyncReq *req)
 {
-    if (req_build(req) != AXL_OK) {
-        req_fail(req, AXL_ERR);
+    int rc = req_build(req);
+    if (rc != AXL_OK) {
+        req_fail(req, rc);   /* AXL_NO_RESOURCES: the request could not be built */
         return;
     }
     if (req_send(req, req->req_buf, req->req_len, on_send_done) != AXL_OK) {

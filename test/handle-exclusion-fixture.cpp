@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file handle-exclusion-fixture.cpp
-    Fixture for `make check-handle-exclusions`.
+    Fixture for `gate.check-handle-exclusions`.
 
     #axl::unique_handle is opt-in per type: it resolves its deleter
     through `axl::handle_traits<T>`, which only exists where a header

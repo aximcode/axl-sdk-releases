@@ -61,8 +61,13 @@
 #                         of exiting QEMU. Off by default. Bound a reset
 #                         loop with --timeout.
 #   --nsh FILE            Use custom startup.nsh instead of auto-generated
-#   --background          Launch QEMU in background, print PID
+#   --background          Launch QEMU in background, print PID. The caller
+#                         owns the guest from the QEMU_PID= line; if this
+#                         script dies before printing it, the guest goes too
 #   --serial-log FILE     Save serial output to FILE
+#   --monitor-socket PATH With --background: HMP monitor on a UNIX socket for
+#                         the guest's life (MONITOR_SOCKET=PATH is printed)
+#   --qmp-socket PATH     With --background: the same for QMP (QMP_SOCKET=)
 #   --gdb [PORT]          Expose QEMU GDB stub on tcp::PORT (default 1234).
 #                         Boot runs free; attach with
 #                         `gdb -ex 'target remote :PORT'` and `interrupt`
@@ -71,8 +76,27 @@
 #                         (guest halted before instruction 0).
 #   --gdb-halt            With --gdb, also start with -S (guest halted).
 #                         Useful for breaking inside SecMain or PEI.
-#   --debugcon FILE       Capture OVMF DEBUG output (port 0x402) — required
-#                         for gdb-syms.py to recover module load addresses.
+#   --debugcon FILE       Capture the firmware's DEBUG output. X64: OVMF's
+#                         port 0x402 -- required for gdb-syms.py to recover
+#                         module load addresses. AARCH64: the guest's debug
+#                         UART, which every AARCH64 guest has (the bundled
+#                         firmware sends DEBUG there, so the console carries
+#                         no DEBUG output); without --debugcon its log is
+#                         beside --serial-log as <name>-firmware-debug.log, in
+#                         --state-dir, else in the run's temp dir. A
+#                         foreground or pooled run that hit a firmware ASSERT
+#                         or exception (whose header alone is the console's;
+#                         its registers are DEBUG) prints the log after the
+#                         app's output as "[firmware-debug] ..." lines, and
+#                         --raw no longer shows the firmware's DEBUG on
+#                         AARCH64. --background prints FIRMWARE_DEBUG_LOG=;
+#                         with no --serial-log that file is in the run's temp
+#                         dir, gone with the guest, as its serial log is.
+#                         X64 with --state-dir (a pooled guest's launch)
+#                         always has the 0x402 port, its log in the state dir
+#                         (or at --debugcon FILE); a booted X64 run has it
+#                         only with --debugcon, and prints none of it. A
+#                         pooled X64 run's ASSERT is printed as AARCH64's.
 #   -i, --interactive     Hand the host TTY to QEMU so keystrokes reach the
 #                         guest. Use for "press a key to exit" stubs and
 #                         other apps that need real user input. Disables
@@ -96,6 +120,63 @@
 #                         with exit 8 — guest failure/timeout take precedence).
 #   --cpu-threshold N     Spike threshold in cores (default 1.5).
 #   --cpu-sustain SECS    Sustain duration in seconds (default 2).
+#
+# Pooled mode (docs/AXL-Test-Guest-Pool-Design.md §6.9). Inside a lease --
+# AXL_POOL_AGENT set: the test declared guest=<class> and the runner leased
+# it under `axlpool run` -- a run whose machine IS the lease's class does not
+# boot. It restores the leased guest to its clean snapshot (`axlpool restore`:
+# a fresh machine per call, as a boot gives), stages the app, the --extra
+# files and pci-ids.json5 into a directory of its own in the lease's share,
+# and runs the script a boot's startup.nsh would (@echo -off, the --setvar
+# lines, the sentinel, the app or the --nsh script) through the agent, its
+# output on the guest's console (`axlpool exec --console`).
+#   Same output: the console from the sentinel, ANSI-stripped and filtered as
+#   a boot's serial log is. --raw and --serial-log: the console from the
+#   run's start (there is no firmware boot to show).
+#   Same exit codes: 0, 1, 2, 8 (the CPU-spike check samples the leased
+#   guest's QEMU, AXL_POOL_QEMU_PID, with no boot warm-up), 9.
+#   The machine must be the lease's class's, fact for fact: `axlpool run`
+#   exports the class's run-qemu.sh options (test/pool/classes.toml, its args
+#   then its arch's) as AXL_POOL_CLASS_ARGS, one per line; they are parsed,
+#   after the `--net` every pooled guest has, by this script's own option
+#   loop, and compared with the run's: --bridges, the NIC (model, --nic-no-rom,
+#   --mac), --gpu (or --screenshot/--display, which imply it), --no-gpu,
+#   --cpu, --mem, each --guestfwd and each --qemu-arg in order. A run with no
+#   NIC option and no --bridges is the bare machine and compares as `--net`
+#   (every class has the agent's NIC). So plain is a bare run or `--net`;
+#   standard is `--bridges --net` with its NIC (X64: --nic-model e1000); a
+#   one-off class (`extends`, its own args) is the run naming exactly those.
+#   The first fact that differs is said, and the run boots. So does a lease
+#   with no AXL_POOL_CLASS_ARGS.
+#   What is not the machine but the way a run is driven boots exactly as
+#   before: --screenshot and the input options, --display/--vnc, -i,
+#   --mount, --background, --debugcon, --gdb, --serial-socket/
+#   --monitor-socket/--qmp-socket, --reboot, --boot-target, --shell,
+#   --qcow2/--state-dir/--hostfwd-bind, --tap, --hostfwd; and no app; an
+#   --arch other than the lease's; QEMU_DRYRUN; AXL_RUN_QEMU_POOL=0; the
+#   test's own pooled background run live (AXL_POOL_BG_LIVE, common-test.sh:
+#   the restore would end its server).
+#   A --nsh script pools only when its first non-blank line is `@echo -off`
+#   (a boot echoes every command before it; a comment first also boots). That line, a following `fs0:` and `cd \`, and a
+#   last `reset -s` are the boot's boilerplate, dropped. It boots when what
+#   remains has a `reset` or `exit` line, names fs0: (not the run's disk on a
+#   leased guest), or changes to a volume's root (`cd \...`).
+#   As on a boot disk: the run's directory is the Shell's `path` (a boot's is
+#   its disk's root), each staged .efi is also there as .EFI (the Shell looks
+#   a bare `tool` up as tool.EFI; the share is case-sensitive, FAT is not),
+#   and only a run whose script had `fs0:` -- or an app run -- enters its
+#   directory (a boot's script has no current directory before `fs0:`).
+#   What still differs, so a test that depends on it stays booted: the
+#   machine has the agent's NIC (its network stack started) and the share;
+#   `ls` of the run's directory lists the .EFI copies; an app that resets the
+#   machine reboots the leased guest rather than ending a QEMU of its own.
+#   A pool failure -- the restore refused or failed (a service older than the
+#   op answers unknown-op), the agent could not run the script, no sentinel
+#   on the console -- boots the run instead: never its verdict.
+#   Said, never to the caller (46 tests parse stdout+stderr): the TIMING line
+#   says mode=pooled, and a run booted inside a lease says why, as
+#   `run-qemu: booted inside a <class> lease: <reason>`, both to
+#   $AXL_TEST_TIMING_LOG (else a terminal).
 #
 # Examples:
 #   ./scripts/run-qemu.sh hello.efi
@@ -141,6 +222,7 @@ NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrid
 MAC_ADDR=""         # --mac XX:XX:XX:XX:XX:XX (HF4: replay a captured NIC MAC)
 CPU_SPEC=""         # --cpu SPEC (HF4: replay a captured CPU model, e.g. qemu64,family=6)
 HOSTFWDS=()
+GUESTFWDS=()        # --guestfwd SPEC, each appended to the slirp netdev
 HOSTFWD_CHOSEN=()   # HOSTFWD_<guest>=<host> for each --hostfwd auto:<guest>
 EXTRA_FILES=()
 # Shell variables to `set` before the app runs, as NAME=VALUE. Exists so a test
@@ -168,6 +250,12 @@ BACKGROUND=false
 SERIAL_LOG=""
 SERIAL_LOG_RAW=""
 SERIAL_SOCKET=""
+# --monitor-socket / --qmp-socket (--background only): a caller-owned HMP /
+# QMP socket for a guest the caller drives for its whole life (screendump on
+# demand, sendkey, input-send-event), reported back as MONITOR_SOCKET= /
+# QMP_SOCKET= next to QEMU_PID=.
+MONITOR_SOCKET=""
+QMP_SOCKET=""
 GDB_PORT=""
 GDB_HALT=false
 DEBUGCON_LOG=""
@@ -200,8 +288,17 @@ INTERACTIVE=false
 DISPLAY_BACKEND=""
 MOUNT_DIR=""
 MOUNT_TAG="hostfs"
+# --qcow2: the vars pflash and the boot disk on qcow2, so a snapshot captures
+# the UEFI variables and the disk (the guest pool restores both per lease).
+QCOW2=false
+# --hostfwd-bind ADDR: the address every forwarded host port listens on
+# (default: every interface, QEMU's own default).
+HOSTFWD_BIND=""
+# --state-dir DIR: with --qcow2, the qcow2 vars and disk live in DIR and
+# outlive the run, so a new QEMU can restore from them (the pool's cold start).
+STATE_DIR=""
 MEM="512M"            # guest RAM (also used for memory-backend-file size)
-BRIDGES=false         # --bridges adds a small PCI bridge tree (mirrors test runner)
+BRIDGES=false         # --bridges boots the standard guest (the integration tests')
 TAP_IFACE=""          # --tap <ifname>: bridge the NIC to a host tap (real net)
                       # instead of SLIRP user-mode (real DHCP/ICMP; needs the
                       # tap pre-created + owned by the qemu user)
@@ -218,6 +315,60 @@ TAP_IFACE=""          # --tap <ifname>: bridge the NIC to a host tap (real net)
 ORIG_ARGV=("$@")
 SHELL_LAUNCHER_STAGED=false
 SHELL_LAUNCHER_PATH=""
+
+# _rq_machine_sig: the machine the parsed options ask for, one fact per line
+# in a fixed order -- what pooled mode compares with the lease's class (its
+# options parsed by this same loop: _rq_class_sig). The way a run is DRIVEN
+# (screenshots, sockets, --background...) is not here; pooled mode refuses
+# those separately.
+_rq_machine_sig() {
+    local a nic=none gpu=false
+    [[ "$NET" == true ]] && nic="${NIC_MODEL:-virtio-net-pci}"
+    [[ "$ENABLE_GPU" == true || -n "$SCREENSHOT" || -n "$DISPLAY_BACKEND" ]] && gpu=true
+    printf '%s\n' "bridges=$BRIDGES" "nic=$nic" "nic-no-rom=${NIC_NO_ROM:-false}" \
+        "mac=$MAC_ADDR" "gpu=$gpu" "no-gpu=$NO_GPU" "cpu=$CPU_SPEC" "mem=$MEM"
+    for a in ${GUESTFWDS[@]+"${GUESTFWDS[@]}"}; do printf 'guestfwd=%s\n' "$a"; done
+    for a in ${EXTRA_QEMU_ARGS[@]+"${EXTRA_QEMU_ARGS[@]}"}; do printf 'qemu-arg=%s\n' "$a"; done
+}
+
+# _rq_class_sig: _rq_machine_sig of the lease's class -- its options
+# (AXL_POOL_CLASS_ARGS, one per line) after the `--net` every pooled guest
+# has, parsed by this script's own loop in a run of its own -- with nothing
+# of this run's environment that shapes a machine (NIC_NO_ROM, an env knob
+# too), and its complaints kept out of the caller's output (a failure is the
+# reason the run then boots with).
+_rq_class_sig() {
+    local -a cargs=()
+    [[ -n "$AXL_POOL_CLASS_ARGS" ]] && mapfile -t cargs <<< "$AXL_POOL_CLASS_ARGS"
+    env -u NIC_NO_ROM _AXL_RQ_MACHINE_SIG=1 bash "${BASH_SOURCE[0]}" --arch "$ARCH" --net \
+        ${cargs[@]+"${cargs[@]}"} 2> /dev/null
+}
+
+# _rq_machine_diff: the first fact in which the parsed run's machine differs
+# from the lease's class's, as "the run has X, the class Y" ("nothing" past
+# the end of either); nothing printed when they are the same. A run with no
+# NIC option and no --bridges is the bare machine, which every class has the
+# agent's NIC beside, so it compares as `--net`. Returns 2 when there is no
+# class to compare with (AXL_POOL_CLASS_ARGS unset) or its options cannot be
+# read. common-test.sh asks the same question of a pooled test's own QEMU
+# arguments (_AXL_RQ_MACHINE_SIG=compare).
+_rq_machine_diff() {
+    local csig i
+    local -a mine=() theirs=()
+    [[ -n "${AXL_POOL_CLASS_ARGS+set}" ]] || return 2
+    if ! csig=$(_rq_class_sig) || [[ -z "$csig" ]]; then return 2; fi
+    mapfile -t theirs <<< "$csig"
+    mapfile -t mine < <(
+        [[ "$NET" != true && "$BRIDGES" != true ]] && NET=true
+        _rq_machine_sig
+    )
+    for (( i = 0; i < ${#mine[@]} || i < ${#theirs[@]}; i++ )); do
+        if [[ "${mine[i]:-}" != "${theirs[i]:-}" ]]; then
+            printf 'the run has %s, the class %s\n' "${mine[i]:-nothing}" "${theirs[i]:-nothing}"
+            return 0
+        fi
+    done
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -249,6 +400,9 @@ while [[ $# -gt 0 ]]; do
         --cpu)        CPU_SPEC="$2"; shift 2 ;;
         --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
+        --guestfwd)   GUESTFWDS+=("$2"); NET=true; shift 2 ;;
+        --mem)        MEM="$2"; shift 2 ;;
+        --hostfwd-bind) HOSTFWD_BIND="$2"; shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
         --setvar)
             # NAME=VALUE, checked here rather than silently emitting `set FOO
@@ -271,6 +425,8 @@ while [[ $# -gt 0 ]]; do
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
         --serial-log-raw) SERIAL_LOG_RAW="$2"; shift 2 ;;
         --serial-socket) SERIAL_SOCKET="$2"; shift 2 ;;
+        --monitor-socket) MONITOR_SOCKET="$2"; shift 2 ;;
+        --qmp-socket) QMP_SOCKET="$2"; shift 2 ;;
         --gdb)
             # Optional numeric port arg; default 1234.
             if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
@@ -288,6 +444,8 @@ while [[ $# -gt 0 ]]; do
         --cpu-threshold) CPU_THRESHOLD="$2"; shift 2 ;;
         --cpu-sustain) CPU_SUSTAIN="$2"; shift 2 ;;
         -i|--interactive) INTERACTIVE=true; shift ;;
+        --qcow2) QCOW2=true; shift ;;
+        --state-dir) STATE_DIR="$2"; shift 2 ;;
         --mount)
             # Accept "DIR" or "DIR:tag" — tag is the UEFI volume label
             # virtiofs advertises (defaults to "hostfs"); rarely needed.
@@ -353,13 +511,13 @@ Options:
                            must already exist and be owned by the qemu user;
                            scripts/netcfg-testnet.sh (in agt) sets up the
                            tap + a dnsmasq DHCP server + NAT.
-  --bridges                Add a small PCI bridge tree (one PCIe root
-                           port + a virtio-rng device behind it) AND a
-                           USB topology (qemu-xhci + usb-mouse + usb-hub
-                           + usb-tablet). Mirrors the topology the unit-
-                           test runner uses, so interactive smoke-tests
-                           of lspci -t and lsusb -t see real bridges
-                           and real USB hub-port chains.
+  --bridges                Add the integration tests' standard devices: a
+                           PCIe root port (00:02.0) with a virtio-rng
+                           behind it, and qemu-xhci (00:03.0) with
+                           usb-mouse + usb-hub + usb-tablet. So interactive
+                           smoke-tests of lspci -t and lsusb -t see real
+                           bridges and real hub-port chains. (The NIC stays
+                           this script's: none unless --net.)
   --nic-model MODEL        QEMU NIC model (implies --net). Examples:
                            virtio-net-pci (default), e1000, e1000e,
                            rtl8139, pcnet, ne2k_pci. Use to test
@@ -388,7 +546,23 @@ Options:
                            hostfwd cannot bind, so a port clash presents as
                            "the guest has no network" rather than as a
                            bind error.
+  --mem SIZE               Guest RAM as <N>M or <N>G (default 512M); the
+                           virtio-fs memory backend follows it. For a pool
+                           class whose tests need more (the unit class: its
+                           FAT RAM disk comes out of guest RAM).
+  --guestfwd SPEC          Forward a guest-initiated TCP connection (slirp
+                           guestfwd; repeatable; implies --net), e.g.
+                           `tcp:10.0.2.100:9999-cmd:cat` -- with `cmd:` a
+                           program spawned per connection on its stdio, so
+                           no host port or server is needed. No commas.
   --extra FILE             Stage additional .efi on disk (repeatable)
+  --monitor-socket PATH    With --background: serve the QEMU HMP monitor on
+                           the UNIX socket PATH for the guest's whole life
+                           (e.g. `screendump` on demand) and report it as
+                           MONITOR_SOCKET=PATH next to QEMU_PID=. The
+                           caller owns PATH; a stale socket there is removed.
+  --qmp-socket PATH        With --background: the same for QMP
+                           (QMP_SOCKET=PATH), e.g. input-send-event.
   --setvar NAME=VALUE      `set` a shell variable before the app (repeatable).
                            e.g. --setvar AXL_LOG_LEVEL=debug to see debug lines
   --sendkey "K K ..."      With --screenshot: inject QEMU monitor key
@@ -494,7 +668,10 @@ Options:
                            launches it directly — no parent shell, no
                            startup.nsh. For a console-hosting app (axterm,
                            SoftBMC); its child Shell is staged at \Shell.efi.
-  --background             Launch QEMU in background, print PID
+  --background             Launch QEMU in background, print PID. You own
+                           the guest from the QEMU_PID= line on; if this
+                           script is killed before printing it, the guest
+                           is taken down with it.
   --serial-log FILE        Save serial output to file (foreground:
                            ANSI-stripped clean transcript; background:
                            live raw log — symlinked).
@@ -539,6 +716,22 @@ Options:
                            ANSI-stripping post-filter. Mutually
                            exclusive with --background and --screenshot.
                            Ctrl-A C → QEMU monitor; Ctrl-A X → quit.
+  --qcow2                  Put the OVMF vars pflash and the boot disk on
+                           qcow2 instead of raw, so a QEMU snapshot
+                           (savevm / snapshot-save) captures the UEFI
+                           variables and the disk, a restore reverts both,
+                           and a new QEMU process can restore it (QEMU
+                           refuses while any writable disk cannot hold a
+                           snapshot) -- what a pooled guest needs.
+  --state-dir DIR          With --qcow2: create the qcow2 vars and disk in
+                           DIR (made if missing) instead of the run's temp
+                           directory, and LEAVE them there when the run
+                           ends -- a later QEMU restores a snapshot from
+                           them (the guest pool's cold start).
+  --hostfwd-bind ADDR      The IPv4 address every --hostfwd host port
+                           listens on (default: every interface). The guest
+                           pool binds its agents to 127.0.0.1: an agent runs
+                           whatever command it is sent.
   --mount DIR[:TAG]        Expose host directory DIR to the guest as
                            a virtiofs volume. Mount with `map -r` from
                            the UEFI shell; appears as fsN:. Requires
@@ -569,7 +762,13 @@ Environment:
   AXL_SHELL_LAUNCHER_BIN   Stage this binary as the launcher instead of
                            building one. Must be a PE image.
   AXL_QEMU_TMPDIR          Base directory for per-run scratch (default
-                           /dev/shm when usable).
+                           /dev/shm when usable). --screenshot and --mount
+                           put UNIX sockets under it, and UNIX socket paths
+                           are capped at 107 bytes (sun_path is 108 with the
+                           NUL): keep this base to 75 bytes or less. A longer
+                           one is refused before QEMU starts. The
+                           --monitor-socket, --qmp-socket and --serial-socket
+                           paths have the same 107-byte cap.
 
   Cached launcher verdicts live in
   ${XDG_CACHE_HOME:-~/.cache}/axl-sdk/shell-launcher-blocklist/ -- delete
@@ -585,6 +784,20 @@ HELP
             shift ;;
     esac
 done
+
+# The machine questions, asked of the parsed options and nothing else done:
+# =1 prints the machine (_rq_class_sig); =compare prints how it differs from
+# the lease's class and exits 0 (the same), 3 (differs) or 2 (no class to
+# compare with) -- common-test.sh's check of a pooled test's own arguments.
+# (Not 1: this script's own refusals exit 1.)
+case "${_AXL_RQ_MACHINE_SIG:-}" in
+    1) _rq_machine_sig; exit 0 ;;
+    compare)
+        _rq_diff=$(_rq_machine_diff) || exit 2
+        [[ -z "$_rq_diff" ]] && exit 0
+        printf '%s\n' "$_rq_diff"
+        exit 3 ;;
+esac
 
 if [[ -z "$EFI_FILE" ]]; then
     if [[ "$INTERACTIVE" == "true" ]]; then
@@ -602,6 +815,29 @@ fi
 
 if [[ -n "$EFI_FILE" && ! -f "$EFI_FILE" ]]; then
     echo "ERROR: file not found: $EFI_FILE" >&2
+    exit 1
+fi
+
+# --monitor-socket / --qmp-socket: only --background hands the guest's life
+# to the caller; every other mode owns (or has no) monitor of its own.
+if [[ -n "$MONITOR_SOCKET$QMP_SOCKET" && "$BACKGROUND" != "true" ]]; then
+    echo "ERROR: --monitor-socket/--qmp-socket need --background" >&2
+    exit 1
+fi
+
+# The caller's own sockets, named by the option that set them. See
+# axl_sock_path_check: over the limit QEMU refuses the socket, and the trace
+# is one line in a log nobody is reading.
+[[ -z "$MONITOR_SOCKET" ]] || axl_sock_path_check --monitor-socket "$MONITOR_SOCKET" || exit 1
+[[ -z "$QMP_SOCKET" ]]     || axl_sock_path_check --qmp-socket "$QMP_SOCKET"         || exit 1
+[[ -z "$SERIAL_SOCKET" ]]  || axl_sock_path_check --serial-socket "$SERIAL_SOCKET"   || exit 1
+
+if [[ -n "$HOSTFWD_BIND" && ! "$HOSTFWD_BIND" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    echo "ERROR: --hostfwd-bind needs an IPv4 address, got '$HOSTFWD_BIND'" >&2
+    exit 1
+fi
+if [[ -n "$STATE_DIR" && "$QCOW2" != true ]]; then
+    echo "ERROR: --state-dir needs --qcow2: the state it keeps is the qcow2 vars and disk a snapshot lives in" >&2
     exit 1
 fi
 
@@ -748,6 +984,633 @@ with open(sys.argv[1], 'rb') as f:
     [[ "$SUBSYSTEM" == "11" || "$SUBSYSTEM" == "12" ]] && IS_DRIVER=true
 fi
 
+# CPU-spike sampler + monitor lifecycle live in scripts/axl-common.sh so
+# common-test.sh (a sibling that builds its own QEMU command and never calls this
+# script) gets the same check. cpu_policy_init picks the KVM/TCG-aware threshold +
+# warm-up + warn carve-out (one source of truth, shared with common-test.sh);
+# --cpu-threshold / --no-cpu-warn parsed above still override it.
+# --workload declares the SHAPE of this run, which decides WHICH gate applies.
+# `compute` must never mean "no gate": the duration signal is the only thing
+# the sampler could legitimately see for a compute-bound guest, and it is what
+# catches an accidental O(n^2) surfacing as "the suite got slower". So it
+# requires an explicit budget rather than defaulting to one that would be wrong
+# for every caller.
+case "$WORKLOAD" in
+    idle) ;;
+    compute)
+        if [[ -z "$MAX_DURATION" ]]; then
+            echo "ERROR: --workload compute requires --max-duration SECS" >&2
+            echo "       (it turns the CPU-sustain check off, so the budget is" >&2
+            echo "        what keeps the run gated at all)" >&2
+            exit 2
+        fi
+        CPU_WARN=false   # measuring duration instead -- see duration_summary
+        ;;
+    *)
+        echo "ERROR: --workload must be 'idle' or 'compute' (got '$WORKLOAD')" >&2
+        exit 2
+        ;;
+esac
+
+cpu_policy_init "$ARCH"
+
+# While a guest runs, a kill of this script must take the guest with it:
+# prepend a `kill` of its PID to the EXIT trap, and drop it again once the PID
+# is reaped -- a reaped PID can be recycled to an unrelated process.
+#
+# The guard goes up AROUND the launch, not after it:
+#
+#   _rq_guard_begin
+#   ( timeout ... ) &          # the guest
+#   WRAPPER_PID=$!
+#   _rq_tm_watch "$WRAPPER_PID" "$LOG"   # inside, so its pid is recorded
+#   _rq_guard_guest "$WRAPPER_PID"
+#
+# A bash trap runs between any two commands, so a guard armed after the `&`
+# left an instant -- the `$!` assignment, the timing watcher's start, the
+# guard's own capture of the EXIT trap -- where a signal to this script ran
+# the cleanup WITHOUT the kill. A booted guest's `timeout` keeps it in a
+# process group of its own, so nothing else reached it and it ran on to
+# --timeout; a --screenshot guest shares this script's group, so only a
+# signal to the script alone missed it -- and it has no watchdog, so it ran
+# for ever. _rq_guard_begin captures the EXIT trap while no guest exists yet,
+# then has INT and TERM only RECORDED until _rq_guard_guest has the kill in
+# place; that re-arms this script's handlers (axl_trap_cleanup's, INT and
+# TERM) and acts on a recorded signal at once. Inside the bracket nothing
+# runs that a signal could cut short (the watcher's fork is a background one;
+# losing it loses a timing reading, not the guard), and the watcher's pid is
+# known before any cleanup can need it -- lib/fwd-signal.sh's
+# record-then-check, for the launch here.
+_rq_exit_prev=""
+_rq_guard_sig=""
+_rq_guard_begin() {
+    _rq_exit_prev=$(axl_exit_trap_cmd)
+    _rq_guard_sig=""
+    trap '_rq_guard_sig=${_rq_guard_sig:-INT}' INT
+    trap '_rq_guard_sig=${_rq_guard_sig:-TERM}' TERM
+}
+_rq_guard_guest() {
+    # shellcheck disable=SC2064  # the PID is meant to expand NOW
+    trap "kill -TERM $1 2>/dev/null; _rq_tm_end unfinished; $_rq_exit_prev" EXIT
+    axl_exit_on_signal INT TERM
+    [[ -z "$_rq_guard_sig" ]] || axl_die_by_signal "$_rq_guard_sig"
+}
+_rq_unguard_guest() {
+    if [[ -n "$_rq_exit_prev" ]]; then trap "$_rq_exit_prev" EXIT; else trap - EXIT; fi
+}
+
+# One `TIMING: run-qemu` line per guest, always (the format is defined in the
+# "Wall-time accounting" block of axl-common.sh). It goes to
+# $AXL_TEST_TIMING_LOG -- the test's own log under the runner -- or to a
+# terminal, NEVER to a stderr that is not one: 46 tests capture this script's
+# stdout+stderr in a variable and parse it. _rq_tm_begin MODE stamps the
+# launch; _rq_tm_watch PID LOG starts the boot reading on LOG (the serial
+# file); _rq_tm_end RC prints the line, once (a killed run prints
+# rc=unfinished from the guard trap above).
+_rq_tm_start=""
+_rq_tm_mode=""
+_rq_tm_wpid=""
+_rq_tm_begin() {
+    _rq_tm_mode="$1"
+    axl_timing_now _rq_tm_start
+}
+_rq_tm_watch() {
+    # noend: this script reads only the boot stamp, so the watcher writes
+    # nothing after the guest is gone. Its pid is left in TMPDIR as well, for
+    # the --background watchdog subshell, which forked before it existed.
+    axl_timing_watch "$1" "$2" "$TMPDIR/.timing" noend
+    _rq_tm_wpid="$AXL_TIMING_WATCH_PID"
+    printf '%s\n' "$_rq_tm_wpid" > "$TMPDIR/.timing.wpid" 2>/dev/null || true
+}
+_rq_tm_end() {
+    [[ -n "$_rq_tm_start" ]] || return 0
+    local now b="" g bs="-"
+    axl_timing_now now
+    # The watcher stopped and gone before its stamp is read, and before the
+    # caller's cleanup removes TMPDIR, which it writes into.
+    # (Not a pooled run: it boots nothing, starts no watcher, owns no TMPDIR.)
+    if [[ "$_rq_tm_mode" != pooled ]]; then
+        [[ -n "$_rq_tm_wpid" ]] || axl_timing_read _rq_tm_wpid "$TMPDIR/.timing.wpid"
+        axl_timing_unwatch "$_rq_tm_wpid"
+        axl_timing_read b "$TMPDIR/.timing.boot"
+    fi
+    axl_timing_secs g $(( now - _rq_tm_start ))
+    if [[ -n "$b" ]]; then
+        (( b > now )) && b=$now
+        axl_timing_secs bs $(( b - _rq_tm_start ))
+    fi
+    axl_timing_emit "TIMING: run-qemu mode=$_rq_tm_mode guest=$g boot=$bs${_rq_tm_extra:+ $_rq_tm_extra} rc=$1"
+    _rq_tm_start=""
+}
+_rq_tm_extra=""   # pooled: `restore=<s>`, between boot= and rc=
+
+# _rq_staged_inputs -- the tree files _rq_stage_files and --nsh hand the guest
+# on EITHER path, one per line: the skip cache's inputs both launches record
+# (with their own image, firmware or agent). One copy, because two hand-kept
+# lists drifted: the booted one lacked --extra and --nsh.
+_rq_staged_inputs() {
+    local pci; pci="$(dirname "$0")/../share/pci-ids.json5"
+    [[ -f "$pci" ]] && printf '%s\n' "$pci"
+    local extra
+    for extra in ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}; do printf '%s\n' "${extra%%:*}"; done
+    [[ -n "$CUSTOM_NSH" ]] && printf '%s\n' "$CUSTOM_NSH"
+    return 0
+}
+
+# _rq_stage_files DIR: what every run stages beside its app -- the PCI
+# vendor/device name sidecar, so axl_pci_ids_load finds it via the standard
+# companion-path resolver (tiny, ~3 KB, and non-PCI tools ignore it; staged
+# unconditionally to avoid the "lspci shows no names because I forgot
+# --bridges" footgun), and the --extra files. Each --extra is "PATH" (lands
+# at DIR's root) or "PATH:DEST", DEST a relative target path (intermediate
+# dirs created) -- e.g. `drivers/x64/<name>.efi` for axl_driver_locate. A
+# booted run stages into its disk image, a pooled one into its directory in
+# the lease's share.
+_rq_stage_files() {
+    local dir="$1" pci extra extra_src extra_dst
+    pci="$(dirname "$0")/../share/pci-ids.json5"
+    if [[ -f "$pci" ]]; then
+        cp "$pci" "$dir/pci-ids.json5"
+    fi
+    for extra in ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}; do
+        # Split src:dest. Reject any DEST that escapes via ".." to keep
+        # the staging dir self-contained.
+        if [[ "$extra" == *:* ]]; then
+            extra_src="${extra%%:*}"
+            extra_dst="${extra#*:}"
+            if [[ "$extra_dst" == *..* || "$extra_dst" = /* ]]; then
+                echo "ERROR: --extra dest must be a relative path without '..': $extra_dst" >&2
+                exit 1
+            fi
+        else
+            extra_src="$extra"
+            extra_dst="$(basename "$extra")"
+        fi
+        if [[ ! -f "$extra_src" ]]; then
+            echo "ERROR: extra file not found: $extra_src" >&2
+            exit 1
+        fi
+        mkdir -p "$dir/$(dirname "$extra_dst")"
+        cp "$extra_src" "$dir/$extra_dst"
+    done
+}
+
+# _rq_print_output CLEAN: what a foreground run prints of its ANSI-stripped
+# console log -- all of it with --raw, else the app's output: from the start
+# sentinel (or, if the launcher fell back to booting the Shell directly, the
+# "...to continue." countdown prompt) down to the "Reset with" trailer, the
+# anchor lines themselves stripped. One copy: a pooled run's output is a
+# booted run's, byte for byte.
+_rq_print_output() {
+    if [[ "$RAW" == "true" ]]; then
+        cat "$1"
+    else
+        sed -n "/$APP_OUTPUT_SENTINEL\|to continue\./,/^Reset with/p" "$1" | \
+            grep -vF "$APP_OUTPUT_SENTINEL" | \
+            grep -v "to continue\." | \
+            grep -v "^Reset with"
+    fi
+}
+
+# _rq_fw_debug_path DIR: where a run keeps the firmware's DEBUG output (an
+# AARCH64 guest's debug UART, a kept X64 guest's debugcon -- FW_DEBUG_LOG, and
+# qemu_fw_debug_uart in axl-common.sh), and where a pooled run copies its part
+# of the leased guest's (beside --serial-log: pooled mode boots for
+# --debugcon instead, since gdb-syms.py needs the boot's load lines a lease's part lacks): the
+# --debugcon file when one is named (X64's option, the same capture); a guest kept in
+# --state-dir DIR keeps it there (a pooled guest's, which a lease reads beside
+# its console); beside --serial-log as <name>-firmware-debug.log; else in DIR,
+# the run's temp dir.
+_rq_fw_debug_path() {
+    if [[ -n "$DEBUGCON_LOG" ]]; then
+        echo "$DEBUGCON_LOG"
+    elif [[ -z "$STATE_DIR" && -n "$SERIAL_LOG" ]]; then
+        echo "${SERIAL_LOG%.log}-firmware-debug.log"
+    else
+        echo "$1/firmware-debug.log"
+    fi
+}
+
+# _rq_print_fw_debug FILE CLEAN: after a run's output, what the
+# firmware's DEBUG channel (FILE, this run's part) said, each line as
+# "[firmware-debug] <line>" -- when it matters: it holds an ASSERT, or the
+# console (CLEAN) shows a firmware exception, whose header alone is the
+# console's (the AArch64 handler prints its registers and backtrace as DEBUG).
+# Before AARCH64 had a debug UART all of it was the console's, and so part of
+# what this script printed; a caller reading that for an ASSERT or a dump
+# still finds one. A clean run prints nothing of it.
+_rq_print_fw_debug() {
+    local slice
+    [[ -s "$1" ]] || return 0
+    slice=$(tr -d '\r' < "$1")
+    if grep -aq 'ASSERT' <<< "$slice" || grep -aqE "$AXL_FW_EXCEPTION_RE" "$2" 2>/dev/null; then
+        sed 's/^/[firmware-debug] /' <<< "$slice"
+    fi
+}
+
+# Emit the caller's `--setvar NAME=VALUE` pairs as shell `set` commands. One
+# definition used by every startup script (booted app, booted --nsh, pooled),
+# so a --setvar cannot work in one and silently do nothing in another.
+emit_setvars() {
+    local sv
+    for sv in ${SETVARS[@]+"${SETVARS[@]}"}; do
+        echo "set ${sv%%=*} ${sv#*=}"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Pooled mode -- the header's "Pooled mode" is the contract (design §6.9).
+# Decided before anything boot-specific runs (QEMU, firmware, the Shell's
+# extraction): a pooled run needs none of it.
+# ---------------------------------------------------------------------------
+_rq_pool_why=""     # why a run inside a lease boots ("" = it pools)
+_rq_pool_fail=""    # a pooled attempt's failure, which then boots
+_rq_nsh_kept=()     # the --nsh lines a pooled run executes (boilerplate dropped)
+_RQ_NO_APP="AXL-POOL-NO-APP"   # the pooled script's probe: the app was not delivered
+_rq_nsh_enters=1    # the run enters its directory (a --nsh without `fs0:` does not)
+
+# _rq_nsh_word LINE: LINE trimmed and lowercased, as a Shell command compares.
+_rq_nsh_word() {
+    local w="${1#"${1%%[![:space:]]*}"}"
+    w="${w%"${w##*[![:space:]]}"}"
+    printf '%s' "${w,,}"
+}
+
+# _rq_nsh_check FILE: sets _rq_pool_why when FILE cannot run pooled, else
+# _rq_nsh_kept. Line numbers in a reason are FILE's own (1-based).
+_rq_nsh_check() {
+    local -a lines
+    local -A drop=()
+    local i n first=-1 last=-1 w nxt
+    mapfile -t lines < "$1"
+    lines=("${lines[@]%$'\r'}")
+    n=${#lines[@]}
+    for (( i = 0; i < n; i++ )); do
+        [[ -n "$(_rq_nsh_word "${lines[i]}")" ]] || continue
+        (( first < 0 )) && first=$i
+        last=$i
+    done
+    if (( first < 0 )) || [[ "$(_rq_nsh_word "${lines[first]}")" != "@echo -off" ]]; then
+        _rq_pool_why="its --nsh does not start with @echo -off (a boot echoes each command)"
+        return
+    fi
+    drop[$first]=1
+    # The boilerplate after it: `fs0:`, then `cd \` -- each on the next
+    # non-blank line, in that order. `fs0:` is what gives a boot's script a
+    # current directory on its disk; without it a relative name finds
+    # nothing, so a pooled run then does not enter its directory either.
+    _rq_nsh_enters=0
+    nxt=$first
+    for w in "fs0:" "cd \\"; do
+        for (( i = nxt + 1; i < n; i++ )); do
+            [[ -n "$(_rq_nsh_word "${lines[i]}")" ]] && break
+        done
+        if (( i >= n )) || [[ "$(_rq_nsh_word "${lines[i]}")" != "$w" ]]; then
+            break
+        fi
+        [[ "$w" == "fs0:" ]] && _rq_nsh_enters=1
+        drop[$i]=1
+        nxt=$i
+    done
+    if (( last > first )) && [[ -z "${drop[$last]:-}" && "$(_rq_nsh_word "${lines[last]}")" == "reset -s" ]]; then
+        drop[$last]=1
+    fi
+    _rq_nsh_kept=()
+    for (( i = 0; i < n; i++ )); do
+        [[ -n "${drop[$i]:-}" ]] && continue
+        _rq_nsh_kept+=("${lines[i]}")
+        w=$(_rq_nsh_word "${lines[i]}")
+        [[ "$w" == "#"* ]] && continue
+        if [[ "$w" =~ ^(reset|exit)([[:space:]]|$) ]]; then
+            _rq_pool_why="its --nsh runs ${BASH_REMATCH[1]} (line $(( i + 1 )))"
+            return
+        fi
+        if [[ "$w" == *fs0:* ]]; then
+            _rq_pool_why="its --nsh names fs0: (line $(( i + 1 )))"
+            return
+        fi
+        if [[ "$w" =~ ^cd[[:space:]]+\\ ]]; then
+            _rq_pool_why="its --nsh changes to a volume's root (line $(( i + 1 )))"
+            return
+        fi
+    done
+}
+
+# _rq_pool_decide: _rq_pool_why = why this run, inside a lease, boots; empty
+# when its machine is the lease's class and nothing else stands in the way.
+_rq_pool_decide() {
+    local opt="" diff
+    _rq_pool_why=""
+    if [[ "${AXL_RUN_QEMU_POOL:-}" == 0 ]]; then _rq_pool_why="AXL_RUN_QEMU_POOL=0"; return; fi
+    if [[ "${QEMU_DRYRUN:-0}" == 1 ]]; then _rq_pool_why="QEMU_DRYRUN (it launches nothing)"; return; fi
+    if [[ -z "$EFI_FILE" ]]; then _rq_pool_why="no app to run"; return; fi
+    if [[ "${AXL_POOL_BG_LIVE:-}" == 1 ]]; then
+        # common-test.sh's pooled background run: its server lives on the
+        # leased guest, and a restore would end it.
+        _rq_pool_why="the test's own background run holds the leased guest"; return
+    fi
+    if [[ "$ARCH" != "${AXL_POOL_ARCH:-}" ]]; then
+        _rq_pool_why="--arch $ARCH; the lease is ${AXL_POOL_ARCH:-of no arch}"
+        return
+    fi
+    # The way of running a pooled guest cannot give. First wins.
+    if   [[ -n "$SCREENSHOT" ]];        then opt=--screenshot
+    elif [[ -n "$SENDKEY_SEQ$SENDMOUSE_SEQ$HOLDKEY_SEQ" ]]; then opt="--sendkey/--sendmouse/--holdkey"
+    elif [[ -n "$DISPLAY_BACKEND" ]];   then opt="--display/--gui/--vnc"
+    elif [[ "$INTERACTIVE" == true ]];  then opt=--interactive
+    elif [[ -n "$MOUNT_DIR" ]];         then opt=--mount
+    elif [[ "$BACKGROUND" == true ]];   then opt=--background
+    elif [[ -n "$DEBUGCON_LOG" ]];      then opt=--debugcon
+    elif [[ -n "$GDB_PORT" ]];          then opt=--gdb
+    elif [[ -n "$SERIAL_SOCKET" ]];     then opt=--serial-socket
+    elif [[ -n "$MONITOR_SOCKET$QMP_SOCKET" ]]; then opt="--monitor-socket/--qmp-socket"
+    elif [[ "$REBOOT" == true ]];       then opt=--reboot
+    elif [[ "$BOOT_TARGET" == true ]];  then opt=--boot-target
+    elif [[ -n "${SHELL_OVERRIDE:-}" ]]; then opt=--shell
+    elif [[ "$QCOW2" == true || -n "$STATE_DIR" ]]; then opt="--qcow2/--state-dir"
+    elif [[ -n "$HOSTFWD_BIND" ]];      then opt=--hostfwd-bind
+    elif [[ -n "$TAP_IFACE" ]];         then opt=--tap
+    elif (( ${#HOSTFWDS[@]} > 0 ));     then opt=--hostfwd
+    fi
+    if [[ -n "$opt" ]]; then _rq_pool_why="$opt: not done on a pooled guest"; return; fi
+    # The machine: the lease's class's, fact for fact (_rq_machine_diff).
+    if [[ -z "${AXL_POOL_CLASS_ARGS+set}" ]]; then
+        _rq_pool_why="the lease names no machine (no AXL_POOL_CLASS_ARGS)"; return
+    fi
+    if ! diff=$(_rq_machine_diff); then
+        _rq_pool_why="run-qemu.sh could not read the ${AXL_POOL_CLASS:-?} class's options"; return
+    fi
+    if [[ -n "$diff" ]]; then
+        _rq_pool_why="the machine is not the ${AXL_POOL_CLASS:-?} class's: $diff"; return
+    fi
+    # Interpolated into Shell lines: only what a lease directory can be.
+    if ! [[ "${AXL_POOL_GUEST_DIR:-}" =~ ^[A-Za-z0-9]+:\\[A-Za-z0-9._-]+$ ]]; then
+        _rq_pool_why="an unexpected AXL_POOL_GUEST_DIR [${AXL_POOL_GUEST_DIR:-}]"; return
+    fi
+    if [[ -n "$CUSTOM_NSH" ]]; then
+        if [[ ! -f "$CUSTOM_NSH" ]]; then _rq_pool_why="its --nsh is not a file"; return; fi
+        _rq_nsh_check "$CUSTOM_NSH"
+    fi
+}
+
+# The axlpool command line, run to completion (AXL_POOL_CLI replaces it: a
+# test's stub).
+_rq_axlpool() {
+    if [[ -n "${AXL_POOL_CLI:-}" ]]; then
+        "$AXL_POOL_CLI" "$@"
+    else
+        (cd "$(dirname "$0")/../test/pool" && exec python3 -m axlpool "$@")
+    fi
+}
+
+# _rq_record_inputs FILE...: the skip cache's inputs for this test (the
+# booted path records its own; lib/test-cache.sh). Through test-cache.sh's own
+# cache_record_input, never a hand-built file name: this once wrote
+# "<test>.inputs" itself, which missed the pooled "@pool" file and then the
+# per-arch "@<arch>" one -- recording into a file nothing reads, so the test
+# could never be skipped.
+_rq_record_inputs() {
+    local lib f
+    lib="$(dirname "${BASH_SOURCE[0]}")/../test/integration/lib/test-cache.sh"
+    [[ -n "${AXL_TEST_CACHE:-}" && -d "${AXL_TEST_CACHE:-/nonexistent}" \
+       && -n "${AXL_TEST_PROFILE_NAME:-}" && -f "$lib" ]] || return 0
+    # shellcheck source=../test/integration/lib/test-cache.sh
+    source "$lib"
+    for f in "$@"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        cache_record_input "$AXL_TEST_PROFILE_NAME" "$f"
+    done
+}
+
+# _rq_clean_log RAW CLEAN: a serial log with ANSI/DEC escape sequences and
+# carriage returns stripped. The param byte class is the full CSI parameter
+# range (ECMA-48 0x30-0x3F) so DEC private modes like ESC[=3h and ESC[?25l
+# strip cleanly, not just numeric/semicolon CSI like ESC[2J; standalone ESC(
+# / ESC) charset designators, which UEFI consoles emit on init, go too.
+_rq_clean_log() {
+    axl_strip_escapes "$1" | tr -d '\r' > "$2"
+}
+
+# _rq_run_pooled: the run on the leased guest. On success it prints what a
+# booted run prints and EXITS; on a pool failure it returns 0 with the reason
+# in _rq_pool_fail, having printed nothing. (Never a non-zero return: it is
+# called as a plain command so that `set -e` holds inside it, as it does for
+# the booted path -- `f || ...` would turn errexit off for its whole body.)
+_rq_sentinel=""
+_rq_run_pooled() {
+    local vol dir host d k n=0 call gcall rc=0 out t0 t1 off size prev stable epid fwlog fwoff
+    local restore_s warmup="$CPU_WARMUP"
+    vol="${AXL_POOL_GUEST_DIR%%:*}:"
+    dir="${AXL_POOL_GUEST_DIR#*:}"
+    host="$AXL_POOL_HOST_DIR"
+    # A directory of its own: the next number, the earlier runs' removed.
+    for d in "$host"/rq-*; do
+        k="${d##*/rq-}"
+        [[ -d "$d" && "$k" =~ ^[0-9]+$ ]] && (( k > n )) && n=$k
+        rm -rf "$d"
+    done
+    n=$(( n + 1 ))
+    call="$host/rq-$n"
+    gcall="$dir\\rq-$n"
+    mkdir -p "$call" || { _rq_pool_fail="cannot make $call"; return 0; }
+    cp "$EFI_FILE" "$call/$EFI_NAME"
+    _rq_stage_files "$call"
+    # The Shell looks a bare `tool` up as tool.EFI -- the extension upper
+    # case. FAT matches it; the share (virtio-fs over a Linux directory) is
+    # case-sensitive and does not. So each staged .efi is reachable by that
+    # name too, as on a boot disk: a COPY -- a hard link (one inode, two
+    # names) makes the guest's VirtioFsDxe fail to run either name
+    # (measured: the agent answers not-run for `tool.efi` too).
+    while IFS= read -r -d '' d; do
+        cp -f "$d" "${d%.efi}.EFI"
+    done < <(find "$call" -type f -name '*.efi' -print0)
+    {
+        echo "@echo -off"
+        if [[ "$_rq_nsh_enters" == 1 ]]; then
+            echo "$vol"
+            echo "cd $gcall"
+        fi
+        # A boot's Shell searches its disk's root (FS0:\efi\tools\;
+        # FS0:\efi\boot\;FS0:\), so a bare `tool` finds tool.efi there; the
+        # leased Shell's path names its own volumes. This run's directory
+        # stands in for that root.
+        echo "set -v path $vol$gcall\\efi\\tools\\;$vol$gcall\\efi\\boot\\;$vol$gcall\\"
+        emit_setvars
+        # The `@cd .` below hides the status a share that did not deliver the
+        # app would leave (0xE, which the agent reported as not-run and this
+        # mode then booted), so a run that names an app -- a --nsh run too --
+        # probes for it and says so: its marker is a pool failure. By full
+        # path (a --nsh run need not enter its directory), and before the
+        # sentinel, so the caller's output never holds it.
+        if [[ -n "$EFI_NAME" ]]; then
+            echo "if not exist $vol$gcall\\$EFI_NAME then"
+            echo "  echo $_RQ_NO_APP"
+            echo "endif"
+        fi
+        echo "echo $APP_OUTPUT_SENTINEL"
+        if [[ -n "$CUSTOM_NSH" ]]; then
+            printf '%s\n' ${_rq_nsh_kept[@]+"${_rq_nsh_kept[@]}"}
+        elif [[ "$IS_DRIVER" == true ]]; then
+            echo "load $EFI_NAME"
+        elif [[ ${#EFI_ARGS[@]} -gt 0 ]]; then
+            echo "$EFI_NAME ${EFI_ARGS[*]}"
+        else
+            echo "$EFI_NAME"
+        fi
+        # Last, `@cd .` -- the one silent command that sets %lasterror% to 0.
+        # The agent reads a script whose last status is 0xE as "not run" (it
+        # cannot tell that from a script never found: axl-shell.h, the 0xE
+        # row), so a run whose last command was a missing-file `type`, or an
+        # app returning 14, booted instead. A boot discards the status too.
+        # The `@`: a kept `echo -on` line must not make the Shell echo it.
+        echo "@cd ."
+    } > "$call/run-qemu.nsh"
+
+    # Global: the EXIT trap reads it after this function has returned.
+    _rq_ptmp=$(mktemp -d -t axl-rqpool.XXXXXXXX)
+    local ptmp="$_rq_ptmp"
+    # The sentinel goes with the temp dir on ANY exit: a signal mid-run would
+    # otherwise leave it, and the sampler polling a guest that lives on.
+    axl_trap_cleanup '[[ -n "$_rq_sentinel" ]] && kill "$_rq_sentinel" 2>/dev/null; rm -rf "$_rq_ptmp"'
+
+    # A fresh machine, as a boot gives (the restore drops what an earlier
+    # run, or the test itself, left in the guest).
+    _rq_tm_begin pooled
+    axl_timing_now t0
+    out=$(_rq_axlpool restore 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        _rq_pool_fail="the pool could not restore the guest (exit $rc: ${out%%$'\n'*})"
+        _rq_tm_start=""
+        _rq_pool_end
+        return 0
+    fi
+    axl_timing_now t1
+    axl_timing_secs restore_s $(( t1 - t0 ))
+
+    off=$(stat -c %s "$AXL_POOL_SERIAL" 2>/dev/null || echo 0)
+    # The guest's firmware DEBUG output (an AARCH64 guest's debug UART, an
+    # X64 guest's debugcon): its log, beside the console's in the guest's
+    # state dir, from here on.
+    fwlog="$(dirname "$AXL_POOL_SERIAL")/firmware-debug.log"
+    if [[ ! -f "$fwlog" ]]; then
+        # Nothing to read an ASSERT from: a boot, not a blind run.
+        _rq_pool_fail="the leased $ARCH guest has no firmware debug log ($fwlog)"
+        _rq_tm_start=""
+        _rq_pool_end
+        return 0
+    fi
+    fwoff=$(stat -c %s "$fwlog" 2>/dev/null || echo 0)
+    # The CPU check samples the leased guest's QEMU, for this run only (the
+    # guest outlives it: the sentinel ends the sampling). No boot to skip.
+    sleep 3600 &
+    _rq_sentinel=$!
+    # No boot to skip -- for this run only: a pool failure below boots, and
+    # that boot's warm-up must be the real one.
+    CPU_WARMUP=0
+    if [[ "${AXL_POOL_QEMU_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+        cpu_monitor_start "$AXL_POOL_QEMU_PID" "$ptmp" "$_rq_sentinel"
+    fi
+    CPU_WARMUP="$warmup"
+    RUN_START_MS=$(now_ms)
+    # Started as the client process itself -- not through _rq_axlpool, whose
+    # function body would be a shell between $! and the client, so the
+    # guard's TERM would leave the client running.
+    local -a ex=(exec --timeout "$TIMEOUT" --console -- "$vol$gcall\\run-qemu.nsh")
+    _rq_guard_begin
+    if [[ -n "${AXL_POOL_CLI:-}" ]]; then
+        "$AXL_POOL_CLI" "${ex[@]}" > "$ptmp/exec.out" 2>&1 &
+    else
+        (cd "$(dirname "$0")/../test/pool" && exec python3 -m axlpool "${ex[@]}") \
+            > "$ptmp/exec.out" 2>&1 &
+    fi
+    epid=$!
+    _rq_guard_guest "$epid"
+    rc=0
+    wait "$epid" || rc=$?
+    _rq_unguard_guest
+    kill "$_rq_sentinel" 2>/dev/null || true
+    wait "$_rq_sentinel" 2>/dev/null || true
+    _rq_sentinel=""
+    # The console's last bytes reach the file: until it stops growing.
+    prev=-1 stable=0
+    for (( k = 0; k < 40 && stable < 2; k++ )); do
+        size=$(stat -c %s "$AXL_POOL_SERIAL" 2>/dev/null || echo 0)
+        if (( size == prev )); then stable=$(( stable + 1 )); else stable=0; fi
+        prev=$size
+        sleep 0.05
+    done
+    tail -c "+$(( off + 1 ))" "$AXL_POOL_SERIAL" > "$ptmp/serial.log" 2>/dev/null || true
+    _rq_clean_log "$ptmp/serial.log" "$ptmp/clean.log"
+    tail -c "+$(( fwoff + 1 ))" "$fwlog" > "$ptmp/firmware-debug.log" 2>/dev/null || true
+
+    case "$rc" in
+        0|1|124) ;;   # it ran (its status is not this script's), or --timeout cut it off
+        *)
+            out=$(head -1 "$ptmp/exec.out")
+            _rq_pool_fail="the agent could not run the script (exit $rc: ${out:-no message})"
+            ;;
+    esac
+    # The escape-stripped log, up to the sentinel: a terminal escape before
+    # the line cannot hide it, and the app printing the same words after the
+    # sentinel is the app's output, not the probe's.
+    if [[ -z "$_rq_pool_fail" ]] \
+            && sed "/$APP_OUTPUT_SENTINEL/q" "$ptmp/clean.log" | grep -cxF "$_RQ_NO_APP" > /dev/null; then
+        _rq_pool_fail="the guest did not find $EFI_NAME in its run directory"
+    fi
+    if [[ -z "$_rq_pool_fail" ]] && ! grep -qF "$APP_OUTPUT_SENTINEL" "$ptmp/clean.log"; then
+        _rq_pool_fail="no sentinel on the guest's console"
+    fi
+    if [[ -n "$_rq_pool_fail" ]]; then
+        cpu_monitor_finish > /dev/null 2>&1 || true
+        _rq_tm_start=""
+        _rq_pool_end
+        return 0
+    fi
+    _rq_tm_extra="restore=$restore_s"
+    _rq_tm_end "$rc"
+    # What ran is this test's input, as a booted run's is -- plus what ran it,
+    # the agent image. The pool's code is in every key already, as harness
+    # (test/integration/lib/test-cache.sh).
+    local -a _rq_staged; mapfile -t _rq_staged < <(_rq_staged_inputs)
+    _rq_record_inputs "$EFI_FILE" ${_rq_staged[@]+"${_rq_staged[@]}"} "${AXL_POOL_AGENT_IMAGE:-}"
+
+    if [[ -n "$SERIAL_LOG" ]]; then cp "$ptmp/clean.log" "$SERIAL_LOG"; fi
+    if [[ -n "$SERIAL_LOG_RAW" ]]; then cp "$ptmp/serial.log" "$SERIAL_LOG_RAW"; fi
+    # This run's part of the firmware's DEBUG output, where a booted run
+    # keeps it (beside --serial-log).
+    # Best effort, as the booted path's fallback: beside a --serial-log with
+    # nowhere writable next to it (/dev/null) there is no place to keep it.
+    if [[ -n "$SERIAL_LOG" ]]; then
+        cp "$ptmp/firmware-debug.log" "$(_rq_fw_debug_path "$ptmp")" 2>/dev/null || true
+    fi
+    _rq_print_output "$ptmp/clean.log"
+    _rq_print_fw_debug "$ptmp/firmware-debug.log" "$ptmp/clean.log"
+
+    local cpu_spike_rc=0
+    CPU_WARMUP=0          # what this run's sampler used (the report says it)
+    cpu_monitor_finish || cpu_spike_rc=$?
+    if [[ "$cpu_spike_rc" == "0" ]]; then
+        duration_summary $(( $(now_ms) - RUN_START_MS )) || cpu_spike_rc=$?
+    fi
+    _rq_pool_end
+    exit "$cpu_spike_rc"
+}
+# The pooled attempt's temp dir gone, its cleanup trap with it (a booted run
+# after a pool failure sets its own).
+_rq_pool_end() {
+    rm -rf "$_rq_ptmp"
+    trap - EXIT
+}
+
+if [[ -n "${AXL_POOL_AGENT:-}" && "${AXL_SHELL_LAUNCHER_RETRIED:-0}" != 1 ]]; then
+    _rq_pool_decide
+    if [[ -z "$_rq_pool_why" ]]; then
+        _rq_run_pooled                 # exits when it ran; back here on a pool failure
+        _rq_pool_why="$_rq_pool_fail"
+    fi
+    axl_timing_emit "run-qemu: booted inside a ${AXL_POOL_CLASS:-?} lease: $_rq_pool_why"
+fi
+
 # Resolve QEMU and firmware. find_qemu's `export QEMU_DIR` happens
 # in the $() subshell, so it doesn't reach our parent shell — re-derive
 # it here so find_firmware below can locate QEMU-bundled firmware
@@ -826,6 +1689,32 @@ _axl_tmp_base="${AXL_QEMU_TMPDIR:-}"
 if [[ -z "$_axl_tmp_base" && -d /dev/shm && -w /dev/shm ]]; then
     _axl_tmp_base=/dev/shm
 fi
+
+# The per-run sockets this run will actually make, checked BEFORE mktemp so a
+# refusal leaves nothing behind. The dir name is a fixed-length template and
+# mktemp drops a trailing slash from the base, so the length is known now.
+# With no usable base, mktemp -d uses $TMPDIR (still the caller's here), so
+# that is the knob to name.
+_rq_socks=()
+if [[ -n "$SCREENSHOT" ]]; then
+    _rq_socks+=(monitor.sock)
+    if [[ -n "$SENDMOUSE_SEQ$HOLDKEY_SEQ" ]]; then _rq_socks+=(qmp.sock); fi
+fi
+if [[ -n "$MOUNT_DIR" ]]; then _rq_socks+=(virtiofs.sock); fi
+if [[ ${#_rq_socks[@]} -gt 0 ]]; then
+    if [[ -n "$_axl_tmp_base" ]]; then
+        _rq_knob=AXL_QEMU_TMPDIR
+        _rq_dir=$(axl_mktemp_dir_template "$_axl_tmp_base" axl-qemu.XXXXXXXX)
+    else
+        _rq_knob=TMPDIR
+        _rq_dir=$(axl_mktemp_dir_template "${TMPDIR:-/tmp}" tmp.XXXXXXXXXX)
+    fi
+    _rq_longest=""
+    for _rq_s in "${_rq_socks[@]}"; do
+        if [[ ${#_rq_s} -gt ${#_rq_longest} ]]; then _rq_longest="$_rq_s"; fi
+    done
+    axl_sock_path_check "$_rq_knob" "$_rq_dir/$_rq_longest" || exit 1
+fi
 if [[ -n "$_axl_tmp_base" ]]; then
     # Defense-in-depth sweep: remove obviously-dead axl-qemu.* state dirs from
     # prior runs (hard-killed, where the self-clean subshell never ran, or
@@ -893,13 +1782,20 @@ if [[ -n "$_axl_tmp_base" ]]; then
 else
     TMPDIR=$(mktemp -d)
 fi
-if [[ "$BACKGROUND" != "true" ]]; then
-    # Trap INT/TERM too, not just EXIT: when a caller wraps this script in
-    # `timeout`, the SIGTERM on expiry would otherwise bypass the EXIT trap and
-    # leak the (tmpfs- or disk-backed) temp dir. (8.6 GB of such leaks were
-    # found accumulating from timeout-killed integration runs.)
-    trap 'rm -rf "$TMPDIR"' EXIT INT TERM
-fi
+# INT/TERM as well as EXIT: when a caller wraps this script in `timeout`, the
+# temp dir must still go (8.6 GB of such leaks were once found from
+# timeout-killed integration runs). And a signal must END the script: this was
+# `trap ... EXIT INT TERM`, whose handler removed the dir and then RESUMED --
+# into `sed` over the serial log it had just deleted. See axl_trap_cleanup in
+# axl-common.sh; test-signal-cleanup-selftest.sh pins it. The handlers read the
+# EXIT trap when a signal arrives, so the replacements below need only set EXIT.
+#
+# --background too, until the fork hands the dir to the detached owner (which
+# drops this trap). It was armed for the foreground only, so every exit between
+# here and that fork leaked the dir: the QEMU_DRYRUN exit -- the guest pool
+# dry-runs every boot and class key with --background, seven dirs in one suite
+# run -- and every validation failure below. test-run-qemu-flags.sh pins it.
+axl_trap_cleanup 'rm -rf "$TMPDIR"'
 
 STAGING="$TMPDIR/staging"
 LOG="$TMPDIR/serial.log"
@@ -924,64 +1820,18 @@ else
     if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
         # "auto": this script owns the serial log, so it can tell whether the
         # boot reached the Shell and undo the launcher if it did not.
-        stage_boot_shell "$STAGING" "$ARCH" "$BOOT_NAME" "$SHELL_EFI" auto
+        stage_boot_shell "$STAGING" "$ARCH" "$BOOT_NAME" "$SHELL_EFI" auto || exit 1
     fi
     if [[ -n "$EFI_FILE" ]]; then
         cp "$EFI_FILE" "$STAGING/$EFI_NAME"
     fi
 fi
 
-# Auto-stage the vendor/device name sidecar so axl_pci_ids_load
-# finds it via the standard companion-path resolver. Tiny file
-# (~3 KB), and non-PCI tools simply ignore its presence — keeping
-# this unconditional avoids the "lspci shows no names because I
-# forgot --bridges" footgun.
-PCI_IDS_FILE="$(dirname "$0")/../share/pci-ids.json5"
-if [[ -f "$PCI_IDS_FILE" ]]; then
-    cp "$PCI_IDS_FILE" "$STAGING/pci-ids.json5"
-fi
+_rq_stage_files "$STAGING"
 # Stage VirtioFsDxe.efi if the active OVMF doesn't ship it integrated.
 if [[ -n "$VFS_DRIVER_STAGE" ]]; then
     cp "$VFS_DRIVER_STAGE" "$STAGING/VirtioFsDxe.efi"
 fi
-
-# Stage extra files. Each entry is either "PATH" (lands at staging
-# root) or "PATH:DEST" where DEST is a relative target path (intermediate
-# dirs get created). Use the DEST form to drop drivers under a layout
-# like `drivers/x64/<name>.efi` for axl_driver_locate to find them.
-if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
-    for extra in "${EXTRA_FILES[@]}"; do
-        # Split src:dest. Reject any DEST that escapes via ".." to keep
-        # the staging dir self-contained.
-        if [[ "$extra" == *:* ]]; then
-            extra_src="${extra%%:*}"
-            extra_dst="${extra#*:}"
-            if [[ "$extra_dst" == *..* || "$extra_dst" = /* ]]; then
-                echo "ERROR: --extra dest must be a relative path without '..': $extra_dst" >&2
-                exit 1
-            fi
-        else
-            extra_src="$extra"
-            extra_dst="$(basename "$extra")"
-        fi
-        if [[ ! -f "$extra_src" ]]; then
-            echo "ERROR: extra file not found: $extra_src" >&2
-            exit 1
-        fi
-        mkdir -p "$STAGING/$(dirname "$extra_dst")"
-        cp "$extra_src" "$STAGING/$extra_dst"
-    done
-fi
-
-# Emit the caller's `--setvar NAME=VALUE` pairs as shell `set` commands. One
-# definition used by both startup-script branches, so a --setvar cannot work in
-# one and silently do nothing in the other.
-emit_setvars() {
-    local sv
-    for sv in "${SETVARS[@]}"; do
-        echo "set ${sv%%=*} ${sv#*=}"
-    done
-}
 
 # There is no startup script to carry them in these modes, so a --setvar would
 # be silently ignored -- say so instead.
@@ -1113,53 +1963,70 @@ fi
 # Build disk image (shared with the integration harness — see
 # qemu_stage_disk in axl-common.sh: mkimage when MKIMAGE_DIR is set, else mtools).
 qemu_stage_disk "$STAGING" "$TMPDIR/disk.img" RUN || exit 1
+DISK_FILE="$TMPDIR/disk.img"
+DISK_FMT=raw
 
 # Prepare NVRAM
-cp "$FW_VARS" "$TMPDIR/vars.fd"
+VARS_FILE="$TMPDIR/vars.fd"
+if [[ "$QCOW2" == true ]]; then
+    _qdir="$TMPDIR"
+    if [[ -n "$STATE_DIR" ]]; then
+        mkdir -p "$STATE_DIR" || { log_error "--state-dir: cannot create $STATE_DIR"; exit 1; }
+        _qdir="$(cd "$STATE_DIR" && pwd)"
+    fi
+    VARS_FILE="$_qdir/vars.qcow2"
+    _qemu_img="$(dirname "$QEMU_BIN")/qemu-img"
+    [[ -x "$_qemu_img" ]] || _qemu_img=qemu-img
+    if ! "$_qemu_img" convert -q -f raw -O qcow2 "$FW_VARS" "$VARS_FILE" \
+       || ! "$_qemu_img" convert -q -f raw -O qcow2 "$DISK_FILE" "$_qdir/disk.qcow2"; then
+        log_error "--qcow2: '$_qemu_img convert' could not make qcow2 copies of $FW_VARS and the boot disk"
+        exit 1
+    fi
+    rm -f "$DISK_FILE"
+    DISK_FILE="$_qdir/disk.qcow2"
+    DISK_FMT=qcow2
+else
+    cp "$FW_VARS" "$VARS_FILE"
+fi
 
-# CPU-spike sampler + monitor lifecycle live in scripts/axl-common.sh so
-# common-test.sh (a sibling that builds its own QEMU command and never calls this
-# script) gets the same check. cpu_policy_init picks the KVM/TCG-aware threshold +
-# warm-up + warn carve-out (one source of truth, shared with common-test.sh);
-# --cpu-threshold / --no-cpu-warn parsed above still override it.
-# --workload declares the SHAPE of this run, which decides WHICH gate applies.
-# `compute` must never mean "no gate": the duration signal is the only thing
-# the sampler could legitimately see for a compute-bound guest, and it is what
-# catches an accidental O(n^2) surfacing as "the suite got slower". So it
-# requires an explicit budget rather than defaulting to one that would be wrong
-# for every caller.
-case "$WORKLOAD" in
-    idle) ;;
-    compute)
-        if [[ -z "$MAX_DURATION" ]]; then
-            echo "ERROR: --workload compute requires --max-duration SECS" >&2
-            echo "       (it turns the CPU-sustain check off, so the budget is" >&2
-            echo "        what keeps the run gated at all)" >&2
-            exit 2
+# The firmware's DEBUG output on a channel of its own (finalize_qemu_cmd adds
+# it; qemu_fw_debug_uart in axl-common.sh says why), in FW_DEBUG_LOG: every
+# AARCH64 guest's debug UART, and a kept X64 guest's debugcon (--state-dir: a
+# pooled guest, which a lease reads from). A booted X64 run keeps its default
+# -- no debugcon, its cost a VM exit per byte -- and --debugcon FILE alone
+# stays the plain -debugcon below. It holds THIS launch's output: truncated
+# here, as the console's log is.
+FW_DEBUG_LOG=""
+if [[ "$ARCH" == AARCH64 || ( "$ARCH" == X64 && -n "$STATE_DIR" ) ]]; then
+    FW_DEBUG_LOG=$(_rq_fw_debug_path "${_qdir:-$TMPDIR}")
+    if [[ "${QEMU_DRYRUN:-0}" != 1 ]] && ! { : > "$FW_DEBUG_LOG"; } 2>/dev/null; then
+        # Beside a --serial-log that is no regular file in a writable dir (say
+        # /dev/null), the log goes to the run's own dir: a by-product must not
+        # fail a run that used to work. A --debugcon FILE was asked for.
+        if [[ -n "$DEBUGCON_LOG" ]]; then
+            echo "ERROR: cannot write --debugcon '$FW_DEBUG_LOG' (missing dir?)" >&2
+            exit 1
         fi
-        CPU_WARN=false   # measuring duration instead -- see duration_summary
-        ;;
-    *)
-        echo "ERROR: --workload must be 'idle' or 'compute' (got '$WORKLOAD')" >&2
-        exit 2
-        ;;
-esac
-
-cpu_policy_init "$ARCH"
-
+        FW_DEBUG_LOG="${_qdir:-$TMPDIR}/firmware-debug.log"
+        : > "$FW_DEBUG_LOG"
+    fi
+fi
 
 # Build QEMU command
-mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd" "$CPU_SPEC")
-CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
+_devices=""
+[[ "$BRIDGES" == "true" ]] && _devices=standard
+# --mem: QEMU's own size syntax, restricted to what both -m and the
+# memory-backend-file size= accept alike.
+if [[ ! "$MEM" =~ ^[1-9][0-9]*[MG]$ ]]; then
+    echo "ERROR: --mem '$MEM' is not <N>M or <N>G" >&2
+    exit 1
+fi
+mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$VARS_FILE" "$CPU_SPEC" "$_devices")
+CMD+=(-drive "format=$DISK_FMT,file=$DISK_FILE")
 
-# Skip the firmware Boot Manager countdown before auto-booting the first
-# option (the UEFI shell). QEMU publishes this as the `etc/boot-menu-wait`
-# fw_cfg, sourced from `-boot splash-time=N` (ms); OVMF's
-# GetFrontPageTimeoutFromQemu() reads it and, when 0, boots immediately
-# (otherwise it defaults to ~5 s). Faster, more deterministic boots — and
-# the visual-capture timing no longer rides on a 5 s wait. Set
-# QEMU_BOOT_MENU_WAIT to a non-empty ms value to restore a countdown.
-CMD+=(-boot "splash-time=${QEMU_BOOT_MENU_WAIT:-0}")
+# No Boot Manager countdown (qemu_boot_wait_args, axl-common.sh).
+mapfile -d '' -t _boot < <(qemu_boot_wait_args)
+CMD+=("${_boot[@]}")
 
 # --gpu / --screenshot: wire a virtual GPU device.  AARCH64's `virt`
 # machine has no default display device, so axl_gfx_* + any other
@@ -1225,22 +2092,6 @@ elif [[ -n "$SENDMOUSE_SEQ" ]]; then
     CMD+=(-device "qemu-xhci,id=axl_tablet_xhci" -device "usb-tablet,bus=axl_tablet_xhci.0,id=axl_tablet")
 fi
 
-# --bridges: matching topology to test/integration/common-test.sh so
-# tools that walk PCI bridges (lspci -t, sysinfo --pci, ...) and USB
-# hubs (lsusb -t) can be smoke-tested interactively against the same
-# shape unit tests use.
-# slot is auto-assigned to avoid colliding with the q35 mch at 00:00.0.
-if [[ "$BRIDGES" == "true" ]]; then
-    CMD+=(
-        -device "pcie-root-port,id=axl_rp0,bus=pcie.0,chassis=1"
-        -device "virtio-rng-pci,bus=axl_rp0"
-        -device "qemu-xhci,id=axl_usb0"
-        -device "usb-mouse,bus=axl_usb0.0,port=1"
-        -device "usb-hub,bus=axl_usb0.0,port=2"
-        -device "usb-tablet,bus=axl_usb0.0,port=2.1"
-    )
-fi
-
 # GDB stub: -gdb tcp::PORT exposes the GDB protocol; -S starts the
 # guest CPU halted so the debugger can attach before the firmware
 # runs a single instruction. KVM is incompatible with single-stepping
@@ -1265,8 +2116,10 @@ fi
 # load lines via the QEMU isa-debugcon device on I/O port 0x402, NOT
 # via the regular serial console. Capture them when --debugcon FILE
 # is given (the symbol-loader needs these to relocate ELF debug info
-# at runtime addresses).
-if [[ -n "$DEBUGCON_LOG" ]]; then
+# at runtime addresses). X64 only: `virt` has no ISA bus, and an AARCH64
+# guest's --debugcon FILE is its debug UART's log (_rq_fw_debug_path); so is
+# a kept X64 guest's (FW_DEBUG_LOG, one debugcon, not two).
+if [[ -n "$DEBUGCON_LOG" && "$ARCH" == X64 && -z "$FW_DEBUG_LOG" ]]; then
     CMD+=(-debugcon "file:$DEBUGCON_LOG"
           -global "isa-debugcon.iobase=0x402")
 fi
@@ -1286,6 +2139,9 @@ VIRTIOFSD_PID=""
 if [[ -n "$MOUNT_DIR" ]]; then
     VFS_SOCK="$TMPDIR/virtiofs.sock"
     VFS_LOG="$TMPDIR/virtiofsd.log"
+fi
+# A dry run starts no process: it shows the device and the socket path only.
+if [[ -n "$MOUNT_DIR" && "${QEMU_DRYRUN:-0}" != "1" ]]; then
     "$VIRTIOFSD_BIN" \
         --socket-path="$VFS_SOCK" \
         --shared-dir="$MOUNT_DIR" \
@@ -1307,7 +2163,8 @@ if [[ -n "$MOUNT_DIR" ]]; then
         kill "$VIRTIOFSD_PID" 2>/dev/null || true
         exit 1
     fi
-
+fi
+if [[ -n "$MOUNT_DIR" ]]; then
     CMD+=(
         -chardev "socket,id=axlvfs,path=$VFS_SOCK"
         -device "vhost-user-fs-pci,queue-size=1024,chardev=axlvfs,tag=$MOUNT_TAG"
@@ -1316,24 +2173,23 @@ if [[ -n "$MOUNT_DIR" ]]; then
     )
 fi
 
-# If --mount spawned a helper daemon (virtiofsd) in foreground mode,
-# extend the cleanup trap so they don't leak after QEMU exits.
-# Background mode emits the PIDs for the caller to manage instead
-# (see below).
-if [[ "$BACKGROUND" != "true" ]]; then
-    helper_pids=()
-    [[ -n "$VIRTIOFSD_PID" ]] && helper_pids+=("$VIRTIOFSD_PID")
-    if [[ ${#helper_pids[@]} -gt 0 ]]; then
-        # Pre-format the kill argument list with a literal space so
-        # the trap doesn't depend on $IFS at trap-fire time. Using
-        # ${helper_pids[*]} would pick up the first byte of $IFS;
-        # safer to spell the join here.
-        kill_args=""
-        for pid in "${helper_pids[@]}"; do
-            kill_args+="${kill_args:+ }$pid"
-        done
-        trap 'kill '"$kill_args"' 2>/dev/null; rm -rf "'"$TMPDIR"'"' EXIT INT TERM
-    fi
+# If --mount spawned a helper daemon (virtiofsd), extend the cleanup trap so it
+# doesn't leak: in the foreground, after QEMU exits; with --background, only
+# until the QEMU_PID= line hands it to the caller (with VIRTIOFSD_PID=), since
+# a refusal between here and the launch -- a bad --mac, say -- otherwise left
+# it running with its socket in the deleted dir.
+kill_args=""
+helper_pids=()
+[[ -n "$VIRTIOFSD_PID" ]] && helper_pids+=("$VIRTIOFSD_PID")
+if [[ ${#helper_pids[@]} -gt 0 ]]; then
+    # Pre-format the kill argument list with a literal space so
+    # the trap doesn't depend on $IFS at trap-fire time. Using
+    # ${helper_pids[*]} would pick up the first byte of $IFS;
+    # safer to spell the join here.
+    for pid in "${helper_pids[@]}"; do
+        kill_args+="${kill_args:+ }$pid"
+    done
+    trap 'kill '"$kill_args"' 2>/dev/null; rm -rf "'"$TMPDIR"'"' EXIT
 fi
 
 # Networking
@@ -1351,6 +2207,11 @@ if [[ "$NET" == "true" ]]; then
         # owns the tap + a dnsmasq DHCP server + NAT). Gives the guest a real
         # DHCP lease and working ICMP, unlike SLIRP. hostfwd is SLIRP-only and
         # ignored here (use the tap subnet directly).
+        # A usage conflict first: it is wrong whatever taps the host has.
+        if (( ${#GUESTFWDS[@]} )); then
+            echo "ERROR: --guestfwd needs slirp; it cannot be combined with --tap" >&2
+            exit 1
+        fi
         if ! ip link show "$TAP_IFACE" >/dev/null 2>&1; then
             echo "ERROR: --tap '$TAP_IFACE' does not exist (create it first," \
                  "e.g. scripts/netcfg-testnet.sh up)" >&2
@@ -1370,7 +2231,18 @@ if [[ "$NET" == "true" ]]; then
                 axl_alloc_host_port HOST_PORT || exit 1
                 HOSTFWD_CHOSEN+=("HOSTFWD_${GUEST_PORT}=${HOST_PORT}")
             fi
-            NETDEV="$NETDEV,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT}"
+            NETDEV="$NETDEV,hostfwd=tcp:${HOSTFWD_BIND}:${HOST_PORT}-:${GUEST_PORT}"
+        done
+        # --guestfwd: a guest connection to an address on slirp's network,
+        # forwarded (`cmd:` spawns a program per connection on its stdio).
+        # A comma would end the option and start another netdev option.
+        for gfwd in "${GUESTFWDS[@]}"; do
+            if [[ "$gfwd" == *,* ]]; then
+                echo "ERROR: --guestfwd '$gfwd' contains a comma, which would end the" \
+                     "guestfwd option inside -netdev" >&2
+                exit 1
+            fi
+            NETDEV="$NETDEV,guestfwd=$gfwd"
         done
         # Non-machine-readable modes get it on stderr; --background repeats
         # it on stdout next to QEMU_PID= where scripts already parse.
@@ -1417,21 +2289,56 @@ fi
 # could test what its firmware does on the NEXT boot. Options QEMU
 # treats as additive (-device, -drive, -netdev, -chardev, -smbios,
 # and the monitor family) are unaffected by the position.
-finalize_qemu_cmd() {
+# The tokens every launch mode appends LAST, into the array named $1. One list,
+# read by both finalize_qemu_cmd and the census record below, so the record
+# cannot describe a different guest from the one launched.
+qemu_cmd_tail() {
+    local -n _tail="$1"
+    _tail=()
     # --reboot: let a guest-initiated reset re-POST the same VM instead
     # of ending the run. -no-reboot is shorthand for `-action
     # reboot=shutdown`; `-action reboot=reset` is its explicit inverse,
     # and the later token wins. Placed before the caller's own tokens
     # so an explicit --qemu-arg still overrides it.
     if [[ "$REBOOT" == "true" ]]; then
-        CMD+=(-action reboot=reset)
+        _tail+=(-action reboot=reset)
     fi
     if [[ ${#EXTRA_QEMU_ARGS[@]} -gt 0 ]]; then
         # Append each token verbatim — no word-splitting, so a token may
         # contain spaces (e.g. a device spec with a space in a file path).
-        CMD+=( "${EXTRA_QEMU_ARGS[@]}" )
+        _tail+=( "${EXTRA_QEMU_ARGS[@]}" )
     fi
 }
+
+finalize_qemu_cmd() {
+    local tail
+    qemu_cmd_tail tail
+    CMD+=( ${tail[@]+"${tail[@]}"} )
+    # Last: the AARCH64 debug UART goes after every launch mode's console
+    # (a kept X64 guest's debugcon has no order to keep).
+    # The dry run comes before a mode adds its console, so its argv lists the
+    # debug UART alone -- which is what a pooled class's key needs to see.
+    [[ -n "$FW_DEBUG_LOG" ]] && qemu_fw_debug_uart CMD "$ARCH" "$FW_DEBUG_LOG"
+    return 0
+}
+
+# --monitor-socket / --qmp-socket (validated above to be --background only).
+# Added before the QEMU_DRYRUN dump so the argument shape is testable.
+if [[ -n "$MONITOR_SOCKET" ]]; then
+    CMD+=(-monitor "unix:$MONITOR_SOCKET,server,nowait")
+fi
+if [[ -n "$QMP_SOCKET" ]]; then
+    CMD+=(-qmp "unix:$QMP_SOCKET,server,nowait")
+fi
+
+# The skip cache's inputs for a booted run: everything it hands the guest from
+# the tree. One list, recorded after the launch point below and printed by the
+# dry run (AXL_RQ_CACHE_INPUT, outside the AXL_DRYRUN_ facts the pool's class
+# key reads) so test-run-qemu-flags.sh can see it. It once held the image and
+# firmware only, while the pooled path recorded --extra and --nsh too: a
+# booted test's ids file or script could change and the test read FRESH.
+mapfile -t _RQ_CACHE_INPUTS < <(printf '%s\n' "${EFI_FILE:-}" "${FW_CODE:-}" \
+    "${FW_VARS:-}" "${SHELL_EFI:-}"; _rq_staged_inputs)
 
 # QEMU_DRYRUN=1 prints the constructed CMD and exits without launching
 # qemu. Useful for argument-shape regression tests and for "what
@@ -1439,11 +2346,25 @@ finalize_qemu_cmd() {
 # own line prefixed with "QEMU_DRYRUN: " — no shell-quoting noise so
 # tests can grep for token literals (commas in -device strings, etc.)
 # without escaping.
+# Three facts beyond the argv, for a caller that keys on the machine (the
+# guest pool's class key): the run's temp dir (to normalise its paths
+# away), the vars template it copied, and a digest of every staged file's
+# name and bytes -- the launcher, Shell, options, scripts and images the
+# boot disk holds, none of which the argv names.
 if [[ "${QEMU_DRYRUN:-0}" == "1" ]]; then
     finalize_qemu_cmd
     for tok in "${CMD[@]}"; do
         printf 'QEMU_DRYRUN: %s\n' "$tok"
     done
+    echo "AXL_DRYRUN_TMPDIR=$TMPDIR"
+    echo "AXL_DRYRUN_INPUT=$FW_VARS"
+    for f in "${_RQ_CACHE_INPUTS[@]}"; do
+        [[ -n "$f" ]] && echo "AXL_RQ_CACHE_INPUT=$f"
+    done
+    if [[ -d "${STAGING:-}" ]]; then
+        echo "AXL_DRYRUN_STAGED=$(cd "$STAGING" && find . -type f -print0 | LC_ALL=C sort -z \
+            | xargs -0 -r sha256sum | sha256sum | cut -c1-64)"
+    fi
     exit 0
 fi
 
@@ -1458,7 +2379,7 @@ fi
 # real launch is below this line; nothing that exits above it boots anything.
 #
 # A COUNT and not a duration: run-qemu.sh installs and REPLACES an EXIT trap in
-# four places, so a fifth for the stop stamp would clobber a cleanup that
+# several places, so another for the stop stamp would clobber a cleanup that
 # removes the guest's TMPDIR. Seconds-per-boot is derived from the runner's own
 # per-test time instead, which needs no exit hook.
 #
@@ -1469,6 +2390,19 @@ fi
 # while looking like a complete report.
 if [[ -n "${AXL_TEST_PROFILE:-}" ]]; then
     printf 'qemu|%s\n' "${AXL_TEST_PROFILE_NAME:-run-qemu}" >> "$AXL_TEST_PROFILE"
+    # ...and the launch with its command line, for the guest-pool census
+    # (test/integration/lib/profile.sh, _prof_launch, has the record's shape).
+    # CMD here is the guest plus the tail every mode appends (qemu_cmd_tail:
+    # --reboot and every --qemu-arg, which is where TPMs, extra NICs and
+    # replayed fixtures come in). What each mode adds beyond that is harness
+    # plumbing -- serial, display, sockets -- and is recorded as the via.
+    _launch_via="run-qemu:bg=$BACKGROUND,reboot=${REBOOT:-false},shot=${SCREENSHOT:+1}"
+    _launch_via+=",serial=${SERIAL_SOCKET:+1},qmp=${QMP_SOCKET:+1},mon=${MONITOR_SOCKET:+1}"
+    _launch_via+=",i=$INTERACTIVE"
+    qemu_cmd_tail _launch_tail
+    printf 'launch|%s|%s|%s|%s\n' "${AXL_TEST_PROFILE_NAME:-run-qemu}" "$_launch_via" \
+        "${FW_VARS:-}" "$(axl_census_argv "${CMD[@]}" ${_launch_tail[@]+"${_launch_tail[@]}"})" \
+        >> "$AXL_TEST_PROFILE"
     # ...and WHAT this launch put in the guest. test_add_efi records the same
     # thing for the common-test.sh path, and misses every test that reaches a
     # guest through here -- 87 of 169 tests staged no recordable artifact until
@@ -1486,14 +2420,7 @@ fi
 # through common-test.sh's launcher. Separate from the profile above because the
 # cache is on in ordinary runs while the profile is a measurement tool. See
 # test/integration/lib/test-cache.sh.
-if [[ -n "${AXL_TEST_CACHE:-}" && -d "${AXL_TEST_CACHE:-/nonexistent}" \
-      && -n "${AXL_TEST_PROFILE_NAME:-}" ]]; then
-    for _ci in "${EFI_FILE:-}" "${FW_CODE:-}" "${FW_VARS:-}" "${SHELL_EFI:-}"; do
-        [[ -n "$_ci" && -f "$_ci" ]] || continue
-        printf '%s\n' "$(cd "$(dirname "$_ci")" && pwd)/$(basename "$_ci")" \
-            >> "$AXL_TEST_CACHE/${AXL_TEST_PROFILE_NAME}.inputs"
-    done
-fi
+_rq_record_inputs "${_RQ_CACHE_INPUTS[@]}"
 
 # Interactive mode — hand the host TTY to QEMU. No pipeline, no
 # timeout, no ANSI strip, no CPU sampler. Ctrl-A C drops to the QEMU
@@ -1593,11 +2520,14 @@ HINT
     # shell uses them.
     [[ "$altscreen_used" == "true" ]] && \
         cleanup_cmd="$cleanup_cmd; printf '\\e[r\\e[?1049l\\e[?1004h\\e[?2004h' >&2"
-    trap "$cleanup_cmd" EXIT INT TERM
+    trap "$cleanup_cmd" EXIT
 
     finalize_qemu_cmd
-    "${CMD[@]}"
-    exit $?
+    _rq_tm_begin interactive
+    _rq_rc=0
+    "${CMD[@]}" || _rq_rc=$?
+    _rq_tm_end "$_rq_rc"
+    exit "$_rq_rc"
 fi
 
 # Windowed mode — open a real graphical window for the guest's GOP
@@ -1653,11 +2583,14 @@ HINT
     cleanup_cmd='rm -rf "'"$TMPDIR"'"; stty sane 2>/dev/null || true'
     [[ -n "$VIRTIOFSD_PID" ]] && \
         cleanup_cmd="kill $VIRTIOFSD_PID 2>/dev/null; $cleanup_cmd"
-    trap "$cleanup_cmd" EXIT INT TERM
+    trap "$cleanup_cmd" EXIT
 
     finalize_qemu_cmd
-    "${CMD[@]}"
-    exit $?
+    _rq_tm_begin window
+    _rq_rc=0
+    "${CMD[@]}" || _rq_rc=$?
+    _rq_tm_end "$_rq_rc"
+    exit "$_rq_rc"
 fi
 
 # Screenshot mode
@@ -1678,8 +2611,12 @@ if [[ -n "$SCREENSHOT" ]]; then
 
     set +e
     finalize_qemu_cmd
+    _rq_tm_begin shot
+    _rq_guard_begin
     "${CMD[@]}" &
     QEMU_PID=$!
+    _rq_tm_watch "$QEMU_PID" "${SERIAL_LOG:-$LOG}"
+    _rq_guard_guest "$QEMU_PID"
     # Sample host CPU for the life of this QEMU (same monitor the default branch
     # runs). A short SHOT_WAIT may kill QEMU before the warm-up clears -> no
     # post-warm-up data, so no detection (fail-safe): give the guest enough
@@ -1947,6 +2884,9 @@ if [[ -n "$SCREENSHOT" ]]; then
     sleep 1
     kill "$QEMU_PID" >/dev/null 2>&1
     wait "$QEMU_PID" >/dev/null 2>&1
+    _rq_shot_rc=$?
+    _rq_unguard_guest
+    _rq_tm_end "$_rq_shot_rc"
     set -e
 
     # Summarize host CPU (WARN + optional CPU-REPORT). A sustained post-warm-up
@@ -2050,6 +2990,9 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     else
         CMD+=(-nographic -no-reboot)
     fi
+    # A stale socket from an earlier guest would make QEMU's bind fail.
+    [[ -n "$MONITOR_SOCKET" ]] && rm -f "$MONITOR_SOCKET"
+    [[ -n "$QMP_SOCKET" ]] && rm -f "$QMP_SOCKET"
     finalize_qemu_cmd
     # Serial destination. When the caller asked for --serial-log, write serial
     # DIRECTLY to their path (which they own and which lives OUTSIDE our $TMPDIR)
@@ -2067,7 +3010,7 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # qemu would never start, and we'd report a dead subshell PID as if it were a
     # live guest. ($LOG lives in $TMPDIR, which always exists, so the no-serial-log
     # case can't trip this.)
-    if ! : > "$BG_SERIAL_DEST" 2>/dev/null; then
+    if ! { : > "$BG_SERIAL_DEST"; } 2>/dev/null; then   # grouped: a failing > is reported before a trailing 2> applies
         echo "ERROR: cannot write --serial-log '$BG_SERIAL_DEST' (missing dir?)" >&2
         exit 1
     fi
@@ -2111,21 +3054,93 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # signal is tied to `timeout`, which lives the guest's whole lifetime, not
     # to run-qemu.sh (which exits immediately by design).
     #
-    # setpriv is util-linux >= 2.33; probed rather than assumed, because this
-    # script runs on CI runners and dev boxes alike and must not gain a hard
-    # dependency. `command -v` alone is not enough — an older setpriv exists
-    # but rejects --pdeathsig, and a launch that fails at exec is worse than
-    # the leak — so the probe actually runs the flag once. No setpriv, or no
-    # --pdeathsig support: fall back to the plain invocation, which is still
-    # bounded by `timeout` in every case except a SIGKILLed watchdog.
-    PDEATH=()
-    if command -v setpriv >/dev/null 2>&1 && setpriv --pdeathsig KILL true >/dev/null 2>&1; then
-        PDEATH=(setpriv --pdeathsig KILL)
-    fi
-    ( trap 'rm -rf "$TMPDIR"' EXIT INT TERM HUP
-      timeout "$TIMEOUT" "${PDEATH[@]}" "${CMD[@]}" > "$BG_SERIAL_DEST" 2>&1 < /dev/null || : ) >/dev/null 2>&1 &
+    # axl_pdeath_init (axl-common.sh) probes setpriv. No setpriv, or no
+    # --pdeathsig support: the plain invocation, which is still bounded by
+    # `timeout` in every case except a SIGKILLed watchdog.
+    axl_pdeath_init
+    # Its TIMING line is this subshell's too: it alone sees the guest end. A
+    # signal to it prints rc=unfinished from the trap (once: _rq_tm_end clears
+    # its stamp). The boot watcher is started BELOW, by this script, and never
+    # from in here: QEMU_PID is found as this subshell's child (`pgrep -P |
+    # head -1`), and a watcher forked first was found instead -- callers then
+    # killed the watcher and left the guest running.
+    # THE OWNER GUARDS THE GUEST UNTIL THE HANDOVER. Until the caller has the
+    # QEMU_PID= line it cannot know the guest exists, so if this script is gone
+    # before printing it -- killed by a signal, by SIGKILL, or mid-way through
+    # its own EXIT trap, which a group TERM was measured to do (3 runs in 10 at
+    # one timing, cause never pinned down) -- the guest must go with it. A guard
+    # in THIS script's traps cannot promise that; the owner subshell outlives
+    # the script by design, so it is the one that watches: until
+    # $TMPDIR/.handover exists it polls this script's pid and TERMs the guest's
+    # `timeout` when the script is gone, and a signal to the owner itself ends
+    # the guest. After the handover the caller owns the guest, and a signal to
+    # the owner only marks the cleanup for when the guest ends (it must not
+    # pull the disk from under a live guest -- bg-leak shape A).
+    #
+    # The 100 ms tick is `read -t` on a FIFO made here, BEFORE the fork: the
+    # owner forks nothing but `timeout`, so qemu_child_pid (the owner's first
+    # child) still finds the watchdog -- a `sleep` it found instead once made
+    # callers kill the wrong process. Every command that can fail is guarded:
+    # this subshell inherits set -e, and a read that times out "fails".
+    mkfifo "$TMPDIR/.owner-tick"
+    ( _rq_t=""; _rq_sig=""; _rq_launcher=$$
+      _rq_handed() { [[ -e "$TMPDIR/.handover" ]]; }
+      # Gone, or a zombie (kill -0 succeeds on one, and a parent that never
+      # reaps would otherwise keep the guest alive to its --timeout).
+      _rq_launcher_gone() {
+          local _st=""
+          kill -0 "$_rq_launcher" 2>/dev/null || return 0
+          read -r _ _ _st _ < "/proc/$_rq_launcher/stat" 2>/dev/null || return 0
+          [[ "$_st" == Z ]]
+      }
+      _rq_owner_signal() {
+          _rq_sig="$1"
+          if [[ -n "$_rq_t" ]] && ! _rq_handed; then kill -TERM "$_rq_t" 2>/dev/null || true; fi
+      }
+      trap '_rq_owner_signal INT' INT
+      trap '_rq_owner_signal TERM' TERM
+      trap '_rq_owner_signal HUP' HUP
+      trap '_rq_tm_end unfinished; rm -rf "$TMPDIR"' EXIT
+      exec {_rq_tick}<> "$TMPDIR/.owner-tick"
+      _rq_tm_begin bg
+      # {_rq_tick}<&-: the tick's fd is the owner's alone -- bash does not
+      # close it on exec, and QEMU would hold the FIFO for its whole life.
+      timeout "$TIMEOUT" ${AXL_PDEATH[@]+"${AXL_PDEATH[@]}"} "${CMD[@]}" > "$BG_SERIAL_DEST" 2>&1 < /dev/null {_rq_tick}<&- &
+      _rq_t=$!
+      # A signal that landed before $_rq_t was known.
+      if [[ -n "$_rq_sig" ]] && ! _rq_handed; then kill -TERM "$_rq_t" 2>/dev/null || true; fi
+      while kill -0 "$_rq_t" 2>/dev/null; do
+          if _rq_handed; then
+              wait "$_rq_t" 2>/dev/null || true    # a trapped signal returns it early
+          else
+              # The marker is RE-CHECKED after the launcher is seen gone: it
+              # is written before the launcher can exit, so a launcher that
+              # handed over and exited between the two tests is not mistaken
+              # for one that died before handing over.
+              if _rq_launcher_gone && ! _rq_handed; then
+                  kill -TERM "$_rq_t" 2>/dev/null || true
+              fi
+              read -r -t 0.1 -u "$_rq_tick" _ 2>/dev/null || true
+          fi
+      done
+      _rq_bg_rc=0
+      wait "$_rq_t" 2>/dev/null || _rq_bg_rc=$?
+      if [[ -n "$_rq_sig" ]]; then exit $(( 128 + $(kill -l "$_rq_sig") )); fi
+      _rq_tm_end "$_rq_bg_rc" ) >/dev/null 2>&1 &
     WRAPPER_PID=$!
+    # The dir is the owner's now: this script must not remove it under the
+    # guest. Its virtiofsd stays this script's to end until the QEMU_PID= line.
+    if [[ -n "$kill_args" ]]; then
+        trap 'kill '"$kill_args"' 2>/dev/null' EXIT
+    else
+        trap - EXIT
+    fi
     QEMU_PID=$(qemu_child_pid "$WRAPPER_PID")
+    # The boot reading, for the subshell's line (it reads $TMPDIR/.timing.boot).
+    # Disowned, output to /dev/null, ends with the watchdog: it outlives this
+    # script without holding a caller's $(...) open. No file on a serial
+    # SOCKET, so no reading there.
+    [[ -n "$SERIAL_SOCKET" ]] || _rq_tm_watch "$WRAPPER_PID" "$BG_SERIAL_DEST"
     if [[ -z "$QEMU_PID" ]]; then
         # Fall back to the wrapper PID. `kill $WRAPPER_PID` won't
         # propagate to a still-execing `timeout`+QEMU pair (they'd
@@ -2157,13 +3172,23 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     done
     axl_report_hostfwd_failure "$BG_SERIAL_DEST" "run-qemu.sh --background" || exit 1
 
+    # THE HANDOVER: from here the caller owns the guest. Marked before the first
+    # line, so a caller that has read QEMU_PID= never sees the owner kill it.
+    # A guest that already exited during startup took $TMPDIR with it (its
+    # owner removes it): the marker then has nowhere to go and nothing to
+    # guard, and the lines below still report the run as they always did.
+    { : > "$TMPDIR/.handover"; } 2>/dev/null || true
+    trap - EXIT        # virtiofsd, too, is the caller's from here
     echo "QEMU_PID=$QEMU_PID"
     echo "SERIAL_LOG=$BG_SERIAL_DEST"
     for _hf in "${HOSTFWD_CHOSEN[@]}"; do
         echo "$_hf"
     done
     [[ -n "$SERIAL_SOCKET" ]] && echo "SERIAL_SOCKET=$SERIAL_SOCKET"
+    [[ -n "$MONITOR_SOCKET" ]] && echo "MONITOR_SOCKET=$MONITOR_SOCKET"
+    [[ -n "$QMP_SOCKET" ]] && echo "QMP_SOCKET=$QMP_SOCKET"
     [[ -n "$VIRTIOFSD_PID" ]] && echo "VIRTIOFSD_PID=$VIRTIOFSD_PID"
+    [[ -n "$FW_DEBUG_LOG" ]] && echo "FIRMWARE_DEBUG_LOG=$FW_DEBUG_LOG"
     echo "TMPDIR=$TMPDIR"
     # TMPDIR is self-cleaned by the detached subshell above when the guest exits
     # (see the launch site), so the caller only needs to kill QEMU (and
@@ -2185,27 +3210,30 @@ else
     # delay (QEMU is up within ~100 ms typical, give it 1 s with
     # backoff for slow hosts), pgrep -P finds it.
     finalize_qemu_cmd
+    _rq_tm_begin fg
+    # `timeout` runs QEMU in a process group of its own, so neither a caller's
+    # group signal nor a kill of this script reaches it: without the guard a
+    # killed run-qemu.sh left its guest running to --timeout, on a deleted
+    # disk. WRAPPER_PID is the `timeout` itself (the subshell execs it), and
+    # it forwards the TERM to QEMU.
+    _rq_guard_begin
     ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
     WRAPPER_PID=$!
+    _rq_tm_watch "$WRAPPER_PID" "$LOG"
+    _rq_guard_guest "$WRAPPER_PID"
     QPID=""
     if [[ "$CPU_WARN" == "true" || "$CPU_REPORT" == "true" ]]; then
         QPID=$(qemu_child_pid "$WRAPPER_PID")
     fi
     RUN_START_MS=$(now_ms)   # --max-duration budget clock
     cpu_monitor_start "$QPID"
-    wait "$WRAPPER_PID" 2>/dev/null || true
+    _rq_fg_rc=0
+    wait "$WRAPPER_PID" 2>/dev/null || _rq_fg_rc=$?
+    _rq_unguard_guest
+    _rq_tm_end "$_rq_fg_rc"
 
-    # Strip ANSI/DEC escape sequences and carriage returns. The param
-    # byte class is the full CSI parameter range (ECMA-48 0x30-0x3F)
-    # so DEC private modes like ESC[=3h and ESC[?25l strip cleanly,
-    # not just numeric/semicolon CSI like ESC[2J.
-    # Also strip standalone ESC, plus ESC( / ESC) charset designators
-    # which UEFI consoles emit on init.
     CLEAN="$TMPDIR/clean.log"
-    sed -E '
-        s/\x1b\[[0-9;:<=>?]*[a-zA-Z@`{|}~]//g
-        s/\x1b[()][A-Za-z0-9]//g
-    ' "$LOG" | tr -d '\r' > "$CLEAN"
+    _rq_clean_log "$LOG" "$CLEAN"
 
     # --serial-log saves the cleaned transcript by default (matches
     # what the user sees on stdout). --serial-log-raw is the explicit
@@ -2234,7 +3262,7 @@ else
         cat <<EOF >&2
 ERROR: QEMU produced no serial output (0 bytes).
 
-  Disk image:    $TMPDIR/disk.img ($(stat -c%s "$TMPDIR/disk.img" 2>/dev/null || echo "?") bytes)
+  Disk image:    $DISK_FILE ($(stat -c%s "$DISK_FILE" 2>/dev/null || echo "?") bytes)
   QEMU binary:   $QEMU_BIN
   Architecture:  $ARCH
 
@@ -2244,6 +3272,10 @@ Likely causes:
   - Disk image build failed silently (rerun with bash -x)
   - QEMU build broken (try: $QEMU_BIN --version)
 EOF
+        if [[ -s "$FW_DEBUG_LOG" ]]; then
+            echo "The firmware's debug log ($FW_DEBUG_LOG) ends:" >&2
+            tail -n 20 "$FW_DEBUG_LOG" | tr -d '\r' | sed 's/^/  /' >&2
+        fi
         exit 1
     fi
 
@@ -2293,17 +3325,8 @@ EOF
         exit $?
     fi
 
-    if [[ "$RAW" == "true" ]]; then
-        cat "$CLEAN"
-    else
-        # App output runs from the start sentinel (or, if the launcher fell back
-        # to booting the Shell directly, the "...to continue." countdown prompt)
-        # down to the "Reset with" trailer. Strip the anchor lines themselves.
-        sed -n "/$APP_OUTPUT_SENTINEL\|to continue\./,/^Reset with/p" "$CLEAN" | \
-            grep -vF "$APP_OUTPUT_SENTINEL" | \
-            grep -v "to continue\." | \
-            grep -v "^Reset with"
-    fi
+    _rq_print_output "$CLEAN"
+    _rq_print_fw_debug "$FW_DEBUG_LOG" "$CLEAN"
 
     # CPU-spike summary + optional CPU-REPORT. Runs after the serial output so a
     # WARN is the last thing the user sees. A sustained post-warm-up spike exits

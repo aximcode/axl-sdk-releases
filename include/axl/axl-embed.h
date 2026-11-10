@@ -16,8 +16,8 @@
  *
  * The blob is supplied at link time by `axl-cc --embed PATH[=symbol]`
  * — axl-cc generates a `.s` file with `.incbin` and links it for
- * you. (AXL's own build system uses an internal `EMBED_BLOB`
- * Makefile function for the same purpose; the symbol convention is
+ * you. (AXL's own build system uses an internal `axl_embed_blob`
+ * CMake function for the same purpose; the symbol convention is
  * shared.)
  *
  * Either way, in C the consumer writes:
@@ -48,6 +48,7 @@
 #define AXL_EMBED_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,9 +80,15 @@ extern "C" {
  * @brief Size of an embedded blob in bytes.
  *
  * Result type is `size_t`. Pair with AXL_EMBED_DECLARE.
+ *
+ * Computed on the two symbols' ADDRESSES: they are two separate objects to
+ * the compiler, so subtracting the pointers themselves would be undefined
+ * behaviour (and clang's analyzer says so), even though the linker places
+ * the end symbol right after the blob.
  */
 #define AXL_EMBED_SIZE(name)                                    \
-    ((size_t)(axl_embedded_##name##_end - axl_embedded_##name))
+    ((size_t)((uintptr_t)axl_embedded_##name##_end              \
+              - (uintptr_t)axl_embedded_##name))
 
 #ifdef __cplusplus
 }

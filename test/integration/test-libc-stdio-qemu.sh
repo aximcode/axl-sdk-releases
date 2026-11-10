@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=28
+# test-meta: arch=both needs= est=28 guest=plain
 # test-libc-stdio-qemu.sh — newlib's stdio runs on AxlStream.
 #
 # P2 of AXL-Libc-Substrate-Design.md §4d/§4c.1. newlib defines NONE of the
@@ -72,7 +72,13 @@ EXPECTED=(
     "  PASS: fopen(\"r\") reopens the file just written"
     "  PASS: fread() returns the 11 bytes"
     "  PASS: fread() returns the right bytes"
-    "=== 16 passed, 0 failed ==="
+    "  PASS: rename(x, x) is a no-op that keeps x"
+    "  PASS: rename: a missing source is -1 with errno ENOENT"
+    "  PASS: rename: a file onto a directory is -1 with errno EISDIR, file kept"
+    "  PASS: rename: across volumes is -1 with errno EXDEV, nothing moved"
+    "  PASS: remove() of an existing file returns 0 and it is gone"
+    "  PASS: remove() of a missing file returns -1"
+    "=== 22 passed, 0 failed ==="
 )
 
 # dlmalloc's own symbols. Defined ONLY by newlib's allocator members, so any of
@@ -208,8 +214,8 @@ run_one() {
         timeout 180 "$PROJECT_DIR/scripts/run-qemu.sh" --arch "$arch" --timeout 90 \
             "$fdefi" >"$fdlog" 2>&1
         tr -d '\r' < "$fdlog" > "$fdlog.clean"
-        grep -Fxq "=== fd: 27 passed, 0 failed ===" "$fdlog.clean"
-        check "$?" "$arch: fd layer — 27 passed, 0 failed"
+        grep -Fxq "=== fd: 29 passed, 0 failed ===" "$fdlog.clean"
+        check "$?" "$arch: fd layer — 29 passed, 0 failed"
         # Name what broke, rather than only that something did.
         grep -E '^  FAIL: ' "$fdlog.clean" | head -6 | sed 's/^/      /'
     else

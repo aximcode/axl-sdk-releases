@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=8 local-only=0
+# test-meta: arch=x64 needs= est=8 local-only=0 builds=binding-driver guest=standard
 # Test the canonical Type-B (UEFI Driver Model) example driver: loads it and
 # verifies the firmware actually drives the AxlDriverBinding lifecycle —
 # Supported -> Start (with the bound interface) -> Stop — against the
@@ -22,21 +22,15 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} binding-driver 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" binding-driver 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/binding-driver.efi"
 
-# startup.nsh: load the driver (its entry self-drives connect/disconnect, so
-# loading alone walks the whole lifecycle), then shut down.
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "load binding-driver.efi"
-    echo "reset -s"
-} | test_set_startup
+# test-binding-driver.nsh: load the driver (its entry self-drives connect/disconnect, so
+# loading alone walks the whole lifecycle).
+test_use_nsh
 
 test_build_image
 

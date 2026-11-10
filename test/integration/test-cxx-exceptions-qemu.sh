@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=38 local-only=0
+# test-meta: arch=both needs= est=38 local-only=0 guest=plain
 # test-cxx-exceptions-qemu.sh — real try/catch under UEFI, and the price a C
 # image does NOT pay for it.
 #
@@ -146,7 +146,12 @@ eh_section_count() {  # eh_section_count <efi> <objdump> -> count | ERR
     local out
     out="$("$2" -h "$1" 2>/dev/null)" || { echo ERR; return 0; }
     grep -q '\.text' <<<"$out"        || { echo ERR; return 0; }
-    grep -cE '\.eh_frame|\.gcc_except_table' <<<"$out"
+    # An IMAGE's section names are eight bytes (PE/COFF 3.4: an image has no
+    # string table), and pe-set-debug drops the one objcopy writes, so the
+    # .efi says `.eh_fram` and `.gcc_exc`. Matched by that prefix: it also
+    # matches the full spelling, so a negative assertion stays sighted whether
+    # or not the name was cut.
+    grep -cE '\.eh_fram|\.gcc_exc' <<<"$out"
 }
 
 # Defined symbols in the ELF .so axl-cc keeps beside the .efi.

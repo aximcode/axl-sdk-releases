@@ -911,12 +911,13 @@ axl-sdk/experiments/axl-kernel/
     stack-pool.c               fixed-slot allocator
   test/
     kernel-poc.c               AxlKernelPoc.efi source
-  Makefile.mk                  included by top-level Makefile
+  CMakeLists.txt               added by the top-level CMakeLists.txt
   README.md                    pointer back to this section
 ```
 
-Top-level `Makefile` gains one include and one new target
-(`AxlKernelPoc.efi`). Integration test
+The top-level `CMakeLists.txt` gains one `add_subdirectory` and one new
+goal (`kernel-poc` -> `AxlKernelPoc.efi`; the Makefile include of the
+original plan went with the Makefile). Integration test
 `test/integration/test-kernel-poc.sh` mirrors the existing
 `test-*` harness.
 

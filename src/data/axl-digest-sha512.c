@@ -41,12 +41,12 @@ void
 sha512_final(Sha512State *s, uint8_t out[64])
 {
     mbedtls_sha512_finish(&s->ctx, out);
-    /* Scrubs the context ON THIS PATH -- not a lifetime guarantee.
-       axl_checksum_free() is a bare axl_free(); a context freed
-       without ever being finalized never reaches this call, so its
-       state is never scrubbed. Same as the three sibling algorithms,
-       not a regression here. The caller may re-arm a finalized
-       context with sha512_init() via axl_checksum_reset(), which
+    /* Scrubs the context ON THIS PATH. A context freed without ever
+       being finalized never reaches this call, and is covered instead
+       by axl_checksum_free(), which zeroizes the whole AxlChecksum --
+       the union that holds this state included. Same as the three
+       sibling algorithms. The caller may re-arm a finalized context
+       with sha512_init() via axl_checksum_reset(), which
        mbedtls_sha512_init() supports on a freed context. */
     mbedtls_sha512_free(&s->ctx);
 }

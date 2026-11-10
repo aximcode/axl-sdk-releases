@@ -2531,6 +2531,117 @@ test_serial_io(void)
     axl_serial_close(NULL);   /* NULL-safe: the suite surviving is the assertion */
 }
 
+/* Bind a child carrying @p tag to @p port the way the terminal driver does:
+   the child gets a copy of the port's device path (as a terminal's starts
+   with it) and the port's serial I/O is opened BY_CHILD_CONTROLLER for it.
+   With @p rewrite, the port's path is then changed IN PLACE, as a serial
+   driver does to its Uart node on a line-setting change while the terminal
+   keeps its copy. Puts axl_serial_is_console(port) in @p answer, and
+   undoes it all. Returns whether the child was really bound -- a negative
+   answer means nothing unless it was. */
+static bool
+serial_test_child_answers(EFI_HANDLE port, uint8_t *port_dp, size_t dp_size,
+                          EFI_GUID *tag, bool rewrite, bool *answer)
+{
+    EFI_HANDLE child  = NULL;
+    void      *iface  = NULL;
+    bool       bound  = false;
+    size_t     body   = dp_size - 4;   /* the port's nodes, end node left out */
+    uint8_t   *copy   = axl_malloc(body * 2 + 4);
+
+    if (copy == NULL) {
+        return false;
+    }
+    /* The port's nodes, then one more (a copy of them: one vendor node),
+       then the end node: a child's path, which starts with its port's and
+       differs from it -- the firmware refuses a second handle with the same
+       path. */
+    axl_memcpy(copy, port_dp, body);
+    axl_memcpy(copy + body, port_dp, dp_size);
+    if (EFI_ERROR(gBS->InstallMultipleProtocolInterfaces(&child, tag, NULL,
+                      &gEfiDevicePathProtocolGuid, copy, NULL))) {
+        axl_free(copy);
+        return false;
+    }
+    if (!EFI_ERROR(gBS->OpenProtocol(port, &gEfiSerialIoProtocolGuid, &iface, gImageHandle,
+                                     child, EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER))) {
+        if (rewrite) {
+            port_dp[4] ^= 0x5a;   /* first byte of the vendor node's data */
+        }
+        *answer = axl_serial_is_console((AxlHandle)port);
+        bound   = true;
+        if (rewrite) {
+            port_dp[4] ^= 0x5a;
+        }
+        gBS->CloseProtocol(port, &gEfiSerialIoProtocolGuid, gImageHandle, child);
+    }
+    gBS->UninstallMultipleProtocolInterfaces(child, tag, NULL,
+                                             &gEfiDevicePathProtocolGuid, copy, NULL);
+    axl_free(copy);
+    return bound;
+}
+
+/* axl_serial_is_console: whether a console output device is bound on the port. */
+static void
+test_serial_is_console(void)
+{
+    /* The runner's console IS its first serial port, on both arches: the
+       terminal driver's child on it is the ConOut/StdErr member the harness
+       reads every result line from. */
+    AxlHandle first = axl_serial_next(NULL);
+    test_check(first != NULL && axl_serial_is_console(first),
+               "serial console: the runner's console port is the console's");
+
+    int local_marker = 0;
+    test_check(!axl_serial_is_console(NULL),
+               "serial console: NULL is not a console port");
+    test_check(!axl_serial_is_console((AxlHandle)&local_marker),
+               "serial console: a non-handle is not a console port");
+
+    /* A synthetic port: serial I/O (never called) and a vendor device path.
+       Decided by what is BOUND on it, never by comparing paths -- a line
+       setting change on the console's own port is not exercised here
+       because on OVMF it restarts the terminal under a new path, which
+       ConPlatform no longer matches to ConOut: the harness's console is
+       gone for the rest of the boot. */
+    static const AxlGuid vguid = { 0x2f1c1a63, 0x5b0e, 0x4f7d,
+                                   { 0x9a, 0x51, 0x6e, 0x0c, 0x33, 0x7b, 0x10, 0xd4 } };
+    static EFI_SERIAL_IO_PROTOCOL fake_sio;
+    AxlDevicePath *vdp  = NULL;
+    EFI_HANDLE     port = NULL;
+    bool           made = axl_device_path_new_vendor(&vguid, &vdp) == AXL_OK
+                          && !EFI_ERROR(gBS->InstallMultipleProtocolInterfaces(
+                                 &port, &gEfiSerialIoProtocolGuid, &fake_sio,
+                                 &gEfiDevicePathProtocolGuid, vdp, NULL));
+    size_t         size = made ? axl_device_path_size(vdp) : 0;
+    uint8_t       *pdp  = (uint8_t *)vdp;
+
+    test_check(made && !axl_serial_is_console(port),
+               "serial console: a port with nothing bound answers false");
+    if (made) {
+        bool ans = false;
+        test_check(serial_test_child_answers(port, pdp, size, &gEfiConsoleOutDeviceGuid, false,
+                                             &ans) && ans,
+                   "serial console: a console-out child makes the port the console's");
+        ans = false;
+        test_check(serial_test_child_answers(port, pdp, size, &gEfiStandardErrorDeviceGuid,
+                                             false, &ans) && ans,
+                   "serial console: a standard-error child makes the port the console's");
+        ans = true;
+        test_check(serial_test_child_answers(port, pdp, size, &gEfiConsoleInDeviceGuid, false,
+                                             &ans) && !ans,
+                   "serial console: a console-in-only child, bound, does not");
+        ans = false;
+        test_check(serial_test_child_answers(port, pdp, size, &gEfiConsoleOutDeviceGuid, true,
+                                             &ans) && ans,
+                   "serial console: still the console's after the port's path is rewritten "
+                   "in place");
+        gBS->UninstallMultipleProtocolInterfaces(port, &gEfiSerialIoProtocolGuid, &fake_sio,
+                                                 &gEfiDevicePathProtocolGuid, vdp, NULL);
+    }
+    axl_free(vdp);
+}
+
 // ---------------------------------------------------------------------------
 // AxlFv — firmware-volume enumeration + attributes + file count
 // ---------------------------------------------------------------------------
@@ -3541,8 +3652,9 @@ test_pci_capabilities(void)
                    "pci bridge_info: NULL out returns -1");
 
         /* Find the pcie-root-port the test runner adds (class 0x060400,
-           PCI-to-PCI bridge). It's at 00:02.0 in QEMU's auto-assignment
-           but we locate it by class to stay topology-agnostic. */
+           PCI-to-PCI bridge). The harness pins it at 00:02.0
+           (qemu_standard_devices), but locate it by class so the check
+           does not depend on that. */
         AxlPciAddr rp;
         if (axl_pci_find_by_class(0x060400, 0, &rp) == AXL_OK) {
             test_check(axl_pci_bridge_info(rp, &br) == AXL_OK,
@@ -5352,7 +5464,7 @@ static void
 test_stdio_bridge_roundtrip(void)
 {
     /* Install captures THIS image's shell handles (it's a shell app). */
-    axl_backend_stdio_bridge_install();
+    axl_backend_stdio_bridge_install(NULL);
     void *iface = NULL;
     int rc = axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface);
     test_check(rc == AXL_OK && iface != NULL, "stdio-bridge: found after install");
@@ -5364,8 +5476,9 @@ test_stdio_bridge_roundtrip(void)
 
     axl_backend_stdio_bridge_uninstall();
     iface = NULL;
-    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) != AXL_OK,
-               "stdio-bridge: gone after uninstall");
+    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) != AXL_OK
+               && axl_protocol_find_guid(&AXL_STDIO_BRIDGE2_GUID, &iface) != AXL_OK,
+               "stdio-bridge: both gone after uninstall");
 }
 
 // ---------------------------------------------------------------------------
@@ -5382,17 +5495,28 @@ static void
 test_public_install_stdio_bridge(void)
 {
     /* This test binary is a shell app, so it has shell handles to bridge. */
-    int rc = axl_shared_driver_install_stdio_bridge();
+    static const int target = 0;   /* stands for a driver's published vtable */
+    int rc = axl_shared_driver_install_stdio_bridge(&target);
     test_check(rc == AXL_OK,
                "install_stdio_bridge: returns AXL_OK under a shell launch");
 
     void *iface = NULL;
-    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) == AXL_OK
+    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE2_GUID, &iface) == AXL_OK
                    && iface != NULL,
                "install_stdio_bridge: bridge findable after public install");
-    AxlStdioBridge *b = iface;
-    test_check(b->stdin_h == axl_backend_shell_stdin(),
+    AxlStdioBridge2 *b = iface;
+    test_check(b->size == sizeof(AxlStdioBridge2),
+               "install_stdio_bridge: the bridge says its own size");
+    test_check(b->base.stdin_h == axl_backend_shell_stdin(),
                "install_stdio_bridge: stdin_h is the launcher's StdIn");
+    test_check(b->target == &target,
+               "install_stdio_bridge: aimed at the interface it was given");
+    /* For drivers built before BRIDGE2: the original GUID carries the SAME
+       base, so an exit status either age of driver arms is the one read. */
+    void *old = NULL;
+    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &old) == AXL_OK
+                   && old == &b->base,
+               "install_stdio_bridge: the original GUID carries the same base");
 
     axl_backend_stdio_bridge_uninstall();
 }
@@ -5497,6 +5621,7 @@ test_platform_main(int argc, char **argv)
     test_usb_get_port_info();
     test_block_io();
     test_serial_io();
+    test_serial_is_console();
     test_fv();
     test_fv_names();
     test_tpm();

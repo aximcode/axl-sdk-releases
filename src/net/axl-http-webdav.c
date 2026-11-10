@@ -17,8 +17,15 @@
 #include "axl-http-server-internal.h"
 #include <axl/axl-string.h>
 #include <axl/axl-xml.h>
+#include <axl/axl-url.h>
 
 AXL_LOG_DOMAIN("webdav");
+
+/* A request path, decoded, with its NUL: what the ops table is handed. */
+#define DAV_PATH_MAX  512
+/* PROPFIND Depth: 1 asks list_dir for this many children first, doubling
+   while a listing fills the array -- with no upper bound. */
+#define DAV_PROPFIND_FIRST  64u
 
 // ---------------------------------------------------------------------------
 // Forward declarations
@@ -31,6 +38,7 @@ static int on_move    (AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
 static int on_copy    (AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
 static int on_propfind(AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
 static int on_get_or_head(AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
+static bool dav_put_release (AxlWebDavCtx *ctx);
 static int on_dav_upload (AxlHttpRequest *req, AxlHttpResponse *resp,
                           const void *chunk, size_t chunk_size,
                           void *data, bool aborted);
@@ -45,6 +53,15 @@ webdav_ctx_free(AxlWebDavCtx *ctx)
     if (ctx == NULL) {
         return;
     }
+    /* Connection teardown runs every in-flight PUT's abort call before the
+       mounts are freed, so no PUT is normally in flight here; one that is
+       is discarded rather than left open. */
+    if (ctx->put_id != 0) {
+        if (dav_put_release(ctx)) {
+            axl_warning("PUT in flight at teardown was discarded; the "
+                        "backend could not restore its target");
+        }
+    }
     /* Server-owned user_data (e.g. serve_fs's AxlFsRoot) — release it. */
     if (ctx->user_data_free != NULL && ctx->user_data != NULL) {
         ctx->user_data_free(ctx->user_data);
@@ -53,25 +70,88 @@ webdav_ctx_free(AxlWebDavCtx *ctx)
     axl_free(ctx);
 }
 
-/* Strip the registered prefix off the request URL, returning the
-   path the consumer's ops table sees ("/" for root, "/foo/bar" for
-   nested). Returns NULL if the request URL doesn't start with the
-   prefix (shouldn't happen — the router already matched, but be
-   defensive). */
-static const char *
-strip_prefix(const AxlWebDavCtx *ctx, const char *path)
+/* Whether every component of the decoded path @p p is a name the volume
+   would look up as spelled. EDK2 FAT trims a leading blank, and trailing
+   blanks and periods, from a name before its lookup, so "~AP1A2B3.TMP."
+   opens "~AP1A2B3.TMP" -- past every exact-name check (a live PUT's temp
+   was served, deleted and replaced that way) -- and FAT cannot store such
+   a name anyway. A component starting with ' ' or ending with ' ' or '.'
+   is refused; "." and ".." are dot segments, resolved later. */
+static bool
+dav_path_components_ok(const char *p)
 {
-    if (path == NULL) {
-        return NULL;
+    const char *start = p;
+    for (;; p++) {
+        if (*p != '/' && *p != '\0') {
+            continue;
+        }
+        size_t n = (size_t)(p - start);
+        bool   dots = (n == 1 && start[0] == '.')
+                      || (n == 2 && start[0] == '.' && start[1] == '.');
+        if (n > 0 && !dots
+            && (start[0] == ' ' || start[n - 1] == ' ' || start[n - 1] == '.')) {
+            return false;
+        }
+        if (*p == '\0') {
+            return true;
+        }
+        start = p + 1;
     }
-    if (axl_strncmp(path, ctx->prefix, ctx->prefix_len) != 0) {
-        return NULL;
+}
+
+/* Percent-decode one path (RFC 3986 2.1) into @p out. A '%' must start a
+   two-hex-digit escape. Refused (400): a malformed escape; an escape that
+   decodes to '/', '\' or NUL -- a separator or terminator hidden inside a
+   segment, which mapping would turn into a real one; and a RAW '\', which
+   the filesystem takes for a separator inside what HTTP calls one segment,
+   past the containment check. "%2e%2e" decodes to "..": it is resolved
+   like any "..", inside the mount. A component FAT would trim before its
+   lookup is 400 too (dav_path_components_ok). @return 0, 400, or 414 when the
+   decoded path does not fit. */
+static int
+dav_path_decode(const char *raw, char *out, size_t cap)
+{
+    size_t n = 0;
+    for (const char *p = raw; *p != '\0'; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\') {
+            return 400;
+        }
+        if (c == '%') {
+            int hi = axl_hex_nibble(p[1]);
+            int lo = (hi >= 0) ? axl_hex_nibble(p[2]) : -1;
+            if (hi < 0 || lo < 0) {
+                return 400;
+            }
+            c = (unsigned char)((hi << 4) | lo);
+            if (c == '\0' || c == '/' || c == '\\') {
+                return 400;
+            }
+            p += 2;
+        }
+        if (n + 1 >= cap) {
+            return 414;
+        }
+        out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    return dav_path_components_ok(out) ? 0 : 400;
+}
+
+/* The path the consumer's ops table sees for request URL path @p path:
+   the registered prefix stripped ("/" for root, "/foo/bar" for nested)
+   and the rest percent-decoded into @p out. @return 0, or the status to
+   answer: 400 when the URL does not start with the prefix (the router
+   already matched, so defensive) or decodes to nothing valid, 414 when
+   too long. */
+static int
+dav_rel(const AxlWebDavCtx *ctx, const char *path, char *out, size_t cap)
+{
+    if (path == NULL || axl_strncmp(path, ctx->prefix, ctx->prefix_len) != 0) {
+        return 400;
     }
     const char *rel = path + ctx->prefix_len;
-    if (*rel == '\0') {
-        return "/";
-    }
-    return rel;
+    return dav_path_decode((*rel == '\0') ? "/" : rel, out, cap);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,10 +258,62 @@ parse_overwrite(const AxlHttpRequest *req)
     return v[0] != 'F' && v[0] != 'f';
 }
 
+/* Length of the authority @p a (@p n bytes) without a trailing port that
+   is the default for @p scheme (@p scheme_len bytes), so
+   "host:80" and "host" compare equal for http. */
+static size_t
+authority_len_sans_default_port(const char *a, size_t n,
+                                const char *scheme, size_t scheme_len)
+{
+    const char *port = NULL;
+    if (scheme_len == 4 && axl_strncasecmp(scheme, "http", 4) == 0) {
+        port = ":80";
+    } else if (scheme_len == 5 && axl_strncasecmp(scheme, "https", 5) == 0) {
+        port = ":443";
+    }
+    size_t pl = (port != NULL) ? axl_strlen(port) : 0;
+    if (port != NULL && n > pl && axl_strncmp(a + n - pl, port, pl) == 0) {
+        return n - pl;
+    }
+    return n;
+}
+
+/* Does the authority of an absolute Destination URL (@p scheme up to
+   "://", then @p auth for @p auth_len bytes) name the server the request
+   was sent to -- its Host header? A request with no Host header (HTTP/1.0)
+   cannot be checked and is taken as this server. Userinfo ("user@") is not
+   part of the server's name. Names compare case-insensitively. */
+static bool
+destination_is_this_server(const AxlHttpRequest *req,
+                           const char *scheme, size_t scheme_len,
+                           const char *auth, size_t auth_len)
+{
+    const char *host = (const char *)axl_hash_table_lookup(req->headers,
+                                                           "host");
+    if (host == NULL) {
+        return true;
+    }
+    for (size_t i = auth_len; i > 0; i--) {
+        if (auth[i - 1] == '@') {
+            auth_len -= i;
+            auth     += i;
+            break;
+        }
+    }
+    size_t al = authority_len_sans_default_port(auth, auth_len,
+                                                scheme, scheme_len);
+    size_t hl = authority_len_sans_default_port(host, axl_strlen(host),
+                                                scheme, scheme_len);
+    return al == hl && axl_strncasecmp(auth, host, al) == 0;
+}
+
 /* Destination header: a URL — usually absolute ("http://host:port/dav/foo")
-   but may be a path. Returns the path component RELATIVE to the
-   webdav prefix, or NULL on parse failure / cross-mount destination.
-   Writes into @p out (caller-supplied buffer). */
+   but may be a path. Writes the path component RELATIVE to the webdav
+   prefix into @p out (caller-supplied buffer).
+
+   @return AXL_OK; AXL_UNSUPPORTED for an absolute URL naming another
+       server (RFC 4918 §9.8.5 / §9.9.4: 502); AXL_ERR on a missing or
+       unparsable header or a destination outside this mount. */
 static int
 parse_destination(const AxlWebDavCtx *ctx,
                   const AxlHttpRequest *req,
@@ -206,6 +338,11 @@ parse_destination(const AxlWebDavCtx *ctx,
         if (path == NULL) {
             return AXL_ERR;
         }
+        if (!destination_is_this_server(req, v, (size_t)(scheme_end - v),
+                                        scheme_end + 3,
+                                        (size_t)(path - (scheme_end + 3)))) {
+            return AXL_UNSUPPORTED;
+        }
     }
 
     /* Must be inside our prefix. */
@@ -221,11 +358,8 @@ parse_destination(const AxlWebDavCtx *ctx,
         return AXL_ERR;
     }
 
-    if (axl_strlen(rel) >= out_size) {
-        return AXL_ERR;
-    }
-    axl_memcpy(out, rel, axl_strlen(rel) + 1);
-    return AXL_OK;
+    /* Decoded as the request path is: one rule for both. */
+    return (dav_path_decode(rel, out, out_size) == 0) ? AXL_OK : AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,56 +405,56 @@ unix_to_rfc1123(uint64_t epoch_secs, char *out, size_t out_size)
                  (unsigned long long)y, hour, minu, sec);
 }
 
-/* Compose the absolute href "<prefix>/<rel>[/]" into @p out. Caller
-   passes a stack buffer; on overflow returns false. The trailing
-   slash on directories is a strong RFC 4918 §5.2 hint clients
-   follow when building child URLs. */
-static bool
-compose_href(const AxlWebDavCtx *ctx, const char *rel, bool is_dir,
-             char *out, size_t out_size)
+/* The absolute href "<prefix>/<rel>[/]" for @p rel, on the heap (axl_free
+   it), or NULL when it cannot be allocated. @p rel is the DECODED path
+   (names as stored); the href is a URL, so every byte outside RFC 3986's
+   unreserved set but '/' is encoded -- a space as %20, UTF-8 byte by byte.
+   The prefix is the registered URL path, used as given. The trailing slash
+   on directories is a strong RFC 4918 §5.2 hint clients follow when
+   building child URLs. No length limit: an href is never cut. */
+static char *
+compose_href(const AxlWebDavCtx *ctx, const char *rel, bool is_dir)
 {
-    /* prefix is e.g. "/dav" (no trailing slash); rel starts with
-       "/" so the join is correct. Root rel ("/") becomes the bare
-       prefix; the is_dir branch below appends the trailing slash. */
-    int n;
-    if (axl_strcmp(rel, "/") == 0) {
-        n = axl_snprintf(out, out_size, "%s/", ctx->prefix);
-    } else {
-        n = axl_snprintf(out, out_size, "%s%s", ctx->prefix, rel);
+    bool   root = axl_strcmp(rel, "/") == 0;
+    size_t cap  = axl_strlen(rel) * 3u + 1u;   /* every byte as %XX */
+    char  *enc  = root ? NULL : axl_malloc(cap);
+    if (!root && (enc == NULL || axl_url_encode(rel, enc, cap) < 0)) {
+        axl_free(enc);
+        return NULL;
     }
-    if (n < 0 || (size_t)n >= out_size) {
-        return false;
-    }
-    size_t len = (size_t)n;
-    if (is_dir && len > 0 && out[len - 1] != '/') {
-        if (len + 1 >= out_size) {
-            return false;
+    const char *tail  = root ? "/" : enc;
+    size_t      tlen  = axl_strlen(tail);
+    bool        slash = is_dir && tail[tlen - 1] != '/';
+    size_t      plen  = ctx->prefix_len;
+    char       *out   = axl_malloc(plen + tlen + (slash ? 1u : 0u) + 1u);
+    if (out != NULL) {
+        axl_memcpy(out, ctx->prefix, plen);
+        axl_memcpy(out + plen, tail, tlen);
+        if (slash) {
+            out[plen + tlen++] = '/';
         }
-        out[len++] = '/';
-        out[len]   = '\0';
+        out[plen + tlen] = '\0';
     }
-    return true;
+    axl_free(enc);
+    return out;
 }
 
 /* Emit one <D:response> for @p e living at @p rel within ctx via
-   the AxlXmlWriter. */
-static void
+   the AxlXmlWriter. false when its href cannot be built (no memory): the
+   caller fails the whole listing rather than send an entry without one. */
+static bool
 emit_entry(AxlXmlWriter *w, const AxlWebDavCtx *ctx,
            const char *rel, const AxlFsEntry *e)
 {
-    axl_xml_writer_start_element(w, "D:response");
-
-    /* href */
-    char href[1024];
-    if (compose_href(ctx, rel, axl_fs_entry_is_dir(e), href, sizeof(href))) {
-        axl_xml_writer_start_element(w, "D:href");
-        axl_xml_writer_text(w, href);
-        axl_xml_writer_end_element(w);
+    char *href = compose_href(ctx, rel, axl_fs_entry_is_dir(e));
+    if (href == NULL) {
+        return false;
     }
-    /* On href overflow we silently drop the href element. The
-       parent compose path's 512-byte cap on @p rel makes this
-       effectively unreachable; the writer's sticky-error flag
-       would surface a real OOM at finish. */
+    axl_xml_writer_start_element(w, "D:response");
+    axl_xml_writer_start_element(w, "D:href");
+    axl_xml_writer_text(w, href);
+    axl_xml_writer_end_element(w);
+    axl_free(href);
 
     axl_xml_writer_start_element(w, "D:propstat");
     axl_xml_writer_start_element(w, "D:prop");
@@ -366,6 +500,7 @@ emit_entry(AxlXmlWriter *w, const AxlWebDavCtx *ctx,
 
     axl_xml_writer_end_element(w);  /* D:propstat */
     axl_xml_writer_end_element(w);  /* D:response */
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -378,9 +513,10 @@ on_propfind(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     AxlWebDavCtx *ctx = data;
     set_dav_class_header(resp);
 
-    const char *rel_raw = strip_prefix(ctx, req->path);
-    if (rel_raw == NULL) {
-        resp->status_code = 400;
+    char rel_raw[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, rel_raw, sizeof(rel_raw));
+    if (rst != 0) {
+        resp->status_code = rst;
         return 0;
     }
     /* Normalize: clients commonly request collections with a
@@ -448,50 +584,86 @@ on_propfind(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     if (axl_strcmp(rel, "/") == 0 && self.name[0] == '\0') {
         axl_strlcpy(self.name, "/", sizeof(self.name));
     }
-    emit_entry(&xw, ctx, rel, &self);
+    bool whole  = emit_entry(&xw, ctx, rel, &self);
+    bool listed = true;   /* list_dir did not fail */
 
     /* Children — only when Depth > 0 AND the resource is a dir
        AND the consumer wired list_dir. */
-    if (include_children && axl_fs_entry_is_dir(&self) && ctx->ops.list_dir != NULL) {
-        /* Cap: enough for typical UEFI volumes. Consumers with
-           larger directories should paginate at a higher layer
-           (out of scope for v1). */
-        AxlFsEntry kids[256];
-        size_t kids_max = sizeof(kids) / sizeof(kids[0]);
-        size_t count = 0;
-        if (ctx->ops.list_dir(ctx->user_data, rel, kids,
-                              kids_max, &count) == AXL_OK) {
-            if (count == kids_max) {
-                axl_warning("propfind: directory '%s' has >= %zu "
-                            "entries; truncating PROPFIND result. "
-                            "v1 does not paginate; consumers with "
-                            "very large directories must batch at "
-                            "a higher layer.",
-                            rel, kids_max);
+    if (whole && include_children && axl_fs_entry_is_dir(&self) && ctx->ops.list_dir != NULL) {
+        /* On the HEAP, never the stack: an AxlFsEntry is hundreds of
+           bytes. list_dir takes no cursor, so a listing that fills the
+           array is asked again with twice the room until it does not --
+           with no cap: the listing is the volume's own, and a 207 that
+           leaves entries out reads as the whole truth to a sync client,
+           which then deletes what it did not see. When the room cannot
+           be had, the PROPFIND fails (507) rather than answer in part. */
+        AxlFsEntry *kids     = NULL;
+        size_t      kids_max = DAV_PROPFIND_FIRST;
+        size_t      count    = 0;
+        int         lrc      = AXL_OK;
+        for (;;) {
+            axl_free(kids);
+            kids = (kids_max <= SIZE_MAX / sizeof(*kids))
+                   ? axl_calloc(kids_max, sizeof(*kids)) : NULL;
+            if (kids == NULL) {
+                whole = false;
+                break;
             }
-            for (size_t i = 0; i < count; i++) {
-                /* Build the child's path = (rel == "/" ? "" : rel)
-                   + "/" + kids[i].name. rel is normalized (no
-                   trailing slash) so this never produces "//". */
-                char child_path[512];
-                bool root = (axl_strcmp(rel, "/") == 0);
-                int n = axl_snprintf(child_path, sizeof(child_path),
-                                     "%s/%s",
-                                     root ? "" : rel,
-                                     kids[i].name);
-                if (n < 0 || (size_t)n >= sizeof(child_path)) {
-                    axl_warning("propfind: child path overflow "
-                                "(rel='%s', name='%s'); skipping",
-                                rel, kids[i].name);
-                    continue;
-                }
-                emit_entry(&xw, ctx, child_path, &kids[i]);
+            count = 0;
+            lrc   = ctx->ops.list_dir(ctx->user_data, rel, kids, kids_max, &count);
+            if (lrc != AXL_OK || count < kids_max) {
+                break;
             }
+            if (kids_max > SIZE_MAX / 2u) {
+                axl_free(kids);
+                kids  = NULL;
+                whole = false;
+                break;
+            }
+            kids_max *= 2u;
         }
+        listed = lrc == AXL_OK;
+        for (size_t i = 0; whole && listed && i < count; i++) {
+            /* The child's path = (rel == "/" ? "" : rel) + "/" + name, on
+               the heap: a long name under a deep collection is listed, not
+               skipped. rel is normalized (no trailing slash). */
+            bool   root = (axl_strcmp(rel, "/") == 0);
+            size_t rl   = root ? 0u : axl_strlen(rel);
+            size_t nl   = axl_strlen(kids[i].name);
+            char  *cp   = axl_malloc(rl + nl + 2u);
+            if (cp == NULL) {
+                whole = false;
+                break;
+            }
+            axl_memcpy(cp, rel, rl);
+            cp[rl] = '/';
+            axl_memcpy(cp + rl + 1u, kids[i].name, nl + 1u);
+            whole = emit_entry(&xw, ctx, cp, &kids[i]);
+            axl_free(cp);
+        }
+        axl_free(kids);
     }
 
     axl_xml_writer_end_element(&xw);  /* D:multistatus */
     axl_xml_writer_finish(&xw);
+    if (!listed) {
+        /* A listing that failed is not an empty one. */
+        axl_error("PROPFIND '%s': the directory could not be listed; 500", rel);
+        axl_string_free(out);
+        resp->status_code = 500;
+        return 0;
+    }
+    if (!whole) {
+        /* Never part of a listing: the memory for the whole of it -- the
+           children, a path, an href -- could not be had. */
+        axl_error("PROPFIND '%s': the listing does not fit in memory; 507, "
+                  "nothing listed", rel);
+        axl_string_free(out);
+        axl_http_response_set_text(resp, "PROPFIND: the listing does not fit "
+                                   "in memory\n");
+        resp->status_code = 507;
+        return 0;
+    }
     if (axl_xml_writer_error(&xw)) {
         axl_string_free(out);
         resp->status_code = 500;
@@ -549,11 +721,13 @@ on_get_or_head(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
 
     bool head_only = (axl_strcmp(req->method, "HEAD") == 0);
 
-    const char *rel = strip_prefix(ctx, req->path);
-    if (rel == NULL) {
-        resp->status_code = 400;
+    char rel_buf[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, rel_buf, sizeof(rel_buf));
+    if (rst != 0) {
+        resp->status_code = rst;
         return 0;
     }
+    const char *rel = rel_buf;
     if (ctx->ops.stat == NULL) {
         resp->status_code = 405;
         return 0;
@@ -753,9 +927,9 @@ on_get_or_head(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
 }
 
 // ---------------------------------------------------------------------------
-// PUT — drives the AxlUploadHandler chunk callback. Single in-flight
-// PUT per mount; concurrent uploads on the same WebDAV mount are
-// not supported in v1.
+// PUT — drives the AxlUploadHandler chunk callback. One PUT in flight
+// per mount: another PUT that arrives meanwhile is 503 with
+// Retry-After, and touches nothing.
 // ---------------------------------------------------------------------------
 
 /* Lowercase a single ASCII byte. Idempotent on lowercase / non-alpha. */
@@ -765,97 +939,339 @@ ascii_tolower(char c)
     return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
 }
 
-/* On clean PUT EOF (called when resp->status_code is 201), verify a
-   client-supplied `Content-Digest: <algo>=<hex>` request header
-   against the just-uploaded file's actual digest. Reuses ops.digest
-   — the same callback that powers response-side Digest emission.
-   The header value is plain hex (axl-webfs's chosen symmetric
-   format; RFC 9530's `:base64:` wrapper form is not parsed in v1).
-
-   Failure modes:
-     - Header absent → no-op (consumer opted out of validation).
-     - ops.digest not wired → no-op (SDK can't verify; pass through).
-     - Digest callback returns AXL_ERR → no-op (consumer can't supply
-       hex for this algo; pass through rather than fail valid uploads).
-     - Hex mismatch → respond 400, best-effort delete via ops.remove
-       so the corrupted bytes don't linger.
-
-   The mismatch + cleanup path is best-effort: if ops.remove is not
-   wired or returns an error, the bad file may remain. Either way
-   the 400 status tells the client the upload failed. */
+/* One Content-Digest entry's value, @p len bytes at @p v, as lowercase hex
+   in @p hex: RFC 9530's byte-sequence form `:<base64>:`, or the bare hex
+   an earlier client sends. A value that is neither leaves "", which
+   matches no digest -- a claim the SDK cannot read is a mismatch, not a
+   pass. */
 static void
-content_digest_validate(AxlWebDavCtx *ctx, AxlHttpRequest *req,
-                        AxlHttpResponse *resp)
+put_digest_value_hex(
+    const char *v,
+    size_t      len,
+    char       *hex,
+    size_t      cap
+    )
 {
-    if (ctx->ops.digest == NULL || req == NULL || req->headers == NULL) {
+    static const char digits[] = "0123456789abcdef";
+
+    hex[0] = '\0';
+    if (len >= 2 && v[0] == ':' && v[len - 1] == ':') {
+        char   b64[AXL_WEBDAV_DIGEST_HEX_MAX];
+        size_t blen = len - 2;
+        void  *raw  = NULL;
+        size_t rlen = 0;
+        if (blen + 3 >= sizeof(b64)) {
+            return;
+        }
+        axl_memcpy(b64, v + 1, blen);
+        /* RFC 8941 §4.2.7 lets a sender drop the padding; the decoder
+           wants it, so restore it. */
+        while (blen % 4 != 0) {
+            b64[blen++] = '=';
+        }
+        b64[blen] = '\0';
+        if (axl_base64_decode(b64, &raw, &rlen) != AXL_OK) {
+            return;
+        }
+        if (rlen * 2 < cap) {
+            const uint8_t *b = raw;
+            for (size_t i = 0; i < rlen; i++) {
+                hex[2 * i]     = digits[b[i] >> 4];
+                hex[2 * i + 1] = digits[b[i] & 0x0f];
+            }
+            hex[2 * rlen] = '\0';
+        }
+        axl_free(raw);
         return;
     }
-    const char *header = (const char *)axl_hash_table_lookup(
-        req->headers, "content-digest");
-    if (header == NULL) {
+    if (len == 0 || len >= cap) {
         return;
     }
+    for (size_t i = 0; i < len; i++) {
+        char c = ascii_tolower(v[i]);
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            hex[0] = '\0';
+            return;
+        }
+        hex[i] = c;
+    }
+    hex[len] = '\0';
+}
 
-    /* Parse <algo>=<hex>. Skip leading whitespace, capture algo
-       (lowercase), require `=`, capture hex (lowercase) — RFC 9530
-       structured-field colon wrappers and q-values not supported. */
-    const char *p = header;
-    while (*p == ' ' || *p == '\t') p++;
-    char algo[32];
-    size_t a = 0;
-    while (((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
-            (*p >= '0' && *p <= '9') || *p == '-') &&
-           a < sizeof(algo) - 1)
-    {
-        algo[a++] = ascii_tolower(*p++);
+/* Read a client's `Content-Digest` request header (RFC 9530): a list of
+   `<algorithm>=<value>` entries, each value `:<base64>:` or (as earlier
+   clients send) bare hex, any `;parameters` ignored. EVERY entry is
+   scanned and the strongest algorithm the SDK hashes is the one checked
+   -- sha-512, else sha-256, the two RFC 9530 registers as active. An entry
+   for any other algorithm is ignored, and a header with none the SDK
+   hashes checks nothing (false): the PUT proceeds unverified. On true,
+   @p claimed holds the value as lowercase hex ("" when unreadable or
+   absent, which then matches nothing). */
+static bool
+put_digest_claim(
+    const AxlHttpRequest *req,
+    AxlChecksumType      *type,
+    char                 *claimed,
+    size_t                cap
+    )
+{
+    if (req == NULL || req->headers == NULL) {
+        return false;
     }
-    algo[a] = '\0';
-    if (a == 0 || *p != '=') {
-        return;  /* malformed — silently skip */
+    const char *p = (const char *)axl_hash_table_lookup(req->headers,
+                                                        "content-digest");
+    if (p == NULL) {
+        return false;
     }
-    p++;  /* consume '=' */
+    int best = 0;   /* 0 none, 1 sha-256, 2 sha-512 */
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        char   algo[32];
+        size_t a = 0;
+        while (*p != '\0' && *p != '=' && *p != ',' && *p != ';'
+               && *p != ' ' && *p != '\t') {
+            if (a < sizeof(algo) - 1) {
+                algo[a++] = ascii_tolower(*p);
+            }
+            p++;
+        }
+        algo[a] = '\0';
+        const char *v    = NULL;
+        size_t      vlen = 0;
+        if (*p == '=') {
+            v = ++p;
+            while (*p != '\0' && *p != ',' && *p != ';'
+                   && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            vlen = (size_t)(p - v);
+        }
+        while (*p != '\0' && *p != ',') {
+            p++;   /* parameters, or whatever else the entry carries */
+        }
+        int rank = (axl_strcmp(algo, "sha-512") == 0) ? 2
+                 : (axl_strcmp(algo, "sha-256") == 0) ? 1 : 0;
+        if (rank > best) {
+            /* An entry with no value claims nothing that can match. */
+            best = rank;
+            put_digest_value_hex((v != NULL) ? v : "", vlen, claimed, cap);
+        }
+    }
+    if (best == 0) {
+        return false;
+    }
+    *type = (best == 2) ? AXL_CHECKSUM_SHA512 : AXL_CHECKSUM_SHA256;
+    return true;
+}
 
-    /* Hex body up to whitespace / comma / end. Normalize case as we
-       walk so the comparison is byte-exact against ops.digest's
-       lowercase output. */
-    char claimed[256];
-    size_t h = 0;
-    while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t' &&
-           h < sizeof(claimed) - 1)
-    {
-        claimed[h++] = ascii_tolower(*p++);
-    }
-    claimed[h] = '\0';
-    if (h == 0) {
-        return;  /* empty hex body */
-    }
+/* Finish a running digest and compare it with the claimed hex. */
+static bool
+put_digest_matches(
+    AxlChecksum *sum,
+    const char  *claimed
+    )
+{
+    const char *actual = axl_checksum_get_string(sum);
+    return actual != NULL && axl_strcmp(actual, claimed) == 0;
+}
 
-    const char *rel = strip_prefix(ctx, req->path);
-    if (rel == NULL) {
+/* The status a refused PUT answers, by the code its open or commit
+   returned: 403 for a refusal by policy (AXL_DENIED); 409 for a target of
+   the wrong kind or one the mount may not replace (AXL_IS_DIR,
+   AXL_EXISTS); 507 for a volume without the room (AXL_NO_RESOURCES);
+   @p other for any other failure. */
+static int
+put_refusal_status(
+    int rc,
+    int other
+    )
+{
+    switch (rc) {
+    case AXL_DENIED:
+        return 403;
+    case AXL_IS_DIR:
+    case AXL_EXISTS:
+        return 409;
+    case AXL_NO_RESOURCES:
+        return 507;
+    case AXL_IO_ERROR:
+        return 500;   /* the volume could not answer */
+    default:
+        return other;
+    }
+}
+
+/* Answer a PUT that arrived while another holds the mount's slot. */
+static void
+put_busy(
+    AxlHttpResponse *resp
+    )
+{
+    resp->status_code = 503;
+    insert_header(resp, "Retry-After", "1");
+}
+
+/* End the in-flight PUT without storing it: close its write as aborted --
+   the backend discards it -- and free the mount's single PUT slot. true
+   when the write was declared IN PLACE at write_open and its discard says
+   it could not restore the resource: the resource holds what was written.
+   For an atomic write the discard's return is ignored, as it always was. */
+static bool
+dav_put_release(
+    AxlWebDavCtx *ctx
+    )
+{
+    bool kept = false;
+    if (ctx->put_ctx != NULL && ctx->ops.write_close != NULL) {
+        int rc = ctx->ops.write_close(ctx->put_ctx, true);
+        kept = ctx->put_in_place && rc != AXL_OK;
+    }
+    ctx->put_in_place = false;
+    axl_checksum_free(ctx->put_sum);
+    ctx->put_sum = NULL;
+    ctx->put_ctx = NULL;
+    ctx->put_id  = 0;
+    return kept;
+}
+
+/* The body length a PUT states: its Content-Length (0 when it has none
+   and is not chunked -- HTTP/1.1 framing gives it no body), or
+   AXL_WEBDAV_LENGTH_UNKNOWN for a chunked body. The request parser has
+   already refused (400) a Content-Length that is not a number or does not
+   fit below SIZE_MAX, so the value read here is the one the body is framed
+   by, and never reaches UINT64_MAX: the two cannot collide. */
+static uint64_t
+put_body_length(
+    const AxlHttpRequest *req
+    )
+{
+    const char *te = (req->headers != NULL)
+                     ? axl_hash_table_lookup(req->headers, "transfer-encoding") : NULL;
+    if (te != NULL && axl_strcasecmp(te, "chunked") == 0) {
+        return AXL_WEBDAV_LENGTH_UNKNOWN;
+    }
+    return (uint64_t)axl_http_get_content_length(req->headers);
+}
+
+/* Open the write a PUT needs and claim the mount's slot for it, with the
+   status a refusal answers: 405 for a mount that cannot write, 403 for a
+   refusal by policy (AXL_DENIED), 503 for a backend out of room for
+   another write (AXL_BUSY), 409 for any other (a missing parent
+   collection, an existing file on a no-overwrite mount). A Content-Digest
+   the SDK can check starts its running digest here. */
+static int
+dav_put_begin(
+    AxlWebDavCtx    *ctx,
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp
+    )
+{
+    if (ctx->ops.write_open == NULL) {
+        resp->status_code = 405;
+        return AXL_ERR;
+    }
+    char rel[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, rel, sizeof(rel));
+    if (rst != 0) {
+        resp->status_code = rst;
+        return AXL_ERR;
+    }
+    if (req->request_id == 0) {
+        /* 0 is the slot's "no PUT in flight": a PUT keyed on it would be
+           taken for no PUT at all. The server never hands it out. */
+        resp->status_code = 500;
+        return AXL_ERR;
+    }
+    AxlChecksumType type;
+    AxlChecksum    *sum = NULL;
+    if (put_digest_claim(req, &type, ctx->put_claim, sizeof(ctx->put_claim))) {
+        sum = axl_checksum_new(type);
+        if (sum == NULL) {
+            resp->status_code = 500;
+            return AXL_ERR;
+        }
+    }
+    void *wctx = NULL;
+    bool  in_place = false;
+    int   rc   = ctx->ops.write_open(ctx->user_data, rel, put_body_length(req),
+                                     &wctx, &in_place);
+    if (rc != AXL_OK) {
+        axl_checksum_free(sum);
+        if (rc == AXL_BUSY) {
+            put_busy(resp);
+        } else {
+            resp->status_code = put_refusal_status(rc, 409);
+        }
+        return AXL_ERR;
+    }
+    ctx->put_ctx      = wctx;
+    ctx->put_in_place = in_place;
+    ctx->put_sum      = sum;
+    ctx->put_id  = req->request_id;
+    return AXL_OK;
+}
+
+/* Clean EOF of the PUT holding the slot: check its Content-Digest, then
+   commit. A mismatch is decided BEFORE the commit, so the write is
+   discarded (write_close aborted) and a backend that replaces atomically
+   keeps the old resource; only then is the status 400. The commit's own
+   status chooses the rest: 201 once stored; 409 for AXL_IS_DIR or
+   AXL_EXISTS (the target changed while the body streamed -- a collection
+   appeared there, or a file on a no-overwrite mount); 403 for AXL_DENIED;
+   507 for AXL_NO_RESOURCES; 500 for any other failure -- the final flush
+   is where the write becomes durable, and 201 for bytes that did not land
+   would be a lie. */
+static void
+dav_put_finish(
+    AxlWebDavCtx    *ctx,
+    AxlHttpResponse *resp
+    )
+{
+    if (ctx->put_sum != NULL && !put_digest_matches(ctx->put_sum,
+                                                    ctx->put_claim)) {
+        /* Hashed before the release frees the running digest. */
+        char got[129];   /* sha-512 hex and the NUL */
+        axl_strlcpy(got, axl_checksum_get_string(ctx->put_sum), sizeof(got));
+        if (dav_put_release(ctx)) {
+            axl_error("PUT Content-Digest mismatch (client claimed %s, body "
+                      "hashed to %s); the resource was written in place and "
+                      "now holds that body", ctx->put_claim, got);
+            axl_http_response_set_text(resp, "Content-Digest mismatch: the "
+                                       "resource now holds the body that did "
+                                       "not match\n");
+        } else {
+            axl_warning("PUT Content-Digest mismatch (client claimed %s, "
+                        "body hashed to %s); nothing stored",
+                        ctx->put_claim, got);
+        }
+        resp->status_code = 400;
         return;
     }
-
-    char actual[256];
-    if (ctx->ops.digest(ctx->user_data, rel, algo,
-                        actual, sizeof(actual)) != AXL_OK)
-    {
-        return;  /* consumer can't supply — pass through */
+    int rc = (ctx->ops.write_close == NULL)
+             ? AXL_OK : ctx->ops.write_close(ctx->put_ctx, false);
+    if (rc != AXL_OK && ctx->put_in_place) {
+        /* A commit in place that fails (the final flush) leaves the
+           resource as partial as a write that failed mid-body. */
+        axl_error("PUT %s: the write in place failed at its commit; the "
+                  "resource is partially written", ctx->prefix);
+        axl_http_response_set_text(resp, "PUT failed part-way: the resource "
+                                   "is partially written\n");
+        resp->status_code = 500;
+    } else if (rc == AXL_BUSY) {
+        put_busy(resp);   /* the target went in-place busy while this streamed */
+    } else {
+        resp->status_code = (rc == AXL_OK) ? 201 : put_refusal_status(rc, 500);
     }
-
-    /* Byte-exact compare. axl_strcmp is fine since both are NUL-
-       terminated lowercase hex. */
-    if (axl_strcmp(actual, claimed) == 0) {
-        return;  /* match — leave the 201 in place */
-    }
-
-    /* Mismatch — corruption detected. Tear down + 400. */
-    if (ctx->ops.remove != NULL) {
-        ctx->ops.remove(ctx->user_data, rel);
-    }
-    axl_warning("webdav: PUT Content-Digest mismatch for %s "
-                "(client claimed %s=%s, server got %s)",
-                rel, algo, claimed, actual);
-    resp->status_code = 400;
+    ctx->put_in_place = false;
+    axl_checksum_free(ctx->put_sum);
+    ctx->put_sum = NULL;
+    ctx->put_ctx = NULL;
+    ctx->put_id  = 0;
 }
 
 static int
@@ -863,21 +1279,18 @@ on_dav_upload(AxlHttpRequest *req, AxlHttpResponse *resp,
               const void *chunk, size_t chunk_size,
               void *data, bool aborted)
 {
-    AxlWebDavCtx *ctx = data;
+    AxlWebDavCtx *ctx  = data;
+    bool          mine = ctx->put_id != 0 && ctx->put_id == req->request_id;
 
     if (aborted) {
-        /* Connection died mid-PUT. Release any open write ctx if it
-           belongs to this request. resp is NOT transmitted on the
-           abort path per the AxlUploadHandler contract. */
-        if (ctx->put_req == req && ctx->put_ctx != NULL &&
-            ctx->ops.write_close != NULL)
-        {
-            ctx->ops.write_close(ctx->put_ctx, true);
-        }
-        if (ctx->put_req == req) {
-            ctx->put_ctx    = NULL;
-            ctx->put_req    = NULL;
-            ctx->put_failed = false;
+        /* The PUT ended without its body: the connection died, or the
+           server refused the body's framing. Release the write if this
+           request holds the slot. resp is sent only for the server's own
+           refusal (AxlUploadHandler); a write in place that the discard
+           could not undo says so in it, as every in-place failure does. */
+        if (mine && dav_put_release(ctx)) {
+            axl_http_response_set_text(resp, "PUT failed part-way: the "
+                                       "resource is partially written\n");
         }
         return 0;
     }
@@ -885,64 +1298,27 @@ on_dav_upload(AxlHttpRequest *req, AxlHttpResponse *resp,
     if (chunk == NULL && chunk_size == 0) {
         /* Clean EOF — finalize and respond. Single exit at the end
            of this block so the before_response hook fires once per
-           PUT, regardless of which sub-case (normal / empty / no
-           ops) populated the status. */
+           PUT, regardless of which sub-case set the status. */
         set_dav_class_header(resp);
 
-        if (ctx->put_req == req) {
-            /* Normal case: at least one chunk arrived. Close the
-               write ctx and report 201 (or 500 if write_chunk
-               errored mid-stream). */
-            if (ctx->put_ctx != NULL && ctx->ops.write_close != NULL) {
-                /* The final flush is where the write becomes durable, so
-                   its status counts toward put_failed BEFORE the status
-                   is chosen: every chunk can succeed and the close still
-                   fail on a full volume. Reporting 201 there would tell
-                   the client its data is stored when it is not. */
-                if (ctx->ops.write_close(ctx->put_ctx, false) != AXL_OK) {
-                    ctx->put_failed = true;
-                }
-            }
-            resp->status_code = ctx->put_failed ? 500 : 201;
-            ctx->put_ctx    = NULL;
-            ctx->put_req    = NULL;
-            ctx->put_failed = false;
-        } else {
-            /* Empty PUT body — no chunk ever arrived
-               (Content-Length: 0). Open + close to materialize an
-               empty file, mirroring POSIX `: > file` semantics. */
-            const char *rel = strip_prefix(ctx, req->path);
-            if (rel == NULL || ctx->ops.write_open == NULL ||
-                ctx->ops.write_close == NULL)
-            {
+        bool finish = mine;
+        if (!mine) {
+            /* No chunk ever arrived (Content-Length: 0): open and commit
+               an empty write, mirroring POSIX `: > file`, through the
+               same digest check and commit as a body. */
+            if (ctx->put_id != 0) {
+                /* Another PUT is in flight: this one would replace the
+                   very file that one is writing. */
+                put_busy(resp);
+            } else if (ctx->ops.write_close == NULL) {
+                /* Without a close the empty file cannot be made. */
                 resp->status_code = 405;
             } else {
-                void *empty_ctx = NULL;
-                if (ctx->ops.write_open(ctx->user_data, rel, &empty_ctx)
-                    != AXL_OK)
-                {
-                    resp->status_code = 409;
-                } else if (ctx->ops.write_close(empty_ctx, false) != AXL_OK) {
-                    /* Same durability contract as the chunked branch —
-                       an empty file that never reached the volume is
-                       still a failed PUT. */
-                    resp->status_code = 500;
-                } else {
-                    resp->status_code = 201;
-                }
+                finish = dav_put_begin(ctx, req, resp) == AXL_OK;
             }
         }
-
-        /* End-to-end integrity check (symmetric to Want-Digest). If
-           the client sent a `Content-Digest: <algo>=<hex>` header
-           and ops.digest is wired, verify the just-uploaded bytes
-           against the claim. Hoisted out of the if/else above so
-           empty-body PUTs are validated too — an empty file has a
-           well-known digest (e3b0c44... for sha-256) and a client
-           sending the wrong hex with Content-Length:0 shouldn't
-           silently succeed. */
-        if (resp->status_code == 201) {
-            content_digest_validate(ctx, req, resp);
+        if (finish) {
+            dav_put_finish(ctx, resp);
         }
 
         /* Last-call mutation hook — symmetric with dav_route_dispatch
@@ -955,46 +1331,41 @@ on_dav_upload(AxlHttpRequest *req, AxlHttpResponse *resp,
         return 0;
     }
 
-    /* Chunk arrival. */
-    if (ctx->put_req == NULL) {
-        /* First chunk — open. */
-        const char *rel = strip_prefix(ctx, req->path);
-        if (rel == NULL || ctx->ops.write_open == NULL) {
-            /* No write_open (read-only mount) → PUT is Method Not
-               Allowed, matching the empty-body branch and the other
-               verbs. Set the status before aborting; the upload
-               framework now preserves a handler-set status. */
-            resp->status_code = (ctx->ops.write_open == NULL) ? 405 : 500;
-            ctx->put_failed = true;
+    /* Chunk arrival. Every AXL_ERR below is this PUT's LAST call: the
+       upload framework sends the response and calls the handler no more
+       for it -- no abort call follows -- so nothing this PUT holds may
+       outlive the return. State left behind is what once wedged a
+       mount: every later PUT was refused, and the first of them had
+       already emptied its target. */
+    if (ctx->put_id == 0) {
+        /* First chunk — open. A refusal claims no slot. */
+        if (dav_put_begin(ctx, req, resp) != AXL_OK) {
             return AXL_ERR;
         }
-        if (ctx->ops.write_open(ctx->user_data, rel, &ctx->put_ctx) != AXL_OK) {
-            ctx->put_failed = true;
-            return AXL_ERR;
-        }
-        ctx->put_req = req;
-    } else if (ctx->put_req != req) {
-        /* Concurrent PUT — refuse this one; do NOT touch the
-           in-flight upload (req A is mid-stream on its own
-           connection; aborting it here AND clearing put_req
-           would let A's next chunk masquerade as a fresh start
-           and silently produce a partial file the consumer
-           accepted as clean). v1 limitation: consumers must
-           serialize PUTs to the same mount; the second-arriving
-           request gets 500 + connection close while the first
-           continues unaffected. */
-        return AXL_ERR;
-    }
-
-    if (ctx->put_failed) {
+    } else if (!mine) {
+        /* Another PUT holds the slot -- refuse this one, and do NOT touch
+           the one in flight: it is mid-stream on its own connection. */
+        put_busy(resp);
         return AXL_ERR;
     }
 
     if (ctx->ops.write_chunk == NULL ||
         ctx->ops.write_chunk(ctx->put_ctx, chunk, chunk_size) != AXL_OK)
     {
-        ctx->put_failed = true;
+        /* The PUT ends here (500): discard the write and free the slot
+           for the next PUT. A backend that wrote in place cannot discard
+           it: the response says what is left. */
+        if (dav_put_release(ctx)) {
+            axl_error("PUT %s: a write in place failed part-way; the "
+                      "resource is partially written", ctx->prefix);
+            resp->status_code = 500;
+            axl_http_response_set_text(resp, "PUT failed part-way: the "
+                                       "resource is partially written\n");
+        }
         return AXL_ERR;
+    }
+    if (ctx->put_sum != NULL) {
+        axl_checksum_update(ctx->put_sum, chunk, chunk_size);
     }
     return 0;
 }
@@ -1028,11 +1399,13 @@ on_mkcol(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
         return 0;
     }
 
-    const char *rel = strip_prefix(ctx, req->path);
-    if (rel == NULL) {
-        resp->status_code = 400;
+    char rel_buf[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, rel_buf, sizeof(rel_buf));
+    if (rst != 0) {
+        resp->status_code = rst;
         return 0;
     }
+    const char *rel = rel_buf;
     /* MKCOL / is meaningless — the mount root always exists.
        Refuse with 405 for symmetry with the DELETE/MOVE-root
        refusals just below; clients shouldn't be asking. */
@@ -1060,11 +1433,13 @@ on_delete(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     AxlWebDavCtx *ctx = data;
     set_dav_class_header(resp);
 
-    const char *rel = strip_prefix(ctx, req->path);
-    if (rel == NULL) {
-        resp->status_code = 400;
+    char rel_buf[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, rel_buf, sizeof(rel_buf));
+    if (rst != 0) {
+        resp->status_code = rst;
         return 0;
     }
+    const char *rel = rel_buf;
     if (ctx->ops.remove == NULL) {
         resp->status_code = 405;
         return 0;
@@ -1077,10 +1452,132 @@ on_delete(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     }
 
     int rc = ctx->ops.remove(ctx->user_data, rel);
-    /* RFC 4918 §9.6.1: 204 No Content on success. 404 on missing.
-       v1 doesn't distinguish — both rc paths to 204 vs 404. */
-    resp->status_code = (rc == AXL_OK) ? 204 : 404;
+    /* RFC 4918 §9.6.1: 204 No Content on success; 423 Locked for a
+       resource a PUT is writing in place (AXL_BUSY); 404 otherwise. */
+    resp->status_code = (rc == AXL_OK) ? 204 : (rc == AXL_BUSY) ? 423
+                        : (rc == AXL_IO_ERROR) ? 500 : 404;
     return 0;
+}
+
+/* Are @p a and @p b the same request path, a trailing '/' aside? */
+static bool
+same_dav_path(const char *a, const char *b)
+{
+    size_t na = axl_strlen(a);
+    size_t nb = axl_strlen(b);
+    while (na > 1 && a[na - 1] == '/') {
+        na--;
+    }
+    while (nb > 1 && b[nb - 1] == '/') {
+        nb--;
+    }
+    return na == nb && axl_strncmp(a, b, na) == 0;
+}
+
+/* Do @p a and @p b differ in letter case only, a trailing '/' aside? */
+static bool
+case_variant_dav_path(const char *a, const char *b)
+{
+    size_t na = axl_strlen(a);
+    size_t nb = axl_strlen(b);
+    while (na > 1 && a[na - 1] == '/') {
+        na--;
+    }
+    while (nb > 1 && b[nb - 1] == '/') {
+        nb--;
+    }
+    return na == nb && axl_strncasecmp(a, b, na) == 0;
+}
+
+/* What MOVE and COPY check before the op is called (RFC 4918 §9.8.5,
+   §9.9.4), in this order: a missing or unparsable Destination (400); one on
+   another server (502); a destination that is the source itself, or the
+   mount root -- overwriting that is DELETE / (403); a missing source (404,
+   when stat is wired); an existing destination with Overwrite: F (412),
+   unless it differs from the source in letter case only and the backend
+   declares AXL_WEBDAV_CAP_IDENTITY.
+
+   @return true with @p dst, @p overwrite and @p existed filled when the op
+       should run; false with resp->status_code set when it must not. */
+static bool
+transfer_precheck(const AxlWebDavCtx *ctx, const AxlHttpRequest *req,
+                  AxlHttpResponse *resp, const char *src,
+                  char *dst, size_t dst_size,
+                  bool *overwrite, bool *existed)
+{
+    int prc = parse_destination(ctx, req, dst, dst_size);
+    if (prc != AXL_OK) {
+        resp->status_code = (prc == AXL_UNSUPPORTED) ? 502 : 400;
+        return false;
+    }
+    if (same_dav_path(src, dst) || axl_strcmp(dst, "/") == 0) {
+        resp->status_code = 403;
+        return false;
+    }
+
+    *overwrite = parse_overwrite(req);
+    *existed   = false;
+    /* Without stat the SDK cannot tell these apart: every failure is then
+       the op's, and every success 201. */
+    if (ctx->ops.stat != NULL) {
+        AxlFsEntry e;
+        axl_memset(&e, 0, sizeof(e));
+        if (ctx->ops.stat(ctx->user_data, src, &e) != AXL_OK) {
+            resp->status_code = 404;
+            return false;
+        }
+        *existed = ctx->ops.stat(ctx->user_data, dst, &e) == AXL_OK;
+        /* A destination differing from the source in letter case only may
+           be the source itself (case-insensitive FAT) or another entry
+           (a case-sensitive volume); only the backend can tell. One that
+           declares it decides identity gets it, with overwrite false and
+           the obligation to refuse another entry; any other is refused
+           here, as for any existing destination. */
+        bool forward = (ctx->ops.caps & AXL_WEBDAV_CAP_IDENTITY) != 0
+                       && case_variant_dav_path(src, dst);
+        if (*existed && !*overwrite && !forward) {
+            resp->status_code = 412;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The status for a MOVE or COPY op's return: 201 when it created the
+   destination, 204 when it replaced one (RFC 4918 §9.8.5, §9.9.4). A
+   failure maps by its code: 403 for a refusal by policy (AXL_DENIED) or an
+   impossible request (AXL_INVALID -- onto the source itself, into its own
+   subtree); 412 for a destination that may not be overwritten
+   (AXL_EXISTS); 409 when the destination cannot be reached or its kind
+   conflicts (AXL_NOT_FOUND, AXL_NOT_DIR, AXL_IS_DIR, AXL_NOT_EMPTY); 502
+   for a move only a copy could make, which the backend cannot
+   (AXL_UNSUPPORTED); 507 for a volume without the room (AXL_NO_RESOURCES);
+   500 for anything else. */
+static int
+transfer_status(int rc, bool existed)
+{
+    switch (rc) {
+    case AXL_OK:
+        return existed ? 204 : 201;
+    case AXL_DENIED:
+    case AXL_INVALID:
+        return 403;
+    case AXL_EXISTS:
+        return 412;
+    case AXL_NOT_FOUND:
+    case AXL_NOT_DIR:
+    case AXL_IS_DIR:
+    case AXL_NOT_EMPTY:
+        return 409;
+    case AXL_UNSUPPORTED:
+        return 502;
+    case AXL_NO_RESOURCES:
+        return 507;
+    case AXL_BUSY:
+        return 423;   /* a PUT is writing it in place */
+    default:
+        return 500;   /* AXL_ERR, AXL_CANCELLED, ... */
+    }
 }
 
 static int
@@ -1089,11 +1586,13 @@ on_move(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     AxlWebDavCtx *ctx = data;
     set_dav_class_header(resp);
 
-    const char *src = strip_prefix(ctx, req->path);
-    if (src == NULL) {
-        resp->status_code = 400;
+    char src_buf[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, src_buf, sizeof(src_buf));
+    if (rst != 0) {
+        resp->status_code = rst;
         return 0;
     }
+    const char *src = src_buf;
     if (ctx->ops.move == NULL) {
         resp->status_code = 405;
         return 0;
@@ -1105,20 +1604,14 @@ on_move(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     }
 
     char dst[512];
-    if (parse_destination(ctx, req, dst, sizeof(dst)) != AXL_OK) {
-        /* RFC 4918 §9.9: bad / missing Destination → 400. */
-        resp->status_code = 400;
+    bool overwrite = true;
+    bool existed   = false;
+    if (!transfer_precheck(ctx, req, resp, src, dst, sizeof(dst),
+                           &overwrite, &existed)) {
         return 0;
     }
-
-    bool overwrite = parse_overwrite(req);
     int rc = ctx->ops.move(ctx->user_data, src, dst, overwrite);
-    /* Map success to 201 (created at destination) — we don't yet
-       distinguish 204 (overwrote existing). Map failure to 412 if
-       overwrite=false and destination exists, else 409. v1 lumps
-       failures into 409; consumer-side ops can return AXL_ERR for
-       any case and the client will retry. */
-    resp->status_code = (rc == AXL_OK) ? 201 : 409;
+    resp->status_code = transfer_status(rc, existed);
     return 0;
 }
 
@@ -1159,11 +1652,13 @@ on_copy(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     AxlWebDavCtx *ctx = data;
     set_dav_class_header(resp);
 
-    const char *src = strip_prefix(ctx, req->path);
-    if (src == NULL) {
-        resp->status_code = 400;
+    char src_buf[DAV_PATH_MAX];
+    int  rst = dav_rel(ctx, req->path, src_buf, sizeof(src_buf));
+    if (rst != 0) {
+        resp->status_code = rst;
         return 0;
     }
+    const char *src = src_buf;
     if (ctx->ops.copy == NULL) {
         resp->status_code = 405;
         return 0;
@@ -1183,33 +1678,14 @@ on_copy(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     }
 
     char dst[512];
-    if (parse_destination(ctx, req, dst, sizeof(dst)) != AXL_OK) {
-        /* RFC 4918 §9.8.4: bad / missing Destination → 400. */
-        resp->status_code = 400;
+    bool overwrite = true;
+    bool existed   = false;
+    if (!transfer_precheck(ctx, req, resp, src, dst, sizeof(dst),
+                           &overwrite, &existed)) {
         return 0;
     }
-
-    /* Pre-stat the source so a missing-source error returns 404
-       (the normal client expectation per RFC 4918 §9.8.5) rather
-       than the generic 409 the ops.copy = AXL_ERR path would map
-       to. MOVE doesn't do this today; it's a known follow-up. */
-    if (ctx->ops.stat != NULL) {
-        AxlFsEntry self;
-        axl_memset(&self, 0, sizeof(self));
-        if (ctx->ops.stat(ctx->user_data, src, &self) != AXL_OK) {
-            resp->status_code = 404;
-            return 0;
-        }
-    }
-
-    bool overwrite = parse_overwrite(req);
     int rc = ctx->ops.copy(ctx->user_data, src, dst, overwrite, depth);
-    /* Success → 201 Created (we don't yet distinguish 204 when the
-       COPY overwrote an existing resource). Failure → 409 (lumps
-       412 precondition-failed-when-overwrite-false-and-dest-exists
-       into the same bucket as other ops failures; matches MOVE,
-       same typed-return follow-up). */
-    resp->status_code = (rc == AXL_OK) ? 201 : 409;
+    resp->status_code = transfer_status(rc, existed);
     return 0;
 }
 

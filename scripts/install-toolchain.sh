@@ -165,7 +165,7 @@ relocated_tool() {  # <manifest tool path> <manifest dir> <new dir>
 }
 
 # A toolchain outside /opt is invisible until the AXL_<ARCH>_* locators point
-# at it: the manifest's defaults still name /opt, and axl-cc, the Makefile and
+# at it: the manifest's defaults still name /opt, and axl-cc, the CMake build and
 # install.sh all resolve ${VAR:-$VAR_DEFAULT}. The installer is the only party
 # that knows the prefix that was chosen, so it is the only one that can say
 # this -- and succeeding silently would leave the user with ~96 MB on disk and
@@ -498,7 +498,7 @@ install_x64() {
                 # branch below refuses to build around, and it deserves the
                 # same answer: a ~40 minute compile that ends in a working
                 # toolchain would hide the inconsistency until the next bump.
-                # `make check-toolchain-conf` now catches this at commit time;
+                # `gate.check-toolchain-conf` now catches this at commit time;
                 # this is the backstop for a prefix staged before that gate.
                 # `| head -1` WOULD ABORT THIS ENTIRE BLOCK. head exits after
                 # one line, tar takes SIGPIPE, pipefail promotes 141 to the
@@ -517,7 +517,7 @@ install_x64() {
                 echo "" >&2
                 echo "  The manifest disagrees with itself: AXL_X64_TOOLCHAIN_URL" >&2
                 echo "  delivers one version and AXL_X64_TOOLCHAIN_DIR names another." >&2
-                echo "  Fix the pair in axl-toolchains.conf (\`make check-toolchain-conf\`" >&2
+                echo "  Fix the pair in axl-toolchains.conf (\`gate.check-toolchain-conf\`" >&2
                 echo "  reports it); do not wait out a source build that would mask it." >&2
                 return 1
             else

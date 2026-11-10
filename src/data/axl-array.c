@@ -359,7 +359,7 @@ axl_array_remove_index(AxlArray *a, size_t index)
     clear_elements(a, index, 1);   /* before the slot is overwritten */
 
     if (index < a->length - 1) {
-        axl_memcpy(a->buffer + index * a->element_size,
+        axl_memmove(a->buffer + index * a->element_size,
                  a->buffer + (index + 1) * a->element_size,
                  (a->length - index - 1) * a->element_size);
     }
@@ -401,7 +401,7 @@ axl_array_remove_range(AxlArray *a, size_t index, size_t len)
     clear_elements(a, index, len);   /* before the survivors shift down */
 
     if (index + len < a->length) {
-        axl_memcpy(a->buffer + index * a->element_size,
+        axl_memmove(a->buffer + index * a->element_size,
                  a->buffer + (index + len) * a->element_size,
                  (a->length - index - len) * a->element_size);
     }

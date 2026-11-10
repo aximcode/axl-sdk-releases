@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=11 local-only=0
+# test-meta: arch=x64 needs= est=11 local-only=0 guest=none
+# guest=none: its NVMe controller -- QEMU's nvme device is not migratable, so
+#   no guest with one can be snapshotted (the pool's snapshot-save refuses it:
+#   "State blocked by non-migratable device '.../nvme'", measured 2026-11-08).
 # test-smart-qemu.sh — AxlSmart union walk + normalized health across transports.
 #
 # The unit suite (AxlSmart) tests the pure normalizers against constructed
@@ -21,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/smart.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: smart.efi not built"; exit 1; }
 

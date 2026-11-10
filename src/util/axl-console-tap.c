@@ -664,8 +664,9 @@ axl_console_tap_inject_key_ex(AxlConsoleTap *m, uint16_t scan, uint16_t unicode,
     if (m == NULL) {
         return AXL_ERR;
     }
+    /* The tap's documented full-ring code is AXL_ERR; the engine says AXL_BUSY. */
     return axl_console_input_inject_key_ex(&m->in, scan, unicode, shift_state,
-                                           toggle_state);
+                                           toggle_state) == AXL_OK ? AXL_OK : AXL_ERR;
 }
 
 int
@@ -674,7 +675,7 @@ axl_console_tap_inject_text(AxlConsoleTap *m, const char *bytes, size_t len)
     if (m == NULL || bytes == NULL) {
         return AXL_ERR;
     }
-    return axl_console_input_inject_text(&m->in, bytes, len);
+    return axl_console_input_inject_text(&m->in, bytes, len) == AXL_OK ? AXL_OK : AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +714,22 @@ _axl_console_tap_test_pop_key(AxlConsoleTap *m, uint16_t *scan,
     return true;
 }
 
+/* The raw Ex view of the next key: what ReadKeyStrokeEx returns, no fold. */
+bool
+_axl_console_tap_test_pop_key_ex(AxlConsoleTap *m, uint16_t *scan, uint16_t *unicode,
+                                 uint32_t *shift, uint8_t *toggle)
+{
+    EFI_KEY_DATA kd;
+    if (m == NULL || !axl_console_input_pop(&m->in, &kd)) {
+        return false;
+    }
+    *scan    = kd.Key.ScanCode;
+    *unicode = kd.Key.UnicodeChar;
+    *shift   = kd.KeyState.KeyShiftState;
+    *toggle  = kd.KeyState.KeyToggleState;
+    return true;
+}
+
 void
 axl_console_tap_set_size(AxlConsoleTap *m, uint32_t cols, uint32_t rows)
 {
@@ -744,8 +761,6 @@ axl_console_tap_reset(AxlConsoleTap *m)
         return;
     }
     axl_console_input_drain(&m->in);
-    m->in.in_esc  = false;
-    m->in.esc_len = 0;
     /* Leave the alt-screen cleanly (emits ESC[?1049l if we were in it) so the
        next session starts on the normal screen; reset the scroll tracker. */
     axl_console_emit_reset(&m->emit);

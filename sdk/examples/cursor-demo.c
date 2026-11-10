@@ -17,7 +17,7 @@
  * View it with the run-qemu.sh windowed modes (mouse-enabled OVMF):
  *   ./scripts/run-qemu.sh --vnc-reverse HOST:PORT cursor-demo.efi
  *
- * Build with: make cursor-demo
+ * Build with: scripts/axl-build.sh cursor-demo
  */
 
 #include <axl.h>

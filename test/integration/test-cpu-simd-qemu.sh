@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=31 local-only=0
+# test-meta: arch=x64 needs= est=31 local-only=0 builds=ARCH=x64,cpu-simd-selftest guest=none
+# guest=none: three machines in one test (QEMU CPU models Nehalem, Haswell,
+#   Icelake-Server), and a lease is one class; two of the three would boot
+#   inside it. Pooling it means splitting it per model.
 # test-cpu-simd-qemu.sh — AxlCpu feature detection + AVX-enable path
 # across explicit QEMU CPU models (x86).
 #
@@ -28,7 +31,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export TEST_SKIP_RATCHET=1
 
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/cpu-simd-selftest.efi"
-make -C "$PROJECT_DIR" ARCH=x64 cpu-simd-selftest 2>&1 | tail -2
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 cpu-simd-selftest 2>&1 | tail -2
 
 overall_fail=0
 

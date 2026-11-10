@@ -13,6 +13,9 @@ scripts/cut-release.sh X.Y.Z --yes      # skip the prompt (non-interactive)
 scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs (default: hand back a URL)
 ```
 
+A **test build** for someone to try on real hardware is not a release: see
+[Test releases](#test-releases-no-ci) (`scripts/make-test-release.sh`).
+
 **It stops and asks before it pushes anything.** After printing the commit
 list it prompts `Cut and publish vX.Y.Z? [y/N]` and reads stdin. That is right
 for a human at a terminal and wrong everywhere else: run from a script, a CI
@@ -42,47 +45,74 @@ does not belong in this release, that is the wrong flow and the script cannot
 do the right one — see [Which flow](#which-flow-from-main-or-from-a-tag)
 immediately below. Three of the last three releases used the other one.
 
-### The gate is CI's green, or a local uncached run — whichever you already have
+### The gate: a dispatched CI suite, or the local release suite plus the push CI
 
 **Release tags do NOT trigger CI.** (A tag used to re-run CI on the exact
 commit already validated on `main` — pure duplication, ~38 min for an identical
-result — so that trigger was removed.) `ci.yml` *does* run on every push to
-`main`, plus `workflow_dispatch`; the trigger table above is authoritative.
-This paragraph said "manual `workflow_dispatch` only" long after the push
-trigger came back, which is the same staleness the table carried.
+result — so that trigger was removed.) Since 2026-10-21 a push to `main` runs
+only the **cheap** jobs (`plan`, `gcc x64`, `gcc aa64`, `clang-tidy`); the
+**QEMU suite runs only on `workflow_dispatch`**. The trigger table below is
+authoritative; `AXL-CI-Release-Speed-Design.md` §14 records the decision and
+its residual risk.
 
-**In the common case you do not have to run anything.** `ci.yml` runs the
-identical uncached suite on every push to `main`, on the same self-hosted box,
-and goes green on the commit you are cutting from — so `cut-release.sh` asks
-GitHub for that run and, if it is green, the gate is satisfied with no local
-suite at all. This heading used to read "the gate is LOCAL", and that was the
-whole ~8.5 minutes: the gate could only see a local stamp file, so the only way
-to satisfy it was to run on this hardware a suite that had already run on this
-hardware.
+**Either of these certifies a release**, and `cut-release.sh` checks both
+before it changes anything — and **refuses** when neither does:
 
-*What counts as green is deliberately narrow:* **every job** in the run must
-have succeeded. A run-level conclusion is not enough — the `release: vX.Y.Z`
-commit carries a `[release-cut]` marker that makes every `ci.yml` job skip, so
-a run exists at it that tested nothing, and accepting that would tag code no
-suite ever ran by the most ordinary path there is. The parent rule below then
-carries the parent's green across the version bump.
+1. **A dispatched CI run** whose `QEMU integration (full suite)` job — and the
+   three cheap jobs — went green on the release commit or its release-only
+   parent. Dispatch it and wait (`gh workflow run ci.yml --ref main`, or
+   `cut-release.sh --ci-gate`, which does it for you). A push run can never
+   satisfy this: it lists the suite job as `skipped`, and the gate names the
+   job rather than trusting the run's `success`.
+2. **A local `scripts/release-suite.sh` run** on a clean tree at the commit
+   being released, **plus** a green push run of the three cheap jobs on that
+   same tree. `release-suite.sh` is the SAME list of steps CI's integration job
+   runs — unit tests in QEMU, the build, `install.sh --arch all --cpp`,
+   `run-integration.sh` (uncached, local-only tests included) and the harness
+   self-tests — and only its complete success writes the sha-bound
+   `.last-run-stamp` the gate reads. A bare `run-integration.sh --no-cache` no
+   longer certifies a release: it ran less than the CI job it stood in for.
+   The local run still cannot see a clean checkout that does not link — a dev
+   box always has the objects that hide it — and the push run's `build` job
+   can; that is the 2026-08-18 class (design §11.2), and why the cheap jobs
+   stayed on push.
+
+*What counts as green is deliberately narrow:* named jobs, each `success`. A
+run-level conclusion is not enough — the `release: vX.Y.Z` commit carries a
+`[release-cut]` marker that makes every `ci.yml` job skip, and every push run
+skips the suite, so runs exist that report success having tested nothing. The
+parent rule below then carries the parent's green across the version bump.
+When `gh` is missing or failing, the gate says it **could not check** — it
+refuses, but it does not tell you to push something.
 
 **The ancestor walk exists because of the plan job.** A docs-only push skips
 every job, so after one there is no green run at the tip — and without this the
-gate would refuse and send you back to the local suite it just removed. So it
-walks back (bounded, `AXL_CI_WALK_MAX=25`) and accepts the first green ancestor
-whose *entire* diff to the release commit is prose, the version bump, or both.
-"Prose" is `scripts/ci-plan.sh`'s own allowlist, asked via `--list-unsafe`, not
-a second copy of it — and a deletion is never prose.
+gate would refuse a tree prose cannot have changed. So it walks back (bounded,
+`AXL_CI_WALK_MAX=25`) and accepts the first green ancestor whose *entire* diff
+to the release commit is prose, the version bump, or both — for the dispatched
+suite and for the cheap push run alike. "Prose" is `scripts/ci-plan.sh`'s own
+allowlist, asked via `--list-unsafe`, not a second copy of it — and a deletion
+is never prose.
 
-**Run the local suite when CI cannot answer** — no push yet, a red run, or a
-tree that has moved since. It is fast in parallel:
+**The local path** — when you would rather not wait for a dispatch, or the
+runner is busy. Commit, push (so the cheap push CI runs on the same commit),
+then:
 
 ```sh
-make ARCH=x64 all tests tools axl-busybox   # one build for the whole gate
-./test/integration/run-integration.sh --no-cache        # 0 failures required
-scripts/lint.sh                                         # clang-tidy exactly as CI runs it
+scripts/release-suite.sh    # every step CI's integration job runs; stamps on success
+scripts/lint.sh             # clang-tidy exactly as CI runs it
 ```
+
+It refuses a tree with tracked changes (a stamp names a commit, not a working
+tree), stops at the first failing step, and writes no stamp unless every step
+passed and the tree is still that commit at the end (when it is not, it prints
+`git status --short` so the message names the file). A run retires any earlier
+stamp for the same commit as it starts. The unit tests' ratchet is handed a
+temp copy of the committed `test/integration/.last-pass-count`, so the bar is
+the committed one and a green run never dirties the tree; when the count rose
+it prints a NOTE with old -> new — commit the new baseline.
+`scripts/release-suite.sh --step <name>` runs one step for debugging and never
+stamps.
 
 **Do not pass `-j"$(nproc)"` here.** That was this command's advice until
 2026-09-02, and it contradicts the runner's own default of `nproc - 2`, which
@@ -100,30 +130,70 @@ own retry does not help when the starvation is sustained. A release gate that
 cries wolf is worse than a slower one, because the next red gets triaged as
 "probably contention" and one day it will not be.
 
+**UNJUDGED: a timing test the box starved certifies nothing.**
+`test-net-latency-qemu.sh` times round trips against bounds (p90 under 5 ms),
+and on a shared box it missed them at load 18+ with nothing wrong in the code
+-- once in a dispatched CI run (5.136 ms against 5). It now carries qloop's
+witness (how long the guest's QEMU waited for a CPU over each round-trip
+window, `AXL_STARVE_MAX_MS` = 50 ms): a run whose failures are all timing
+misses in starved windows exits 77 with an `UNJUDGED:` line. To ctest that is
+a skip, which passes a ctest run -- so `release-suite.sh`'s integration step
+reads the JUnit report afterwards and re-runs each UNJUDGED test ALONE (the
+quiet slot, as verify's qloop runs last and alone --
+docs/AXL-Build-System-Design.md §10.14), under the same preset:
+
+| alone, it reads | the step |
+|---|---|
+| PASS | passes -- the bound was judged, on a quiet box |
+| FAIL, or a plain SKIP (it judged nothing) | fails |
+| UNJUDGED again | **exit 3, no stamp**: `release-suite: UNJUDGED at step 4/5 ... Re-run on a quiet box.` |
+
+Decided 2026-11-09, and the same in `--ci`: the dispatched suite is the only
+place CI runs the integration tests, and a green one IS a release certificate
+(`release-gate.sh` accepts it), so a green run over a bound nobody judged would
+tag code on it. The observed misses each passed when re-run alone, which is
+what the quiet re-run does; a dispatched run goes red for load only when even
+a lone run of the test is starved, and then it says UNJUDGED, not FAIL. The
+alternative -- CI green, and the gate reading the run's JUnit artifact to
+refuse it -- was not built: a second channel into the gate for one rare case.
+Outside a release run it is never a FAIL: `run-integration.sh` names it,
+counts it apart from passes (`N UNJUDGED`) and exits 3 -- not 0, so a script
+chaining on success still stops, and not 1.
+
 `run-integration.sh` discovers every `test-*.sh` (including the patched-QEMU /
 real-pointer `local-only` tests, which your dev box CAN run) and runs each in
-its own QEMU. Green here is the release gate. Then:
+its own QEMU. A green `release-suite.sh`, with the cheap push CI green on the
+same tree, is the release gate. Then:
 
 ```sh
-scripts/cut-release.sh X.Y.Z            # cut (no CI wait — local suite was the gate)
-scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
-scripts/cut-release.sh X.Y.Z --ci-gate  # want the CI backstop too (see the stamp, below)
-scripts/cut-release.sh X.Y.Z --force-ci # --ci-gate, and dispatch even if the stamp covers it
+scripts/cut-release.sh X.Y.Z               # cut; REFUSES if nothing certifies HEAD
+scripts/cut-release.sh X.Y.Z --dry-run     # preview, change nothing (says if it would refuse)
+scripts/cut-release.sh X.Y.Z --ci-gate     # nothing covers it yet: dispatch the suite and wait
+scripts/cut-release.sh X.Y.Z --force-ci    # --ci-gate, and dispatch even if something covers it
+scripts/cut-release.sh X.Y.Z --tag-untested  # tag with NOTHING certifying it -- loud, and in the notes
 scripts/cut-release.sh X.Y.Z --watch    # wait for Release+Docs instead of a URL
 ```
 
-**`--ci-gate` no longer always dispatches.** A clean, COMPLETE
-**`--no-cache` is required for a release gate, not optional.** Caching is on by
-default (it skips a test whose inputs are byte-identical to its last green run),
-and a cached run deliberately refuses to write the stamp — it skipped tests on
-the strength of their inputs looking unchanged, which is the right answer for an
-inner loop and the wrong one for certifying a tree. `cut-release.sh` says so if
-it finds no stamp.
+**The gate is enforced, before anything changes.** `cut-release.sh` first
+waits for the push run of the commit it is about to release (and refuses if
+that run did not succeed), then decides — before the version bump, so a
+refusal strands no release commit on the branch. With nothing certifying the
+commit it prints both remedies and exits non-zero. `--ci-gate` proceeds and
+dispatches the suite after pushing the release commit; `--tag-untested`
+proceeds with a WARNING and writes a "Released untested" line into the
+release's CHANGELOG section (which `release.yml` publishes as the release
+notes) and the tag message; the cut dies if that line did not land, and a test
+runs `release.yml`'s own extraction (`scripts/changelog-section.sh`) over it.
+`--resume` goes through the same gate, but refuses `--tag-untested`: the
+release commit is already pushed, so the note could not reach the notes.
+Certify the commit instead (`--resume --ci-gate`, or `scripts/release-suite.sh`
+then `--resume`).
 
-`run-integration.sh` writes `test/integration/.last-run-stamp` (gitignored —
-it describes one machine's run, not a property of the tree). If that stamp
-covers the release commit, `--ci-gate` is satisfied without dispatching
-anything, because it would be the same tests on the same code for an answer
+**`--ci-gate` does not always dispatch.** `scripts/release-suite.sh` writes
+`test/integration/.last-run-stamp` (gitignored — it describes one machine's
+run, not a property of the tree). If that stamp, with the cheap push CI,
+covers the release commit — or a dispatched run already does — nothing is
+dispatched, because it would be the same tests on the same code for an answer
 you already hold. A run never dispatched is the only thing that improves both
 turnaround and Actions spend — see `AXL-CI-Release-Speed-Design.md` §10.3.
 
@@ -135,17 +205,19 @@ release commit is allowed to touch:
 
 | situation | gate |
 |---|---|
-| stamp's SHA == the release commit | satisfied |
-| **a green CI run at the release commit** | satisfied |
-| stamp is the release commit's PARENT, and the only diff is `VERSION`, `include/axl/axl-version.h`, `CHANGELOG.md` | satisfied |
-| **a green CI run at that PARENT, same diff rule** | satisfied |
-| **a green CI run at an ANCESTOR, with only prose and/or the version bump since** | satisfied — see below |
+| stamp's SHA == the release commit, **and** a green cheap push run on it | satisfied |
+| stamp is the release commit's PARENT, the only diff is `VERSION`, `include/axl/axl-version.h`, `CHANGELOG.md`, **and** a green cheap push run at the parent | satisfied |
+| **a green dispatched (full) CI run at the release commit or that PARENT** | satisfied |
+| **a green run at an ANCESTOR, with only prose and/or the version bump since** | satisfied — for either path |
+| a good stamp, but no green push run of `gcc x64`, `gcc aa64` and `clang-tidy` on that tree | **refused** — push, and let the push run finish |
+| that push run still going | **refused** as *still running* (exit 3) — wait for it; `cut-release.sh` does |
+| that push run CANCELLED (a later docs-only push superseded it) | **refused**, naming the cancellation — re-dispatch or re-push |
+| a stamp in the old `run-integration.sh` format | **refused** — only `scripts/release-suite.sh` certifies |
+| a PUSH run (the suite job listed `skipped`) | **refused** as CI coverage — it never contains the suite |
 | a CI run whose jobs were SKIPPED (the `[release-cut]` shape) | **refused** |
-| a CI run that does not contain the **suite** job (the docs-only shape) | **refused** |
-| `gh` missing, so CI cannot be consulted at all | **refused** |
-| anything else changed since the stamp | **dispatches** |
-| stamp missing, malformed, or from a failing run | **dispatches** |
-| stamp came from a `--shard` (partial) run | **dispatches** — it never wrote one |
+| `gh` missing or failing, so CI cannot be consulted at all | **refused** as *could not check* (exit 2), not *not covered* |
+| anything else changed since the stamp | **refuses**; dispatches with `--ci-gate` |
+| stamp missing or malformed (a failed or partial `release-suite.sh` writes none) | **refuses**; dispatches with `--ci-gate` |
 
 The parent rule is not a convenience: `cut-release.sh` creates the version-bump
 commit itself, so the stamp is always one commit behind by construction and a
@@ -155,12 +227,43 @@ bare SHA match could never fire at cut time.
 specifically — a toolchain bump, a workflow change, anything where "it passed
 on my box" is the thing in question.
 
-Before any release, trigger CI by hand on `main` (Actions tab →
-`workflow_dispatch`, or `gh workflow run ci.yml --ref main`) and watch it green —
-that commit IS the one you will tag, so this is the fresh-OS backstop. The tag no
-longer re-runs it. `--ci-gate` makes the cut dispatch CI on `main` and wait for it
-before tagging. The `--ci` flag on the runner excludes the `local-only` tests CI
+Dispatching CI by hand on `main` (Actions tab → `workflow_dispatch`, or
+`gh workflow run ci.yml --ref main`) is how the suite runs in CI at all now —
+that commit IS the one you will tag, so a green dispatch is the fresh-OS
+backstop and satisfies the gate on its own. The tag does not re-run it.
+`--ci-gate` makes the cut dispatch CI on the release branch and wait for it
+before tagging, whenever nothing already covers the commit. The `--ci` flag on the runner excludes the `local-only` tests CI
 runners can't execute (patched-QEMU SMBus, usb-mouse pointer) — that's what CI runs.
+
+**When the dispatched suite goes red (or is cancelled),** its per-test logs
+are on the run as the `integration-logs` artifact (14 days):
+`gh run download <run-id> -n integration-logs`. A green run uploads none.
+
+### When a push seems to have vanished
+
+```sh
+scripts/check-main-ci.sh          # does origin/main's tip have a green push run?
+```
+
+"Green" here is the three cheap jobs passing. A push run never contains the
+suite (it runs on dispatch), so the script does not ask for it; whether the
+suite covered a commit is the release gate's question. An inert tip — a
+docs-only push, or the `[release-cut]` commit, whose own run skips the cheap
+jobs — is answered by the commit below it, through the gate's own bounded
+walk, and "pending" means the run that decides is still going, not merely
+that some run is. Exit 2 means it could not check (no `gh`, a failing one, or
+a tip not fetched yet).
+
+On 2026-09-05 a push to `main` produced **no workflow run** — not a skipped
+one, which still exists and still lists, but no run object at all. `ci.yml` was
+active, its trigger has no path filter, and the commit subject did not match
+the skip guard. The event simply did not fire.
+
+Everything downstream fails closed: the release gate refuses a commit it cannot
+see a green run for, so a missed event can only *block* a release, never let an
+unverified one through. But nothing goes red and nothing is unusual to look at,
+so the gap surfaces at cut time — when someone is waiting. This answers it in a
+second, and the remedy is one line: `gh workflow run ci.yml --ref main`.
 
 ### Before a tag: check docs at CI's doxygen version
 
@@ -215,6 +318,24 @@ tar xzf actions-runner-linux-x64.tar.gz
 sudo ./svc.sh install "$(id -un)" && sudo ./svc.sh start
 ```
 
+**A DEBUG OVMF is a runner prerequisite**, provisioned like the toolchains.
+The suite job runs on the host, and `test-stderr-stale-qemu.sh` needs a
+DEBUG build of OVMF (its pool is cleared on free, so a write through a freed
+handle faults). The job's "Pin the runner's DEBUG OVMF" step resolves it with
+`find_debug_ovmf` (`scripts/axl-common.sh`) as the runner account sees it --
+`AXL_OVMF_DEBUG_DIR`, else `$EDK2_DIR/Build/OvmfX64/DEBUG_GCC5/FV`, else
+`$HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV` -- and fails the job, naming each
+place and why, when there is none. Build `OvmfPkg` DEBUG for X64 and, if it
+is not in one of those trees, add `AXL_OVMF_DEBUG_DIR=<its FV directory>` to
+the runner's `~/actions-runner/.env` (then restart the service).
+
+**The hosted fallback cannot certify a release.** `runner: hosted` exists for
+when the box is down, but a hosted runner has no DEBUG OVMF and building EDK2
+there costs more than a fallback is worth. Its suite job therefore REFUSES
+(`release-suite.sh --ci`, exit 2) before any step, saying why and what to do
+-- run on the self-hosted runner, or set `AXL_OVMF_DEBUG_DIR` -- rather than
+skip the tests that need one. The cheap jobs (build, lint) still run there.
+
 The **label** `axl-qemu` is what the workflow selects on; the **name** only has
 to be unique, which is why it carries the hostname. Register several hosts with
 the same label and GitHub sends each job to whichever is idle.
@@ -238,16 +359,18 @@ registering a new host.
 
 ### GitHub Actions trigger policy
 
-**No workflow runs on a code push.** Push to `main` (or any branch) as much as
-you like — zero Actions minutes. The triggers are baked into the workflow files:
+**A push to `main` runs only the cheap `ci.yml` jobs; nothing runs on any other
+branch.** The QEMU suite is dispatched, never pushed. The triggers are baked
+into the workflow files:
 
 | Workflow | What | Triggers on |
 |---|---|---|
-| **ci.yml** | plan + build + QEMU integration + lint | **every push to `main`**, plus `workflow_dispatch` — but a `plan` job classifies the push first (`scripts/ci-plan.sh`), and a **docs-only** one runs `plan` alone in ~4 s. There is no `paths-ignore` any more; prose is routed, not silently dropped. NOT on release tags (the tagged commit was already tested on `main`). The push trigger came back on 2026-08-18; this row said "manual only" long afterwards, which is how a full uncached local suite came to be run right before every push — duplicating CI's identical run on the same self-hosted box |
+| **ci.yml** | plan + build (gcc x64/aa64) + lint (clang-tidy); QEMU integration on dispatch | **every push to `main`** runs `plan`, `gcc x64`, `gcc aa64` and `clang-tidy` — a `plan` job classifies the push first (`scripts/ci-plan.sh`), and a **docs-only** one runs `plan` alone in ~4 s. **`QEMU integration (full suite)` runs only on `workflow_dispatch`** (since 2026-10-21, design §14) — by hand or from `cut-release.sh --ci-gate`. NOT on release tags, and no schedule. A push cancels an older push run; it no longer cancels a running dispatch |
 | **docs.yml** | Doxygen/Sphinx → Cloudflare Pages | major tag `vX.0.0`, or manual |
-| **release.yml** | build + publish `install.sh`, `VERSION`, `SHA256SUMS` and the three tarballs | **every** release tag `v*` (it's the publish step), or manual |
+| **release.yml** | build + publish `install.sh`, `VERSION`, `SHA256SUMS`, the four tarballs and (not for a prerelease) the `.deb`/`.rpm` | **every** release tag `v*` (it's the publish step), or manual |
 
-So: a normal push runs nothing; **no** release tag runs CI (it was validated on
+So: a push to a non-`main` branch runs nothing, a push to `main` runs the cheap
+jobs; **no** release tag runs CI (it was validated on
 `main` before the cut); a **patch/minor** release tag runs only `release.yml`
 (publish); a **major** (`vX.0.0`) tag also runs `docs.yml`. `cut-release.sh` tells
 its watcher which to expect (major → `Release Docs`, minor/patch → `Release`), so
@@ -293,37 +416,32 @@ a comment explaining its trigger).
   QMP-pointer-injection-capable host the GitHub runners don't provide, e.g.
   `test-input-modifiers-qemu.sh`); run those by hand before a release.
 
-- Both archs build clean against `BUILD=RELEASE`. **Each `BUILD` now gets
-  its own output tree automatically** (`out/native-<arch>-release`), so no
-  `PREFIX` override is needed and the two can coexist.
+- Both archs build clean against `BUILD=RELEASE` -- the CMake RELEASE
+  presets, through the wrapper `release.yml`, `install.sh` and every test
+  build with. Each configuration has its own tree (`build/<arch>-release`),
+  so the two coexist with the DEBUG trees the suite uses:
 
   ```sh
-  make ARCH=x64  BUILD=RELEASE
-  make ARCH=aa64 BUILD=RELEASE
+  ./scripts/axl-build.sh ARCH=x64  BUILD=RELEASE tools
+  ./scripts/axl-build.sh ARCH=aa64 BUILD=RELEASE tools
   ```
 
-  This used to require a manual `PREFIX=out/native-<arch>-release`, because
-  the `.o` cache key is the `.c` timestamp only, not the `BUILD` mode: a
-  same-prefix RELEASE compile left `.o` files newer than their source, and a
-  subsequent default `make` reused them with the wrong flags. The symptom was
-  the `debug: alloc fill 0xDA` test failing (axl-mem.o built without
-  `-DAXL_MEM_DEBUG`) — a *phantom* regression that cost real debugging time
-  more than once, since `make tests` could not recover it either. Ask make
-  where a configuration's artefacts landed rather than hardcoding the path:
+  Ask the wrapper where a configuration's artefacts land rather than
+  hardcoding the path:
 
   ```sh
-  make -s ARCH=x64 BUILD=RELEASE print-prefix     # -> out/native-x64-release
+  ./scripts/axl-build.sh --print-prefix ARCH=x64 BUILD=RELEASE   # -> build/x64-release
   ```
 
-  `make clean` removes only the current configuration's tree; `make clean-all`
-  wipes every tree under `out/`.
-
-- TLS-enabled build is green if you touched anything in `src/net/`
-  (release.yml builds the published packages the same way):
-
-  ```sh
-  make ARCH=x64 BUILD=RELEASE
-  ```
+- **The release builds from a clean checkout.** CI's build job builds the
+  RELEASE tree of each arch and makes the release's tarballs from it with the
+  scripts `release.yml` runs, on every push. (Until 5.0.0 it also held them to
+  the retired Makefile's -- `release-parity.sh`, gone with it.) Both CI and
+  `release.yml` build with the CMake `scripts/ci-cmake.sh` pins, and so does
+  every local entry point -- `release-suite.sh` included -- through
+  `scripts/axl-cmake-pin.sh` (AXL-Build-System-Design.md §10.13), so a local
+  certification runs the CMake that ships. Bumping the pin is a change to
+  `ci-cmake.sh` alone (the version and its two SHA-256s).
 
 - **clang-tidy is clean locally.** The CI workflow's `lint` job
   runs `clang-tidy` with `WarningsAsErrors: '*'`; the unit /
@@ -335,7 +453,7 @@ a comment explaining its trigger).
   surface BEFORE the artifacts are public — just use the wrapper:
 
   ```sh
-  scripts/lint.sh      # bear + clang-tidy, exactly as ci.yml's lint job
+  scripts/lint.sh      # the x64-lint preset, exactly as ci.yml's lint job
   ```
 
   Fix any errors and re-run. If the only findings are warnings
@@ -346,12 +464,12 @@ a comment explaining its trigger).
   **Version skew — local-clean does NOT imply CI-clean (unless versions
   match).** CI pins **`clang-tidy-21`** by running the `lint` job inside an
   **`ubuntu:26.04` container** (26.04 is the first Ubuntu whose apt ships
-  clang-tidy-21 natively; 24.04 tops out at 20). `scripts/lint.sh` pins the
-  same `CT_VERSION=21` — so a clean `scripts/lint.sh` *does* mean a clean CI
+  clang-tidy-21 natively; 24.04 tops out at 20). `cmake/AxlLint.cmake` pins the
+  same `AXL_CLANG_TIDY_VERSION 21` — so a clean `scripts/lint.sh` *does* mean a clean CI
   lint when your local clang-tidy is 21. Three ways to get a matching 21:
   - **Ubuntu 26.04+:** `sudo apt-get install clang-tidy-21`.
   - **EL/Fedora/macOS dev boxes:** the distro's current `clang-tidy` is often
-    already 21 — `scripts/lint.sh` detects that and uses it without warning
+    already 21 — the lint preset detects that and uses it without warning
     (it only warns on a *real* mismatch).
   - **Any host:** run CI's exact lint in the same image —
     `podman run --rm -v "$PWD":/src:ro ubuntu:26.04 …` (the container `ci.yml`'s
@@ -362,7 +480,8 @@ a comment explaining its trigger).
   (`bugprone-sizeof-expression` on a correct array-of-pointers `sizeof`). When
   you intentionally move clang-tidy versions, bump it in both `ci.yml` (the
   `clang-tidy-NN` install + invocation, and the `ubuntu:NN.NN` container if the
-  new version needs a newer base) and `scripts/lint.sh`'s `CT_VERSION` together.
+  new version needs a newer base) and `AXL_CLANG_TIDY_VERSION` in
+  `cmake/AxlLint.cmake` together.
   Either way, the §4b CI-on-`main` run remains the authoritative gate.
 
 - **Doxygen has the same version-skew trap, with no pin available.**
@@ -391,10 +510,15 @@ a comment explaining its trigger).
   is the flaky form — don't use it.
 
   **What `scripts/lint.sh` covers, and what it deliberately does not.**
-  It runs three passes over one `bear`-generated compile database:
+  It is a wrapper over the **x64-lint CMake preset** (`cmake/AxlLint.cmake`):
+  clang-tidy runs beside each compile, per target, and Ninja re-checks only
+  the TUs whose source, headers, `.clang-tidy` or clang-tidy changed. The
+  preset will not even configure if a source is in no linted target. Four
+  passes:
 
   1. `clang -fsyntax-only -Wall -Wextra` over every project TU
-     (`scripts/check-clang-warnings.py`). The tree builds with **gcc**, and
+     (`scripts/check-clang-warnings.py`, the preset's `lint.clang-warnings`
+     test, over the preset's compile database). The tree builds with **gcc**, and
      clang-*tidy* reports `.clang-tidy`'s checks, not the clang frontend's
      own `-W` diagnostics — so before this pass a clang-only compiler
      warning had nowhere to surface, and a `-Wformat` "zero field width"
@@ -404,21 +528,34 @@ a comment explaining its trigger).
      a style opinion, not a defect signal). Everything else `-Wextra` brings
      is enforced.
   2. clang-tidy over `src/` — the full `.clang-tidy` config.
-  3. clang-tidy over `test/unit/` **and `tools/`** — **`bugprone-*` only**
-     (`--checks='-clang-analyzer-*'`, which subtracts the analyzer from the
-     shared config so the disabled-check list stays single-sourced).
+  3. clang-tidy over `test/unit/`, `tools/` **and `test/integration/`** —
+     **`bugprone-*` only** (`--checks='-clang-analyzer-*'`, which subtracts
+     the analyzer from the shared config so the disabled-check list stays
+     single-sourced).
+  4. clang-tidy over the C++ TUs — the full config, against the cross
+     toolchain's libstdc++.
 
-  Pass 3 is narrowed on purpose, and the numbers are why. Both directories
-  are **0** findings at `bugprone-*` and both are far from clean at the full
-  config, for the same reason with different specifics:
+  Pass 3 is narrowed on purpose, and the numbers are why. All three
+  directories are **0** findings at `bugprone-*` today and all three are far
+  from clean at the full config, for the same reason with different
+  specifics:
 
   | Scope | `bugprone-*` | full config | what the difference is |
   |---|---|---|---|
   | `test/unit/` | 0 | ~40 | the analyzer objecting to what unit tests do deliberately — casting `99` to an enum to pin the bad-enum error path, indexing a buffer the test has already asserted non-NULL |
   | `tools/` | 0 | 10 | 4 × `security.PointerSub` on ordinary buffer arithmetic, 2 × garbage-value in `mkfixture.c`/`sysinfo.c`, and a `core.DivideZero` in `crashtest.c` — a tool whose entire purpose is to divide by zero |
+  | `test/integration/` (`*.c`) | 0 (was 5) | 10 (was 15) | 4 × `security.PointerSub`, every one of them on `AXL_EMBED_SIZE`, which subtracts two linker symbols *by construction*; 2 × `core.CallAndMessage` on a vtable the fixture has already asserted non-NULL; 3 × `unix.StdCLibraryFunctions` and 1 × `insecureAPI.strcpy` on what the two libc fixtures *exist to do* — one of them is the deliberate `open(NULL, O_RDONLY)` assertion |
 
-  Enabling the analyzer over either would mean a red gate or ~50
+  Enabling the analyzer over any of them would mean a red gate or ~50
   suppressions that bury the real findings.
+
+  `test/integration/` was measured at **5** `bugprone-*` findings the first
+  time anything linted it — all `bugprone-assignment-in-if-condition`, all in
+  `ssh-server-selftest.c`, all `(v = f()) != NULL` inside an `if`. They were
+  **fixed, not waived**: `src/`, `tools/` and `test/unit/` contain not one
+  instance of that idiom, because this pass has forbidden it everywhere it
+  could see for as long as it has run, and a fixture is not where the house
+  style gets an exemption.
 
   `tools/` was measured at **3** `bugprone-*` findings before it was turned
   on, and the three were resolved individually rather than waived as a
@@ -437,11 +574,42 @@ a comment explaining its trigger).
     already uses for its `long` / `long long` `va_arg` branches. The check
     stays enabled everywhere else.
 
+  **How `test/integration/*.c` got into the lint**, since "absent from it"
+  is what kept the directory out for as long as it was out: under the old
+  `bear`-driven lint, the `integration-fixtures` Makefile target compiled all
+  60 guest fixtures -- objects only, no links. Under the preset they are the
+  `axl_fixture_objs` target (every `test/integration/*.c`, as the retired
+  Makefile's wildcard took them), and the preset's coverage check fails configure if
+  one falls out.
+
+  **It widens pass 1 as well as pass 3**, which is worth stating because
+  nothing asked for it: `check-clang-warnings.py` selects from the
+  *database*, so those 59 TUs also joined `clang -Wall -Wextra` — 366 → 426
+  TUs, a far wider check set than the `bugprone-*` they were added for.
+  Measured at 2.5 s for the whole pass, **zero findings**.
+
+  Cost, measured 2026-11-02 on the preset (x64, idle box): cold -- an empty
+  `build/x64-lint`, which is what CI's fresh container pays -- **59.6 s**;
+  warm with nothing changed **0.03 s**, after a one-file change **1.9 s**, the
+  full `scripts/lint.sh` including its tests **3.1 s**. The old `bear`-driven
+  lint cost ~55 s on every run.
+
   **Not covered (measured, deferred — not an oversight):**
-  - `test/integration/`, `test/fuzz/` — absent from the compile database
-    (`make tests tools` does not build them), so clang-tidy falls back to
-    default flags and emits nonsense `'foo.h' file not found` errors rather
-    than real analysis. Getting them into the DB is the prerequisite.
+  - `test/fuzz/` — a HOST build under libFuzzer, which the lint build does
+    not run, so it is absent from the compile database. clang-tidy does not
+    skip such a file: it interpolates a compile command from the nearest
+    sibling by path, so the result is either analysis under flags nobody
+    chose for it or a nonsense `'foo.h' file not found` — measured both
+    ways, and neither is real analysis of this code.
+  - `test/integration/*.cpp` — the 16 C++ fixtures. Pass 4 takes its list
+    **from the database**, so putting them in it also puts them in that pass
+    at the *full* config, which is a separate measurement and a separate
+    decision from the `bugprone-*` one made for the C fixtures.
+  - ~~The **non-default configurations** of three C fixtures~~ -- closed:
+    the preset lints EVERY variant of a source (`axl_object_variant`;
+    `docs/AXL-Build-System-Design.md` §10.3), so `pin-svc-driver.c`'s,
+    `sd-sibling-driver.c`'s and `console-device-smoke.c`'s `#ifdef`-gated
+    halves are read too.
 
 ## Which flow: from `main`, or from a tag?
 
@@ -488,11 +656,10 @@ mislabelled *version*, not unrelated work that happens to be non-breaking.
 ### The release commit skips CI, on purpose
 
 `cut-release.sh` pushes a `release: vX.Y.Z` commit to `main` before it tags,
-and `ci.yml` triggers on every push to `main`. So a release used to run the
-full integration suite **twice on this box** — once as the local pre-release
-gate, and again from that push, for a commit whose entire content is a version
-string and a date — before `release.yml` built and tested everything a third
-time on the tag.
+and `ci.yml` triggers on every push to `main`. That commit's entire content is
+a version string and a date: the gate certifies it from its parent's runs, and
+`release.yml` builds and tests everything again on the tag. (When the push
+trigger also ran the suite, this ran it **twice on this box** per release.)
 
 The release commit therefore carries a `[release-cut]` marker, and every
 `ci.yml` job is conditioned on **not** seeing it.
@@ -602,9 +769,9 @@ scripts/bump-version.sh X.Y.Z
 ```
 
 This updates **both** `VERSION` and `include/axl/axl-version.h` in
-one shot. Don't edit either file by hand — the Makefile's
-`check-version` target compares them and refuses to build on
-mismatch. If you've ever seen
+one shot. Don't edit either file by hand — the CMake configure
+compares them and refuses to build on mismatch (and `cut-release.sh`
+runs `scripts/check-version.sh`). If you've ever seen
 `ERROR: VERSION (X.Y.Z) != axl-version.h (P.Q.R)` in CI, this is
 why.
 
@@ -651,31 +818,29 @@ release.yml workflow can race and check out the wrong commit.
 `release.yml` triggers on any `v*` tag regardless of which branch
 carries it, so the tag flow publishes exactly the same way.
 
-### 4b. The gate is the LOCAL suite — CI no longer auto-runs on a push
+### 4b. The gate: a dispatched suite, or the local suite plus the push CI
 
-> **Updated policy** (was "wait for CI green before tagging"). CI does **not**
-> run on a push to `main` anymore (see "GitHub Actions trigger policy" above), so
-> there's nothing to wait for on the branch. The authoritative gate is the
-> **local** suite — run it before you cut:
->
-> ```sh
-> ./test/integration/run-integration.sh --no-cache -j"$(nproc)"   # 0 failures required
-> scripts/lint.sh                                       # clang-tidy as CI runs it
-> ```
+See ["The gate"](#the-gate-a-dispatched-ci-suite-or-the-local-release-suite-plus-the-push-ci)
+above — it is the authority, and this step used to contradict it. In short:
+`scripts/cut-release.sh X.Y.Z` refuses unless a dispatched suite run, or the
+local release suite plus the cheap push CI, already covers the commit; it
+names both remedies when nothing does. `--ci-gate` dispatches CI on the release
+branch and waits for the suite to go green before creating the tag;
+`--tag-untested` tags anyway, loudly, and records it in the release notes.
+CI is **not** re-run by the tag; a **major** (`vX.0.0`) tag additionally
+triggers `docs.yml` as a post-publish step.
 
-Get the cross-OS CI backstop *before* tagging — run
-`scripts/cut-release.sh X.Y.Z --ci-gate`, which dispatches CI on `main` (the
-release commit) and waits for green before creating the tag. Without `--ci-gate`,
-the cut tags immediately (the local suite was the gate). CI is **not** re-run by
-the tag; a **major** (`vX.0.0`) tag additionally triggers `docs.yml` as a
-post-publish step, and `cut-release.sh` watches Release (+ Docs on a major).
+The local path, run before you cut:
 
-Why the change: the suite is run locally before every release anyway, so a
-per-push CI gate was redundant cost. The two CI-only failures that burned v1.0.0
-(a headless-runner pointer test, a clang-tidy version skew) are now handled
-structurally: the pointer test is `local-only` (excluded from CI), and
-`scripts/lint.sh` pins the exact CI clang-tidy version — run it locally and it
-matches CI byte-for-byte.
+```sh
+scripts/release-suite.sh   # CI's integration job, locally; stamps on success
+scripts/lint.sh            # clang-tidy as CI runs it
+```
+
+The two CI-only failures that burned v1.0.0 (a headless-runner pointer test, a
+clang-tidy version skew) are handled structurally: the pointer test is
+`local-only` (excluded from CI), and `scripts/lint.sh` pins the exact CI
+clang-tidy version — run it locally and it matches CI byte-for-byte.
 
 ### 5. Create and push the tag
 
@@ -724,12 +889,17 @@ The tag push triggers **two** workflows (and on a minor/patch, one):
 > push-to-`main` trigger came back. The trigger table above is authoritative.)
 
 - **Release** (`.github/workflows/release.yml`) — builds the SDK,
-  host-tools and UEFI-tools tarballs (both arches), pulls iPXE
-  from upstream for the UEFI-tools tarball, and attaches
+  host-tools and UEFI-tools tarballs (both arches), and attaches
   everything plus `install.sh`, `VERSION` and `SHA256SUMS` to a
-  GitHub Release on `aximcode/axl-sdk-releases`. **No `.deb` or
-  `.rpm`** — they retired with D2
-  ([AXL-Distribution-Design.md](AXL-Distribution-Design.md) §17).
+  GitHub Release on `aximcode/axl-sdk-releases`. Since 5.0.0 it also
+  builds the versioned **`.deb` and `.rpm`** (`axl-sdk-<ver>`, under
+  `/opt/axl-sdk-<ver>`) for every release but a prerelease. They were
+  retired with D2 in 4.5.0 and came back built from the same install
+  rules as the tarballs — the `.rpm` by CPack's RPM generator, the `.deb`
+  by `dpkg-deb` under `cpack -G External` (CPack's DEB generator's
+  Installed-Size counts directory sizes, so its `.deb` differed between
+  ext4 and XFS)
+  ([AXL-Distribution-Design.md](AXL-Distribution-Design.md) §17.5).
 - **Docs** (`.github/workflows/docs.yml`) — Doxygen + Sphinx
   build + Cloudflare Pages deploy.
 
@@ -742,7 +912,7 @@ user-mode emulation.
 
 **The CI backstop is the slow one, and it is a separate wait.**
 `--ci-gate` dispatches ci.yml on the release commit before
-tagging **unless the local stamp already covers it** (see above),
+tagging **unless something already covers it** (see above),
 and its QEMU job runs the WHOLE integration suite, each test in
 its own QEMU. Measured **~50 minutes** on the v3.2.0 cut; the
 other three jobs finished in under 6.
@@ -877,23 +1047,39 @@ The Release is published on the public sibling repo
 gh release view vX.Y.Z --repo aximcode/axl-sdk-releases
 ```
 
-Should show exactly **six** assets:
+Should show exactly **nine** assets for a release (**seven** for a
+prerelease, which publishes no packages):
 
 | asset | name |
 |---|---|
 | the installer | `install.sh` |
 | the version it resolves | `VERSION` |
-| checksums over the other five | `SHA256SUMS` |
+| checksums over every other asset | `SHA256SUMS` |
 | host SDK prefix | `axl-sdk-linux-<ver>-x86_64.tar.gz` |
 | host tooling, no compiler | `axl-sdk-host-tools-<ver>.tar.gz` |
-| TARGET firmware binaries | `axl-sdk-uefi-tools-<ver>-{x64,aa64}.tar.gz` |
+| TARGET firmware binaries (two files) | `axl-sdk-uefi-tools-<ver>-{x64,aa64}.tar.gz` |
+| Debian/Ubuntu package (release only) | `axl-sdk-<ver>_<ver>-1_amd64.deb` |
+| RHEL/Fedora package (release only) | `axl-sdk-<ver>-<ver>-1.x86_64.rpm` |
 
-Three names are stable and three carry the version, and only the first
+Don't count from this table: the authority is the rule `release.yml`
+publishes by — `scripts/make-release-assets.sh assets --version X.Y.Z`
+lists every asset but `SHA256SUMS`. `scripts/check-published-release.sh
+vX.Y.Z` is the check to run on the published release: it downloads every
+asset against `SHA256SUMS` and checks the package names. (This section said "six" through 4.7.5, which actually
+published seven; the uefi-tools row is two files.)
+
+Three names are stable and the rest carry the version, and only the first
 two need to be stable — they are the only ones fetched by a reader who
 does not yet know the version (§14.1a). `<arch>` means the **host** on
-the SDK tarball and the **target firmware** on the uefi-tools ones.
+the SDK tarball and the **target firmware** on the uefi-tools ones. The
+packages' names carry the version TWICE, deliberately: the package NAME is
+versioned (`axl-sdk-<ver>`, installed side by side under
+`/opt/axl-sdk-<ver>`), and so is its version field
+([AXL-Distribution-Design.md](AXL-Distribution-Design.md) §17.5). An RPM
+`Version` cannot hold a prerelease's `-`, which is why a prerelease
+publishes no packages.
 
-The release job itself asserts the count, and `make check-asset-names`
+The release job itself asserts the count, and `gate.check-asset-names`
 holds these spellings equal to the ones `packaging/install.sh`
 constructs, so a rename that misses one place fails before the tag.
 
@@ -911,7 +1097,8 @@ Specifically, it contains:
   simply reports which install step is missing. Since D2 the
   archive also carries `share/doc/axl-sdk/` — LICENSE, NOTICE,
   THIRD_PARTY.md, the examples, and the five third-party licence
-  sets the retired packages used to carry.
+  sets the pre-D2 packages carried (the 5.0.0 packages install this
+  same tree, so they carry them too).
 - C++ bits (when toolchain present at build time): the four
   `axl-cxxrt-*.o` glue objects per arch, plus the C++ headers.
   The archive conveys no libstdc++ — `axl-cc` names the
@@ -954,6 +1141,113 @@ pushing) that it's worth verifying. Subsequent commits made
 while detached will be invisible to `git push origin main`,
 which is the silent-data-loss case to avoid.
 
+## Test releases (no CI)
+
+To hand a build of `sshd` and the tools to a remote user without cutting a
+release, publish a **test release** -- from a clean, committed checkout by default:
+
+```sh
+scripts/make-test-release.sh --dry-run   # build + gate, print the gh commands
+scripts/make-test-release.sh             # build + gate + publish + prune
+scripts/make-test-release.sh --keep 5    # keep 5 test releases instead of 3
+scripts/make-test-release.sh --dirty     # build uncommitted changes too
+scripts/make-test-release.sh --update    # rebuild the newest test release in place
+scripts/make-test-release.sh --update TAG [--dirty]
+scripts/make-test-release.sh --list      # test releases, newest first
+scripts/make-test-release.sh --delete TAG
+scripts/make-test-release.sh --delete-all
+```
+
+Every mode touches **only test pre-releases**: a tag shaped
+`test-<8 digits>-<8 hex>[-dirty-<8 hex>]` whose release is a pre-release.
+`--delete`, `--delete-all` and `--update` refuse anything else by name -- a
+`v*` tag, a test-shaped full release, a tag that does not exist -- and
+`--dry-run` prints every gh write of every mode instead of running it.
+
+- **`--dirty`** builds the working tree as it is. Without it a tree with
+  uncommitted tracked changes is refused, and the message names `--dirty`;
+  untracked files under `share/` or `third_party/` are refused either way.
+  The patch is every tracked change **plus every untracked, non-ignored file
+  under the build inputs** (the top-level directories the repository tracks,
+  plus any untracked top-level directory, less every hidden one (`.github`,
+  and an untracked `.claude/` or the like: private state never goes in a
+  public patch) and `docs/` -- a test release builds the tools and their
+  tarball, never the Sphinx docs). Before building, the run prints the
+  untracked directories it will include (`--dirty: including untracked:
+  newlib/`) and refuses one over 50 MB, naming it -- `git diff --binary
+  HEAD` over a throwaway index with those files added intent-to-add, so a new
+  header a tracked edit includes is in it and the patch, applied to the
+  commit, reproduces exactly what was built. An untracked file at the root
+  (a scratch note) is not an input and is left out. The tag ends
+  `-dirty-<first 8 hex of the patch's sha256>`, the notes say the build is
+  from uncommitted changes and list them (the patch's `--stat`), and the
+  patch ships as `<tag>.patch`, listed in `SHA256SUMS`.
+- **`--update [TAG]`** (default: the newest test pre-release) rebuilds and
+  re-gates from the current tree (respecting `--dirty`), then replaces that
+  release's assets (`--clobber`, and any asset the new build lacks is
+  deleted) and its notes in place. The tag name -- and so the link -- stays.
+  When the source differs from the one the tag's commit names, the tag is
+  moved to a fresh commit made as a new tag's is (below); `main` is still
+  never written. The notes' first line states what THIS build is (the tag's
+  name is from the first build published under it), every notes file
+  records its build as `Source: axl-sdk <sha>[-dirty-<hash8>]`, and the
+  notes say the tag moved whenever the source differs from the one the
+  published notes describe -- so a rerun after an update that failed past
+  moving the tag still says so.
+- **`--list`** prints each test pre-release's tag, its tag commit's date and
+  its asset count, newest first.
+
+What it does, all on this machine:
+
+1. Refuses a tree with tracked changes unless `--dirty` (the tag must name
+   what was built), an untracked file under `share/` or `third_party/` (the
+   build globs those, so it would ship), and a tag that already exists on
+   `aximcode/axl-sdk-releases`. If HEAD is not on `origin/main` (the local
+   ref; nothing is fetched) it warns and goes on -- it never pushes -- and the
+   notes label the commit "(local commit, not yet pushed)".
+2. `scripts/axl-build.sh ARCH=<arch> BUILD=RELEASE tools` for x64 and aa64
+   (CMake, the RELEASE preset).
+3. Builds both UEFI-tools tarballs with `scripts/make-release-assets.sh uefi-tools`
+   -- the command `release.yml` runs, so the layout is a release's -- into
+   `out/test-release/<tag>/`, versioned `<VERSION>-<tag>` (for example
+   `axl-sdk-uefi-tools-4.7.3-test-20261020-0b4094d0-x64.tar.gz`).
+4. **Gates** each arch on `test-efi-pack-release-qemu.sh`, booting a
+   read-only stick extracted from **the tarball it is about to publish**
+   (`UEFI_TOOLS_TARBALL=<tarball>`). Any failure publishes nothing, and no
+   flag skips the gate.
+5. Publishes the two tarballs and `SHA256SUMS` as a **Pre-release** on
+   `aximcode/axl-sdk-releases`, tag `test-<YYYYMMDD>-<8-hex sha>`, with
+   `--latest=false`. The notes name the commit and say it is a test build,
+   not a release. The tag names a **commit of its own** on the releases
+   repo, made through the git data API: `main`'s tree, `main` as its parent,
+   a fresh date, and the axl-sdk commit in its message. GitHub orders
+   releases by their tag's commit date, so a tag at `main`'s old head sorted
+   a new test build below every release since; this one sorts at the top.
+   `main` is read, never written; the release is created on that tag
+   (`--verify-tag`), and a failed create deletes the tag it made (or, if
+   that delete fails, prints the command that finishes it). A rerun that
+   finds a leftover DRAFT on its tag -- a create that died while uploading --
+   deletes it and goes on; a published release on the tag is refused, with
+   `--update TAG` or `--delete TAG` named as the way forward.
+6. Prunes: keeps the 3 newest test pre-releases (`--keep N`) -- newest by the
+   tag commit's date, which is what GitHub orders by and what `--update`
+   moves, so a release just refreshed in place is kept -- and deletes the
+   older ones with their tags (each tag's own commit is then unreferenced).
+   Only pre-releases tagged `test-<8 digits>-<8 hex>` are ever candidates.
+
+What it does **not** do: push or tag axl-sdk, or touch CI. The tag exists only
+on the releases repo and never matches `v*`, so no workflow fires; nothing in
+`release.yml`, `docs.yml` or `ci.yml` runs. It is never "Latest", which matters:
+`packaging/install.sh` is fetched from `releases/latest/download/`, and a test
+release carries no `install.sh` or `VERSION`. The page's "Source code" links
+are GitHub's archive of the releases repo at that tag -- the last official
+source snapshot, not this build; the notes say so.
+
+Test releases are published without asking; an official release (above)
+stays ask-first. A run is two release builds (incremental when the tree
+is already built) plus two QEMU boots of the release-image test, the aa64
+one emulated.
+
 ## Recovery: a failed release tag
 
 If a workflow fails on a freshly-pushed tag and **no GitHub Release
@@ -977,7 +1271,8 @@ has been created yet**, it's safe to re-cut:
    does that re-cut for you **once the old tag is deleted** — it refuses while
    the tag still exists — and it dispatches the CI run, because `ci.yml` has no
    trigger for that ref and nothing else will start one. (`--branch` turns the
-   gate on by itself; `--ci-gate` adds nothing there.)
+   gate on by itself; `--ci-gate` adds nothing there. `--resume --ci-gate` on
+   `main` dispatches too: a push to `main` runs no suite.)
 
 4. Watch the new workflow runs (step 6) and confirm (step 7).
 
@@ -991,10 +1286,10 @@ instead.
 
 The order is a recovery from each pitfall we've actually hit:
 
-- `bump-version.sh` exists because the Makefile's `check-version`
-  target catches stale `axl-version.h` on every build. Cut a
-  release without it and the first `make` invocation in CI fails;
-  v0.2.6 was re-cut for exactly this reason.
+- `bump-version.sh` exists because a stale `axl-version.h` against
+  `VERSION` fails the build (the CMake configure refuses it, as the
+  Makefile's `check-version` did). Cut a release without it and the first
+  build in CI fails; v0.2.6 was re-cut for exactly this reason.
 - "Push main before the tag" exists because release.yml clones the
   *tag*, but the tag points to a commit that has to be reachable
   via the branch ref the runners pull from.
@@ -1006,7 +1301,14 @@ The order is a recovery from each pitfall we've actually hit:
 - [`scripts/bump-version.sh`](../scripts/bump-version.sh) — the
   atomic version helper.
 - [`.github/workflows/release.yml`](../.github/workflows/release.yml)
-  — the deb/rpm build and publish workflow.
+  — the tarball build and publish workflow.
+- [`scripts/make-release-assets.sh`](../scripts/make-release-assets.sh)
+  — every release archive and `SHA256SUMS`, by CPack over the install rules
+  (`cmake/AxlInstall.cmake`, `cmake/AxlPackage.cmake`, `packaging/*/`), that
+  `release.yml`, the release-image test and `make-test-release.sh` share.
+- [`scripts/make-test-release.sh`](../scripts/make-test-release.sh) — test
+  releases (above).
 - [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) — the
-  per-push integration suite that gates a release.
+  per-push cheap jobs, and the dispatched integration suite that gates a
+  release.
 - [`CHANGELOG.md`](../CHANGELOG.md) — what's shipped, by tag.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=25 local-only=0
+# test-meta: arch=x64 needs= est=25 local-only=0 guest=standard
 # test-tcp-multi-transmit-qemu.sh — the AXL-Tcp-Queue-Design §7 spike, made
 # repeatable.
 #
@@ -79,30 +79,16 @@ MTX_EXPECT_BYTES=$(( MTX_TOKENS * 65536 ))
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo ""
-    echo "echo Connecting drivers..."
-    echo "connect -r"
-    echo "stall 1000000"
-    echo ""
-    echo "echo Configuring network via DHCP..."
-    echo "ifconfig -s eth0 dhcp"
-    echo "stall 3000000"
-    echo ""
-    echo "echo Running concurrent-Transmit spike..."
-    echo "AxlTestNet.efi tcp-multi-tx 10.0.2.2 ${REC_HOST_PORT} ${MTX_GAP_MS} ${MTX_ORDER} ${MTX_TOKENS}"
-    echo ""
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-tcp-multi-transmit-qemu.nsh; the
+# recorder's port, the gap, the order and the token count are %1-%4.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$REC_HOST_PORT" "$MTX_GAP_MS" "$MTX_ORDER" "$MTX_TOKENS"
 
 test_build_image
 
@@ -112,11 +98,13 @@ REC_PID=0
 python3 "$(dirname "$0")/tcp-multi-tx-server.py" "$REC_HOST_PORT" "$REC_OUT" &
 REC_PID=$!
 
-# EXIT INT TERM, not EXIT alone: test_setup installed all three, and a bare
-# `trap ... EXIT` REPLACES them -- so a `timeout` SIGTERM from
-# run-integration.sh would skip test_cleanup entirely, leaking the scratch
-# dir and orphaning the recorder.
-trap 'test_cleanup; [[ $REC_PID -gt 0 ]] && kill $REC_PID 2>/dev/null || true' EXIT INT TERM
+# EXIT alone. A `trap ... EXIT` replaces only the EXIT trap -- traps are per
+# signal -- so common-test.sh's INT/TERM handlers stay in force: a `timeout`
+# SIGTERM from run-integration.sh reports the kill, runs THIS trap (the
+# handler reads the EXIT trap when the signal arrives, and runs it itself),
+# and ends the test. Trapping TERM here too would make a killed test RESUME
+# after the cleanup (see common-test.sh's _test_killed).
+trap 'test_cleanup; [[ $REC_PID -gt 0 ]] && kill $REC_PID 2>/dev/null || true' EXIT
 
 sleep 1
 echo "  recorder PID: $REC_PID, port: $REC_HOST_PORT"

@@ -242,7 +242,10 @@ axl_efi1x_setenv(
     cmd[len] = 0;
 
     /* Handle by value, per the EFI Toolkit ShellExecute convention. */
+    axl_backend_child_image_enter();
     EFI_STATUS st = se->Execute(axl_efi1x_shell_parent(), cmd, FALSE);
+    axl_backend_child_image_leave();
+    axl_backend_exit_if_deferred();
     return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
 }
 
@@ -517,6 +520,41 @@ resolve_path(
 }
 
 int
+axl_efi1x_path_locate(
+    const unsigned short  *path,
+    void                 **volume,
+    unsigned short        *rel,
+    size_t                 rel_cap
+    )
+{
+    if (path == NULL || volume == NULL || rel == NULL) {
+        return AXL_ERR;
+    }
+
+    CHAR16 name[AXL_EFI1X_NAME_MAX];
+    CHAR16 out[AXL_EFI1X_PATH_MAX];
+    if (resolve_path((const CHAR16 *)path, name, out) != AXL_OK) {
+        return AXL_ERR;
+    }
+    void *dp = map_device_path(name);
+    if (dp == NULL) {
+        return AXL_ERR;
+    }
+
+    /* LocateDevicePath advances its pointer; it walks a local, never the
+       shell's device path. */
+    EFI_DEVICE_PATH_PROTOCOL *walk   = (EFI_DEVICE_PATH_PROTOCOL *)dp;
+    EFI_HANDLE                handle = NULL;
+    EFI_GUID                  sfs    = gEfiSimpleFileSystemProtocolGuid;
+    if (EFI_ERROR(gBS->LocateDevicePath(&sfs, &walk, &handle))
+        || !axl_backend_wcs_copy(rel, rel_cap, out)) {
+        return AXL_ERR;
+    }
+    *volume = handle;
+    return AXL_OK;
+}
+
+int
 axl_efi1x_file_open(
     const unsigned short  *path,
     uint64_t               mode,
@@ -565,8 +603,9 @@ axl_efi1x_file_open(
         if (st != EFI_NOT_FOUND) {
             axl_debug("efi1x: open failed (status=0x%llx)",
                       (unsigned long long)st);
+            return AXL_ERR;
         }
-        return AXL_ERR;
+        return AXL_NOT_FOUND;   /* the volume resolved; the file is absent */
     }
     *out = file;
     return AXL_OK;

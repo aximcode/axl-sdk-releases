@@ -44,8 +44,9 @@ axl_efi1x_shell_env(
  * the cwd is not the root). A CREATE mode against a bare-volume path is
  * rejected (no leaf to create).
  *
- * @return AXL_OK on success, AXL_ERR on a bad path, an unmapped volume, a
- *     CREATE against a bare volume, or any firmware failure.
+ * @return AXL_OK on success; AXL_NOT_FOUND when the volume opened and the
+ *     file system reported no such file; AXL_ERR on a bad path, an unmapped
+ *     volume, a CREATE against a bare volume, or any other firmware failure.
  */
 int
 axl_efi1x_file_open(
@@ -53,6 +54,23 @@ axl_efi1x_file_open(
     uint64_t               mode,        ///< EFI file mode flags
     uint64_t               attributes,  ///< EFI file attributes (create only)
     EFI_FILE_PROTOCOL    **out          ///< (out) receives the open file
+    );
+
+/**
+ * @brief axl_backend_path_locate for the old EFI 1.x shell: the volume a path
+ *     resolves to and the path below its root, resolved exactly as
+ *     axl_efi1x_file_open resolves it, without opening anything.
+ *
+ * @return AXL_OK with @p volume (the SimpleFileSystem EFI_HANDLE) and
+ *     @p rel set; AXL_ERR when the volume does not resolve or @p rel does
+ *     not fit.
+ */
+int
+axl_efi1x_path_locate(
+    const unsigned short  *path,     ///< UCS-2 path
+    void                 **volume,   ///< [out] SimpleFileSystem EFI_HANDLE
+    unsigned short        *rel,      ///< [out] volume-relative path, `\` separators
+    size_t                 rel_cap   ///< capacity of @p rel in characters
     );
 
 /**

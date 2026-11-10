@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="8"
+	failures="2"
+	disabled="0"
+	skipped="1"
+	hostname=""
+	time="16"
+	timestamp="2026-11-06T10:58:10"
+	>
+	<testcase name="integration.test-cr-fail" classname="integration.test-cr-fail" time="3.01508" status="fail">
+		<failure message="Failed"/>
+		<properties>
+			<property name="cmake_labels" value="arch:x64;integration"/>
+		</properties>
+		<system-out>  test-cr-fail.sh FAIL 3s (after retry)
+    --- test-cr-fail.sh output (last 25 lines) ---
+    | stub fail
+    --- end test-cr-fail.sh ---
+</system-out>
+	</testcase>
+	<testcase name="integration.test-cr-flaky" classname="integration.test-cr-flaky" time="3.04715" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;integration"/>
+		</properties>
+		<system-out>  test-cr-flaky.sh PASS 3s (retry; attempt 1 failed — see test-cr-flaky.sh.attempt1.log)
+</system-out>
+	</testcase>
+	<testcase name="integration.test-cr-hang" classname="integration.test-cr-hang" time="9.01846" status="fail">
+		<failure message="Failed"/>
+		<properties>
+			<property name="cmake_labels" value="arch:x64;integration"/>
+		</properties>
+		<system-out>  test-cr-hang.sh TIMEOUT 9s (after retry; test declares est=1s, limit was 3s)
+    --- test-cr-hang.sh output (last 25 lines) ---
+    --- end test-cr-hang.sh ---
+</system-out>
+	</testcase>
+	<testcase name="integration.test-cr-pass" classname="integration.test-cr-pass" time="0.0111433" status="run">
+		<properties>
+			<property name="cmake_labels" value="arch:x64;integration"/>
+		</properties>
+		<system-out>  test-cr-pass.sh PASS 0s
+</system-out>
+	</testcase>
+	<testcase name="integration.test-cr-skip" classname="integration.test-cr-skip" time="0.0121095" status="notrun">
+		<skipped message="SKIP_RETURN_CODE=77"/>
+		<properties>
+			<property name="cmake_labels" value="arch:x64;integration"/>
+		</properties>
+		<system-out>  test-cr-skip.sh SKIP 0s (SKIP: no widget on this box)
+</system-out>
+	</testcase>
+	<testcase name="integration.prep" classname="integration.prep" time="0.978125" status="run">
+		<properties>
+			<property name="cmake_labels" value="prep"/>
+		</properties>
+		<system-out></system-out>
+	</testcase>
+	<testcase name="integration.tmp-setup" classname="integration.tmp-setup" time="0.00536148" status="run">
+		<properties>
+			<property name="cmake_labels" value="prep"/>
+		</properties>
+		<system-out></system-out>
+	</testcase>
+	<testcase name="integration.tmp-cleanup" classname="integration.tmp-cleanup" time="0.00258395" status="run">
+		<properties>
+			<property name="cmake_labels" value="prep"/>
+		</properties>
+		<system-out></system-out>
+	</testcase>
+</testsuite>

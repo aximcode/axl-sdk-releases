@@ -101,6 +101,239 @@ axl_shell_execute(
     return rc;
 }
 
+/* The Shell's "not found" status (SHELL_NOT_FOUND), as %lasterror% holds it. */
+#define SHELL_LASTERROR_NOT_FOUND 0xEu
+#define UEFI_ERROR_BIT            0x8000000000000000ULL
+
+static const char *
+skip_blanks(
+    const char *s
+    )
+{
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    return s;
+}
+
+/* Copy @p line's first word into @p out as the Shell parses it
+   (GetNextParameter): it ends at a blank outside quotes, every unescaped `"`
+   is dropped wherever it stands, and `^` takes the next character literally --
+   so `"exit"`, `ex"it"` and `e^xit` are all exit, and `"exit"5` is exit5.
+   Empty when there is none. No `@` handling: that prefix is a script's, and
+   Execute runs neither `@x` nor `@ x` (measured: both not found). */
+static void
+first_word(
+    const char *line,
+    char       *out,
+    size_t      out_size
+    )
+{
+    line = skip_blanks(line);
+    bool   quoted = false;
+    size_t n      = 0;
+    for (; *line != '\0'; line++) {
+        if (*line == '^' && line[1] != '\0') {
+            line++;                       /* the escaped character, as itself */
+        } else if (*line == '"') {
+            quoted = !quoted;
+            continue;
+        } else if (!quoted && (*line == ' ' || *line == '\t')) {
+            break;
+        }
+        if (n + 1 < out_size) {
+            out[n++] = *line;
+        }
+    }
+    out[n] = '\0';
+}
+
+/* The UTF-8 value of a Shell alias, or NULL; caller frees. */
+static char *
+alias_value(
+    const char *name
+    )
+{
+    unsigned short *w = axl_utf8_to_ucs2(name);
+    if (w == NULL) {
+        return NULL;
+    }
+    const unsigned short *v = axl_backend_shell_get_alias(w);
+    axl_free(w);
+    return v != NULL ? axl_ucs2_to_utf8(v) : NULL;
+}
+
+/* `exit`, typed or behind an alias: in a -nonest Shell it ends the Shell
+   hosting the caller while reporting 0. */
+static bool
+is_exit(
+    const char *line
+    )
+{
+    char word[64];
+    first_word(line, word, sizeof(word));
+    if (axl_strcasecmp(word, "exit") == 0) {
+        return true;
+    }
+    if (word[0] == '\0') {
+        return false;
+    }
+    char *alias = alias_value(word);
+    if (alias == NULL) {
+        return false;
+    }
+    char target[64];
+    first_word(alias, target, sizeof(target));
+    axl_free(alias);
+    return axl_strcasecmp(target, "exit") == 0;
+}
+
+/* A Shell variable read as a hex number ("0xE"); false when unset or not a
+   number. */
+static bool
+shell_env_hex(
+    const unsigned short *name,
+    uint64_t             *out
+    )
+{
+    const unsigned short *v = axl_backend_shell_getenv(name);
+    if (v == NULL) {
+        return false;
+    }
+    char *u = axl_ucs2_to_utf8(v);
+    if (u == NULL) {
+        return false;
+    }
+    const char *digits = u;
+    if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        digits += 2;
+    }
+    size_t len = axl_strlen(digits);
+    bool ok = len > 0 && axl_hex_parse_u64(digits, len, out) == (int)len;
+    axl_free(u);
+    return ok;
+}
+
+static bool
+shell_env_true(
+    const unsigned short *name
+    )
+{
+    const unsigned short *v = axl_backend_shell_getenv(name);
+    if (v == NULL) {
+        return false;
+    }
+    char *u = axl_ucs2_to_utf8(v);
+    bool t = u != NULL && axl_strcasecmp(u, "True") == 0;
+    axl_free(u);
+    return t;
+}
+
+/* Set %lasterror% to 0 with a quiet `cd .` -- the variable cannot be written,
+   and `cd` is the one silent command that resets it. Not when there is no
+   current directory (cd would fail, and print) or `cd` is an alias (it would
+   run something else). True only if it then reads 0. */
+static bool
+reset_lasterror(void)
+{
+    if (axl_backend_shell_getcwd() == NULL) {
+        return false;
+    }
+    char *cd_alias = alias_value("cd");
+    if (cd_alias != NULL) {
+        axl_free(cd_alias);
+        return false;
+    }
+    if (axl_backend_shell_execute_quiet(u"cd .") != AXL_OK) {
+        return false;
+    }
+    uint64_t le = 1;
+    return shell_env_hex(u"lasterror", &le) && le == 0;
+}
+
+/* The outcome of a line a -nonest Shell ran, from what it reported -- the
+   header's table, row by row. */
+static AxlShellOutcome
+nonest_outcome(
+    const AxlShellResult *r,
+    bool                  have_lasterror,
+    uint64_t              lasterror
+    )
+{
+    bool exec_failed = (r->execute_status & UEFI_ERROR_BIT) != 0;
+    if (r->status_written) {
+        /* A written status without the error bit beside a failed Execute is
+           a load error: the image never ran. */
+        bool load_error = exec_failed && (r->status & UEFI_ERROR_BIT) == 0;
+        return load_error ? AXL_SHELL_OUTCOME_NOT_RUN : AXL_SHELL_OUTCOME_RAN;
+    }
+    if (exec_failed) {
+        return AXL_SHELL_OUTCOME_NOT_RUN;   /* refused before running */
+    }
+    if (!r->reset_ok || !have_lasterror) {
+        return AXL_SHELL_OUTCOME_UNKNOWN;
+    }
+    return lasterror == SHELL_LASTERROR_NOT_FOUND ? AXL_SHELL_OUTCOME_NOT_RUN
+                                                  : AXL_SHELL_OUTCOME_RAN;
+}
+
+int
+axl_shell_execute_status(
+    const char     *cmd,
+    AxlShellResult *out
+    )
+{
+    if (cmd == NULL || out == NULL) {
+        return AXL_ERR;
+    }
+    if (*skip_blanks(cmd) == '\0') {
+        return AXL_ERR;   /* a nested Shell handed this starts a whole session */
+    }
+    if (is_exit(cmd)) {
+        return AXL_DENIED;   /* the line itself: a caller can tell it from a failure */
+    }
+    AxlShellKind kind = axl_shell_kind();
+    if (kind == AXL_SHELL_KIND_NONE) {
+        return AXL_ERR;
+    }
+    unsigned short *ucs2 = axl_utf8_to_ucs2(cmd);
+    if (ucs2 == NULL) {
+        return AXL_ERR;
+    }
+
+    AxlShellResult r;
+    axl_memset(&r, 0, sizeof(r));   /* outcome UNKNOWN */
+
+    if (kind == AXL_SHELL_KIND_EFI_1X) {
+        /* SHELL_ENVIRONMENT.Execute returns the command's status and a
+           dispatch failure through the same value, so even its error says
+           nothing about whether the line ran: UNKNOWN either way. */
+        axl_backend_shell_execute(ucs2);
+        axl_free(ucs2);
+        *out = r;
+        return AXL_OK;
+    }
+
+    r.nonest = shell_env_true(u"nonesting");
+    if (r.nonest) {
+        r.reset_ok = reset_lasterror();
+    }
+    uint64_t status = 0;
+    int rc = axl_backend_shell_execute_status(ucs2, &status, &r.status_written,
+                                              &r.execute_status);
+    axl_free(ucs2);
+    if (rc != AXL_OK) {
+        return AXL_ERR;
+    }
+    uint64_t lasterror = 0;
+    bool have_le = r.nonest && shell_env_hex(u"lasterror", &lasterror);
+    r.status  = r.status_written ? status : lasterror;
+    r.outcome = r.nonest ? nonest_outcome(&r, have_le, lasterror)
+                         : AXL_SHELL_OUTCOME_UNKNOWN;
+    *out = r;
+    return AXL_OK;
+}
+
 int
 axl_shell_sources(
     AxlShellSources *out

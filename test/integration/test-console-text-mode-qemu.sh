@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=11 local-only=0
+# test-meta: arch=both needs= est=11 local-only=0 builds=console-text-mode-selftest guest=gpu
 # test-console-text-mode-qemu.sh — text-console mode enumerate / switch
 # round-trip.
 #
@@ -44,7 +44,7 @@ run_one() {
     efi="$out/console-text-mode-selftest.efi"
 
     echo "=== text-console mode enumerate/switch ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" console-text-mode-selftest 2>&1 | tail -2
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" console-text-mode-selftest 2>&1 | tail -2
 
     log="$(mktemp)"
     # --gpu wires a virtual GPU so OVMF's graphics console publishes several

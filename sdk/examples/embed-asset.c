@@ -17,7 +17,7 @@
  *   axl-cc --embed embed-asset.txt=greeting \
  *          embed-asset.c -o embed-asset.efi
  *
- * In-tree: the Makefile's EMBED_BLOB function emits the same
+ * In-tree: the build's axl_embed_blob function emits the same
  * `axl_embedded_greeting` / `_end` symbol pair that
  * `axl-cc --embed` generates.
  */

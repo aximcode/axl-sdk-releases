@@ -19,7 +19,8 @@ write -- so it gets a gate instead.
 
 WHAT IT DOES NOT POLICE. Entries with no TOOL_NAMES counterpart are FINE and
 expected: the devkit image also stages drivers and apps that are deliberately
-not busybox verbs (the Makefile says so at each one -- crashtest, fbcon, 9p).
+not busybox verbs (scripts/axl-lists.conf's TOOL_EXTRA_APPS -- crashtest,
+fbcon, 9p).
 Flagging those would make the gate cry wolf on a correct file, and a gate that
 cries wolf gets its output ignored.
 """
@@ -35,23 +36,23 @@ CONF = REPO / "devkit.conf"
 
 
 def tool_names() -> list[str]:
-    """The canonical tool set, asked of the Makefile rather than restated."""
+    """The canonical tool set, read from scripts/axl-lists.conf, not restated."""
     out = subprocess.run(
-        ["make", "-s", "print-TOOL_NAMES"],
+        ["bash", str(REPO / "scripts" / "axl-list.sh"), "TOOL_NAMES"],
         cwd=REPO, capture_output=True, text=True, check=False,
     )
     # A gate that cannot RUN its source of truth must say so, not report clean.
     # "The tool could not start" and "the tool found nothing" are the same
     # empty string and opposite facts.
     if out.returncode != 0:
-        print("check-devkit-conf: FAIL -- `make -s print-TOOL_NAMES` exited "
+        print("check-devkit-conf: FAIL -- `scripts/axl-list.sh TOOL_NAMES` exited "
               f"{out.returncode}; cannot tell which tools should be present.",
               file=sys.stderr)
         print(out.stderr.strip()[:400], file=sys.stderr)
         sys.exit(1)
     names = out.stdout.split()
     if len(names) < 25:
-        print(f"check-devkit-conf: FAIL -- print-TOOL_NAMES named only "
+        print(f"check-devkit-conf: FAIL -- TOOL_NAMES named only "
               f"{len(names)} tools. A gate checking almost nothing passes "
               "forever.", file=sys.stderr)
         sys.exit(1)

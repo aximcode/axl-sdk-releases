@@ -20,12 +20,31 @@ AXL_LOG_DOMAIN("task");
 // Tunables
 // ---------------------------------------------------------------------------
 
-/* Spin bounds for the two points where the BSP waits on a worker: coming
-   up (axl_task_pool_new) and going down (axl_task_pool_free). Both are
-   backstops against a wedged AP, not expected costs — an AP that is going
-   to arrive does so almost immediately. */
-#define WORKER_READY_TIMEOUT_SPINS  1000000u
-#define WORKER_EXIT_TIMEOUT_SPINS   1000000u
+/* How long the BSP waits for a worker to answer: to arrive and echo the
+   liveness probe (axl_task_pool_new), or to acknowledge quit (teardown).
+
+   Wall-clock time, not a spin count. A spin bound measures the BSP's own
+   speed, and the BSP is precisely the processor still running when an AP
+   is not: the old 1,000,000 pause spins lasted 25-200 ms of an x64 KVM
+   guest's time depending on the host's load, while a virtual AP that the
+   host has descheduled makes no progress at all for as long as the host
+   decides. On a loaded host live workers took over 200 ms to answer the
+   probe, and one made no progress for over a second, so the spin bound
+   retired live workers and the pool came up short (CI: "slot reclaim:
+   workers=2 expected=3"; test-task-pool-mp-starved-qemu.sh reproduces it
+   on demand).
+
+   The bound is AXL_AP_ANSWER_TIMEOUT_US (axl-backend.h, 10 s), shared
+   with the backend's wait for the firmware to retire a stopped worker.
+   It is what an AP that never answers costs each axl_task_pool_new --
+   warned about each time -- so it is sized to the stalls a host can
+   impose, not to how quickly a healthy AP answers (microseconds). The
+   same choice as OVMF's, which waits for every AP regardless of timeout
+   on QEMU, and Linux's 10 s bound on an AP coming alive. */
+
+/* The bound used instead when the monotonic clock is unusable (reads 0)
+   -- the old spin bound, so the wait still ends on a dead AP. */
+#define WORKER_ANSWER_FALLBACK_SPINS  1000000u
 
 static inline void
 cpu_pause(void)
@@ -40,6 +59,12 @@ cpu_pause(void)
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
+
+/* A bounded wait on another processor, measured in time. */
+typedef struct {
+    uint64_t  start_us;   /* 0: the clock is unusable, count spins */
+    uint64_t  spins;
+} WaitBudget;
 
 /* Slot lifecycle, encoded in ONE word so every observer reads a single,
    consistent value. The previous design used three separate volatile flags
@@ -89,6 +114,33 @@ typedef struct {
 
 _Static_assert(sizeof(WorkerSlot) == 64,
                "WorkerSlot must stay one cache line - see comment above");
+
+static
+void
+wait_budget_start(
+    WaitBudget *budget
+    )
+{
+    budget->start_us = axl_backend_get_monotonic_us();
+    budget->spins    = 0;
+}
+
+/* True once AXL_AP_ANSWER_TIMEOUT_US has passed since wait_budget_start.
+   Call once per spin. The clock is not asked again when it read 0 at the
+   start: on x64 an unusable counter re-runs its calibration on every
+   call. */
+static
+bool
+wait_budget_spent(
+    WaitBudget *budget
+    )
+{
+    if (budget->start_us == 0) {
+        return ++budget->spins >= WORKER_ANSWER_FALLBACK_SPINS;
+    }
+    return axl_backend_get_monotonic_us() - budget->start_us
+           >= AXL_AP_ANSWER_TIMEOUT_US;
+}
 
 // ---------------------------------------------------------------------------
 // Worker slot storage
@@ -275,16 +327,21 @@ wait_for_workers(
     AxlTaskPool *pool
     )
 {
-    size_t  i;
-    size_t  ready;
-    size_t  waited;
+    size_t      i;
+    size_t      ready;
+    WaitBudget  budget;
 
-    for (waited = 0; waited < WORKER_READY_TIMEOUT_SPINS; waited++) {
+    /* One budget for arriving and answering the probe together: it is
+       one question -- is this worker running our loop -- so a dead AP
+       costs the timeout once, not twice. */
+    wait_budget_start(&budget);
+
+    for (;;) {
         ready = 0;
         for (i = 0; i < pool->slot_count; i++) {
             ready += pool->slots[i]->ready;
         }
-        if (ready == pool->slot_count) {
+        if (ready == pool->slot_count || wait_budget_spent(&budget)) {
             break;
         }
         cpu_pause();
@@ -302,12 +359,12 @@ wait_for_workers(
     }
     __sync_synchronize();          /* publish probes before sampling echoes */
 
-    for (waited = 0; waited < WORKER_READY_TIMEOUT_SPINS; waited++) {
+    for (;;) {
         ready = 0;
         for (i = 0; i < pool->slot_count; i++) {
             ready += (pool->slots[i]->probe == 0);
         }
-        if (ready == pool->slot_count) {
+        if (ready == pool->slot_count || wait_budget_spent(&budget)) {
             break;
         }
         cpu_pause();
@@ -343,9 +400,9 @@ stop_workers(
     AxlTaskPool *pool
     )
 {
-    size_t  i;
-    size_t  timeout;
-    bool    all_exited;
+    size_t      i;
+    bool        all_exited;
+    WaitBudget  budget;
 
     if (pool->slots == NULL) {
         return;
@@ -359,19 +416,23 @@ stop_workers(
     }
     __sync_synchronize();
 
-    /* Wait only on workers that arrived. A slot that never became ready
-       has no worker to acknowledge — waiting on it would burn the whole
-       timeout on every teardown. */
-    all_exited = false;
-    for (timeout = 0; timeout < WORKER_EXIT_TIMEOUT_SPINS; timeout++) {
+    /* Wait only on workers that were counted. A slot that never became
+       ready has no worker to acknowledge, and one retired UNUSABLE has
+       already failed to answer for a whole budget -- waiting on either
+       would burn the timeout again on every teardown. Should a retired
+       slot's AP be merely late, it still sees quit, and
+       worker_slots_release retains the slot because it never saw exited. */
+    wait_budget_start(&budget);
+    for (;;) {
         all_exited = true;
         for (i = 0; i < pool->slot_count; i++) {
-            if (pool->slots[i]->ready && !pool->slots[i]->exited) {
+            if (pool->slots[i]->state != SLOT_UNUSABLE &&
+                pool->slots[i]->ready && !pool->slots[i]->exited) {
                 all_exited = false;
                 break;
             }
         }
-        if (all_exited) {
+        if (all_exited || wait_budget_spent(&budget)) {
             break;
         }
         cpu_pause();
@@ -540,6 +601,8 @@ axl_task_pool_free(
     AxlTaskPool *pool
     )
 {
+    size_t  i;
+
     if (pool == NULL) {
         return;
     }
@@ -556,8 +619,16 @@ axl_task_pool_free(
     /* Reclaim the firmware's per-AP dispatch state before the slots: the
        drain in mp_cleanup waits for the firmware to confirm each worker
        has left our procedure, which is the same fact that decides whether
-       a slot is safe to hand out again. */
+       a slot is safe to hand out again. A dispatched worker that never
+       confirmed exit has already used a whole answer budget, so the drain
+       is told not to spend another on it. slots[i] is AP index i:
+       axl_task_pool_new dispatches index i into slots[i], failed or not. */
     if (pool->mp_ctx != NULL) {
+        for (i = 0; i < pool->slot_count; i++) {
+            if (pool->slots[i]->dispatched && !pool->slots[i]->exited) {
+                axl_backend_mp_abandon_ap(pool->mp_ctx, i);
+            }
+        }
         axl_backend_mp_cleanup(pool->mp_ctx);
         pool->mp_ctx = NULL;
     }

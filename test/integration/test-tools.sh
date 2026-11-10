@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=9 local-only=0
+# test-meta: arch=x64 needs= est=9 local-only=0 guest=standard
 # AXL tool tests — boots QEMU and verifies each tool produces correct output.
 #
 # Usage: ./test/integration/test-tools.sh [--arch X64|AARCH64]
@@ -19,8 +19,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tools 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tools 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 TOOLS_DIR="$NATIVE_DIR/tools"
@@ -103,146 +103,7 @@ printf 'line one: hello world\nline two: HELLO WORLD\nline three: goodbye world\
 
 # Startup script — run each tool and capture its output.
 # The host-side script checks the serial log for expected content.
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo ""
-    echo "echo === TEST-HEXDUMP ==="
-    echo "hexdump.efi -n 32 testdata.txt"
-    echo ""
-    echo "echo === TEST-GREP-MATCH ==="
-    echo "grep.efi Hello testdata.txt"
-    echo ""
-    echo "echo === TEST-GREP-MISS ==="
-    echo "grep.efi ZZZNOMATCH testdata.txt"
-    echo ""
-    echo "echo === TEST-GREP-RECURSIVE ==="
-    echo "grep.efi needle testdir"
-    echo ""
-    echo "echo === TEST-GREP-LONGLINE ==="
-    # 4096-byte line with pattern at byte 3000 — proves grep
-    # streams via axl_readline rather than the previous 1024-byte
-    # fixed buffer that would have truncated the line below the
-    # match offset.
-    echo "grep.efi NEEDLE grep_long.txt"
-    echo ""
-    echo "echo === TEST-GREP-REGEX ==="
-    # -E enables AxlRegex. 'a.ple' (dot = any char) matches "apple"; a
-    # literal "a.ple" would not — proves the regex path is live.
-    echo "grep.efi -E a.ple regex_test.txt"
-    # -E -i: case-insensitive regex 'BAN.NA' matches "banana".
-    echo "grep.efi -E -i BAN.NA regex_test.txt"
-    echo ""
-    echo "echo === TEST-FIND ==="
-    echo "find.efi testdir"
-    echo ""
-    echo "echo === TEST-SYSINFO ==="
-    echo "sysinfo.efi"
-    echo ""
-    echo "echo === TEST-DMIDECODE-VERSION ==="
-    echo "dmidecode.efi --smbios-version"
-    echo ""
-    echo "echo === TEST-DMIDECODE-BIOS ==="
-    echo "dmidecode.efi -t 0"
-    echo ""
-    echo "echo === TEST-DMIDECODE-STRING ==="
-    echo "dmidecode.efi -s system-manufacturer"
-    echo ""
-    echo "echo === TEST-DMIDECODE-UNDECODED ==="
-    # Type 32 (System Boot Information) has no specialized decoder, so
-    # the tool should fall back to Header-and-Data + Strings.
-    echo "dmidecode.efi -t 32"
-    echo ""
-    echo "echo === TEST-CAT-PLAIN ==="
-    echo "cat.efi testdata.txt"
-    echo ""
-    echo "echo === TEST-CAT-NUMBER-SQUEEZE ==="
-    # -n numbers all output lines; -s collapses the run of blanks in
-    # cat3.txt into a single blank line. Expect 4 numbered lines:
-    # `     1\tfirst`, `     2\tsecond`, `     3\t` (the squeezed
-    # blank), `     4\tthird`.
-    echo "cat.efi -n -s cat3.txt"
-    echo ""
-    echo "echo === TEST-CAT-UCS2-BOM ==="
-    # BOM-probe path: the file is UCS-2 LE with BOM; cat must transcode
-    # and emit "ux" as plain UTF-8.
-    echo "cat.efi cat_ucs2.txt"
-    echo ""
-    echo "echo === TEST-CAT-FORCE-ENCODING ==="
-    # Force the encoding even though the file has no BOM (drop the
-    # first 2 bytes via -e). Use the same UCS-2 LE file to verify -e
-    # parses correctly and the wire-side bytes still decode to text.
-    echo "cat.efi -e ucs2le cat_ucs2.txt"
-    echo ""
-    echo "echo === TEST-CAT-UCS2-HEADERLESS ==="
-    # Auto-detect UCS-2 LE without a BOM via the content sniff in
-    # axl_text_stream_wrap. Body is "headless" — should appear as
-    # plain UTF-8 on the console.
-    echo "cat.efi cat_ucs2nb.txt"
-    echo ""
-    echo "echo === TEST-MKRD-HELP ==="
-    echo "mkrd.efi -h"
-    echo ""
-    echo "echo === TEST-MKRD-POSITIONAL ==="
-    # Reproduces the user-reported case: positional label arg.
-    # When RamDiskDxe.efi is staged at drivers/<arch>/, mkrd's
-    # axl_driver_ensure() auto-load should find it and create the
-    # ramdisk. When not staged, mkrd should print "not found on any
-    # mounted volume" — still proof argv[1] reached the program.
-    echo "mkrd.efi testrd"
-    echo ""
-    echo "echo === TEST-MKRD-LIST ==="
-    echo "mkrd.efi -l"
-    echo ""
-    # --- flag-level coverage absorbed from uefi-devkit's test-shelltools.sh
-    #     (so that test can be retired without losing tool-flag coverage) ---
-    echo "echo === TEST-GREP-ICASE-START ==="
-    # -i: case-insensitive literal — the uppercase "HELLO WORLD" line only
-    # appears under -i (a plain `grep hello` would miss it).
-    echo "grep.efi -i hello grep_multi.txt"
-    echo "echo === TEST-GREP-ICASE-END ==="
-    echo ""
-    echo "echo === TEST-GREP-LINENUM-START ==="
-    echo "grep.efi -n hello grep_multi.txt"      # -n prefixes "1:" etc.
-    echo "echo === TEST-GREP-LINENUM-END ==="
-    echo ""
-    echo "echo === TEST-GREP-COUNT-START ==="
-    echo "grep.efi -c hello grep_multi.txt"      # -c prints just "2"
-    echo "echo === TEST-GREP-COUNT-END ==="
-    echo ""
-    echo "echo === TEST-FIND-NAME-START ==="
-    # Quoted so the UEFI shell doesn't wildcard-expand against cwd; find
-    # must apply the *.txt filter itself (match.txt in, other.log out).
-    echo "find.efi --name \"*.txt\" testdir"
-    echo "echo === TEST-FIND-NAME-END ==="
-    echo ""
-    echo "echo === TEST-FIND-TYPE-START ==="
-    echo "find.efi --type d testdir"             # dirs only: subdir in, match.txt out
-    echo "echo === TEST-FIND-TYPE-END ==="
-    echo ""
-    echo "echo === TEST-HEXDUMP-OFFSET-START ==="
-    echo "hexdump.efi -o 16 -n 32 testdata.txt"  # first addr column = 00000010
-    echo "echo === TEST-HEXDUMP-OFFSET-END ==="
-    echo ""
-    echo "echo === TEST-SYSINFO-FW-START ==="
-    # `sysinfo fw` is firmware-only: prints "=== Firmware ===" but NOT the
-    # "=== CPU ===" section the bare sysinfo emits.
-    echo "sysinfo.efi fw"
-    echo "echo === TEST-SYSINFO-FW-END ==="
-    echo ""
-    echo "echo === TEST-SYSINFO-ARCH-START ==="
-    echo "sysinfo.efi arch"                       # prints x64 / aa64
-    echo "echo === TEST-SYSINFO-ARCH-END ==="
-    echo ""
-    echo "echo === TEST-MKRD-DESTROY-START ==="
-    # testrd was created above (TEST-MKRD-POSITIONAL); tear it down.
-    echo "mkrd.efi -v -d testrd"
-    echo "echo === TEST-MKRD-DESTROY-END ==="
-    echo ""
-    echo "echo === TEST-END ==="
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 
@@ -388,7 +249,7 @@ check_absent_in_section "mkrd-positional-no-label-required" \
 
 # Auto-load proof — must succeed regardless of whether an external
 # RamDiskDxe.efi was staged: when one is staged, axl_driver_ensure()
-# finds it on disk; when not, the .incbin'd blob in mkrd-blob.S is
+# finds it on disk; when not, the .incbin'd ramdiskdxe blob is
 # the always-on fallback. Either way, the protocol must end up live
 # and the ramdisk must appear in the listing.
 check "mkrd-autoload-success" \

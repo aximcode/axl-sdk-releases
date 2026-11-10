@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=svc-startfail guest=standard
 # test-service-startfail-qemu.sh — a service driver whose setup fails, deployed
 # from an EMBEDDED blob, must fail cleanly and hand control back to the shell.
 #
@@ -39,8 +39,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     svc-startfail 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -50,19 +50,7 @@ NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/svc_startfail.efi"
 
 MARKER="AXL-STARTFAIL-SHELL-SURVIVED"
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    # Run the failing start TWICE: each failed start buffer-loads the embedded
-    # driver afresh, so a per-failure leak of the synthesized device path (or an
-    # orphaned image handle) would compound here. Both must fail cleanly and
-    # RETURN — if either wedges, the marker below never prints.
-    echo "svc_startfail.efi start"
-    echo "svc_startfail.efi start"
-    echo "echo $MARKER"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh "$MARKER"
 
 test_build_image
 

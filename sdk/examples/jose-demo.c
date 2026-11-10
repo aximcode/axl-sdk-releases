@@ -17,10 +17,16 @@
 
     Build:
         ./scripts/install.sh --arch x64
-        ./out/bin/axl-cc sdk/examples/jose-demo.c -o jose-demo.efi
+        ./stage/bin/axl-cc sdk/examples/jose-demo.c -o jose-demo.efi
     then run jose-demo.efi under run-qemu.sh. JOSE is compiled into every
     build and axl_jose_available() is a guaranteed true, so there is no
     availability branch for a consumer to write.
+
+    ECDSA/RSA keys are opt-in: an image carries them only if it calls
+    axl_pk_enable_mbedtls(). AxlJose makes that call itself, so a program
+    that only signs and verifies through JOSE needs nothing; this demo
+    also mints keys with axl_pk_key_new() directly, so it makes the call
+    as any direct AxlPk user must.
 **/
 
 #include <axl.h>
@@ -69,6 +75,9 @@ int
 main(void)
 {
     axl_printf("axl-jose demo\n");
+
+    /* Direct axl_pk_key_new() use below: enable ECDSA/RSA. */
+    axl_pk_enable_mbedtls();
 
     // -----------------------------------------------------------------
     // 1. Mint an ES256 key, sign a JWT, verify it against a claim policy.

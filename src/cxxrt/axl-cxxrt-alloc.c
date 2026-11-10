@@ -45,6 +45,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../runtime/axl-libc-heap-internal.h"
+
 // ---------------------------------------------------------------------------
 // sbrk — the heap newlib's dlmalloc grows into
 // ---------------------------------------------------------------------------
@@ -140,12 +142,49 @@
    diverge sharply (512 MB of RAM, a 423 MiB best run). */
 #define AXL_SBRK_LIMIT_ENV    "AXL_LIBC_HEAP_MAX"
 
+/* Defined here, declared WEAK for teardown in axl-libc-heap-internal.h (whose
+   declaration makes this definition weak too -- harmless, it is the only
+   one). Armed when the arena is first taken, so an image that never mallocs
+   leaves it null and its teardown has nothing to do. */
+void (*_axl_libc_heap_release_hook)(void);
+
 static uint8_t *mBrkBase;   /* start of the arena -- set ONCE, never moves */
+static bool     mBrkReleased;  /* the arena went back; never take another */
 static uint8_t *mBrkCur;    /* next byte to hand out */
 static uint8_t *mBrkEnd;    /* end of the region owned so far */
 static size_t   mGrowPages = AXL_SBRK_GROW_MIN;  /* doubles, capped */
 static size_t   mLimitPages;                     /* 0 = no ceiling */
 static bool     mLimitRead;                      /* env consulted already */
+
+/* Each AllocatePages the arena was built from, so sbrk_release can return
+   them as they were taken: the spec promises FreePages for a range one
+   AllocatePages returned, not for several adjacent ones in one call (EDK2
+   accepts that; other firmware need not). 32 covers the geometric growth to
+   ~450 MiB, past the largest free run measured (423 MiB); a 33rd piece is
+   merged into the last record, which still frees correctly on EDK2 and only
+   on such a heap. */
+#define AXL_SBRK_MAX_PIECES 32
+static struct {
+    uint64_t base;
+    size_t   pages;
+} mPieces[AXL_SBRK_MAX_PIECES];
+static size_t mPieceCount;
+
+/* Record one AllocatePages the arena now owns (see mPieces). */
+static void
+sbrk_note_piece(
+    uint64_t base,
+    size_t   pages
+    )
+{
+    if (mPieceCount == AXL_SBRK_MAX_PIECES) {
+        mPieces[mPieceCount - 1].pages += pages;
+        return;
+    }
+    mPieces[mPieceCount].base  = base;
+    mPieces[mPieceCount].pages = pages;
+    mPieceCount++;
+}
 
 /* Read the cap once, before a single byte has been handed out.
  *
@@ -180,16 +219,18 @@ sbrk_read_limit(void)
 
 #if defined(AXL_NEWLIB_MALLINFO_INT)
 /* GATED ON THE BUILD-TIME PROBE, and that gate is the whole correctness story
-   across arches. The Makefile reads the SIZE of __malloc_current_mallinfo out
-   of the toolchain's libc.a: 40 bytes is ten ints (broken against the header),
-   80 is ten size_t (correct). Measured -- the pinned x86_64-elf build is 40 and
-   ARM's is 80, so this is a property of the TOOLCHAIN BUILD and not of the
-   arch. Hard-coding the int layout was wrong on aa64 and the aa64 suite caught
-   it; hard-coding the other would be wrong on x64. Where newlib is already
-   right, AXL defines nothing and newlib's own mstats.o is used unchanged.
+   across arches. cmake/AxlFlags.cmake reads the SIZE of
+   __malloc_current_mallinfo out of the toolchain's libc.a: 40 bytes is ten
+   ints (broken against the header), 80 is ten size_t (correct). Measured -- an
+   x86_64-elf newlib built from the pre-axl3 recipe is 40, and ARM's and the
+   axl3 build are 80, so this is a property of the TOOLCHAIN BUILD and not of
+   the arch. Hard-coding the int layout was wrong on aa64 and the aa64 suite
+   caught it; hard-coding the other would be wrong on x64. Where newlib is
+   already right, AXL defines nothing and newlib's own mstats.o is used
+   unchanged.
 
-   This block therefore disappears the moment the x64 toolchain is rebuilt with
-   matching types, which is the correct end state. */
+   With the pinned axl3 toolchains this block therefore compiles out; it stays
+   for an AXL_TOOLCHAIN=cross newlib built from the older recipe. */
 
 // ---------------------------------------------------------------------------
 // mallinfo and friends -- newlib's are BROKEN here, so AXL owns them
@@ -325,6 +366,35 @@ mstats(
 #endif /* AXL_NEWLIB_MALLINFO_INT */
 
 /**
+ * @brief Give the whole arena back to the firmware. Teardown only.
+ *
+ * Reached through _axl_libc_heap_release_hook as the LAST step of image
+ * teardown (see axl-libc-heap-internal.h for the order and the callers).
+ * UEFI does not reclaim an image's page allocations at unload, so this is the
+ * only way the arena ever goes back.
+ *
+ * Piece by piece, newest first, exactly as the arena was taken (see
+ * mPieces).
+ *
+ * Afterwards _sbrk refuses to take a new arena. That does not make a later
+ * malloc safe -- dlmalloc may serve one from a chunk it already holds, inside
+ * the pages just freed -- which is why this must run after everything that
+ * could allocate, and why nothing is reset here as though it could.
+ */
+static void
+sbrk_release(
+    void
+    )
+{
+    _axl_libc_heap_release_hook = NULL;
+    mBrkReleased = true;
+    while (mPieceCount > 0) {
+        mPieceCount--;
+        axl_free_pages(mPieces[mPieceCount].base, mPieces[mPieceCount].pages);
+    }
+}
+
+/**
  * @brief Extend the break by @a increment bytes.
  *
  * Returns the PREVIOUS break on success and (void *)-1 on failure, which is
@@ -332,7 +402,8 @@ mstats(
  * allocating, which is how dlmalloc discovers its base.
  *
  * A negative increment walks back inside the current chunk only. Pages are
- * never returned to the firmware here: dlmalloc calls this to trim, and
+ * never returned to the firmware HERE (only sbrk_release, at teardown, hands
+ * the whole arena back): dlmalloc calls this to trim, and
  * handing a page back that it still believes it owns would be a use-after-free
  * with the firmware as the other party.
  */
@@ -365,6 +436,9 @@ _sbrk(
     }
 
     want = (size_t)increment;
+    if (mBrkReleased) {
+        return (void *)-1;
+    }
     if (mBrkCur != NULL && want <= (size_t)(mBrkEnd - mBrkCur)) {
         prev = mBrkCur;
         mBrkCur += want;
@@ -413,6 +487,8 @@ _sbrk(
         mBrkBase = (uint8_t *)(uintptr_t)phys;
         mBrkCur  = mBrkBase;
         mBrkEnd  = mBrkBase + (pages * 4096u);
+        sbrk_note_piece(phys, pages);
+        _axl_libc_heap_release_hook = sbrk_release;
 
         prev = mBrkCur;
         mBrkCur += want;
@@ -455,6 +531,7 @@ _sbrk(
         if (axl_alloc_pages_at((uint64_t)(uintptr_t)mBrkEnd, pages) != AXL_OK) {
             return (void *)-1;
         }
+        sbrk_note_piece((uint64_t)(uintptr_t)mBrkEnd, pages);
         mBrkEnd += pages * 4096u;
 
         /* Double for next time. Grown AFTER a success, so a run of refusals

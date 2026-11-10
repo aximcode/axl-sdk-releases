@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=16 local-only=0
+# test-meta: arch=x64 needs= est=16 local-only=0 guest=standard
 # test-console-mirror-https-qemu.sh — Console Mirror rung 5 (P3).
 #
 # The deployment-faithful SoftBMC shape, all three at once: the
@@ -26,8 +26,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
@@ -42,22 +42,8 @@ else
     echo "  WARNING: no standalone Shell.efi — test will SKIP-balance"
 fi
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting HTTPS + mirror + foreground Shell...
-AxlTestNet.efi serve-tls-shell-coexist
-NSHEOF
+# The startup commands live in test-console-mirror-https-qemu.nsh
+test_use_nsh
 
 test_build_image
 
@@ -70,9 +56,9 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for HTTPS server + Shell launch..."
 
-if ! test_wait_for "READY" 60; then
+if ! test_wait_boot "READY" 60; then
     test_clean_log
-    echo "FAIL: server did not reach READY within 60 seconds"
+    echo "FAIL: server did not reach READY within ${TEST_WAITED_S} seconds"
     echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
 fi
@@ -96,13 +82,13 @@ if [[ "$HAVE_SHELL" -eq 0 ]] || grep -qa "NO_SHELL" "$TEST_CLEAN_LOG"; then
 else
     # The crux: a TLS handshake must COMPLETE under the driver-tick pump WHILE
     # the foreground Shell blocks in StartImage. A 200 proves all three coexist.
-    RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/plain" 2>/dev/null || true)
+    RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/plain" || true)
     CODE=$(echo "$RESP" | tail -1)
     [[ "$CODE" == "200" ]] \
         && pass "HTTPS GET /plain returns 200 (handshake completed under the mirrored Shell)" \
         || fail "HTTPS GET /plain (got '$CODE' — handshake stalled or loop starved)"
 
-    RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/plain" 2>/dev/null || true)
+    RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/plain" || true)
     CODE=$(echo "$RESP" | tail -1)
     [[ "$CODE" == "200" ]] \
         && pass "HTTPS GET /plain still 200 (timer keeps serving under the Shell)" \

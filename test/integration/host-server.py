@@ -9,7 +9,11 @@ Usage: python3 host-server.py <port>
 """
 
 import json
+import socket
+import ssl
+import struct
 import sys
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
@@ -24,9 +28,46 @@ _LAST_UPLOAD = {"len": 0, "head_hex": "", "tail_hex": ""}
 # plain-http instance redirect into an https instance (cross-scheme redirect).
 _REDIRECT_BASE: str | None = None
 
+# Connections accepted so far (see Handler.setup).
+_CONN_SEQ = [0]
+
+# The client's cap on interim 1xx heads before a final response
+# (HTTP_CLIENT_INTERIM_MAX); /resp/1xx-flood-ka sends one more.
+_INTERIM_CAP = 16
+
+# Arrivals of a counted /resp/ route since its last read (/arrivals/<name>).
+_ARRIVALS: dict[str, int] = {}
+
 
 class Handler(BaseHTTPRequestHandler):
+    def _path_echo(self) -> None:
+        # /path-echo/<anything>: the length of the request target exactly as
+        # it arrived -- what the client sent, cut or whole. A PUT's body is
+        # read and dropped.
+        te = self.headers.get("Transfer-Encoding", "").lower()
+        cl = int(self.headers.get("Content-Length", "0"))
+        if "chunked" in te:
+            while True:
+                n = int(self.rfile.readline().strip().split(b";", 1)[0] or b"0", 16)
+                if n == 0:
+                    while self.rfile.readline().strip():
+                        pass
+                    break
+                self.rfile.read(n + 2)
+        elif cl:
+            self.rfile.read(cl)
+        body = json.dumps({"len": len(self.path)}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_PUT(self):
+        if self.path.startswith("/path-echo/"):
+            self._path_echo()
+            return
         if self.path == "/upload":
             # Honor either Content-Length or Transfer-Encoding:
             # chunked so the same endpoint validates both client
@@ -80,7 +121,200 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
 
+    def setup(self) -> None:
+        # Each connection gets a serial number: a response that reports it
+        # shows whether the client sent its next request on the SAME
+        # connection (reused) or a new one.
+        super().setup()
+        _CONN_SEQ[0] += 1
+        self.conn_id = _CONN_SEQ[0]
+        self.req_seq = 0
+
+    def _resp_raw(self) -> bool:
+        # /resp/<name>: a response written byte for byte, for the shapes a
+        # user agent must read as RFC 9112 says -- a fold, a repeated or a
+        # differing Content-Length, Content-Length with chunked on a
+        # connection left open, bare-LF line ends, and a Transfer-Encoding
+        # whose last coding is not chunked (its body runs to the close).
+        if not self.path.startswith("/resp/"):
+            return False
+        cl = int(self.headers.get("Content-Length", "0") or "0")
+        if cl:
+            self.rfile.read(cl)
+        name = self.path[len("/resp/"):]
+        self.req_seq += 1
+        if name.startswith("host-echo"):
+            # The Host header exactly as it arrived (RFC 9110 7.2).
+            body = (self.headers.get("Host") or "(none)").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        if name.startswith("redirect-tls?port="):
+            # A 302 to the TLS instance's /resp/host-echo on another port: the
+            # Host a client sends after the redirect must name the NEW target.
+            port = name.split("=", 1)[1]
+            self.send_response(302)
+            self.send_header("Location", f"https://10.0.2.2:{port}/resp/host-echo")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return True
+        if self._resp_interim(name):
+            return True
+        conn = f"conn-{self.conn_id}".encode()
+        chunk = f"{len(conn):x}\r\n".encode() + conn + b"\r\n0\r\n\r\n"
+        raw = {
+            "fold": b"HTTP/1.1 200 OK\r\nX-Folded: a\r\n b\r\n\t c\r\n"
+                    b"Content-Length: 5\r\nConnection: close\r\n\r\nhello",
+            "dup-cl": b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                      b"Content-Length: 5\r\nConnection: close\r\n\r\nhello",
+            "list-cl": b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n"
+                       b"Connection: close\r\n\r\nhello",
+            "diff-cl": b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                       b"Content-Length: 6\r\nConnection: close\r\n\r\nhello!",
+            "bare-lf": b"HTTP/1.1 200 OK\nContent-Length: 5\nX-Lf: y\n"
+                       b"Connection: close\n\nhello",
+            "te-close": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n"
+                        b"Content-Length: 3\r\n\r\nhello-until-close",
+            "cl-te-ka": b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n" + chunk,
+            "te-ka": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunk,
+            "te-close-rst": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\npartial",
+            # RFC 9112 6.3 rule 8: no Content-Length, no Transfer-Encoding --
+            # the body runs to the close; and rule 1's exceptions, which have
+            # no body whatever they say, on a connection left OPEN, so a
+            # client that waits for a body hangs.
+            "close-200": b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody-runs-to-the-close",
+            "close-200-rst": b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial",
+            "204-ka": b"HTTP/1.1 204 No Content\r\n\r\n",
+            "304-ka": b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n",
+            "head-ka": b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n",
+            "head-cl-ka": b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            # Part of a body, then nothing for 4 s (past a 2 s client idle
+            # timeout), then the close: the client must time out mid-body.
+            "close-200-stall": b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial",
+            "cl-stall": b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial",
+            # Content-Length 20, 7 bytes of it, then the close (over TLS, no
+            # close_notify): a cut that no close_notify mode may accept.
+            "cl-cut-nonotify": b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial",
+            "te-close-notify": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"
+                               b"notify-body-intact",
+            "te-close-nonotify": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"
+                                 b"cut-body-no-notify",
+        }.get(name)
+        if raw is None:
+            self.send_response(404)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return True
+        self.wfile.write(raw)
+        self.wfile.flush()
+        if name.endswith("-stall"):
+            time.sleep(4)
+            self.close_connection = True
+            return True
+        if name.endswith("-rst"):
+            # Part of a body framed by the close, then a RESET, not a FIN:
+            # the body is cut, and a client must not take it for whole.
+            # The pause lets the part reach the client before the RST
+            # (SO_LINGER 0 discards what is still unsent).
+            time.sleep(0.5)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                       struct.pack("ii", 1, 0))
+            self.connection.close()
+            self.close_connection = True
+            return True
+        if name.endswith("-notify") and isinstance(self.connection, ssl.SSLSocket):
+            # Over TLS, the orderly end of a stream is close_notify (the
+            # server's default close sends none -- that is -nonotify).
+            try:
+                self.connection.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+            self.close_connection = True
+            return True
+        # The -ka shapes leave the connection open for a next request; the
+        # rest close it (te-close's body is framed BY the close).
+        self.close_connection = not name.endswith("-ka")
+        return True
+
+    def _resp_interim(self, name: str) -> bool:
+        # Interim 1xx heads before the final response (RFC 9110 15.2), on a
+        # connection left open: the final body names the connection and the
+        # request's place on it, so a client that takes a 1xx for the final
+        # response -- and reads this 200 as the NEXT request's -- shows.
+        body = f"c{self.conn_id}r{self.req_seq}".encode()
+        final = (b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
+                 + b"\r\n\r\n" + body)
+        hundred = b"HTTP/1.1 100 Continue\r\n\r\n"
+        early = b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n"
+        if name == "100-200-ka":
+            self.wfile.write(hundred)
+            self.wfile.flush()
+            time.sleep(0.3)   # the final head arrives in a later segment
+            self.wfile.write(final)
+        elif name == "103-100-200-ka":
+            self.wfile.write(early + hundred + final)   # all in one segment
+        elif name == "1xx-flood-ka":
+            # The final head comes late: by then the client has given up on
+            # the request, so a client that kept the connection reads this
+            # 200 as its NEXT request's.
+            self.wfile.write(hundred * (_INTERIM_CAP + 1))
+            self.wfile.flush()
+            time.sleep(0.5)
+            self.wfile.write(final)
+        elif name == "100-rst-ka":
+            # Arrivals are counted: the connection's FIRST request is answered
+            # 200 (keep-alive), its SECOND 100 Continue then a reset. A client
+            # that took the reset for a stale kept-alive connection would
+            # replay the request -- a second arrival of the same request.
+            _ARRIVALS[name] = _ARRIVALS.get(name, 0) + 1
+            if self.req_seq == 1:
+                self.wfile.write(final)
+            else:
+                self.wfile.write(hundred)
+                self.wfile.flush()
+                time.sleep(0.3)
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                           struct.pack("ii", 1, 0))
+                self.connection.close()
+                self.close_connection = True
+                return True
+        elif name == "101-ka":
+            self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n"
+                             b"Connection: Upgrade\r\n\r\n")
+        else:
+            return False
+        self.wfile.flush()
+        self.close_connection = False
+        return True
+
+    def do_HEAD(self):
+        if self._resp_raw():
+            return
+        self.send_response(404)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def do_GET(self):
+        if self.path.startswith("/arrivals/"):
+            # How many times /resp/<name> arrived since the last read (reset).
+            name = self.path[len("/arrivals/"):]
+            body = str(_ARRIVALS.pop(name, 0)).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self._resp_raw():
+            return
+        if self.path.startswith("/path-echo/"):
+            self._path_echo()
+            return
         if self.path == "/last-upload":
             body = json.dumps(_LAST_UPLOAD).encode()
             self.send_response(200)
@@ -186,8 +420,6 @@ if __name__ == "__main__":
         _REDIRECT_BASE = sys.argv[sys.argv.index("--redirect-base") + 1]
     httpd = HTTPServer(("0.0.0.0", port), Handler)
     if "--tls" in sys.argv:
-        import ssl
-
         i = sys.argv.index("--tls")
         cert, key = sys.argv[i + 1], sys.argv[i + 2]
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

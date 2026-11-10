@@ -4,7 +4,7 @@
 /** @file cxx-handle-selftest.cpp
     #axl::unique_handle owning a real AXL object under UEFI.
 
-    `make check-handle-exclusions` proves the compile-time contract: which
+    `gate.check-handle-exclusions` proves the compile-time contract: which
     types get a handle, which are refused, and what the refusal says. It
     cannot see the one thing that matters at run time — that the deleter
     reaches the destroy function the header named, on a real object, and

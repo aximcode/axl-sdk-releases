@@ -1,0 +1,5 @@
+axlpool run: leased g4 plain/X64 (restored, pool start 380 ms) in 400 ms
+TIMING: run-qemu mode=pooled guest=1.500 boot=- restore=0.400 rc=0
+TIMING: run-qemu mode=pooled guest=1.000 boot=- restore=0.400 rc=0
+axlpool run: released g4 (returned) in 5 ms
+TIMING: runner test=test-rqpool.sh attempt=1 via=pool wall=4.000 cpu=1.200 rc=0

@@ -21,6 +21,7 @@
 
 #include "axl-net-internal.h"
 #include "axl-tcp-internal.h"
+#include "../loop/axl-loop-internal.h"   /* _axl_loop_has_source */
 
 AXL_LOG_DOMAIN("tcp");
 
@@ -32,12 +33,36 @@ bool _axl_loop_in_callback(void);
 
 /* 10 ms Poll cadence between close-completion checks — matches the Tier-4
    per-protocol wait helpers (axl-net-wait.c). */
-#define AXL_TCP_CLOSE_POLL_US  10000ULL
+#define AXL_TCP_CLOSE_POLL_US  AXL_NET_POLL_TICK_US
 
 /* Inline wait cap for an ABORTIVE close. A RST completes with no TIME_WAIT, so
    the completion event signals almost immediately; this only bounds a wedged
-   firmware. Much shorter than the graceful 3 s (which had to cover TIME_WAIT). */
+   firmware. Shorter than the graceful cap below. */
 #define AXL_TCP_ABORT_WAIT_US  (1000ULL * 1000ULL)
+
+/* Wait cap for a GRACEFUL close with no loop to defer to. The wait normally
+   ends a round trip after the FIN (close_wire_done); this bounds a peer that
+   never ACKs it. */
+#define AXL_TCP_GRACEFUL_WAIT_US  (3000ULL * 1000ULL)
+
+/* How long that wait gives a peer in FIN_WAIT_2 (our FIN ACKed) to send its
+   own FIN before finalizing anyway (close_wire_done). A peer closing on our
+   FIN answers within a round trip; the margin is for its application waking
+   to read the EOF. A quarter of TIME_WAIT, so a peer that is not closing
+   costs the caller 500 ms rather than the old 3 s bound. */
+#define AXL_TCP_FIN_WAIT2_GRACE_US  (500ULL * 1000ULL)
+
+/* Deferred graceful closes are finalized by ONE sweeper timer per loop, not
+   one event source per close: a close holds its context until the firmware
+   completes it or the FINs are exchanged (close_wire_done), and with a source
+   each, a client opening a connection per request at ~1 ms a round trip had
+   hundreds in flight -- when every close sat out TIME_WAIT -- and exhausted
+   the loop's AXL_MAX_SOURCES. A completion is noticed within one sweep, which
+   only delays releasing the firmware's resources, never a reply. The sweep
+   is one poll tick, because close_wire_done counts its FIN_WAIT_2 grace in
+   those. The sweeper's id lives in its AxlLoop (tcp_close_sweeper), so
+   axl_loop_free can report closes still pending. */
+#define AXL_TCP_CLOSE_SWEEP_MS   ((uint32_t)(AXL_TCP_CLOSE_POLL_US / 1000ULL))
 
 typedef struct {
     AxlTcp    *sock;
@@ -46,6 +71,44 @@ typedef struct {
     AxlLoop   *loop;
 } SyncResult;
 
+/* When a graceful close may be finalized. The firmware signals
+   the close token only when the connection is fully closed -- for an active
+   close, after TIME_WAIT (2 s, EDK2's TCP_TIME_WAIT_TIME) -- so every client
+   that closed first sat out 2 s of bookkeeping after the last segment had
+   crossed the wire: an HTTP client freed on a keep-alive connection paid it
+   per request, and a server held every connection it closed first -- socket,
+   firmware child, port -- for 2 s after its reply. The close owes the wire
+   nothing once BOTH FINs are exchanged (TIME_WAIT) or the connection is gone
+   (CLOSED), and both the synchronous wait and the loop's sweeper finalize
+   there.
+
+   FIN_WAIT_2 -- our FIN and every byte before it ACKed, the peer's FIN not yet
+   in -- is given AXL_TCP_FIN_WAIT2_GRACE_US: a peer closing on our FIN sends
+   its own a moment after the ACK (often in the same burst), and finalizing
+   before it arrives makes us answer it with an RST. A peer that is not
+   closing (a keep-alive server idling, one stalled mid-response) ends the
+   wait when the grace runs out. CLOSING (a simultaneous close, our FIN not
+   yet ACKed), LAST_ACK and anything earlier keep waiting, for the event or
+   (the sync wait only) the bound; so does a failed GetModeData.
+
+   Finalizing early drops the PCB silently (Configure(NULL) flushes it and
+   signals the parked close token; nothing goes on the wire). What it gives up
+   is what TIME_WAIT and FIN_WAIT_2 hold the PCB for, none of it data the
+   caller sent: a retransmitted peer FIN (our last ACK lost), or what a peer
+   still open sends after the grace, is answered with an RST -- as a stack
+   answers data arriving for a socket its application has closed.
+
+   Called once per poll tick -- AXL_TCP_CLOSE_POLL_US in close_wait_inline,
+   AXL_NET_POLL_TICK_US (the same constant) in _axl_tcp_wait, and
+   AXL_TCP_CLOSE_SWEEP_MS (defined from it) in on_close_sweep -- so the grace
+   is counted in ticks, like the inline wait's own bound, never a wall clock
+   that a failed read could stop. A late tick only lengthens it. */
+typedef struct {
+    EFI_TCP4_PROTOCOL *tcp4;
+    uint32_t           fin_wait2_ticks;   ///< ticks seen in FIN_WAIT_2
+} TcpCloseWait;
+
+
 /* Heap-owned context for an in-flight TCP close. The Close()
    token must outlive axl_tcp_close because EDK2 parks
    &ctx->close_token in Sock->CloseToken and dereferences it from
@@ -53,8 +116,8 @@ typedef struct {
 typedef struct AxlTcpCloseCtx {
     EFI_TCP4_CLOSE_TOKEN  close_token;
     AxlTcp               *sock;
-    AxlLoop              *loop;       /* set on the async path */
-    AxlSourceId           source_id;  /* set on the async path */
+    TcpCloseWait          wire;       /* close_wire_done's state, both paths */
+    AxlLoop              *loop;       /* set on the async path: its sweeper finalizes it */
     /* Deferred-close registry links (async path only). Every in-flight
        loop-owned close is on g_deferred_closes so an abortive listener teardown
        can find and finalize its own children's deferred closes synchronously.
@@ -71,10 +134,13 @@ typedef struct AxlTcpCloseCtx {
 static uint64_t g_next_listener_id = 1;
 
 /* Intrusive list of in-flight loop-deferred closes (single-threaded UEFI, no
-   lock). A ctx is linked when tcp_close_impl registers on_close_event and
-   unlinked in finalize_close_ctx — whether that runs from on_close_event or
+   lock). A ctx is linked when tcp_close_impl defers it to its loop's sweeper
+   and unlinked in finalize_close_ctx — whether that runs from the sweeper or
    from the abortive listener-teardown sweep. */
 static AxlTcpCloseCtx *g_deferred_closes;
+/* Bumped by every link and unlink, so a sweep can tell whether the registry
+   changed under it beyond its own finalize. */
+static uint32_t        g_deferred_gen;
 
 static void
 deferred_close_link(AxlTcpCloseCtx *ctx)
@@ -85,6 +151,7 @@ deferred_close_link(AxlTcpCloseCtx *ctx)
         g_deferred_closes->reg_prev = ctx;
     }
     g_deferred_closes = ctx;
+    g_deferred_gen++;
 }
 
 static void
@@ -99,6 +166,28 @@ deferred_close_unlink(AxlTcpCloseCtx *ctx)
         ctx->reg_next->reg_prev = ctx->reg_prev;
     }
     ctx->reg_prev = ctx->reg_next = NULL;
+    g_deferred_gen++;
+}
+
+static bool
+close_wire_done(void *ctx)
+{
+    TcpCloseWait              *w     = (TcpCloseWait *)ctx;
+    EFI_TCP4_CONNECTION_STATE  state = Tcp4StateEstablished;
+
+    if (EFI_ERROR(axl_efi_call(w->tcp4->GetModeData, 6, w->tcp4, &state,
+                               NULL, NULL, NULL, NULL))) {
+        return false;
+    }
+    if (state == Tcp4StateTimeWait || state == Tcp4StateClosed) {
+        return true;
+    }
+    if (state == Tcp4StateFinWait2) {
+        w->fin_wait2_ticks++;
+        return (uint64_t)w->fin_wait2_ticks * AXL_TCP_CLOSE_POLL_US
+               >= AXL_TCP_FIN_WAIT2_GRACE_US;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +497,7 @@ axl_tcp_listen_via(uint16_t port, const AxlIPv4Address *source_ip,
     sock->sb_handle  = sb_handle;
     sock->is_listener = true;
     sock->listener_id = g_next_listener_id++;   /* unique; children inherit it */
+    _axl_net_latency_link(sock);
 
     *out_listener = sock;
     axl_debug("listening on port %u", port);
@@ -489,7 +579,13 @@ axl_tcp_accept(AxlTcp *listener, AxlTcp **out_client, size_t timeout_ms)
 int
 axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
 {
-    if (sock == NULL || data == NULL || size == 0) {
+    if (sock == NULL) {
+        return AXL_ERR;
+    }
+    /* A refusal below reports 0 bytes sent (axl_tcp_send_get_sent). */
+    sock->send_last_sent     = 0;
+    sock->send_last_finished = false;
+    if (data == NULL || size == 0) {
         return AXL_ERR;
     }
 
@@ -559,9 +655,20 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
        would write into. The timeout path leaves nothing behind (the cancel
        retires it), so this is the abnormal exit only; drop the token without
        its callback, which is exactly the case axl_tcp_send_drop_token exists
-       for. r.status stays AXL_ERR: the send did not complete. */
+       for. r.status stays AXL_ERR: the send did not complete. A piece it had
+       armed is left to the firmware as the socket's orphan, and its count is
+       left in send_last_sent. */
     if (!r.done) {
         (void)axl_tcp_send_drop_token(sock, on_sync_complete, &r);
+    } else if (r.status == AXL_CANCELLED
+               || (r.status == AXL_OK && !sock->send_last_finished)) {
+        /* The only cancel this call arms is its timeout. A send cut short by
+           it is AXL_CANCELLED; one whose last piece was already armed is
+           retired AXL_OK by the async layer (nothing is left to stop), but
+           its last Transmit has not completed -- and "finished when I
+           return" is this wrapper's contract, so a peer that has stopped
+           reading is still reported. */
+        r.status = AXL_TIMEOUT;
     }
 
     axl_cancellable_free(cancel);
@@ -625,22 +732,45 @@ axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
     axl_loop_run(loop);
     tcp_sync_disarm_poll_tick(loop, poll_src);
 
+    /* The loop can return with the receive still armed -- a Ctrl-C (a new
+       loop intercepts the Shell's break), or any other source quitting it.
+       The firmware's Receive token then still points into the caller's
+       buffer, which is often a stack frame about to be reused: the next
+       segment would be written into it. So the receive is taken down HERE,
+       while the loop its sources are on still exists: its sources removed
+       (and a linger ended) and the token cancelled, which takes it off
+       TcpDxe's queue. The completion that signals is left on the event: the
+       socket's next axl_tcp_recv_async consumes any pending signal (its
+       CheckEvent before re-arming), and nothing else waits on it. On a
+       completed or timed-out receive there is nothing to do:
+       on_recv_complete and the cancel path already cleared the ids. */
+    if (!r.done) {
+        axl_tcp_recv_drop_sources(sock);
+        if (sock->tcp4 != NULL && sock->rx_token.CompletionToken.Event != NULL) {
+            axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
+                         &sock->rx_token.CompletionToken);
+            /* The receive may have COMPLETED between the loop returning and
+               the Cancel (TcpDxe runs at TPL_CALLBACK and can deliver in that
+               window): the bytes are then in the caller's buffer and gone
+               from the stream, so they are reported, not dropped.
+               axl_tcp_recv_async armed the token with Status EFI_ABORTED and
+               a Cancel leaves it EFI_ABORTED, so EFI_SUCCESS here can only
+               mean it completed with data. That includes a Receive TcpDxe
+               completed synchronously from data already buffered, whose
+               completion the loop never dispatched because it saw Ctrl-C
+               first. Counted like any completed receive (stat_recvs). */
+            if (sock->rx_token.CompletionToken.Status == EFI_SUCCESS) {
+                sock->stat_recvs++;
+                sock->recv_size = (size_t)sock->rx_data.DataLength;
+                sock->recv_end  = EFI_SUCCESS;
+                r.status        = AXL_OK;
+            }
+        }
+    }
+
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
     sock->async_loop = saved_loop;
-
-    /* on_recv_complete's !keep branch can't zero recv_source/recv_cancel_source
-       (it must not touch a sock the callback may have freed), so they still
-       hold ids from the now-freed ephemeral loop. The cross-loop-removal hazard
-       this used to create (axl_tcp_close deleting a colliding id off the
-       restored outer loop) is gone — source ids are now process-globally unique
-       (axl-loop.c), so a stale id matches nothing on another loop. We still zero
-       them here (the sock is valid in this sync context) for a separate reason:
-       the NEXT sync recv on this sock checks recv_source > 0 and would otherwise
-       issue a needless tcp4->Cancel on the already-completed token
-       (axl_tcp_recv_async re-arm path). */
-    sock->recv_source        = 0;
-    sock->recv_cancel_source = 0;
 
     if (r.status == AXL_OK) {
         *size = axl_tcp_recv_get_size(sock);
@@ -690,43 +820,104 @@ axl_tcp_poll(AxlTcp *sock)
 //       and return immediately, OR fall back to a bounded sync wait
 //       if no loop is running (shutdown after axl_loop_run returned).
 //
-//   PHASE 2 (finalize_close_ctx, fired from on_close_event):
-//     * Configure(NULL) — safe now because the close has fully
-//       completed, so TcpFlushPcb's NetbufQueFlush has nothing left
-//       to drop (vs. the old shape that dropped FIN if the bounded
-//       wait expired early).
+//   PHASE 2 (finalize_close_ctx, run by the loop's close sweeper, or
+//   inline at the end of the sync wait):
+//     * Configure(NULL) — safe now because nothing un-ACKed remains:
+//       the close completed, or the sweeper or the sync wait saw
+//       TIME_WAIT, FIN_WAIT_2 or CLOSED (close_wire_done), so
+//       TcpFlushPcb's NetbufQueFlush has nothing of ours left to drop
+//       -- unless the sync wait's bound expired first.
 //     * DestroyChild on the service binding.
 //     * Free sock + close_event + ctx.
 //
-// The async path leaves up to one loop source per outstanding close
-// for ~TIME_WAIT seconds; AXL_MAX_SOURCES = 64 has the headroom for
-// an http-server bursting at curl-storm rates.
+// The async path holds one registry entry (no loop source -- one sweeper
+// serves them all) per outstanding close, normally for a round trip.
 // ---------------------------------------------------------------------------
 
-static void
+/* Returns false when NEITHER release call succeeded -- the one case in which
+   the firmware may still hold a close token parked on this socket (either
+   call flushes it: Configure(NULL) via SockConnFlush, DestroyChild via
+   SockDestroy). */
+static bool
 finalize_sock(AxlTcp *sock)
 {
+    EFI_STATUS cfg_status     = EFI_SUCCESS;
+    EFI_STATUS destroy_status = EFI_SUCCESS;
+    bool       keep_tx        = false;
+
+    _axl_net_latency_unlink(sock);   /* before the TCP instance it polls goes */
     if (sock->tcp4 != NULL) {
-        axl_efi_call(sock->tcp4->Configure, 2, sock->tcp4, NULL);
+        cfg_status = axl_efi_call(sock->tcp4->Configure, 2, sock->tcp4, NULL);
     }
     if (sock->tcp_sb != NULL && sock->tcp_handle != NULL) {
-        axl_efi_call(sock->tcp_sb->DestroyChild, 2, sock->tcp_sb,
-                     sock->tcp_handle);
+        destroy_status = axl_efi_call(sock->tcp_sb->DestroyChild, 2,
+                                      sock->tcp_sb, sock->tcp_handle);
     }
+    if (EFI_ERROR(cfg_status) || EFI_ERROR(destroy_status)) {
+        /* With a Transmit accepted and never completed, a failed release may
+           mean the firmware kept the socket -- and with it pointers to
+           tx_token, tx_data and tx_frag (all INSIDE this struct), the
+           token's event and tx_bounce. Freeing any of them would hand the
+           firmware freed memory, so all of them are deliberately LEAKED,
+           the AxlTcp included: a bounded leak on a firmware failure beats a
+           use-after-free. The send callbacks below still run; they never
+           lent the firmware anything. */
+        if (sock->tx_inflight) {
+            keep_tx              = true;
+            sock->firmware_holds = true;
+            axl_error("close: firmware release failed with a transmit in "
+                      "flight (Configure %llx, DestroyChild %llx); leaking "
+                      "the socket and its %zu-byte transmit buffer",
+                      (unsigned long long)cfg_status,
+                      (unsigned long long)destroy_status,
+                      sock->tx_bounce_cap);
+        } else {
+            axl_debug("close: firmware release failed (Configure %llx, "
+                      "DestroyChild %llx)",
+                      (unsigned long long)cfg_status,
+                      (unsigned long long)destroy_status);
+        }
+    }
+    /* The firmware has let go: Configure(NULL) flushes the socket's send
+       queue (SockFlush -> SockConnFlush) and DestroyChild frees it, so the
+       transmit copy buffer is referenced from nowhere any more, and the
+       transmit token -- left outstanding by a close, see tcp_close_impl --
+       has been signalled for the last time. Only now may its event close and
+       the copy buffer go. Clear the handles too: a callback below asking this
+       socket for, say, its peer address must get a clean failure rather than
+       a call into a destroyed child. */
+    sock->tcp4       = NULL;
+    sock->tcp_handle = NULL;
+    if (!keep_tx) {
+        axl_free(sock->tx_bounce);
+        if (sock->tx_token.CompletionToken.Event != NULL) {
+            axl_backend_event_close(
+                (AxlEventHandle)sock->tx_token.CompletionToken.Event);
+        }
+    }
+    sock->tx_bounce                      = NULL;
+    sock->tx_bounce_cap                  = 0;
+    sock->tx_token.CompletionToken.Event = NULL;
+
+    /* Deliver every send callback still owed -- AFTER the release above, so
+       an abortive close's AXL_CANCELLED means the bytes were not delivered:
+       the RST has discarded them. A no-op on the graceful path, which retired
+       everything before submitting its Close. */
+    axl_tcp_send_flush(sock, false);
+
     /* A retired-send drain is walking this socket's callbacks and still hands
        `sock` to each of them — freeing here would hand the rest a dangling
        pointer. The drain does the free once its last callback has returned
-       (axl_tcp_send_drain_done). Clear the firmware handles on the way out:
-       the teardown above already released them, and a later callback asking
-       this socket for, say, its peer address must get a clean failure rather
-       than a call into a destroyed child. */
+       (axl_tcp_send_drain_done). */
+    bool released = !EFI_ERROR(cfg_status) || !EFI_ERROR(destroy_status);
     if (sock->send_draining) {
-        sock->tcp4          = NULL;
-        sock->tcp_handle    = NULL;
         sock->free_deferred = true;
-        return;
+        return released;
     }
-    axl_free(sock);
+    if (!sock->firmware_holds) {
+        axl_free(sock);
+    }
+    return released;
 }
 
 static void
@@ -735,7 +926,18 @@ finalize_close_ctx(AxlTcpCloseCtx *ctx)
     /* Drop from the deferred-close registry first (no-op for a sync-path ctx
        that was never linked). Idempotent — a ctx is finalized exactly once. */
     deferred_close_unlink(ctx);
-    finalize_sock(ctx->sock);
+    if (!finalize_sock(ctx->sock)
+        && ctx->close_token.CompletionToken.Event != NULL
+        && axl_backend_event_check(
+               (AxlEventHandle)ctx->close_token.CompletionToken.Event) > 0) {
+        /* The firmware released nothing and never signalled the token: it may
+           still hold &ctx->close_token (a sync close finalizes before the
+           close completes). Leak ctx and its event rather than hand the
+           firmware freed memory -- the same trade as finalize_sock's. */
+        axl_error("close: firmware release failed with the close pending; "
+                  "leaking its %zu-byte context", sizeof(*ctx));
+        return;
+    }
     if (ctx->close_token.CompletionToken.Event != NULL) {
         axl_backend_event_close(
             (AxlEventHandle)ctx->close_token.CompletionToken.Event);
@@ -743,13 +945,77 @@ finalize_close_ctx(AxlTcpCloseCtx *ctx)
     axl_free(ctx);
 }
 
+/* Finalize @p loop's completed deferred closes. Finalizing runs send
+   callbacks, which may close other sockets -- linking new closes, or (an
+   abortive listener teardown) finalizing others -- so the walk keeps its
+   saved next pointer only while the registry changed by nothing but its own
+   finalize, and starts again from the head otherwise. The sweeper goes once
+   its loop has no close left. */
 static bool
-on_close_event(void *data)
+on_close_sweep(void *data)
 {
-    AxlTcpCloseCtx *ctx = (AxlTcpCloseCtx *)data;
-    axl_loop_remove_source(ctx->loop, ctx->source_id);
-    finalize_close_ctx(ctx);
+    AxlLoop        *loop = (AxlLoop *)data;
+    AxlTcpCloseCtx *ctx  = g_deferred_closes;
+    while (ctx != NULL) {
+        AxlTcpCloseCtx *next = ctx->reg_next;
+        /* Completed (0) or a bad handle (<0) -- or done on the wire, which
+           for an active close is TIME_WAIT's 2 s sooner. The event check
+           MUST come first: a child the firmware destroyed under us (driver
+           Stop) has its token signalled, and close_wire_done would call
+           GetModeData on the freed protocol. */
+        if (ctx->loop == loop
+            && (axl_backend_event_check(
+                    (AxlEventHandle)ctx->close_token.CompletionToken.Event) <= 0
+                || close_wire_done(&ctx->wire))) {
+            uint32_t gen = g_deferred_gen;
+            finalize_close_ctx(ctx);
+            if (g_deferred_gen != gen + 1u) {
+                next = g_deferred_closes;   /* changed under us: rescan */
+            }
+        }
+        ctx = next;
+    }
+    for (ctx = g_deferred_closes; ctx != NULL; ctx = ctx->reg_next) {
+        if (ctx->loop == loop) {
+            return AXL_SOURCE_CONTINUE;
+        }
+    }
+    loop->tcp_close_sweeper = 0;
     return AXL_SOURCE_REMOVE;
+}
+
+/* @p loop's sweeper removed now if it has no close left -- for closes
+   finalized by an abortive listener teardown, so a loop freed right after
+   does not see a sweeper still registered with nothing to do. That teardown
+   can run inside the sweep itself (a send callback finalize ran); removing
+   the source being dispatched is safe -- AxlLoop marks it inactive and
+   ignores its return -- and a sweeper a nested close started meanwhile
+   removes itself on its next pass. */
+static void
+close_sweeper_release_if_idle(AxlLoop *loop)
+{
+    if (loop == NULL || loop->tcp_close_sweeper == 0) {
+        return;
+    }
+    for (AxlTcpCloseCtx *ctx = g_deferred_closes; ctx != NULL; ctx = ctx->reg_next) {
+        if (ctx->loop == loop) {
+            return;
+        }
+    }
+    axl_loop_remove_source(loop, loop->tcp_close_sweeper);
+    loop->tcp_close_sweeper = 0;
+}
+
+/* A sweeper on @p loop, started if it has none; false if none can be. */
+static bool
+close_sweeper_ensure(AxlLoop *loop)
+{
+    if (loop->tcp_close_sweeper != 0 && _axl_loop_has_source(loop, loop->tcp_close_sweeper)) {
+        return true;
+    }
+    loop->tcp_close_sweeper = axl_loop_add_timer(loop, AXL_TCP_CLOSE_SWEEP_MS,
+                                                 on_close_sweep, loop);
+    return loop->tcp_close_sweeper != 0;
 }
 
 // Finalize every in-flight loop-deferred close spawned from @p listener,
@@ -757,8 +1023,8 @@ on_close_event(void *data)
 // listener teardown must clear (connections served then gracefully closed, whose
 // close went async and whose slot the server already dropped). Each such close
 // keeps a firmware PCB on the listen port and a caller-owned loop source until
-// its on_close_event fires (~TIME_WAIT, needs a pump). Here we remove the loop
-// source and finalize now: Configure(NULL)+DestroyChild in finalize_sock force-
+// its loop's sweeper finalizes it (close_wire_done; needs a pump). Here we
+// finalize now: Configure(NULL)+DestroyChild in finalize_sock force-
 // drops the PCB even mid-graceful-close (dropping the un-ACKed FIN, which is the
 // intended trade for an immediate teardown — same as an abortive close). Scoped
 // by reg_listener so a sibling server on the same loop/NIC is untouched.
@@ -767,22 +1033,28 @@ finalize_listener_deferred_closes(AxlTcp *listener)
 {
     AxlTcpCloseCtx *ctx = g_deferred_closes;
     while (ctx != NULL) {
-        AxlTcpCloseCtx *next = ctx->reg_next;   /* snapshot: finalize unlinks ctx */
+        AxlTcpCloseCtx *next = ctx->reg_next;
         if (ctx->reg_listener_id == listener->listener_id) {
-            /* Drop the loop source before finalizing so on_close_event can never
-               fire against the freed ctx, and so it is gone from the loop (the
-               "zero caller-owned sources at loop_free" invariant). */
-            if (ctx->loop != NULL && ctx->source_id != 0) {
-                axl_loop_remove_source(ctx->loop, ctx->source_id);
-            }
+            /* Finalizing unlinks it, so the sweeper never sees it again; and
+               a sweeper left with nothing goes now, not at its next pass.
+               Finalizing runs send callbacks, which may close (link or
+               finalize) others: keep `next` only if the registry changed by
+               this unlink alone, as on_close_sweep does. */
+            AxlLoop *loop = ctx->loop;
+            uint32_t gen  = g_deferred_gen;
             finalize_close_ctx(ctx);
+            close_sweeper_release_if_idle(loop);
+            if (g_deferred_gen != gen + 1u) {
+                next = g_deferred_closes;
+            }
         }
         ctx = next;
     }
 }
 
 /* Loop-FREE close completion: drive tcp4->Poll() and poll the close_event
-   directly until it signals or the deadline passes. Unlike _axl_tcp_wait (which
+   directly until it signals, @p done_fn (when not NULL) says the close owes
+   nothing more, or the deadline passes. Unlike _axl_tcp_wait (which
    spins up an ephemeral axl_loop_new() to multiplex event+timeout+tick), this
    nests NO loop — so it is safe from inside a loop dispatch (a sync request's
    ephemeral-loop callback, the connect-fail/cancel teardown) at a raised TPL:
@@ -794,7 +1066,7 @@ finalize_listener_deferred_closes(AxlTcp *listener)
    stuck active close. */
 static void
 close_wait_inline(EFI_TCP4_PROTOCOL *tcp4, EFI_EVENT close_event,
-                  uint64_t timeout_us)
+                  AxlCondFn done_fn, void *done_ctx, uint64_t timeout_us)
 {
     /* Bound by iteration count (timeout / poll cadence), not a wall clock, so a
        failed monotonic read can never turn this into an unbounded spin. */
@@ -804,6 +1076,9 @@ close_wait_inline(EFI_TCP4_PROTOCOL *tcp4, EFI_EVENT close_event,
         int rc = axl_backend_event_check((AxlEventHandle)close_event);
         if (rc <= 0) {
             return;  /* 0 = close completed; <0 = bad handle, don't spin */
+        }
+        if (done_fn != NULL && done_fn(done_ctx)) {
+            return;
         }
         axl_backend_stall(AXL_TCP_CLOSE_POLL_US);
     }
@@ -905,6 +1180,7 @@ drain_accept_backlog(AxlTcp *listener)
         axl_memset(&listener->acc_token, 0, sizeof(listener->acc_token));
         listener->acc_token.CompletionToken.Event  = ev;
         listener->acc_token.CompletionToken.Status = EFI_ABORTED;
+        _axl_net_latency_activity();
         axl_efi_call(listener->tcp4->Accept, 2, listener->tcp4,
                      &listener->acc_token);
 
@@ -912,6 +1188,14 @@ drain_accept_backlog(AxlTcp *listener)
             drain_reset_child(listener, child_handle);
         }
     }
+}
+
+/* Production's answer at every test point: never (see axl-tcp-internal.h). */
+__attribute__((weak)) bool
+_axl_tcp_test_point(const char *point)
+{
+    (void)point;
+    return false;
 }
 
 static void
@@ -935,6 +1219,12 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
     }
     sock->closed = true;
 
+    if (sock->stat_recvs != 0 && _axl_tcp_test_point("recv-stats")) {
+        /* log-level: a test seam's measurement, logged only when a test image asks */
+        axl_info("closed after %u receive(s); %u linger(s), %u receive(s) inside one",
+                 sock->stat_recvs, sock->stat_lingers, sock->stat_linger_recvs);
+    }
+
     /* A GRACEFUL EFI_TCP4.Close() at a raised TPL hard-wedges the loop when the
        connection still has un-flushed outbound TCP data. Close() (AbortOnClose
        FALSE) flushes the send buffer and drives the active-close FIN handshake
@@ -955,6 +1245,25 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
        foreground (TPL_APPLICATION) path is unchanged — there the MNP timer fires
        and graceful Close() completes normally. */
     if (!abortive && !sock->is_listener && axl_backend_at_raised_tpl()) {
+        abortive = true;
+    }
+
+    /* A close that would DROP accepted bytes is abortive too: a send still
+       queued, an active send only partly handed to the firmware, or a stream
+       some earlier send already cut short (stream_torn). A FIN there would
+       tell the peer the stream ended cleanly -- indistinguishable from a
+       complete, shorter one -- and the RST says it did not. The owners of the
+       dropped sends are told AXL_CANCELLED once the firmware has let go (see
+       finalize_sock).
+
+       It is no longer a memory-safety property: the firmware only ever holds
+       AxlTcp's own copy of a piece (tx_bounce), never the caller's buffer, so
+       nothing a callback frees can reach the wire. An active send that is
+       FULLY armed drops nothing -- TCP sends its last piece ahead of the FIN
+       -- so it stays graceful and is retired AXL_OK (axl_tcp_send_flush), as
+       is an orphan piece on an untruncated stream. */
+    if (!abortive && !sock->is_listener && axl_tcp_send_close_drops(sock)) {
+        axl_debug("close: send(s) pending -- promoted to abortive (RST)");
         abortive = true;
     }
 
@@ -1013,11 +1322,11 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
     }
 
     if (sock->recv_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->recv_source);
+        axl_loop_remove_source(sock->recv_loop, sock->recv_source);
         sock->recv_source = 0;
     }
     if (sock->recv_cancel_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->recv_cancel_source);
+        axl_loop_remove_source(sock->recv_loop, sock->recv_cancel_source);
         sock->recv_cancel_source = 0;
     }
     if (sock->tcp4 != NULL && sock->rx_token.CompletionToken.Event != NULL) {
@@ -1028,14 +1337,14 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
         sock->rx_token.CompletionToken.Event = NULL;
     }
 
+    /* The transmit token is NEVER cancelled here, or anywhere: EFI_TCP4.Cancel
+       on a Transmit TcpDxe is still processing frees the token and strands its
+       data in the send queue, which SockDataSent then trips over. An abortive
+       Close(Abort) retires it itself (SockConnFlush signals it); a graceful
+       Close sends it ahead of the FIN. Its event is closed in finalize_sock,
+       once nothing can signal it. */
     axl_tcp_send_drop_sources(sock);
-    if (sock->tcp4 != NULL && sock->tx_token.CompletionToken.Event != NULL) {
-        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                     &sock->tx_token.CompletionToken);
-        axl_backend_event_close(
-            (AxlEventHandle)sock->tx_token.CompletionToken.Event);
-        sock->tx_token.CompletionToken.Event = NULL;
-    }
+
     /* Retire every pending send — port of EDK2 SockConnFlush, which runs
        SockFlushPendingToken over the PROCESSING list as well as SndTokenList.
        Both halves matter, for the same reason: an accepted send's callback
@@ -1044,17 +1353,24 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
        callback leaks with it. docs/AXL-Tcp-Queue-Design.md §3.5.
 
        The ACTIVE send is included because a send the caller merely QUEUED can
-       have been promoted into that slot behind their back. Firing its callback
-       was not implementable while callbacks ran inline: it re-entered teardown
-       (on_response_sent -> reset_connection -> axl_tcp_close) and wedged the
-       run. It is implementable now — the callbacks are retired first and run
+       have been promoted into that slot behind their back. The callbacks run
        from one drain, and the re-entrant close they trigger returns at the
        `closed` guard above rather than tearing this socket down twice.
 
        Synchronous, unlike every other retirement: the caller's loop may be
        freed the moment this returns (test_tcp_send_async_flush_on_close does
-       exactly that), so a callback left for the next tick would never run. */
-    axl_tcp_send_flush(sock, AXL_CANCELLED);
+       exactly that), so a callback left for the next tick would never run.
+
+       WHEN depends on the mode. An abortive close delivers them from
+       finalize_sock, after the firmware has released the socket, so its
+       AXL_CANCELLED means "not delivered". A graceful close drops nothing (it
+       would have been promoted), so all it can hold is a FINISHED send whose
+       callback has not run yet, or a FULLY-armed active one: both are done
+       from their owner's point of view, and their callbacks run here, before
+       Close is submitted. */
+    if (!abortive) {
+        axl_tcp_send_flush(sock, true);
+    }
 
     if (sock->connect_source > 0) {
         axl_loop_remove_source(sock->async_loop, sock->connect_source);
@@ -1086,11 +1402,6 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
             axl_backend_event_close(
                 (AxlEventHandle)sock->rx_token.CompletionToken.Event);
             sock->rx_token.CompletionToken.Event = NULL;
-        }
-        if (sock->tx_token.CompletionToken.Event != NULL) {
-            axl_backend_event_close(
-                (AxlEventHandle)sock->tx_token.CompletionToken.Event);
-            sock->tx_token.CompletionToken.Event = NULL;
         }
         if (sock->conn_token.CompletionToken.Event != NULL) {
             axl_backend_event_close(
@@ -1125,6 +1436,7 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
     }
 
     ctx->sock                              = sock;
+    ctx->wire.tcp4                         = sock->tcp4;
     ctx->close_token.CompletionToken.Event = close_event;
     ctx->close_token.AbortOnClose          = abortive;
 
@@ -1144,38 +1456,54 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
            safe at a raised TPL and leaves no deferred close-event source on any
            loop. Configure(NULL) in finalize is safe even if the completion event
            lags: the RST already tore the PCB down, so there is no graceful FIN
-           for TcpFlushPcb to drop — the hazard that makes the default (graceful)
-           path defer finalization to a later loop tick. */
-        close_wait_inline(sock->tcp4, close_event, AXL_TCP_ABORT_WAIT_US);
+           for TcpFlushPcb to drop -- the hazard that makes the default (graceful)
+           path defer finalization to a later loop tick.
+
+           THIS STAYS SYNCHRONOUS FOR CONNECTION SOCKETS TOO, and it was
+           briefly not. Deferring a connection's abortive close onto the loop
+           looks like an easy win -- close_wait_inline busy-polls, and a server
+           dropping N connections from its own callbacks pays that N times --
+           but it moves a guarantee THREE subsystems depend on. AxlHttpServer
+           and Axl9pServer free their LISTENER FIRST and their live connections
+           second, deliberately (94a603b5, f558bc5d, 9f960b7b): the listener's
+           PHASE 0 sweep is what finalizes deferred closes of children accepted
+           from it. Make the children defer and that sweep has already run --
+           nothing finalizes them, their EFI_TCP4 children keep PCBs on the
+           listen port, and the port-free-on-return promise in
+           axl-http-server.h breaks. Reached in driver mode, where
+           axl_loop_is_running() stays true.
+
+           The busy-poll cost is real, and it belongs to the CALLER: a server
+           that can drop many connections at once should bound how many it
+           holds, which is what AxlSsh's MAX_CONNS does. */
+        close_wait_inline(sock->tcp4, close_event, NULL, NULL, AXL_TCP_ABORT_WAIT_US);
         finalize_close_ctx(ctx);
         return;
     }
 
-    /* Async path: register close_event on the caller's running loop
-       and return. on_close_event runs finalize_close_ctx when the
-       firmware signals SockConnClosed (post-TIME_WAIT for active
-       close), with no synchronous wait or CPU spin. */
+    /* Async path: hand the close to the caller's running loop and return.
+       The loop's close sweeper runs finalize_close_ctx once the close owes
+       the wire nothing (close_wire_done) or the firmware signals
+       SockConnClosed, with no synchronous wait or CPU spin. Graceful closes only: see the abortive
+       branch above for why that one stays synchronous. */
     if (sock->async_loop != NULL && axl_loop_is_running(sock->async_loop)) {
-        ctx->loop      = sock->async_loop;
-        ctx->source_id = axl_loop_add_event(
-            ctx->loop,
-            (AxlEventHandle)close_event,
-            on_close_event,
-            ctx
-            );
-        if (ctx->source_id != 0) {
-            /* Track this loop-deferred close so an abortive teardown of the
-               listener it was accepted from can finalize it synchronously. */
+        if (close_sweeper_ensure(sock->async_loop)) {
+            /* Tracked so the loop's sweeper finds it, and so an abortive
+               teardown of the listener it was accepted from can finalize it
+               synchronously. */
+            ctx->loop            = sock->async_loop;
             ctx->reg_listener_id = sock->listener_id;
             deferred_close_link(ctx);
             return;
         }
-        axl_warning("close: cannot register close event on loop - sync fallback");
+        axl_warning("close: cannot start this loop's close sweeper - sync fallback");
     }
 
-    /* Sync fallback (loop not running, or registration failed). 3 s
-       covers TIME_WAIT for active close; passive close signals
-       immediately so the wait usually returns much sooner. */
+    /* Sync fallback (loop not running, or registration failed). The wait
+       ends once the close owes the wire nothing (close_wire_done) -- a round
+       trip after the FIN, not TIME_WAIT -- or when the firmware completes it
+       (a passive close completes at once); AXL_TCP_GRACEFUL_WAIT_US bounds a
+       peer that never ACKs the FIN. */
     if (_axl_loop_in_callback()) {
         /* A loop is already dispatching in this call stack — a sync request's
            ephemeral-loop callback (axl-http-client-async.c clears async_loop on
@@ -1184,14 +1512,16 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
            SECOND loop nested in the first: the re-entrancy artifact the async
            effort removed, plus a close-event source that outlives the ephemeral
            loop (the leak). Complete the close loop-free instead. */
-        close_wait_inline(sock->tcp4, close_event, 3000ULL * 1000ULL);
+        close_wait_inline(sock->tcp4, close_event, close_wire_done, &ctx->wire,
+                          AXL_TCP_GRACEFUL_WAIT_US);
     } else {
         /* No loop dispatching in this call stack (e.g. axl_http_client_free /
            an explicit axl_tcp_close after a sync call has already returned):
            the loop-based wait sleeps on WaitForEvent between Poll ticks rather
            than busy-polling. (A sync request's OWN drop-close runs inside its
            ephemeral loop's dispatch, so it takes the inline branch above.) */
-        _axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
+        _axl_tcp_wait(sock->tcp4, close_event, close_wire_done, &ctx->wire,
+                      AXL_TCP_GRACEFUL_WAIT_US);
     }
     finalize_close_ctx(ctx);
 }
@@ -1200,6 +1530,17 @@ void
 axl_tcp_close(AxlTcp *sock, AxlTeardown mode)
 {
     tcp_close_impl(sock, mode == AXL_TEARDOWN_RESET);
+}
+
+size_t
+axl_tcp_closes_pending(void)
+{
+    size_t n = 0;
+
+    for (AxlTcpCloseCtx *ctx = g_deferred_closes; ctx != NULL; ctx = ctx->reg_next) {
+        n++;
+    }
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,4 +1612,12 @@ axl_tcp_recv_get_size(AxlTcp *sock)
         return 0;
     }
     return sock->recv_size;
+}
+
+bool
+_axl_tcp_recv_fin(
+    const AxlTcp *sock
+    )
+{
+    return sock != NULL && sock->recv_end == EFI_CONNECTION_FIN;
 }

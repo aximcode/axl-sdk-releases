@@ -1,7 +1,21 @@
 # AXL Network Driver Bundle — v0.6.0 Design
 
 Status: **Shipped in v0.6.0** (tag dd3c4e2, 2026-04-29). This doc is
-the as-built record. Real-hardware validation against firmware
+the as-built record.
+
+> **iPXE removed, 2026-10-21.** The bundled `ipxe-all.efidrv` is no longer
+> built or shipped: in practice it never brought a NIC up where the EDK2
+> USB-network drivers (and vendor drivers staged by hand) did, and loading it
+> takes the USB host controller from the firmware, so a USB stick -- BMC
+> virtual media included -- leaves the map. The tools tarball's
+> `drivers/<arch>/` now holds the five EDK2 drivers only, and
+> `third_party/ipxe/` and `scripts/build-ipxe.sh` are gone. What stays is
+> AXL's tolerance of an iPXE someone else supplies or the firmware contains:
+> `axl_net_driver_is_ipxe()`, the try-it-last order and watchdog disarm in
+> `axl_net_ensure_drivers` and `netload`, and AxlTcp's pacing for iPXE-based
+> SNP. The sections below describe the bundle as it was; `docs/ROADMAP.md`
+> ("Removed: bundled iPXE") names the last commit that had it and how to
+> restore it. Real-hardware validation against firmware
 without native NIC drivers is still pending — QEMU coverage is the
 only validation to date.
 
@@ -235,8 +249,8 @@ SNP-installing one. The NII installer is the actual NIC driver.
 
 ## Build and packaging
 
-- **iPXE build script** — [`scripts/build-ipxe.sh`](../scripts/build-ipxe.sh)
-  clones iPXE at pinned commit `df4eec8c` and builds the universal
+- **iPXE build script** — `scripts/build-ipxe.sh` (removed; it is in
+  the history at `dca94436`, the parent of the commit "Remove the bundled iPXE; the library never auto-loads iPXE") cloned iPXE at pinned commit `df4eec8c` and builds the universal
   `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB, ~2.9k chip IDs on x64).
   Reproducible (~35s wall on 16-thread).
 - **Packaging** — `release.yml` builds iPXE

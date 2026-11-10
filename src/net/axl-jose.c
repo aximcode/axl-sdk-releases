@@ -245,6 +245,12 @@ header_alg(const char *seg, size_t seg_len, AxlJoseAlg *alg_out)
 static bool
 pk_alg_for(AxlJoseAlg a, AxlPkAlg *out)
 {
+    /* JOSE's ES256/ES384/RS256/PS256 need the mbedTLS PK provider, which
+       is opt-in. This call is the opt-in on every JOSE user's behalf: it
+       is a reference from axl-jose.o, so any image that links JOSE at
+       all links the provider -- no JOSE consumer has to know the enable
+       function exists. Idempotent, so calling it per signature is free. */
+    axl_pk_enable_mbedtls();
     switch (a) {
     case AXL_JOSE_ES256: *out = AXL_PK_ECDSA_P256; return true;
     case AXL_JOSE_ES384: *out = AXL_PK_ECDSA_P384; return true;

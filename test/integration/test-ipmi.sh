@@ -68,7 +68,7 @@ esac
 IPMI_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$_native_arch")/tools/ipmi.efi"
 if [[ ! -f "$IPMI_EFI" ]]; then
     log_info "Building ipmi.efi ($ARCH)..."
-    make -C "$PROJECT_DIR" ARCH="$_native_arch" tools 2>&1 | tail -3
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" tools 2>&1 | tail -3
 fi
 log_info "Tool binary: $IPMI_EFI"
 

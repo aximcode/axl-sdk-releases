@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=29 local-only=0
+# test-meta: arch=x64 needs= est=29 local-only=0 builds=ARCH=x64,gfx-avail-probe guest=none
+# guest=none: run-qemu.sh's --workload CPU gate on the guest it boots is the
+#   subject; its 1 s budget assumes that boot.
 # test-workload-gate-qemu.sh — run-qemu.sh --workload declares what SHAPE of
 # run this is, so the CPU gate stops mismeasuring compute-bound guests.
 #
@@ -36,7 +38,7 @@ fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 # A trivial guest that boots and exits — enough to measure a duration against.
 PROBE="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/gfx-avail-probe.efi"
-make -C "$PROJECT_DIR" ARCH=x64 gfx-avail-probe > /dev/null 2>&1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 gfx-avail-probe > /dev/null 2>&1
 
 # --- host-side argument validation (no QEMU boot) ------------------------
 

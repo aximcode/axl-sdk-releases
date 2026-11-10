@@ -100,3 +100,61 @@ axl_ssh_packet_unwrap(const uint8_t *p, size_t len, size_t *consumed,
     *consumed    = 4 + plen;
     return AXL_OK;
 }
+
+int
+axl_ssh_unimplemented_build(AxlString *out, uint32_t seq)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    char hdr = (char)AXL_SSH_MSG_UNIMPLEMENTED;
+    if (axl_string_append_len(out, &hdr, 1) != AXL_OK) {
+        return AXL_ERR;
+    }
+    return axl_ssh_put_u32(out, seq);
+}
+
+bool
+axl_ssh_unimplemented_due(uint8_t msg, bool post_auth)
+{
+    switch (msg) {
+    case AXL_SSH_MSG_DISCONNECT:
+    case AXL_SSH_MSG_IGNORE:
+    case AXL_SSH_MSG_UNIMPLEMENTED:
+    case AXL_SSH_MSG_DEBUG:
+        return false;
+    default:
+        break;
+    }
+    return !(post_auth
+             && msg >= AXL_SSH_MSG_USERAUTH_FIRST
+             && msg <= AXL_SSH_MSG_USERAUTH_LAST);
+}
+
+int
+axl_ssh_global_request_parse(const uint8_t *p, size_t len, bool *want_reply)
+{
+    size_t         off  = 1;
+    const uint8_t *name = NULL;
+    uint32_t       nlen = 0;
+
+    if (p == NULL || want_reply == NULL || len < 1
+        || p[0] != AXL_SSH_MSG_GLOBAL_REQUEST
+        || axl_ssh_get_string(p, len, &off, &name, &nlen) != AXL_OK
+        || off >= len) {
+        return AXL_ERR;
+    }
+    *want_reply = p[off] != 0;
+    return AXL_OK;
+}
+
+int
+axl_ssh_request_failure_build(AxlString *out)
+{
+    char hdr = (char)AXL_SSH_MSG_REQUEST_FAILURE;
+
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    return axl_string_append_len(out, &hdr, 1);
+}

@@ -33,9 +33,10 @@ Vendored code (deps/) is excluded as a TU and filtered from the output, since a
 warning inside deps/libvterm or deps/sdefl is not ours to fix and would make the
 gate permanently red.
 
-Usage: scripts/check-clang-warnings.py [-p BUILD_DIR]
-  Requires a current compile_commands.json (scripts/lint.sh generates one via
-  bear; that is where this check is wired in).
+Usage: scripts/check-clang-warnings.py -p BUILD_DIR --libc-include DIR
+  Reads BUILD_DIR's compile_commands.json -- the x64-lint preset's, where this
+  check is wired in as the CTest test lint.clang-warnings (scripts/lint.sh
+  runs it), which also hands it the cross libc's include directory.
 """
 
 from __future__ import annotations
@@ -44,33 +45,13 @@ import argparse
 import concurrent.futures
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-
-def cross_libc_include() -> str:
-    """The cross toolchain's libc include directory, from the Makefile.
-
-    This gate REPLAYS the compile database with a different driver, and the
-    libc headers are IMPLICIT in the recorded compiler binary -- nothing on the
-    command line names <toolchain>/x86_64-elf/include. Left alone, clang
-    resolves <string.h> to the HOST's /usr/include, so this measured a
-    glibc-flavoured version of a freestanding program: clean on a
-    non-multiarch distro, and wrong everywhere. clang-tidy hit the same rock
-    and died outright in CI; this one stayed quiet, which is worse.
-
-    The Makefile owns the value (it asks $(CC), so a toolchain override moves
-    it too) and fails rather than printing an empty string.
-    """
-    proc = subprocess.run(["make", "-s", "print-cc-libc-include"],
-                          cwd=ROOT, capture_output=True, text=True)
-    if proc.returncode != 0 or not proc.stdout.strip():
-        sys.exit("check-clang-warnings: cannot resolve the cross libc include "
-                 f"directory:\n{proc.stderr.strip()}")
-    return proc.stdout.strip()
 
 # Added on top of the recorded build flags.
 EXTRA_FLAGS = [
@@ -101,9 +82,13 @@ def excluded(path: str) -> bool:
 
 
 def clang_command(entry: dict[str, object], libc_include: str) -> list[str] | None:
+    # bear writes `arguments` (a list), CMake writes `command` (one string).
     args = entry.get("arguments")
     if not isinstance(args, list):
-        return None
+        command = entry.get("command")
+        if not isinstance(command, str):
+            return None
+        args = shlex.split(command)
     out: list[str] = []
     skip = False
     for arg in args:
@@ -149,20 +134,27 @@ def ours(line: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--build-dir", default=str(ROOT),
+    parser.add_argument("-p", "--build-dir", required=True,
                         help="directory holding compile_commands.json")
+    # Required: the libc headers are IMPLICIT in the recorded compiler, so
+    # clang left alone resolves <string.h> to the HOST's /usr/include and
+    # measures a glibc-flavoured version of a freestanding program. CMake
+    # knows the directory (cmake/AxlLint.cmake's AXL_LIBC_INCLUDE); the
+    # Makefile answered it until 5.0.0.
+    parser.add_argument("--libc-include", required=True,
+                        help="the cross libc's include directory")
     opts = parser.parse_args()
 
     db_path = Path(opts.build_dir) / "compile_commands.json"
     if not db_path.is_file():
         print(f"check-clang-warnings: no compile_commands.json at {db_path}\n"
-              "  Generate one first:  bear -- make tests tools\n"
+              "  Configure the lint preset first: cmake --preset x64-lint\n"
               "  (scripts/lint.sh does this and then runs this check.)",
               file=sys.stderr)
         return 2
 
     entries = json.loads(db_path.read_text())
-    libc_include = cross_libc_include()
+    libc_include = opts.libc_include
     jobs: list[tuple[str, list[str], Path]] = []
     seen: set[str] = set()
     for entry in entries:
@@ -173,18 +165,16 @@ def main() -> int:
         cmd = clang_command(entry, libc_include)
         if cmd is None:
             continue
-        # The database is single-arch (one `make` invocation produced it) while
-        # the libc directory above came from make's DEFAULT arch. Linting an
-        # ARCH=aa64 database would otherwise analyze aarch64 TUs against x64
-        # newlib headers and report something meaningless about neither.
+        # The database is single-arch (one preset produced it), and so is the
+        # libc directory handed in. Linting an aa64 database against x64
+        # newlib headers would report something meaningless about neither.
         for arg in cmd:
             if arg.startswith("--target=") and arg[len("--target="):] not in libc_include:
                 sys.exit(
                     f"check-clang-warnings: {path} targets "
-                    f"{arg[len('--target='):]}, but the libc headers reported "
-                    f"by make are {libc_include}.\n  Regenerate "
-                    "compile_commands.json for the arch you are linting, or "
-                    "run make with the matching ARCH."
+                    f"{arg[len('--target='):]}, but the libc headers handed "
+                    f"in are {libc_include}.\n  Pass the --libc-include of "
+                    "the arch whose database you are linting."
                 )
         jobs.append((path, cmd, Path(str(entry.get("directory", ROOT)))))
 

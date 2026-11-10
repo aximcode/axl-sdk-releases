@@ -16,7 +16,9 @@
 #include "../posix/axl-app-internal.h"
 #include "axl-atexit-internal.h"
 #include "axl-cxxabi-internal.h"
+#include "axl-libc-heap-internal.h"
 #include "axl-registry-internal.h"
+#include "axl-runtime-internal.h"
 #include "axl-signal-internal.h"
 #include <axl/axl-runtime.h>
 #include <axl/axl-signal.h>
@@ -65,13 +67,51 @@ axl_loop_default(void)
     return mDefaultLoop;
 }
 
+void
+_axl_default_loop_free(void)
+{
+    if (mDefaultLoop != NULL && mLoopFreeFn != NULL) {
+        mLoopFreeFn(mDefaultLoop);
+        mDefaultLoop = NULL;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Yield
 // ---------------------------------------------------------------------------
 
+/* Depth of _axl_poll_break_hold(): while above zero an observed Ctrl-C is
+   recorded but does not end the program. */
+static unsigned mBreakHold;
+
+void
+_axl_poll_break_hold(void)
+{
+    mBreakHold++;
+}
+
+void
+_axl_poll_break_release(void)
+{
+    if (mBreakHold > 0) {
+        mBreakHold--;
+    }
+}
+
 void
 _axl_poll_break(void)
 {
+    /* Not in a driver image. Resident code does not own the Shell's break:
+     * reading the flag CONSUMES it, so the Shell's script runner (which polls
+     * the same event between lines) would never see the Ctrl-C meant for it;
+     * and the exit below cannot work for an image that is not the current
+     * one -- gBS->Exit fails and axl_exit spins, wedging the machine at
+     * whatever TPL the driver was running. Accepted cost: a driver blocked in
+     * library work cannot be aborted with Ctrl-C. */
+    if (_axl_atexit_is_driver_image()) {
+        return;
+    }
+
     /* Observe Ctrl-C without touching the loop. The yield-only app (no
      * event sources, no loops) and all in-library yields go through here:
      * poll the shell break flag directly. */
@@ -82,8 +122,11 @@ _axl_poll_break(void)
     /* Default-policy exit: if Ctrl-C fired and no user handler is
      * installed, the blessed behavior is to terminate cleanly at the next
      * yield point. Apps that want to handle interrupts themselves must
-     * axl_signal_install before the first yield. */
-    if (g_axl_interrupted && !_axl_signal_has_handler()) {
+     * axl_signal_install before the first yield. Not while a hold is
+     * taken: the caller is inside a sequence that must be undone or
+     * finished first, and leaves the interrupt pending for the next yield
+     * after it releases the hold. */
+    if (g_axl_interrupted && !_axl_signal_has_handler() && mBreakHold == 0) {
         axl_exit(1);
     }
 }
@@ -178,6 +221,71 @@ _axl_init(void *image_handle, void *system_table)
      * runtime is up so ctors may use axl_printf / axl_malloc / etc.
      * No-op for pure-C apps (empty .init_array). */
     _axl_cxxabi_run_init_array();
+}
+
+/* Set by _axl_cleanup_note_exit; read by _axl_cleanup and
+   _axl_cleanup_pin_exit_status. */
+static bool     mExitUnloadsDriver;
+static uint64_t mExitStatus;
+static bool     mExitNoted;
+
+void
+_axl_cleanup_note_exit(
+    int rc
+    )
+{
+    /* LATCHED: the first exit decides. A second one can only come from
+       inside the teardown that first exit started -- a destructor reaching
+       std::terminate in the atexit drain calls axl_exit(1) -- and by then the
+       image is half torn down; re-deciding on its non-error code would send
+       it back to the firmware RESIDENT (test-heap-release-qemu.sh). */
+    if (mExitNoted) {
+        return;
+    }
+    mExitNoted = true;
+
+    /* EFI_ERROR: the status word's top bit, on both arches. A non-error
+       status -- 0, or the small POSIX code a bare nonzero rc maps to, which
+       is what std::terminate's _exit(1) reaches -- leaves a driver RESIDENT
+       (EDK2 unloads only on an error), so it keeps everything.
+
+       No child running: while an image this one started is running (the
+       entry inside axl_image_run, a driver start, a Shell command), the
+       CHILD is the firmware's current image, and an exit from one of this
+       image's callbacks makes gBS->Exit FAIL and spin -- that exit must not
+       tear the image down. A raised TPL is NOT that case and once stood in
+       for it, keeping the heap of an entry that exits from a raise it never
+       restored (test-heap-release-qemu.sh, tplexit). */
+    mExitStatus        = axl_backend_resolve_exit_status(rc);
+    mExitUnloadsDriver = _axl_atexit_driver_entry_live()
+                         && !axl_backend_child_images_running()
+                         && (mExitStatus >> 63) != 0;
+}
+
+void
+_axl_cleanup_finish_exit(
+    void
+    )
+{
+    if (_axl_atexit_is_driver_image() && !mExitUnloadsDriver) {
+        return;     /* a driver staying resident keeps everything */
+    }
+
+    /* The heap, again -- because THIS call may be a nested exit. An
+       axl_exit from inside the atexit drain (a destructor reaching
+       std::terminate) never returns to the _axl_cleanup that drain belongs
+       to, so that cleanup's own last step never runs and the arena would go
+       with the image unreleased. Idempotent: on the ordinary path
+       _axl_cleanup released it already and this does nothing. */
+    _axl_libc_heap_release();
+
+    /* The teardown just taken was decided on mExitStatus; an atexit handler
+       or destructor that armed another status in it must not reach
+       gBS->Exit. A success there would leave the driver RESIDENT, with its
+       destructors run and its heap released. */
+    if (mExitUnloadsDriver) {
+        axl_backend_set_exit_status(mExitStatus);
+    }
 }
 
 unsigned
@@ -285,16 +393,24 @@ _axl_cleanup(void)
      * would otherwise be caught (noisily) by the sweep.
      *
      * NOT in a driver image, where that table belongs to
-     * axl_driver_cleanup. This path is reachable from a driver:
-     * _axl_poll_break calls axl_exit(1) on a shell break with no handler
-     * installed, and it sits under ordinary library work (axl-fs,
-     * axl-http-client, axl-digest, axl-sort). The drain was a guaranteed
-     * no-op there until axl_driver_init began populating the table; left
-     * unguarded it would now run every global destructor, after which
-     * gBS->Exit FAILS for a non-current image and spins — leaving a live
-     * driver on destructed state. The spin predates this; destroying the
-     * image's C++ state on the way into it would not. */
-    if (!_axl_atexit_is_driver_image()) {
+     * axl_driver_cleanup. This path is still reachable from a driver: its
+     * own code can call axl_exit(), and axl_yield exits on a break latched
+     * by a loop the driver opted in to intercepting. (_axl_poll_break, under
+     * ordinary library work, no longer leads here from a driver image.) The
+     * drain was a guaranteed no-op there until axl_driver_init began
+     * populating the table; left unguarded it would run every global
+     * destructor, after which gBS->Exit FAILS for a non-current image and
+     * spins — leaving a live driver on destructed state. The spin predates
+     * this; destroying the image's C++ state on the way into it would not. */
+    /* ...UNLESS this exit unloads the driver image: inside an AXL macro's
+     * DriverEntry, with an EFI error (_axl_cleanup_note_exit). Then the
+     * firmware unloads it through CoreUnloadAndCloseImage, which never calls
+     * its Unload, so nothing else will ever run its destructors -- the same
+     * teardown the macro's own error return does through
+     * axl_driver_cleanup. */
+    bool own_teardown = !_axl_atexit_is_driver_image() || mExitUnloadsDriver;
+
+    if (own_teardown) {
         _axl_atexit_run_all();
     }
 
@@ -303,14 +419,27 @@ _axl_cleanup(void)
     /* Explicitly free the default loop (if any) before sweep so its
      * registry entry unregisters cleanly; otherwise it'd appear as
      * a "leak" on every run. */
-    if (mDefaultLoop != NULL && mLoopFreeFn != NULL) {
-        mLoopFreeFn(mDefaultLoop);
-        mDefaultLoop = NULL;
-    }
+    _axl_default_loop_free();
 
     _axl_registry_sweep();
 
 #ifdef AXL_MEM_DEBUG
     _axl_mem_dump_leaks_at_exit();
 #endif
+
+    /* LAST: newlib's arena back to the firmware, which does not reclaim it
+     * at unload. Everything above may still malloc or free -- atexit
+     * handlers, C++ destructors, a destroy callback the sweep runs -- and
+     * nothing below this line may. See axl-libc-heap-internal.h.
+     *
+     * NOT in a driver image, for the reason the atexit drain above is
+     * skipped there: a driver that reaches this through axl_exit(0) in its
+     * entry is then Exit()ed with EFI_SUCCESS and STAYS RESIDENT, still
+     * using its heap -- releasing it here made that driver's later free()
+     * fault on the pages EDK2 had filled with 0xAF (test-heap-release-qemu).
+     * A driver's heap goes with axl_driver_cleanup, on its real unload --
+     * or here, when this exit is what unloads it (own_teardown, above). */
+    if (own_teardown) {
+        _axl_libc_heap_release();
+    }
 }

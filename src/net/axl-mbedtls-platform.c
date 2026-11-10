@@ -9,19 +9,35 @@
     Standard C functions (memcpy, strlen, etc.) come from newlib. This
     file only handles mbedTLS-specific platform hooks: memory
     allocator, printf, fprintf, time, and entropy.
+
+    It also implements the two public entropy-policy calls declared in
+    <axl/axl-crypto.h> -- axl_crypto_set_weak_entropy_allowed() and
+    axl_crypto_is_weak_entropy_allowed(). They live beside the entropy
+    poll rather than with the rest of AxlCrypto because the poll is
+    their only reader, which keeps the flag and the branch that honors
+    it in one translation unit.
 **/
 
 #include <stddef.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <mbedtls/platform_time.h>
+#include <mbedtls/entropy.h>
 #include "../backend/axl-backend.h"
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include <axl/axl-format.h>
 #include <axl/axl-time.h>
+#include <axl/axl-crypto.h>
+#include <axl/axl-rng.h>
 
-AXL_LOG_DOMAIN("tls");
+/* "crypto", not "tls": this file's only log line is the entropy poll, and
+   that poll seeds the DRBG behind SSH host keys, Ed25519 and ECDH key
+   generation and PK signing as well as TLS. Filing a warning about SSH key
+   material under a "tls" domain would send an operator looking in the wrong
+   place -- and the domain is what AXL_LOG_LEVEL selects on. */
+AXL_LOG_DOMAIN("crypto");
 
 // ---------------------------------------------------------------------------
 // Memory: mbedTLS calloc/free → axl_calloc/axl_free
@@ -116,8 +132,9 @@ time(time_t *timer)
            (matches the previous behavior which gated on
            t.Year >= 1970 before doing any conversion). The new
            tv_sec >= 0 check is slightly stricter — it also rejects
-           1970-01-01 dates that go negative after a positive
-           tz_minutes offset is subtracted — but the difference is
+           1970-01-01 dates that go negative after a negative
+           tz_minutes offset is added (UEFI: UTC = local + TimeZone)
+           — but the difference is
            a fraction of a day on the epoch boundary, harmless for
            certificate validity windows that span years. */
         result = (time_t)ts.tv_sec;
@@ -141,40 +158,69 @@ mbedtls_ms_time(void)
 }
 
 // ---------------------------------------------------------------------------
-// Entropy: UEFI RNG protocol with software fallback
+// Entropy: EFI_RNG_PROTOCOL, and what happens when it is not there.
+//
+// This is the ONLY entropy source registered with mbedTLS (see
+// axl-crypto-rng.c and axl-tls.c, which both add it with a threshold of
+// 32 and MBEDTLS_ENTROPY_SOURCE_STRONG; MBEDTLS_NO_PLATFORM_ENTROPY means
+// mbedtls_entropy_init() adds none of its own). So every private key the
+// SDK produces traces back to this function.
+//
+// mbedTLS credits whatever a source reports through *olen toward that
+// threshold, without inspecting the bytes. Reporting a clock-seeded
+// xorshift as gathered entropy therefore satisfies the threshold and seeds
+// the DRBG -- which is why the fallback below reports NOTHING unless the
+// consumer has explicitly opted in.
 // ---------------------------------------------------------------------------
 
-int
-axl_mbedtls_entropy_poll(
-    void           *data,
-    unsigned char  *output,
-    size_t          len,
-    size_t         *olen
+/* Default false: no hardware RNG means no key, rather than a key derived
+   from a wall clock. Lives in this TU so the flag and its only reader are
+   the same object -- a consumer that calls the setter necessarily links the
+   poll that honors it. */
+static bool g_weak_entropy_allowed;
+
+/* Set the first time the clock fallback actually FEEDS the pool, and never
+   cleared: a DRBG seeded from a clock stays derived from it for the life of
+   the image, whatever the policy flag says afterwards. Its reader is
+   axl_crypto_entropy_was_weak(), which axl_ssh_host_key_nv_load_or_create()
+   asks before persisting a key -- the policy flag answers a different
+   question ("may it happen?", not "did it?"). */
+static bool g_weak_entropy_used;
+
+bool
+axl_crypto_entropy_was_weak(
+    void
     )
 {
-    (void)data;
+    return g_weak_entropy_used;
+}
 
-    /* Try hardware RNG via EFI_RNG_PROTOCOL */
-    EFI_GUID rng_guid = { 0x3152bca5, 0xeade, 0x433d,
-        { 0x86, 0x2e, 0xc0, 0x1c, 0xdc, 0x29, 0x1f, 0x44 } };
-    void *rng_proto = NULL;
+void
+axl_crypto_set_weak_entropy_allowed(
+    bool allowed
+    )
+{
+    g_weak_entropy_allowed = allowed;
+}
 
-    EFI_STATUS status = axl_bs()->LocateProtocol(
-        &rng_guid, NULL, &rng_proto);
+bool
+axl_crypto_is_weak_entropy_allowed(
+    void
+    )
+{
+    return g_weak_entropy_allowed;
+}
 
-    if (status == 0 && rng_proto != NULL) {
-        typedef EFI_STATUS (EFIAPI *RNG_GET_RNG)(void *, void *, size_t, void *);
-        RNG_GET_RNG get_rng = ((RNG_GET_RNG *)rng_proto)[0];
-        status = axl_efi_call(get_rng, 4,
-                              rng_proto, NULL, (size_t)len, output);
-        if (status == 0) {
-            *olen = len;
-            return 0;
-        }
-    }
-
-    /* Fallback: weak entropy from time + monotonic counter */
-    axl_debug("hardware RNG unavailable, using weak entropy fallback");
+/// Fill @p output with @p len bytes from a xorshift64 generator started
+/// from the real-time clock and the firmware's monotonic counter. NOT an
+/// entropy source: the state space is bounded by how precisely an attacker
+/// can bound boot time. Reachable only through the opt-in above.
+static void
+entropy_from_clock(
+    unsigned char *output,
+    size_t         len
+    )
+{
     uint64_t seed = 0;
     AxlTime  et;
     /* Through the backend, not gRT->GetTime directly: the backend carries the
@@ -197,7 +243,66 @@ axl_mbedtls_entropy_poll(
         seed ^= seed << 17;
         output[i] = (unsigned char)(seed & 0xFF);
     }
+}
 
+int
+axl_mbedtls_entropy_poll(
+    void           *data,
+    unsigned char  *output,
+    size_t          len,
+    size_t         *olen
+    )
+{
+    (void)data;
+
+    *olen = 0;
+
+    /* Through axl_rng_bytes() rather than a second, local EFI_RNG_PROTOCOL
+       binding. The local one was WRONG and silently so: it took
+       ((RNG_GET_RNG *)proto)[0], but member 0 of EFI_RNG_PROTOCOL is
+       GetInfo and GetRNG is member 1 (UEFI 2.11 §37.5). So it called
+       GetInfo(This, NULL, output), which answers EFI_INVALID_PARAMETER for
+       a NULL size pointer -- on EVERY platform, including ones whose RNG
+       works. The hardware branch never once succeeded, and the fallback
+       below silently absorbed it, which is precisely what fail-closed and
+       one binding per protocol exist to prevent. */
+    if (axl_rng_bytes(output, len) == AXL_OK) {
+        *olen = len;
+        return 0;
+    }
+
+    if (!g_weak_entropy_allowed) {
+        /* MBEDTLS_ERR_ENTROPY_SOURCE_FAILED rather than "return 0 with
+           *olen = 0". Both end in a failed seed, but they cost very
+           differently: entropy_gather_internal() propagates a source
+           ERROR immediately, whereas a zero-length success leaves the
+           threshold unmet and mbedtls_entropy_func() re-polls
+           ENTROPY_MAX_LOOP (256) times before giving up -- 256 protocol
+           lookups and 256 log lines to reach the same verdict. The error
+           is also what the library documents this condition as. */
+        /* log-level: the caller mbedTLS reports this to is not the caller
+           who needs to know. By the time it surfaces it is an
+           axl_pk_key_new() NULL or an axl_tls_init() AXL_ERR, neither of
+           which says WHY, and the why is a security property of the
+           platform. */
+        axl_error("no usable EFI_RNG_PROTOCOL: refusing to seed the DRBG"
+                  " from a clock -- no key will be generated."
+                  " axl_crypto_set_weak_entropy_allowed(true) accepts"
+                  " predictable keys on a platform that has no RNG");
+        return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+    }
+
+    /* Opted in. Loud EVERY time, not once and not at debug: an image built
+       this way is generating guessable key material for as long as it runs,
+       and a single line at startup is easy to miss in a boot log. */
+    /* log-level: nothing in the return value says these bytes came from a
+       clock -- mbedTLS sees an ordinary successful poll. This line is the
+       only record that the key being generated is predictable. */
+    axl_warning("no usable EFI_RNG_PROTOCOL: seeding from the clock"
+                " because weak entropy was explicitly allowed --"
+                " keys generated now are predictable");
+    entropy_from_clock(output, len);
+    g_weak_entropy_used = true;
     *olen = len;
     return 0;
 }

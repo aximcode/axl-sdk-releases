@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=43 local-only=0
+# test-meta: arch=both needs= est=43 local-only=0 builds=9p guest=standard
 # test-9p-tool-qemu.sh -- the `9p` TOOL against a host 9P server. Same
 # guest-connects-out topology as test-9p-qemu.sh (p9-server.py on the host,
 # reached at 10.0.2.2:<port> through QEMU user-net), but the guest runs the
@@ -45,8 +45,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all 9p 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all 9p 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/tools/9p.efi"
 
@@ -68,45 +68,9 @@ python3 "$(dirname "$0")/p9-server.py" "$P9_PORT" &
 P9_PID=$!
 trap 'test_cleanup; [[ $P9_PID -gt 0 ]] && kill $P9_PID 2>/dev/null || true' EXIT
 
-# Interpolated heredoc (unquoted) so $P9_PORT lands in the startup script.
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo TOOL-LS
-9p.efi ls 10.0.2.2:${P9_PORT} /
-echo TOOL-GET-STDOUT
-9p.efi get 10.0.2.2:${P9_PORT} /hello.txt
-echo TOOL-GET-FILE
-9p.efi get 10.0.2.2:${P9_PORT} /readonly.txt fs0:\\got.txt
-type fs0:\\got.txt
-echo TOOL-PUT
-9p.efi put fs0:\\putsrc.txt 10.0.2.2:${P9_PORT} /puttest.txt
-echo TOOL-PUT-RB
-9p.efi get 10.0.2.2:${P9_PORT} /puttest.txt
-echo TOOL-MOUNT
-9p.efi mount 10.0.2.2 --port ${P9_PORT}
-echo TOOL-MOUNT-STATUS
-9p.efi status
-echo TOOL-MOUNT-READ
-type fs20:\\dir\\a.txt
-echo TOOL-UMOUNT
-9p.efi umount
-9p.efi status
-echo TOOL-UMOUNT-DONE
-type fs20:\\dir\\a.txt
-echo TOOL-DONE
-reset -s
-NSHEOF
+# The guest's commands live in test-9p-tool-qemu.nsh (%1 = the 9P port),
+# its files named relatively. Booted, test_use_nsh appends the reset -s.
+test_use_nsh "$P9_PORT"
 
 test_build_image
 
@@ -117,8 +81,8 @@ test_run_background
 
 echo "  QEMU PID: $TEST_QEMU_PID; 9P server PID: $P9_PID on host :$P9_PORT"
 
-if ! test_wait_for "TOOL-DONE" 90; then
-    echo "FAIL: the tool run did not finish within 90 seconds"
+if ! test_wait_boot "TOOL-DONE" 90; then
+    echo "FAIL: the tool run did not finish within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -40 "$TEST_CLEAN_LOG"
     exit 1
@@ -182,7 +146,7 @@ assert_line "hello from 9p"
 # here. A DIFFERENT source file from the stdout case (/readonly.txt, 18 B)
 # keeps the two paths independent: neither assertion can be satisfied by the
 # other path's output.
-assert_line "9p: wrote 18 bytes to fs0:\\got.txt"
+assert_line "9p: wrote 18 bytes to got.txt"
 assert_line "read-only content"
 
 # `put` reports what it sent; the read-back proves the bytes reached the

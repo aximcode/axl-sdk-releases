@@ -96,7 +96,15 @@ tables and is the **single** width authority shared by producer and consumer: 2
 for double-width (CJK, emoji), 0 for combining marks and other zero-width
 codepoints, 1 otherwise. A consumer decoding an `output_text` run under
 `AXL_CONSOLE_CELLS_WIDTH_RESOLVED` uses it to rebuild cell boundaries, merging
-zero-width codepoints into the preceding cell. There must not be a second table.
+zero-width codepoints into the preceding cell. The VT encoder
+(`axl-console-vt-enc`) asks it too, and follows the cell rule its producer
+reports. Under `AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT` (the console device and
+the tap) a codepoint whose width is not 1 would move a terminal off the
+console's grid, so the encoder sends `?` for it. Under
+`AXL_CONSOLE_CELLS_WIDTH_RESOLVED` (this module, re-encoded) the glyph goes out
+as it is and the encoder's tracked cursor moves by its width. A C1 control is
+`?` under both: it is a control to a terminal, not a glyph. There must not be a
+second table.
 
 ## What the consumer sees of libvterm: nothing
 

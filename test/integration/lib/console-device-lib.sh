@@ -17,8 +17,8 @@
 # binding constraint and not this test. (AXL-CI-Release-Speed-Design.md §12.11.)
 #
 # Each group sets CD_NAME, sources this file, runs its scenarios, and calls
-# test_host_summary. The guards below exit 0 on a SKIP, so a machine without
-# DEBUG OVMF or Pillow skips all four identically.
+# test_host_summary. A machine without DEBUG OVMF or Pillow skips all four
+# identically (no DEBUG OVMF: exit 77, or a FAILURE under release-suite.sh).
 #
 # Usage from a group script:
 #   CD_NAME="console-device take-over"
@@ -43,15 +43,15 @@ fi
 
 # Locate a DEBUG build of OVMF. Release OVMF compiles the asserts out, so it
 # cannot gate the "0 firmware fatals" half of this smoke; require the DEBUG FV.
-DBG_FV="$HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV"
-DBG_CODE="${OVMF_CODE:-$DBG_FV/OVMF_CODE.fd}"
-DBG_VARS="${OVMF_VARS:-$DBG_FV/OVMF_VARS.fd}"
-if [[ ! -f "$DBG_CODE" || ! -f "$DBG_VARS" ]]; then
-    echo "WARN: DEBUG OVMF not found (looked for '$DBG_CODE' + '$DBG_VARS')."
-    echo "      Set OVMF_CODE/OVMF_VARS to a DEBUG OVMF build to run this test."
-    echo "$CD_NAME: SKIP"
-    exit 0
+# find_debug_ovmf (scripts/axl-common.sh) is the one place every DEBUG-OVMF
+# test looks: AXL_OVMF_DEBUG_DIR, else the EDK2 or $HOME build tree. Without
+# one this SKIPs (exit 77), or FAILS under release-suite.sh.
+if ! find_debug_ovmf; then
+    echo "$CD_NAME: no DEBUG OVMF"
+    debug_ovmf_unavailable
 fi
+DBG_CODE="$DEBUG_OVMF_CODE"
+DBG_VARS="$DEBUG_OVMF_VARS"
 
 # The analyzer needs PIL; without it we can't render a verdict from the shot.
 if ! python3 -c 'import PIL' >/dev/null 2>&1; then
@@ -79,14 +79,10 @@ ANALYZER="$TESTS_DIR/analyze-console-device-shot.py"
 # missing-capability SKIP) — surface it loudly. The `if` guard keeps set -e /
 # pipefail from aborting mid-pipe so we own the message instead of dying with a
 # truncated `tail`.
-# flock, because the four group scripts run CONCURRENTLY under run-integration's
-# pool and would otherwise drive `make` at the same targets at the same time --
-# two `ld -o` on one path. The build is incremental, so the three that wait pay
-# a no-op make once the first finishes. Degrades to an unlocked build when flock
-# is absent (a standalone run, where there is no concurrency to guard).
-_cd_lock="${TMPDIR:-/tmp}/axl-console-device-fixtures.lock"
-_cd_flock=(); command -v flock >/dev/null 2>&1 && _cd_flock=(flock "$_cd_lock")
-if ! "${_cd_flock[@]}" make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+# The four group scripts run CONCURRENTLY and build these same targets;
+# scripts/axl-build.sh serialises builds in one tree, so the three that wait
+# pay a no-op build once the first finishes.
+if ! "$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 \
         console-device-smoke console-device-restore-smoke console-device-wide-smoke \
         console-device-passthrough-smoke \
         console-device-input-smoke console-device-input-restore-smoke \

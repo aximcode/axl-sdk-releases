@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=62 local-only=0
+# test-meta: arch=x64 needs= est=20 local-only=0 guest=standard
 # rfbrowse.efi integration test — boots QEMU, runs rfbrowse against a
 # Python mock Redfish server on the host, validates serial log output.
 #
@@ -21,44 +21,9 @@ TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/tools/rfbrowse.efi"
 
 # Startup script: init network, run rfbrowse tests
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo [TEST START]
-
-echo [test-root]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} --raw
-
-echo [test-system]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} -u admin -p password --raw system
-
-echo [test-thermal]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} -u admin -p password --raw thermal
-
-echo [test-members]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} -u admin -p password --members systems
-
-echo [test-noauth]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} --raw systems
-
-echo [test-badpass]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} -u admin -p wrong system
-
-echo [test-json5-rejected]
-rfbrowse.efi http://10.0.2.2:${MOCK_PORT} --members /redfish/v1/JSON5Trap
-
-echo [TEST DONE]
-NSHEOF
+# The startup commands live in test-redfish.nsh; the mock port is %1.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$MOCK_PORT"
 
 test_build_image
 
@@ -75,10 +40,7 @@ echo "  Mock Redfish server PID: $MOCK_PID, port: $MOCK_PORT"
 
 # Boot QEMU with user-mode networking (guest connects out to host)
 test_build_qemu_cmd
-TEST_QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev "user,id=net0"
-)
+test_add_network
 
 test_run_foreground 60
 

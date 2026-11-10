@@ -9,6 +9,7 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-url.h>
+#include "axl-url-internal.h"
 
 AXL_LOG_DOMAIN("url");
 
@@ -19,6 +20,42 @@ AXL_LOG_DOMAIN("url");
 /* Hex digits for axl_url_encode (`%XX` byte-emission). Uppercase
    per RFC 3986 §2.1. */
 static const char hex_chars[] = "0123456789ABCDEF";
+
+// ---------------------------------------------------------------------------
+// Authority helpers
+// ---------------------------------------------------------------------------
+
+/* The port a scheme implies when a URL names none: 80 for http, 443 for
+   https, 0 (none) for any other. */
+static uint16_t
+url_default_port(
+    const char *scheme
+    )
+{
+    if (axl_strcmp(scheme, "http") == 0) {
+        return 80;
+    }
+    if (axl_strcmp(scheme, "https") == 0) {
+        return 443;
+    }
+    return 0;
+}
+
+void
+_axl_url_authority(
+    const char      *scheme,
+    const char      *host,
+    uint16_t         port,
+    AxlUrlAuthority *out)
+{
+    bool v6 = axl_strchr(host, ':') != NULL;
+    out->open  = v6 ? "[" : "";
+    out->close = v6 ? "]" : "";
+    out->port[0] = '\0';
+    if (port != 0 && port != url_default_port(scheme)) {
+        axl_snprintf(out->port, sizeof(out->port), ":%u", (unsigned)port);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // axl_url_parse
@@ -107,13 +144,34 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     }
 
     //
-    // Find end of host — terminated by ':', '/', '?', '#', or NUL
+    // Find end of host — terminated by ':', '/', '?', '#', or NUL. An IPv6
+    // literal is bracketed (RFC 3986 3.2.2): its colons are the address's,
+    // the host is what is inside the brackets, and a port may follow ']'.
     //
-    host_end = host_start;
-    while (*host_end != '\0' && *host_end != ':' && *host_end != '/' &&
-           *host_end != '?' && *host_end != '#')
-    {
-        host_end++;
+    const char *addr_start = host_start;
+    const char *addr_end;
+    if (*host_start == '[') {
+        addr_start = host_start + 1;
+        addr_end   = addr_start;
+        while (axl_isxdigit((unsigned char)*addr_end) || *addr_end == ':' || *addr_end == '.') {
+            addr_end++;
+        }
+        host_end = addr_end + 1;
+        /* At least one ':' -- [abc] or [1.2.3.4] is no IPv6 address. */
+        if (*addr_end != ']' || axl_memchr(addr_start, ':', (size_t)(addr_end - addr_start)) == NULL
+            || (*host_end != '\0' && *host_end != ':' && *host_end != '/'
+                && *host_end != '?' && *host_end != '#')) {
+            axl_error("malformed URL: bad IPv6 literal in '%s'", url);
+            return AXL_ERR;
+        }
+    } else {
+        host_end = host_start;
+        while (*host_end != '\0' && *host_end != ':' && *host_end != '/' &&
+               *host_end != '?' && *host_end != '#')
+        {
+            host_end++;
+        }
+        addr_end = host_end;
     }
 
     if (host_end == host_start) {
@@ -202,10 +260,10 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     if (port == 0) {
         size_t scheme_len = (size_t)(scheme_end - url);
 
-        if (scheme_len == 4 && axl_strncmp(url, "http", 4) == 0) {
-            port = 80;
-        } else if (scheme_len == 5 && axl_strncmp(url, "https", 5) == 0) {
-            port = 443;
+        if (scheme_len == 4 && axl_strncasecmp(url, "http", 4) == 0) {
+            port = url_default_port("http");
+        } else if (scheme_len == 5 && axl_strncasecmp(url, "https", 5) == 0) {
+            port = url_default_port("https");
         }
     }
 
@@ -218,7 +276,12 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     }
 
     u->scheme = axl_strndup(url, (size_t)(scheme_end - url));
-    u->host   = axl_strndup(host_start, (size_t)(host_end - host_start));
+    /* A scheme is case-insensitive (RFC 3986 3.1): stored lowercased, so
+       every comparison with "http" or "https" holds for HTTPS:// too. */
+    for (char *c = u->scheme; c != NULL && *c != '\0'; c++) {
+        *c = (char)axl_tolower((unsigned char)*c);
+    }
+    u->host   = axl_strndup(addr_start, (size_t)(addr_end - addr_start));
     u->port   = port;
 
     //
@@ -312,13 +375,12 @@ axl_url_free(AxlUrl *url)
  * exact-sized buffer instead of a second, drifting copy of it. */
 static size_t
 url_format(char *out, size_t size, const char *scheme, const char *host,
-           uint16_t port, uint16_t default_port, const char *path)
+           uint16_t port, const char *path)
 {
-    if (port != 0 && port != default_port) {
-        return axl_snprintf(out, size, "%s://%s:%u%s", scheme, host, port,
-                            path);
-    }
-    return axl_snprintf(out, size, "%s://%s%s", scheme, host, path);
+    AxlUrlAuthority a;
+    _axl_url_authority(scheme, host, port, &a);
+    return axl_snprintf(out, size, "%s://%s%s%s%s%s", scheme, a.open, host, a.close,
+                        a.port, path);
 }
 
 char *
@@ -328,7 +390,6 @@ axl_url_build(const char *scheme, const char *host, uint16_t port,
     char         buf[512];
     size_t       len;
     char        *result;
-    uint16_t     default_port;
     const char  *use_path;
 
     if (scheme == NULL || host == NULL) {
@@ -338,17 +399,7 @@ axl_url_build(const char *scheme, const char *host, uint16_t port,
     use_path = (path != NULL) ? path : "/";
 
     //
-    // Determine default port for scheme
-    //
-    default_port = 0;
-    if (axl_strcmp(scheme, "http") == 0) {
-        default_port = 80;
-    } else if (axl_strcmp(scheme, "https") == 0) {
-        default_port = 443;
-    }
-
-    //
-    // Build: scheme://host[:port]path
+    // Build: scheme://host[:port]path (an IPv6 host in brackets)
     //
     // The stack buffer is a fast path, not the bound. axl_snprintf reports
     // the length the URL WOULD need regardless of the buffer it was given,
@@ -358,8 +409,7 @@ axl_url_build(const char *scheme, const char *host, uint16_t port,
     // A path of a few hundred bytes is enough, and the result went straight
     // to a caller. Over-length now re-formats into the exact allocation.
     //
-    len = url_format(buf, sizeof(buf), scheme, host, port, default_port,
-                     use_path);
+    len = url_format(buf, sizeof(buf), scheme, host, port, use_path);
 
     result = axl_malloc(len + 1);
     if (result == NULL) {
@@ -368,8 +418,7 @@ axl_url_build(const char *scheme, const char *host, uint16_t port,
     if (len < sizeof(buf)) {
         axl_memcpy(result, buf, len + 1);
     } else {
-        (void)url_format(result, len + 1, scheme, host, port, default_port,
-                         use_path);
+        (void)url_format(result, len + 1, scheme, host, port, use_path);
     }
 
     return result;

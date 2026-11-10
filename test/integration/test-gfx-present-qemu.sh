@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=11 local-only=0
+# test-meta: arch=both needs= est=11 local-only=0 builds=gfx-present-selftest guest=gpu
 # test-gfx-present-qemu.sh — GOP present-pipeline round-trip test (G17+G18).
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
@@ -50,7 +50,7 @@ run_one() {
     efi="$out/gfx-present-selftest.efi"
 
     echo "=== GOP present round-trip ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" gfx-present-selftest 2>&1 | tail -2
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" gfx-present-selftest 2>&1 | tail -2
 
     log="$(mktemp)"
     # --gpu wires a virtual GPU so OVMF publishes a linear-FB GOP.

@@ -1,5 +1,10 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=110 local-only=0
+# test-meta: arch=both needs= est=110 local-only=0 builds=9p-server-selftest guest=none
+# guest=none: its long-name case seeds a name of 240 x U+20AC -- 720 bytes of
+#   UTF-8, past Linux's 255-byte NAME_MAX -- which the virtio-fs share a
+#   pooled run's directory lives on cannot hold (measured 2026-11-09: with
+#   the export moved into the run's directory, the seed failed there; FAT
+#   takes it).
 # test-9p-server-qemu.sh — the FIRST thing that ever executes Axl9pServer's
 # handler code. 9p-server-selftest.efi seeds a small tree inside the guest,
 # exports it with axl_9p_server_new + axl_9p_server_listen, and pumps the loop;
@@ -31,7 +36,7 @@
 # segment -- including [Tclunk][Tversion(131072)][Tattach][Tgetattr], the exact
 # shape of the two heap use-after-frees this server shipped and fixed -- a
 # frame over the negotiated msize and one under the header length (both must
-# REAP, proven by the socket closing), msize refusal below the 512 floor,
+# REAP, proven by the socket closing), msize refusal below the 1024 floor,
 # counts that lie about the frame, 64-bit read offsets and dirent cursors,
 # far-offset writes that must answer EFBIG rather than zero-fill toward the FAT
 # ceiling, a full fid table, the s9p_fid_restore_open rollback in all four
@@ -72,8 +77,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all 9p-server-selftest 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all 9p-server-selftest 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/9p-server-selftest.efi"
 
@@ -111,13 +116,13 @@ TEST_QEMU_CMD+=(
 test_run_background
 
 LINGER_PID=0
-trap 'test_cleanup; [[ $LINGER_PID -gt 0 ]] && kill $LINGER_PID 2>/dev/null || true' EXIT INT TERM
+trap 'test_cleanup; [[ $LINGER_PID -gt 0 ]] && kill $LINGER_PID 2>/dev/null || true' EXIT
 
 echo "  QEMU PID: $TEST_QEMU_PID, host :$HOST_PORT -> guest :$GUEST_PORT" \
      "(rw), :$HOST_PORT_RO -> :$GUEST_PORT_RO (ro)"
 
-if ! test_wait_for "SERVER: LISTENING port=$GUEST_PORT ro=$GUEST_PORT_RO" 90; then
-    echo "FAIL: 9P server did not start listening within 90 seconds"
+if ! test_wait_boot "SERVER: LISTENING port=$GUEST_PORT ro=$GUEST_PORT_RO" 90; then
+    echo "FAIL: 9P server did not start listening within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
@@ -242,7 +247,7 @@ ASSERTIONS=(
 # case that list does not number.
 ADVERSARIAL=(
     "CASE03 Tversion msize=0 = Rversion 0/unknown"
-    "CASE03 Tversion msize=511 = Rversion 511/unknown"
+    "CASE03 Tversion msize=1023 = Rversion 1023/unknown"
     "CASE03 refused msize leaves the session at 8192 = ok"
     "CASE04 frame one byte over msize = connection closed"
     "EXTRA frame size below the 7-byte header = connection closed"
@@ -359,13 +364,25 @@ ADVERSARIAL=(
     "CASE34 the rename moved the name = ok"
     "CASE34 the renamed file kept its content = ok"
     "CASE34 Trename onto itself = Rrename, no-op"
-    "CASE34 Trename onto an existing name = EEXIST"
+    "CASE34 Trename onto an existing name replaces it = ok"
     "CASE34 Trename of the export root = EPERM"
-    "CASE42 cross-directory Trename = EXDEV"
-    "CASE42 the EXDEV rename moved nothing"
-    "CASE42 the fid still names the source after EXDEV"
-    "CASE42 the client's copy+unlink fallback then works = ok"
+    "CASE42 cross-directory Trename moves the node = ok"
+    "CASE42 the fid names the moved node"
+    "CASE42 the moved file kept its content = ok"
     "CASE42 connection alive after the renames"
+    "CASE45 a directory onto a non-empty directory = ENOTEMPTY"
+    "CASE45 a file onto a directory = EISDIR"
+    "CASE45 a directory onto a file = ENOTDIR"
+    "CASE45 a directory into itself = EINVAL"
+    "CASE45 the refused renames changed nothing"
+    "CASE45 a directory onto an EMPTY directory replaces it = ok"
+    "CASE45 a case-only rename changes the stored spelling = ok"
+    "CASE45 connection alive after the renames"
+    "CASE47 two spellings of one FAT entry share one qid.path"
+    "CASE47 the readdir record carries the same qid.path"
+    "CASE47 a case-only Trename stores the new spelling = ok"
+    "EXTRA a 720-byte name is listed whole"
+    "EXTRA the 720-byte name walks and reads"
     "CASE35 an already-open fid sees the shrunk file = ok"
     "CASE35 the grown region reads back as 2048 zeros"
     "CASE41 Tsetattr one byte past MAX_GROW = EFBIG"
@@ -374,6 +391,12 @@ ADVERSARIAL=(
     "CASE35 Tsetattr(SIZE) on a directory = EISDIR"
     "CASE36 Tsetattr with valid=0 and with no-op bits changed nothing"
     "CASE36 Tsetattr on an unbound fid = EBADF"
+    "CASE46 Tsetattr MTIME_SET = the time is kept"
+    "CASE46 an odd second is kept as the even one below"
+    "CASE46 a 1970 time clamps to 1981-01-01"
+    "CASE46 a time past 2107 clamps to 2107"
+    "CASE46 MTIME without MTIME_SET = the server's now"
+    "CASE46 SIZE and MTIME_SET together = both kept"
     "CASE36 connection alive after the setattrs"
     "CASE29 reader fid sees the original content"
     "CASE29 the other fid on the same connection sees the write"

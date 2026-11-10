@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=72 local-only=0
+# test-meta: arch=both needs= est=72 local-only=0 builds=9p guest=none
+# guest=none: it types into the guest Shell (test_send_stdin), and a leased
+#   guest takes no typed serial input.
 # test-9p-tool-serve-qemu.sh -- `9p serve` as a RESIDENT driver. The guest
 # Shell runs `9p.efi serve fs0:\9pexport --detach`, which deploys the
 # embedded 9p-serve-dxe.efi; the driver brings the NIC up, exports the
@@ -83,8 +85,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all 9p 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all 9p 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/tools/9p.efi"
 
@@ -144,8 +146,8 @@ test_run_background
 
 echo "  QEMU PID: $TEST_QEMU_PID, host :$HOST_PORT -> guest :$GUEST_PORT"
 
-if ! test_wait_for "TOOL-SERVE-READY" 120; then
-    echo "FAIL: '9p serve' did not reach the ready marker within 120 seconds"
+if ! test_wait_boot "TOOL-SERVE-READY" 120; then
+    echo "FAIL: '9p serve' did not reach the ready marker within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -40 "$TEST_CLEAN_LOG"
     exit 1

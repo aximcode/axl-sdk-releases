@@ -48,6 +48,32 @@ if (axl_guid_equal(&a, &b)) {
 &b)` is its strcmp-style counterpart (0 if equal, negative/positive for a
 stable byte-lexicographic ordering) for keying sorted containers.
 
+### Firmware timer resolution
+
+UEFI fires every timer event, and wakes a halted CPU, only on the
+firmware's periodic tick -- 10 ms on EDK2. A 1 ms loop timer therefore
+fires every 10 ms, and a network poll answers no sooner. To react faster,
+raise the tick for as long as you need it, the way Windows'
+`timeBeginPeriod` raises the system timer resolution:
+
+```c
+AxlTimerResolutionId id;
+uint32_t granted;
+if (axl_timer_resolution_begin(1000, &id, &granted) == AXL_OK) {
+    /* ... latency-sensitive work: the firmware ticks every `granted` us ... */
+    axl_timer_resolution_end(id);
+}
+```
+
+The tick is firmware-global, so the requests are shared by every AXL image
+on the machine: it runs at the finest active request and goes back to the
+period found once the last ends. Requests are released when their image
+exits or unloads, and those of an image that died without releasing them
+are dropped at the next begin or end. A faster tick costs CPU everywhere
+(~0.1 core at 1 ms on an idle QEMU guest, against ~0.013 at 10 ms), so
+hold it only while something needs it. `axl_timer_period_us()` reports the
+tick in force.
+
 ### Firmware Globals
 
 After `AXL_APP` or `axl_driver_init`, these globals are available
@@ -361,6 +387,67 @@ full ordering contract, including why `.fini_array` is not walked.
 
 See `sdk/examples/driver.c` for a complete example.
 
+### Packed (Compressed) Images
+
+Every AXL loader -- `axl_driver_load`, `axl_driver_load_sibling`,
+`axl_driver_load_dir`, `axl_driver_load_buffer*`, and everything built on
+them (`axl_image_load`/`axl_image_run`, the shared-driver and service
+ensure paths) -- takes an
+image packed by `axl-efi-pack` exactly as it takes a raw one. The decision is
+made from the CONTENT: a packed `.efi` is the self-extracting stub with the
+compressed original in a PE section named `.axlpack`
+([src/pack/README.md](../pack/README.md)), so the loader reads the file and
+looks at its PE section table. A raw file is loaded as it is; a file whose
+table names `.axlpack` is unpacked in-process and the ORIGINAL image is
+loaded. Either way `LoadImage` gets the bytes AND the file's own device
+path, so the image's `FilePath` and `DeviceHandle` are the file's.
+
+### Reading the File: 64 KB Reads, Never the Firmware's One Large Read
+
+A loader that names a file -- `axl_driver_load`, `axl_driver_load_sibling`,
+`axl_driver_load_dir`, and through them `netload`'s and `sshd`'s driver
+sweeps -- reads the whole file ITSELF, in `Read` calls of at most 64 KB
+(`AXL_FS_READ_CHUNK`, `src/fs/axl-fs-read-chunk.h`), and calls
+`LoadImage(FALSE, parent, file_dp, buf, len)`. It no longer hands the
+firmware the path alone (`LoadImage(file_dp, NULL, 0)`), because that makes
+the firmware read the whole file in ONE call, and on BMC virtual media large
+single reads come back intermittently corrupt while 64 KB reads do not
+(measured on real hardware: a packed tool loaded that way failed its CRC 7
+times in 10; `sha256sum` of the same file, in 64 KB reads, was right 5 times
+in 5). A raw image has no CRC, so that fault would run the bad bytes.
+
+Passing the device path WITH the buffer keeps everything the path gave: the
+image's `LoadedImage->FilePath` and `DeviceHandle` are the file's (iPXE-style
+drivers locate their install directory from them), and Secure Boot verifies
+the buffer the same way it verifies a file the firmware read. The file's
+size comes from `GetInfo` (`EFI_FILE_INFO`), which every file system
+implements. A volume named by any shell mapping works, not only an `fsN:`
+alias -- a name set with `axl_volume_set_map` or `map` resolves to the
+volume it was set for.
+
+The firmware reads the file itself only when AXL cannot open it or learn
+its size (`GetInfo` fails; logged at debug). Once AXL has the size, every
+failure is final and logged as a warning, `cannot load <file>: <why>`: a
+read that fails part-way (`the file could not be read whole`), an empty
+file, a file over 64 MB (`AXL_PACK_MAX_RAW`, checked before anything is
+allocated), and `LoadImage` rejecting the bytes. The loader never retries
+through the firmware's own large read: an error in AXL's own read is the
+strongest sign the media is bad, and a raw image read that way runs
+whatever bytes come back.
+
+Every other file read in AXL -- `axl_file_get_contents`, `AxlStream` file
+reads, directory reads -- goes through the backend's
+`axl_backend_file_read`, which asks for at most 64 KB per call the same way
+(`src/fs/README.md`).
+
+So the handle a loader returns is always the original image's: its
+`LoadedImage->FilePath` is the file's, a protocol it installs sits on that
+handle (unload-by-protocol-GUID keeps working), and no `axl-pack-stub` image
+is left resident. Only the Shell's own `load`, and the firmware, run the stub.
+A packed image that fails to unpack (corrupt, another architecture, out of
+range) is a load ERROR, logged as `cannot load <file>: <pack status>` -- it is
+never loaded as its stub.
+
 ### Surviving a Driver That Hangs the Box (AxlAttempt)
 
 Loading an arbitrary `.efi` is the riskiest thing a tool does. A bad
@@ -577,7 +664,8 @@ if (axl_image_load("fs0:\\boot\\hello.efi", &img) == 0) {
 The handle is opaque — `EFI_HANDLE` and `EFI_LOADED_IMAGE_PROTOCOL`
 never cross the public API. `axl_image_*` is a thin wrapper over
 `axl_driver_*` (which already handles path-to-device-path
-construction and the device-path / buffer load fallback); the only
+construction, the device-path / buffer load fallback and packed
+images); the only
 distinct piece is `axl_image_start`, which captures the image's
 exit status (`axl_driver_start` discards it because drivers aren't
 expected to exit cleanly). Forward slashes in the path are
@@ -628,6 +716,23 @@ generations: `EFI_SHELL_PROTOCOL.Execute` on the modern EDK2 Shell, with
 a fallback to the EFI 1.x `SHELL_ENVIRONMENT.Execute`. It returns
 `AXL_ERR` when no shell is hosting the image at all (BDS, a driver),
 which is the case to handle — the command simply cannot run there.
+
+`axl_shell_execute` does not report the command's status, and the Shell
+cannot always say whether a command ran at all.
+`axl_shell_execute_status(cmd, &result)` runs the same line and fills an
+`AxlShellResult`: `RAN` with the command's status, `NOT_RUN` (no such
+command or file, an image that would not load, a malformed redirection),
+or `UNKNOWN`. Only a Shell started with `-nonest` can answer — there the
+line runs in the hosting Shell, and its `%lasterror%`, reset to 0 by a
+quiet `cd .` first, separates a script or pipe that ran from a command
+that never did. EDK2's default nested Shell reports 0 for a command that
+never ran, so every result there is `UNKNOWN`. `exit` is refused with
+`AXL_DENIED` (in a `-nonest` Shell it would end the Shell hosting you while
+reporting 0), and so, with `AXL_ERR`, is an empty line (a nested Shell handed one starts a new session). Two
+limits are stated in the header: a script or pipe whose last status was
+not-found reads `NOT_RUN`, and a line cut short by Ctrl-C reads as if it
+finished. The measurements behind it are in
+`docs/AXL-Test-Guest-Pool-Design.md` §2.4.
 
 The reusable primitive underneath the FV launchers is
 `axl_image_run_fv_file(name_guid, args, &exit)`, which loads + runs any
@@ -1120,6 +1225,54 @@ or embedded in an image) needs: read the blob, parse it, edit the map
 with the same typed getters and setters, serialize it, write the blob
 back. `axl_config_file_load` / `_save` are these two plus file I/O.
 
+#### OpenSSH syntax
+
+A map created with `axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH)`
+parses OpenSSH `sshd_config(5)` lines instead -- `Keyword args` or
+`Keyword=args`, quotes, `#` comments -- which is what lets `sshd` read an
+`sshd.conf` an administrator wrote for OpenSSH:
+
+```
+# sshd.conf
+Port 2222
+PasswordAuthentication no
+Banner "fs0:\banner.txt"
+RekeyLimit 1G 1h
+```
+
+Keywords compare case-insensitively and the map keeps OpenSSH's
+first-wins value, so `axl_config_file_get(cf, "port", NULL)` is `"2222"`.
+The map also records every directive in file order, repeats included,
+with its line number -- the input a caller needs to validate each
+occurrence and refuse one by `file:line`:
+
+```c
+AXL_AUTOPTR(AxlConfigFile) cf = axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH);
+AxlConfigFileError err;
+AxlStatus rc = axl_config_file_read(cf, "fs0:\\sshd.conf", &err);
+if (rc == AXL_INVALID && err.line != 0) {
+    axl_printf("sshd.conf:%zu: %s\n", err.line, err.reason);
+} else if (rc == AXL_OK) {
+    for (size_t i = 0; i < axl_config_file_entry_count(cf); i++) {
+        const AxlConfigFileEntry *e = axl_config_file_entry_at(cf, i);
+        /* e->keyword, e->argc, e->argv[], e->line */
+    }
+}
+```
+
+`axl_config_file_read()` is the reporting counterpart of `_load`:
+`AXL_NOT_FOUND` only when the volume resolved and the file is absent,
+`AXL_IO_ERROR` for anything else that stops the read (an unmapped volume,
+a directory, a failed read) -- so "missing means defaults" cannot swallow
+an unreadable file. A parse is all or nothing: a syntax error ("unterminated
+quoted string", "line too long", "missing keyword", "invalid UTF-16",
+"NUL byte") changes neither the entries nor the values.
+`axl_config_file_parse_bytes()` is the same from memory, and also accepts
+UTF-16LE with a `FF FE` BOM (what Windows Notepad writes); UTF-8 may carry
+a BOM. None of this reaches a key=value map, which behaves exactly as
+above; an OpenSSH map cannot be serialized (`_save` / `_to_string` return
+`AXL_ERR`).
+
 ## Command-Line Parsing (AxlArgs)
 
 Declarative CLI parser — the tool declares a static `AxlArgsNode`
@@ -1320,6 +1473,17 @@ static int bios_test(AxlArgs *a) {
 Same for `axl_args_user_data` — descendants inherit the nearest
 non-NULL value walking up the chain.
 
+### Was a flag given?
+
+`axl_args_is_set(a, "port")` says whether a flag or positional was given
+on the command line, as opposed to absent or only at its `default_value`.
+It is how a tool layers its own configuration file between a flag's
+default and the command line: read the file, then apply each flag only
+where `axl_args_is_set` is true. Any value counts as given -- one equal to
+the default, an explicit `--flag=false`, a repeated flag (the getters read
+its last value). It reads the same slot the getters read, so a child
+node's flag of the same name shadows the parent's.
+
 ### Error attribution
 
 Errors are prefixed with the full breadcrumb path so users know
@@ -1401,6 +1565,9 @@ AXL_AUTO_FREE char *base = axl_path_get_basename("fs0:/logs/app.log");
 
 AXL_AUTO_FREE char *dir = axl_path_get_dirname("fs0:/logs/app.log");
 // dir = "fs0:/logs"
+
+AXL_AUTO_FREE char *root = axl_path_get_dirname("fs0:/app.log");
+// root = "fs0:/" -- a volume root keeps its separator, like "/"
 
 AXL_AUTO_FREE char *ext = axl_path_get_extension("app.log");
 // ext = "log"

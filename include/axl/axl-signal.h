@@ -107,6 +107,38 @@ axl_interrupted(void);
  * Convention: rc == 0 -> EFI_SUCCESS, any other value -> EFI_ABORTED.
  * To exit with a different, exact status, see axl_set_exit_status /
  * axl_exit_status below.
+ *
+ * **From a callback while a child image runs** (an AxlLoop or event
+ * callback that fires during axl_image_run, axl_driver_start, a Shell
+ * command or a driver connect this image started), the exit is
+ * DEFERRED: the firmware will not let this image exit while the child is
+ * its current image. The callback does not return to its caller -- that
+ * one dispatch is abandoned, and nothing of its own work after the
+ * axl_exit runs -- but the loop's OTHER sources keep dispatching on later
+ * ticks until the child returns, and a second request is unwound the same
+ * way without changing the first: the FIRST request's rc and status are
+ * the ones the exit uses. The exit happens when the call that started the
+ * child returns, after that call's own cleanup, from its caller's context.
+ * A child that never returns (a sub-Shell) postpones it indefinitely. Only
+ * a callback that began after the child started, at the TPL it was called
+ * at, can be unwound. A callback already running when the child started --
+ * one that connected a controller whose binding Start then calls axl_exit
+ * -- is not unwound, because that would abandon the firmware's frames for
+ * the connect: the exit proceeds from inside it, which succeeds when this
+ * image is the firmware's current one (an application, or a driver still in
+ * its entry).
+ *
+ * **Not covered: children and events AXL cannot see.** Under
+ * AXL_ALLOW_UEFI, a child started with gBS->StartImage directly, and a
+ * callback of an event created directly through the firmware, are invisible
+ * to this. An axl_exit from a callback while such a child runs -- or from
+ * such a callback while any child runs -- tears this image down, finds that
+ * gBS->Exit fails (the child is the firmware's current image), and spins at
+ * the callback's TPL: the child is starved and the machine hangs. AXL has
+ * no way to tell beforehand (the firmware offers no "is this image current"
+ * query short of Exit itself). Start images with axl_image_run /
+ * axl_image_start / axl_driver_start and create events through AXL
+ * (AxlLoop, axl-event.h), or do not call axl_exit from such a callback.
  */
 AXL_NORETURN void
 axl_exit(int rc);

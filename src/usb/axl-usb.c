@@ -505,6 +505,37 @@ axl_usb_next(
     return &cursor;
 }
 
+int
+axl_usb_host_controller_count(
+    size_t  *count
+    )
+{
+    if (count == NULL) {
+        return AXL_INVALID;
+    }
+    *count = 0;
+
+    EFI_HANDLE *handles      = NULL;
+    size_t      handle_count = 0;
+    EFI_STATUS  status = axl_efi_call(
+        axl_bs()->LocateHandleBuffer, 5,
+        ByProtocol, &gEfiUsb2HcProtocolGuid, NULL,
+        &handle_count, &handles);
+    /* EFI_NOT_FOUND is the firmware's answer for "no such handle" --
+       a successful count of zero, not a failure to ask. */
+    if (status == EFI_NOT_FOUND) {
+        return AXL_OK;
+    }
+    if (EFI_ERROR(status)) {
+        axl_debug("USB2_HC LocateHandleBuffer failed: 0x%llx",
+                  (unsigned long long)status);
+        return AXL_ERR;
+    }
+    axl_backend_free(handles);
+    *count = handle_count;
+    return AXL_OK;
+}
+
 /* Linear scan over the entry array — typical USB enumeration is
    a few dozen entries at most, so a hash table would be overkill. */
 static Entry *

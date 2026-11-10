@@ -254,7 +254,9 @@ s9p_fnv1a(const char *s)
 
 /* Build a 9P qid (type[1] version[4] path[8], AXL_9P_QID_LEN bytes) for the
    node at `path` described by `e`. version is always 0 (not tracked in
-   v1). path is an FNV-1a hash of the export path string -- a v1 limitation
+   v1). path is an FNV-1a hash of the export path string, which Twalk keeps
+   in the spelling the filesystem stores (so two spellings of one FAT entry
+   share a qid) -- a v1 limitation
    documented here and in the phase-4 plan: it is NOT an inode number, so a
    rename changes qid.path (two qids for "the same" underlying file across a
    rename won't match) and, in principle, two distinct paths could collide.
@@ -306,6 +308,28 @@ s9p_path_append(char *out, size_t cap, const char *base, const char *name)
     size_t n = axl_strlcpy(out, joined, cap);
     axl_free(joined);
     return n < cap;
+}
+
+bool
+s9p_root_normalize(char *root, size_t cap)
+{
+    size_t len = axl_strlen(root);
+    if (len > 0 && root[len - 1] == ':') {
+        /* A bare volume ("fs0:") gains its root separator. */
+        if (len + 2 > cap) {
+            return false;
+        }
+        root[len]     = '\\';
+        root[len + 1] = '\0';
+        return true;
+    }
+    /* Drop one trailing separator unless it is the filesystem's own root:
+       the lone "/", or the one after a volume colon. */
+    if (len > 1 && (root[len - 1] == '/' || root[len - 1] == '\\')
+        && root[len - 2] != ':') {
+        root[len - 1] = '\0';
+    }
+    return true;
 }
 
 /* Move `path` up one directory using axl_path_get_dirname (separator-aware,

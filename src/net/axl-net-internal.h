@@ -14,7 +14,9 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-hash-table.h>
+#include <axl/axl-cancellable.h>
 #include <axl/axl-net.h>
+#include <axl/axl-wait.h>
 
 // ---------------------------------------------------------------------------
 // Service-binding locator — shared between TCP, UDP, and any future
@@ -154,6 +156,23 @@ int
 _axl_net_nics_build(
     AxlNic **out,    ///< [out] allocated array, release with _axl_net_nics_free
     size_t  *count   ///< [out] number of physical NICs
+);
+
+/**
+ * @brief axl_net_try_driver for an image in memory (AxlNetAutoOpts.embedded):
+ *     load @p image (raw or packed by axl-efi-pack) with @p name as its file
+ *     name, then start, connect and attribute exactly as axl_net_try_driver.
+ *
+ * @return as axl_net_try_driver; AXL_ERR (with @c found false) for a NULL
+ *     @p image or @p name, an empty @p name, or a zero @p size.
+ */
+int
+_axl_net_try_driver_image(
+    const void      *image,   ///< the driver image
+    size_t           size,    ///< bytes at @p image
+    const char      *name,    ///< its file name (identity and log)
+    void            *device_handle, ///< its LoadedImage DeviceHandle (a volume), or NULL
+    AxlNetTryResult *r        ///< [out] attempt outcome (not NULL)
 );
 
 /// Release an array from _axl_net_nics_build. NULL is a no-op.
@@ -314,16 +333,28 @@ typedef struct {
 // on Ctrl-C, AXL_ERR on internal failure.
 // ---------------------------------------------------------------------------
 
+/* The Tier 4 waits' Poll() tick. 10 ms keeps the driver-advancement hint
+   without burning CPU at the old idiom's 1 ms stall cadence. Shared with the
+   TCP close's inline wait, whose FIN_WAIT_2 grace counts these ticks. */
+#define AXL_NET_POLL_TICK_US  10000ULL
+
 /**
- * @brief Wait for a TCP4 completion event.
+ * @brief Wait for a TCP4 completion event, or for @a done_fn to say the
+ *        wait is over sooner.
  *
- * @return AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED on
- *     Ctrl-C, AXL_ERR on internal failure.
+ * @a done_fn is called with @a done_ctx after each tick; it lets a caller
+ * stop on a protocol state the firmware signals no event for (a graceful
+ * close whose FINs are exchanged, long before TIME_WAIT completes it).
+ *
+ * @return AXL_OK on event or @a done_fn true, AXL_TIMEOUT on deadline,
+ *     AXL_CANCELLED on Ctrl-C, AXL_ERR on internal failure.
  */
 AxlStatus
 _axl_tcp_wait(
     EFI_TCP4_PROTOCOL *tcp4,        ///< TCP4 protocol (polled each tick)
     EFI_EVENT          event,       ///< completion token's Event
+    AxlCondFn          done_fn,     ///< ends the wait early (NULL = event only)
+    void              *done_ctx,    ///< context for done_fn
     uint64_t           timeout_us   ///< timeout in microseconds (0 = forever)
 );
 

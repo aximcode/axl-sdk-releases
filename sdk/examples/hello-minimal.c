@@ -44,7 +44,7 @@
  * Parameter" -- measured, not guessed. So ~1 KB of bootstrap is not optional
  * for any UEFI image, minimal or not.
  *
- *   Build:  make hello-minimal        Test: test-hello-minimal-qemu.sh
+ *   Build:  scripts/axl-build.sh hello-minimal   Test: test-hello-minimal-qemu.sh
  *   Notes:  docs/AXL-Minimal-Image-Notes.md
  */
 
@@ -80,9 +80,9 @@ typedef unsigned char      U8;
 #define OFFSET_OF(T, m) __builtin_offsetof(T, m)
 
 /* OFFSETS ARE VERIFIED, NOT GUESSED. Derived with offsetof() against the
- * generated headers (see the note in the Makefile target); the first hand-
- * computed set had three of six wrong and the image triple-faulted at its
- * entry point with no diagnostic beyond a CPU dump. The _Static_asserts below
+ * generated headers; the first hand-computed set had three of six wrong and
+ * the image triple-faulted at its entry point with no diagnostic beyond a
+ * CPU dump. The _Static_asserts below
  * catch a typo in the padding; they cannot catch a spec change, which is
  * precisely the fragility this spike exists to price.
  *

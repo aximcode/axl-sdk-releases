@@ -126,6 +126,13 @@ axl_checksum_reset(
 
 /**
  * @brief Free a checksum context. NULL-safe.
+ *
+ * The whole context is zeroized before the memory is released. A digest
+ * context always holds message bytes -- the algorithm state keeps the
+ * trailing partial block of the input, and a finalized context also holds
+ * the digest and its hex spelling -- so callers hashing key material do not
+ * have to scrub it themselves. Any pointer returned by
+ * axl_checksum_get_string() is dead after this call, as before.
  */
 void
 axl_checksum_free(

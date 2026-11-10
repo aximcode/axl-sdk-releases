@@ -329,9 +329,10 @@ When the shell-params protocol isn't published (cross-volume
 launches, BDS contexts, non-Shell-2.0 launches), `axl_stdin` reads
 return EOF (0 bytes) and `axl_stdout_raw` / `axl_stderr_raw` writes
 return -1 — tools that opt in should fall back to a file argument or
-print a clear error. `axl_stderr` (text) has no such gap: it falls
-back to `gST->ConOut` when `gST->StdErr` is NULL, so diagnostics
-still land somewhere instead of going silent.
+print a clear error. `axl_stderr` (text) has no such gap: with no Shell
+handles it is the console's (below), and with no `gST->StdErr` it is
+`gST->ConOut`, so diagnostics still land somewhere instead of going
+silent.
 
 ### Standard streams and their sinks
 
@@ -340,15 +341,197 @@ still land somewhere instead of going silent.
 | `axl_stdin` | in | raw bytes (redirected) / line-cooked (interactive) | shell **StdIn** handle (`EFI_SHELL_PARAMETERS_PROTOCOL.StdIn`) — `<` / `\|`, else console line editor |
 | `axl_stdin_text()` | in | text (UTF-8, auto-sniffed) | `axl_text_stream_wrap` over `axl_stdin` — decodes the UCS-2 `\|` pipe to UTF-8 |
 | `axl_stdout` | out | text (UTF-8 in → UCS-2 out) | `gST->ConOut` — honors `>` / `>>` |
-| `axl_stderr` | out | text (UTF-8 in → UCS-2 out) | `gST->StdErr`, falling back to `gST->ConOut` when NULL — honors `2>` / `2>>` |
-| `axl_stdout_raw` | out | raw bytes | shell **StdOut** handle (direct `WriteFile`, bypasses the console) |
-| `axl_stderr_raw` | out | raw bytes | shell **StdErr** handle (direct `WriteFile`); sibling of `axl_stdout_raw` — also works in a resident shared-driver via the stdio bridge |
+| `axl_stderr` | out | text (UTF-8 in → UCS-2 out) | on the console, the console's ConOut splitter plus every StdErr-only device; otherwise `gST->StdErr` — honors `2>` / `2>>` (see *Standard error on the console*) |
+| `axl_stdout_raw` | out | raw bytes | shell **StdOut** handle (direct `WriteFile`); when that handle IS the Shell's console file, the `axl_stdout` text path instead |
+| `axl_stderr_raw` | out | raw bytes | shell **StdErr** handle (direct `WriteFile`); when that handle IS the Shell's console file, the `axl_stderr` text path instead; sibling of `axl_stdout_raw` — also works in a resident shared-driver via the stdio bridge |
 
 Diagnostic logging (`axl_log`, `axl_warning`, including the level-color
 attribute) writes to `axl_stderr`, not `axl_stdout` — so `tool > out.txt`
 captures only the tool's own stdout text, with no AXL log lines mixed in.
 A script that used to scrape AXL diagnostics out of a `>`-redirected file
 must switch to `2>`.
+
+### Standard error on the console
+
+On a terminal, stdout and stderr are one stream with one cursor: an error
+line starts where stdout left the cursor, and the next prompt starts on the
+row after it. UEFI's console is two: `gST->ConOut` and `gST->StdErr` are
+separate ConSplitter instances, each keeping its own cursor record, and the
+Shell places its prompt from ConOut's (`SetCursorPosition(0,
+ConOut->Mode->CursorRow)`). A line written to `gST->StdErr` moves the
+devices' cursors but not that record -- and where ConOut's first device is
+not a StdErr device at all (OVMF's display), not even that device's -- so the
+Shell drew its next prompt over the error lines: the teardown's
+`mem: no leaks detected`, a tool's log line.
+
+So when standard error is the console, it is written through the console's
+ConOut splitter -- the stream stdout reaches the screen through, and the
+cursor record the prompt is placed from -- and also directly to every device
+that is in the StdErr fan-out but not ConOut's (the serial terminal while a
+take-over holds the screen, a port only `ErrOut` names). Every console a
+person watches -- the display, the serial terminal, an ssh session -- shows
+the line once, in order with stdout. That holds when stdout is redirected
+too: `tool > out.txt` and `tool | other` leave the error lines on the
+screen, each on its own row, and the file or pipe gets stdout only.
+
+It is the splitter, not `gST->ConOut` itself: under the Shell,
+`gST->ConOut` is the Shell's console logger, which keeps the scroll-back,
+stops at each screenful under page break (`-b`) and on Ctrl-S to wait for a
+key, and is not written to be entered from a timer callback -- where a
+resident image's log line comes from. The logger shares the splitter's
+`Mode`, so a line written beneath it still moves the cursor record. The
+splitter is found once, at image start: the SimpleTextOut that shares `Mode`
+with the logger, which is installed on the Shell's own image handle (the
+handle carrying `EFI_SHELL_PROTOCOL`) -- still there when `>` has swapped
+`gST->ConOut` for a file. Error lines are therefore not in the Shell's
+scroll-back; they never were, as StdErr bypassed the logger too.
+
+A deliberate decision, for Unix parity: error lines now reach every ConOut
+device, including one the platform's `ErrOut` leaves out. On OVMF that is
+the display, which shows error and log lines now as a terminal shows
+stderr. A device only `ErrOut` names still gets them.
+
+"The console" is decided by identity: standard error is the console only
+when its Shell handle IS the Shell's console file (what
+`EFI_SHELL_PROTOCOL.OpenFileByName` returns for `>e`). A size probe cannot
+tell: `NUL` and an environment variable (`2>v name`) have no file size
+either, so `2> NUL` would print on the screen and `2>v` would lose the line.
+In a Shell started from the Shell, a command inherits the OUTER Shell's
+console file while `OpenFileByName` answers with the inner one's; both are
+the same static of the Shell binary, so a handle at the same offset in
+another image of the same size counts as the console too. The handle is the
+live one -- the image's own Shell StdErr, or, for a
+resident shared driver, the StdErr the CURRENT launcher lends it through the
+stdio bridge -- judged on every write, so each launcher's
+redirection applies to its own dispatch. A bridge is aimed at the interface
+the launcher dispatches through, and only the image that published that
+interface reads it: no other resident image -- a service, another shared
+driver -- is lent a launcher's handles. With no live handle at all (a
+service driver writing on its own clock, between launchers or while another
+image is dispatched into), the verdict taken when the image started
+applies: its own handle then, or its parent's -- the launcher a driver was
+loaded from, running as it starts. A resident image whose standard error
+was the console therefore keeps writing to the splitter while another
+command runs under `>` or `2>` -- a shared-driver launcher's included --
+and its lines land in no command's file (`test-stderr-row-qemu.sh`,
+`resident` and `bridge`).
+
+Otherwise the line goes to `gST->StdErr`, as it always did: under `2>`
+(which swaps `gST->StdErr` for the file, so it captures the line), and with
+nothing to compare -- no `EFI_SHELL_PARAMETERS_PROTOCOL` on the image or its
+parent (the EFI 1.x shell, a launch from the boot manager), no
+`EFI_SHELL_PROTOCOL`, no splitter found. With no `gST->StdErr`, or one the
+console tap aliased to `gST->ConOut`, everything goes to `gST->ConOut`.
+
+The AxlLog console sink and the runtime's own notices (the Ctrl-C line)
+take the same path; the pack stub, which runs before libaxl, makes the same
+choice itself (`src/pack/README.md`).
+
+### A line exactly the console's width
+
+A UEFI text console wraps the moment a character lands in its LAST column:
+EDK2's GraphicsConsole writes CR LF right there, and TerminalDxe's and
+ConSplitter's cursor records move to column 0 of the next row. A Unix
+terminal defers that wrap until the next printable character (xterm's and
+the Linux VT's "pending wrap"), so a line's own CR LF only finishes the row
+it is on. Written as it stood, a line that exactly filled a row was followed
+by an EMPTY row on the display and in an ssh session, and the serial
+terminal, whose real cursor had not wrapped, drifted a row from TerminalDxe's
+record until the Shell's next absolute cursor move showed the gap.
+
+So AXL's console writes -- stdout's, standard error's on the console, the
+log sink's; one function, `axl_text_out_lines`
+(`src/backend/native/axl-backend-native-lines.c`) -- watch for the wrap on each
+device the output reaches -- following each one's own cursor through the
+line's last character, since a narrower device wraps a line a wider one does
+not -- and write the line break that follows it to each device, as what
+leaves that device where it now stands:
+
+| device | the break after a wrap | why |
+|--------|------------------------|-----|
+| an EDK2 TerminalDxe terminal of any type but `TtyTerm` -- PC-ANSI, VT-100, VT-100+, VT-UTF8, Linux, Xterm-R6, VT400, SCO (its device path ends in that vendor node) | CR LF, then the cursor put back on the row the wrap left it on | TerminalDxe never sends its wrap down the wire, so the terminal is still in its pending wrap on the full row: the CR LF is the newline it needs -- and a serial capture keeps one line per line -- and the absolute cursor move puts TerminalDxe's record back in step with it |
+| anything else: GraphicsConsole, a `TtyTerm` terminal (TerminalDxe sends that one's wrap itself), AXL's console device (its encoder sends the wrap), a terminal driver that is not EDK2's | a space and a backspace | no motion on a console that has wrapped; a terminal still in a pending wrap is taken out of it, so the Shell's next prompt (placed with an absolute cursor move) cannot land on the full row when it is the screen's last |
+| a device the line did not wrap | the break as written | it runs a geometry of its own: in the mode OVMF boots x64 in, the display is 100 columns and the serial terminal 80, so a line of 80 wraps the terminal and not the display |
+
+When the devices disagree -- a narrower one wrapped the line, the console's
+own record (the splitter's, which copies its first device's cursor, and the
+Shell's console logger, which keeps the scroll-back at that width) did not --
+the break goes through the console as written, so the record and the
+scroll-back both end the line, and each device that had wrapped is then put
+back where its wrap left it by a cursor move alone. Where the record did
+wrap, the breaks above go to the devices one by one; either way an empty
+write through the console afterwards makes the splitter copy its first
+device's cursor again.
+
+The devices are the console splitter's -- every handle carrying the ConOut
+(or, for `gST->StdErr`, the StdErr) device tag -- only when the output
+verifiably IS that splitter: the SimpleTextOut on the system table's console
+handle, or one sharing its Mode, as the Shell's console logger does (under
+`>`, the logger is found on the handle carrying `EFI_SHELL_PROTOCOL`). Any
+other output -- AXL's console tap, which with local output off promised the
+physical devices nothing, or another firmware wrapper -- is one device of its
+own and gets the break itself; so does the one device a standard-error line
+is written to directly. An empty line after a full one
+is still exactly one empty row, everywhere.
+
+The wrap is OBSERVED, not computed from a width: the line's last character
+moved a device's cursor from a column past 0 to column 0. Anything whose
+cursor does not move never shows it, and that -- not the path taken -- is what
+keeps redirected output byte-for-byte. Standard error under `2> file`,
+`2> NUL` and `2>v name` DOES reach this writer: it is written to
+`gST->StdErr`, which the Shell has swapped for a SimpleTextOut over the
+file, `NUL` or variable, and that wrapper's `Mode` is a frozen copy of the
+console's taken when the redirect was set up, so it never wraps and gets
+every CR LF (`test-stderr-row-qemu.sh`, `wrap`: the `>` and `2>` files
+byte for byte). Standard output under `>` or `|` does not reach it: it is
+written to the Shell's handle as UCS-2. A newline written in a later call
+than its line (`axl_print(line)` then `axl_print("\n")`) is matched to the
+wrap by every cursor still standing where the wrap left it -- also when the
+line went to standard output and its newline to standard error, which share
+the console's one cursor. One thing that case does not reach: the Shell's
+scroll-back joins that full line with the next, because standard error is
+written beneath the Shell's console logger and never reaches its copy.
+The pack stub, which runs before libaxl, links the same object for its own
+lines (`src/pack/README.md`).
+
+`axl_stdout_raw` and `axl_stderr_raw` write their bytes to the Shell's
+handle untouched when it is a file, a pipe, `NUL` or a variable. When it IS
+the Shell's console file (the same identity test), they take the text path
+instead, through `axl_stdout`'s or `axl_stderr`'s sink. A writer may hand
+the bytes over in any pieces -- `cat --raw` in buffer-sized chunks, `sum -z`
+a byte at a time -- so each sink keeps a decoder: the encoding is decided by
+the first bytes (UTF-16LE when they start with its mark, as the Shell's
+pipes and files do -- `echo x | clip` then `paste` shows `x`; UTF-8
+otherwise; and, with nothing held, a later write that starts with that mark
+switches to UTF-16LE, as `cat --raw a.txt b.utf16` writes a UTF-16 file
+after a UTF-8 one -- FF FE never occurs in UTF-8) and up to three bytes of
+a character split between writes are held for the next one. Ill-formed UTF-8 -- an overlong form such as
+`C0 80`, a surrogate, a value past U+10FFFF, a byte that begins no
+character -- is U+FFFD, one per maximal subpart (Unicode 3.9: a valid
+prefix cut short is one, `E1 80 41` showing U+FFFD then `A`; each byte that
+begins no valid prefix is one), as is an unpaired UTF-16 surrogate.
+A sink's decoder belongs to one stream: a new handle, or -- in a resident
+shared driver -- a new launcher lending it a handle, starts a fresh one
+(every launcher's console handle is the same Shell file, so the handle alone
+would let one launcher's UTF-16 mode or half a character reach the next).
+Bytes still held when a decoder starts fresh, or when the image exits, are
+DROPPED, not shown as U+FFFD: they are the unfinished end of a stream that
+has ended, and the console they were bound for may no longer be its own --
+writing a replacement there would put a stray character on another
+command's output. The console file
+ignores the size it is given and prints its buffer as a NUL-terminated UCS-2
+string, so raw bytes handed to it read on past their end. The Shell handles
+themselves are read live on every call, never cached: the Shell closes a
+redirect's file when the launch command ends, and a resident image writing
+after that must not use the freed handle.
+
+A known firmware hazard, not AXL's: when a command ends, the EDK2 Shell
+(`RestoreStdInStdOutStdErr`) closes a `2>` file's console wrapper BEFORE it
+puts the original `gST->StdErr` back, so for that moment `gST->StdErr`
+points at freed memory. A writer that runs then -- a timer callback at
+`TPL_CALLBACK`, a resident image's log line taking the `gST->StdErr` path --
+touches it. Nothing in AXL can close that window; standard error on the
+console never uses `gST->StdErr`, which keeps most resident lines out of it.
 
 ### Redirect-encoding boundary
 

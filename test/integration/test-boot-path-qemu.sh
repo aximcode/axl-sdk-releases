@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=20 local-only=0
+# test-meta: arch=both needs= est=20 local-only=0 builds=boot-path-selftest guest=none
+# guest=none: the boot is the subject: BdsDxe launches
+#   \EFI\BOOT\BOOT<arch>.EFI directly (--boot-target), with no Shell.
 # test-boot-path-qemu.sh — self-relative file access with NO shell.
 #
 # BdsDxe launching \EFI\BOOT\BOOTx64.EFI directly is the one context where
@@ -43,7 +45,7 @@ case "$WHICH" in
     *) echo "usage: $0 [X64|AARCH64|both]" >&2; exit 2 ;;
 esac
 
-EXPECTED_CHECKS=7
+EXPECTED_CHECKS=8
 
 overall_fail=0
 
@@ -112,8 +114,8 @@ for arch in "${ARCHES[@]}"; do
     esac
 
     echo "=== boot-path selftest ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" \
-        ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} boot-path-selftest 2>&1 | tail -1
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" \
+        boot-path-selftest 2>&1 | tail -1
 
     # No shell anywhere: the app IS the boot loader. run-qemu.sh --boot-target
     # stages it as \EFI\BOOT\BOOT<arch>.EFI, so BdsDxe launches it directly

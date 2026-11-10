@@ -1,0 +1,2 @@
+host checks: OK
+TIMING: runner test=test-host.sh attempt=1 via=boot wall=0.800 cpu=0.700 rc=0

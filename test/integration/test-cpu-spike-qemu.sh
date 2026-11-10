@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=233 local-only=0
+# test-meta: arch=x64 needs= est=70 local-only=0 builds=cpu-spin-fixture guest=none
+# guest=none: the CPU-spike sampler's warm-up and verdict on a booted guest
+#   are the subject.
 # test-cpu-spike-qemu.sh — the CPU-spike detector actually detects.
 #
 # run-qemu.sh has had a CPU-spike sampler on by default for a long time, but
@@ -31,43 +33,7 @@
 # a peg (a threshold at/above 1.0 can never fire on a 1-vCPU guest).
 set -euo pipefail
 
-source "$(dirname "$0")/common-test.sh"
-test_parse_args "$@"
-test_setup
-
-declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
-_native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
-TEST_BUILD_DIR="$(test_build_dir)"
-
-# The spin fixture (test/integration/cpu-spin-fixture.c + its `cpu-spin-fixture`
-# make target) is shared with the CPU-burn investigation and is owned by that
-# change, not this one. SKIP loudly rather than failing if it is not present:
-# a missing fixture means "this proof could not run here", which is a different
-# statement from "the detector is broken", and conflating them would make this
-# test lie in exactly the way it exists to prevent.
-if [[ ! -f "$PROJECT_DIR/test/integration/cpu-spin-fixture.c" ]]; then
-    echo "SKIP: cpu-spin-fixture.c not present — the CPU-spike detector proof needs it."
-    echo "      (shared fixture; see test/integration/cpu-spin-fixture.c)"
-    exit 0
-fi
-
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
-    all cpu-spin-fixture 2>&1 | tail -3
-
-if [[ ! -f "$TEST_BUILD_DIR/cpu-spin-fixture.efi" ]]; then
-    echo "SKIP: cpu-spin-fixture.efi did not build — cannot prove the detector fires."
-    exit 0
-fi
-
-PASS=0; FAIL=0
-pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "  FAIL: $1"; [[ -n "${2:-}" ]] && echo "    $2"; FAIL=$((FAIL + 1)); }
-
-CPU_WARMUP=15
-CPU_SUSTAIN=2
-CPU_THRESHOLD=0.5
-SPIN_MS=32000    # must outlast the 15 s warm-up with room to sustain
-RUN_SECS=55
+source "$(dirname "$0")/lib/cpu-spike-common.sh"
 
 # run_phase <mode> — boot the fixture in <mode>, leaving the sampler's verdict
 # in TEST_CPU_SPIKE, its stderr in PHASE_WARN, its raw numbers in
@@ -83,6 +49,7 @@ run_phase() {
 echo PHASE-$mode-START
 cpu-spin-fixture.efi $mode $SPIN_MS
 echo PHASE-$mode-DONE
+reset -s
 NSH
     test_build_image
     test_build_qemu_cmd
@@ -157,42 +124,8 @@ else
          "summary was all-zero — the guest did not outlive the warm-up, so the silence proves nothing"
 fi
 
-# --- Phase 3: the spike must reach a CALLER as an exit code ----------------
-#
-# Everything above proves the sampler sees the spin and that common-test.sh
-# surfaces it as a WARN. Neither proves the thing a script actually branches
-# on: run-qemu.sh exiting non-zero. That was an untested seam --
-# test-workload-gate-qemu.sh drives run-qemu.sh directly but only ever with a
-# short non-spinning probe, so a regression that silently returned 0 here
-# would have passed the whole suite.
-#
-# Uses run-qemu.sh directly rather than the common-test.sh helpers, because
-# the exit code IS the interface under test.
-RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-spike_rc=0
-timeout 200s "$RUN_QEMU" --arch X64 --raw --timeout 70 \
-    "$TEST_BUILD_DIR/cpu-spin-fixture.efi" compute "$SPIN_MS" \
-    >/dev/null 2>&1 || spike_rc=$?
-
-if [[ "$spike_rc" == "${CPU_SPIKE_EXIT:-8}" ]]; then
-    pass "a spinning guest makes run-qemu.sh exit ${CPU_SPIKE_EXIT:-8}"
-else
-    fail "a spinning guest makes run-qemu.sh exit ${CPU_SPIKE_EXIT:-8}" \
-         "got rc=$spike_rc"
-fi
-
-# The negative control matters as much: an exit code that fires for every run
-# is not a detector. A guest that sleeps must come back clean.
-idle_rc=0
-timeout 200s "$RUN_QEMU" --arch X64 --raw --timeout 40 \
-    "$TEST_BUILD_DIR/cpu-spin-fixture.efi" idle 20000 \
-    >/dev/null 2>&1 || idle_rc=$?
-
-if [[ "$idle_rc" == "0" ]]; then
-    pass "an idle guest leaves run-qemu.sh at rc=0"
-else
-    fail "an idle guest leaves run-qemu.sh at rc=0" "got rc=$idle_rc"
-fi
+# Phase 3, run-qemu.sh's exit code, is test-cpu-spike-runqemu-qemu.sh: a
+# separate test so the two halves run in parallel.
 
 echo
 printf "cpu-spike detector: %d passed, %d failed (%s)\n" "$PASS" "$FAIL" "$TEST_ARCH"

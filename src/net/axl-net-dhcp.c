@@ -65,6 +65,18 @@ typedef struct {
     uint8_t mac[6];   ///< stable key (valid iff have) -- for the read-back
 } ConfiguredNic;
 
+/* What one bring-up may spend: an overall deadline every wait inside it is cut
+   to, and a token that ends any of those waits. Both optional: NULL (or a zero
+   deadline and no token) is the unbounded bring-up the older entry points
+   make, whose waits keep their own fixed timeouts. Firmware calls that block
+   (driver connects, the IP4Config2-free ladder's DHCP) are not waits, so
+   neither can cut them short. axl_net_auto_init_opts is the one bring-up that
+   sets them (AxlNetAutoOpts.timeout_sec / cancel). */
+typedef struct {
+    AxlCancellable *cancel;       ///< ends a wait with AXL_CANCELLED, or NULL
+    uint64_t        deadline_ms;  ///< axl_time_get_ms() limit, or 0 for none
+} NetBudget;
+
 /* axl_net_auto_init's real body, defined far below beside the rest of the DHCP
    machinery; forward-declared because axl_net_bring_up (near the top of this
    file, beside the other one-call entry points) is its other caller. @p used is
@@ -72,9 +84,9 @@ typedef struct {
    plain return. */
 static int
 auto_init_body(
-    size_t         nic_index,
-    size_t         dhcp_timeout_sec,
-    ConfiguredNic *used
+    size_t           nic_index,
+    size_t           dhcp_timeout_sec,
+    ConfiguredNic   *used
 );
 
 /* The DHCP-configure tail of auto_init_body: set the IP4Config2 DHCP policy and
@@ -85,9 +97,10 @@ auto_init_body(
    already-defaulted, non-zero @p timeout (a 0 would mean a 0-second DHCP poll). */
 static int
 net_dhcp_configure(
-    size_t         nic_index,
-    size_t         timeout,
-    ConfiguredNic *used
+    size_t           nic_index,
+    size_t           timeout,
+    ConfiguredNic   *used,
+    const NetBudget *budget
 );
 
 /* The shared static-IP SetData sequence, defined below beside the public
@@ -514,6 +527,19 @@ configured_nic_address(const ConfiguredNic *used, AxlIPv4Address *out)
     return fall_back ? axl_net_get_ip_address(out) : rc;
 }
 
+/* Every bring-up that leaves a NIC configured ends here, so a tool from before
+   UEFI 2.4 (the old EFI 1.x shell's ifconfig) sees the address too. Best
+   effort: the NIC is up whether or not the compatibility driver loads (Secure
+   Boot refuses its unsigned image, for one), and the bring-up's result says so
+   already -- so nothing here can turn success into failure. */
+static void
+net_publish_legacy_ip4cfg(void)
+{
+    if (axl_net_legacy_ip4cfg_install() != AXL_OK) {
+        axl_debug("pre-UEFI-2.4 IPv4 config protocols not published");
+    }
+}
+
 int
 axl_net_bring_up(
     size_t          nic_index,
@@ -583,6 +609,7 @@ axl_net_bring_up(
         axl_msleep(AXL_NET_STATIC_IP_SETTLE_MS);
     }
 
+    net_publish_legacy_ip4cfg();
     if (addr_out != NULL) {
         if (configured_nic_address(&used, addr_out) != AXL_OK) {
             return AXL_ERR;
@@ -653,6 +680,7 @@ static_ip_apply(
         }
     }
 
+    net_publish_legacy_ip4cfg();
     return AXL_OK;
 }
 
@@ -959,33 +987,20 @@ axl_net_get_dhcp_lease_by_mac(const uint8_t mac[6], AxlDhcpLease *out)
 // axl_net_ensure_drivers
 // ---------------------------------------------------------------------------
 
-/* Drivers tried in two phases:
+/* The NIC drivers axl_net_ensure_drivers looks for: USB-CDC ECM/NCM/RNDIS
+ * for BMC virtual NICs and USB dongles, plus Realtek/Asix vendor UNDI
+ * drivers. ~20-200 KB each, and safe to load unconditionally -- they only
+ * bind controllers they recognize.
  *
- *   Phase 1 (core): non-iPXE class drivers covering the common cases —
- *   USB-CDC ECM/NCM/RNDIS for BMC virtual NICs and USB dongles, plus
- *   Realtek/Asix vendor UNDI drivers. ~20-200 KB each. Safe to load
- *   unconditionally — they only bind controllers they recognize.
+ * NO iPXE driver is on it, and none is ever loaded as a fallback. Loading one
+ * takes the USB host controller from the firmware, so on a BMC console the
+ * virtual keyboard and the virtual-media stick -- both USB -- vanish under a
+ * tool that only wanted a NIC; it also hooks LoadImage (later .efi loads in
+ * the session fail) and arms a 5-minute watchdog. An iPXE driver loads only
+ * when a caller names it (netload -p, axl_net_try_driver).
  *
- *   Phase 2 (iPXE fallback): iPXE-derived drivers (~280-1100 KB each).
- *   Only loaded if Phase 1 didn't produce any SNP handles. Two reasons
- *   to gate iPXE this way (discovered 2026-05-04 on an AMD-EPYC server):
- *
- *   (a) iPXE's UEFI option-ROM appears to hook LoadImage in ways that
- *       break subsequent EFI image loads in the same shell session
- *       — observed as "Command Error Status: Load Error" on every
- *       fs0:\foo.efi attempt after iPXE has been resident, even on
- *       healthy hardware. Same shape as the original mkrd Load Error
- *       mystery, which also followed netinfo running iPXE.
- *
- *   (b) iPXE's efi_watchdog.c arms a 5-min boot-services watchdog
- *       continuously while it's loaded and only disarms when chaining
- *       to an OS. axl_net_ensure_drivers calls axl_watchdog_disarm()
- *       at the end as a safety net, but skipping iPXE entirely when
- *       it's not needed is cleaner.
- *
- *   Each name is silently skipped when the file isn't on any mounted
- *   volume — the cost of a miss is one file existence check per
- *   candidate. */
+ * Each name is silently skipped when the file isn't on any mounted volume --
+ * the cost of a miss is one file existence check per candidate. */
 static const char *const net_drivers_core[] = {
     "NetworkCommon.efi",
     "UsbCdcEcm.efi",
@@ -994,12 +1009,6 @@ static const char *const net_drivers_core[] = {
     "RtkUndiDxe.efi",
     "RtkUsbUndiDxe.efi",
     "AsixUsbUndiDxe.efi",
-};
-
-static const char *const net_drivers_ipxe[] = {
-    "ipxe-all.efidrv",
-    "ipxe-intel.efi",
-    "ipxe-broadcom.efi",
 };
 
 static size_t
@@ -1047,16 +1056,16 @@ load_driver_list(
         /* Inline StartImage so EFI_ALREADY_STARTED counts as success — a
          * subsequent invocation finds the driver already loaded and just
          * re-runs ConnectController below. */
-        size_t exit_data_size = 0;
-        EFI_STATUS st = axl_bs()->StartImage(
-            (EFI_HANDLE)drv, &exit_data_size, NULL);
+        EFI_STATUS st = (EFI_STATUS)axl_backend_start_image((void *)drv);
 
         if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
             axl_warning("ensure_drivers: StartImage failed for '%s': 0x%llx",
                         path, (unsigned long long)st);
             axl_driver_unload(drv);
+            axl_backend_exit_if_deferred();
             continue;
         }
+        axl_backend_exit_if_deferred();
 
         axl_debug("ensure_drivers: loaded '%s'", path);
         loaded++;
@@ -1078,7 +1087,7 @@ axl_net_ensure_drivers(void)
         return AXL_NET_DRIVERS_OK;
     }
 
-    /* Phase 1: load core (non-iPXE) drivers + ConnectController.
+    /* Load the drivers + ConnectController.
      *
      * Wire up driver bindings globally. NIC drivers register
      * DRIVER_BINDING_PROTOCOL in their entry point but only bind to
@@ -1092,37 +1101,15 @@ axl_net_ensure_drivers(void)
         sizeof(net_drivers_core) / sizeof(net_drivers_core[0]));
     axl_driver_connect(NULL);
 
-    size_t snp_after_core = net_count_snp();
-
-    /* Phase 2 (iPXE fallback): only if core drivers didn't produce
-     * any SNP handle. iPXE's UEFI driver (a) hooks LoadImage in ways
-     * that break subsequent EFI image loads in the same shell session
-     * and (b) arms a 5-min boot-services watchdog. Skipping it when
-     * unnecessary avoids both side-effects. See net_drivers_ipxe[]
-     * comment for the empirical evidence captured during development. */
-    if (snp_after_core == 0) {
-        axl_debug(
-            "ensure_drivers: no SNP after core drivers - falling back to iPXE");
-        loaded_count += load_driver_list(
-            net_drivers_ipxe,
-            sizeof(net_drivers_ipxe) / sizeof(net_drivers_ipxe[0]));
-        axl_driver_connect(NULL);
-    } else {
-        axl_debug(
-            "ensure_drivers: SNP came up via core drivers (%zu handles) - skipping iPXE",
-            snp_after_core);
-    }
-
-    /* Disarm any boot-services watchdog the loaded drivers may have
-     * armed. iPXE in particular installs a 10-second holdoff timer
-     * that re-arms a 5-minute SetWatchdogTimer continuously while it
-     * runs, and only disarms in its shutdown path when chaining to
-     * an OS (booting==true). When axl-sdk loads iPXE just for SNP
-     * binding, iPXE exits with the watchdog still armed → host
-     * resets ~5 minutes later. Verified on an AMD-EPYC server 2026-05-04
-     * (iPXE source: src/interface/efi/efi_watchdog.c). Disarming here
-     * is unconditionally safe — no axl-sdk caller of this function is
-     * relying on the watchdog being armed. */
+    /* Disarm any boot-services watchdog a loaded driver may have armed.
+     * None on the list is known to, but an iPXE resident from an earlier
+     * explicit load does: it installs a 10-second holdoff timer that
+     * re-arms a 5-minute SetWatchdogTimer continuously while it runs, and
+     * only disarms when chaining to an OS -- the host resets ~5 minutes
+     * later. Verified on an AMD-EPYC server 2026-05-04 (iPXE source:
+     * src/interface/efi/efi_watchdog.c). Disarming here is unconditionally
+     * safe -- no axl-sdk caller of this function relies on the watchdog
+     * being armed. */
     axl_watchdog_disarm();
 
     size_t snp_after = net_count_snp();
@@ -1149,15 +1136,24 @@ axl_net_ensure_drivers(void)
 
 #define AXL_NET_DRIVERS_UP_IFACE_MAX  4
 
-/* axl_net_auto_init's DHCP-completion cond — re-checks GetData on every
-   wakeup. Lives at file scope so axl_net_drivers_up's static link cond
-   isn't the only example here. */
+/* net_dhcp_configure's DHCP-completion cond: has THE IP4Config2 instance we
+   set to DHCP (@p ctx) got a station address -- re-read on every wakeup.
+
+   Per-instance, never "does ANY NIC have an address": that was the old
+   condition, and with a second NIC already up it held before the wait began,
+   so the wait returned at once and the read-back of the NIC we configured
+   found no address yet. netload then reported "no DHCP lease in 15s" after
+   ~0 s, and a NIC whose lease was milliseconds away failed whenever the guest
+   was slow (an iPXE NIC under host load). The predicate is the one the
+   read-back applies (StationAddress != 0 on this IP4Config2), so the wait and
+   the read-back cannot disagree about the same NIC. */
 static bool
 ip4cfg_addr_acquired(void *ctx)
 {
-    (void)ctx;
-    AxlIPv4Address addr;
-    return axl_net_get_ip_address(&addr) == AXL_OK;
+    static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+    uint8_t station[4] = { 0 };
+    return read_station_address((EFI_IP4_CONFIG2_PROTOCOL *)ctx, station) == AXL_OK
+        && axl_memcmp(station, zero4, 4) != 0;
 }
 
 void
@@ -1198,8 +1194,26 @@ link_is_up(void *ctx)
     return false;
 }
 
-int
-axl_net_drivers_up(void)
+/* @p cap_us, cut to what is left of @p budget; 0 when the deadline has
+   passed. */
+static uint64_t
+budget_us(const NetBudget *budget, uint64_t cap_us)
+{
+    if (budget == NULL || budget->deadline_ms == 0) {
+        return cap_us;
+    }
+    uint64_t now = axl_time_get_ms();
+    if (now >= budget->deadline_ms) {
+        return 0;
+    }
+    uint64_t left = (budget->deadline_ms - now) * 1000ULL;
+    return left < cap_us ? left : cap_us;
+}
+
+/* axl_net_drivers_up's body: the wait's own status, so auto_init stops on a
+   Ctrl-C (AXL_CANCELLED) instead of going on to DHCP. */
+static AxlStatus
+net_drivers_up(void)
 {
     /* Locate and load NIC drivers (and NetworkCommon) if SNP isn't up
      * yet. We don't care about the specific NOT_FOUND vs NO_LINK error
@@ -1219,12 +1233,17 @@ axl_net_drivers_up(void)
         NULL, NULL,
         100ULL * 1000ULL,        /* tick_us = 100 ms */
         NULL,
-        5ULL * 1000ULL * 1000ULL); /* timeout_us = 5 s */
+        5ULL * 1000ULL * 1000ULL);
     if (rc != AXL_OK) {
         axl_debug("no link detected on any NIC");
-        return AXL_ERR;
     }
-    return AXL_OK;
+    return rc;
+}
+
+int
+axl_net_drivers_up(void)
+{
+    return net_drivers_up() == AXL_OK ? AXL_OK : AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,16 +1352,19 @@ auto_init_body(size_t nic_index, size_t dhcp_timeout_sec, ConfiguredNic *used)
         }
     }
 
-    /* drivers_up returns AXL_ERR if no link came up — auto_init still
-       continues (older callers rely on the DHCP poll being attempted
-       even on no-link paths to surface a clearer error). */
-    axl_net_drivers_up();
+    /* No link is not the end -- auto_init still continues (older callers
+       rely on the DHCP poll being attempted even on no-link paths to surface
+       a clearer error). A cancelled wait is: the caller asked to stop. */
+    if (net_drivers_up() == AXL_CANCELLED) {
+        return AXL_CANCELLED;
+    }
 
-    return net_dhcp_configure(nic_index, timeout, used);
+    return net_dhcp_configure(nic_index, timeout, used, NULL);
 }
 
 static int
-net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
+net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used,
+                   const NetBudget *budget)
 {
     /*
      * Set DHCP policy via IP4Config2. We find the right handle,
@@ -1358,6 +1380,10 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
            Sets g_config_method so axl_net_last_config_method() reports it. */
         if (cfg_handles != NULL) {
             axl_free(cfg_handles);
+        }
+        /* The ladder blocks in firmware: never started past the deadline. */
+        if (budget_us(budget, 1) == 0) {
+            return AXL_TIMEOUT;
         }
         axl_debug("no IP4Config2 - trying IP4Config2-free DHCP fallback");
         /* Both ladder rungs keep have=false: they never touch IP4Config2, so
@@ -1390,6 +1416,25 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
     if (ip4cfg == NULL) {
         return AXL_ERR;
     }
+
+    /* A bounded bring-up never starts DHCP once its time is up or it has
+       been cancelled: the firmware would go on asking after the caller has
+       reported failure. */
+    if (budget != NULL && axl_cancellable_is_cancelled(budget->cancel)) {
+        return AXL_CANCELLED;
+    }
+    if (budget_us(budget, 1) == 0) {
+        return AXL_TIMEOUT;
+    }
+
+    /* The policy as found, so a bounded bring-up that fails can put it back
+       (0 = not read: nothing to restore). */
+    uint32_t old_policy  = 0;
+    size_t   policy_size = sizeof(old_policy);
+    bool     have_old    = budget != NULL
+        && axl_efi_call(ip4cfg->GetData, 4, ip4cfg, Ip4Config2DataTypePolicy,
+                        &policy_size, &old_policy) == EFI_SUCCESS
+        && policy_size == sizeof(old_policy);
 
     /* Set DHCP policy (value 1 = DHCP per UEFI spec) */
     uint32_t policy = 1;
@@ -1431,13 +1476,16 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
         }
     }
 
+    /* A deadline already passed still checks once: the condition's fast
+       path answers an address that is already there. */
+    uint64_t  wait_us = budget_us(budget, timeout * 1000ULL * 1000ULL);
     AxlStatus wait_rc = _axl_event_wait_timeout_with_tick(
         (AxlEventHandle)cfg_event,
-        ip4cfg_addr_acquired, NULL,
+        ip4cfg_addr_acquired, ip4cfg,
         NULL, NULL,
         1000ULL * 1000ULL,             /* tick_us = 1 s — same fallback cadence */
-        NULL,
-        timeout * 1000ULL * 1000ULL);  /* timeout_us */
+        budget != NULL ? budget->cancel : NULL,
+        wait_us > 0 ? wait_us : 1);    /* timeout_us */
 
     if (cfg_event_registered) {
         axl_efi_call(ip4cfg->UnregisterDataNotify, 3,
@@ -1455,8 +1503,21 @@ net_dhcp_configure(size_t nic_index, size_t timeout, ConfiguredNic *used)
         return AXL_OK;
     }
 
-    axl_debug("DHCP timeout after %zu seconds", timeout);
-    return AXL_ERR;
+    /* A bounded bring-up that gives up stops the DHCP it started: the
+       policy goes back to what it was (Static stops the asking). */
+    if (have_old && old_policy != policy) {
+        EFI_STATUS st = axl_efi_call(ip4cfg->SetData, 4, ip4cfg, Ip4Config2DataTypePolicy,
+                                     (size_t)sizeof(old_policy), &old_policy);
+        axl_debug("DHCP gave up: policy %u restored (0x%llx)", (unsigned)old_policy,
+                  (unsigned long long)st);
+    }
+    if (wait_rc == AXL_CANCELLED) {
+        axl_debug("DHCP wait cancelled");
+        return AXL_CANCELLED;
+    }
+    axl_debug("DHCP timeout after %llu seconds",
+              (unsigned long long)((wait_us + 999999ULL) / 1000000ULL));
+    return wait_rc == AXL_TIMEOUT ? AXL_TIMEOUT : AXL_ERR;
 }
 
 int
@@ -1468,7 +1529,11 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
        what the removed return-hiding macro used to enforce structurally, so keep
        it true on both sides of the call rather than only on the callee's. */
     ConfiguredNic used = { .have = false, .mac = { 0 } };
-    return auto_init_body(nic_index, dhcp_timeout_sec, &used);
+    if (auto_init_body(nic_index, dhcp_timeout_sec, &used) != AXL_OK) {
+        return AXL_ERR;
+    }
+    net_publish_legacy_ip4cfg();
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,19 +1655,39 @@ net_engine_nic(const AxlNetAutoOpts *opts, size_t *eff)
     }
 }
 
-/* Assign an address to the selected NIC WITHOUT acquiring drivers (the caller
-   already did firmware-first / a sweep): DHCP via net_dhcp_configure, or static
-   via the shared static_ip_apply, then read the address back through the same
-   registry build that configured it. AXL_ERR if the NIC can't be resolved or the
-   assignment fails. */
+/* What is left of @p budget: AXL_OK to go on, AXL_CANCELLED when its
+   cancellable fired, AXL_TIMEOUT when its deadline passed. A Ctrl-C the
+   cancellable claims (axl_cancellable_set_cancel_on_break) is seen only by a
+   wait, so a cancellable is polled with a 1 ms one: that observes a break
+   latched while a driver was loading -- the firmware call no wait covers. */
 static int
-net_engine_assign(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
-                  AxlIPv4Address *addr_out)
+net_budget_left(const NetBudget *budget)
 {
-    size_t eff;
-    if (!net_engine_nic(opts, &eff)) {
-        return AXL_ERR;   /* SEL_MAC target not present */
+    if (budget == NULL) {
+        return AXL_OK;
     }
+    if (budget->cancel != NULL
+        && (axl_cancellable_is_cancelled(budget->cancel)
+            || axl_wait_ms(budget->cancel, 1) == AXL_CANCELLED)) {
+        return AXL_CANCELLED;
+    }
+    if (budget->deadline_ms != 0 && axl_time_get_ms() >= budget->deadline_ms) {
+        return AXL_TIMEOUT;
+    }
+    return AXL_OK;
+}
+
+/* Assign an address to NIC @p eff (a list_interfaces ordinal, or
+   AXL_NET_NIC_AUTO) WITHOUT acquiring drivers (the caller already did
+   firmware-first / a sweep): DHCP via net_dhcp_configure under @p budget, or
+   static via the shared static_ip_apply, then read the address back through the
+   same registry build that configured it. AXL_OK; AXL_CANCELLED; AXL_TIMEOUT
+   when the deadline cut a DHCP wait short and it ran out; or AXL_ERR
+   (unresolvable NIC, a failed set, no lease in the DHCP's own time). */
+static int
+net_assign_on(const AxlNetAutoOpts *opts, bool is_static, size_t timeout, size_t eff,
+              const NetBudget *budget, AxlIPv4Address *addr_out)
+{
     ConfiguredNic used = { .have = false, .mac = { 0 } };
 
     if (is_static) {
@@ -1621,17 +1706,42 @@ net_engine_assign(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
         }
     } else {
         /* DHCP, retried up to dhcp_retries times for a link-up NIC that doesn't
-           lease on the first poll (0/1 == a single attempt). */
-        size_t tries = (opts->dhcp_retries > 0) ? opts->dhcp_retries : 1;
-        int rc = AXL_ERR;
+           lease on the first poll (0/1 == a single attempt) -- never past a
+           cancel or the deadline. */
+        size_t   tries   = (opts->dhcp_retries > 0) ? opts->dhcp_retries : 1;
+        uint64_t full_us = (uint64_t)timeout * 1000ULL * 1000ULL;
+        int      rc      = AXL_ERR;
         for (size_t t = 0; t < tries && rc != AXL_OK; t++) {
-            rc = net_dhcp_configure(eff, timeout, &used);
+            if (t > 0 && net_budget_left(budget) != AXL_OK) {
+                break;
+            }
+            /* A wait the deadline cut short that then timed out IS the
+               deadline, said here rather than read off the clock after: the
+               wait's own timer can fire a millisecond before the deadline,
+               which would let a sweep start that the deadline forbids. */
+            bool cut = budget_us(budget, full_us) < full_us;
+            rc = net_dhcp_configure(eff, timeout, &used, budget);
+            if (rc == AXL_CANCELLED || (rc == AXL_TIMEOUT && cut)) {
+                return rc;
+            }
         }
         if (rc != AXL_OK) {
             return AXL_ERR;
         }
     }
-    return configured_nic_address(&used, addr_out);
+    return configured_nic_address(&used, addr_out) == AXL_OK ? AXL_OK : AXL_ERR;
+}
+
+/* Assign an address to the NIC opts->nic_select resolves (the ungated path). */
+static int
+net_engine_assign(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
+                  const NetBudget *budget, AxlIPv4Address *addr_out)
+{
+    size_t eff;
+    if (!net_engine_nic(opts, &eff)) {
+        return AXL_ERR;   /* SEL_MAC target not present */
+    }
+    return net_assign_on(opts, is_static, timeout, eff, budget, addr_out);
 }
 
 /* Fill @ev's live NIC state (link_up / have_ip / ipv4) from the registry row for
@@ -1658,15 +1768,15 @@ net_event_nic_state(AxlNetDriverEvent *ev, const uint8_t *mac)
 
 /* Emit a per-driver progress event to opts->on_driver, if a hook is set. @mac is
    NULL when no NIC was attributed; otherwise the event's link/ip state is filled
-   from the registry. */
+   from the registry. @p embedded marks a driver from AxlNetAutoOpts.embedded. */
 static void
-net_sweep_emit(const AxlNetAutoOpts *opts, const char *driver,
-               AxlNetDriverOutcome outcome, const uint8_t *mac)
+net_sweep_emit_ex(const AxlNetAutoOpts *opts, const char *driver,
+                  AxlNetDriverOutcome outcome, const uint8_t *mac, bool embedded)
 {
     if (opts->on_driver == NULL) {
         return;
     }
-    AxlNetDriverEvent ev = { .driver = driver, .outcome = outcome };
+    AxlNetDriverEvent ev = { .driver = driver, .outcome = outcome, .is_embedded = embedded };
     if (mac != NULL) {
         ev.have_nic = true;
         axl_memcpy(ev.mac, mac, 6);
@@ -1675,15 +1785,26 @@ net_sweep_emit(const AxlNetAutoOpts *opts, const char *driver,
     opts->on_driver(&ev, opts->on_driver_ctx);
 }
 
-/* Run the requested reachability checks against the configured NIC @mac. True if
-   REACHABLE wasn't asked, or every configured check passes. A check with no
-   usable target (e.g. --ping-gw with no known gateway) is skipped, not failed --
-   matching netload's verify. */
-static bool
-net_verify_reachable(const AxlNetAutoOpts *opts, const uint8_t *mac)
+/* net_sweep_emit_ex for a driver that is not embedded (a file, "firmware"). */
+static void
+net_sweep_emit(const AxlNetAutoOpts *opts, const char *driver,
+               AxlNetDriverOutcome outcome, const uint8_t *mac)
 {
-    if (opts->verify != AXL_NET_VERIFY_REACHABLE) {
-        return true;
+    net_sweep_emit_ex(opts, driver, outcome, mac, false);
+}
+
+/* The installed verifier's answer for the configured NIC @mac; true with none. */
+static bool
+net_verified(const AxlNetAutoOpts *opts, const uint8_t *mac)
+{
+    return opts->verifier == NULL || opts->verifier(opts, mac);
+}
+
+bool
+axl_net_verify_reachable(const AxlNetAutoOpts *opts, const uint8_t *mac)
+{
+    if (opts == NULL) {
+        return false;
     }
     bool ok = true;
     size_t rtt = 0;
@@ -1709,6 +1830,8 @@ net_verify_reachable(const AxlNetAutoOpts *opts, const uint8_t *mac)
                 }
             }
         }
+        /* A check with no usable target (no known gateway) is skipped, not
+           failed -- matching netload's verify. */
         if (have_gw) {
             AxlIPv4Address tgt = { 0 };
             axl_memcpy(tgt.addr, gw, 4);
@@ -1726,12 +1849,502 @@ net_verify_reachable(const AxlNetAutoOpts *opts, const uint8_t *mac)
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// The link gate (AxlNetAutoOpts.link_wait_sec)
+// ---------------------------------------------------------------------------
+
+/* The NICs one gated pass may use: those the selection allows and, in a swept
+   pass, that the candidate bound (@c macs NULL in the firmware pass). */
+typedef struct {
+    const AxlNetAutoOpts *opts;
+    const uint8_t       (*macs)[6];   ///< the candidate's NICs, or NULL for any
+    size_t                nmacs;
+    bool                  embedded;   ///< the candidate is an embedded driver
+} NetGate;
+
+/* How one gated pass ended. */
+typedef enum {
+    NET_GATE_UP = 0,      ///< a NIC got an address (and verified)
+    NET_GATE_NO_LINK,     ///< no NIC it may use had a link
+    NET_GATE_NO_ADDR,     ///< a link-up NIC got no address
+    NET_GATE_NO_REACH,    ///< a link-up NIC got one but failed the verifier
+    NET_GATE_STOPPED,     ///< cancelled, or the deadline passed
+} NetGateEnd;
+
+static bool
+net_gate_allows(const NetGate *g, size_t idx, const uint8_t mac[6])
+{
+    if (g->macs != NULL) {
+        bool bound = false;
+        for (size_t k = 0; k < g->nmacs && !bound; k++) {
+            bound = axl_memcmp(g->macs[k], mac, 6) == 0;
+        }
+        if (!bound) {
+            return false;
+        }
+    }
+    switch (g->opts->nic_select) {
+        case AXL_NET_NIC_SEL_INDEX:
+            return idx == g->opts->nic_index;
+        case AXL_NET_NIC_SEL_MAC:
+            return axl_memcmp(g->opts->nic_mac, mac, 6) == 0;
+        case AXL_NET_NIC_SEL_AUTO:
+        default:
+            return true;
+    }
+}
+
+/* True when the firmware has an IP4Config2 at all (else DHCP goes down the
+   NIC-agnostic Dhcp4-SB / PXE ladder, which cannot race). */
+static bool
+net_have_ip4cfg2(void)
+{
+    void  **h = NULL;
+    size_t  n = 0;
+    bool    have = axl_protocol_enumerate("ip4-config2", &h, &n) == AXL_OK && n > 0;
+    axl_free(h);
+    return have;
+}
+
+/* The link wait's condition: a NIC the pass may use has a link. */
+static bool
+net_gate_link_up(void *ctx)
+{
+    const NetGate   *g   = (const NetGate *)ctx;
+    AxlNetInterface *ifs = NULL;
+    size_t           n   = 0;
+    bool             up  = false;
+
+    if (axl_net_list_interfaces_alloc(&ifs, &n) != AXL_OK) {
+        return false;
+    }
+    for (size_t i = 0; i < n && !up; i++) {
+        up = ifs[i].link_up && net_gate_allows(g, i, ifs[i].mac);
+    }
+    axl_free(ifs);
+    return up;
+}
+
+
+// ---------------------------------------------------------------------------
+// The DHCP race: every link-up NIC of a gated pass at once, first lease wins
+// ---------------------------------------------------------------------------
+
+/* One NIC in a gated pass's DHCP race. */
+typedef struct {
+    size_t                    idx;       ///< its list_interfaces ordinal
+    uint8_t                   mac[6];
+    EFI_IP4_CONFIG2_PROTOCOL *cfg;       ///< NULL: no IP4Config2, not racing
+    ConfiguredNic             used;      ///< for the winner's read-back
+    uint32_t                  old;       ///< its policy as found
+    bool                      have_old;  ///< @c old was read
+    bool                      out;       ///< rejected by the verifier: out of the race
+    void                     *manual;    ///< static as found: its ManualAddress, or NULL
+    size_t                    manual_sz;
+    void                     *gw;        ///< ... its Gateway list, or NULL
+    size_t                    gw_sz;
+    void                     *dns;       ///< ... its DnsServer list, or NULL
+    size_t                    dns_sz;
+} NetRacer;
+
+typedef struct {
+    NetRacer *r;
+    size_t    n;
+} NetRace;
+
+/* The race's wait condition: some NIC still in the race has an address. */
+static bool
+net_race_any_addr(void *ctx)
+{
+    const NetRace *race = (const NetRace *)ctx;
+    for (size_t k = 0; k < race->n; k++) {
+        if (race->r[k].cfg != NULL && !race->r[k].out
+            && ip4cfg_addr_acquired(race->r[k].cfg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Put @p r back as it was found, which stops its DHCP: the policy, and for a
+   NIC that was static its ManualAddress, Gateway and DnsServer, which EDK2
+   frees whenever the policy changes. Settings it had none of stay none. A
+   NIC that was already DHCP is left so. Clears @p r's snapshot, so a second
+   call does nothing. */
+static void
+net_racer_restore(NetRacer *r)
+{
+    static const uint32_t dhcp = 1;
+    if (r->cfg == NULL || !r->have_old || r->old == dhcp) {
+        return;
+    }
+    uint32_t   old = r->old;
+    EFI_STATUS st  = axl_efi_call(r->cfg->SetData, 4, r->cfg, Ip4Config2DataTypePolicy,
+                                  (size_t)sizeof(old), &old);
+    axl_debug("DHCP race: NIC %zu policy %u restored (0x%llx)", r->idx, (unsigned)old,
+              (unsigned long long)st);
+    if (r->manual != NULL) {
+        axl_efi_call(r->cfg->SetData, 4, r->cfg, Ip4Config2DataTypeManualAddress,
+                     r->manual_sz, r->manual);
+    }
+    if (r->gw != NULL) {
+        axl_efi_call(r->cfg->SetData, 4, r->cfg, Ip4Config2DataTypeGateway, r->gw_sz, r->gw);
+    }
+    if (r->dns != NULL) {
+        axl_efi_call(r->cfg->SetData, 4, r->cfg, Ip4Config2DataTypeDnsServer,
+                     r->dns_sz, r->dns);
+    }
+    r->have_old = false;
+}
+
+/* Free @p r's snapshot of its static settings. */
+static void
+net_racer_free(NetRacer *r)
+{
+    axl_backend_free(r->manual);
+    axl_backend_free(r->gw);
+    axl_backend_free(r->dns);
+    r->manual = r->gw = r->dns = NULL;
+}
+
+/* Set the DHCP policy on every racer still in the race. A racer that is
+   already DHCP gets the same policy again: EDK2 restarts a DHCP that has not
+   succeeded on a same-policy SetData, which is what a retry needs. */
+static void
+net_race_start(NetRace *race)
+{
+    static const uint32_t dhcp = 1;
+    for (size_t k = 0; k < race->n; k++) {
+        NetRacer *r = &race->r[k];
+        if (r->cfg == NULL || r->out) {
+            continue;
+        }
+        uint32_t   policy = dhcp;
+        EFI_STATUS st     = axl_efi_call(r->cfg->SetData, 4, r->cfg, Ip4Config2DataTypePolicy,
+                                         (size_t)sizeof(policy), &policy);
+        if (EFI_ERROR(st)) {
+            axl_warning("failed to set DHCP policy on NIC %zu: %llx", r->idx,
+                        (unsigned long long)st);
+        }
+    }
+}
+
+/* Take @p r into the race: read its policy, and when it is static, snapshot
+   the settings the switch to DHCP would discard. */
+static void
+net_racer_enter(NetRacer *r)
+{
+    size_t sz   = sizeof(r->old);
+    r->have_old = axl_efi_call(r->cfg->GetData, 4, r->cfg, Ip4Config2DataTypePolicy,
+                               &sz, &r->old) == EFI_SUCCESS && sz == sizeof(r->old);
+    if (r->have_old && r->old == 0) {
+        r->manual = ip4cfg_getdata(r->cfg, Ip4Config2DataTypeManualAddress, &r->manual_sz);
+        r->gw     = ip4cfg_getdata(r->cfg, Ip4Config2DataTypeGateway, &r->gw_sz);
+        r->dns    = ip4cfg_getdata(r->cfg, Ip4Config2DataTypeDnsServer, &r->dns_sz);
+    }
+}
+
+/* True while some racer is still in the race (has an IP4Config2 and was not
+   rejected): once none is, no wait or retry can produce a winner. */
+static bool
+net_race_running(const NetRace *race)
+{
+    for (size_t k = 0; k < race->n; k++) {
+        if (race->r[k].cfg != NULL && !race->r[k].out) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The first racer, in ordinal order, with an address -- or NULL. */
+static NetRacer *
+net_race_leased(NetRace *race)
+{
+    for (size_t k = 0; k < race->n; k++) {
+        NetRacer *r = &race->r[k];
+        if (r->cfg != NULL && !r->out && ip4cfg_addr_acquired(r->cfg)) {
+            return r;
+        }
+    }
+    return NULL;
+}
+
+/* DHCP on every NIC in @p up (ordinals into @p ifs) AT ONCE, under one DHCP
+   budget (@p timeout s, cut to @p budget; retried per opts->dhcp_retries), as
+   Linux's in-kernel ip=dhcp, systemd-networkd and dhcpcd do. The first NIC to
+   lease that the verifier accepts wins; a NIC it rejects is put back and
+   dropped from the race, which goes on waiting for the others in the same
+   budget. Every NIC but the winner is put back as it was found (see
+   net_racer_restore). CONFIGURING fires for each NIC before the wait.
+   Returns as net_gate_pass. */
+static NetGateEnd
+net_gate_race(const AxlNetAutoOpts *opts, size_t timeout, const NetBudget *budget,
+              const char *driver, const NetGate *g, const AxlNetInterface *ifs,
+              const size_t *up, size_t nup, AxlIPv4Address *addr_out, uint8_t mac_out[6],
+              int *rc_out)
+{
+    NetRacer *racers = axl_calloc(nup, sizeof *racers);
+    if (racers == NULL) {
+        return NET_GATE_NO_ADDR;
+    }
+    NetRace    race   = { .r = racers, .n = 0 };
+    NetGateEnd end    = NET_GATE_NO_ADDR;
+    bool       racing = false;
+
+    for (size_t k = 0; k < nup; k++) {
+        int left = net_budget_left(budget);
+        if (left != AXL_OK) {
+            *rc_out = left;
+            end     = NET_GATE_STOPPED;
+            break;
+        }
+        NetRacer *r = &racers[race.n++];
+        r->idx = up[k];
+        axl_memcpy(r->mac, ifs[up[k]].mac, 6);
+        net_sweep_emit_ex(opts, driver, AXL_NET_DRV_EV_CONFIGURING, r->mac, g->embedded);
+        axl_memcpy(mac_out, r->mac, 6);
+        r->cfg = ip4cfg_for_ex(r->idx, &r->used);
+        if (r->cfg != NULL) {
+            net_racer_enter(r);
+            racing = true;
+        }
+    }
+
+    NetRacer *win = NULL;
+    if (end != NET_GATE_STOPPED && racing) {
+        /* One event for every racer's address notification: a NIC whose
+           lease is committed wakes the wait at once; the 1 s tick re-checks
+           all of them on firmware that never signals. */
+        AxlEventHandle ev = NULL;
+        if (axl_backend_event_create(&ev) != AXL_OK) {
+            ev = NULL;
+        }
+        bool *notified = axl_calloc(race.n, sizeof *notified);
+        for (size_t k = 0; k < race.n && ev != NULL && notified != NULL; k++) {
+            NetRacer *r = &racers[k];
+            notified[k] = r->cfg != NULL
+                && axl_efi_call(r->cfg->RegisterDataNotify, 3, r->cfg,
+                                Ip4Config2DataTypeInterfaceInfo, (EFI_EVENT)ev) == EFI_SUCCESS;
+        }
+
+        size_t   tries   = (opts->dhcp_retries > 0) ? opts->dhcp_retries : 1;
+        uint64_t full_us = (uint64_t)timeout * 1000ULL * 1000ULL;
+        for (size_t t = 0; t < tries && win == NULL && end != NET_GATE_STOPPED; t++) {
+            if (t > 0) {
+                int left = net_budget_left(budget);
+                if (left != AXL_OK) {
+                    *rc_out = left;
+                    end     = NET_GATE_STOPPED;
+                    break;
+                }
+            }
+            net_race_start(&race);
+            /* ONE budget per try, however many leases the verifier rejects:
+               each wait after a reject gets only what is left of it. A wait
+               the deadline cut short that then timed out IS the deadline
+               (see net_assign_on). */
+            uint64_t try_end = axl_time_get_ms() + full_us / 1000ULL;
+            for (;;) {
+                uint64_t now  = axl_time_get_ms();
+                uint64_t left = now < try_end ? (try_end - now) * 1000ULL : 0;
+                if (left == 0) {
+                    break;
+                }
+                uint64_t  wait_us = budget_us(budget, left);
+                bool      cut     = wait_us < left;
+                AxlStatus w       = _axl_event_wait_timeout_with_tick(
+                    ev, net_race_any_addr, &race, NULL, NULL,
+                    1000ULL * 1000ULL,             /* tick_us = 1 s */
+                    budget != NULL ? budget->cancel : NULL,
+                    wait_us > 0 ? wait_us : 1);
+                if (w == AXL_CANCELLED || (w == AXL_TIMEOUT && cut)) {
+                    *rc_out = w == AXL_CANCELLED ? AXL_CANCELLED : AXL_TIMEOUT;
+                    end     = NET_GATE_STOPPED;
+                    break;
+                }
+                if (w != AXL_OK) {
+                    break;   /* this try's budget is spent */
+                }
+                /* Leases in ordinal order: the first the verifier accepts
+                   wins; each it rejects is put back and leaves the race. */
+                for (NetRacer *r = net_race_leased(&race); r != NULL && win == NULL;
+                     r = net_race_leased(&race)) {
+                    axl_memcpy(mac_out, r->mac, 6);
+                    if (net_verified(opts, r->mac)) {
+                        win = r;
+                    } else {
+                        end    = NET_GATE_NO_REACH;
+                        r->out = true;
+                        net_racer_restore(r);
+                    }
+                }
+                if (win != NULL || !net_race_running(&race)) {
+                    break;   /* a winner, or every racer rejected */
+                }
+            }
+            if (!net_race_running(&race)) {
+                break;       /* nobody left to retry: end NO_REACH now */
+            }
+        }
+
+        for (size_t k = 0; k < race.n && notified != NULL; k++) {
+            if (notified[k]) {
+                axl_efi_call(racers[k].cfg->UnregisterDataNotify, 3, racers[k].cfg,
+                             Ip4Config2DataTypeInterfaceInfo, (EFI_EVENT)ev);
+            }
+        }
+        axl_free(notified);
+        if (ev != NULL) {
+            axl_backend_event_close(ev);
+        }
+
+        if (win != NULL) {
+            axl_memcpy(mac_out, win->mac, 6);
+            if (configured_nic_address(&win->used, addr_out) == AXL_OK) {
+                g_config_method = AXL_NET_CONFIG_IP4CONFIG2;
+                end             = NET_GATE_UP;
+            } else {
+                end = NET_GATE_NO_ADDR;
+                win = NULL;   /* not a winner after all: put back below */
+            }
+        }
+    }
+    for (size_t k = 0; k < race.n; k++) {
+        if (&racers[k] != win) {
+            net_racer_restore(&racers[k]);
+        }
+        net_racer_free(&racers[k]);
+    }
+    axl_free(racers);
+    return end;
+}
+
+/* One gated pass for @p driver: wait for a link (cut to the budget), then
+   LINK_DOWN for each NIC it may use that has none, and the address step on the
+   link-up ones: DHCP on all of them at once (net_gate_race), or a static
+   address on each in ordinal order until one is up, CONFIGURING before each. @p *rc_out is
+   AXL_CANCELLED / AXL_TIMEOUT for NET_GATE_STOPPED. On NET_GATE_UP @p addr_out
+   and @p mac_out name the NIC; on NO_ADDR / NO_REACH @p mac_out names the last
+   NIC tried. */
+static NetGateEnd
+net_gate_pass(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
+              const NetBudget *budget, const char *driver, const NetGate *g,
+              AxlIPv4Address *addr_out, uint8_t mac_out[6], int *rc_out)
+{
+    AxlNetInterface *ifs = NULL;
+    size_t           n   = 0;
+
+    /* The wait runs even when no NIC this pass may use exists yet: its
+       condition lists the NICs afresh on every tick, so one whose interface
+       appears during it (a USB NIC still enumerating, the ordinal -n names)
+       is found. A pass that ends the wait with none ends without an event. */
+    uint64_t wait_us = budget_us(budget, (uint64_t)opts->link_wait_sec * 1000000ULL);
+    if (wait_us > 0) {
+        AxlStatus w = _axl_event_wait_timeout_with_tick(
+            NULL, net_gate_link_up, (void *)g, NULL, NULL,
+            100ULL * 1000ULL,             /* tick_us = 100 ms */
+            budget != NULL ? budget->cancel : NULL, wait_us);
+        if (w == AXL_CANCELLED) {
+            *rc_out = AXL_CANCELLED;
+            return NET_GATE_STOPPED;
+        }
+    }
+
+    /* Again after the wait: link states have moved. */
+    if (axl_net_list_interfaces_alloc(&ifs, &n) != AXL_OK) {
+        n = 0;
+    }
+    size_t *up  = n > 0 ? axl_calloc(n, sizeof *up) : NULL;
+    size_t  nup = 0;
+    for (size_t i = 0; i < n && up != NULL; i++) {
+        if (!net_gate_allows(g, i, ifs[i].mac)) {
+            continue;
+        }
+        if (!ifs[i].link_up) {
+            net_sweep_emit_ex(opts, driver, AXL_NET_DRV_EV_LINK_DOWN, ifs[i].mac, g->embedded);
+            continue;
+        }
+        up[nup++] = i;
+    }
+
+    NetGateEnd end = NET_GATE_NO_LINK;
+    if (nup > 0 && !is_static && net_have_ip4cfg2()) {
+        end = net_gate_race(opts, timeout, budget, driver, g, ifs, up, nup, addr_out,
+                            mac_out, rc_out);
+    } else {
+        /* Static (or DHCP with no IP4Config2, whose fallback ladder is not
+           per NIC): one NIC at a time, in ordinal order. */
+        for (size_t k = 0; k < nup; k++) {
+            size_t i    = up[k];
+            int    left = net_budget_left(budget);
+            if (left != AXL_OK) {
+                *rc_out = left;
+                end = NET_GATE_STOPPED;
+                break;
+            }
+            net_sweep_emit_ex(opts, driver, AXL_NET_DRV_EV_CONFIGURING, ifs[i].mac,
+                              g->embedded);
+            axl_memcpy(mac_out, ifs[i].mac, 6);
+            int a = net_assign_on(opts, is_static, timeout, i, budget, addr_out);
+            if (a == AXL_CANCELLED || a == AXL_TIMEOUT) {
+                *rc_out = a;
+                end = NET_GATE_STOPPED;
+                break;
+            }
+            if (a != AXL_OK) {
+                end = NET_GATE_NO_ADDR;
+                continue;
+            }
+            if (!net_verified(opts, mac_out)) {
+                end = NET_GATE_NO_REACH;
+                continue;
+            }
+            end = NET_GATE_UP;
+            break;
+        }
+    }
+    axl_free(up);
+    axl_free(ifs);
+    return end;
+}
+
+// ---------------------------------------------------------------------------
+// The SWEEP_DIR sweep
+// ---------------------------------------------------------------------------
+
 #define NET_SWEEP_MAX 64
 
 typedef struct {
-    char name[AXL_NET_DRVQ_NAME_MAX];   ///< basename (breadcrumb/quarantine/callback key)
-    char path[256];                     ///< full path handed to axl_net_try_driver
+    char        name[AXL_NET_DRVQ_NAME_MAX]; ///< basename (breadcrumb/quarantine/callback key)
+    char        path[256];               ///< full path handed to axl_net_try_driver ("" for
+                                         ///<   an embedded one)
+    const void *image;                   ///< an embedded driver's image
+    size_t      size;                    ///< bytes at @c image
+    bool        embedded;                ///< from AxlNetAutoOpts.embedded, not a file
 } NetSweepEntry;
+
+/* The volume handle of @p dir's "fsN:" prefix, or NULL (no dir, no prefix, no
+   such volume). */
+static void *
+net_dir_volume(const char *dir)
+{
+    const char *colon = dir != NULL ? axl_strchr(dir, ':') : NULL;
+    AxlVolume   vols[32];
+    size_t      n = 0;
+
+    if (colon == NULL || colon == dir || (size_t)(colon - dir) >= sizeof(vols[0].name)
+        || axl_volume_enumerate(vols, AXL_ARRAY_SIZE(vols), &n) != AXL_OK) {
+        return NULL;
+    }
+    for (size_t i = 0; i < n && i < AXL_ARRAY_SIZE(vols); i++) {
+        if (axl_strlen(vols[i].name) == (size_t)(colon - dir)
+            && axl_strncasecmp(vols[i].name, dir, (size_t)(colon - dir)) == 0) {
+            return vols[i].handle;
+        }
+    }
+    return NULL;
+}
 
 /* iPXE candidates sort AFTER every non-iPXE one (iPXE's LoadImage hook breaks
    later loads in the same session), else plain byte order for determinism. */
@@ -1749,8 +2362,9 @@ net_sweep_cmp(const void *a, const void *b)
 }
 
 /* Fill @out with the drivers to sweep, sorted iPXE-last. A NULL @dir uses the
-   default search path (axl_net_list_available_drivers, all volumes' drivers dir);
-   an explicit @dir is scanned for *.efi. Returns the count (capped at @max). */
+   multi-volume search path (axl_net_list_available_drivers, every volume's
+   drivers dir); a directory is scanned for *.efi. Returns the count (capped at
+   @max). */
 static size_t
 net_sweep_enumerate(const char *dir, NetSweepEntry *out, size_t max)
 {
@@ -1794,24 +2408,47 @@ net_sweep_enumerate(const char *dir, NetSweepEntry *out, size_t max)
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// Companion-driver co-load (AxlNetAutoOpts.deps) -- linked only by an image
+// that installs axl_net_sweep_deps_sidecar()
+// ---------------------------------------------------------------------------
+
 /* Shared driver-dependency sidecar filename (historically netload's; kept stable
-   so deployed boxes' sidecars keep working when netload rides this engine). */
+   so deployed boxes' sidecars keep working). */
 #define NET_SWEEP_DEPS_FILE   "netload-drivers.json5"
 #define NET_DEP_TRIED_MAX     16
 
-/* Co-load context for a candidate's declared dependencies (axl_driver_deps_walk
-   visitor state): the dir to load from, the crash guard, and a small
-   already-attempted set so a dependency shared by several candidates loads once. */
+/* The co-loader's operations, behind the opaque public handle: a function table,
+   so the sweep reaches the sidecar reader only through what a caller installed. */
+struct AxlNetSweepDeps {
+    void *(*open)(const AxlNetAutoOpts *opts, const char *dir, AxlAttempt *guard);
+    bool  (*is_dependency)(void *state, const char *name);
+    void  (*co_load)(void *state, const char *candidate);
+    void  (*release)(void *state, const char *winner);
+    void  (*close)(void *state);
+};
+
+/* One sweep's co-load state: the parsed sidecar, the dir to load from, the crash
+   guard, a small already-attempted set so a companion shared by several
+   candidates loads once, and the companions this sweep loaded -- resident for
+   the rest of the sweep, then unloaded (release) unless the winning driver
+   needs them, so a failed bring-up leaves nothing behind. Every companion here
+   is an image this sweep loaded itself: one already resident before it is
+   another image, and is never unloaded. */
 typedef struct {
-    const AxlNetAutoOpts *opts;   /* for the on_driver hook */
-    const char *dir;
-    AxlAttempt *guard;   /* NULL if unguarded */
-    char        tried[NET_DEP_TRIED_MAX][AXL_NET_DRVQ_NAME_MAX];
-    size_t      ntried;
-} NetDepCtx;
+    const AxlNetAutoOpts *opts;    /* for the on_driver hook */
+    const char           *dir;
+    AxlAttempt           *guard;   /* NULL if unguarded */
+    AxlDriverDeps         deps;
+    char                  tried[NET_DEP_TRIED_MAX][AXL_NET_DRVQ_NAME_MAX];
+    size_t                ntried;
+    AxlDriverHandle       held[NET_DEP_TRIED_MAX];
+    char                  held_name[NET_DEP_TRIED_MAX][AXL_NET_DRVQ_NAME_MAX];
+    size_t                nheld;
+} NetDepState;
 
 static bool
-net_dep_seen(NetDepCtx *c, const char *dep)
+net_dep_seen(NetDepState *c, const char *dep)
 {
     for (size_t i = 0; i < c->ntried; i++) {
         if (axl_strcmp(c->tried[i], dep) == 0) {
@@ -1830,7 +2467,7 @@ static bool
 net_dep_enter(const char *dep, const char *parent, void *ctx)
 {
     (void)parent;
-    NetDepCtx *c = (NetDepCtx *)ctx;
+    NetDepState *c = (NetDepState *)ctx;
     if (net_dep_seen(c, dep)) {
         return false;
     }
@@ -1841,12 +2478,13 @@ net_dep_enter(const char *dep, const char *parent, void *ctx)
 }
 
 /* axl_driver_deps_walk load hook: breadcrumb + load+start a dependency so the
-   candidate that needs it can bind. Leaves it resident on success. */
+   candidate that needs it can bind. Leaves it resident on success, held for
+   net_deps_release; one past the hold's capacity stays resident. */
 static void
 net_dep_load(const char *dep, const char *parent, void *ctx)
 {
     (void)parent;
-    NetDepCtx *c = (NetDepCtx *)ctx;
+    NetDepState *c = (NetDepState *)ctx;
     char path[256];
     axl_snprintf(path, sizeof path, "%s\\%s", c->dir, dep);
     if (c->guard != NULL) {
@@ -1858,6 +2496,11 @@ net_dep_load(const char *dep, const char *parent, void *ctx)
     if (rc == 0 && axl_driver_start(h) == 0) {
         axl_driver_connect(h);
         ok = true;
+        if (c->nheld < NET_DEP_TRIED_MAX) {
+            c->held[c->nheld] = h;
+            axl_strlcpy(c->held_name[c->nheld], dep, AXL_NET_DRVQ_NAME_MAX);
+            c->nheld++;
+        }
     } else if (h != NULL) {
         axl_driver_unload(h);
     }
@@ -1874,15 +2517,140 @@ net_dep_load(const char *dep, const char *parent, void *ctx)
     }
 }
 
-static bool
-net_sweep_dir(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
-              AxlIPv4Address *addr_out, AxlNetBringUpResult *res)
+static void *
+net_deps_open(const AxlNetAutoOpts *opts, const char *dir, AxlAttempt *guard)
 {
-    NetSweepEntry *entries = axl_calloc(NET_SWEEP_MAX, sizeof *entries);
-    if (entries == NULL) {
-        return false;
+    NetDepState *c = axl_calloc(1, sizeof *c);
+    if (c == NULL) {
+        return NULL;
     }
-    size_t n = net_sweep_enumerate(opts->sweep_dir, entries, NET_SWEEP_MAX);
+    if (axl_driver_deps_load(dir, NET_SWEEP_DEPS_FILE, "netload", &c->deps)
+            != AXL_SIDECAR_OK) {
+        axl_free(c);
+        return NULL;   /* no sidecar, or one that does not parse: sweep standalone */
+    }
+    c->opts  = opts;
+    c->dir   = dir;
+    c->guard = guard;
+    return c;
+}
+
+static bool
+net_deps_is_dependency(void *state, const char *name)
+{
+    return axl_driver_deps_is_required(&((NetDepState *)state)->deps, name);
+}
+
+static void
+net_deps_co_load(void *state, const char *candidate)
+{
+    NetDepState        *c = (NetDepState *)state;
+    AxlDriverDepVisitor v = { net_dep_enter, net_dep_load, c };
+    axl_driver_deps_walk(&c->deps, candidate, &v);
+}
+
+/* What the winner needs: every name the walk would load for it. */
+typedef struct {
+    bool  keep[NET_DEP_TRIED_MAX];   ///< parallel to NetDepState.held
+    const NetDepState *c;
+} NetDepKeep;
+
+static void
+net_dep_keep(const char *dep, const char *parent, void *ctx)
+{
+    (void)parent;
+    NetDepKeep *k = (NetDepKeep *)ctx;
+    for (size_t i = 0; i < k->c->nheld; i++) {
+        if (axl_strcmp(k->c->held_name[i], dep) == 0) {
+            k->keep[i] = true;
+        }
+    }
+}
+
+/* At the sweep's end: unload the companions it loaded, newest first (a
+   companion's own companion was loaded before it), except those @p winner
+   (the driver that brought a NIC up, or NULL for none) depends on. */
+static void
+net_deps_release(void *state, const char *winner)
+{
+    NetDepState *c = (NetDepState *)state;
+    NetDepKeep   k = { .keep = { false }, .c = c };
+
+    if (winner != NULL) {
+        AxlDriverDepVisitor v = { NULL, net_dep_keep, &k };
+        axl_driver_deps_walk(&c->deps, winner, &v);
+    }
+    for (size_t i = c->nheld; i > 0; i--) {
+        if (!k.keep[i - 1]) {
+            axl_driver_unload(c->held[i - 1]);
+        }
+    }
+    c->nheld = 0;
+}
+
+static void
+net_deps_close(void *state)
+{
+    axl_free(state);   /* AxlDriverDeps is fixed-size: nothing else to free */
+}
+
+static const AxlNetSweepDeps net_deps_sidecar = {
+    net_deps_open, net_deps_is_dependency, net_deps_co_load, net_deps_release,
+    net_deps_close,
+};
+
+const AxlNetSweepDeps *
+axl_net_sweep_deps_sidecar(void)
+{
+    return &net_deps_sidecar;
+}
+
+/* The sweep. AXL_OK when a driver brought a NIC up (res->via names it),
+   AXL_CANCELLED / AXL_TIMEOUT when the budget ended it, AXL_ERR when every
+   candidate was tried. */
+static int
+net_sweep_dir(const AxlNetAutoOpts *opts, const char *dir, bool is_static, size_t timeout,
+              const NetBudget *budget, AxlIPv4Address *addr_out, AxlNetBringUpResult *res)
+{
+    /* The order: the embedded drivers (in the caller's order), the
+       directory's (sorted), then -- iPXE's LoadImage hook breaks later loads,
+       so iPXE goes after every other candidate -- the embedded iPXE ones, then
+       the directory's. */
+    size_t         nemb    = opts->embedded != NULL ? opts->embedded_count : 0;
+    NetSweepEntry *all     = axl_calloc(nemb + NET_SWEEP_MAX, sizeof *all);
+    NetSweepEntry *entries = axl_calloc(nemb + NET_SWEEP_MAX, sizeof *entries);
+    if (all == NULL || entries == NULL) {
+        axl_free(all);
+        axl_free(entries);
+        return AXL_ERR;
+    }
+    for (size_t i = 0; i < nemb; i++) {
+        const AxlNetEmbeddedDriver *e = &opts->embedded[i];
+        if (e->name != NULL) {
+            axl_strlcpy(all[i].name, e->name, sizeof all[i].name);
+        }
+        all[i].image    = e->image;
+        all[i].size     = e->size;
+        all[i].embedded = true;
+    }
+    size_t n = nemb + net_sweep_enumerate(dir, all + nemb, NET_SWEEP_MAX);
+    size_t m = 0;
+    for (int ipxe = 0; ipxe <= 1; ipxe++) {
+        for (size_t i = 0; i < n; i++) {
+            if (axl_net_driver_is_ipxe(all[i].name) == (ipxe == 1)) {
+                entries[m++] = all[i];
+            }
+        }
+    }
+    axl_free(all);
+    /* An embedded driver is given the sweep directory's volume, as if loaded
+       from a file there, else the caller's opts->device_handle. */
+    void *vol = nemb > 0 ? net_dir_volume(dir) : NULL;
+    if (vol == NULL) {
+        vol = opts->device_handle;
+    }
+    axl_debug("sweep: %zu embedded and %zu driver(s) in %s", nemb, n - nemb,
+              dir != NULL ? dir : "every volume's drivers dir");
 
     AxlAttempt guard;
     bool guarded = (net_drvq_init(&guard) == AXL_OK);
@@ -1894,51 +2662,62 @@ net_sweep_dir(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
         axl_attempt_recover(&guard, culprit, sizeof culprit);
     }
 
-    /* Optional dependency co-load: an explicit sweep_dir's sidecar declares which
-       candidates need a companion loaded first (USB-RNDIS/CDC). The multi-volume
-       default path (sweep_dir == NULL) has no single sidecar, so deps apply only
-       to an explicit dir. */
-    NetDepCtx dep_ctx = { .opts = opts, .dir = opts->sweep_dir,
-                          .guard = guarded ? &guard : NULL, .ntried = 0 };
-    AxlDriverDeps deps = { 0 };   /* fixed-size, no cleanup */
-    bool have_deps = false;
-    if (opts->load_deps && opts->sweep_dir != NULL
-        && axl_driver_deps_load(opts->sweep_dir, NET_SWEEP_DEPS_FILE, "netload", &deps)
-               == AXL_SIDECAR_OK) {
-        have_deps = true;
+    /* Companion co-load, when installed: a single directory's sidecar declares
+       which candidates need a companion loaded first (USB-RNDIS/CDC). The
+       multi-volume search (dir == NULL) has no single sidecar. */
+    void *dep_state = NULL;
+    if (opts->deps != NULL && dir != NULL) {
+        dep_state = opts->deps->open(opts, dir, guarded ? &guard : NULL);
     }
 
-    bool won = false;
-    for (size_t i = 0; i < n && !won; i++) {
+    int rc = AXL_ERR;
+    for (size_t i = 0; i < n && rc == AXL_ERR; i++) {
         const char *name = entries[i].name;
+        bool        emb  = entries[i].embedded;
 
-        /* A dependency-only driver is co-loaded on demand, never swept as a
-           candidate -- mirror netload's candidate filter. */
-        if (have_deps && axl_driver_deps_is_required(&deps, name)) {
+        /* An embedded entry with no name, image or size cannot be loaded or
+           keyed: say so and go on (nothing touched, no breadcrumb). */
+        if (emb && (name[0] == '\0' || entries[i].image == NULL || entries[i].size == 0)) {
+            net_sweep_emit_ex(opts, name[0] != '\0' ? name : "(embedded)",
+                              AXL_NET_DRV_EV_LOAD_FAIL, NULL, true);
             continue;
         }
 
+        /* A dependency-only driver is co-loaded on demand, never swept as a
+           candidate -- mirror netload's candidate filter. An embedded driver
+           is a candidate whatever the sidecar names: the caller handed it in
+           to be tried. */
+        if (!entries[i].embedded && dep_state != NULL
+            && opts->deps->is_dependency(dep_state, name)) {
+            continue;
+        }
         if (guarded && axl_attempt_is_quarantined(&guard, name)) {
-            net_sweep_emit(opts, name, AXL_NET_DRV_EV_SKIPPED_QUAR, NULL);
+            net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_SKIPPED_QUAR, NULL, emb);
             res->drivers_quarantined++;
             continue;
         }
+        int left = net_budget_left(budget);
+        if (left != AXL_OK) {
+            rc = left;
+            break;
+        }
 
         /* Co-load declared dependencies BEFORE this candidate. */
-        if (have_deps) {
-            AxlDriverDepVisitor v = { net_dep_enter, net_dep_load, &dep_ctx };
-            axl_driver_deps_walk(&deps, name, &v);
+        if (dep_state != NULL) {
+            opts->deps->co_load(dep_state, name);
         }
 
         /* Announce the attempt BEFORE the load/connect blocks, so a UI can show
            progress and warn of a slow (USB-RNDIS) connect before it stalls. */
-        net_sweep_emit(opts, name, AXL_NET_DRV_EV_TRYING, NULL);
+        net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_TRYING, NULL, emb);
 
         if (guarded) {
             axl_attempt_begin(&guard, name);   /* durable breadcrumb BEFORE the risky load */
         }
         AxlNetTryResult tr;
-        int try_rc = axl_net_try_driver(entries[i].path, &tr);
+        int try_rc = emb ? _axl_net_try_driver_image(entries[i].image, entries[i].size, name,
+                                                     vol, &tr)
+                         : axl_net_try_driver(entries[i].path, &tr);
         if (guarded) {
             axl_attempt_end(&guard);           /* survived */
         }
@@ -1947,107 +2726,227 @@ net_sweep_dir(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
         if (try_rc != AXL_OK || tr.bound_nic_count == 0) {
             /* not found / load failed / bound no NIC -- try_driver already
                unloaded a non-binder; nothing resident to drop. */
-            net_sweep_emit(opts, name,
-                           tr.loaded ? AXL_NET_DRV_EV_NO_NIC : AXL_NET_DRV_EV_LOAD_FAIL,
-                           NULL);
+            net_sweep_emit_ex(opts, name,
+                              tr.loaded ? AXL_NET_DRV_EV_NO_NIC : AXL_NET_DRV_EV_LOAD_FAIL,
+                              NULL, emb);
             axl_free(tr.bound_nic_macs);
             continue;
         }
 
-        /* A NIC bound. Bring it online, then (if asked) require reachability. */
-        const uint8_t *first_mac = tr.bound_nic_macs[0];
-        if (net_engine_assign(opts, is_static, timeout, addr_out) != AXL_OK) {
-            net_sweep_emit(opts, name, AXL_NET_DRV_EV_LINK_NO_LEASE, first_mac);
-        } else if (!net_verify_reachable(opts, first_mac)) {
-            net_sweep_emit(opts, name, AXL_NET_DRV_EV_NO_REACH, first_mac);
+        /* A NIC bound. Bring it online, then (if asked) verify it. */
+        if (opts->link_wait_sec > 0) {
+            NetGate g = { .opts = opts, .macs = tr.bound_nic_macs,
+                          .nmacs = tr.bound_nic_count, .embedded = emb };
+            uint8_t mac[6] = { 0 };
+            int     stop   = AXL_ERR;
+            switch (net_gate_pass(opts, is_static, timeout, budget, name, &g, addr_out,
+                                  mac, &stop)) {
+                case NET_GATE_UP:
+                    net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_UP, mac, emb);
+                    rc = AXL_OK;
+                    break;
+                case NET_GATE_NO_ADDR:
+                    net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_LINK_NO_LEASE, mac, emb);
+                    break;
+                case NET_GATE_NO_REACH:
+                    net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_NO_REACH, mac, emb);
+                    break;
+                case NET_GATE_NO_LINK:
+                    net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_NO_NIC, NULL, emb);
+                    break;
+                case NET_GATE_STOPPED:
+                    rc = stop;
+                    break;
+            }
         } else {
-            net_sweep_emit(opts, name, AXL_NET_DRV_EV_UP, first_mac);
-            axl_strlcpy(res->via, name, sizeof res->via);
-            won = true;
+            const uint8_t *first_mac = tr.bound_nic_macs[0];
+            int a = net_engine_assign(opts, is_static, timeout, budget, addr_out);
+            if (a == AXL_CANCELLED || a == AXL_TIMEOUT) {
+                rc = a;
+            } else if (a != AXL_OK) {
+                net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_LINK_NO_LEASE, first_mac, emb);
+            } else if (!net_verified(opts, first_mac)) {
+                net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_NO_REACH, first_mac, emb);
+            } else {
+                net_sweep_emit_ex(opts, name, AXL_NET_DRV_EV_UP, first_mac, emb);
+                rc = AXL_OK;
+            }
         }
-        if (!won && tr.driver != NULL) {
-            /* configured-but-not-a-win -- drop this driver so the next starts clean. */
+        if (rc == AXL_OK) {
+            axl_strlcpy(res->via, name, sizeof res->via);
+        } else if (tr.driver != NULL) {
+            /* configured-but-not-a-win, or stopped -- drop this driver so the
+               next starts clean and a stopped bring-up leaves nothing behind. */
             axl_driver_unload((AxlDriverHandle)tr.driver);
         }
         axl_free(tr.bound_nic_macs);
     }
 
-    (void)have_deps;   /* AxlDriverDeps is fixed-size -- nothing to free */
+    if (dep_state != NULL) {
+        /* Companions stay resident through the sweep (a later candidate
+           reuses them); at its end, only the winner's are kept. */
+        opts->deps->release(dep_state, rc == AXL_OK ? res->via : NULL);
+        opts->deps->close(dep_state);
+    }
     axl_free(entries);
-    return won;
+    return rc;
+}
+
+/* The firmware-first pass: connect the drivers the firmware staged, then try to
+   configure, reported as the "firmware" row. AXL_OK (res->via set), AXL_CANCELLED,
+   AXL_TIMEOUT, or AXL_ERR (nothing came up). */
+static int
+net_firmware_pass(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
+                  const NetBudget *budget, AxlIPv4Address *addr, AxlNetBringUpResult *res)
+{
+    net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_TRYING, NULL);
+    axl_driver_connect(NULL);
+    _axl_net_connect_snp_handles();
+
+    if (opts->link_wait_sec > 0) {
+        NetGate g    = { .opts = opts, .macs = NULL, .nmacs = 0 };
+        uint8_t mac[6] = { 0 };
+        int     stop = AXL_ERR;
+        switch (net_gate_pass(opts, is_static, timeout, budget, "firmware", &g, addr,
+                              mac, &stop)) {
+            case NET_GATE_UP:
+                net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_UP, mac);
+                axl_strlcpy(res->via, "firmware", sizeof res->via);
+                return AXL_OK;
+            case NET_GATE_NO_ADDR:
+                net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_LINK_NO_LEASE, mac);
+                return AXL_ERR;
+            case NET_GATE_NO_REACH:
+                net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_NO_REACH, mac);
+                return AXL_ERR;
+            case NET_GATE_NO_LINK:
+                net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_NO_NIC, NULL);
+                return AXL_ERR;
+            case NET_GATE_STOPPED:
+            default:
+                return stop;
+        }
+    }
+
+    int a = net_engine_assign(opts, is_static, timeout, budget, addr);
+    if (a == AXL_CANCELLED || a == AXL_TIMEOUT) {
+        return a;
+    }
+    if (a != AXL_OK) {
+        net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_NO_NIC, NULL);
+        return AXL_ERR;
+    }
+    AxlNetBringUpResult fw = { 0 };
+    net_result_identify(&fw, addr->addr);
+    const uint8_t *fwmac = fw.have_nic ? fw.mac : NULL;
+    if (!net_verified(opts, fwmac)) {
+        /* Configured but unreachable -- report it and keep looking. */
+        net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_NO_REACH, fwmac);
+        return AXL_ERR;
+    }
+    net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_UP, fwmac);
+    axl_strlcpy(res->via, "firmware", sizeof res->via);
+    return AXL_OK;
+}
+
+/* Room for the default sweep directory axl_net_driver_dir() names. */
+#define NET_DRIVER_DIR_MAX  512
+
+/* The validated request's budget: NULL keeps the unbounded bring-up exactly as
+   it was (no policy restore, no break polling). */
+static const NetBudget *
+net_budget_init(const AxlNetAutoOpts *opts, NetBudget *budget)
+{
+    budget->cancel      = opts->cancel;
+    budget->deadline_ms = opts->timeout_sec > 0
+                              ? axl_time_get_ms() + (uint64_t)opts->timeout_sec * 1000ULL
+                              : 0;
+    return (budget->cancel != NULL || budget->deadline_ms != 0) ? budget : NULL;
+}
+
+/* Acquire drivers per opts->driver_strategy and configure, after firmware-first
+   did not satisfy the request. AXL_OK (@p res->via set), AXL_ERR, AXL_CANCELLED or
+   AXL_TIMEOUT. */
+static int
+net_acquire(const AxlNetAutoOpts *opts, bool is_static, size_t timeout,
+            const NetBudget *budget, AxlIPv4Address *addr, AxlNetBringUpResult *res)
+{
+    int rc = net_budget_left(budget);
+    if (rc != AXL_OK) {
+        return rc;
+    }
+    if (opts->driver_strategy == AXL_NET_DRV_SWEEP_DIR) {
+        /* NULL: the stick's own drivers directory when it has one, else every
+           volume's drivers\<arch>. */
+        char        defdir[NET_DRIVER_DIR_MAX];
+        const char *dir = opts->sweep_dir;
+        if (dir == NULL && axl_net_driver_dir(defdir, sizeof defdir) == AXL_OK) {
+            dir = defdir;
+        }
+        return net_sweep_dir(opts, dir, is_static, timeout, budget, addr, res);
+    }
+    if (opts->driver_strategy == AXL_NET_DRV_CURATED) {
+        axl_net_ensure_drivers();
+        _axl_net_connect_snp_handles();
+        rc = net_engine_assign(opts, is_static, timeout, budget, addr);
+        if (rc == AXL_OK) {
+            axl_strlcpy(res->via, "curated", sizeof res->via);
+        }
+        return rc;
+    }
+    return AXL_ERR;   /* AXL_NET_DRV_FIRMWARE_ONLY: firmware-first was the whole job */
 }
 
 int
 axl_net_auto_init_opts(const AxlNetAutoOpts *opts, AxlNetBringUpResult *out)
 {
     AxlNetBringUpResult res = { 0 };
+    AxlIPv4Address      addr;
+    int                 rc  = AXL_ERR;
 
-    if (opts == NULL) {
-        goto fail;
-    }
-
-    /* Validate the static request BEFORE any firmware bring-up, so a malformed
-       static config is rejected even when some NIC is already up (never answer
-       "online" via a stray DHCP lease to a caller that asked for static). */
-    bool is_static = (opts->ip_mode == AXL_NET_IP_STATIC);
-    if (is_static && (opts->static_ipv4 == NULL || opts->static_mask == NULL)) {
-        goto fail;
-    }
-    size_t timeout = (opts->dhcp_timeout_sec > 0) ? opts->dhcp_timeout_sec : 10;
-    AxlIPv4Address addr;
-
-    /* Firmware-first (default): bind NIC drivers the firmware already staged, then
-       try to configure. On a server whose vendor ships onboard NIC drivers this
-       alone brings a NIC up with nothing loaded. Reported as the "firmware" row.
-       A caller that ran its own firmware-first pass sets skip_firmware_first. */
-    if (!opts->skip_firmware_first) {
-        axl_driver_connect(NULL);
-        _axl_net_connect_snp_handles();
-        if (net_engine_assign(opts, is_static, timeout, &addr) == AXL_OK) {
-            AxlNetBringUpResult fw = { 0 };
-            net_result_identify(&fw, addr.addr);
-            const uint8_t *fwmac = fw.have_nic ? fw.mac : NULL;
-            if (net_verify_reachable(opts, fwmac)) {
-                net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_UP, fwmac);
-                axl_strlcpy(res.via, "firmware", sizeof res.via);
-                goto online;
-            }
-            /* Configured but unreachable -- report it and keep looking. */
-            net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_NO_REACH, fwmac);
-        } else {
-            net_sweep_emit(opts, "firmware", AXL_NET_DRV_EV_NO_NIC, NULL);
-        }
-    }
-
-    /* Firmware-first didn't satisfy the request -- acquire more drivers. */
-    if (opts->driver_strategy == AXL_NET_DRV_SWEEP_DIR) {
-        if (net_sweep_dir(opts, is_static, timeout, &addr, &res)) {
-            goto online;   /* res.via set to the winning driver */
-        }
-    } else if (opts->driver_strategy == AXL_NET_DRV_CURATED) {
-        axl_net_ensure_drivers();
-        _axl_net_connect_snp_handles();
-        if (net_engine_assign(opts, is_static, timeout, &addr) == AXL_OK) {
-            axl_strlcpy(res.via, "curated", sizeof res.via);
-            goto online;
-        }
-    }
-    /* AXL_NET_DRV_FIRMWARE_ONLY: the firmware-first attempt was the whole job. */
-
-fail:
-    if (out != NULL) {
-        *out = res;   /* zeroed: online=false */
-    }
-    return AXL_ERR;
-
-online:
-    res.online = true;
-    axl_memcpy(res.ipv4, addr.addr, 4);
-    net_result_identify(&res, addr.addr);
     if (out != NULL) {
         *out = res;
     }
-    return AXL_OK;
+    /* Validate BEFORE any firmware bring-up, so a malformed request is rejected
+       even when some NIC is already up (never answer "online" via a stray DHCP
+       lease to a caller that asked for static). */
+    if (opts == NULL || opts->timeout_sec > AXL_NET_AUTO_TIMEOUT_MAX_SEC) {
+        return AXL_ERR;
+    }
+    bool is_static = (opts->ip_mode == AXL_NET_IP_STATIC);
+    if (is_static && (opts->static_ipv4 == NULL || opts->static_mask == NULL)) {
+        return AXL_ERR;
+    }
+    if (opts->cancel != NULL && axl_cancellable_is_cancelled(opts->cancel)) {
+        return AXL_CANCELLED;
+    }
+    size_t           timeout = (opts->dhcp_timeout_sec > 0) ? opts->dhcp_timeout_sec : 10;
+    NetBudget        budget;
+    const NetBudget *bp = net_budget_init(opts, &budget);
+
+    /* Firmware-first (default): on a server whose vendor ships onboard NIC
+       drivers this alone brings a NIC up with nothing loaded. A caller that ran
+       its own firmware-first pass sets skip_firmware_first. */
+    if (!opts->skip_firmware_first) {
+        rc = net_firmware_pass(opts, is_static, timeout, bp, &addr, &res);
+    }
+    if (rc == AXL_ERR) {
+        rc = net_acquire(opts, is_static, timeout, bp, &addr, &res);
+    }
+
+    if (rc == AXL_OK) {
+        res.online = true;
+        axl_memcpy(res.ipv4, addr.addr, 4);
+        net_result_identify(&res, addr.addr);
+        net_publish_legacy_ip4cfg();
+    } else if (rc == AXL_ERR && bp != NULL && bp->deadline_ms != 0
+               && axl_time_get_ms() >= bp->deadline_ms) {
+        rc = AXL_TIMEOUT;   /* nothing came up, and the deadline is why the search ended */
+    }
+    if (out != NULL) {
+        *out = res;
+    }
+    return rc;
 }
 
 // ---------------------------------------------------------------------------

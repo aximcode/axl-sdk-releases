@@ -123,8 +123,8 @@ check $? "extracts to axl-sdk-$NEW_VER/"
 [[ "$(readlink "$PREFIX/axl-sdk" 2>/dev/null)" == "axl-sdk-$NEW_VER" ]]
 check $? "current symlink points at axl-sdk-$NEW_VER"
 
-[[ -L "$BIN/axl" && -L "$BIN/axl-cc" && ! -e "$BIN/pe-set-debug" ]]
-check $? "links axl + axl-cc, not pe-set-debug"
+[[ -L "$BIN/axl" && -L "$BIN/axl-cc" && ! -e "$BIN/pe-set-debug" && ! -e "$BIN/axl-efi-pack" ]]
+check $? "links axl + axl-cc, not pe-set-debug or axl-efi-pack"
 
 run_installer "$WORK/new-ht.log" --host-tools --base-url "file://$NEW_REL" \
     --prefix "$PREFIX" --bin-dir "$BIN"

@@ -112,13 +112,119 @@ axl_shell_launch_fv(
  *
  * @return AXL_OK if the command was handed to a shell and executed
  *     (regardless of the command's own exit status, which is not
- *     surfaced); AXL_ERR if neither shell protocol is present (this image
+ *     surfaced -- @ref axl_shell_execute_status reports it, and whether
+ *     the command ran at all); AXL_ERR if neither shell protocol is present (this image
  *     was not launched from a UEFI shell), @p cmd is NULL, or the UTF-8 to
  *     UCS-2 conversion failed.
  */
 int
 axl_shell_execute(
     const char *cmd   ///< shell command line (UTF-8)
+);
+
+/**
+ * @brief What is known about a command line handed to the Shell.
+ *
+ * Zero is AXL_SHELL_OUTCOME_UNKNOWN, so a result nobody filled in never reads
+ * as "ran, succeeded" -- the confusion this API exists to prevent.
+ */
+typedef enum {
+    AXL_SHELL_OUTCOME_UNKNOWN = 0,  ///< the Shell cannot say whether it ran; `status` is only what it reported
+    AXL_SHELL_OUTCOME_RAN,          ///< it ran; `status` is its exit status
+    AXL_SHELL_OUTCOME_NOT_RUN       ///< the Shell did not run it (see @ref axl_shell_execute_status)
+} AxlShellOutcome;
+
+/**
+ * @brief The result of @ref axl_shell_execute_status.
+ */
+typedef struct {
+    AxlShellOutcome outcome;        ///< what is known about the run
+    uint64_t        status;         ///< the status the Shell reported, as `%lasterror%` holds it: an internal
+                                    ///< command's Shell status with the UEFI error bit (`goto` outside a script:
+                                    ///< 0x800000000000000E), or an application's status as the Shell truncates it
+                                    ///< to 32 bits -- so EFI_ABORTED from an app reads 0x15, and AXL's own entry
+                                    ///< code narrows a negative int return (-1 is 0xFF)
+    bool            nonest;         ///< the Shell ran the line itself (`nonesting` read `True`)
+    bool            reset_ok;       ///< `%lasterror%` was reset to 0 before the line ran (see below)
+    bool            status_written; ///< `Execute` wrote its StatusCode out-parameter
+    uint64_t        execute_status; ///< `Execute`'s own return (a UEFI status)
+} AxlShellResult;
+
+/**
+ * @brief Run a Shell command line and report whether it ran, and its status.
+ *
+ * Runs @p cmd as @ref axl_shell_execute does -- the whole line through the
+ * hosting Shell, so redirection, pipes, `%var%`, aliases and scripts behave
+ * as typed at the prompt -- and fills @p out with what can be known about it.
+ *
+ * **Only a Shell started with `-nonest` can answer.** EDK2's default Shell
+ * runs each `Execute` in a nested `Shell.efi`, which reports 0 for a command
+ * that never ran and the bare load error for an image that would not load
+ * (0x3 for a wrong-architecture `.efi` -- the same as an application
+ * returning 3). There every result is AXL_SHELL_OUTCOME_UNKNOWN with
+ * `status` holding what was reported. The EFI 1.x shell reports the command's
+ * status and a dispatch failure through one value, so nothing there can be
+ * separated: UNKNOWN, with `status` and `execute_status` 0, and AXL_OK even
+ * when its `Execute` failed. The
+ * Shell's `nonesting` variable is read on every call, so `set nonesting
+ * False` makes later calls nested.
+ *
+ * In a `-nonest` Shell the line runs in that Shell, and its `%lasterror%` is
+ * read back afterwards. That variable cannot be written, so it is first reset
+ * to 0 by a `cd .` whose console output is discarded -- skipped, and
+ * `reset_ok` false, when there is no current directory or an alias named `cd`
+ * exists; and `reset_ok` is false too if it does not read 0 afterwards (the
+ * current directory was removed). The reset touches the current directory's
+ * filesystem once per call. Then:
+ *
+ * | the Shell                                                     | outcome | status        |
+ * |---------------------------------------------------------------|---------|---------------|
+ * | wrote a status, `Execute` succeeded                           | RAN     | that status   |
+ * | wrote a status WITH the UEFI error bit, `Execute` failed (a failing script-only command: `goto` outside a script) | RAN | that status |
+ * | wrote a status WITHOUT the error bit, `Execute` failed (an image that would not load: wrong architecture, corrupt, refused) | NOT_RUN | the load error |
+ * | wrote nothing, `Execute` failed (a malformed redirection, an unmapped drive, out of resources) | NOT_RUN | `%lasterror%` |
+ * | wrote nothing, reset not OK (or `%lasterror%` unreadable)      | UNKNOWN | `%lasterror%`, or 0 if unreadable |
+ * | wrote nothing, `%lasterror%` is 0xE (no such command, file or `.efi`; a directory) | NOT_RUN | 0xE |
+ * | wrote nothing otherwise (a script, a pipe, a drive change, a comment line) | RAN | `%lasterror%` |
+ *
+ * The 0xE row cannot tell a line that never ran from a script or pipe whose
+ * LAST status was 0xE -- a final command not found, an application returning
+ * 14, `exit /b 14`. Those read NOT_RUN: the error is in the safe direction, a
+ * failure reported and never a success invented.
+ *
+ * **A line cut short by Ctrl-C reads as if it finished**: a script stops at
+ * the break, but the Shell consumes the break before `Execute` returns and
+ * reports the last completed command's status -- RAN, often 0. A caller that
+ * must not trust such a line has to know about the break itself.
+ *
+ * **`exit` is refused** (AXL_DENIED, nothing run): a line whose first word is
+ * `exit` as the Shell parses that word -- quoted, partly quoted (`ex"it"`) or
+ * escaped (`e^xit`) -- or an alias for it. In a `-nonest`
+ * Shell it would end the Shell hosting the caller -- and before that cut every
+ * later script short -- while reporting status 0. Only the first word is
+ * checked, before the Shell expands it: an `exit` later in a pipe, in a
+ * script the line runs, or a `%var%` holding `exit` still runs. Measured
+ * (both arches): the line reports RAN 0, every later script stops after
+ * its first line still reporting RAN 0, and the Shell exits when the caller
+ * returns -- nothing undoes it. A caller running lines it did not write (an
+ * agent, `sshd` exec) must detect it afterwards: `tools/agent.c` runs a
+ * canary script after each line (sets a variable to 1, then 2: reading 1
+ * means only the first line ran).
+ *
+ * An empty or all-whitespace @p cmd is refused too: a nested Shell handed one
+ * starts an interactive session, which runs `startup.nsh` again.
+ *
+ * @return AXL_OK when the Shell was asked (read @p out for what happened);
+ *     AXL_DENIED, with @p out untouched, if @p cmd is an `exit` (the line
+ *     itself is refused, so a caller serving others can say so); AXL_ERR,
+ *     with @p out untouched, if @p cmd or @p out is NULL, @p cmd is empty or
+ *     whitespace, the UTF-8 to UCS-2 conversion failed, or no Shell hosts
+ *     this image.
+ */
+AXL_WARN_UNUSED int
+axl_shell_execute_status(
+    const char     *cmd,   ///< shell command line (UTF-8)
+    AxlShellResult *out    ///< [out] what is known about the run
 );
 
 /**

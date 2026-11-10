@@ -11,18 +11,18 @@
 
 AXL_LOG_DOMAIN("netload");
 
-#if defined(__aarch64__)
-#  define NETLOAD_ARCH "aa64"
-#elif defined(__x86_64__)
-#  define NETLOAD_ARCH "x64"
-#else
-#  error "unsupported arch"
-#endif
-
 #define NETLOAD_NS       "netload"
 #define NETLOAD_NAME_MAX 64        /* driver basename bound */
 #define NETLOAD_Q_MAX    1024      /* quarantine var bound (bytes) */
 #define NETLOAD_LOG_MAX  2048      /* result-log var bound (bytes) */
+/* One result-log record, NUL included. The longest is the SWEEP summary:
+   its fixed text, a driver name as long as a bound driver's file path, and
+   five size_t counters of up to 20 digits. Every other record is a short
+   tag and one name. */
+#define NETLOAD_SWEEP_FMT \
+    "SWEEP %s lease=%s link=%zu noreach=%zu nonic=%zu fail=%zu skip=%zu"
+#define NETLOAD_LOG_LINE_MAX \
+    (sizeof NETLOAD_SWEEP_FMT + sizeof "no-lease" + AXL_NET_DRIVER_NAME_MAX + 5 * 20)
 #define NETLOAD_CFG_MAX  256       /* saved Config var bound (bytes) */
 #define NETLOAD_NV_FLAGS (AXL_NV_PERSISTENT | AXL_NV_BOOT)
 
@@ -54,7 +54,7 @@ typedef struct {
     bool          sel_by_mac;
     uint8_t       sel_mac[6];
     size_t        sel_nic;
-    uint32_t      dhcp_timeout;   /* seconds; 0 -> tool default 15 */
+    uint32_t      dhcp_timeout;   /* seconds; 0 -> AXL_NET_DHCP_ATTEMPT_SEC */
     uint32_t      retries;        /* >=1 */
     const char   *ping;           /* NULL = none */
     bool          ping_gw;
@@ -92,7 +92,7 @@ static const AxlArgDesc flags[] = {
     { .name = "clear", .short_name = 'c', .type = AXL_ARG_BOOL,
       .help = "Clear all netload NVRAM state and exit" },
     { .name = "dir",   .short_name = 'D', .type = AXL_ARG_STRING,
-      .help = "Override the driver directory (default: <boot-vol>:\\drivers\\<arch>)" },
+      .help = "Override the driver directory (default: drivers\\<arch> beside netload.efi)" },
     { .name = "no-deps", .short_name = 'N', .type = AXL_ARG_BOOL,
       .help = "Probe each driver standalone; do not auto-load dependency drivers" },
     { .name = "connect", .short_name = 'f', .type = AXL_ARG_BOOL,
@@ -152,6 +152,8 @@ static const AxlArgDesc flags[] = {
       .help = "dump SNP handle order vs IP4Config2 handle order (DHCP index diag)" },
     { .name = "_fwrow", .type = AXL_ARG_STRING, .hidden = true,
       .help = "print the firmware summary-row detail for N link-down NICs and exit" },
+    { .name = "_fwwin", .type = AXL_ARG_STRING, .hidden = true,
+      .help = "report a firmware-first win by driver <name> (summary or --json, SWEEP record) and exit" },
     { .name = "_drvresolve", .type = AXL_ARG_BOOL, .hidden = true,
       .help = "trace how each bound NIC's owning driver resolves (run after -a)" },
     {0}
@@ -223,7 +225,7 @@ log_append_fmt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void
 log_append_fmt(const char *fmt, ...)
 {
-    char line[128];
+    char line[NETLOAD_LOG_LINE_MAX];
     va_list ap;
     va_start(ap, fmt);
     axl_vsnprintf(line, sizeof line, fmt, ap);
@@ -282,7 +284,7 @@ dump_log_table(const char *log)
         const char *nl = axl_strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : axl_strlen(p);
         if (len > 0) {
-            char line[128];
+            char line[NETLOAD_LOG_LINE_MAX];   /* the records log_append_fmt wrote */
             size_t n = len < sizeof line - 1 ? len : sizeof line - 1;
             axl_memcpy(line, p, n);
             line[n] = '\0';
@@ -464,8 +466,11 @@ cmd_clear(void)
     return 0;
 }
 
-/* Resolve the driver directory: --dir override, else
-   <boot-vol>:\drivers\<arch>, else fallback <boot-vol>:\drivers. */
+/* Resolve the driver directory: --dir override, else (R28) the library's rule
+   (axl_net_driver_dir) -- drivers\<arch>, then drivers, beside netload.efi,
+   then the volume root's \drivers\<arch>. When none exists it names the
+   volume's \drivers, so the "no drivers found" message names the place a flat
+   stick would use. */
 static int
 resolve_driver_dir(AxlArgs *a, char *out, size_t cap)
 {
@@ -474,10 +479,8 @@ resolve_driver_dir(AxlArgs *a, char *out, size_t cap)
         axl_strlcpy(out, override, cap);
         return AXL_OK;
     }
-    if (axl_app_boot_path("\\drivers\\" NETLOAD_ARCH, out, cap) == AXL_OK) {
-        return AXL_OK;
-    }
-    return axl_app_boot_path("\\drivers", out, cap);
+    int rc = axl_net_driver_dir(out, cap);
+    return (rc == AXL_OK || rc == AXL_NOT_FOUND) ? AXL_OK : AXL_ERR;
 }
 
 /* Alphabetical, EXCEPT any candidate axl_net_driver_is_ipxe recognizes
@@ -672,7 +675,8 @@ typedef enum {
    outcome + the representative NIC it saw (if any); cmd_auto also synthesizes
    `skipped` rows for quarantined drivers it didn't probe. */
 typedef struct {
-    char        name[NETLOAD_NAME_MAX];
+    char        name[AXL_NET_DRIVER_NAME_MAX];   /* a staged basename, or a bound
+                                                    driver's whole file path */
     ProbeResult result;
     bool        skipped;        /* quarantined -> not probed (result unused) */
     bool        is_firmware;    /* the firmware-first probe's row, not a staged driver */
@@ -910,7 +914,7 @@ static ProbeResult
 bring_up_and_verify(size_t nic_index, const NetloadCfg *c, const char *drv_name,
                     DriverReport *rep)
 {
-    uint32_t timeout = c->dhcp_timeout ? c->dhcp_timeout : 15;
+    uint32_t timeout = c->dhcp_timeout ? c->dhcp_timeout : AXL_NET_DHCP_ATTEMPT_SEC;
     const uint8_t *ip   = c->st.have ? c->st.ip   : NULL;
     const uint8_t *mask = c->st.have ? c->st.mask : NULL;
     const uint8_t *gw   = (c->st.have && c->st.have_gw) ? c->st.gw : NULL;
@@ -1023,7 +1027,7 @@ probe_firmware_stack(const NetloadCfg *c, DriverReport *rep)
 {
     if (rep != NULL) {
         axl_memset(rep, 0, sizeof *rep);
-        axl_strlcpy(rep->name, "(firmware)", NETLOAD_NAME_MAX);
+        axl_strlcpy(rep->name, "(firmware)", sizeof rep->name);
         axl_strlcpy(rep->layer, "-", sizeof rep->layer);
         rep->is_firmware = true;
         rep->result = PR_NO_NIC;   /* placeholder until a link-up NIC is examined */
@@ -1086,7 +1090,7 @@ probe_firmware_stack(const NetloadCfg *c, DriverReport *rep)
         axl_memcpy(cand.mac, ifs[i].mac, 6);
         cand.link_up = true;
         axl_strlcpy(cand.layer, haved ? di.layer : "-", sizeof cand.layer);
-        axl_strlcpy(cand.name, drv, NETLOAD_NAME_MAX);
+        axl_strlcpy(cand.name, drv, sizeof cand.name);
         cand.result = br;
 
         int rank = (br == PR_OK) ? 3 : (br == PR_NO_REACH) ? 2 : 1;
@@ -1107,7 +1111,7 @@ probe_firmware_stack(const NetloadCfg *c, DriverReport *rep)
         }
         axl_printf("  link is up but no DHCP lease in %us (data plane may be stalled;\n"
                    "  try 'rndisfix' for an RNDIS NIC)\n",
-                   c->dhcp_timeout ? c->dhcp_timeout : 15);
+                   c->dhcp_timeout ? c->dhcp_timeout : AXL_NET_DHCP_ATTEMPT_SEC);
         log_append_fmt("LINK_NO_DHCP %s", drv);
     }
     /* No usable firmware NIC. If any were enumerated they were all link-down
@@ -1152,7 +1156,7 @@ probe_driver(const char *dir, const char *name, const NetloadCfg *c, DriverRepor
 {
     if (rep != NULL) {
         axl_memset(rep, 0, sizeof *rep);
-        axl_strlcpy(rep->name, name, NETLOAD_NAME_MAX);
+        axl_strlcpy(rep->name, name, sizeof rep->name);
         axl_strlcpy(rep->layer, "-", sizeof rep->layer);
     }
 
@@ -1266,7 +1270,7 @@ probe_driver(const char *dir, const char *name, const NetloadCfg *c, DriverRepor
             result = PR_NO_REACH;   /* already logged (NOREACH) inside bring_up_and_verify */
             continue;
         }
-        uint32_t tmo = c->dhcp_timeout ? c->dhcp_timeout : 15;
+        uint32_t tmo = c->dhcp_timeout ? c->dhcp_timeout : AXL_NET_DHCP_ATTEMPT_SEC;
         if (is_rndis_like(name)) {
             axl_printf("  link is up but no DHCP lease in %us -- the data plane may be\n"
                        "  stalled (the EDK2 UsbRndis packet-filter bug). Try 'rndisfix',\n"
@@ -1436,7 +1440,7 @@ persist_sweep_summary(DriverReport *reports, size_t nr)
         case PR_LOAD_FAIL:    fail++;    break;
         }
     }
-    log_append_fmt("SWEEP %s lease=%s link=%zu noreach=%zu nonic=%zu fail=%zu skip=%zu",
+    log_append_fmt(NETLOAD_SWEEP_FMT,
                    winner ? "up" : "no-lease", winner ? winner->name : "-",
                    link, noreach, nonic, fail, skip);
 }
@@ -1610,7 +1614,7 @@ json_result_selfcheck(const char *json, size_t len, const char *want_driver)
         axl_printf("netload: INTERNAL ERROR -- --json emitted unparsable JSON: %s\n", json);
         return;
     }
-    char got[NETLOAD_NAME_MAX] = "";
+    char got[AXL_NET_DRIVER_NAME_MAX] = "";
     if (!axl_json_get_string(&check, "driver", got, sizeof got)
         || axl_strcmp(got, want_driver) != 0) {
         axl_printf("netload: INTERNAL ERROR -- --json 'driver' field did not round-trip\n");
@@ -1929,7 +1933,9 @@ engine_outcome_to_pr(AxlNetDriverOutcome o)
         case AXL_NET_DRV_EV_LOAD_FAIL:     return PR_LOAD_FAIL;
         case AXL_NET_DRV_EV_NO_NIC:
         case AXL_NET_DRV_EV_SKIPPED_QUAR:
-        case AXL_NET_DRV_EV_TRYING:         break;
+        case AXL_NET_DRV_EV_TRYING:
+        case AXL_NET_DRV_EV_LINK_DOWN:
+        case AXL_NET_DRV_EV_CONFIGURING:    break;
     }
     return PR_NO_NIC;
 }
@@ -1974,12 +1980,18 @@ auto_sweep_cb(const AxlNetDriverEvent *ev, void *ctx)
         return;
     }
 
+    /* The link gate's per-NIC events: netload runs the sweep without the gate
+       (its rows are per driver), so these never arrive -- and are no row. */
+    if (ev->outcome == AXL_NET_DRV_EV_LINK_DOWN
+        || ev->outcome == AXL_NET_DRV_EV_CONFIGURING) {
+        return;
+    }
     if (*c->nr >= c->cap) {
         return;
     }
     DriverReport *r = &c->reports[*c->nr];
     axl_memset(r, 0, sizeof *r);
-    axl_strlcpy(r->name, ev->driver, NETLOAD_NAME_MAX);
+    axl_strlcpy(r->name, ev->driver, sizeof r->name);
     axl_strlcpy(r->layer, "-", sizeof r->layer);
 
     if (ev->outcome == AXL_NET_DRV_EV_SKIPPED_QUAR) {
@@ -2006,6 +2018,23 @@ auto_sweep_cb(const AxlNetDriverEvent *ev, void *ctx)
     (*c->nr)++;
 }
 
+/* Report a sweep the firmware-first row (@fw) won: its line, then the summary
+   or --json, and the SWEEP record. One tail for cmd_auto and the --_fwwin
+   seam, so the seam's long-path checks exercise what a real win prints. */
+static int
+report_firmware_win(const char *dir, DriverReport *fw, const NetloadCfg *cfg)
+{
+    axl_printf("=== netload: networking came up via a firmware driver -- "
+               "no staged driver needed ===\n");
+    if (cfg->want_json) {
+        persist_sweep_summary(fw, 1);
+        print_json_result(fw, cfg);
+    } else {
+        print_summary(dir, fw, 1, /*persist=*/true);
+    }
+    return 0;
+}
+
 static int
 cmd_auto(const char *dir, char names[][NETLOAD_NAME_MAX], size_t nd, const NetloadCfg *cfg)
 {
@@ -2026,15 +2055,7 @@ cmd_auto(const char *dir, char names[][NETLOAD_NAME_MAX], size_t nd, const Netlo
        wonder. */
     ProbeResult fw = probe_firmware_stack(cfg, &reports[0]);
     if (fw == PR_OK) {
-        axl_printf("=== netload: networking came up via a firmware driver -- "
-                   "no staged driver needed ===\n");
-        if (cfg->want_json) {
-            persist_sweep_summary(reports, nr);
-            print_json_result(&reports[0], cfg);
-        } else {
-            print_summary(dir, reports, nr, /*persist=*/true);
-        }
-        return 0;
+        return report_firmware_win(dir, &reports[0], cfg);
     }
     /* Saved-config-first, best-effort: a prior --save run may already know a
        working driver+config for this box -- try it before the full staged
@@ -2064,8 +2085,8 @@ cmd_auto(const char *dir, char names[][NETLOAD_NAME_MAX], size_t nd, const Netlo
         .driver_strategy     = AXL_NET_DRV_SWEEP_DIR,
         .skip_firmware_first = true,
         .sweep_dir           = dir,
-        .load_deps           = g_load_deps,
-        .dhcp_timeout_sec    = cfg->dhcp_timeout,
+        .deps                = g_load_deps ? axl_net_sweep_deps_sidecar() : NULL,
+        .dhcp_timeout_sec    = cfg->dhcp_timeout ? cfg->dhcp_timeout : AXL_NET_DHCP_ATTEMPT_SEC,
         .dhcp_retries        = cfg->retries,
         .on_driver           = auto_sweep_cb,
         .on_driver_ctx       = &cbc,
@@ -2087,7 +2108,7 @@ cmd_auto(const char *dir, char names[][NETLOAD_NAME_MAX], size_t nd, const Netlo
     }
     uint8_t ping_ip[4];
     if ((cfg->ping && cfg->ping[0]) || cfg->ping_gw || (cfg->resolve && cfg->resolve[0])) {
-        opts.verify = AXL_NET_VERIFY_REACHABLE;
+        opts.verifier = axl_net_verify_reachable;
         if (cfg->ping && cfg->ping[0] && axl_ipv4_parse(cfg->ping, ping_ip) == AXL_OK) {
             opts.ping_ipv4 = ping_ip;
         }
@@ -2197,7 +2218,7 @@ run_netload(AxlArgs *a)
     const char *lg = axl_args_get_string(a, "_log");
     if (lg != NULL && lg[0] != '\0') {           /* test seam: seed one log line */
         const char *nm = axl_args_get_string(a, "_logname");
-        char line[128];
+        char line[NETLOAD_LOG_LINE_MAX];
         axl_snprintf(line, sizeof line, "%s %s", lg, nm && nm[0] ? nm : "X.efi");
         log_append(line);
         return 0;
@@ -2262,6 +2283,25 @@ run_netload(AxlArgs *a)
         print_row_detail(&r);
         axl_printf("\n");
         return 0;
+    }
+    const char *fww = axl_args_get_string(a, "_fwwin");
+    if (fww != NULL && fww[0] != '\0') {
+        /* test seam: a firmware-first win by the driver @fww, reported through
+           cmd_auto's own tail. A disk-loaded driver's name is its whole file
+           path, and the only QEMU NIC a disk-loaded driver binds AND leases
+           was the bundled iPXE's (removed) -- so the summary row, --json and
+           the SWEEP record are checked for a long path through this seam. */
+        DriverReport r = {0};
+        axl_strlcpy(r.name, fww, sizeof r.name);
+        r.result = PR_OK;
+        r.is_firmware = true;
+        r.have_nic = true;
+        r.link_up = true;
+        r.have_ip = true;
+        axl_memcpy(r.mac, ((const uint8_t[6]){ 0x02, 0, 0, 0, 0, 0x01 }), 6);
+        axl_memcpy(r.ip, ((const uint8_t[4]){ 10, 0, 2, 15 }), 4);
+        axl_strlcpy(r.layer, "NII3.1", sizeof r.layer);
+        return report_firmware_win("(firmware)", &r, &cfg);
     }
     if (axl_args_get_bool(a, "_applydry")) {   /* test seam: exercise config_load alone */
         char driver[NETLOAD_NAME_MAX];

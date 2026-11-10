@@ -72,4 +72,35 @@ axl_var_attrs_from_efi(
     uint32_t  efi_attrs
 );
 
+/* axl_var_read() with the attributes as the firmware reported them -- every
+   EFI_VARIABLE_* bit, including the deprecated AUTHENTICATED_WRITE_ACCESS
+   (0x10) and any bit no AXL_NV_* / AXL_VAR_* flag names. For a caller that
+   must refuse a variable whose attributes are anything but an exact set: a
+   mapped word drops what it does not model, so "exactly NV+BS" would accept
+   NV+BS+0x10. Returns as axl_var_read(). */
+int
+axl_var_read_raw(
+    const char     *name,
+    const AxlGuid  *vendor,
+    uint32_t       *efi_attrs,   /* [out] raw EFI_VARIABLE_* word, or NULL */
+    void          **data,
+    size_t         *size
+);
+
+/* SetVariable with a raw attribute word; @a size 0 deletes. Deliberately not
+   public: axl-var.h is read-only by design, and writes outside a registered
+   namespace belong to a caller that has a reason (AxlSsh's host key, whose
+   GUID is fixed and whose refusals must be told apart).
+   AXL_OK; AXL_NOT_FOUND for a delete of an absent variable; AXL_DENIED when
+   the firmware refuses it as write-protected or a security violation;
+   AXL_INVALID on a bad argument; AXL_NO_RESOURCES; AXL_ERR otherwise. */
+int
+axl_var_write_raw(
+    const char     *name,
+    const AxlGuid  *vendor,
+    uint32_t        efi_attrs,
+    const void     *data,
+    size_t          size
+);
+
 #endif /* AXL_VAR_INTERNAL_H */

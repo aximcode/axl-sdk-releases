@@ -135,6 +135,12 @@ typedef struct _EFI_TCP4_IO_TOKEN {
   }                Packet;
 } EFI_TCP4_IO_TOKEN;
 
+#define EFI_CONNECTION_FIN EFIERR      (104)
+
+#define EFI_CONNECTION_RESET EFIERR    (105)
+
+#define EFI_CONNECTION_REFUSED EFIERR  (106)
+
 typedef struct _EFI_TCP4_CLOSE_TOKEN {
   EFI_TCP4_COMPLETION_TOKEN         CompletionToken;
   BOOLEAN                           AbortOnClose;
@@ -715,7 +721,7 @@ EFI_STATUS
   IN VOID                              *Buffer,
   IN EFI_MAC_ADDRESS                   *SrcAddr OPTIONAL,
   IN EFI_MAC_ADDRESS                   *DestAddr OPTIONAL,
-  IN UINT16                            Protocol OPTIONAL
+  IN UINT16                            *Protocol OPTIONAL
   );
 
 typedef
@@ -865,7 +871,7 @@ EFI_STATUS
   IN EFI_DHCP4_PROTOCOL        *This,
   IN EFI_DHCP4_PACKET          *SeedPacket,
   IN UINT32                    DeleteCount,
-  IN UINT8                     DeleteList OPTIONAL,
+  IN UINT8                     *DeleteList OPTIONAL,
   IN UINT32                    AppendCount,
   IN EFI_DHCP4_PACKET_OPTION   *AppendList[] OPTIONAL,
   OUT EFI_DHCP4_PACKET         **NewPacket

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=8 local-only=0
+# test-meta: arch=both needs= est=8 local-only=0 builds=bss-probe guest=plain
 # test-bss-probe-qemu.sh — validate the build's uninitialized-.bss handling.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
@@ -48,7 +48,7 @@ run_one() {
     efi="$out/bss-probe.efi"
 
     echo "=== bss-probe ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" bss-probe 2>&1 | tail -1
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" bss-probe 2>&1 | tail -1
 
     # Mechanism check: .bss must be a real uninitialized PE section — present,
     # ALLOC, and WITHOUT CONTENTS (no file bytes). This pins the actual fix:

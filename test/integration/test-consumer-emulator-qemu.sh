@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=openssl est=29 local-only=0
+# test-meta: arch=x64 needs=openssl est=29 local-only=0 guest=standard
 # test-consumer-emulator-qemu.sh — the consumer-emulator harness.
 #
 # Models SoftBMC's execution topology in-repo so the SDK breaks first, not the
@@ -43,43 +43,26 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting consumer-emulator (serve-hazard-driver)...
-AxlTestNet.efi serve-hazard-driver
-NSHEOF
+# The startup commands live in test-consumer-emulator-qemu.nsh
+test_use_nsh
 
 test_build_image
 
 echo "=== AXL consumer-emulator Integration Test ($TEST_ARCH) ==="
 
 test_build_qemu_cmd
-TEST_QEMU_CMD+=(
-    -device "$(_test_nic_device),netdev=net0"
-    -netdev "user,id=net0,hostfwd=tcp::${H_TLS}-:8443,hostfwd=tcp::${H_PLAIN}-:8081"
-)
+test_add_port_forward "$H_TLS" 8443 "$H_PLAIN" 8081
 test_run_background
 
 echo "  QEMU PID: $TEST_QEMU_PID  (host $H_TLS->8443 HTTPS, $H_PLAIN->8081 plain)"
 echo "  Waiting for servers..."
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: servers did not start within 60 seconds"
+if ! test_wait_boot "READY" 60; then
+    echo "FAIL: servers did not start within ${TEST_WAITED_S} seconds"
     test_clean_log; echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
 fi
@@ -157,13 +140,13 @@ PYEOF
 }
 
 # --- A. HTTPS serving + liveness ----------------------------------------
-CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" "${TLS_URL}/api/version" 2>/dev/null || true)
+CODE=$(test_curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" "${TLS_URL}/api/version" || true)
 [[ "$CODE" == "200" ]] && test_host_pass "HTTPS GET /api/version (baseline)" \
                        || test_host_fail "HTTPS GET baseline (got '$CODE')"
 test_liveness_probe "${TLS_URL}/api/version" "after HTTPS baseline"
 
 # --- B. plain second server on the SHARED loop dispatches + liveness -----
-CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" "${PLAIN_URL}/plain" 2>/dev/null || true)
+CODE=$(test_curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" "${PLAIN_URL}/plain" || true)
 [[ "$CODE" == "200" ]] && test_host_pass "plain HTTP GET :8081 (2nd server on shared loop dispatches)" \
                        || test_host_fail "plain HTTP GET :8081 (got '$CODE' — adbf5461 class)"
 test_liveness_probe "${TLS_URL}/api/version" "after plain 2nd-server GET"

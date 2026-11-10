@@ -778,7 +778,7 @@ MyToolVtable *vt = my_custom_resolve();
 
 /* Install the bridge so the resident driver sees THIS launcher's
    piped / redirected / interactive StdIn. */
-axl_shared_driver_install_stdio_bridge();
+axl_shared_driver_install_stdio_bridge(vt);   /* aimed at the vtable you dispatch through */
 
 return vt->do_run(argc, argv);   /* driver reads via axl_stdin_text() */
 ```

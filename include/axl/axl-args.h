@@ -461,6 +461,37 @@ axl_args_get_string(
 );
 
 /**
+ * @brief Whether a flag or positional was given in the parsed argv, as
+ *     opposed to absent or only defaulted. Walks parents like the getters.
+ *
+ * The way a caller layers its own configuration between a flag's default
+ * and the command line: a value from a file applies only where this is
+ * false. "The parsed argv" is whatever axl_args_run() was handed -- the
+ * Shell command line for an application, the LoadOptions string for a
+ * driver.
+ *
+ * It reads the same slot the axl_args_get_* accessors read: the nearest
+ * level, walking from @p args up through its parents, that DECLARES
+ * @p name -- so a child's flag shadows a parent's of the same name, and a
+ * parent's flag given on the command line is not reported for a child that
+ * redeclares it unset.
+ *
+ * Counts as given: any value at all, including one equal to the
+ * @c default_value; an explicit false for a boolean (`--flag=false`, or
+ * `-f:false` / `-ffalse` in compact mode); a flag given more than once (the getters read
+ * its last value); for an `AXL_ARG_MULTI` flag, at least one occurrence.
+ * There is no `--no-` negated form to account for.
+ *
+ * @return true when @p name was given; false when absent, unknown, or
+ *     NULL @p args / @p name.
+ */
+bool
+axl_args_is_set(
+    AxlArgs    *args,   ///< parsed argument set
+    const char *name    ///< flag or positional name
+);
+
+/**
  * @brief Get a boolean flag value by name. Defaults to false when
  *     unset and no @c default_value is configured. Walks parents.
  */

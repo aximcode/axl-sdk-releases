@@ -1,0 +1,2 @@
+TIMING: guest kind=booted via=fg guest=3.000 boot=1.000 rc=0
+TIMING: runner test=test-retry.sh attempt=2 via=boot wall=4.500 cpu=3.000 rc=0

@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs=socat est=15 local-only=0
+# test-meta: arch=both needs=socat est=15 local-only=0 guest=none
+# guest=none: it types over --serial-socket into a --background guest; a
+#   leased guest takes no typed serial input.
 # arch=both since 2026-08-19: verified passing on AARCH64 unchanged -- it already
 # printed 'PASS (AARCH64)', so the arch support was there and only the test-meta
 # said otherwise.

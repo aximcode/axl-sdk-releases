@@ -16,7 +16,7 @@
     Splitting the emitters into their own object moves the decision to ONE
     symbol. axl-log-emit.c declares _axl_log_vdispatch WEAK and NULL-checks it,
     so nothing pulls the engine implicitly; every link that wants logging asks
-    for it with `-u _axl_log_vdispatch` ($(LOG_ENGINE_PULL) in the Makefile,
+    for it with `-u _axl_log_vdispatch` (AXL_LOG_ENGINE_PULL in the build,
     the default in axl-cc, `--minimal-runtime=log` when opting back in).
 
     THE WEAKNESS IS PER-TRANSLATION-UNIT, and deliberately so. A `weak`

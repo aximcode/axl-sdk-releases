@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ ${#CANDIDATES[@]} -eq 0 ]] && CANDIDATES=(axl newlib-int newlib)
 
-# The manifest, sourced — its dual sh/make KEY=VALUE form exists so scripts
+# The manifest, sourced — its plain KEY=VALUE form exists so scripts
 # read the toolchain location instead of restating it.
 # shellcheck disable=SC1091
 . scripts/axl-toolchains.conf
@@ -202,8 +202,8 @@ measure() {
     local objs=() libs=()
     case "$name" in
         axl)
-            # The ABI/codegen half of CFLAGS_BASE (Makefile). AXL pays for these
-            # in every shipped object, so a row measured without them is not
+            # The ABI/codegen half of axl_flags (cmake/AxlFlags.cmake). AXL pays
+            # for these in every shipped object, so a row measured without them is not
             # measuring what AXL costs: -fpic, the frame pointer and the stack
             # protector together add ~160 B here. The libc rows cannot be given
             # the same treatment -- they are prebuilt archives carrying whatever

@@ -59,6 +59,8 @@
 
 #define HELLO_CONTENT "hello from 9p server\n"
 #define INNER_CONTENT "inner\n"
+#define LONG_UNITS    240u        /* lng\ name: 240 x U+20AC, 720 bytes */
+#define LONG_CONTENT  "fits\n"
 
 /* Quit the loop once the harness has had its round-trip. A one-shot timeout
    rather than a bounded iterate loop so the app's shape matches how a real
@@ -134,8 +136,28 @@ seed_tree(const char *root)
     }
 
     axl_snprintf(path, sizeof(path), "%s\\sub\\inner.txt", root);
-    return axl_file_set_contents(path, INNER_CONTENT,
-                                 sizeof(INNER_CONTENT) - 1) == AXL_OK;
+    if (axl_file_set_contents(path, INNER_CONTENT,
+                              sizeof(INNER_CONTENT) - 1) != AXL_OK) {
+        return false;
+    }
+
+    /* lng\<240 x U+20AC>: a 720-byte name, past the 256 bytes AxlFsEntry
+       once held, and inside FAT's path limit (about 255 units) below
+       \9pexport\lng\. p9-client.py's long-name case lists and reads it. */
+    static char lng[1024];
+    axl_snprintf(lng, sizeof(lng), "%s\\lng", root);
+    if (axl_dir_mkdir(lng) != AXL_OK) {
+        return false;
+    }
+    size_t k = axl_strlen(lng);
+    lng[k++] = '\\';
+    for (size_t i = 0; i < LONG_UNITS && k + 4 < sizeof(lng); i++) {
+        lng[k++] = (char)0xE2;
+        lng[k++] = (char)0x82;
+        lng[k++] = (char)0xAC;
+    }
+    lng[k] = '\0';
+    return axl_file_set_contents(lng, LONG_CONTENT, sizeof(LONG_CONTENT) - 1) == AXL_OK;
 }
 
 int

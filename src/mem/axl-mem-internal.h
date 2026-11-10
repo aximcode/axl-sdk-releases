@@ -20,4 +20,17 @@
  */
 void _axl_mem_dump_leaks_at_exit(void);
 
+#ifdef AXL_MEM_DEBUG
+/**
+ * Release every block the free quarantine holds, running its
+ * use-after-free checks on each (debug builds only).
+ *
+ * For a teardown that prints no leak report: a plain driver's unload
+ * (axl_driver_cleanup). The ring pins up to 64 KiB of freed pool, which
+ * otherwise outlives the image -- ~2.9 pages per load/unload cycle of a
+ * C++ driver, measured. The two dump functions drain it themselves.
+ */
+void _axl_mem_quarantine_drain(void);
+#endif
+
 #endif /* AXL_MEM_INTERNAL_H */

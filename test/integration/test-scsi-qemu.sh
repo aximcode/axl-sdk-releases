@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=11 local-only=0
+# test-meta: arch=x64 needs= est=11 local-only=0 guest=scsi
 # test-scsi-qemu.sh — AxlScsi against an emulated virtio-scsi disk + CD.
 #
 # The unit suite (AxlScsi) tests the pure decoders against fixed buffers.
@@ -19,29 +19,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/scsi.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: scsi.efi not built"; exit 1; }
 
 WORK="$(mktemp -d)"
 LOG="$WORK/serial.log"
-DISK="$WORK/disk.img"
-CD="$WORK/cd.img"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-truncate -s 48M "$DISK"
-truncate -s 16M "$CD"
+# The disks are QEMU's null-co -- zeros of a fixed size, no file (the tool
+# never needs their contents) -- so the machine is the same on every run and
+# is the `scsi` pool class's (test/pool/classes.toml).
 
 # A virtio-scsi HBA with one SCSI disk (carrying a vendor/product/serial so the
 # INQUIRY assertions have concrete strings) plus a SCSI CD-ROM (a second
 # peripheral device type and a 2048-byte block size).
 timeout 120s "$PROJECT_DIR/scripts/run-qemu.sh" --timeout 90 \
     --qemu-arg -device --qemu-arg "virtio-scsi-pci,id=scsi0" \
-    --qemu-arg -drive --qemu-arg "file=$DISK,if=none,id=scsidisk,format=raw" \
+    --qemu-arg -drive --qemu-arg "driver=null-co,size=48M,read-zeroes=on,if=none,id=scsidisk" \
     --qemu-arg -device \
     --qemu-arg "scsi-hd,drive=scsidisk,bus=scsi0.0,vendor=AXLVND,product=AXLSCSIDISK,serial=SCSI98765" \
-    --qemu-arg -drive --qemu-arg "file=$CD,if=none,id=scsicd,format=raw" \
+    --qemu-arg -drive --qemu-arg "driver=null-co,size=16M,read-zeroes=on,if=none,id=scsicd" \
     --qemu-arg -device --qemu-arg "scsi-cd,drive=scsicd,bus=scsi0.0" \
     "$EFI" 2>&1 | tee "$LOG" \
     | grep -iE "scsi[0-9]|serial|blocks|health|rev:|EXCEPTION|leak report" \

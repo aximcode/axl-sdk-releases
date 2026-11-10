@@ -166,9 +166,11 @@ axl9p_get_handler(
             rc = 1;
         }
     } else if (len > 0) {
-        /* Byte-exact, like cat.c: the payload is not NUL-terminated and may
-           contain NULs, so a "%.*s" here would both scan past the allocation
-           and silently truncate a binary file at its first zero byte. */
+        /* Byte-exact, like cat.c: the payload may contain NULs, so a "%.*s"
+           here would silently truncate a binary file at its first zero byte.
+           It would also scan past the allocation, until AxlFormat's %s was
+           taught to bound that scan by the precision; the truncation is the
+           reason that still stands, and it is the decisive one. */
         if (axl_write(axl_stdout, buf, len) != (axl_ssize_t)len) {
             axl_printerr("9p: cannot write %s to stdout\n", path);
             rc = 1;

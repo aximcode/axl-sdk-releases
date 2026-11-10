@@ -1,0 +1,221 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 29,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "${sourceDir}/cmake/AxlToolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "x64-debug",
+      "inherits": "base",
+      "displayName": "x64, debug (the default)",
+      "cacheVariables": {
+        "AXL_ARCH": "x64",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "x64-release",
+      "inherits": "base",
+      "displayName": "x64, release (BUILD=RELEASE)",
+      "cacheVariables": {
+        "AXL_ARCH": "x64",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "aa64-debug",
+      "inherits": "base",
+      "displayName": "aa64, debug",
+      "cacheVariables": {
+        "AXL_ARCH": "aa64",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "aa64-release",
+      "inherits": "base",
+      "displayName": "aa64, release",
+      "cacheVariables": {
+        "AXL_ARCH": "aa64",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "x64-lint",
+      "inherits": "x64-debug",
+      "displayName": "x64, debug, clang-tidy beside every compile (replaces scripts/lint.sh)",
+      "cacheVariables": {
+        "AXL_LINT": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "host clang: the libFuzzer harnesses in test/fuzz (no cross toolchain)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "AXL_FUZZ": "ON",
+        "CMAKE_C_COMPILER": "clang"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x64-debug",
+      "configurePreset": "x64-debug"
+    },
+    {
+      "name": "x64-release",
+      "configurePreset": "x64-release"
+    },
+    {
+      "name": "aa64-debug",
+      "configurePreset": "aa64-debug"
+    },
+    {
+      "name": "aa64-release",
+      "configurePreset": "aa64-release"
+    },
+    {
+      "name": "x64-lint",
+      "configurePreset": "x64-lint"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "environment": {
+        "CTEST_PARALLEL_LEVEL": "",
+        "AXL_IT_POOL_DEFAULT": "auto"
+      },
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      },
+      "filter": {
+        "exclude": {
+          "label": "^unit-boot$"
+        }
+      }
+    },
+    {
+      "name": "x64-debug",
+      "inherits": "base",
+      "configurePreset": "x64-debug"
+    },
+    {
+      "name": "x64-release",
+      "inherits": "base",
+      "configurePreset": "x64-release"
+    },
+    {
+      "name": "aa64-debug",
+      "inherits": "base",
+      "configurePreset": "aa64-debug"
+    },
+    {
+      "name": "aa64-release",
+      "inherits": "base",
+      "configurePreset": "aa64-release"
+    },
+    {
+      "name": "x64-lint",
+      "inherits": "base",
+      "configurePreset": "x64-lint"
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "configurePreset": "fuzz"
+    },
+    {
+      "name": "suite-base",
+      "hidden": true,
+      "inherits": "base",
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "x64-suite",
+      "inherits": "suite-base",
+      "filter": {
+        "exclude": {
+          "label": "^unit-boot$"
+        }
+      },
+      "configurePreset": "x64-debug",
+      "displayName": "x64: the whole tree -- integration, unit binaries, gates (an integration test retries once, in run-one.sh)"
+    },
+    {
+      "name": "x64-integration",
+      "inherits": "suite-base",
+      "configurePreset": "x64-debug",
+      "displayName": "x64: every integration test, local-only included (an integration test retries once, in run-one.sh)",
+      "filter": {
+        "include": {
+          "label": "^integration$"
+        }
+      },
+      "environment": {
+        "AXL_IT_POOL_DEFAULT": "auto",
+        "AXL_IT_POOL_AGENT": "tree"
+      }
+    },
+    {
+      "name": "aa64-suite",
+      "inherits": "suite-base",
+      "filter": {
+        "exclude": {
+          "label": "^unit-boot$"
+        }
+      },
+      "configurePreset": "aa64-debug",
+      "displayName": "aa64: the whole tree -- integration and unit binaries (an integration test retries once, in run-one.sh)"
+    },
+    {
+      "name": "x64-ci",
+      "inherits": "suite-base",
+      "configurePreset": "x64-debug",
+      "displayName": "x64 integration tests as CI runs them: no local-only tests, the 240 s limit, no cache, JUnit",
+      "environment": {
+        "AXL_IT_TIMEOUT": "240",
+        "AXL_IT_CACHE": "0",
+        "AXL_PREP_SKIP_LOCAL": "1",
+        "AXL_IT_POOL_DEFAULT": "auto",
+        "AXL_IT_POOL_AGENT": "tree"
+      },
+      "filter": {
+        "include": {
+          "label": "^integration$"
+        },
+        "exclude": {
+          "label": "^local-only$"
+        }
+      },
+      "output": {
+        "outputOnFailure": true,
+        "outputJUnitFile": "ctest-junit.xml"
+      }
+    }
+  ]
+}

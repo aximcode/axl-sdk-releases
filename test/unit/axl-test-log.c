@@ -251,9 +251,13 @@ test_custom_handler(void)
 static void
 test_suppress_console(void)
 {
+    test_check(axl_log_get_console_enabled(),
+               "console enabled: on by default");
     custom_handler_calls = 0;
     axl_log_add_handler(custom_handler, NULL);
     axl_log_suppress_console();
+    test_check(!axl_log_get_console_enabled(),
+               "console enabled: suppress_console turns it off");
 
     axl_info("suppressed console test");
     test_check(custom_handler_calls == 1, "suppress console: handler still fires");
@@ -268,6 +272,12 @@ test_suppress_console(void)
        reaches teardown without printing one. Delete this line and that
        gate goes red. */
     axl_log_set_console_enabled(true);
+    test_check(axl_log_get_console_enabled(),
+               "console enabled: set_console_enabled(true) turns it back on");
+    axl_log_set_console_enabled(false);
+    bool off = !axl_log_get_console_enabled();
+    axl_log_set_console_enabled(true);
+    test_check(off, "console enabled: set_console_enabled(false) turns it off");
 
     axl_log_remove_handler(custom_handler);
 }

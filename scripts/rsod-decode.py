@@ -365,7 +365,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # axl_version.py is staged beside this script. These tools are run by
 # absolute path from the `axl` dispatcher rather than imported as a
@@ -433,12 +433,39 @@ class Image:
 
 
 @dataclass
+class DumpLocation:
+    """Where the dump's OWN facts place an address no symbol source covers.
+
+    The firmware's module list says which image an address is inside, and the
+    stack dump plus SP say whether it is on the stack. Neither needs a symbol
+    file, and between them they answer "where was it" for every address the
+    decode prints -- including the ones the firmware's own `name +offset`
+    annotation gets wrong.
+    """
+    module: str = ""        # module-list image holding the address
+    offset: int = 0         # ... and how far into it
+    stack_offset: int = -1  # SP-relative, when the address is in the stack dump
+    # A firmware attribution the module list refutes. Repeating it would print
+    # a confident wrong answer; dropping it would hide what the screen said.
+    note: str = ""
+
+    @property
+    def label(self) -> str:
+        if self.module:
+            return f"{self.module}+0x{self.offset:x}"
+        if self.stack_offset >= 0:
+            return f"<stack SP+0x{self.stack_offset:x}>"
+        return ""
+
+
+@dataclass
 class StackFrame:
     frame: int = 0
     addr: int = 0
     offset: int = 0
     image_idx: int = -1
     module_name: str = ""  # from RSOD text, used when no --syms matches
+    stack_offset: int = -1  # SP-relative, when the PC is in the stack dump
     resolve: ResolveResult = field(default_factory=ResolveResult)
 
 
@@ -460,6 +487,9 @@ class BranchAnnotation:
     to_addr: int = 0
     from_resolve: ResolveResult = field(default_factory=ResolveResult)
     to_resolve: ResolveResult = field(default_factory=ResolveResult)
+    # Filled only for an end no symbol source covers.
+    from_loc: DumpLocation = field(default_factory=DumpLocation)
+    to_loc: DumpLocation = field(default_factory=DumpLocation)
 
 
 @dataclass
@@ -498,6 +528,13 @@ class RsodData:
     # entered and the source names its caller.
     branch_records: list[tuple[int, int, int]] = field(
         default_factory=lambda: list[tuple[int, int, int]]())
+    # The firmware's own `<addr> <name> +<offset>` annotations on the LBR and
+    # `-->RIP` lines: {addr: (name, offset)}. Kept apart from module_bases on
+    # purpose -- these are CLAIMS, checked against the module list rather than
+    # trusted, because at least one vendor attributes an address to the image
+    # with the nearest lower base without checking that image's size.
+    fw_labels: dict[int, tuple[str, int]] = field(
+        default_factory=lambda: dict[int, tuple[str, int]]())
     # True when the backtrace was reconstructed by walking the FP chain (no
     # firmware sNN frames) — the order is heuristic, so the report flags it.
     recovered_via_fp: bool = False
@@ -1379,7 +1416,7 @@ def register_image(spec: str, tc: Toolchain, quiet: bool = False,
 # unwinders there need pip deps and stay out of this zero-dep variant).
 # ═══════════════════════════════════════════════════════════════
 
-def _first_present(regs: dict, names: Tuple[str, ...]) -> Optional[int]:
+def _first_present(regs: dict[str, int], names: Tuple[str, ...]) -> Optional[int]:
     """First register in @names that is present in @regs (value may be 0), else
     None. Lets a fault at address 0 be distinguished from a missing register."""
     for n in names:
@@ -1510,6 +1547,71 @@ def resolve_addr_to_image(addr: int, images: List[Image]) -> int:
         if img.base is not None and img.base <= addr < img.base + img.size:
             return i
     return -1
+
+
+def _stack_offset(addr: int, rsod: RsodData) -> Optional[int]:
+    """SP-relative offset of @addr when it lies in the captured stack dump.
+
+    Bounded by SP below and the end of the dump above: an address past the
+    dump may still be stack, but nothing in the capture shows it.
+    """
+    sp = _first_present(rsod.registers, ("RSP", "SP"))
+    if sp is None or not rsod.stack_pairs:
+        return None
+    end = max(a for a, _ in rsod.stack_pairs) + 8
+    return addr - sp if sp <= addr < end else None
+
+
+def _module_key(name: str) -> str:
+    """@name as a comparison key: lower-case, every trailing `.efi` removed."""
+    key = name.lower()
+    while key.endswith(".efi"):
+        key = key[:-4]
+    return key
+
+
+def locate_in_dump(addr: int, rsod: RsodData) -> DumpLocation:
+    """Place @addr using only the dump: its module list, then its stack.
+
+    Also checks the firmware's own annotation for @addr, when it printed one,
+    against the module list. The list is the stronger statement -- it records
+    each image's base AND size, where an annotation is one `name +offset` that
+    nothing on the screen bounds.
+    """
+    loc = DumpLocation()
+    hits = [e for e in rsod.loaded_images if e[0] <= addr < e[0] + e[1]]
+    if hits:
+        base, _size, name = max(hits)     # innermost, should two ever nest
+        loc.module, loc.offset = name, addr - base
+    else:
+        off = _stack_offset(addr, rsod)
+        if off is not None:
+            loc.stack_offset = off
+
+    claim = rsod.fw_labels.get(addr)
+    if claim is None:
+        return loc
+    name, off = claim
+    said = f"firmware said {name}+0x{off:x}"
+    if not rsod.loaded_images:
+        # Nothing to check it against: the claim is the best there is.
+        if not loc.label:
+            loc.module, loc.offset = name, off
+        else:
+            loc.note = said
+        return loc
+    # Firmware labels and the module list spell one image differently
+    # (`Foo`, `Foo.efi`, `Foo.efi.efi`), so names are compared without
+    # their `.efi` suffixes and case.
+    if loc.offset == off and _module_key(loc.module) == _module_key(name):
+        return loc
+    sizes = [e[1] for e in rsod.loaded_images
+             if _module_key(e[2]) == _module_key(name) and e[0] == addr - off]
+    if sizes and off >= sizes[0]:
+        loc.note = f"{said}, past the end of that 0x{sizes[0]:x}-byte image"
+    else:
+        loc.note = f"{said}, which the module list does not support"
+    return loc
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2235,14 +2337,29 @@ def _diagnose_fault_addr(addr_str: str) -> str:
     return ""
 
 
+def _x64_vector(exception_type: str) -> Optional[int]:
+    """The exception vector an x64 `Type` string names, or None.
+
+    Two spellings, two radixes: EDK2 prints `0E(#PF - Page-Fault)` (hex, before
+    the parenthesis) and the vendor screen prints `Page fault (14)` (DECIMAL,
+    inside it -- `Invalid opcode (06)` is #UD, 6). Reading only the first left
+    every vendor dump with no Cause line at all.
+    """
+    m = re.match(r"([0-9a-fA-F]+)\(", exception_type)
+    if m:
+        return int(m.group(1), 16)
+    m = re.match(r"[A-Za-z][^()]*\((\d{1,2})\)", exception_type)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def _diagnose_x64(data: RsodData) -> str:
     """Produce a human-readable cause for an X64 exception."""
     parts: List[str] = []
 
-    # Parse vector number from exception type like "0e(#PF)"
-    m = re.match(r"([0-9a-fA-F]+)\(", data.exception_type)
-    if m:
-        vec = int(m.group(1), 16)
+    vec = _x64_vector(data.exception_type)
+    if vec is not None:
         info = _X64_EXCEPTIONS.get(vec)
         if info:
             parts.append(info[1])
@@ -2272,6 +2389,16 @@ def _diagnose_x64(data: RsodData) -> str:
             addr_diag = _diagnose_fault_addr(data.fault_addr)
             if addr_diag:
                 parts.append(addr_diag)
+
+    # A PC inside the captured stack is the diagnosis whatever the vector: code
+    # does not live there, so a return or jump landed on stack data -- usually
+    # a smashed return address. The vendor screen in the fixture attributed
+    # exactly such a PC to an unrelated image, so this is worth stating outright.
+    if data.fault_pc:
+        off = _stack_offset(int(data.fault_pc, 16), data)
+        if off is not None:
+            parts.append(f"RIP is on the stack (SP+0x{off:x}): "
+                         "execution jumped into stack memory")
 
     return " — ".join(parts) if parts else ""
 
@@ -2502,17 +2629,44 @@ def _parse_loaded_images(text: str, data: RsodData):
         if base and size and entry not in data.loaded_images:
             data.loaded_images.append(entry)
 
+    # The vendor x64 screen's list, headed by its own row count. Scoped to that
+    # block because its rows need not end in `.efi`: an image the firmware has
+    # no name for is `Unknown(frffb) <driver description>`, and the regex above
+    # skipped every one. Anchoring on the heading is what makes accepting any
+    # name safe -- the block ends at the first row of another shape.
+    in_table = False
+    for line in text.splitlines():
+        if re.match(r"\s*EFI Debug Support Table TableSize\s*:", line):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        m = re.match(r"\s*([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{8})\s+(\S+)", line)
+        if not m:
+            in_table = False
+            continue
+        entry = (int(m.group(1), 16), int(m.group(2), 16), m.group(3))
+        if entry[0] and entry[1] and entry not in data.loaded_images:
+            data.loaded_images.append(entry)
+
 
 def _parse_branch_records(text: str, data: RsodData):
-    """Parse last-branch records: `LBRfrN <addr> ...` / `LBRtoN <addr> ...`."""
+    """Parse last-branch records: `LBRfrN <addr> [<name> +<offset>]`.
+
+    The address must be a whole token. The vendor screen follows the records
+    with an `LBRfr0 Dump:` byte-dump heading, and an unbounded hex match read
+    its `D` as address 0xd -- overwriting the real record, so the one line
+    naming the culprit printed as `??? [0xd]`.
+    """
     frm: Dict[int, int] = {}
     to: Dict[int, int] = {}
-    for m in re.finditer(r"^\s*LBR(fr|to)(\d+)\s+([0-9a-fA-F]+)", text, re.M):
-        try:
-            idx, addr = int(m.group(2)), int(m.group(3), 16)
-        except ValueError:
-            continue
+    for m in re.finditer(r"^\s*LBR(fr|to)(\d+)\s+([0-9a-fA-F]+)(?=\s|$)"
+                         r"(?:[ \t]+(\S.*?)[ \t]+\+([0-9a-fA-F]+)[ \t]*$)?",
+                         text, re.M):
+        idx, addr = int(m.group(2)), int(m.group(3), 16)
         (frm if m.group(1) == "fr" else to)[idx] = addr
+        if m.group(4):
+            data.fw_labels[addr] = (m.group(4), int(m.group(5), 16))
 
     for idx in sorted(set(frm) | set(to)):
         data.branch_records.append((idx, frm.get(idx, 0), to.get(idx, 0)))
@@ -2645,9 +2799,13 @@ def _parse_dell_bios(text: str, data: RsodData):
     if m:
         data.abort_desc = m.group(1).strip()
 
-    # Also capture the "--> PC/RIP ADDR Description" line if present
+    # Also capture the "--> PC/RIP ADDR Description" line if present -- unless
+    # the tail is a `<name> +<offset>` attribution, which is no description of
+    # the fault but the firmware's claim of where ADDR is (kept, and checked
+    # against the module list, in fw_labels below).
     m = re.search(r"-->\s*(?:PC|RIP)\s+[0-9a-fA-F]+\s+(.*)", text)
-    if m and m.group(1).strip() and not data.abort_desc:
+    if m and m.group(1).strip() and not data.abort_desc \
+            and not re.fullmatch(r"\S.*?\s+\+[0-9a-fA-F]+", m.group(1).strip()):
         data.abort_desc = m.group(1).strip()
 
     # Registers: any "NAME=HEXVALUE" pair (generic — handles unknown fields).
@@ -2657,15 +2815,25 @@ def _parse_dell_bios(text: str, data: RsodData):
     # and a regex that required no space silently dropped every one of them.
     # Bounded to three spaces so this stays a register assignment and does not
     # start matching prose.
-    for m in re.finditer(
-            r"([A-Za-z][A-Za-z0-9_]*) {0,3}=(?:0x)?([0-9a-fA-F]{2,16})(?:\s|$|,)",
-            text):
-        reg = m.group(1)
-        try:
-            val = int(m.group(2), 16)
-            data.registers[reg] = val
-        except ValueError:
-            pass
+    #
+    # Two more shapes from a real vendor x64 screen:
+    #   * R10-R15 print as a bare `10=` .. `15=`. A name had to start with a
+    #     letter, so all six were silently dropped.
+    #   * dump rows (`<addr>  <qword> <ASCII gutter>`, and the byte dumps) are
+    #     skipped whole. The gutter is raw memory rendered as text, and one
+    #     spelled `nic=1844` -- read as a register named `nic`.
+    reg_re = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*|1[0-5]) {0,3}"
+                        r"=(?:0x)?([0-9a-fA-F]{2,16})(?=\s|$|,)")
+    for line in text.splitlines():
+        if re.match(r"\s*[0-9a-fA-F]{8,16}\s+[0-9a-fA-F]{2}", line):
+            continue
+        for m in reg_re.finditer(line):
+            reg = m.group(1)
+            if reg.isdigit():
+                if data.arch != "X64":
+                    continue
+                reg = f"R{reg}"
+            data.registers[reg] = int(m.group(2), 16)
 
     # Extract fault PC from known register names (X64 + AARCH64)
     for reg in ("IP", "RIP", "PC", "ELR"):
@@ -2684,11 +2852,14 @@ def _parse_dell_bios(text: str, data: RsodData):
         data.esr_decode = _esr_decode_str(data.registers["ESR"])
 
     # Faulting PC: "-->RIP ADDR" or "--> PC ADDR" — prepend as frame #0
-    m = re.search(r"-->\s*(?:RIP|PC|IP)\s+([0-9a-fA-F]+)", text)
+    m = re.search(r"-->\s*(?:RIP|PC|IP)\s+([0-9a-fA-F]+)"
+                  r"(?:[ \t]+(\S.*?)[ \t]+\+([0-9a-fA-F]+)[ \t]*$)?", text, re.M)
     if m:
         fault_pc_val = int(m.group(1), 16)
         if fault_pc_val != 0:
             data.stack_pcs.append(fault_pc_val)
+        if m.group(2):
+            data.fw_labels[fault_pc_val] = (m.group(2), int(m.group(3), 16))
 
     # Stack trace: "sNN ADDR ModuleName +OFFSET" (any extension or none). The
     # frames may be indented (leading whitespace) in some serial captures.
@@ -2709,9 +2880,11 @@ def _parse_dell_bios(text: str, data: RsodData):
             r"^\s*([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{16})\s", text, re.M):
         row_addr = int(m.group(1), 16)
         qw = int(m.group(2), 16)
+        # Zero rows are kept in the PAIRS: they are where the dump ends, and
+        # _stack_offset bounds "on the stack" by that end.
+        data.stack_pairs.append((row_addr, qw))
         if qw != 0:
             data.stack_qwords.append(qw)
-            data.stack_pairs.append((row_addr, qw))
 
     if not data.stack_pcs and data.fault_pc:
         data.stack_pcs.append(int(data.fault_pc, 16))
@@ -3053,7 +3226,7 @@ def _emit_image_warnings(images: List[Image]):
     # wrong image: it yields specific SOURCE LINES, which are believed exactly
     # because they are so specific. Reported separately so the reader is not
     # told the whole decode is fiction when only the lines would have been.
-    def _banner(heading: str, pick) -> None:
+    def _banner(heading: str, pick: Callable[[Image], list[str]]) -> None:
         hit = [img for img in images if pick(img)]
         if not hit:
             return
@@ -3100,12 +3273,46 @@ def _emit_branches(branch_annots: List[BranchAnnotation]):
     print(f"\n{bold('Branch records (last branch taken, most recent first):')}\n")
     for b in branch_annots:
         if b.from_addr:
-            print(f"  from  {cyan(f'{_sym_label(b.from_resolve):<40}')} "
-                  f"{dim(f'[0x{b.from_addr:x}]')}")
+            label, notes = _branch_end(b.from_resolve, b.from_loc)
+            tail = "".join(f"  ({n})" for n in notes)
+            print(f"  from  {cyan(f'{label:<40}')} "
+                  f"{dim(f'[0x{b.from_addr:x}]')}{tail}")
         if b.to_addr:
+            label, notes = _branch_end(b.to_resolve, b.to_loc)
             entry = "  (function entry)" if b.to_resolve.func_offset == 0 else ""
-            print(f"  to    {green(f'{_sym_label(b.to_resolve):<40}')} "
-                  f"{dim(f'[0x{b.to_addr:x}]')}{entry}")
+            tail = "".join(f"  ({n})" for n in notes)
+            print(f"  to    {green(f'{label:<40}')} "
+                  f"{dim(f'[0x{b.to_addr:x}]')}{entry}{tail}")
+
+
+def _branch_end(r: ResolveResult, loc: DumpLocation) -> tuple[str, list[str]]:
+    """Label and notes for one end of a branch record.
+
+    A symbol wins when an image covered the address; otherwise the dump's own
+    placement (module list, then stack), and failing both the `???` a symbol
+    miss has always printed. A refuted firmware attribution rides along as a
+    note in every case.
+    """
+    notes: list[str] = []
+    if loc.label:
+        label = loc.label
+        if loc.module:
+            notes.append("no debug image")
+    else:
+        label = _sym_label(r)
+    if loc.note:
+        notes.append(loc.note)
+    return label, notes
+
+
+def _unplaced_frame_note(sf: StackFrame) -> str:
+    """Why a frame has no image: on the stack, or nowhere the dump records."""
+    if sf.stack_offset >= 0:
+        where = f"on the stack at SP+0x{sf.stack_offset:x}"
+        return f"faulting PC — {where}" if sf.frame == 0 else where
+    if sf.frame == 0:
+        return "faulting PC — invalid address"
+    return "outside all known images"
 
 
 def _emit_frame(sf: StackFrame, images: List[Image], multi: bool):
@@ -3117,10 +3324,7 @@ def _emit_frame(sf: StackFrame, images: List[Image], multi: bool):
             label = f"{sf.module_name}+0x{sf.offset:x}"
             print(f"  {prefix} {yellow(f'{label:<30}')} {dim(f'[0x{sf.addr:x}]  (no debug image)')}")
         else:
-            if sf.frame == 0:
-                print(f"  {prefix} {red(f'0x{sf.addr:x}  (faulting PC — invalid address)')}")
-            else:
-                print(f"  {prefix} {red(f'0x{sf.addr:x}  (outside all known images)')}")
+            print(f"  {prefix} {red(f'0x{sf.addr:x}  ({_unplaced_frame_note(sf)})')}")
         return
 
     img_tag = f" {dim(f'<{images[sf.image_idx].name}>')}" if multi else ""
@@ -3279,6 +3483,8 @@ def emit_json(
             "file": sf.resolve.file or None,
             "line": sf.resolve.line or 0,
             "image": image_name,
+            "stack_offset": (f"0x{sf.stack_offset:x}"
+                             if sf.stack_offset >= 0 else None),
             "status": "no_debug_image" if sf.module_name and sf.image_idx < 0 else sf.resolve.status,
         }
 
@@ -3342,10 +3548,14 @@ def emit_json(
              "from_function": b.from_resolve.func if b.from_addr else None,
              "from_offset": (f"0x{b.from_resolve.func_offset:x}"
                              if b.from_resolve.func_offset >= 0 else None),
+             "from_location": b.from_loc.label or None,
+             "from_note": b.from_loc.note or None,
              "to": f"0x{b.to_addr:x}" if b.to_addr else None,
              "to_function": b.to_resolve.func if b.to_addr else None,
              "to_offset": (f"0x{b.to_resolve.func_offset:x}"
                            if b.to_resolve.func_offset >= 0 else None),
+             "to_location": b.to_loc.label or None,
+             "to_note": b.to_loc.note or None,
              "to_is_function_entry": b.to_resolve.func_offset == 0}
             for b in (branch_annots or [])
         ],
@@ -3408,7 +3618,7 @@ def emit_markdown(
             loc = "*(no debug image)*"
         elif sf.image_idx < 0:
             func = "???"
-            loc = ""
+            loc = f"*({_unplaced_frame_note(sf)})*"
         else:
             func = f"`{_sym_label(r)}`" if r.func != "???" else "???"
             loc = _md_link(r.file, r.line) if r.file and r.line else ""
@@ -3420,7 +3630,8 @@ def emit_markdown(
 
     # Header
     now = datetime.now(timezone.utc).astimezone()
-    print(f"# RSOD Report — {images[0].name} ({arch})")
+    title = images[0].name if images else "RSOD"
+    print(f"# RSOD Report — {title} ({arch})")
     print(f"\n*Generated: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}*\n")
 
     # A markdown report gets pasted into a ticket and read by someone who was
@@ -3521,11 +3732,15 @@ def emit_markdown(
         print("|---|-----------|----------|---------|")
         for b in branch_annots:
             if b.from_addr:
-                print(f"| {b.index} | from | `{_sym_label(b.from_resolve)}` "
+                label, notes = _branch_end(b.from_resolve, b.from_loc)
+                tail = "".join(f" *({n})*" for n in notes)
+                print(f"| {b.index} | from | `{label}`{tail} "
                       f"| `0x{b.from_addr:x}` |")
             if b.to_addr:
+                label, notes = _branch_end(b.to_resolve, b.to_loc)
                 entry = " *(function entry)*" if b.to_resolve.func_offset == 0 else ""
-                print(f"| {b.index} | to | `{_sym_label(b.to_resolve)}`{entry} "
+                tail = "".join(f" *({n})*" for n in notes)
+                print(f"| {b.index} | to | `{label}`{entry}{tail} "
                       f"| `0x{b.to_addr:x}` |")
         print()
 
@@ -4015,6 +4230,12 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
                 sf.image_idx = 0
                 sf.offset = off
                 sf.resolve = _resolve_in_image(tc, images[0], sf.offset)
+        if sf.image_idx < 0 and not sf.module_name:
+            # No symbol source and no sNN frame: the dump's own module list
+            # and stack still say where it was.
+            loc = locate_in_dump(addr, rsod)
+            sf.module_name, sf.offset = loc.module, loc.offset
+            sf.stack_offset = loc.stack_offset
         frames.append(sf)
 
     # Register annotations
@@ -4044,13 +4265,15 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
     branch_annots: List[BranchAnnotation] = []
     for bidx, frm, to in rsod.branch_records:
         b = BranchAnnotation(index=bidx, from_addr=frm, to_addr=to)
-        for addr, attr in ((frm, "from_resolve"), (to, "to_resolve")):
+        for addr, end in ((frm, "from"), (to, "to")):
             if not addr:
                 continue
             idx = resolve_addr_to_image(addr, images)
             if idx >= 0:
-                setattr(b, attr,
+                setattr(b, f"{end}_resolve",
                         _resolve_in_image(tc, images[idx], addr - _img_base(idx)))
+            else:
+                setattr(b, f"{end}_loc", locate_in_dump(addr, rsod))
         if b.from_addr or b.to_addr:
             branch_annots.append(b)
 

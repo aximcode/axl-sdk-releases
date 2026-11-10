@@ -278,15 +278,25 @@ protocol will read it.
 
 **`axl_console_tap_inject_text(t, bytes, len)`** decodes a run of raw
 xterm/VT input bytes -- CSI/SS3 escapes for arrows, F-keys, Home/End,
-PgUp/PgDn, Delete, plus UTF-8 printables -- into the keystrokes above, for
-a consumer whose own input source is already byte-shaped (a remote
-terminal). Each call is self-contained: an escape sequence left
-incomplete at end-of-call is flushed as a bare Esc plus its literal body
-bytes rather than held into the next call, so a dropped final byte can't
-splice onto and corrupt a later keystroke. Bytes decoded this way carry
-`KeyState` 0 (no modifier), which still fires a notify whose own
-registered shift state is 0 but cannot reach a Ctrl-qualified one --
-that's what `inject_key_ex` is for.
+PgUp/PgDn, Insert/Delete, the C0 control bytes, plus UTF-8 printables --
+into the keystrokes above, for a consumer whose own input source is
+already byte-shaped (a remote terminal). Each call is self-contained: an
+escape sequence left incomplete at end-of-call is flushed as a bare Esc
+plus its literal body bytes rather than held into the next call, so a
+dropped final byte can't splice onto and corrupt a later keystroke.
+
+Each decoded key has the shape an OVMF USB keyboard reports for the same
+key, measured through the console splitter's `ReadKeyStrokeEx`:
+`KeyShiftState` carries `EFI_SHIFT_STATE_VALID` plus the modifiers,
+`KeyToggleState` is `0xC0` (VALID | KEY_STATE_EXPOSED). A C0 byte is its
+Ctrl chord (`0x01` = `a` + left Ctrl, which reaches the Shell's
+Ctrl-qualified Ctrl-C / Ctrl-S notifies), except the bytes a terminal
+sends for Backspace (`0x08`/`0x7f`), Tab, Enter and Esc; the xterm
+modifier parameter (`ESC[1;5F` = Ctrl-End), ESC + a key (Alt), CSI-u and
+modifyOtherKeys become the same modifier bits; Shift is dropped where it
+only changed the character, as the USB driver does. The full rule is the
+`axl_console_tap_inject_text` docstring; the table it is tested against
+is `test_console_input_modifiers` in `test/unit/axl-test-util.c`.
 
 ---
 

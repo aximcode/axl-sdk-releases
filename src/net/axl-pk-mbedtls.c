@@ -4,6 +4,16 @@
 /** @file axl-pk-mbedtls.c
     The mbedTLS AxlPkProvider: ECDSA P-256, ECDSA P-384, and RSA.
 
+    Opt-in, like Ed25519: the dispatcher reaches
+    `_axl_pk_provider_mbedtls` through a weak reference (see
+    axl-pk-provider.h), so an image links this object -- and mbedTLS's
+    PK layer, RSA included -- only when it calls something defined HERE.
+    axl_pk_enable_mbedtls() is the function that exists for nothing
+    else. Every ECDSA/RSA-specific public function lives in this file
+    too, the raw-bytes axl_pk_verify() included, so calling one is
+    itself the opt-in and axl_pk_alg_available() can never answer "no"
+    for an algorithm such a caller can in fact use.
+
     One provider serves all three algorithms -- they differ only by
     curve/key type, which the key itself carries (see axl-pk-verify.c's
     `_axl_pk_provider_for`). This file holds the mbedTLS-specific
@@ -12,6 +22,7 @@
 **/
 
 #include <axl/axl-crypto.h>
+#include <axl/axl-digest.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include "axl-crypto-internal.h"
@@ -555,6 +566,85 @@ axl_pk_rsa_pss_sha256_verify(const AxlPkKey *key,
 }
 
 // -------------------------------------------------------------------
+// ECDSA P-256 raw-bytes verification (axl_pk_verify).
+// -------------------------------------------------------------------
+//
+// Distinct from the AxlPkKey family: this takes a DER public key
+// directly, with no persistent key handle and no provider involved --
+// it predates the provider seam and is ECDSA-P256-only by contract. It
+// lives here rather than in the dispatcher so that calling it links
+// this object, and with it the provider: see the file comment.
+
+/**
+ * Verify a detached ECDSA-with-SHA-256 signature over @p msg using the
+ * P-256 public key in @p pubkey (DER SubjectPublicKeyInfo) and the DER
+ * ECDSA signature in @p sig. Returns AXL_OK only on a valid signature.
+ */
+static int
+verify_ecdsa_p256(const uint8_t *pubkey, size_t pubkey_len,
+                  const uint8_t *msg, size_t msg_len,
+                  const uint8_t *sig, size_t sig_len)
+{
+    mbedtls_pk_context pk;
+    uint8_t            hash[32];
+    int                rc = AXL_ERR;
+
+    mbedtls_pk_init(&pk);
+
+    if (mbedtls_pk_parse_public_key(&pk, pubkey, pubkey_len) != 0) {
+        goto out;
+    }
+
+    /* Enforce the contracted algorithm: an EC key on NIST P-256. A key
+       on a different curve must not silently verify under this enum. */
+    if (!mbedtls_pk_can_do(&pk, MBEDTLS_PK_ECKEY) ||
+        mbedtls_ecp_keypair_get_group_id(mbedtls_pk_ec(pk)) !=
+            MBEDTLS_ECP_DP_SECP256R1) {
+        goto out;
+    }
+
+    /* ECDSA-with-SHA-256: verify over SHA-256(msg). */
+    if (axl_compute_checksum_digest(AXL_CHECKSUM_SHA256, msg, msg_len,
+                                    hash, sizeof(hash)) != AXL_OK) {
+        goto out;
+    }
+
+    if (mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash),
+                          sig, sig_len) == 0) {
+        rc = AXL_OK;
+    }
+
+out:
+    mbedtls_pk_free(&pk);
+    return rc;
+}
+
+int
+axl_pk_verify(AxlPkAlg alg,
+              const uint8_t *pubkey, size_t pubkey_len,
+              const uint8_t *msg, size_t msg_len,
+              const uint8_t *sig, size_t sig_len)
+{
+    /* Argument validation precedes any crypto. msg may be NULL only
+       when msg_len is 0 (an empty message is well-defined). */
+    if (pubkey == NULL || pubkey_len == 0 ||
+        sig == NULL || sig_len == 0 ||
+        (msg == NULL && msg_len != 0)) {
+        return AXL_ERR;
+    }
+
+    switch (alg) {
+    case AXL_PK_ECDSA_P256:
+        return verify_ecdsa_p256(pubkey, pubkey_len, msg, msg_len,
+                                 sig, sig_len);
+    case AXL_PK_ED25519:
+        /* Reserved; not supported by this mbedTLS build. */
+    default:
+        return AXL_ERR;
+    }
+}
+
+// -------------------------------------------------------------------
 // AxlPkProvider member implementations.
 // -------------------------------------------------------------------
 
@@ -823,6 +913,17 @@ mbedtls_der_public_export(const AxlPkKey *key, uint8_t *out, size_t *len)
         return AXL_ERR;
     }
     return emit_der(mbedtls_pk_write_pubkey_der, pk, out, len);
+}
+
+/* The opt-in. Its body is deliberately empty: what enables the provider
+   is that a call to this function makes the linker take this object,
+   which DEFINES `_axl_pk_provider_mbedtls` and so resolves the
+   dispatcher's weak reference to it. There is no run-time state, so it
+   is idempotent and order-free by construction -- the provider is in
+   the image from the first instruction or it is not in it at all. */
+void
+axl_pk_enable_mbedtls(void)
+{
 }
 
 const AxlPkProvider _axl_pk_provider_mbedtls = {

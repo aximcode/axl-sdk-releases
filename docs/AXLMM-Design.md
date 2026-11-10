@@ -536,7 +536,8 @@ individual functions can split to `src/axlmm/X.cpp` and join
   ratchets later if axlmm grows enough to warrant attribution; cost
   of splitting later is one snapshot + a sed.
 
-- **`make tests` requires `AXL_CPP=1`.**  The ratchet is an
+- **The tests build the C++ binaries too** (the Makefile's `make tests`
+  needed `AXL_CPP=1`; the CMake build always builds C++).  The ratchet is an
   SDK-development concern, not a consumer concern.  SDK developers
   have the C++ toolchain installed (per
   `scripts/install-toolchain.sh`) — that's the canonical dev

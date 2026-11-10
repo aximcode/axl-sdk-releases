@@ -5,7 +5,9 @@
 #include "axl-test.h"
 #include "axl-test-flushfail-fs.h"
 #include "axl-backend.h"   /* axl_backend_get_monotonic_us (raised-TPL timing) */
+#include "../../src/fs/axl-fs-internal.h"   /* axl_fs_replace_test_seed */
 #include <uefi/axl-uefi.h> /* gBS RaiseTPL/RestoreTPL, TPL_CALLBACK */
+#include "../../src/stream/axl-console-decode.h"   /* raw console decoder */
 
 static inline int
 test_memcmp(const void *a, const void *b, size_t n)
@@ -20,9 +22,237 @@ test_memcmp(const void *a, const void *b, size_t n)
     return 0;
 }
 
+/* True when @p path holds exactly the @p len bytes at @p want. */
+static bool
+file_holds(const char *path, const void *want, size_t len)
+{
+    void   *buf = NULL;
+    size_t  got = 0;
+    bool    ok  = axl_file_get_contents(path, &buf, &got) == AXL_OK
+                  && got == len && test_memcmp(buf, want, len) == 0;
+    axl_free(buf);
+    return ok;
+}
+
+/* The file's modification time, or 0 if it cannot be read. */
+static uint64_t
+file_mtime(const char *path)
+{
+    AxlFsEntry e;
+    return (axl_file_info(path, &e) == AXL_OK) ? e.mtime_unix : 0;
+}
+
 // ---------------------------------------------------------------------------
 // Console tests
 // ---------------------------------------------------------------------------
+
+/* Feed @p n chunks (a pointer and a length each) through one decoder and
+   return the text, NUL-terminated, in @p out (capacity @p cap). */
+static void
+decode_chunks(
+    const unsigned char *const *chunks,
+    const size_t               *lens,
+    size_t                      n,
+    char                       *out,
+    size_t                      cap
+    )
+{
+    AxlConsoleDecoder d;
+    char              buf[64];
+    size_t            pos = 0;
+    axl_console_decoder_reset(&d);
+    for (size_t i = 0; i < n; i++) {
+        size_t m = axl_console_decode(&d, chunks[i], lens[i], buf);
+        for (size_t j = 0; j < m && pos + 1 < cap; j++) {
+            out[pos++] = buf[j];
+        }
+    }
+    out[pos] = '\0';
+}
+
+/* Raw bytes bound for the console arrive in any pieces; the decoder carries
+   the encoding and a partial character from one write to the next. */
+static void
+test_console_decode_across_writes(void)
+{
+    char out[64];
+
+    /* UTF-16LE with its mark, then more UTF-16LE with none. */
+    static const unsigned char u16a[] = { 0xFF, 0xFE, 'a', 0, 'b', 0 };
+    static const unsigned char u16b[] = { 'c', 0, 'd', 0 };
+    const unsigned char *c1[] = { u16a, u16b };
+    size_t               l1[] = { sizeof(u16a), sizeof(u16b) };
+    decode_chunks(c1, l1, 2, out, sizeof(out));
+    test_check(axl_strcmp(out, "abcd") == 0,
+               "console decode: BOM + \"ab\" then \"cd\" (UTF-16LE) is \"abcd\"");
+
+    /* One three-byte UTF-8 character (U+20AC), a byte per write. */
+    static const unsigned char e0[] = { 0xE2 }, e1[] = { 0x82 }, e2[] = { 0xAC };
+    const unsigned char *c2[] = { e0, e1, e2 };
+    size_t               l2[] = { 1, 1, 1 };
+    decode_chunks(c2, l2, 3, out, sizeof(out));
+    test_check(axl_strcmp(out, "\xE2\x82\xAC") == 0,
+               "console decode: a UTF-8 character a byte at a time is that character");
+
+    /* U+1F600 as a UTF-16LE surrogate pair, split inside the pair and inside
+       a unit: mark + high-surrogate low byte | high byte + low surrogate. */
+    static const unsigned char s0[] = { 0xFF, 0xFE, 0x3D };
+    static const unsigned char s1[] = { 0xD8, 0x00 };
+    static const unsigned char s2[] = { 0xDE };
+    const unsigned char *c3[] = { s0, s1, s2 };
+    size_t               l3[] = { sizeof(s0), sizeof(s1), sizeof(s2) };
+    decode_chunks(c3, l3, 3, out, sizeof(out));
+    test_check(axl_strcmp(out, "\xF0\x9F\x98\x80") == 0,
+               "console decode: a UTF-16 surrogate pair split across writes is that character");
+
+    /* Plain ASCII, no mark: UTF-8, as it stands, in two writes. */
+    static const unsigned char a0[] = { 'h', 'i' }, a1[] = { '!', '\n' };
+    const unsigned char *c4[] = { a0, a1 };
+    size_t               l4[] = { 2, 2 };
+    decode_chunks(c4, l4, 2, out, sizeof(out));
+    test_check(axl_strcmp(out, "hi!\n") == 0,
+               "console decode: ASCII with no mark passes through");
+
+    /* An unpaired low surrogate (UTF-16LE) is U+FFFD, and decoding goes on. */
+    static const unsigned char b0[] = { 0xFF, 0xFE, 0x00, 0xDC, 'z', 0 };
+    const unsigned char *c5[] = { b0 };
+    size_t               l5[] = { sizeof(b0) };
+    decode_chunks(c5, l5, 1, out, sizeof(out));
+    test_check(axl_strcmp(out, "\xEF\xBF\xBDz") == 0,
+               "console decode: an unpaired surrogate is U+FFFD and decoding goes on");
+
+    /* The UTF-8 mark is dropped. */
+    static const unsigned char m0[] = { 0xEF, 0xBB }, m1[] = { 0xBF, 'q' };
+    const unsigned char *c6[] = { m0, m1 };
+    size_t               l6[] = { 2, 2 };
+    decode_chunks(c6, l6, 2, out, sizeof(out));
+    test_check(axl_strcmp(out, "q") == 0,
+               "console decode: a UTF-8 mark split across writes is dropped");
+}
+
+/* Decode @p n bytes in ONE write and compare with @p want (NUL-terminated). */
+static bool
+decode_one_is(
+    const unsigned char *in,
+    size_t               n,
+    const char          *want
+    )
+{
+    char                 out[64];
+    const unsigned char *c[] = { in };
+    size_t               l[] = { n };
+    decode_chunks(c, l, 1, out, sizeof(out));
+    return axl_strcmp(out, want) == 0;
+}
+
+#define FFFD "\xEF\xBF\xBD"
+
+/* Only well-formed UTF-8 reaches the console (Unicode 3.9, Table 3-7): an
+   overlong form, a surrogate, a value past U+10FFFF or a byte that is no
+   lead is U+FFFD -- one per byte of an ill-formed prefix -- and never the
+   NUL a UCS-2 conversion of C0 80 would end the line at. */
+static void
+test_console_decode_ill_formed_utf8(void)
+{
+    static const unsigned char c080[] = { 'a', 0xC0, 0x80, 'b' };
+    test_check(decode_one_is(c080, sizeof(c080), "a" FFFD FFFD "b"),
+               "console decode: C0 80 (an overlong NUL) is two U+FFFD, not a NUL");
+    static const unsigned char c1[] = { 0xC1, 0xBF };
+    test_check(decode_one_is(c1, sizeof(c1), FFFD FFFD),
+               "console decode: C1 BF (overlong) is two U+FFFD");
+    static const unsigned char e0[] = { 0xE0, 0x9F, 0xBF };
+    test_check(decode_one_is(e0, sizeof(e0), FFFD FFFD FFFD),
+               "console decode: E0 9F BF (overlong) is three U+FFFD");
+    static const unsigned char e0ok[] = { 0xE0, 0xA0, 0x80 };
+    test_check(decode_one_is(e0ok, sizeof(e0ok), "\xE0\xA0\x80"),
+               "console decode: E0 A0 80 (U+0800) passes");
+    static const unsigned char ed[] = { 0xED, 0xA0, 0x80 };
+    test_check(decode_one_is(ed, sizeof(ed), FFFD FFFD FFFD),
+               "console decode: ED A0 80 (a high surrogate) is three U+FFFD");
+    static const unsigned char edlow[] = { 0xED, 0xB0, 0x80 };
+    test_check(decode_one_is(edlow, sizeof(edlow), FFFD FFFD FFFD),
+               "console decode: ED B0 80 (a lone low surrogate) is three U+FFFD");
+    static const unsigned char edok[] = { 0xED, 0x9F, 0xBF };
+    test_check(decode_one_is(edok, sizeof(edok), "\xED\x9F\xBF"),
+               "console decode: ED 9F BF (U+D7FF) passes");
+    static const unsigned char f0[] = { 0xF0, 0x8F, 0xBF, 0xBF };
+    test_check(decode_one_is(f0, sizeof(f0), FFFD FFFD FFFD FFFD),
+               "console decode: F0 8F BF BF (overlong) is four U+FFFD");
+    static const unsigned char f4[] = { 0xF4, 0x90, 0x80, 0x80 };
+    test_check(decode_one_is(f4, sizeof(f4), FFFD FFFD FFFD FFFD),
+               "console decode: F4 90 80 80 (past U+10FFFF) is four U+FFFD");
+    static const unsigned char f4ok[] = { 0xF4, 0x8F, 0xBF, 0xBF };
+    test_check(decode_one_is(f4ok, sizeof(f4ok), "\xF4\x8F\xBF\xBF"),
+               "console decode: F4 8F BF BF (U+10FFFF) passes");
+    static const unsigned char f5[] = { 'a', 0xF5 };
+    test_check(decode_one_is(f5, sizeof(f5), "a" FFFD),
+               "console decode: F5 at the end of a write is U+FFFD, not held");
+    static const unsigned char f7[] = { 0xF7, 0xBF, 0xBF, 0xBF };
+    test_check(decode_one_is(f7, sizeof(f7), FFFD FFFD FFFD FFFD),
+               "console decode: F7 BF BF BF (past U+10FFFF) is four U+FFFD");
+    static const unsigned char f8[] = { 'a', 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF };
+    test_check(decode_one_is(f8, sizeof(f8), "a" FFFD FFFD FFFD FFFD FFFD FFFD FFFD FFFD),
+               "console decode: F8..FF are each U+FFFD");
+
+    /* A valid prefix cut short is ONE U+FFFD, however long the prefix
+       (Unicode 3.9, "U+FFFD Substitution of Maximal Subparts"). */
+    static const unsigned char e1[] = { 0xE1, 0x80, 0x41 };
+    test_check(decode_one_is(e1, sizeof(e1), FFFD "A"),
+               "console decode: E1 80 41 (a cut-short prefix) is one U+FFFD, then A");
+    static const unsigned char f1[] = { 0xF1, 0x80, 0x80, 0x41 };
+    test_check(decode_one_is(f1, sizeof(f1), FFFD "A"),
+               "console decode: F1 80 80 41 (a cut-short prefix) is one U+FFFD, then A");
+    {
+        char                 o2[64];
+        static const unsigned char p0[] = { 'x', 0xF1 }, p1[] = { 0x80 }, p2[] = { 0x80, 'B' };
+        const unsigned char *cp[] = { p0, p1, p2 };
+        size_t               lp[] = { sizeof(p0), sizeof(p1), sizeof(p2) };
+        decode_chunks(cp, lp, 3, o2, sizeof(o2));
+        test_check(axl_strcmp(o2, "x" FFFD "B") == 0,
+                   "console decode: F1 80 80 split across writes, then B, is one U+FFFD");
+    }
+
+    /* An ill-formed second byte that arrives in the NEXT write. */
+    char                 out[64];
+    static const unsigned char h0[] = { 'x', 0xE0 }, h1[] = { 0x9F, 'y' };
+    const unsigned char *c1w[] = { h0, h1 };
+    size_t               l1w[] = { sizeof(h0), sizeof(h1) };
+    decode_chunks(c1w, l1w, 2, out, sizeof(out));
+    test_check(axl_strcmp(out, "x" FFFD FFFD "y") == 0,
+               "console decode: E0 then 9F in the next write is two U+FFFD");
+}
+
+/* UTF-16LE that can never decode, and a mark split across writes. */
+static void
+test_console_decode_ill_formed_utf16(void)
+{
+    char out[64];
+    static const unsigned char hi[] = { 0xFF, 0xFE, 0x3D, 0xD8, 'q', 0 };
+    test_check(decode_one_is(hi, sizeof(hi), FFFD "q"),
+               "console decode: a high surrogate before a non-low unit is U+FFFD, then the unit");
+    static const unsigned char m0[] = { 0xFF }, m1[] = { 0xFE, 'r', 0 };
+    const unsigned char *c[] = { m0, m1 };
+    size_t               l[] = { sizeof(m0), sizeof(m1) };
+    decode_chunks(c, l, 2, out, sizeof(out));
+    test_check(axl_strcmp(out, "r") == 0,
+               "console decode: a UTF-16LE mark split across writes is dropped");
+}
+
+/* A raw writer may emit two files one after the other (`cat --raw a.txt
+   b.utf16`): a write that STARTS with FF FE, with nothing held, is a
+   UTF-16LE mark -- that pair is never UTF-8. */
+static void
+test_console_decode_second_mark(void)
+{
+    char out[64];
+    static const unsigned char a[] = { 'a', 'b', '\n' };
+    static const unsigned char b[] = { 0xFF, 0xFE, 'c', 0, 'd', 0 };
+    const unsigned char *c[] = { a, b };
+    size_t               l[] = { sizeof(a), sizeof(b) };
+    decode_chunks(c, l, 2, out, sizeof(out));
+    test_check(axl_strcmp(out, "ab\ncd") == 0,
+               "console decode: UTF-8 then a write starting FF FE is UTF-16LE from there");
+}
 
 static void
 test_console(void)
@@ -352,24 +582,20 @@ test_file(void)
     /* Cleanup */
     axl_file_delete("fs0:\\axl_rn_dst.tmp");
 
-    /* Cross-directory rename must be refused — SetFileInfo can't
-       move across directories on most FAT drivers, and we surface
-       that as AXL_ERR rather than silently doing the wrong thing.
-       Materialize the destination directory first so a refusal here
-       MUST come from the SDK's prefix-check, not the backend
-       failing to find the target dir (which would mask a regression
-       where the prefix check is silently deleted). */
+    /* A cross-directory rename on the same volume MOVES the file: the
+       FAT driver resolves a root-anchored FileName in SetInfo, so no data
+       is copied. (It used to be refused; test_file_rename_moves covers
+       the move semantics in full.) */
     axl_dir_mkdir("fs0:\\axl_sub");
     (void)axl_file_set_contents("fs0:\\axl_rn_x.tmp", "y", 1);
     test_check(axl_file_rename("fs0:\\axl_rn_x.tmp",
-                               "fs0:\\axl_sub\\axl_rn_x.tmp") != AXL_OK,
-               "file: cross-directory rename refused");
-    /* Source must still exist — verifies the refusal happened before
-       any backend mutation. */
+                               "fs0:\\axl_sub\\axl_rn_x.tmp") == AXL_OK,
+               "file: cross-directory rename on one volume -> AXL_OK");
     AxlFsEntry finfo_src;
-    test_check(axl_file_info("fs0:\\axl_rn_x.tmp", &finfo_src) == AXL_OK,
-               "file: cross-dir refusal left source in place");
-    axl_file_delete("fs0:\\axl_rn_x.tmp");
+    test_check(axl_file_info("fs0:\\axl_rn_x.tmp", &finfo_src) != AXL_OK
+               && file_holds("fs0:\\axl_sub\\axl_rn_x.tmp", "y", 1),
+               "file: cross-dir rename moved the file, exact bytes");
+    axl_file_delete("fs0:\\axl_sub\\axl_rn_x.tmp");
     axl_dir_rmdir("fs0:\\axl_sub");
 
     /* Basename-only new_path (common from shell-style callers)
@@ -426,6 +652,21 @@ test_file(void)
     test_check(axl_file_delete("fs0:\\axl_absent.tmp") == AXL_NOT_FOUND,
                "file: delete of an absent path is NOT_FOUND, not a false OK "
                "for a file the call itself created");
+
+    /* NOT_FOUND means "not there" and nothing else: a caller maps it to a
+       404. A file that IS there but cannot be removed -- the read-only
+       attribute (test-axl.sh stages it with mattrib +r) -- and a path whose
+       volume does not resolve are both AXL_ERR. */
+    test_check(axl_file_delete("fs0:\\axl-ro-del.txt") == AXL_ERR,
+               "file: delete of a read-only file is AXL_ERR, not NOT_FOUND");
+    {
+        AxlFsEntry ro;
+        test_check(axl_file_info("fs0:\\axl-ro-del.txt", &ro) == AXL_OK
+                   && axl_fs_entry_is_read_only(&ro) && ro.size == 7,
+                   "file: the read-only file is still there, 7 bytes");
+    }
+    test_check(axl_file_delete("axlnovol:\\x.txt") == AXL_ERR,
+               "file: delete on a volume that does not resolve is AXL_ERR");
 
     /* --- axl_file_move: same-directory case falls through to rename
        (fast atomic-on-FAT path); cross-directory case does the
@@ -2624,7 +2865,7 @@ test_write_paths_report_a_failed_flush(void)
     if (!ff_fs_up()) {
         /* No shell to map the published volume through, so it cannot be
            reached by path at all. One balancer per assertion below. */
-        test_skip_n(9, "flush-fail write paths (no shell map for the published volume)");
+        test_skip_n(12, "flush-fail write paths (no shell map for the published volume)");
         return;
     }
 
@@ -2660,23 +2901,1376 @@ test_write_paths_report_a_failed_flush(void)
                "flush-fail: move's copy fallback kept the source it could not copy");
 
     /* Recovery policy at the PROMOTE step, which needs the opposite fixture:
-       the temp write must LAND so the rename is reached, and the rename must
-       be the thing that fails (FF_NORENAME_PREFIX). write_atomic then finds
-       the target already deleted by its own delete-then-rename fallback, and
-       the temp is the only complete copy in existence -- deleting it, which
-       is what "clean up on failure" used to do unconditionally, destroys the
-       caller's data outright. axl_piece_tree_save keeps its temp in exactly
-       this situation; the two promote sites now agree. */
+       the temp write must LAND so the promote is reached, and the promote
+       must be what fails. First a temp that cannot be renamed (ff_tmp_stuck):
+       the target was set aside, the promote failed, the aside went back --
+       the target exactly as it was, the temp removed as litter. */
     ff_set_flush_ok(true);
-    test_check(ff_seed(FF_NORENAME_PREFIX "doc", "orig", 4)
-               && axl_file_write_atomic(FF_PATH(FF_NORENAME_PREFIX "doc"),
-                                        "replacement", 11) == AXL_ERR,
-               "flush-fail: write_atomic whose promote fails returns AXL_ERR");
-    test_check(ff_content_is(FF_NORENAME_PREFIX "doc.tmp", "replacement", 11),
-               "flush-fail: a promote that destroyed the target keeps the temp "
-               "holding the only complete copy");
+    ff_tmp_stuck = true;
+    test_check(ff_seed("doc", "orig", 4)
+               && axl_file_write_atomic(FF_PATH("doc"), "replacement", 11) == AXL_ERR,
+               "flush-fail: write_atomic whose promote fails -> AXL_ERR");
+    test_check(ff_content_is("doc", "orig", 4) && !ff_exists("doc.tmp")
+               && ff_count_prefix("~AXL") == 0,
+               "flush-fail: the target is back exactly, no temp, no aside");
+    ff_tmp_stuck = false;
+
+    /* Then a filesystem that refuses EVERY rename onto the name
+       (FF_NORENAME_PREFIX): the promote fails and so does putting the
+       target back. The target is stranded at its aside -- reported, with
+       both names -- and the temp, now the only copy of the new contents
+       under a name the caller knows, is kept. */
+    test_check(ff_seed(FF_NORENAME_PREFIX "doc", "orig", 4),
+               "flush-fail: setup: nr-doc holds orig");
+    axl_fs_replace_test_seed(0x0300);
+    test_log_quiet_begin("fs");
+    int  wrc   = axl_file_write_atomic(FF_PATH(FF_NORENAME_PREFIX "doc"), "replacement", 11);
+    bool error = test_log_quiet_armed && test_log_quiet_hits == 1
+                 && test_log_quiet_first_level == AXL_LOG_ERROR
+                 && axl_strcmp(test_log_quiet_first_msg,
+                               "replace: '" FF_MAP ":\\~AXL0300.TMP' could not be renamed "
+                               "back to '" FF_MAP ":\\" FF_NORENAME_PREFIX "doc' and is "
+                               "still there") == 0;
+    test_log_quiet_abort();
+    test_check(wrc == AXL_UNSUPPORTED && error,
+               "flush-fail: promote and put-back both refused -> AXL_UNSUPPORTED, "
+               "the exact error naming both");
+    test_check(ff_content_is("~AXL0300.TMP", "orig", 4) && !ff_exists(FF_NORENAME_PREFIX "doc")
+               && ff_content_is(FF_NORENAME_PREFIX "doc.tmp", "replacement", 11),
+               "flush-fail: the target is at its aside, the temp kept with the new contents");
+    ff_fs_down();
+}
+
+/* Fill @p n bytes at @p path with a non-zero pattern and delete the file, so
+   the clusters it held go back on the free list still carrying that pattern.
+   The EDK2-derived FAT driver lowers its next-free-cluster hint on a free
+   (FileSpace.c), so the next allocation reuses exactly those clusters. */
+static bool
+dirty_free_clusters(const char *path, size_t n)
+{
+    uint8_t *junk = axl_malloc(n);
+    if (junk == NULL) {
+        return false;
+    }
+    axl_memset(junk, 0xA5, n);
+    bool ok = axl_file_set_contents(path, junk, n) == AXL_OK
+              && axl_file_delete(path) == AXL_OK;
+    axl_free(junk);
+    return ok;
+}
+
+/* True when @p path holds exactly @p gap zero bytes followed by "Z". */
+static bool
+file_is_zero_gap_then_z(const char *path, size_t gap)
+{
+    void   *buf = NULL;
+    size_t  len = 0;
+    bool    ok  = false;
+
+    if (axl_file_get_contents(path, &buf, &len) == AXL_OK && len == gap + 1) {
+        const uint8_t *b = (const uint8_t *)buf;
+        ok = (b[gap] == 'Z');
+        for (size_t i = 0; ok && i < gap; i++) {
+            ok = (b[i] == 0);
+        }
+    }
+    axl_free(buf);
+    return ok;
+}
+
+/* Write one 'Z' at offset @p gap of a new file at @p path through the raw
+   backend, under the file stream's zero-fill, and report whether the gap
+   read back holds any 0xA5 -- the stale bytes dirty_free_clusters left. */
+static bool
+raw_write_past_eof_leaves_stale(const char *path, size_t gap)
+{
+    unsigned short *wide = axl_utf8_to_ucs2(path);
+    AxlFileHandle   h    = NULL;
+    size_t          one  = 1;
+    bool            ok   = wide != NULL
+        && axl_backend_file_open(wide, AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE
+                                       | AXL_FILE_MODE_CREATE, 0, &h) == AXL_OK
+        && axl_backend_file_set_position(h, (uint64_t)gap) == AXL_OK
+        && axl_backend_file_write(h, &one, "Z") == AXL_OK
+        && axl_backend_file_flush(h) == AXL_OK;
+    axl_backend_file_close(&h);
+    axl_free(wide);
+
+    void   *buf   = NULL;
+    size_t  len   = 0;
+    bool    stale = false;
+    if (ok && axl_file_get_contents(path, &buf, &len) == AXL_OK
+        && len == gap + 1) {
+        for (size_t i = 0; i < gap && !stale; i++) {
+            stale = ((const uint8_t *)buf)[i] == 0xA5;
+        }
+    }
+    axl_free(buf);
+    return stale;
+}
+
+/* Regression: a stream's sequential write after its file was SHRUNK below
+   the stream's position -- by a path call, by another stream, or by the
+   stream itself -- must zero the gap too. Only a seek on THIS stream armed
+   the check, so the clusters the shrink freed (still holding the old 'A's)
+   came back when the write regrew the file. */
+static void
+test_write_after_a_shrink_zero_fills(void)
+{
+    const char *path  = "fs0:\\axl_gap_shrink.tmp";
+    size_t      n     = 8192;
+    uint8_t    *as    = axl_malloc(n);
+    AxlStream  *s;
+    AxlStream  *other = NULL;
+
+    if (as == NULL) {
+        test_fail("gap shrink: setup allocation");
+        return;
+    }
+    axl_memset(as, 'A', n);
+
+    /* P1: axl_file_truncate by path. */
+    axl_file_delete(path);
+    s = axl_fopen(path, "w");
+    test_check(s != NULL && axl_write(s, as, n) == (axl_ssize_t)n
+               && axl_fflush(s) == AXL_OK
+               && axl_file_truncate(path, 0) == AXL_OK
+               && axl_write(s, "Z", 1) == 1,
+               "gap shrink: write 8192, truncate by path to 0, write Z");
+    axl_fclose(s);
+    test_check(file_is_zero_gap_then_z(path, n),
+               "gap shrink: after a truncate by path, 8192 zeros then Z");
+
+    /* P1b: axl_ftruncate through ANOTHER stream. */
+    axl_file_delete(path);
+    s = axl_fopen(path, "w");
+    if (s != NULL && axl_write(s, as, n) == (axl_ssize_t)n
+        && axl_fflush(s) == AXL_OK) {
+        other = axl_fopen(path, "w");
+    }
+    test_check(other != NULL && axl_ftruncate(other, 0) == AXL_OK
+               && axl_write(s, "Z", 1) == 1,
+               "gap shrink: write 8192, another stream ftruncates to 0, write Z");
+    axl_fclose(other);
+    axl_fclose(s);
+    test_check(file_is_zero_gap_then_z(path, n),
+               "gap shrink: after another stream's ftruncate, 8192 zeros then Z");
+
+    /* The stream's own ftruncate below its position. */
+    axl_file_delete(path);
+    s = axl_fopen(path, "w");
+    test_check(s != NULL && axl_write(s, as, n) == (axl_ssize_t)n
+               && axl_ftruncate(s, 0) == AXL_OK && axl_write(s, "Z", 1) == 1,
+               "gap shrink: write 8192, own ftruncate to 0, write Z");
+    axl_fclose(s);
+    test_check(file_is_zero_gap_then_z(path, n),
+               "gap shrink: after its own ftruncate, 8192 zeros then Z");
+
+    axl_file_delete(path);
+    axl_free(as);
+}
+
+/* Regression: axl_fseek must write out the stream's own buffered bytes
+   first, as stdio's fseek does. It did not, so they landed at the NEW
+   position: FULL buffering, write "AB", seek to 10, write "Z" gave
+   ten zeros then "ABZ". */
+static void
+test_fseek_drains_buffered_writes(void)
+{
+    const char           *p    = "fs0:\\axl_seek_drain.tmp";
+    static const uint8_t  want[11] = { 'A', 'B', 0, 0, 0, 0, 0, 0, 0, 0, 'Z' };
+    AxlStream            *s;
+
+    axl_file_delete(p);
+    s = axl_fopen(p, "w");
+    test_check(s != NULL
+               && axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 0) == AXL_OK
+               && axl_write(s, "AB", 2) == 2
+               && axl_fseek(s, 10, AXL_SEEK_SET) == AXL_OK
+               && axl_write(s, "Z", 1) == 1,
+               "fseek drain: FULL-buffered AB, seek to 10, Z");
+    axl_fclose(s);
+    test_check(file_holds(p, want, sizeof(want)),
+               "fseek drain: the file is exactly A B, eight zeros, Z");
+    axl_file_delete(p);
+}
+
+/* Regression: the file stream's gap check asked the firmware for the
+   position, which an AxlFsProvider volume never supports, so the write
+   failed -- after any seek, and after any AXL write to ANOTHER file whose
+   basename shares this one's registry slot -- and every write after it
+   failed too. The stream tracks its position itself now. */
+static void
+test_stream_writes_on_a_provider_volume(void)
+{
+    static const uint8_t gap[6] = { 'a', 'b', 0, 0, 0, 'Z' };
+    AxlStream           *s;
+
+    if (!ff_fs_up()) {
+        test_skip_n(8, "provider stream writes (no shell map for the published volume)");
+        return;
+    }
+    ff_set_flush_ok(true);
+
+    /* A write to a same-named file on another volume moves the shared
+       registry slot between two writes. */
+    s = axl_fopen(FF_PATH("g"), "w");
+    test_check(s != NULL && axl_write(s, "ab", 2) == 2,
+               "provider stream: first write");
+    test_check(axl_file_set_contents("fs0:\\g", "other", 5) == AXL_OK
+               && s != NULL && axl_write(s, "cd", 2) == 2
+               && axl_write(s, "ef", 2) == 2,
+               "provider stream: writes after a foreign same-name write succeed");
+    test_check(s != NULL && axl_ftell(s) == 6,
+               "provider stream: ftell tracks the position, 6");
+    axl_fclose(s);
+    test_check(ff_content_is("g", "abcdef", 6),
+               "provider stream: the file is exactly abcdef");
+    axl_file_delete("fs0:\\g");
+
+    /* Seek back, then write over the middle. */
+    s = axl_fopen(FF_PATH("h"), "w");
+    test_check(s != NULL && axl_write(s, "abc", 3) == 3
+               && axl_fseek(s, 1, AXL_SEEK_SET) == AXL_OK
+               && axl_write(s, "X", 1) == 1,
+               "provider stream: write abc, seek to 1, write X");
+    axl_fclose(s);
+    test_check(ff_content_is("h", "aXc", 3),
+               "provider stream: the file is exactly aXc");
+
+    /* Seek past the end: the gap is zeros on a provider too. */
+    s = axl_fopen(FF_PATH("k"), "w");
+    test_check(s != NULL && axl_write(s, "ab", 2) == 2
+               && axl_fseek(s, 5, AXL_SEEK_SET) == AXL_OK
+               && axl_write(s, "Z", 1) == 1,
+               "provider stream: write ab, seek to 5, write Z");
+    axl_fclose(s);
+    test_check(ff_content_is("k", gap, sizeof(gap)),
+               "provider stream: the file is exactly a b 00 00 00 Z");
 
     ff_fs_down();
+}
+
+/* Regression: axl_ftell ignored the stream's own buffered bytes, so the
+   save/restore idiom -- cur = ftell; seek to the end; seek back to cur --
+   lost them once fseek began writing the buffer out first: AB, then C,
+   came out "CB". Run on fs0: and on a provider volume. */
+static bool
+ftell_save_restore(
+    const char  *path,
+    AxlEncoding  enc,
+    const char  *first,
+    int64_t      want_at
+    )
+{
+    AxlStream *s  = axl_fopen(path, "w");
+    size_t     n  = axl_strlen(first);
+    bool       ok = s != NULL
+                    && axl_stream_set_encoding(s, enc) == AXL_OK
+                    && axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 0) == AXL_OK
+                    && axl_write(s, first, n) == (axl_ssize_t)n;
+    int64_t    at = ok ? axl_ftell(s) : -1;
+
+    ok = ok && at == want_at
+         && axl_fseek(s, 0, AXL_SEEK_END) == AXL_OK
+         && axl_fseek(s, at, AXL_SEEK_SET) == AXL_OK
+         && axl_write(s, "C", 1) == 1;
+    axl_fclose(s);
+    return ok;
+}
+
+static void
+test_ftell_counts_buffered_bytes(void)
+{
+    const char           *p = "fs0:\\axl_ftell_buf.tmp";
+    static const uint8_t  ucs2[6] = { 'A', 0, 'B', 0, 'C', 0 };
+
+    /* UTF-8 passthrough: two bytes buffered are two bytes of position. */
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_UTF8, "AB", 2)
+               && file_holds(p, "ABC", 3),
+               "ftell: buffered AB, save, seek end, restore, C -> ABC");
+    /* UCS-2: the buffered "AB" is FOUR wire bytes. */
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_UCS2_LE, "AB", 4)
+               && file_holds(p, ucs2, sizeof(ucs2)),
+               "ftell: UCS-2 buffered AB is 4 wire bytes; restore, C -> A B C");
+    /* ASCII: the two-byte e-acute is ONE wire byte ('?'). */
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_ASCII, "\xC3\xA9" "B", 2)
+               && file_holds(p, "?BC", 3),
+               "ftell: ASCII buffered e-acute B is 2 wire bytes; -> ?BC");
+    /* One code point per character, whatever its UTF-8 length: above
+       U+FFFF is a single '?' in UCS-2 (4 caller bytes, 2 wire bytes); a
+       lead byte that its next byte cannot continue is Latin-1 (C3 'A' is
+       two code points); a lone continuation byte is one. */
+    static const uint8_t astral[4] = { '?', 0, 'C', 0 };
+    static const uint8_t latin[6]  = { 0xC3, 0, 'A', 0, 'C', 0 };
+    static const uint8_t lone[4]   = { 0x80, 0, 'C', 0 };
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_UCS2_LE, "\xF0\x9F\x98\x80", 2)
+               && file_holds(p, astral, sizeof(astral)),
+               "ftell: UCS-2 U+1F600 is one '?' unit, 2 wire bytes -> ? C");
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_UCS2_LE, "\xC3" "A", 4)
+               && file_holds(p, latin, sizeof(latin)),
+               "ftell: UCS-2 C3 'A' is two code points, 4 wire bytes");
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_UCS2_LE, "\x80", 2)
+               && file_holds(p, lone, sizeof(lone)),
+               "ftell: UCS-2 lone 0x80 is one code point, 2 wire bytes");
+
+    /* A trailing incomplete sequence is not yet a wire byte. */
+    axl_file_delete(p);
+    test_check(ftell_save_restore(p, AXL_ENC_UCS2_LE, "AB\xC3", 4),
+               "ftell: a buffered half character counts nothing yet");
+    axl_file_delete(p);
+
+    /* Read side: a UCS-2 e-acute delivered one UTF-8 byte at a time. After
+       the first byte the caller is INSIDE the character, whose wire bytes
+       are already pulled: ftell reports its start, not past it. */
+    static const uint8_t eacute_x[4] = { 0xE9, 0x00, 'x', 0x00 };
+    char       b[2];
+    AxlStream *r = NULL;
+    if (axl_file_set_contents(p, eacute_x, sizeof(eacute_x)) == AXL_OK) {
+        r = axl_fopen(p, "r");
+    }
+    test_check(r != NULL && axl_stream_set_encoding(r, AXL_ENC_UCS2_LE) == AXL_OK
+               && axl_read(r, b, 1) == 1 && (uint8_t)b[0] == 0xC3
+               && axl_ftell(r) == 0,
+               "ftell: mid-character on the read side reports the character's start");
+    axl_fclose(r);
+    axl_file_delete(p);
+
+    if (!ff_fs_up()) {
+        test_skip_n(2, "ftell on a provider (no shell map for the published volume)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    test_check(ftell_save_restore(FF_PATH("t"), AXL_ENC_UTF8, "AB", 2)
+               && ff_content_is("t", "ABC", 3),
+               "ftell: the same on a provider volume -> ABC");
+    test_check(ftell_save_restore(FF_PATH("u"), AXL_ENC_UCS2_LE, "AB", 4)
+               && ff_content_is("u", ucs2, sizeof(ucs2)),
+               "ftell: UCS-2 on a provider volume -> A B C");
+    ff_fs_down();
+}
+
+/* Regression: a name longer than the caller's buffer made the handle stat
+   FAIL, which took axl_fstat down with it. It is cut instead -- at a
+   character boundary, never between the two halves of a surrogate pair.
+   Driven at the backend seam with a deliberately small buffer, since no
+   filesystem here stores a name longer than AxlFsEntry's. */
+static void
+test_handle_stat_cuts_a_long_name(void)
+{
+    /* fs0:\ab<U+1F600>z.tmp, with the emoji as its UTF-16 surrogate pair
+       (axl_utf8_to_ucs2 stops at the BMP, so the name is built by hand). */
+    static const unsigned short wide[] = {
+        'f', 's', '0', ':', '\\', 'a', 'b', 0xD83D, 0xDE00,
+        'z', '.', 't', 'm', 'p', 0
+    };
+    AxlFileHandle   h = NULL;
+    unsigned short  name[4];
+    unsigned short  whole[32];
+    bool            cut = false;
+
+    axl_backend_file_delete(wide);
+    bool opened = axl_backend_file_open(wide, AXL_FILE_MODE_READ
+                                              | AXL_FILE_MODE_WRITE
+                                              | AXL_FILE_MODE_CREATE, 0, &h)
+                  == AXL_OK;
+    test_check(opened, "stat cut: setup: a name with a surrogate pair");
+    /* Four units: "ab", the high surrogate, NUL -- the cut must drop the
+       lone high half and leave "ab". */
+    test_check(opened && axl_backend_file_handle_stat(h, NULL, NULL, NULL,
+                                                      NULL, NULL, name, 4, &cut)
+                             == AXL_OK
+               && name[0] == 'a' && name[1] == 'b' && name[2] == 0,
+               "stat cut: a long name is cut to ab, not split mid-pair");
+    test_check(cut, "stat cut: the cut is reported");
+    cut = true;
+    test_check(opened && axl_backend_file_handle_stat(h, NULL, NULL, NULL,
+                                                      NULL, NULL, whole, 32, &cut)
+                             == AXL_OK
+               && !cut && whole[2] == 0xD83D && whole[3] == 0xDE00,
+               "stat cut: a name that fits is whole and reported uncut");
+    axl_backend_file_close(&h);
+    axl_backend_file_delete(wide);
+}
+
+/* Regression: the file stream's tracked position and the handle's real one
+   must not drift apart after a failure. A write that moved some bytes and
+   then failed left the handle past the position the stream reports; a
+   pread whose final restore failed left the handle at the offset; a pwrite
+   whose seek failed after the gap fill had moved the handle never put it
+   back. Each next operation then landed in the wrong place. Driven on the
+   provider fixture, which can fail exactly there. */
+static void
+test_stream_position_survives_a_failure(void)
+{
+    static const uint8_t m2_want[5] = { 'a', 'b', 'c', 0, 0 };
+    AxlStream           *s;
+    char                 one;
+    bool                 ok;
+
+    if (!ff_fs_up()) {
+        test_skip_n(10, "position after failure (no shell map for the published volume)");
+        return;
+    }
+    ff_set_flush_ok(true);
+
+    /* m1: a short write that errors. */
+    s  = axl_fopen(FF_PATH("w1"), "w");
+    ok = s != NULL && axl_write(s, "ab", 2) == 2;
+    ff_write_limit = 4;
+    test_check(ok && axl_write(s, "cdef", 4) < 0,
+               "position: a write that moves 2 of 4 bytes and fails -> -1");
+    ff_write_limit = 0;
+    test_check(s != NULL && axl_write(s, "XY", 2) == 2,
+               "position: the next write succeeds");
+    axl_fclose(s);
+    test_check(ff_content_is("w1", "abXY", 4),
+               "position: it landed where the stream was, at 2: abXY");
+
+    /* m1: a pread whose restore fails. */
+    s  = axl_fopen(FF_PATH("w2"), "w");
+    ok = s != NULL && axl_write(s, "abcd", 4) == 4;
+    ff_seek_fail_pos   = 4;
+    ff_seek_fail_armed = true;
+    ok = ok && axl_pread(s, &one, 1, 0) == 1;
+    ff_seek_fail_armed = false;
+    test_check(ok && axl_write(s, "Z", 1) == 1,
+               "position: pread at 0 whose restore fails, then a write");
+    axl_fclose(s);
+    test_check(ff_content_is("w2", "abcdZ", 5),
+               "position: it landed at 4, not where pread left the handle: abcdZ");
+
+    /* m2: a pwrite whose seek to the offset fails after the gap fill. */
+    s  = axl_fopen(FF_PATH("w3"), "w");
+    ok = s != NULL && axl_write(s, "ab", 2) == 2;
+    ff_seek_fail_pos   = 5;
+    ff_seek_fail_armed = true;
+    test_check(ok && axl_pwrite(s, "Z", 1, 5) < 0,
+               "position: pwrite at 5 whose seek there fails -> -1");
+    ff_seek_fail_armed = false;
+    ok = s != NULL && axl_write(s, "c", 1) == 1;
+    axl_fclose(s);
+    test_check(ok && ff_content_is("w3", m2_want, sizeof(m2_want)),
+               "position: the next write lands at 2, after the gap zeros: abc 00 00");
+
+    /* m3: append mode starts at the end it reads -- and refuses to open
+       when it cannot read the end, rather than start at 0 while the
+       handle sits at the end. */
+    AxlStream *ap = NULL;
+    if (ff_seed("ap", "ab", 2)) {
+        ap = axl_fopen(FF_PATH("ap"), "a");
+    }
+    test_check(ap != NULL && axl_ftell(ap) == 2 && axl_write(ap, "c", 1) == 1,
+               "position: append opens at the end, 2, and writes there");
+    axl_fclose(ap);
+    test_check(ff_content_is("ap", "abc", 3),
+               "position: the append landed after ab: abc");
+    ff_info_fail = true;
+    ap = axl_fopen(FF_PATH("ap"), "a");
+    ff_info_fail = false;
+    test_check(ap == NULL,
+               "position: append with an unreadable length refuses to open");
+    axl_fclose(ap);
+
+    ff_fs_down();
+}
+
+/* Regression: a UTF-8 lead byte followed by a byte that cannot continue it
+   ("\xE2A") is provably invalid already -- the lead is Latin-1 U+00E2 and
+   'A' is 'A' -- but the decoder called it "incomplete" and held both back.
+   ftell then left them out, and a seek or a new encoding dropped the held
+   bytes, losing a valid 'A'. */
+static void
+test_transcode_decides_a_provably_invalid_tail(void)
+{
+    const char           *p = "fs0:\\axl_tail.tmp";
+    static const uint8_t  want[4] = { 0xE2, 0x00, 'A', 0x00 };
+
+    axl_file_delete(p);
+    AxlStream *s = axl_fopen(p, "w");
+    test_check(s != NULL && axl_stream_set_encoding(s, AXL_ENC_UCS2_LE) == AXL_OK
+               && axl_write(s, "\xE2" "A", 2) == 2 && axl_ftell(s) == 4,
+               "tail: UCS-2 write of E2 41 is two characters now, ftell 4");
+    test_check(s != NULL && axl_fseek(s, 0, AXL_SEEK_END) == AXL_OK,
+               "tail: a seek after it");
+    axl_fclose(s);
+    test_check(file_holds(p, want, sizeof(want)),
+               "tail: the file is exactly E2 00 41 00 -- the 'A' survived");
+    axl_file_delete(p);
+}
+
+/* Regression: a write that starts past end of file must leave zeros in the
+   gap, as POSIX does -- never the stale contents of whatever clusters the
+   driver allocated for it.
+
+   The EDK2-derived FAT driver extends a file on WRITE through FatGrowEof
+   (ReadWrite.c), which allocates clusters and moves the end of file but
+   writes nothing into the gap; only the SetInfo path (FatExpandOFile)
+   zero-fills. So an AXL write at an offset beyond the end -- axl_pwrite, or
+   axl_fseek then axl_write -- published deleted data from the volume. */
+static void
+test_write_past_eof_zero_fills(void)
+{
+    const char *junk = "fs0:\\axl_gap_junk.tmp";
+    const char *path = "fs0:\\axl_gap.tmp";
+    size_t      gap  = 16384;
+    AxlStream  *s;
+
+    /* CONTROL: the fixture must really leave stale bytes for the driver to
+       expose, or every zero below proves nothing. Write past the end through
+       the raw backend -- below the file stream's zero-fill -- and the gap
+       must come back holding the deleted file's 0xA5. */
+    axl_file_delete(path);
+    test_check(dirty_free_clusters(junk, gap),
+               "gap: control setup: freed clusters hold a non-zero pattern");
+    test_check(raw_write_past_eof_leaves_stale(path, gap),
+               "gap: control: a raw write past EOF exposes the stale 0xA5 bytes");
+    axl_file_delete(path);
+
+    /* axl_pwrite past the end. */
+    test_check(dirty_free_clusters(junk, gap),
+               "gap: setup: freed clusters hold a non-zero pattern");
+    s = axl_fopen(path, "w");
+    test_check(s != NULL && axl_pwrite(s, "Z", 1, gap) == 1,
+               "gap: pwrite one byte at offset 16384 of an empty file");
+    axl_fclose(s);
+    test_check(file_is_zero_gap_then_z(path, gap),
+               "gap: pwrite past EOF leaves exactly 16384 zero bytes before it");
+    axl_file_delete(path);
+
+    /* axl_fseek past the end, then a sequential axl_write. */
+    test_check(dirty_free_clusters(junk, gap),
+               "gap: setup: freed clusters hold a non-zero pattern again");
+    s = axl_fopen(path, "w");
+    test_check(s != NULL && axl_fseek(s, (int64_t)gap, AXL_SEEK_SET) == AXL_OK
+               && axl_write(s, "Z", 1) == 1,
+               "gap: seek to 16384 then write one byte");
+    axl_fclose(s);
+    test_check(file_is_zero_gap_then_z(path, gap),
+               "gap: seek past EOF then write leaves exactly 16384 zero bytes");
+    axl_file_delete(path);
+}
+
+/* True when @p path does not resolve at all. */
+static bool
+path_absent(const char *path)
+{
+    AxlFsEntry e;
+    return axl_file_info(path, &e) != AXL_OK;
+}
+
+#define MV_A  "fs0:\\axl_mv_a"
+#define MV_B  "fs0:\\axl_mv_b"
+
+/* axl_file_rename moving entries between directories of one FAT volume,
+   and everything it must refuse with nothing changed. */
+static void
+test_file_rename_moves(void)
+{
+    axl_dir_mkdir(MV_A);
+    axl_dir_mkdir(MV_B);
+
+    /* A file into a sibling directory: one SetInfo, times kept. */
+    test_check(axl_file_set_contents(MV_A "\\f.txt", "payload", 7) == AXL_OK
+               && axl_file_set_mtime(MV_A "\\f.txt", 1000000000) == AXL_OK,
+               "move: setup: a\\f.txt = payload at 1000000000");
+    test_check(axl_file_rename(MV_A "\\f.txt", MV_B "\\f.txt") == AXL_OK,
+               "move: file into a sibling directory -> AXL_OK");
+    test_check(path_absent(MV_A "\\f.txt"),
+               "move: the old path no longer resolves");
+    test_check(file_holds(MV_B "\\f.txt", "payload", 7)
+               && file_mtime(MV_B "\\f.txt") == 1000000000,
+               "move: exact bytes and mtime 1000000000 at the new path");
+
+    /* A directory moves with what is below it. */
+    test_check(axl_dir_mkdir(MV_A "\\d") == AXL_OK
+               && axl_file_set_contents(MV_A "\\d\\c.txt", "child", 5) == AXL_OK,
+               "move: setup: a\\d\\c.txt = child");
+    test_check(axl_file_rename(MV_A "\\d", MV_B "\\d") == AXL_OK,
+               "move: a directory into a sibling -> AXL_OK");
+    test_check(file_holds(MV_B "\\d\\c.txt", "child", 5)
+               && path_absent(MV_A "\\d"),
+               "move: the child reads back at b\\d\\c.txt, a\\d is gone");
+
+    /* axl_file_move: a copy cannot move a directory, so success here can
+       only have come from the rename. */
+    test_check(axl_file_move(MV_B "\\d", MV_A "\\d2") == AXL_OK
+               && file_holds(MV_A "\\d2\\c.txt", "child", 5),
+               "move: axl_file_move moves a directory by rename");
+
+    /* Never replaces. */
+    test_check(axl_file_set_contents(MV_A "\\e1", "one", 3) == AXL_OK
+               && axl_file_set_contents(MV_B "\\e1", "two", 3) == AXL_OK
+               && axl_file_set_contents(MV_A "\\e2", "dup", 3) == AXL_OK,
+               "move: setup: a\\e1 one, b\\e1 two, a\\e2 dup");
+    test_check(axl_file_rename(MV_A "\\e1", MV_B "\\e1") == AXL_EXISTS,
+               "move: onto an existing file in another directory -> AXL_EXISTS");
+    test_check(axl_file_rename(MV_A "\\e1", "e2") == AXL_EXISTS,
+               "move: onto an existing name in the same directory -> AXL_EXISTS");
+    test_check(file_holds(MV_A "\\e1", "one", 3)
+               && file_holds(MV_B "\\e1", "two", 3)
+               && file_holds(MV_A "\\e2", "dup", 3),
+               "move: both refusals left every file exactly as it was");
+
+    /* A missing source is AXL_NOT_FOUND, by either spelling of new_path. */
+    test_check(axl_file_rename(MV_A "\\nope", MV_B "\\nope") == AXL_NOT_FOUND
+               && axl_file_rename(MV_A "\\nope", "nope2") == AXL_NOT_FOUND,
+               "move: a missing source -> exactly AXL_NOT_FOUND");
+
+    test_check(axl_file_rename(MV_A "\\e1", "fs0:\\axl_mv_nodir\\e1")
+                   == AXL_ERR
+               && file_holds(MV_A "\\e1", "one", 3),
+               "move: a missing destination directory -> AXL_ERR, source kept");
+
+    /* A directory into itself or below itself. */
+    test_check(axl_dir_mkdir(MV_A "\\p") == AXL_OK
+               && axl_dir_mkdir(MV_A "\\p\\q") == AXL_OK,
+               "move: setup: a\\p\\q");
+    test_check(axl_file_rename(MV_A "\\p", MV_A "\\p\\q\\p") == AXL_ERR
+               && axl_file_rename(MV_A "\\p", MV_A "\\p\\p2") == AXL_ERR,
+               "move: a directory below itself -> AXL_ERR");
+    test_check(axl_file_is_dir(MV_A "\\p\\q"),
+               "move: the refused tree is intact");
+
+    /* An open file below a directory pins the directory (FAT refuses). */
+    test_check(axl_dir_mkdir(MV_A "\\o") == AXL_OK
+               && axl_file_set_contents(MV_A "\\o\\k", "k", 1) == AXL_OK,
+               "move: setup: a\\o\\k");
+    AxlStream *held = axl_fopen(MV_A "\\o\\k", "r");
+    test_check(held != NULL && axl_file_rename(MV_A "\\o", MV_B "\\o")
+                                   == AXL_ERR,
+               "move: a directory with an open file below it -> AXL_ERR");
+    test_check(held != NULL && axl_file_move(MV_A "\\o", MV_B "\\o") == AXL_ERR
+               && path_absent(MV_B "\\o"),
+               "move: axl_file_move does not fall back to a copy on AXL_ERR");
+    axl_fclose(held);
+    test_check(axl_file_rename(MV_A "\\o", MV_B "\\o") == AXL_OK
+               && file_holds(MV_B "\\o\\k", "k", 1),
+               "move: the same move once the file is closed -> AXL_OK");
+
+    /* Other spellings of the same volume. */
+    test_check(axl_file_rename("FS0:/axl_mv_a/e1", "FS0:/axl_mv_b/e3")
+                   == AXL_OK
+               && file_holds(MV_B "\\e3", "one", 3),
+               "move: FS0:/ forward-slash spelling -> AXL_OK");
+    char *cwd = axl_get_current_dir();
+    if (cwd != NULL && (axl_strcasecmp(cwd, "fs0:") == 0
+                        || axl_strcasecmp(cwd, "fs0:\\") == 0)) {
+        test_check(axl_file_rename("axl_mv_b\\e3", "axl_mv_a\\e3") == AXL_OK
+                   && file_holds(MV_A "\\e3", "one", 3),
+                   "move: paths relative to the current directory -> AXL_OK");
+    } else {
+        test_skip_n(1, "move: relative spelling (current directory is not fs0:\\)");
+    }
+    axl_free(cwd);
+
+    /* FAT reads a case-only change as the same name and does nothing. */
+    test_check(axl_file_set_contents(MV_A "\\cs.txt", "c", 1) == AXL_OK
+               && axl_file_rename(MV_A "\\cs.txt", "CS.TXT") == AXL_ERR,
+               "move: a case-only rename on FAT -> AXL_ERR");
+
+    /* Another volume: a RAM disk given its own map name. */
+    void *dp = NULL;
+    if (axl_ramdisk_ensure_driver(NULL, 0, NULL) == AXL_OK
+        && axl_ramdisk_create("AXLMVRD", 2, &dp) == AXL_OK
+        && axl_volume_set_map(dp, "AXLMVRD") == AXL_OK) {
+        test_check(axl_file_rename(MV_A "\\cs.txt", "AXLMVRD:\\cs.txt")
+                       == AXL_UNSUPPORTED,
+                   "move: onto another volume -> AXL_UNSUPPORTED");
+        test_check(file_holds(MV_A "\\cs.txt", "c", 1)
+                   && path_absent("AXLMVRD:\\cs.txt"),
+                   "move: the cross-volume refusal changed nothing");
+        test_check(axl_file_move(MV_A "\\cs.txt", "AXLMVRD:\\cs.txt") == AXL_OK
+                   && file_holds("AXLMVRD:\\cs.txt", "c", 1)
+                   && path_absent(MV_A "\\cs.txt"),
+                   "move: axl_file_move copies across volumes");
+        test_check(axl_volume_unmap("AXLMVRD") == AXL_OK,
+                   "move: RAM disk map name removed");
+    } else {
+        test_skip_n(4, "move: cross-volume (no RAM disk volume to map)");
+    }
+    if (dp != NULL) {
+        axl_ramdisk_destroy("AXLMVRD");
+    }
+
+    /* Cleanup, deepest first. */
+    static const char *const files[] = {
+        MV_B "\\f.txt", MV_A "\\d2\\c.txt", MV_A "\\e1", MV_B "\\e1",
+        MV_A "\\e2", MV_A "\\e3", MV_B "\\e3", MV_B "\\o\\k", MV_A "\\cs.txt",
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        axl_file_delete(files[i]);
+    }
+    static const char *const dirs[] = {
+        MV_A "\\d2", MV_A "\\p\\q", MV_A "\\p", MV_B "\\o", MV_A "\\o",
+        MV_B "\\d", MV_A, MV_B,
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        axl_dir_rmdir(dirs[i]);
+    }
+}
+
+/* Build "fs0:\" followed by @p n copies of U+4E00 (3 UTF-8 bytes each) and
+   @p suffix into @p out (capacity @p cap). Returns @p out. */
+static char *
+cjk_path(char *out, size_t cap, size_t n, const char *suffix)
+{
+    size_t len = axl_strlcpy(out, "fs0:\\", cap);
+    for (size_t i = 0; i < n && len + 4 < cap; i++) {
+        out[len++] = (char)0xE4;
+        out[len++] = (char)0xB8;
+        out[len++] = (char)0x80;
+    }
+    out[len] = '\0';
+    axl_strlcat(out, suffix, cap);
+    return out;
+}
+
+/* Regression: a rename that the filesystem PERFORMED must not be reported
+   as AXL_ERR because the stored name is not byte-for-byte the requested
+   one. FAT strips trailing dots and spaces from a long name, and a name
+   over 255 UTF-8 bytes did not fit the AxlFsEntry.name it was read back
+   into -- both read as "the rename did not happen". The knock-on was
+   axl_file_write_atomic deleting the content it had just put in place. */
+static void
+test_file_rename_names_the_driver_rewrites(void)
+{
+    char long_a[512];
+    char long_b[512];
+
+    axl_file_delete("fs0:\\axl_rv_td");
+    axl_file_delete("fs0:\\axl_rv_td2");
+    test_check(axl_file_set_contents("fs0:\\axl_rv_td", "dot", 3) == AXL_OK
+               && axl_file_rename("fs0:\\axl_rv_td", "axl_rv_td2.") == AXL_OK,
+               "rename: a trailing dot FAT strips -> AXL_OK");
+    test_check(file_holds("fs0:\\axl_rv_td2", "dot", 3)
+               && path_absent("fs0:\\axl_rv_td"),
+               "rename: the file is at the stripped name, not the old one");
+    test_check(axl_file_rename("fs0:\\axl_rv_td2", "fs0:\\..\\axl_rv_up")
+                   == AXL_ERR && file_holds("fs0:\\axl_rv_td2", "dot", 3),
+               "rename: a .. above the volume root -> AXL_ERR, nothing moved");
+    test_check(axl_file_rename("fs0:\\axl_rv_td2", "axl_rv_td2. ") == AXL_ERR,
+               "rename: a name that strips to the current one is still AXL_ERR");
+    axl_file_delete("fs0:\\axl_rv_td2");
+
+    /* 90 CJK characters: 270 UTF-8 bytes, 90 UTF-16 units -- a legal FAT
+       long name past the 256 bytes AxlFsEntry.name once held. */
+    cjk_path(long_a, sizeof(long_a), 90, "");
+    cjk_path(long_b, sizeof(long_b), 89, "b");
+    axl_file_delete(long_a);
+    axl_file_delete(long_b);
+    test_check(axl_file_set_contents(long_a, "cjk", 3) == AXL_OK
+               && axl_file_rename(long_a, long_b + 5) == AXL_OK,
+               "rename: a 270-byte UTF-8 long name -> AXL_OK");
+    test_check(file_holds(long_b, "cjk", 3) && path_absent(long_a),
+               "rename: the long-named file moved");
+    axl_file_delete(long_b);
+
+    /* write_atomic to a fresh path whose name the driver rewrites keeps the
+       data it wrote. */
+    axl_file_delete("fs0:\\axl_rv_wa");
+    test_check(axl_file_write_atomic("fs0:\\axl_rv_wa.", "atomic", 6) == AXL_OK
+               && file_holds("fs0:\\axl_rv_wa", "atomic", 6),
+               "rename: write_atomic to a trailing-dot name keeps its data");
+    axl_file_delete("fs0:\\axl_rv_wa");
+    axl_file_delete("fs0:\\axl_rv_wa..tmp");
+    test_check(axl_file_write_atomic(long_a, "longer", 6) == AXL_OK
+               && file_holds(long_a, "longer", 6),
+               "rename: write_atomic to a 270-byte name keeps its data");
+    axl_file_delete(long_a);
+}
+
+/* The same move-aside cases on an AxlFsProvider volume, whose names are
+   case-SENSITIVE: onto itself, and onto the very name the next aside would
+   take. */
+static void
+test_move_onto_itself_on_a_provider_volume(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(4, "provider move onto itself (no shell map for the published volume)");
+        return;
+    }
+    ff_set_flush_ok(true);
+
+    test_check(ff_seed("self", "keep", 4)
+               && axl_file_move(FF_PATH("self"), FF_PATH("self")) == AXL_OK
+               && ff_content_is("self", "keep", 4),
+               "provider move: onto its own path keeps the file");
+    test_check(axl_file_move(FF_PATH("self"), FF_PATH("SELF")) == AXL_OK
+               && ff_content_is("SELF", "keep", 4) && !ff_exists("self"),
+               "provider move: to another case is a real rename there");
+
+    axl_fs_replace_test_seed(0x0150);
+    test_check(ff_seed("~AXL0150.TMP", "old", 3)
+               && axl_file_move(FF_PATH("SELF"), FF_PATH("~AXL0150.TMP")) == AXL_OK
+               && ff_content_is("~AXL0150.TMP", "keep", 4)
+               && ff_count_prefix("~AXL") == 1
+               && axl_file_rename(FF_PATH("~AXL0150.TMP"), "SELF") == AXL_OK,
+               "provider move: onto the next aside name keeps the data");
+    test_check(ff_seed("fwdold", "old", 3)
+               && axl_file_move(FF_MAP ":/SELF", FF_MAP ":/fwdold") == AXL_OK
+               && ff_content_is("fwdold", "keep", 4) && !ff_exists("SELF"),
+               "provider move: '/' source onto an existing '/' destination");
+    ff_fs_down();
+}
+
+/* Regression: axl_file_move deleted new_path BEFORE renaming, so a
+   new_path that named the source itself destroyed the source -- the same
+   path, a case-only change, "./x", the other separator. And a missing
+   source cost the destination. Identity is now decided by stored names
+   before anything changes, and only the destination is ever set aside. */
+static void
+test_file_move_onto_itself_keeps_the_file(void)
+{
+    const char *p  = "fs0:\\axl_mv_self.txt";
+    const char *cs = "fs0:\\axl_mv_case.txt";
+    AxlFsEntry  e;
+
+    axl_file_delete(p);
+    test_check(axl_file_set_contents(p, "keep", 4) == AXL_OK
+               && axl_file_move(p, p) == AXL_OK && file_holds(p, "keep", 4),
+               "move: onto its own path -> AXL_OK, the file is kept");
+    test_check(axl_file_move(p, "fs0:\\.\\axl_mv_self.txt") == AXL_OK
+               && file_holds(p, "keep", 4),
+               "move: onto itself spelled with .\\ -> the file is kept");
+    test_check(axl_file_move(p, "fs0:/axl_mv_self.txt") == AXL_OK
+               && file_holds(p, "keep", 4),
+               "move: onto itself spelled with / -> the file is kept");
+    axl_file_delete(p);
+
+    axl_file_delete(cs);
+    test_check(axl_file_set_contents(cs, "case", 4) == AXL_OK
+               && axl_file_move(cs, "fs0:\\AXL_MV_CASE.TXT") == AXL_OK
+               && file_holds(cs, "case", 4),
+               "move: a case-only change -> AXL_OK, the data is kept");
+    AxlStream *s = axl_fopen(cs, "r");
+    test_check(s != NULL && axl_fstat(s, &e) == AXL_OK
+               && axl_strcmp(e.name, "AXL_MV_CASE.TXT") == 0,
+               "move: a case-only change stores the new case");
+    axl_fclose(s);
+    axl_file_delete(cs);
+
+    /* A destination that IS the name the next aside would take (or a
+       case variant of it, the same name to FAT) is taken, so the aside
+       skips it; the destination is replaced, and nothing else is left. */
+    static const char *const aside_like[2] = {
+        "fs0:\\~AXL0400.TMP", "fs0:\\~axl0650.tmp"
+    };
+    static const uint16_t seeds[2] = { 0x0400, 0x0650 };
+    static const char *const next_aside[2] = {
+        "fs0:\\~AXL0401.TMP", "fs0:\\~AXL0651.TMP"
+    };
+    for (size_t k = 0; k < 2; k++) {
+        axl_fs_replace_test_seed(seeds[k]);
+        test_check(axl_file_set_contents(p, "keep", 4) == AXL_OK
+                   && axl_file_set_contents(aside_like[k], "old", 3) == AXL_OK
+                   && axl_file_move(p, aside_like[k]) == AXL_OK
+                   && file_holds(aside_like[k], "keep", 4)
+                   && path_absent(p) && path_absent(next_aside[k]),
+                   (k == 0)
+                   ? "move: onto the next aside name replaces it, no aside left"
+                   : "move: onto a case variant of the aside name replaces it");
+        axl_file_delete(aside_like[k]);
+        axl_file_delete(p);
+    }
+
+    /* Either separator, on both sides: a '/' source moves, and a '/'
+       destination that exists is replaced. */
+    axl_file_delete("fs0:\\axl_mv_fwd.txt");
+    test_check(axl_file_set_contents(p, "fwd", 3) == AXL_OK
+               && axl_file_set_contents("fs0:\\axl_mv_fwd.txt", "old", 3) == AXL_OK
+               && axl_file_move("fs0:/axl_mv_self.txt", "fs0:/axl_mv_fwd.txt")
+                      == AXL_OK
+               && file_holds("fs0:\\axl_mv_fwd.txt", "fwd", 3) && path_absent(p),
+               "move: '/' source onto an existing '/' destination replaces it");
+    axl_file_delete("fs0:\\axl_mv_fwd.txt");
+
+    axl_file_delete("fs0:\\axl_mv_nosrc.txt");
+    test_check(axl_file_set_contents(p, "dest", 4) == AXL_OK
+               && axl_file_move("fs0:\\axl_mv_nosrc.txt", p) == AXL_NOT_FOUND
+               && file_holds(p, "dest", 4),
+               "move: a missing source -> AXL_NOT_FOUND, the destination is intact");
+    test_check(axl_file_move(p, "fs0:\\axl_mv_nodir\\x.txt") == AXL_NOT_FOUND
+               && file_holds(p, "dest", 4),
+               "move: a failed move puts the source back under its own name");
+    axl_file_delete(p);
+}
+
+/* Regression: axl_file_move deleted the destination whatever it was, so a
+   directory moved onto a file DELETED THE FILE (and then could not rename
+   the directory over it either). POSIX refuses both mismatches -- ENOTDIR,
+   EISDIR -- and so does this now, before anything is touched. Not run on
+   a provider volume: the flushfail fixture has no directories, and the
+   mvdir fixture renames only its one directory. */
+static void
+test_file_move_refuses_a_kind_mismatch(void)
+{
+    const char *dir  = "fs0:\\axl_mvk_dir";
+    const char *full = "fs0:\\axl_mvk_full";
+    const char *file = "fs0:\\axl_mvk_file.txt";
+
+    axl_dir_mkdir(dir);
+    axl_dir_mkdir(full);
+    test_check(axl_file_set_contents("fs0:\\axl_mvk_dir\\c", "c", 1) == AXL_OK
+               && axl_file_set_contents("fs0:\\axl_mvk_full\\d", "d", 1) == AXL_OK
+               && axl_file_set_contents(file, "file", 4) == AXL_OK,
+               "move kind: setup: a directory, a non-empty directory, a file");
+
+    test_check(axl_file_move(dir, file) == AXL_NOT_DIR,
+               "move kind: a directory onto a file -> AXL_NOT_DIR");
+    test_check(file_holds(file, "file", 4)
+               && file_holds("fs0:\\axl_mvk_dir\\c", "c", 1),
+               "move kind: the file and the directory are both intact");
+
+    test_check(axl_file_move(file, full) == AXL_IS_DIR,
+               "move kind: a file onto a non-empty directory -> AXL_IS_DIR");
+    test_check(file_holds(file, "file", 4)
+               && file_holds("fs0:\\axl_mvk_full\\d", "d", 1),
+               "move kind: the file and the directory's contents are intact");
+
+    /* POSIX: a file onto ANY directory is EISDIR -- an empty one too. */
+    const char *empty = "fs0:\\axl_mvk_empty";
+    axl_dir_mkdir(empty);
+    test_check(axl_file_move(file, empty) == AXL_IS_DIR
+               && file_holds(file, "file", 4) && axl_file_is_dir(empty),
+               "move kind: a file onto an EMPTY directory -> AXL_IS_DIR, both kept");
+
+    /* A directory onto a non-empty directory is ENOTEMPTY. */
+    test_check(axl_file_move(dir, full) == AXL_NOT_EMPTY
+               && file_holds("fs0:\\axl_mvk_dir\\c", "c", 1)
+               && file_holds("fs0:\\axl_mvk_full\\d", "d", 1),
+               "move kind: a directory onto a non-empty directory -> AXL_NOT_EMPTY");
+
+    /* A directory onto an EMPTY directory replaces it. */
+    test_check(axl_file_move(dir, empty) == AXL_OK
+               && file_holds("fs0:\\axl_mvk_empty\\c", "c", 1)
+               && path_absent(dir),
+               "move kind: a directory onto an empty directory replaces it");
+
+    /* A non-empty directory onto ITSELF is the no-op it always was. */
+    test_check(axl_file_move(empty, empty) == AXL_OK
+               && file_holds("fs0:\\axl_mvk_empty\\c", "c", 1),
+               "move kind: a non-empty directory onto itself is a no-op");
+
+    axl_file_delete("fs0:\\axl_mvk_empty\\c");
+    axl_file_delete("fs0:\\axl_mvk_dir\\c");
+    axl_file_delete("fs0:\\axl_mvk_full\\d");
+    axl_file_delete(file);
+    axl_dir_rmdir(dir);
+    axl_dir_rmdir(full);
+    axl_dir_rmdir(empty);
+}
+
+/* Regression: the "destination is the aside" check compared directory
+   STRINGS, so spelling the directory through its 8.3 alias slipped past
+   it and the aside -- the source -- was deleted as the destination. The
+   move now sets the DESTINATION aside and decides identity by stored
+   names, so the alias spelling on either side must replace exactly the
+   entry it names and leave nothing behind. */
+static void
+test_file_move_through_a_directory_alias(void)
+{
+    const char *dir   = "fs0:\\axl_longdirname";
+    const char *src   = "fs0:\\axl_longdirname\\src.txt";
+    const char *dst   = "fs0:\\axl_longdirname\\dst.txt";
+    const char *alias = "fs0:\\AXL_LO~1";
+
+    axl_dir_mkdir(dir);
+    axl_file_delete(src);
+    axl_file_delete(dst);
+    test_check(axl_file_set_contents(src, "keep", 4) == AXL_OK
+               && axl_file_set_contents(dst, "old", 3) == AXL_OK
+               && axl_file_is_dir(alias),
+               "move alias: setup: the directory answers to AXL_LO~1");
+
+    test_check(axl_file_move(src, "fs0:\\AXL_LO~1\\dst.txt") == AXL_OK
+               && file_holds(dst, "keep", 4) && path_absent(src),
+               "move alias: dest through the dir alias replaces exactly dst.txt");
+    test_check(axl_file_set_contents(src, "back", 4) == AXL_OK
+               && axl_file_move("fs0:\\AXL_LO~1\\src.txt", dst) == AXL_OK
+               && file_holds(dst, "back", 4) && path_absent(src),
+               "move alias: source through the dir alias replaces exactly dst.txt");
+
+    AxlDir    *d = axl_dir_open(dir);
+    AxlFsEntry e;
+    size_t     n = 0;
+    while (d != NULL && axl_dir_read(d, &e)) {
+        if (axl_strcmp(e.name, ".") != 0 && axl_strcmp(e.name, "..") != 0) {
+            n++;
+        }
+    }
+    axl_dir_close(d);
+    test_check(n == 1, "move alias: dst.txt is the only entry left, no aside");
+
+    axl_file_delete(dst);
+    axl_dir_rmdir(dir);
+}
+
+/* Regression: the move cleared its destination even when it could not read
+   the destination's name -- the one fact that says whether the
+   destination is the moved source itself. It now refuses instead. The
+   destination is on the provider fixture with get_info failing; the
+   source is on fs0:, so the source's own name reads fine. */
+static void
+test_move_refuses_a_destination_it_cannot_name(void)
+{
+    const char *src = "fs0:\\axl_mv_noname.txt";
+
+    if (!ff_fs_up()) {
+        test_skip_n(2, "move onto an unnameable destination (no shell map)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    axl_file_delete(src);
+    test_check(ff_seed("dst", "keep", 4)
+               && axl_file_set_contents(src, "new", 3) == AXL_OK,
+               "move noname: setup");
+    ff_info_fail = true;
+    int rc = axl_file_move(src, FF_PATH("dst"));
+    ff_info_fail = false;
+    test_check(rc == AXL_ERR && ff_content_is("dst", "keep", 4)
+               && file_holds(src, "new", 3),
+               "move noname: a destination whose name cannot be read is "
+               "refused, both kept");
+    axl_file_delete(src);
+    ff_fs_down();
+}
+
+/* axl_file_rename on an AxlFsProvider volume. A provider is only ever
+   handed a basename, so a move between directories must come back
+   AXL_UNSUPPORTED with nothing changed -- and axl_file_move then copies --
+   while a same-directory rename still works and still never replaces,
+   though this fixture's set_info would replace if asked. */
+static void
+test_rename_on_a_provider_volume(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(10, "provider rename (no shell map for the published volume)");
+        return;
+    }
+    ff_set_flush_ok(true);
+
+    test_check(ff_seed("mvd", "data", 4) && ff_seed_dir("sub")
+               && axl_file_rename(FF_PATH("mvd"), FF_MAP ":\\sub\\other")
+                      == AXL_UNSUPPORTED,
+               "provider: rename into another directory -> AXL_UNSUPPORTED");
+    test_check(ff_content_is("mvd", "data", 4) && !ff_exists("other")
+               && !ff_exists("\\sub\\other"),
+               "provider: the refused move changed nothing");
+    test_check(axl_file_move(FF_PATH("mvd"), FF_MAP ":\\sub\\other") == AXL_OK
+               && ff_content_is("other", "data", 4) && !ff_exists("mvd"),
+               "provider: axl_file_move copies when the rename is unsupported");
+
+    test_check(axl_file_rename(FF_PATH("other"), "renamed") == AXL_OK
+               && ff_content_is("renamed", "data", 4) && !ff_exists("other"),
+               "provider: a same-directory rename still works");
+
+    test_check(ff_seed("keep", "kept", 4)
+               && axl_file_rename(FF_PATH("renamed"), FF_PATH("keep"))
+                      == AXL_EXISTS,
+               "provider: rename onto an existing name -> AXL_EXISTS");
+    test_check(ff_content_is("keep", "kept", 4)
+               && ff_content_is("renamed", "data", 4),
+               "provider: the refused rename replaced nothing");
+
+    /* A filesystem that keeps a trailing dot stores the name exactly as
+       asked; that is a rename that landed, not a failed one. */
+    test_check(ff_seed("dot", "dot", 3)
+               && axl_file_rename(FF_PATH("dot"), "dot.") == AXL_OK
+               && ff_content_is("dot.", "dot", 3) && !ff_exists("dot"),
+               "provider: rename to a trailing-dot name it keeps -> AXL_OK");
+    test_check(axl_file_write_atomic(FF_PATH("wa."), "atomic", 6) == AXL_OK
+               && ff_content_is("wa.", "atomic", 6),
+               "provider: write_atomic to a trailing-dot name keeps its data");
+
+    /* A rename that FAILS (rather than being unsupported) is not answered
+       with a copy, and the source is put back under its own name. */
+    test_check(ff_seed("mvf", "move", 4)
+               && axl_file_move(FF_PATH("mvf"), FF_PATH(FF_RENAMEFAIL_PREFIX "dst"))
+                      == AXL_ERR,
+               "provider: move whose rename fails -> AXL_ERR");
+    test_check(ff_content_is("mvf", "move", 4)
+               && !ff_exists(FF_RENAMEFAIL_PREFIX "dst"),
+               "provider: no copy was made, the source is back as mvf");
+
+    ff_fs_down();
+}
+
+/* axl_file_set_mtime against the EDK2-derived FAT driver: exact stored
+   values across the whole FAT range, both range edges refused before I/O,
+   the restore after the driver's 1980 year bug, and the refusals. */
+static void
+test_file_set_mtime(void)
+{
+    const char *path = "fs0:\\axl_mt_set.tmp";
+    const char *dir  = "fs0:\\axl_mt_dir";
+    const char *gone = "fs0:\\axl_mt_absent.tmp";
+
+    axl_file_delete(path);
+    if (axl_file_set_contents(path, "hello", 5) != AXL_OK) {
+        test_fail("set_mtime: setup write failed");
+        return;
+    }
+
+    test_check(axl_file_set_mtime(path, 1000000000) == AXL_OK
+               && file_mtime(path) == 1000000000,
+               "set_mtime: 1000000000 -> AXL_OK, reads back 1000000000");
+    test_check(axl_file_set_mtime(path, 1000000001) == AXL_OK
+               && file_mtime(path) == 1000000000,
+               "set_mtime: odd 1000000001 -> AXL_OK, stored as 1000000000");
+    test_check(axl_file_set_mtime(path, 347155200) == AXL_OK
+               && file_mtime(path) == 347155200,
+               "set_mtime: 347155200 (1981-01-01) -> AXL_OK, exact");
+    test_check(axl_file_set_mtime(path, 315532799) == AXL_INVALID
+               && file_mtime(path) == 347155200,
+               "set_mtime: 315532799 (1979) -> AXL_INVALID, time unchanged");
+
+    /* The driver keeps the old YEAR of a 1980 time while taking its month,
+       day and clock, so 1980-01-01 on a 2001 file reads back as
+       2001-01-01. Only the restore puts 2001-09-09 01:46:40 back. */
+    test_check(axl_file_set_mtime(path, 1000000000) == AXL_OK,
+               "set_mtime: setup: back to 1000000000");
+    test_check(axl_file_set_mtime(path, 315532800) == AXL_ERR,
+               "set_mtime: 315532800 (1980) on a 2001 file -> AXL_ERR");
+    test_check(file_mtime(path) == 1000000000,
+               "set_mtime: the refused 1980 time was rolled back exactly");
+
+    test_check(axl_file_set_mtime(path, 4354819198) == AXL_OK
+               && file_mtime(path) == 4354819198,
+               "set_mtime: 4354819198 (2107-12-31 23:59:58) -> AXL_OK, exact");
+    test_check(axl_file_set_mtime(path, 4354819199) == AXL_OK
+               && file_mtime(path) == 4354819198,
+               "set_mtime: 4354819199 -> AXL_OK, stored as 4354819198");
+    test_check(axl_file_set_mtime(path, 4354819200) == AXL_INVALID
+               && file_mtime(path) == 4354819198,
+               "set_mtime: 4354819200 (2108) -> AXL_INVALID, time unchanged");
+    test_check(file_holds(path, "hello", 5),
+               "set_mtime: size and bytes unchanged");
+
+    axl_dir_rmdir(dir);
+    test_check(axl_dir_mkdir(dir) == AXL_OK
+               && axl_file_set_mtime(dir, 1000000000) == AXL_OK
+               && file_mtime(dir) == 1000000000,
+               "set_mtime: a directory -> AXL_OK, reads back 1000000000");
+    axl_dir_rmdir(dir);
+
+    AxlFsEntry e;
+    axl_file_delete(gone);
+    test_check(axl_file_set_mtime(gone, 1000000000) == AXL_NOT_FOUND
+               && axl_file_info(gone, &e) != AXL_OK,
+               "set_mtime: missing path -> AXL_NOT_FOUND, nothing created");
+    test_check(axl_file_set_mtime("fs0:\\", 1000000000) == AXL_ERR,
+               "set_mtime: the volume root -> AXL_ERR");
+    test_check(axl_file_set_mtime(NULL, 1000000000) == AXL_ERR,
+               "set_mtime: NULL path -> AXL_ERR");
+
+    axl_file_delete(path);
+}
+
+/* The handle forms act on the file a stream was opened on, wherever it now
+   is: the path it was opened under is reused by another file below. */
+static void
+test_handle_forms_follow_the_file(void)
+{
+    const char *ca = "fs0:\\axl_c_a.tmp";
+    const char *cb = "fs0:\\axl_c_b.tmp";
+    AxlFsEntry  e;
+
+    axl_file_delete(ca);
+    axl_file_delete(cb);
+    AxlStream *h = axl_fopen(ca, "w");
+    if (h == NULL || axl_write(h, "hello", 5) != 5) {
+        test_fail("handle: setup write failed");
+        axl_fclose(h);
+        return;
+    }
+    test_check(axl_file_rename(ca, cb) == AXL_OK
+               && axl_file_set_contents(ca, "xyz", 3) == AXL_OK,
+               "handle: setup: renamed to c_b, new c_a holds xyz");
+    uint64_t ca_time = file_mtime(ca);
+
+    test_check(axl_ftruncate(h, 0) == AXL_OK,
+               "handle: ftruncate(0) -> AXL_OK");
+    test_check(file_holds(cb, "", 0),
+               "handle: ftruncate emptied the renamed file c_b");
+    test_check(file_holds(ca, "xyz", 3),
+               "handle: ftruncate left the new c_a exactly xyz");
+    test_check(axl_fstat(h, &e) == AXL_OK
+               && axl_strcmp(e.name, "axl_c_b.tmp") == 0 && e.size == 0,
+               "handle: fstat names the current basename axl_c_b.tmp, size 0");
+    test_check(axl_fset_mtime(h, 1000000000) == AXL_OK
+               && file_mtime(cb) == 1000000000,
+               "handle: fset_mtime(1000000000) -> c_b reads 1000000000");
+    test_check(file_mtime(ca) == ca_time,
+               "handle: fset_mtime left c_a's time unchanged");
+
+    static const uint8_t eight_nuls[8] = { 0 };
+    test_check(axl_ftruncate(h, 8) == AXL_OK
+               && file_holds(cb, eight_nuls, 8),
+               "handle: ftruncate(8) grows to exactly eight NULs");
+    axl_fclose(h);
+    axl_file_delete(ca);
+    axl_file_delete(cb);
+}
+
+/* Position, buffering and the mtime ordering rules of the handle forms. */
+static void
+test_handle_forms_position_and_buffering(void)
+{
+    const char *p = "fs0:\\axl_c_pos.tmp";
+    AxlStream  *s;
+
+    /* The position is not moved by a shrink below it. */
+    axl_file_delete(p);
+    s = axl_fopen(p, "w");
+    test_check(s != NULL && axl_write(s, "12345", 5) == 5
+               && axl_ftruncate(s, 2) == AXL_OK && axl_ftell(s) == 5,
+               "handle: write 5, ftruncate(2) -> ftell still 5");
+    axl_fclose(s);
+    test_check(file_holds(p, "12", 2),
+               "handle: the file is exactly the 2 kept bytes");
+
+    /* Bytes buffered in the stream are written out before the resize, so
+       none of them lands after it. */
+    axl_file_delete(p);
+    s = axl_fopen(p, "w");
+    test_check(s != NULL
+               && axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 0) == AXL_OK
+               && axl_write(s, "abc", 3) == 3
+               && axl_ftruncate(s, 1) == AXL_OK,
+               "handle: FULL-buffered write abc, ftruncate(1) -> AXL_OK");
+    axl_fclose(s);
+    test_check(file_holds(p, "a", 1),
+               "handle: buffered abc then ftruncate(1) leaves exactly a");
+
+    /* write, fset_mtime, close keeps the time: the drain comes first. */
+    axl_file_delete(p);
+    s = axl_fopen(p, "w");
+    test_check(s != NULL
+               && axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 0) == AXL_OK
+               && axl_write(s, "data", 4) == 4
+               && axl_fset_mtime(s, 1000000000) == AXL_OK,
+               "handle: buffered write then fset_mtime -> AXL_OK");
+    axl_fclose(s);
+    test_check(file_mtime(p) == 1000000000 && file_holds(p, "data", 4),
+               "handle: write, fset_mtime, close keeps 1000000000 and the bytes");
+
+    /* fset_mtime, write, close: the later write stamps the time again. */
+    s = axl_fopen(p, "w");
+    test_check(s != NULL && axl_fset_mtime(s, 1000000000) == AXL_OK
+               && axl_write(s, "x", 1) == 1,
+               "handle: fset_mtime then write -> both succeed");
+    axl_fclose(s);
+    test_check(file_mtime(p) != 1000000000,
+               "handle: fset_mtime, write, close -> the write restamped it");
+
+    /* A grow clears the end-of-file flag the old length set; a shrink
+       leaves it. */
+    axl_file_delete(p);
+    s = axl_fopen(p, "w");
+    char rd[8];
+    test_check(s != NULL && axl_write(s, "ab", 2) == 2
+               && axl_fseek(s, 0, AXL_SEEK_SET) == AXL_OK
+               && axl_read(s, rd, sizeof(rd)) == 2
+               && axl_read(s, rd, sizeof(rd)) == 0 && axl_feof(s),
+               "handle: setup: read to the end, feof set");
+    test_check(axl_ftruncate(s, 4) == AXL_OK && !axl_feof(s),
+               "handle: ftruncate growing the file clears feof");
+    axl_fclose(s);
+
+    /* Clearing feof must clear ONLY feof. A UCS-2 stream holding the first
+       byte of a two-byte UTF-8 character keeps it across the grow, so the
+       next write completes the character: 61 00, then e-acute E9 00. */
+    axl_file_delete(p);
+    s = axl_fopen(p, "w");
+    static const uint8_t ucs2[4] = { 0x61, 0x00, 0xE9, 0x00 };
+    test_check(s != NULL && axl_stream_set_encoding(s, AXL_ENC_UCS2_LE) == AXL_OK
+               && axl_write(s, "a\xC3", 2) == 2
+               && axl_read(s, rd, sizeof(rd)) == 0 && axl_feof(s),
+               "handle: setup: UCS-2 a, half of e-acute pending, feof set");
+    test_check(axl_ftruncate(s, 4) == AXL_OK && !axl_feof(s)
+               && axl_write(s, "\xA9", 1) == 1,
+               "handle: ftruncate grows to 4, then the second half of e-acute");
+    axl_fclose(s);
+    test_check(file_holds(p, ucs2, sizeof(ucs2)),
+               "handle: the pending half survived the grow: 61 00 E9 00");
+
+    /* Out of range on a writable stream, both edges. */
+    s = axl_fopen(p, "w");
+    test_check(axl_fset_mtime(s, 315532799) == AXL_INVALID
+               && axl_fset_mtime(s, 4354819200) == AXL_INVALID,
+               "handle: fset_mtime outside 315532800..4354819199 -> AXL_INVALID");
+    axl_fclose(s);
+    axl_file_delete(p);
+}
+
+/* What the handle forms refuse, and that a refusal changes nothing. */
+static void
+test_handle_forms_refusals(void)
+{
+    const char *p = "fs0:\\axl_c_ro.tmp";
+    AxlFsEntry  e;
+
+    axl_file_delete(p);
+    test_check(axl_file_set_contents(p, "keep", 4) == AXL_OK
+               && axl_file_set_mtime(p, 1000000000) == AXL_OK,
+               "handle: setup: keep, time 1000000000");
+
+    AxlStream *r = axl_fopen(p, "r");
+    test_check(axl_ftruncate(r, 1) == AXL_DENIED,
+               "handle: ftruncate on an \"r\" stream -> AXL_DENIED");
+    test_check(axl_fset_mtime(r, 1100000000) == AXL_DENIED,
+               "handle: fset_mtime on an \"r\" stream -> AXL_DENIED");
+    test_check(axl_fstat(r, &e) == AXL_OK && e.size == 4
+               && axl_strcmp(e.name, "axl_c_ro.tmp") == 0
+               && e.mtime_unix == 1000000000,
+               "handle: fstat on an \"r\" stream -> AXL_OK, 4 bytes, its name");
+    axl_fclose(r);
+    test_check(file_holds(p, "keep", 4) && file_mtime(p) == 1000000000,
+               "handle: the refusals left bytes and time unchanged");
+
+    /* Not a stream axl_fopen returned: a buffer stream, a console stream,
+       and a text wrapper built over a real file stream. */
+    AxlStream *buf = axl_bufopen();
+    AxlStream *src = axl_fopen(p, "w");
+    AxlStream *txt = axl_text_stream_wrap(src);
+    AxlStream *others[3] = { buf, axl_stdout, txt };
+    bool all = buf != NULL && src != NULL && txt != NULL;
+    for (size_t i = 0; i < 3; i++) {
+        all = all && axl_ftruncate(others[i], 0) == AXL_UNSUPPORTED
+                  && axl_fstat(others[i], &e) == AXL_UNSUPPORTED
+                  && axl_fset_mtime(others[i], 1000000000) == AXL_UNSUPPORTED;
+    }
+    test_check(all, "handle: buffer, console and text-wrapped streams -> "
+                    "AXL_UNSUPPORTED from all three");
+    axl_fclose(txt);
+    axl_fclose(src);
+    axl_fclose(buf);
+    test_check(file_holds(p, "keep", 4),
+               "handle: the unsupported calls left the file unchanged");
+
+    test_check(axl_ftruncate(NULL, 0) == AXL_ERR
+               && axl_fstat(NULL, &e) == AXL_ERR
+               && axl_fset_mtime(NULL, 1000000000) == AXL_ERR,
+               "handle: NULL stream -> AXL_ERR from all three");
+
+    /* A file deleted through another handle: every query on this one
+       fails, and the entry is still left defined. */
+    r = axl_fopen(p, "r");
+    uint8_t zero[sizeof(e)] = { 0 };
+    axl_memset(&e, 0xFF, sizeof(e));
+    test_check(r != NULL && axl_file_delete(p) == AXL_OK
+               && axl_fstat(r, &e) == AXL_ERR
+               && test_memcmp(&e, zero, sizeof(e)) == 0,
+               "handle: fstat after delete by path -> AXL_ERR, entry zeroed");
+    axl_fclose(r);
+    axl_file_delete(p);
 }
 
 static void
@@ -4997,6 +6591,293 @@ test_failed_open_is_quiet_at_info(void)
 }
 
 // ---------------------------------------------------------------------------
+// Either separator: every path the fs layer takes reads '/' as '\'. The
+// modern shell's OpenFileByName fails "fs0:/x" outright, so the backend
+// converts before the firmware sees the path.
+// ---------------------------------------------------------------------------
+
+#define SLASH_DIR  "fs0:\\axl_slash"
+
+static void
+test_forward_slash_paths(void)
+{
+    AxlFsEntry e;
+
+    axl_file_delete(SLASH_DIR "\\f.txt");
+    axl_dir_rmdir(SLASH_DIR "\\sub");
+    axl_dir_rmdir(SLASH_DIR);
+
+    test_check(axl_dir_mkdir("fs0:/axl_slash") == AXL_OK
+               && axl_file_is_dir(SLASH_DIR),
+               "slash: mkdir fs0:/axl_slash makes fs0:\\axl_slash");
+    test_check(axl_dir_mkdir("fs0:/axl_slash/sub") == AXL_OK
+               && axl_file_is_dir(SLASH_DIR "\\sub"),
+               "slash: mkdir of a two-component '/' path");
+    test_check(axl_file_set_contents("fs0:/axl_slash/f.txt", "abc", 3) == AXL_OK
+               && file_holds(SLASH_DIR "\\f.txt", "abc", 3),
+               "slash: set_contents through '/' lands at the '\\' path");
+    test_check(axl_file_info("fs0:/axl_slash/f.txt", &e) == AXL_OK && e.size == 3,
+               "slash: axl_file_info(fs0:/axl_slash/f.txt) -> size 3");
+    test_check(axl_file_info(SLASH_DIR "/f.txt", &e) == AXL_OK && e.size == 3,
+               "slash: a mixed-separator path resolves");
+    test_check(axl_file_is_dir("fs0:/axl_slash/sub"),
+               "slash: axl_file_is_dir through '/'");
+
+    AxlStream *s      = axl_fopen("fs0:/axl_slash/f.txt", "r");
+    char       buf[8] = {0};
+    test_check(s != NULL && axl_fread(buf, 1, sizeof(buf) - 1, s) == 3
+               && axl_strcmp(buf, "abc") == 0,
+               "slash: axl_fopen(fs0:/axl_slash/f.txt, r) reads the file");
+    if (s != NULL) {
+        axl_fclose(s);
+    }
+
+    AxlDir *d     = axl_dir_open("fs0:/axl_slash");
+    bool    found = false;
+    if (d != NULL) {
+        while (axl_dir_read(d, &e)) {
+            found = found || axl_strcmp(e.name, "f.txt") == 0;
+        }
+        axl_dir_close(d);
+    }
+    test_check(found, "slash: axl_dir_open(fs0:/axl_slash) lists f.txt");
+
+    char *cwd = axl_get_current_dir();
+    test_check(cwd != NULL && axl_chdir("fs0:/axl_slash/sub") == AXL_OK,
+               "slash: axl_chdir(fs0:/axl_slash/sub) -> AXL_OK");
+    char *now = axl_get_current_dir();
+    test_check(now != NULL && axl_strcasecmp(now, SLASH_DIR "\\sub") == 0,
+               "slash: the cwd is then fs0:\\axl_slash\\sub");
+    axl_free(now);
+    /* The shell reports a volume's root as "FS0:", and `cd FS0:` selects
+       the volume WITHOUT moving its directory, so the root is restored as
+       "FS0:\". */
+    char *back = (cwd != NULL && axl_str_has_suffix(cwd, ":"))
+                 ? axl_asprintf("%s\\", cwd) : axl_strdup(cwd != NULL ? cwd : "");
+    test_check(back != NULL && axl_chdir(back) == AXL_OK,
+               "slash: chdir back to the original cwd -> AXL_OK");
+    axl_free(back);
+    now = axl_get_current_dir();
+    test_check(now != NULL && cwd != NULL && axl_strcmp(now, cwd) == 0,
+               "slash: the cwd reads back as it was");
+    axl_free(now);
+    axl_free(cwd);
+
+    test_check(axl_file_delete("fs0:/axl_slash/f.txt") == AXL_OK
+               && path_absent(SLASH_DIR "\\f.txt"),
+               "slash: axl_file_delete through '/'");
+    test_check(axl_dir_rmdir("fs0:/axl_slash/sub") == AXL_OK
+               && path_absent(SLASH_DIR "\\sub"),
+               "slash: axl_dir_rmdir through '/'");
+    axl_dir_rmdir(SLASH_DIR);
+}
+
+// ---------------------------------------------------------------------------
+// axl_dir_walk: every path whole, at any depth; the callback's verdict
+// propagates from any level.
+// ---------------------------------------------------------------------------
+
+#define WALK_ROOT  "fs0:\\axl_walk"
+
+typedef struct {
+    size_t count;
+    size_t longest;
+    bool   saw_leaf;
+    int    stop_rc;       /* returned for a path ending in stop_at */
+    char   stop_at[16];
+} WalkSeen;
+
+static int
+walk_cb(const char *full_path, const AxlFsEntry *entry, void *user)
+{
+    WalkSeen *w = user;
+    size_t    n = axl_strlen(full_path);
+    w->count++;
+    if (n > w->longest) {
+        w->longest = n;
+    }
+    if (axl_str_has_suffix(full_path, "\\leaf.txt") && !axl_fs_entry_is_dir(entry)) {
+        w->saw_leaf = true;
+    }
+    if (w->stop_at[0] != '\0' && axl_str_has_suffix(full_path, w->stop_at)) {
+        return w->stop_rc;
+    }
+    return 0;
+}
+
+/* @p levels nested directories, each named 85 x U+20AC (255 bytes), with
+   leaf.txt at the bottom: a path of 13 + 256 * levels + 9 bytes but only
+   13 + 86 * levels + 9 units -- long in bytes, short enough in units for
+   FAT, which refuses a path of more than 260. */
+static bool
+walk_make_deep(size_t levels, char *path, size_t cap)
+{
+    size_t k = (size_t)axl_snprintf(path, cap, "%s", WALK_ROOT);
+    for (size_t l = 0; l < levels; l++) {
+        if (k + 257 >= cap) {
+            return false;
+        }
+        path[k++] = '\\';
+        for (size_t i = 0; i < 85; i++) {
+            path[k++] = (char)0xE2;
+            path[k++] = (char)0x82;
+            path[k++] = (char)0xAC;
+        }
+        path[k] = '\0';
+        if (axl_dir_mkdir(path) != AXL_OK) {
+            return false;
+        }
+    }
+    if (k + 10 >= cap) {
+        return false;
+    }
+    axl_memcpy(path + k, "\\leaf.txt", 10);
+    return axl_file_set_contents(path, "L", 1) == AXL_OK;
+}
+
+static void
+test_dir_walk(void)
+{
+    static char deep[1024];
+    WalkSeen    w;
+
+    if (axl_fs_remove_tree(WALK_ROOT) == AXL_ERR) {
+        test_check(false, "walk: clear a previous run's tree");
+    }
+    bool made = axl_dir_mkdir(WALK_ROOT) == AXL_OK
+                && axl_dir_mkdir(WALK_ROOT "\\a") == AXL_OK
+                && axl_file_set_contents(WALK_ROOT "\\a\\b.txt", "b", 1) == AXL_OK
+                && axl_file_set_contents(WALK_ROOT "\\c.txt", "c", 1) == AXL_OK;
+    test_check(made, "walk: setup");
+
+    axl_memset(&w, 0, sizeof(w));
+    test_check(axl_dir_walk(WALK_ROOT, walk_cb, &w, 5) == 0 && w.count == 3,
+               "walk: a, a\\b.txt and c.txt -> 3 callbacks, rc 0");
+    axl_memset(&w, 0, sizeof(w));
+    test_check(axl_dir_walk(WALK_ROOT, walk_cb, &w, 1) == 0 && w.count == 2,
+               "walk: max_depth 1 -> root's two children only");
+
+    axl_memset(&w, 0, sizeof(w));
+    axl_strlcpy(w.stop_at, "\\b.txt", sizeof(w.stop_at));
+    w.stop_rc = -1;
+    test_check(axl_dir_walk(WALK_ROOT, walk_cb, &w, 5) == -1,
+               "walk: a callback's -1 at depth 2 stops the walk and is returned");
+    axl_memset(&w, 0, sizeof(w));
+    axl_strlcpy(w.stop_at, "\\b.txt", sizeof(w.stop_at));
+    w.stop_rc = 7;
+    test_check(axl_dir_walk(WALK_ROOT, walk_cb, &w, 5) == 7,
+               "walk: a callback's 7 at depth 2 is returned");
+
+    /* Two 255-byte components: the leaf's path is 534 bytes, past the 512
+       the walker once cut every path to. */
+    test_check(walk_make_deep(2, deep, sizeof(deep)),
+               "walk: setup -- two 85-unit directories and a leaf");
+    axl_memset(&w, 0, sizeof(w));
+    test_check(axl_dir_walk(WALK_ROOT, walk_cb, &w, 10) == 0 && w.saw_leaf
+               && w.longest == axl_strlen(deep) && axl_strlen(deep) == 534,
+               "walk: a 534-byte leaf path reaches the callback whole");
+
+    test_check(axl_fs_remove_tree(WALK_ROOT) == AXL_OK, "walk: cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_list_available_drivers never reports a cut name or path: a driver
+// file whose name does not fit AxlNetDriverFile.name is skipped.
+// ---------------------------------------------------------------------------
+
+#if defined(__aarch64__)
+#define DRV_DIR  "fs0:\\drivers\\aa64"
+#else
+#define DRV_DIR  "fs0:\\drivers\\x64"
+#endif
+
+static void
+test_driver_list_never_cuts(void)
+{
+    static const char longname[] = DRV_DIR "\\axlw3-a-driver-file-name-too-long-for-the"
+                                   "-sixty-four-byte-field-xx.efi";
+    bool made = axl_dir_mkdir("fs0:\\drivers") == AXL_OK && axl_dir_mkdir(DRV_DIR) == AXL_OK
+                && axl_file_set_contents(DRV_DIR "\\axlw3-ok.efi", "d", 1) == AXL_OK
+                && axl_file_set_contents(longname, "d", 1) == AXL_OK;
+    test_check(made, "drivers: setup -- axlw3-ok.efi and a 70-byte name");
+
+    size_t count = 0;
+    test_check(axl_net_list_available_drivers(NULL, &count) == AXL_OK,
+               "drivers: count");
+    AxlNetDriverFile *files = axl_calloc(count + 1, sizeof(*files));
+    size_t            cap   = count + 1;
+    bool              ok_seen = false, cut_seen = false;
+    if (files != NULL && axl_net_list_available_drivers(files, &cap) == AXL_OK) {
+        for (size_t i = 0; i < cap; i++) {
+            ok_seen  = ok_seen || (axl_strcmp(files[i].name, "axlw3-ok.efi") == 0
+                                   && axl_str_has_suffix(files[i].path, "\\axlw3-ok.efi"));
+            cut_seen = cut_seen || axl_str_has_prefix(files[i].name, "axlw3-a-driver");
+        }
+    }
+    test_check(ok_seen && !cut_seen && cap == count,
+               "drivers: the 70-byte name is skipped, not cut; the other is listed whole");
+    axl_free(files);
+    axl_file_delete(longname);
+    axl_file_delete(DRV_DIR "\\axlw3-ok.efi");
+    /* Removed only when empty: a staged driver set is left alone. */
+    if (axl_dir_rmdir(DRV_DIR) == AXL_OK) {
+        axl_dir_rmdir("fs0:\\drivers");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EFI_TIME <-> Unix seconds: UEFI 2.11 section 8.3 defines
+// Localtime = UTC - TimeZone, so UTC = local + TimeZone.
+// ---------------------------------------------------------------------------
+
+/* 2026-01-01 00:00:00 as EFI_TIME bytes with @p tz in TimeZone. */
+static void
+efi_time_2026(uint8_t b[16], int16_t tz)
+{
+    axl_memset(b, 0, 16);
+    b[0]  = (uint8_t)(2026u & 0xFFu);
+    b[1]  = (uint8_t)(2026u >> 8);
+    b[2]  = 1;
+    b[3]  = 1;
+    b[12] = (uint8_t)((uint16_t)tz & 0xFFu);
+    b[13] = (uint8_t)((uint16_t)tz >> 8);
+}
+
+#define T_2026_UTC  1767225600ULL   /* 2026-01-01 00:00:00 UTC */
+
+static void
+test_efi_time_zone_sign(void)
+{
+    uint8_t b[16];
+
+    efi_time_2026(b, 0x07FF);
+    test_check(axl_backend_efi_time_to_unix(b) == T_2026_UTC,
+               "efi time: TimeZone unspecified reads as UTC");
+    efi_time_2026(b, 60);
+    test_check(axl_backend_efi_time_to_unix(b) == T_2026_UTC + 3600u,
+               "efi time: TimeZone +60 (local = UTC - 1h) -> UTC 01:00");
+    efi_time_2026(b, -300);
+    test_check(axl_backend_efi_time_to_unix(b) == T_2026_UTC - 18000u,
+               "efi time: TimeZone -300 (local = UTC + 5h) -> UTC 19:00 the day before");
+    axl_memset(b, 0, sizeof(b));
+    test_check(axl_backend_efi_time_to_unix(b) == 0,
+               "efi time: an all-zero EFI_TIME is 0 (unknown)");
+
+    uint8_t out[16];
+    axl_memset(out, 0xA5, sizeof(out));
+    axl_backend_unix_to_efi_time(T_2026_UTC + 3723u, out);
+    test_check(out[0] == (2026u & 0xFFu) && out[1] == (2026u >> 8)
+               && out[2] == 1 && out[3] == 1 && out[4] == 1 && out[5] == 2
+               && out[6] == 3 && out[7] == 0
+               && out[8] == 0 && out[9] == 0 && out[10] == 0 && out[11] == 0
+               && out[12] == 0xFF && out[13] == 0x07
+               && out[14] == 0 && out[15] == 0,
+               "efi time: unix_to_efi_time writes 2026-01-01 01:02:03, zone unspecified");
+    test_check(axl_backend_efi_time_to_unix(out) == T_2026_UTC + 3723u,
+               "efi time: unix_to_efi_time round-trips");
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -5016,6 +6897,26 @@ test_io_main(int argc, char **argv)
     test_file_truncate();
     test_fflush();
     test_write_paths_report_a_failed_flush();
+    test_write_past_eof_zero_fills();
+    test_write_after_a_shrink_zero_fills();
+    test_fseek_drains_buffered_writes();
+    test_stream_writes_on_a_provider_volume();
+    test_ftell_counts_buffered_bytes();
+    test_transcode_decides_a_provably_invalid_tail();
+    test_stream_position_survives_a_failure();
+    test_handle_stat_cuts_a_long_name();
+    test_file_rename_moves();
+    test_file_rename_names_the_driver_rewrites();
+    test_move_onto_itself_on_a_provider_volume();
+    test_file_move_onto_itself_keeps_the_file();
+    test_file_move_refuses_a_kind_mismatch();
+    test_file_move_through_a_directory_alias();
+    test_move_refuses_a_destination_it_cannot_name();
+    test_rename_on_a_provider_volume();
+    test_file_set_mtime();
+    test_handle_forms_follow_the_file();
+    test_handle_forms_position_and_buffering();
+    test_handle_forms_refusals();
     test_detect_encoding();
     test_printf();
     test_stdin();
@@ -5060,6 +6961,10 @@ test_io_main(int argc, char **argv)
     test_stream_ctx_docstring_idiom();
     test_stream_ctx_refuses_mismatched_ops();
     test_stream_ctx_rejects_bad_args();
+    test_console_decode_across_writes();
+    test_console_decode_ill_formed_utf8();
+    test_console_decode_ill_formed_utf16();
+    test_console_decode_second_mark();
     test_stream_ctx_refuses_builtins();
     test_stream_ctx_null_context();
     test_buffer_accessors_reject_foreign_streams();
@@ -5090,6 +6995,10 @@ test_io_main(int argc, char **argv)
     test_fclose_frees_a_heap_stream();
     test_fclose_leaves_the_static_streams_usable();
     test_failed_open_is_quiet_at_info();
+    test_forward_slash_paths();
+    test_efi_time_zone_sign();
+    test_dir_walk();
+    test_driver_list_never_cuts();
 
     return test_print_results();
 }

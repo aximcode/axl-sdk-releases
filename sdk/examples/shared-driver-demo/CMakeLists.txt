@@ -17,7 +17,7 @@
 #   shared-driver-demo.efi stderr 2> err.txt
 # The driver image is NOT shipped separately — it's baked into the launcher.
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 project(shared-driver-demo C)
 
 find_package(axl REQUIRED)
@@ -44,8 +44,8 @@ axl_add_app(shared-driver-demo
 )
 # The EMBEDS clause emits a file-DEPENDS on the driver's .efi, so
 # correctness is guaranteed even without this line. But under
-# parallel `make -j`, the two custom-target trees race to build
+# a parallel build (`make -j`, ninja), the two custom-target trees race to build
 # the driver's intermediates independently — visible as duplicated
 # "gcc/ld/objcopy" log lines and double the work. add_dependencies
-# pins the target ordering and lets make serialize cleanly.
+# pins the target ordering and lets the generator serialize cleanly.
 add_dependencies(shared-driver-demo shared-driver-demo-dxe)

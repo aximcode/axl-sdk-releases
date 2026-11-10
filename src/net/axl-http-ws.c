@@ -141,13 +141,28 @@ ws_outq_drop_one(HttpConn *conn)
 }
 
 /* Send completion: advance the queue. On error, reap the connection
-   (reset_connection frees the rest of the queue). */
+   (reset_connection frees the rest of the queue). A completion delivered
+   from inside the teardown's axl_tcp_close -- AXL_OK for a frame that had
+   finished -- is ignored: ws_outq_clear frees the whole queue right after
+   the close, and pumping the next frame would only offer it to a socket
+   that refuses it. */
+static bool ws_out_on_sent_body(AxlTcp *sock, AxlStatus status, void *data);
+
 static bool
 ws_out_on_sent(AxlTcp *sock, AxlStatus status, void *data)
 {
+    HttpConn *conn = (HttpConn *)data;
+
+    return http_dispatch((conn != NULL) ? conn->server : NULL,
+                         ws_out_on_sent_body, sock, status, data);
+}
+
+static bool
+ws_out_on_sent_body(AxlTcp *sock, AxlStatus status, void *data)
+{
     (void)sock;
     HttpConn *conn = (HttpConn *)data;
-    if (conn == NULL || !conn->active) {
+    if (conn == NULL || !conn->active || conn->tearing_down) {
         return false;
     }
     conn->ws_out_inflight = false;
@@ -160,6 +175,30 @@ ws_out_on_sent(AxlTcp *sock, AxlStatus status, void *data)
     ws_outq_pop_free_head(conn);
     ws_outq_pump(conn);
     return false;   /* one-shot per frame */
+}
+
+/* Insert an owned copy of @p key with @p value_owned (already allocated,
+   possibly NULL from a failed allocation) into a table that owns both.
+   Returns false on any allocation failure, with nothing kept and nothing
+   leaked: the table's insert leaves both strings with the caller when it
+   fails. */
+static bool
+ws_header_put(
+    AxlHashTable *headers,      ///< table owning keys and values
+    const char   *key,          ///< header name, copied
+    char         *value_owned   ///< header value, ownership taken
+)
+{
+    char *k = axl_strdup(key);
+
+    if (k == NULL || value_owned == NULL
+        || axl_hash_table_insert(headers, k, value_owned)
+           == AXL_HASH_TABLE_ERR) {
+        axl_free(k);
+        axl_free(value_owned);
+        return false;
+    }
+    return true;
 }
 
 /* If idle and a frame is queued, send the head (encrypted, for TLS). */
@@ -264,8 +303,10 @@ ws_outq_clear(HttpConn *conn)
         return;
     }
     /* Frees every queued frame including the in-flight head: its async send was
-       just retired by axl_tcp_close (reset_connection runs close first), so
-       head->data is no longer referenced.
+       just retired by axl_tcp_close (reset_connection runs close first), which
+       delivered its callback. The firmware never held head->data itself --
+       AxlTcp hands it a copy of each piece (axl-tcp.h, axl_tcp_send_async) --
+       so once that callback has run nothing references it.
 
        This used to note a bounded leak, twice over: a TLS in-flight frame's
        CIPHERTEXT lives in a TlsWriteAsyncCtx that axl_tcp_close cancelled
@@ -275,8 +316,10 @@ ws_outq_clear(HttpConn *conn)
        case the queue's first cut still did not cover.
 
        FIXED once send callbacks became deferred: close retires the ACTIVE send
-       as well as the queued ones, tls_write_async_done runs with AXL_CANCELLED
-       and frees both. The reason it could not be done before was that firing a
+       as well as the queued ones and delivers every owed callback before it
+       returns -- AXL_CANCELLED for a send still pending, the real status for
+       one that had already finished -- so tls_write_async_done runs and frees
+       both. The reason it could not be done before was that firing a
        callback inline from teardown re-entered it via on_response_sent ->
        reset_connection -> axl_tcp_close; a deferred callback re-entering a
        closed socket is a no-op instead. docs/AXL-Tcp-Queue-Design.md §6b. */
@@ -294,9 +337,26 @@ ws_outq_clear(HttpConn *conn)
     conn->ws_out_inflight = false;
 }
 
+static int ws_broadcast_body(AxlHttpServer *s, const char *path,
+                             const void *bcast_data, size_t size);
+
+/* A send failure on any connection fires its DISCONNECT mid-loop; bracketed
+   so a DISCONNECT that frees the server waits until the loop is done. */
 int
 axl_http_server_ws_broadcast(AxlHttpServer *s, const char *path,
                              const void *bcast_data, size_t size)
+{
+    int rc;
+
+    http_dispatch_begin(s);
+    rc = ws_broadcast_body(s, path, bcast_data, size);
+    http_dispatch_end(s);
+    return rc;
+}
+
+static int
+ws_broadcast_body(AxlHttpServer *s, const char *path,
+                  const void *bcast_data, size_t size)
 {
     uint8_t *frame;
     size_t   frame_len;
@@ -327,7 +387,7 @@ axl_http_server_ws_broadcast(AxlHttpServer *s, const char *path,
 
     for (size_t i = 0; i < s->max_conns; i++) {
         HttpConn *conn = &s->conns[i];
-        if (!conn->active || !conn->is_websocket) {
+        if (!conn->active || !conn->is_websocket || conn->ws_close_deferred) {
             continue;
         }
         if (conn->ws_path == NULL || axl_strcmp(conn->ws_path, path) != 0) {
@@ -411,6 +471,7 @@ handle_websocket_upgrade(
         req.path    = conn->path;
         req.query   = conn->query;
         req.headers = conn->headers;
+        req.request_id = conn->request_id;
         axl_memcpy(req.client_addr, conn->client_addr, sizeof(req.client_addr));
         if (s->auth_cb(&req, &ws_auth, s->auth_data) != 0) {
             send_error_response(conn, 401);
@@ -433,11 +494,12 @@ handle_websocket_upgrade(
        we deliberately do NOT add a Connection header here (a
        second one would violate the handshake).
 
-       Pre-stamp the WS state and fire CONNECT. on_response_sent
-       sees keep_alive=true with is_websocket=true and runs the
-       keep-alive branch — start_conn_recv re-arms the recv that
-       on_recv_complete routes to process_websocket_data when
-       is_websocket is set. */
+       Stamp the WS state here; AXL_WS_CONNECT fires later, from
+       on_response_sent once the 101 has actually been sent (see
+       ws_connect_pending below). on_response_sent sees keep_alive=true
+       with is_websocket=true and runs the keep-alive branch —
+       start_conn_recv re-arms the recv that on_recv_complete routes to
+       process_websocket_data when is_websocket is set. */
     (void)response;
     (void)resp_len;
 
@@ -450,16 +512,30 @@ handle_websocket_upgrade(
 
     AxlHttpResponse upgrade_resp = {0};
     upgrade_resp.status_code = 101;
-    upgrade_resp.headers = axl_hash_table_new_str();
+    /* The table OWNS both key and value (freed on axl_hash_table_free
+       below). axl_hash_table_new_str would copy the strdup'd key -- leaking
+       the original -- and borrow the value, leaking it: every upgrade used
+       to leak all four strings. Same contract as set_content_range_header. */
+    upgrade_resp.headers = axl_hash_table_new_full(axl_str_hash, axl_str_equal,
+                                                   axl_free_impl, axl_free_impl);
     if (upgrade_resp.headers == NULL) {
         axl_free(accept_key);
         send_error_response(conn, 500);
         return;
     }
-    axl_hash_table_insert(upgrade_resp.headers,
-                          axl_strdup("Upgrade"), axl_strdup("websocket"));
-    axl_hash_table_insert(upgrade_resp.headers,
-                          axl_strdup("Sec-WebSocket-Accept"), accept_key);
+    if (!ws_header_put(upgrade_resp.headers, "Upgrade",
+                       axl_strdup("websocket"))) {
+        axl_free(accept_key);
+        axl_hash_table_free(upgrade_resp.headers);
+        send_error_response(conn, 500);
+        return;
+    }
+    if (!ws_header_put(upgrade_resp.headers, "Sec-WebSocket-Accept",
+                       accept_key)) {
+        axl_hash_table_free(upgrade_resp.headers);
+        send_error_response(conn, 500);
+        return;
+    }
 
     conn->is_websocket    = true;
     conn->ws_handler      = s->ws_routes[i].handler;
@@ -469,6 +545,12 @@ handle_websocket_upgrade(
     conn->ws_auth         = ws_auth;
     conn->ws_authed       = authed;
     conn->ws_path         = axl_strdup(s->ws_routes[i].path);
+    if (conn->ws_path == NULL) {
+        conn->is_websocket = false;
+        axl_hash_table_free(upgrade_resp.headers);
+        send_error_response(conn, 500);
+        return;
+    }
     conn->keep_alive      = true;
 
     /* Defer AXL_WS_CONNECT until the 101 has actually been sent (fired from
@@ -561,11 +643,11 @@ process_websocket_data(
                resident driver-tick loop (the adbf5461 / axl_tls_free
                hazard), wedging the loop. The transport teardown from
                axl_tcp_close conveys the close (mirrors axl_tls_free
-               dropping the close_notify alert): a FIN in the foreground,
-               and — because a graceful Close() would itself wedge at a
-               raised TPL when un-drained TX is still buffered — an RST
-               under the driver pump (axl_tcp_close promotes a raised-TPL
-               connection close to abortive; see tcp_close_impl). */
+               dropping the close_notify alert): a FIN in the foreground
+               when nothing is left to send, and an RST when a frame is
+               still in flight (a close with a send pending is abortive) or
+               under the driver pump (a graceful Close() would itself wedge
+               at a raised TPL; see tcp_close_impl for both promotions). */
             if (buf != data) {
                 axl_free(buf);
             }
@@ -610,14 +692,36 @@ process_websocket_data(
 // Per-connection WebSocket API (P1)
 // ---------------------------------------------------------------------------
 
+static int ws_send_body(AxlWsConn *ws_conn, size_t opcode, const void *data,
+                        size_t size);
+
+/* A failed send tears the connection down and fires DISCONNECT, which may
+   free the server: bracketed like a server callback (http_dispatch_begin). */
 int
 axl_ws_send(AxlWsConn *ws_conn, size_t opcode, const void *data, size_t size)
+{
+    HttpConn      *conn = (HttpConn *)ws_conn;
+    AxlHttpServer *s    = (conn != NULL) ? conn->server : NULL;
+    int            rc;
+
+    http_dispatch_begin(s);
+    rc = ws_send_body(ws_conn, opcode, data, size);
+    http_dispatch_end(s);
+    return rc;
+}
+
+static int
+ws_send_body(AxlWsConn *ws_conn, size_t opcode, const void *data, size_t size)
 {
     HttpConn *conn = (HttpConn *)ws_conn;
     if (conn == NULL || data == NULL || size == 0) {
         return AXL_ERR;
     }
-    if (!conn->active || !conn->is_websocket) {
+    /* A close asked for from inside CONNECT is deferred until CONNECT
+       returns (do_reset_connection), but the connection is closed as far as
+       the app is concerned: a frame queued now would only turn that close
+       into a reset and be dropped. */
+    if (!conn->active || !conn->is_websocket || conn->ws_close_deferred) {
         return AXL_ERR;
     }
 
@@ -695,7 +799,8 @@ int
 axl_ws_conn_close(AxlWsConn *ws_conn)
 {
     HttpConn *conn = (HttpConn *)ws_conn;
-    if (conn == NULL || !conn->active || !conn->is_websocket) {
+    if (conn == NULL || !conn->active || !conn->is_websocket
+        || conn->ws_close_deferred) {
         return AXL_ERR;
     }
     /* Tear down (reset_connection fires the handler's AXL_WS_DISCONNECT).
@@ -703,7 +808,13 @@ axl_ws_conn_close(AxlWsConn *ws_conn)
        inside the loop dispatch, and a blocking send wedges a resident
        driver-tick loop (the nested-ephemeral-loop / raised-TPL hazard — see
        process_websocket_data's WS_OP_CLOSE branch and axl_tls_free). The TCP
-       FIN from axl_tcp_close conveys the close. */
+       teardown from axl_tcp_close conveys the close: a FIN, or an RST if a
+       frame is still in flight (a close with a send pending is abortive). */
+    /* Bracketed: the DISCONNECT this fires may free the server. */
+    AxlHttpServer *srv = conn->server;
+
+    http_dispatch_begin(srv);
     reset_connection(conn);
+    http_dispatch_end(srv);
     return AXL_OK;
 }

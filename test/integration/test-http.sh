@@ -1,105 +1,18 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=35 local-only=0
-# AxlNet HTTP server integration test — boots QEMU with port forwarding,
-# starts the HTTP server inside UEFI, validates with curl from the host.
+# test-meta: arch=x64 needs= est=38 local-only=0 guest=standard
+# test-http.sh -- the AxlNet HTTP server, one part of the HTTP suite: routes,
+# authentication, the response cache, upload streaming, WebDAV and
+# WebSocket, validated with curl from the host.
+#
+# The boot and the helpers are lib/http-test-lib.sh, whose header says
+# how the suite is split and why.
 #
 # Usage: ./test/integration/test-http.sh [--arch X64|AARCH64]
 
-source "$(dirname "$0")/common-test.sh"
-
-test_parse_args "$@"
-test_setup
-
-HOST_PORT=$(test_port 0)
-GUEST_PORT=8080
-
-# Stage test app
-declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
-_native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
-TEST_BUILD_DIR="$(test_build_dir)"
-test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
-
-# Startup script: init network, run DHCP, start HTTP server
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Network status:
-ifconfig -l
-stall 1000000
-
-echo Starting HTTP server...
-AxlTestNet.efi serve
-NSHEOF
-
-test_build_image
-
-echo "=== AxlNet HTTP Integration Test ($TEST_ARCH) ==="
-
-# ---------------------------------------------------------------------------
-# Start a Python HTTP server on the host for UEFI client tests.
-# The UEFI guest reaches it via QEMU gateway at 10.0.2.2.
-# ---------------------------------------------------------------------------
-
-HOST_SERVER_PORT=$(test_port 1)
-HOST_SERVER_PID=0
-
-python3 "$(dirname "$0")/host-server.py" "$HOST_SERVER_PORT" &
-HOST_SERVER_PID=$!
-
-trap 'test_cleanup; [[ $HOST_SERVER_PID -gt 0 ]] && kill $HOST_SERVER_PID 2>/dev/null || true' EXIT
-
-sleep 1
-echo "  Host HTTP server PID: $HOST_SERVER_PID, port: $HOST_SERVER_PORT"
-
-# Boot QEMU with networking and port forwarding
-test_build_qemu_cmd
-test_add_port_forward "$HOST_PORT" "$GUEST_PORT"
-test_run_background
-
-echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
-echo "  Waiting for HTTP server..."
-
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: HTTP server did not start within 60 seconds"
-    test_clean_log
-    echo "--- Serial log ---"
-    tail -20 "$TEST_CLEAN_LOG"
-    echo "---"
-    exit 1
-fi
-
-echo "  Server is ready"
-sleep 2
-
-# ---------------------------------------------------------------------------
-# HTTP tests via curl
-# ---------------------------------------------------------------------------
-
-PASS=0
-FAIL=0
-BASE_URL="http://127.0.0.1:${HOST_PORT}"
-CURL_OPTS=(-s -H "Connection: close" --max-time 10)
-
-pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
-
-http_get() {
-    curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}$1" 2>/dev/null || true
-}
-
-http_post() {
-    curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -X POST -d "$2" "${BASE_URL}$1" 2>/dev/null || true
-}
+HTTP_TEST_PART="server"
+source "$(dirname "$0")/lib/http-test-lib.sh"
+test_use_nsh
+http_boot
 
 echo ""
 echo "  --- HTTP Server Tests ---"
@@ -321,6 +234,17 @@ RESP=$(http_get "/ttl-long")
 BODY=$(echo "$RESP" | sed '$d')
 echo "$BODY" | grep -q '"count":1' && pass "/ttl-long still cached (count=1)" || fail "/ttl-long unexpectedly re-ran ($BODY)"
 
+# A route TTL of 0 means "never cached": both requests reach the handler.
+# (It was stored as the hash value itself, read back as "no override", and
+# the route was cached for the 60 s default.)
+RESP=$(http_get "/ttl-zero")
+BODY1=$(echo "$RESP" | sed '$d')
+RESP=$(http_get "/ttl-zero")
+BODY2=$(echo "$RESP" | sed '$d')
+[[ "$BODY1" == '{"route":"zero","count":1}' && "$BODY2" == '{"route":"zero","count":2}' ]] \
+    && pass "/ttl-zero (route TTL 0) is never cached" \
+    || fail "/ttl-zero was cached: '$BODY1' then '$BODY2'"
+
 # ---------------------------------------------------------------------------
 # Prefix-based cache invalidation — after caching three entries under
 # /api/users/* and /api/posts/1, GET /invalidate-users calls
@@ -499,6 +423,35 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
 [[ "$CODE" == "201" ]] && pass "MOVE /dav/preset-dir -> /dav/moved-dir returns 201" \
                        || fail "MOVE preset-dir (got $CODE)"
 
+# A PROPFIND lists a directory WHOLE or not at all: a partial 207 reads as
+# the full truth to a sync client, which then deletes what it did not see.
+# /dav/big lists 5000 children (PROPFIND once cut at 4096); /dav/oom never
+# stops growing and its listing runs out of memory -- 507, never a cut
+# 207; a child whose path passes 512 bytes (it once was skipped) is listed.
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -X PROPFIND -H "Depth: 1" \
+    "${BASE_URL}/dav/big/" 2>/dev/null || true)
+CODE=$(echo "$RESP" | tail -1)
+N=$(echo "$RESP" | grep -oE '<D:href>/dav/big/f[0-9]{5}</D:href>' | sort -u | wc -l || true)
+[[ "$CODE" == 207 && "$N" == 5000 ]] \
+    && pass "PROPFIND of a 5000-entry directory lists all 5000 (207)" \
+    || fail "PROPFIND 5000 entries (got $CODE, listed $N; want 207 5000)"
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -X PROPFIND -H "Depth: 1" \
+    "${BASE_URL}/dav/oom/" 2>/dev/null || true)
+CODE=$(echo "$RESP" | tail -1); BODY=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == 507 && "$BODY" == "PROPFIND: the listing does not fit in memory" ]] \
+    && pass "PROPFIND whose listing runs out of memory -> 507, no partial 207" \
+    || fail "PROPFIND out of memory (got $CODE '${BODY:0:80}'; want 507 and the message)"
+LONGD=$(printf 'd%.0s' $(seq 1 300)); LONGK=$(printf 'k%.0s' $(seq 1 250))
+RESP=$(curl "${CURL_OPTS[@]}" -X PROPFIND -H "Depth: 1" "${BASE_URL}/dav/${LONGD}/" 2>/dev/null || true)
+[[ "$RESP" == *"<D:href>/dav/${LONGD}/${LONGK}</D:href>"* ]] \
+    && pass "PROPFIND lists a child whose path passes 512 bytes" \
+    || fail "PROPFIND long child path (not listed)"
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 1" \
+    "${BASE_URL}/dav/listfail/" 2>/dev/null || true)
+[[ "$CODE" == 500 ]] \
+    && pass "PROPFIND of a directory whose list_dir fails -> 500, not an empty 207" \
+    || fail "PROPFIND list failure (got $CODE; want 500)"
+
 # PROPFIND on a known file (Depth: 0) — 207 Multi-Status, XML body
 # carrying one <D:response> for the file itself.
 RESP=$(curl "${CURL_OPTS[@]}" -i -X PROPFIND -H "Depth: 0" \
@@ -658,6 +611,18 @@ echo "$BODY" | grep -q "\"preview\":\"${PUT_BODY}\"" \
 echo "$BODY" | grep -q '"aborted":false' \
     && pass "PUT delivered clean EOF (aborted=false)" \
     || fail "PUT aborted flag (body: $BODY)"
+[[ "$BODY" == "{\"path\":\"/uploaded.txt\",\"length\":${#PUT_BODY},\"len\":${#PUT_BODY},\"aborted\":false,\"preview\":\"${PUT_BODY}\"}" ]] \
+    && pass "write_open was told the Content-Length (${#PUT_BODY})" \
+    || fail "write_open length (body: $BODY)"
+
+# A chunked PUT states no length: write_open is told it is unknown.
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -H "Transfer-Encoding: chunked" -d "chunked-body" \
+    "${BASE_URL}/dav/chunked.txt" 2>/dev/null || true)
+BODY=$(http_get "/dav-status?seq=chunked" | sed '$d')
+[[ "$CODE" == "201" && "$BODY" == '{"path":"/chunked.txt","length":"unknown","len":12,"aborted":false,"preview":"chunked-body"}' ]] \
+    && pass "a chunked PUT: write_open told the length is unknown, 201" \
+    || fail "chunked PUT (got $CODE, body: $BODY)"
 
 # After PUT, GET should see the new entry as a known file (404 → not 404
 # is the cheap regression — the test backend registered it on
@@ -674,8 +639,8 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
 [[ "$CODE" == "201" ]] && pass "PUT empty body returns 201" \
                        || fail "PUT empty (got $CODE)"
 
-# PUT whose final flush/close FAILS. Every chunk was accepted, so nothing
-# sets put_failed along the way — the only signal is write_close's status.
+# PUT whose final flush/close FAILS. Every chunk was accepted, so no chunk
+# call failed along the way — the only signal is write_close's status.
 # The response must be 500: a 201 here tells the client its data is stored
 # when the backend could not make it durable (full volume, write-protected
 # media, device error). The test backend fails write_close for any target
@@ -693,6 +658,77 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
     "${BASE_URL}/dav/flush-fails-empty.bin" 2>/dev/null || true)
 [[ "$CODE" == "500" ]] && pass "empty-body PUT whose close fails returns 500" \
                        || fail "empty PUT flush-failure (got $CODE, want 500)"
+
+# A PUT whose backend refuses a CHUNK fails with 500 -- and that is the
+# end of it. The failing chunk call is the handler's last for that PUT (no
+# abort call follows a chunk that failed), so the handler releases the
+# write itself, as aborted; the next PUT on the mount then stores normally.
+# Before, the write stayed open and claimed the mount's single in-flight
+# slot, and the next PUT was refused as "concurrent".
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -d "dropped" "${BASE_URL}/dav/chunk-fails.bin" 2>/dev/null || true)
+[[ "$CODE" == "500" ]] && pass "PUT whose chunk write fails returns 500" \
+                       || fail "PUT chunk-failure (got $CODE, want 500)"
+BODY=$(http_get "/dav-status?seq=chunkfail" | sed '$d')
+[[ "$BODY" == '{"path":"/chunk-fails.bin","length":7,"len":0,"aborted":true,"preview":""}' ]] \
+    && pass "the failed PUT's write was released as aborted" \
+    || fail "chunk-failure write not released (body: $BODY)"
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -d "after-chunk-fail" "${BASE_URL}/dav/after-chunk-fail.txt" 2>/dev/null || true)
+BODY=$(http_get "/dav-status?seq=afterchunkfail" | sed '$d')
+[[ "$CODE" == "201" && "$BODY" == '{"path":"/after-chunk-fail.txt","length":16,"len":16,"aborted":false,"preview":"after-chunk-fail"}' ]] \
+    && pass "the PUT after a chunk failure stores normally (201)" \
+    || fail "PUT after a chunk failure (got $CODE, body: $BODY)"
+
+# A backend whose discard cannot restore the resource (it wrote in place)
+# says so by failing the discard; the SDK then tells the client the
+# resource is partially written instead of answering a bare 500. The
+# control is the ordinary chunk failure: its discard restored the
+# resource, and its 500 carries no such body.
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" \
+    -X PUT -d "dropped" "${BASE_URL}/dav/chunk-fails.bin" 2>/dev/null || true)
+CODE=$(echo "$RESP" | tail -1); BODY=$(echo "$RESP" | sed '$d')
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" \
+    -X PUT -d "dropped" "${BASE_URL}/dav/chunk-fails-kept.bin" 2>/dev/null || true)
+CODE2=$(echo "$RESP" | tail -1); BODY2=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == 500 && -z "$BODY" && "$CODE2" == 500 \
+   && "$BODY2" == "PUT failed part-way: the resource is partially written" ]] \
+    && pass "a chunk failure the discard cannot undo -> 500 'partially written'; one it can -> bare 500" \
+    || fail "kept chunk failure (restored: $CODE '$BODY', kept: $CODE2 '$BODY2')"
+BAD_HEX=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -X PUT \
+    -H "Content-Digest: sha-256=${BAD_HEX}" -d "kept body" \
+    "${BASE_URL}/dav/kept-digest.txt" 2>/dev/null || true)
+CODE=$(echo "$RESP" | tail -1); BODY=$(echo "$RESP" | sed '$d')
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -X PUT \
+    -H "Content-Digest: sha-256=${BAD_HEX}" -d "other body" \
+    "${BASE_URL}/dav/digest-restored.txt" 2>/dev/null || true)
+CODE2=$(echo "$RESP" | tail -1); BODY2=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == 400 && "$BODY" == "Content-Digest mismatch: the resource now holds the body that did not match" \
+   && "$CODE2" == 400 && -z "$BODY2" ]] \
+    && pass "a digest mismatch the discard cannot undo -> 400 saying the resource holds it; one it can -> bare 400" \
+    || fail "kept digest mismatch (kept: $CODE '$BODY', restored: $CODE2 '$BODY2')"
+
+# The discard's return means "could not restore" ONLY for a write the
+# backend declared in place at write_open. An atomic write whose discard
+# fails (a temp that could not be removed) leaves the resource as it was:
+# the 400 stays bare.
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -X PUT \
+    -H "Content-Digest: sha-256=${BAD_HEX}" -d "atomic body" \
+    "${BASE_URL}/dav/discard-fails.txt" 2>/dev/null || true)
+CODE=$(echo "$RESP" | tail -1); BODY=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == 400 && -z "$BODY" ]] \
+    && pass "an atomic write's failing discard is ignored -> bare 400" \
+    || fail "atomic discard failure (got $CODE '$BODY'; want 400 '')"
+
+# A write declared in place whose COMMIT fails (the final flush) is as
+# partial as one that failed mid-body: 500 saying so, not a bare 500.
+RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" \
+    -X PUT -d "flushed" "${BASE_URL}/dav/flush-fails-kept.bin" 2>/dev/null || true)
+CODE=$(echo "$RESP" | tail -1); BODY=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == 500 && "$BODY" == "PUT failed part-way: the resource is partially written" ]] \
+    && pass "an in-place commit that fails -> 500 'partially written'" \
+    || fail "in-place commit failure (got $CODE '$BODY'; want 500 and the message)"
 
 # MOVE without Destination → 400.
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
@@ -740,6 +776,34 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
 [[ "$CODE" == "404" ]] && pass "COPY of missing source returns 404" \
                        || fail "COPY missing src (got $CODE)"
 
+# A move or copy op's failure maps by its code: AXL_ERR is 500 and
+# AXL_UNSUPPORTED (a move only a copy could make) 502. The test backend
+# fails the op with that code for a destination named op-err* /
+# op-unsupported*; the source exists, so the SDK's pre-checks pass.
+C1=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X MOVE \
+    -H "Destination: ${BASE_URL}/dav/op-err-mv" "${BASE_URL}/dav/copy-source-file" 2>/dev/null || true)
+C2=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X COPY \
+    -H "Destination: ${BASE_URL}/dav/op-err-cp" "${BASE_URL}/dav/copy-source-file" 2>/dev/null || true)
+C3=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X MOVE \
+    -H "Destination: ${BASE_URL}/dav/op-unsupported-mv" "${BASE_URL}/dav/copy-source-file" 2>/dev/null || true)
+C4=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X COPY \
+    -H "Destination: ${BASE_URL}/dav/op-unsupported-cp" "${BASE_URL}/dav/copy-source-file" 2>/dev/null || true)
+[[ "$C1 $C2 $C3 $C4" == "500 500 502 502" ]] \
+    && pass "MOVE/COPY op failure: AXL_ERR -> 500, AXL_UNSUPPORTED -> 502" \
+    || fail "MOVE/COPY op status map (MOVE err $C1, COPY err $C2, MOVE unsupported $C3, COPY unsupported $C4; want 500 500 502 502)"
+
+# A destination differing from the source in letter case only is, by
+# default, an existing destination like any other: this backend is
+# case-sensitive and does not declare that it decides identity, so MOVE and
+# COPY /dav/csx -> /dav/CSX with Overwrite: F are refused 412 by the SDK.
+C1=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X MOVE -H "Overwrite: F" \
+    -H "Destination: ${BASE_URL}/dav/CSX" "${BASE_URL}/dav/csx" 2>/dev/null || true)
+C2=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" -X COPY -H "Overwrite: F" \
+    -H "Destination: ${BASE_URL}/dav/CSX" "${BASE_URL}/dav/csx" 2>/dev/null || true)
+[[ "$C1 $C2" == "412 412" ]] \
+    && pass "case-variant MOVE/COPY with Overwrite: F, both existing -> 412 (the default)" \
+    || fail "case-variant Overwrite F (MOVE $C1, COPY $C2; want 412 412)"
+
 # COPY without Destination → 400.
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
     -X COPY "${BASE_URL}/dav/copy-source-file" 2>/dev/null || true)
@@ -753,15 +817,15 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
 [[ "$CODE" == "400" ]] && pass "COPY cross-prefix Destination returns 400" \
                        || fail "COPY cross-prefix (got $CODE)"
 
-# COPY with Overwrite: F into an existing target → 409 (v1 lumps
-# precondition failures into 409, matching MOVE; spec-strict 412
-# is a known follow-up).
+# COPY with Overwrite: F into an existing target → 412 Precondition
+# Failed (RFC 4918 §9.8.5), as MOVE answers: the handler pre-stats the
+# destination and never calls the op.
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
     -X COPY -H "Destination: ${BASE_URL}/dav/copy-existing-target" \
     -H "Overwrite: F" \
     "${BASE_URL}/dav/copy-source-file" 2>/dev/null || true)
-[[ "$CODE" == "409" ]] && pass "COPY Overwrite:F into existing target returns 409" \
-                       || fail "COPY no-overwrite collision (got $CODE)"
+[[ "$CODE" == "412" ]] && pass "COPY Overwrite:F into existing target returns 412" \
+                       || fail "COPY no-overwrite collision (got $CODE, want 412)"
 
 # COPY of the mount root → 403 (symmetric with MOVE / DELETE /).
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
@@ -894,15 +958,16 @@ echo "$RESP" | grep -qi "^Digest: sha-256=" \
     || fail "Range omitted Digest"
 
 # --- WebDAV W7b: PUT Content-Digest validation (symmetric) ---
-# Test backend returns a fixed 64-char hex for every file present
-# in its in-memory FS. PUT round-trips that match the fixed hex
-# pass; mismatches return 400 and the file is removed.
-
-FIXED_HEX="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# The SDK hashes a PUT's body itself as it streams (sha-256 and sha-512)
+# and compares BEFORE the write is committed: a match commits (201), a
+# mismatch discards the write -- write_close(aborted) -- and is 400, so a
+# backend that replaces atomically keeps the old file. The test backend's
+# fixed digest answers Want-Digest (the response side) only.
 
 # PUT with matching Content-Digest → 201 + file lands.
+GOOD_HEX=$(printf '%s' "matching-digest-body" | sha256sum | cut -d' ' -f1)
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
-    -X PUT -H "Content-Digest: sha-256=${FIXED_HEX}" \
+    -X PUT -H "Content-Digest: sha-256=${GOOD_HEX}" \
     -d "matching-digest-body" \
     "${BASE_URL}/dav/cd-good.tmp" 2>/dev/null || true)
 [[ "$CODE" == "201" ]] && pass "PUT with matching Content-Digest returns 201" \
@@ -956,15 +1021,26 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
 [[ "$CODE" == "404" ]] && pass "PUT empty mismatch removed file" \
                        || fail "PUT empty mismatch cleanup (post-PROPFIND $CODE)"
 
-# Empty-body PUT with matching hex → 201 (validates against the
-# test backend's FIXED_HEX, which the backend returns for every
-# file in fs — empty or not).
+# Empty-body PUT with the empty body's real sha-256 → 201.
+EMPTY_HEX=$(printf '' | sha256sum | cut -d' ' -f1)
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
     -X PUT -H "Content-Length: 0" --data-binary "" \
-    -H "Content-Digest: sha-256=${FIXED_HEX}" \
+    -H "Content-Digest: sha-256=${EMPTY_HEX}" \
     "${BASE_URL}/dav/cd-empty-good.tmp" 2>/dev/null || true)
 [[ "$CODE" == "201" ]] && pass "PUT empty body + matching Content-Digest returns 201" \
                        || fail "PUT empty + matching (got $CODE)"
+
+# sha-512 is verified the same way: a match commits, a mismatch is 400.
+GOOD512=$(printf '%s' "sha512-body" | sha512sum | cut -d' ' -f1)
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -H "Content-Digest: sha-512=${GOOD512}" -d "sha512-body" \
+    "${BASE_URL}/dav/cd-512-good.tmp" 2>/dev/null || true)
+CODE2=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -H "Content-Digest: sha-512=${GOOD512}" -d "sha512-other" \
+    "${BASE_URL}/dav/cd-512-bad.tmp" 2>/dev/null || true)
+[[ "$CODE" == "201" && "$CODE2" == "400" ]] \
+    && pass "PUT with sha-512 Content-Digest: match 201, mismatch 400" \
+    || fail "PUT sha-512 Content-Digest (got $CODE / $CODE2; want 201 400)"
 
 # Pipelined regression: middleware rejection on an upload route MUST
 # force-close the connection. The client almost always sends headers
@@ -1541,149 +1617,4 @@ else
     fail "200 KB WS frame not accepted (WS-BIGFRAME-RC='${BIG_RC:-<absent>}', want 0)"
 fi
 
-# ---------------------------------------------------------------------------
-# UEFI HTTP Client tests (UEFI fetches from host Python server)
-# ---------------------------------------------------------------------------
-
-echo ""
-echo "  --- UEFI HTTP Client Tests ---"
-
-# Client GET — UEFI fetches /hello from host server via QEMU gateway
-RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/hello")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "client-test proxy returns 200" || fail "client-test proxy (got $CODE)"
-echo "$BODY" | grep -q '"client_status":200' && pass "AxlHttpGet got 200 from host" || fail "AxlHttpGet wrong status (body: $BODY)"
-echo "$BODY" | grep -q 'hello from host' && pass "AxlHttpGet got correct body" || fail "AxlHttpGet wrong body (body: $BODY)"
-
-# Client GET — redirect (UEFI fetches /redirect which 302s to /hello)
-RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/redirect")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "client-test redirect returns 200" || fail "client-test redirect (got $CODE)"
-echo "$BODY" | grep -q '"client_status":200' && pass "AxlHttpGet follows redirect" || fail "AxlHttpGet redirect failed (body: $BODY)"
-
-# Client GET — 404
-RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/nonexistent")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "client-test 404 proxy returns 200" || fail "client-test 404 proxy (got $CODE)"
-echo "$BODY" | grep -q '"client_status":404' && pass "AxlHttpGet sees 404 from host" || fail "AxlHttpGet didn't see 404 (body: $BODY)"
-
-# Client GET — Transfer-Encoding: chunked. Host emits two body chunks
-# (0xb + 0x9 = 0x14 = 20 bytes total) plus terminator. Decoded body must
-# be the exact concatenation "hello-chunk-second!!".
-RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/chunked")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "client-test chunked proxy returns 200" || fail "client-test chunked proxy (got $CODE)"
-echo "$BODY" | grep -q '"client_status":200' && pass "AxlHttpGet got 200 from chunked host" || fail "AxlHttpGet wrong status from chunked (body: $BODY)"
-echo "$BODY" | grep -q '"client_body_size":20' && pass "AxlHttpGet decoded chunked body size=20" || fail "AxlHttpGet chunked body size (body: $BODY)"
-echo "$BODY" | grep -q '"client_body":"hello-chunk-second!!"' && pass "AxlHttpGet decoded chunked body bytes" || fail "AxlHttpGet chunked body bytes (body: $BODY)"
-
-# Client GET — chunked with chunk extensions (`b;name=foo`) and a
-# trailer header (`X-Trace`). Real servers emit these in production.
-RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/chunked-ext")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "client-test chunked-ext proxy returns 200" || fail "client-test chunked-ext proxy (got $CODE)"
-echo "$BODY" | grep -q '"client_body_size":20' && pass "AxlHttpGet ignores chunk extensions" || fail "AxlHttpGet chunked-ext body size (body: $BODY)"
-echo "$BODY" | grep -q '"client_body":"hello-chunk-second!!"' && pass "AxlHttpGet decoded chunked-ext body bytes" || fail "AxlHttpGet chunked-ext body bytes (body: $BODY)"
-
-# Client GET — both Content-Length and Transfer-Encoding: chunked.
-# RFC 7230 §3.3.3: chunked wins, the bogus Content-Length is ignored.
-RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/chunked-with-cl")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "client-test chunked+CL proxy returns 200" || fail "client-test chunked+CL proxy (got $CODE)"
-echo "$BODY" | grep -q '"client_body_size":20' && pass "AxlHttpGet prefers chunked over Content-Length" || fail "AxlHttpGet chunked+CL body size (body: $BODY)"
-echo "$BODY" | grep -q '"client_body":"hello-chunk-second!!"' && pass "AxlHttpGet decoded chunked+CL body bytes" || fail "AxlHttpGet chunked+CL body bytes (body: $BODY)"
-
-# --- Streaming PUT (axl_http_request_streaming / _stream_file) ---
-# UEFI client drives a multi-chunk PUT against the host's /upload
-# endpoint, varying framing + producer source. Host records the
-# received bytes; we GET /last-upload to verify size + head/tail
-# bytes match the producer pattern (byte_i = i & 0xFF).
-
-# Helper: hit the in-guest streaming-put driver, then read back
-# what the host received. Args: mode, size.
-SP_HOST_URL="http://10.0.2.2:${HOST_SERVER_PORT}/upload"
-EXPECT_HEAD_HEX="0001020304050607"
-
-# Content-Length framing, raw producer callback.
-RESP=$(http_get "/streaming-put-test?url=${SP_HOST_URL}&size=2048&mode=cb")
-CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$CODE" == "200" ]] && pass "streaming-put cb: handler returns 200" \
-                       || fail "streaming-put cb status (got $CODE)"
-echo "$BODY" | grep -q '"rc":0' \
-    && pass "streaming-put cb: rc 0 (request succeeded)" \
-    || fail "streaming-put cb rc (body: $BODY)"
-echo "$BODY" | grep -q '"server_status":201' \
-    && pass "streaming-put cb: server returned 201" \
-    || fail "streaming-put cb server_status (body: $BODY)"
-HOST_RESP=$(curl -s "http://127.0.0.1:${HOST_SERVER_PORT}/last-upload")
-echo "$HOST_RESP" | grep -q '"len": 2048' \
-    && pass "streaming-put cb: host received 2048 bytes" \
-    || fail "streaming-put cb host len (resp: $HOST_RESP)"
-echo "$HOST_RESP" | grep -q "\"head_hex\": \"${EXPECT_HEAD_HEX}\"" \
-    && pass "streaming-put cb: head bytes match producer pattern" \
-    || fail "streaming-put cb head hex (resp: $HOST_RESP)"
-
-# Transfer-Encoding: chunked framing, same producer. Verify tail
-# bytes too — proves the reassembly worked across chunk boundaries
-# (byte 4088..4095 of an i&0xFF pattern is f8..ff).
-EXPECT_TAIL_HEX_4096="f8f9fafbfcfdfeff"
-RESP=$(http_get "/streaming-put-test?url=${SP_HOST_URL}&size=4096&mode=chunked")
-BODY=$(echo "$RESP" | sed '$d')
-echo "$BODY" | grep -q '"rc":0' && echo "$BODY" | grep -q '"server_status":201' \
-    && pass "streaming-put chunked: rc 0 + server 201" \
-    || fail "streaming-put chunked outcome (body: $BODY)"
-HOST_RESP=$(curl -s "http://127.0.0.1:${HOST_SERVER_PORT}/last-upload")
-echo "$HOST_RESP" | grep -q '"len": 4096' \
-    && pass "streaming-put chunked: host reassembled 4096 bytes" \
-    || fail "streaming-put chunked host len (resp: $HOST_RESP)"
-echo "$HOST_RESP" | grep -q "\"head_hex\": \"${EXPECT_HEAD_HEX}\"" \
-    && pass "streaming-put chunked: head bytes match" \
-    || fail "streaming-put chunked head hex (resp: $HOST_RESP)"
-echo "$HOST_RESP" | grep -q "\"tail_hex\": \"${EXPECT_TAIL_HEX_4096}\"" \
-    && pass "streaming-put chunked: tail bytes match (cross-chunk reassembly)" \
-    || fail "streaming-put chunked tail hex (resp: $HOST_RESP)"
-
-# Producer overshoots declared Content-Length → SDK detects + aborts.
-# Pin the guard that prevents a buggy producer from sending more
-# than total_size bytes when not using chunked transfer.
-RESP=$(http_get "/streaming-put-test?url=${SP_HOST_URL}&size=2048&mode=overshoot")
-BODY=$(echo "$RESP" | sed '$d')
-echo "$BODY" | grep -q '"rc":0' \
-    && fail "streaming-put overshoot: SDK accepted >Content-Length bytes (body: $BODY)" \
-    || pass "streaming-put overshoot: SDK rejects producer overshoot"
-
-# Producer returns AXL_ERR mid-stream → request fails, host doesn't
-# see a complete body. We can't assert exactly what the host sees
-# (race with the abort), but rc != 0 on the client side is the
-# contract guarantee.
-RESP=$(http_get "/streaming-put-test?url=${SP_HOST_URL}&size=4096&mode=err")
-BODY=$(echo "$RESP" | sed '$d')
-echo "$BODY" | grep -q '"rc":0' \
-    && fail "streaming-put err: producer error masked as success (body: $BODY)" \
-    || pass "streaming-put err: producer error surfaces as rc != 0"
-
-# File-backed convenience wrapper. Producer comes from a UEFI file
-# the handler writes first; SDK streams it via axl_fopen + axl_read.
-RESP=$(http_get "/streaming-put-test?url=${SP_HOST_URL}&size=8192&mode=file")
-BODY=$(echo "$RESP" | sed '$d')
-echo "$BODY" | grep -q '"rc":0' && echo "$BODY" | grep -q '"server_status":201' \
-    && pass "streaming-put file: rc 0 + server 201" \
-    || fail "streaming-put file outcome (body: $BODY)"
-HOST_RESP=$(curl -s "http://127.0.0.1:${HOST_SERVER_PORT}/last-upload")
-echo "$HOST_RESP" | grep -q '"len": 8192' \
-    && pass "streaming-put file: host received 8192 bytes" \
-    || fail "streaming-put file host len (resp: $HOST_RESP)"
-echo "$HOST_RESP" | grep -q "\"head_hex\": \"${EXPECT_HEAD_HEX}\"" \
-    && pass "streaming-put file: head bytes match pattern from disk" \
-    || fail "streaming-put file head hex (resp: $HOST_RESP)"
-
-echo ""
-echo "Results: $PASS passed, $FAIL failed ($TEST_ARCH)"
-[[ $FAIL -eq 0 && $PASS -gt 0 ]] && exit 0 || exit 1
+http_finish

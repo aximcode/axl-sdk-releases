@@ -7,7 +7,7 @@
 #
 #   1. RESTORE MTIME. `sed -i.bak file && mv file.bak file` gives the restored
 #      source the BACKUP's mtime, which is older than the object built from the
-#      sabotaged source. make then sees the .o as up to date and skips the
+#      sabotaged source. ninja then sees the .o as up to date and skips the
 #      rebuild -- so the next run links the PREVIOUS sabotage and reports
 #      failures belonging to an edit that is no longer in the file. This script
 #      always `touch`es on restore.
@@ -69,7 +69,7 @@
 #   scripts/sabotage.sh -s 'src/util/axl-tar.c:s/sum += hdr\[i\]/sum += 0/' \
 #       --expect-fail -- ./test/integration/test-axl.sh
 #
-#   scripts/sabotage.sh -p /tmp/break-it.diff --expect-fail -- make check-nul
+#   scripts/sabotage.sh -p /tmp/break-it.diff --expect-fail -- python3 scripts/check-nul.py
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -128,7 +128,7 @@ restore() {
     for f in "${FILES[@]}"; do
         cp -- "$SNAP/$f" "$f"
         # touch AFTER the copy: cp preserves nothing here (no -p on purpose),
-        # but be explicit -- make must see the restored source as NEWER than
+        # but be explicit -- ninja must see the restored source as NEWER than
         # any object built from the sabotaged one, or it skips the rebuild and
         # the next run silently tests the old sabotage.
         touch -- "$f"

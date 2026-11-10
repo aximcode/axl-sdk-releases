@@ -53,6 +53,10 @@ typedef enum {
     AXL_IO_ERROR     = -9,  ///< underlying device / transport I/O failure
     AXL_BUSY         = -10, ///< resource temporarily unavailable (e.g. a prior async op still in flight) — retry later
     AXL_INCOMPLETE   = -11, ///< input ended mid-item: well-formed so far, but more bytes are needed to decide
+    AXL_IS_DIR       = -12, ///< a directory where a non-directory is required (`EISDIR`)
+    AXL_NOT_DIR      = -13, ///< a non-directory where a directory is required (`ENOTDIR`)
+    AXL_NOT_EMPTY    = -14, ///< a directory that must be empty is not (`ENOTEMPTY`)
+    AXL_EXISTS       = -15, ///< the name is already taken (`EEXIST`)
 } AxlStatus;
 
 // ---------------------------------------------------------------------------

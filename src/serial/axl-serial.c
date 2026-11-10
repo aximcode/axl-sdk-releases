@@ -126,6 +126,47 @@ axl_serial_get_control(
     return AXL_OK;
 }
 
+/* Does @p h carry @p tag? */
+static bool
+has_tag(
+    EFI_HANDLE  h,
+    EFI_GUID   *tag
+    )
+{
+    void *iface = NULL;
+    return !EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3, h, tag, &iface));
+}
+
+/* Decided by binding, not by device path: a serial driver rewrites its
+   port's Uart node in place on a line-setting change, while a terminal may
+   keep the path it copied at Start. */
+bool
+axl_serial_is_console(
+    AxlHandle handle
+    )
+{
+    if (handle == NULL) {
+        return false;
+    }
+    EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *info = NULL;
+    UINTN                                n    = 0;
+    EFI_STATUS st = axl_efi_call(axl_bs()->OpenProtocolInformation, 4,
+                                 (EFI_HANDLE)handle, &gEfiSerialIoProtocolGuid, &info, &n);
+    if (EFI_ERROR(st) || info == NULL) {
+        return false;
+    }
+    bool hit = false;
+    for (UINTN i = 0; i < n && !hit; i++) {
+        EFI_HANDLE child = info[i].ControllerHandle;
+        hit = (info[i].Attributes & EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER) != 0
+              && child != NULL
+              && (has_tag(child, &gEfiConsoleOutDeviceGuid)
+                  || has_tag(child, &gEfiStandardErrorDeviceGuid));
+    }
+    axl_backend_free(info);
+    return hit;
+}
+
 // ---------------------------------------------------------------------------
 // Byte I/O — open / set-mode / write / read / async receive
 // ---------------------------------------------------------------------------

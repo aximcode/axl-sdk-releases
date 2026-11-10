@@ -39,6 +39,12 @@ static const EFI_GUID STDIO_BRIDGE_GUID = {
     {0x98, 0xd6, 0xb1, 0x16, 0x82, 0x5e, 0x30, 0xbf}
 };
 
+/* Mirrors AXL_STDIO_BRIDGE2_GUID: a launcher installs both, and leaks both. */
+static const EFI_GUID STDIO_BRIDGE2_GUID = {
+    0xce4cacac, 0xe9c8, 0x4efc,
+    {0x92, 0x6b, 0x66, 0xbe, 0x58, 0x76, 0xdb, 0x55}
+};
+
 static int g_pass = 0;
 static int g_fail = 0;
 
@@ -53,14 +59,16 @@ check(bool ok, const char *msg)
     }
 }
 
-/* Count handles carrying the stdio-bridge protocol. SIZE_MAX on failure. */
+/* Count handles carrying the bridge protocol @p guid. SIZE_MAX on failure. */
 static size_t
-count_bridges(void)
+count_bridges(
+    const EFI_GUID  *guid
+    )
 {
     EFI_HANDLE *handles = NULL;
     UINTN       count   = 0;
     EFI_STATUS  st = gBS->LocateHandleBuffer(
-        ByProtocol, (EFI_GUID *)&STDIO_BRIDGE_GUID, NULL, &count, &handles);
+        ByProtocol, (EFI_GUID *)guid, NULL, &count, &handles);
     if (st == EFI_NOT_FOUND) {
         return 0;
     }
@@ -82,18 +90,22 @@ main(int argc, char **argv)
     /* Two leakers ran from the shell before us; each leaked a bridge whose
      * launcher is now gone. With the reap-at-install fix the 2nd leaker swept
      * the 1st, so at most one dead instance remains. */
-    size_t initial = count_bridges();
-    axl_printf("INFO: BRIDGES_INITIAL=%zu\n", initial);
-    check(initial != (size_t)-1 && initial <= 1,
+    size_t initial  = count_bridges(&STDIO_BRIDGE_GUID);
+    size_t initial2 = count_bridges(&STDIO_BRIDGE2_GUID);
+    axl_printf("INFO: BRIDGES_INITIAL=%zu BRIDGES2_INITIAL=%zu\n", initial, initial2);
+    check(initial != (size_t)-1 && initial <= 1
+          && initial2 != (size_t)-1 && initial2 <= 1,
           "dead bridges did not accumulate across launchers (reap at install)");
 
     /* axl_shared_driver_unload reaps dead bridges even when the named driver
      * is not resident (the reap runs before the not-found early return). */
     axl_shared_driver_unload("stdio-bridge-fix");
 
-    size_t after = count_bridges();
-    axl_printf("INFO: BRIDGES_AFTER_UNLOAD=%zu\n", after);
-    check(after == 0, "shared_driver_unload reaped the residual dead bridge");
+    size_t after  = count_bridges(&STDIO_BRIDGE_GUID);
+    size_t after2 = count_bridges(&STDIO_BRIDGE2_GUID);
+    axl_printf("INFO: BRIDGES_AFTER_UNLOAD=%zu BRIDGES2_AFTER_UNLOAD=%zu\n", after, after2);
+    check(after == 0 && after2 == 0,
+          "shared_driver_unload reaped the residual dead bridge, both layouts");
 
     axl_printf("stdio-bridge-reap-test: %d passed, %d failed\n",
                g_pass, g_fail);

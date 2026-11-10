@@ -24,7 +24,7 @@ AXL_LOG_DOMAIN("stdio-bridge-fix");
 static FixVtable  gVtable;
 static AxlHandle  gPublishedHandle;
 
-/* argv[0] is the verb (the launcher strips its own name).
+/* argv[0] is the verb (the launcher strips its own name); see also "err".
  *   "echo" — read one line from axl_stdin, print GOT:<line>.
  *   "emit" — print DRIVEROUT (the > redirect probe). */
 static int
@@ -73,6 +73,45 @@ fix_run(int argc, char **argv)
     if (axl_strcmp(argv[0], "emit") == 0) {
         axl_printf("DRIVEROUT\n");
         return 0;
+    }
+
+    /* "err" — print DRIVERERR on standard error: where the LAUNCHER's
+       standard error is, this dispatch (test-stderr-row-qemu.sh). */
+    if (axl_strcmp(argv[0], "err") == 0) {
+        axl_printerr("DRIVERERR\n");
+        return 0;
+    }
+
+    /* "wait" — stay in the dispatch for 2 s: a launcher whose bridge is live
+       that long, while another image writes on its own clock. WAIT-BEGIN and
+       WAIT-END on stdout bracket the 2 s, so a test can show the other
+       image's lines fell inside them. */
+    if (axl_strcmp(argv[0], "wait") == 0) {
+        axl_printf("WAIT-BEGIN\n");
+        axl_msleep(2000);
+        axl_printf("WAIT-END\n");
+        return 0;
+    }
+
+    /* Raw stdout, which the launcher's console turns into text with a
+       decoder that carries state from one write to the next. Each dispatch
+       is a different launcher: one must not inherit another's state.
+       "rawbom"   -- UTF-16LE with its mark: BOM, a line.
+       "rawsplit" -- SPLIT, a line, then a lone C3: a character left open.
+       "rawplain" -- RAWPLAIN, a line, in plain UTF-8. */
+    if (axl_strcmp(argv[0], "rawbom") == 0) {
+        static const unsigned char b[] = {
+            0xFF, 0xFE, 'B', 0, 'O', 0, 'M', 0, '\n', 0,
+        };
+        return axl_fwrite(b, 1, sizeof(b), axl_stdout_raw) == sizeof(b) ? 0 : 1;
+    }
+    if (axl_strcmp(argv[0], "rawsplit") == 0) {
+        static const unsigned char b[] = { 'S', 'P', 'L', 'I', 'T', '\n', 0xC3 };
+        return axl_fwrite(b, 1, sizeof(b), axl_stdout_raw) == sizeof(b) ? 0 : 1;
+    }
+    if (axl_strcmp(argv[0], "rawplain") == 0) {
+        static const char b[] = "RAWPLAIN\n";
+        return axl_fwrite(b, 1, sizeof(b) - 1, axl_stdout_raw) == sizeof(b) - 1 ? 0 : 1;
     }
 
     if (axl_strcmp(argv[0], "exitstatus") == 0) {

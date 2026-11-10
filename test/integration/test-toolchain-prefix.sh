@@ -16,7 +16,7 @@
 #
 # WHAT THIS DOES NOT NEED TO CHANGE, measured 2026-08-29: USING a relocated
 # toolchain already works. AXL_<ARCH>_GCC / _GXX / _BINUTILS_PREFIX are
-# resolved by axl-cc, the Makefile and install.sh through the `_DEFAULT`
+# resolved by axl-cc, the build and install.sh through the `_DEFAULT`
 # convention, and axl-toolchains.conf's own header already names this exact
 # case ("a per-user prefix, a CI cache, or a locally built tree"). Only the
 # INSTALLER could not put one there.

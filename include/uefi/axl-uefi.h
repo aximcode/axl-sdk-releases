@@ -36,6 +36,14 @@
  *
  * Reach for an axl_* API first. If none covers what you need, that gap is
  * worth reporting -- it is more useful than the workaround.
+ *
+ * What a raw call gives up: AXL keeps state about what it started and
+ * created, and cannot see what you start or create yourself. In particular,
+ * a child image started with gBS->StartImage, and a callback of an event
+ * made with gBS->CreateEvent, are outside axl_exit's deferral -- an
+ * axl_exit from a callback while such a child runs hangs the machine (see
+ * axl_exit in <axl/axl-signal.h>). Start images and create events through
+ * the axl_* API when the image may exit from a callback.
  */
 #if !defined(AXL_ALLOW_UEFI)
 #  error "<uefi/axl-uefi.h> is not available to applications. Use the axl_* API; build a driver with `axl-cc --type driver` (CMake: axl_add_driver), or pass `--allow-uefi` (CMake: ALLOW_UEFI) to opt in deliberately."

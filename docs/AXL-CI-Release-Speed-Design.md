@@ -72,6 +72,15 @@ Two bounds worth stating before the design:
 > actual requirement (never a hardcoded runner; a fallback when the box is
 > down) without a job whose only output is a label. The design below is kept
 > for its reasoning, not as a description of the code.
+>
+> **The hosted fallback runs the cheap jobs but cannot certify.** The suite
+> needs a DEBUG OVMF (`test-stderr-stale-qemu.sh`), which the self-hosted box
+> provides as a runner prerequisite and a hosted runner does not; building
+> EDK2 there is too costly for a fallback. So `release-suite.sh --ci` refuses
+> up front (exit 2) on a runner with none, naming the way out -- the
+> self-hosted runner, or `AXL_OVMF_DEBUG_DIR` -- instead of skipping those
+> tests and certifying a run that never ran them. RELEASING.md, "Registering
+> a self-hosted runner".
 
 The QEMU job targets `[self-hosted, linux, X64, axl-qemu]`. A `plan` job
 (~1 billable min) decides where the work goes and how it is split, and emits
@@ -373,11 +382,15 @@ gates link images, so a rejected build fails it for the same cause three
 minutes later. The cost is losing clang-tidy findings on a red-build run, which
 the re-push returns.
 
-**Not** `integration: needs: [build, lint]`, though it is tempting to order the
-9-minute job behind the 3-minute one. That costs nothing on a single-slot
-runner and permanently forbids the two running concurrently — which is exactly
-what a second `axl-qemu` registration (§9) or the `-f runner=hosted` fallback
-would otherwise buy. Sequence on the real dependency, not on duration.
+**SUPERSEDED 2026-11-09 (owner decision): `integration: needs: [build, lint]`.**
+The owner expects every build and the clang-tidy pass to finish before any QEMU
+work, and `needs: build` alone left their order arbitrary: run 42633699186 ran
+the 10-minute suite first and clang-tidy after it. On the single-slot runner the
+chain costs no wall time, and a lint finding now stops the run before the
+suite. The argument it overrides, kept for the record: it "permanently forbids
+the two running concurrently — which is exactly what a second `axl-qemu`
+registration (§9) or the `-f runner=hosted` fallback would otherwise buy."
+Revisit that if a second runner is registered.
 
 **The apt lists are HOST tooling only.** Target code is 100% bare-metal
 toolchain on both arches, so the question for each package is what runs on the
@@ -605,6 +618,9 @@ the same green as one that can. A cached pass and a real pass must not look
 alike in a terminal or in a CI log.
 
 ### 12.9 CI stays unrestricted on push
+
+> **Superseded 2026-10-21 by §14:** the suite left the push trigger; the
+> cheap jobs stayed.
 
 §11.2 records what the opposite policy cost: five days and ~40 commits of
 undetected red, in three places, two of which a dev box structurally cannot
@@ -872,8 +888,81 @@ a file made only of miss assertions.
 
 The key covers every staged artifact by SOURCE path and digest, the firmware
 (`FW_CODE`/`FW_VARS` are recorded like any other input), the test script, the
-harness, the arch and `AXL_TLS`. A toolchain change is covered transitively --
-it changes the artifacts.
+harness and the arch. A toolchain change is covered transitively -- it changes
+the artifacts. "The harness" is a glob since 2026-11-09
+(`_tc_harness_files` in `test/integration/lib/test-cache.sh`): all of
+`scripts/` and `test/pool/`, and every `test/integration` file that is not a
+test script -- plus, per test, its own script and every other test script it
+names (`test-net-latency-starved-qemu.sh` runs `test-net-latency-qemu.sh`).
+It was common-test.sh, run-qemu.sh and `lib/*.sh` only, so an edit to
+`scripts/axl-common.sh` (which both source), a sourced `.conf`, an executed
+prefix script, a helper such as `ssh-peer.py`, or the pool's code (its own
+tests run under a booted key) left cached tests reading green without having
+run it. Any edit there now misses every key once, the safe direction; a find
+or read error leaves no key at all, so the test runs. `AXL_TLS` left the key
+when mbedTLS became unconditional.
+
+Since 2026-11-09 (later that day) the key also reads, without being told:
+
+- **Every tree file the test spells as a literal path** -- `$PROJECT_DIR/...`
+  in the test or a test it names, directly or through a variable set from one
+  (`_tc_literal_inputs`). Only a path naming an existing FILE counts: a
+  directory is never hashed (`deps/json-corpora` is thousands of files), a
+  literal that continues with an expansion names a prefix, and nothing under
+  `build/`, `out/` or `stage/` is a source.
+- **The products of the test's `builds=` targets**, from the tree's own build
+  graph (`lib/build-products.sh`): from each target, the walk goes through
+  phony nodes only (their order-only `||` inputs too: CMake hangs a utility
+  target's dependencies there, a service's inner image among them) and stops
+  at the first file a real rule makes. `*.o *.obj *.a *.so` are dropped --
+  intermediates that
+  reach a guest only inside an image that is itself a product; keying
+  `libaxl.a` would miss every builds= key on every library edit, which is what
+  this cache exists not to do. A utility target's symbolic
+  `<dir>/CMakeFiles/<target>` is skipped. The walk is memoised per tree and
+  target in `$AXL_TEST_CACHE/.products/`, keyed by `build.ninja`'s identity;
+  the files are hashed fresh each time. The tree is the one the runner's
+  pre-build used: builds='s own `ARCH=`/`BUILD=`/`RTK_USB_UNDI=`, else the
+  environment's (a reader that forced DEBUG keyed the debug tree while a
+  `BUILD=RELEASE` run staged the release one -- caught in review). Only the
+  test's OWN builds=, not those of the tests it names (unlike its literals):
+  a name is mostly a mention in a comment -- test-sshd-conf-qemu.sh names
+  eleven, one with BUILD=RELEASE `all` -- and keying their products missed
+  on every release image and left no key whenever the run's prep had not
+  built them (tried, measured, reverted). A test that RUNS another declares
+  the child's builds= in its own. An unconfigured tree, an unknown target or variable, a target that
+  produces no file the graph shows (a utility command: `sshd-rtk`), a
+  product that does not exist, or a ninja that cannot run or says nothing
+  leaves NO key. Per key: ~25-38 ms before, ~35-57 ms after (2026-11-09,
+  five typical tests, idle host) -- the extra is mostly hashing the products
+  and one `axl-build.sh --print-prefix`.
+- **The pool service's code**, for a POOLED run. The guests come from the
+  long-lived `axlpool` service, which may run other code than the tree's
+  `test/pool/` (an older start; the main checkout's copy while the key hashes
+  a worktree's). The service reports a CODE IDENTITY in `hello` (a digest of
+  the pool code it loaded at start); the CTest registration asks it ONCE per
+  run and hands it to every pooled guest= test as `AXL_POOL_CODE_ID`, which
+  the key holds. No answer (no service, or one older than the identity) is no
+  pooled key: the test runs. A service restarted with other code mid-run
+  cannot let a key name code a test did not run on: every lease passes
+  `axlpool run --expect-code`, and a service whose identity differs is a pool
+  MISS, so the test boots and commits a BOOTED key. (A test SKIPPED before the
+  restart was decided by the identity the run started with; the next run asks
+  again.) `docs/AXL-Test-Guest-Pool-Design.md` §6.10.
+
+What neither the key nor a record can see, `gate.check-test-inputs`
+(`scripts/check-test-inputs.py`) holds: a copy, redirect or tee into
+`$TEST_STAGING` (or into a `--mount`ed directory) of a tree file that is not
+literal, not a builds= product and not recorded, and any `--mount` of an
+in-repo path, fails unless the line says `# test-input: not-keyed -- <why>`.
+It judges "keyed" by the key's own readers (`test-cache.sh --literals`,
+`build-products.sh --tree`), never a copy of them. With both in place the ten
+hand-written `test_record_input` calls 09147d6b added for literal tree files
+and builds= products went (DRY: the key reads them itself, and the gate fails
+if one stops being read); the ones kept are what the key cannot see -- a
+pre-built `tools` image (test-axl.sh's mkrd.efi), gitignored real-hardware
+fixtures that may be absent, and a lib's copies, which have no builds= of
+their own.
 
 It does NOT cover the host environment: `nproc`, `/dev/shm`, network
 reachability, the version of python/tar/socat a test shells out to. A test
@@ -916,6 +1005,135 @@ with that doc edit" loop. After a real library change the figure is the §12.15
 one, ~304 s, because 46% of the work is skippable and the rest is not. Quoting
 78 s as the cost of a library change would be the same category error §12.13.1
 already paid for twice.
+
+#### 12.16.5 The order-of-operations defect, and the `builds=` declaration
+
+**Found 2026-09-26.** §12.16's design says the key is computed over the
+artifacts a test STAGED, and that is right. What was wrong is WHEN: the
+runner decided the cache before the test that builds those artifacts had run.
+
+`run-integration.sh` pre-built `all tests tools axl-busybox` and nothing
+else. 81 make targets, across 79 of the 203 tests, are fixtures that only the
+test itself builds, inside
+its own run -- `ssh-server-selftest`, `compositor-selftest`, `kbtune-drv`,
+`shell-launcher`, the nine `console-device-*` drivers, and so on. So on the
+first cached invocation after a library change, `make all` rebuilt
+`libaxl.a`, the fixture `.efi` did NOT get rebuilt, every recorded input
+hashed identically, and the test reported CACHED. **`libaxl.a` is in no key
+at all** -- the fixture is the only thing carrying it -- so the exposure was
+never limited to fixture-only edits.
+
+And it did not self-heal. A test that is skipped never rebuilds the artifact
+that would miss the key next time, so all five ssh tests could cache
+indefinitely. Measured: a sabotage of `src/net/axl-ssh-server.c` (one audit
+string two assertions read) ran GREEN through
+`--only=test-ssh-auth-qemu.sh` with the cache on. CI never saw it because
+`--ci` and `--no-cache` set `CACHE_DIR=""`; the exposed gate was the
+pre-push one, which is cached by default.
+
+**A build race sat on top of it, and the first diagnosis of that race was
+WRONG.** Four of five AArch64 ssh tests failed attempt 1 with
+`ssh-server-selftest.so is empty` / `file format not recognized`, and the
+runner's retry-once hid it. That was read as five workers colliding on one
+`ld -o`/`objcopy` -- plausible, wrong, and committed as "closed" in three
+places before an independent review reproduced the race WITH the fix in
+place and isolated the real cause.
+
+The real cause is in the Makefile, untouched by the cache work.
+`Makefile:1554-1555` wrote `$(BUILDDIR)/.axl-flags` with `$(file >…)` and
+hashed it with `sha256sum` on the next line, **both at parse time of every
+make**. Two makes in one tree: one truncates the file, the other's
+`sha256sum` reads zero bytes and gets `e3b0c44298fc` -- the SHA-256 of the
+empty string, which the Makefile's own comment already named as the tell --
+the signature mismatches, and `Makefile:1589` deletes every `.o`, both
+archives and every `.efi`/`.so` under `$(PREFIX)` while five other workers
+are linking into it. Reproduced directly: eight simultaneous NO-OP
+`make ARCH=aa64 all ssh-server-selftest`, one wipe and seven of eight jobs
+failed, on the sixth round of eight.
+
+Fixed at the source: the flags are written to a per-invocation temp file,
+hashed there, and `mv`d into place, so no make hashes a path another make
+can be writing and no make reads one half-written. The state file gets the
+same treatment (its truncation window suppresses a wipe rather than causing
+one -- quieter, and still a check that did not run). It stays a FILE, not a
+pipe, for the reason the surrounding comment gives: the flags carry
+`-DMBEDTLS_CONFIG_FILE='"axl-mbedtls-config.h"'`, whose quotes once broke a
+shell pipeline and made the signature hash the empty string permanently.
+
+`test/integration/test-build-state-race.sh` holds it, DETERMINISTICALLY: it
+points `.axl-flags` at `/dev/null` -- the reproducible form of "another make
+truncated it a microsecond ago" -- and requires the signature not to move,
+with a control that a genuine compiler change still does wipe. Reproducing
+by concurrency alone took six rounds of eight jobs, and a gate that fires
+one time in six is worse than none. After the fix: **160 concurrent makes,
+0 wipes, 0 failures.**
+
+What the `builds=` pre-build does for that race is real but partial, and it
+is not why the race is closed: it removes the case where five workers
+rebuild `libaxl.a` and the fixture at once, which is why the end-to-end
+symptom became hard to reproduce and why the first "0 retries" measurement
+read as a fix. A parse alone is enough to wipe, and every test parses a
+makefile several times (its fixture, plus `shell-launcher` on every boot via
+`scripts/axl-common.sh`). `lib/console-device-lib.sh`'s `flock` is a local
+mitigation of this same Makefile bug.
+
+**The fix.** Each test declares its own targets in a `builds=` field of the
+`# test-meta:` header it already carries, and the runner builds the union of
+the SELECTED tests' targets before the cache decision, grouped by make
+variable (`AXL_CPP=1`, an `ARCH=` override) so one invocation covers each
+group. `make check-test-meta` compares the declaration with the script's own
+`make` line in both directions -- an undeclared target, a stale entry, and a
+make argument the parser cannot read all fail it -- so the two copies of that
+fact cannot drift. It follows a `lib/*.sh` the test sources, because three
+ssh tests and four console-device tests reach their fixtures only that way.
+
+Cost: the full local X64 union is 81 targets (68 under `--ci`, 45 on aa64)
+and ~2 s warm, ~4 s when some are stale, against a 3,385 s suite -- and it is work the tests were doing
+anyway, once instead of once per worker. It runs under `--no-build` too:
+that flag means the shared build happened in a prior job, and CI's prior job
+builds exactly the pre-built set, so the fixtures -- precisely the ones that
+race -- would otherwise still be left to the pool.
+
+**The gate had to be fixed twice, and the second round is the instructive
+one.** The first parser matched only `make -C "$PROJECT_DIR"`. Six scripts
+`cd "$PROJECT_DIR"` and call plain `make`, so it reported all six clean --
+and two of them (`test-exit-status-qemu.sh`, `test-flushfail-tools-qemu.sh`)
+built fixtures nothing declared. Its silence over those six meant "not
+looked at", not "nothing there", which is the defect it exists to catch
+wearing the gate's own clothes. Both of those also build only when the
+artifact is MISSING (`[[ -f "$DRV" ]] || make ...`), which is strictly worse
+than the cache hazard: they did not refresh after a library change even on
+an uncached run. Found by listing what tests actually record as cache inputs
+and asking which the union produces -- not by reading the parser again.
+
+Extraction is now the union of the explicit form ANYWHERE on a line
+(`lib/console-device-lib.sh` then ran its make behind an `flock` command
+prefix, which is not a command position, and nine fixtures hung off that one
+line)
+and a bare `make` AT a command position with full-line comments stripped
+first -- matching `make` anywhere reads the word out of English. Both halves
+are pinned by a case and fail the self-test when sabotaged; two of the four
+sabotages were UNDETECTED on the first attempt because the fixtures did not
+reach those branches, and the fixtures were fixed rather than the verdict.
+
+**The census, taken independently of the parser.** For every artifact any
+test has recorded as a cache input on this box (81 x64, 62 aa64), touch a
+library source, run the pre-build plus the union, and check the file was
+relinked. x64: 81 of 81. aa64: 60 of 62, and the two exceptions --
+`hello-minimal-{c,cxx}.efi` -- ARE in the union; make correctly had nothing
+to do, because hello-minimal links no libaxl at all, which is the property
+that test exists to protect.
+
+What it does NOT close: a test that stages something built by neither the
+pre-built set nor a `builds=` target. Nothing in the tree is in that state,
+and a new one fails the gate rather than appearing as a silent cache hit --
+provided the gate can SEE the invocation, which is what the second round was
+about. Three shapes are skipped whole, each with a case and a control: a
+`-n` dry run, a `print-<var>` query target, and a `PREFIX=` / `BUILD=RELEASE`
+build of a DIFFERENT output tree. The last is sound only while no recorded
+cache input lives outside `out/native-{x64,aa64}/`, which is checked, not
+assumed; a test that started keying on a release tree would need a rule of
+its own.
 
 ### 12.17 NOT SCHEDULED — caching `verify.sh`'s jobs, if the clock is felt again
 
@@ -1033,6 +1251,110 @@ Converted: `test-json-corpus-qemu.sh`. The other 38 are latent -- they only
 matter on a machine missing the dependency -- and adopt 77 as they are touched
 rather than in a sweep. `test-runner-selftest.sh` asserts the mechanism with a
 stub that exits 77, including that it is scored neither PASS nor FAIL.
+
+### 12.19 SHIPPED: three scoping knobs, and where the clock actually was
+
+Asked for directly: gate runs cost too much when a change is confined to one
+module. Three flags, all opt-in, all local, none reachable from CI's own
+invocations (`ci.yml` calls `test-axl.sh` bare, `lint.sh` bare, and
+`run-integration.sh --arch X64 --no-build --ci [--only=<from ci-plan.sh>]` —
+unchanged by all of this).
+
+**`verify.sh --apps=<csv>`** narrows the two arch jobs to named unit binaries.
+Measured on an idle box: x64 71s -> 15s, aa64 62s -> 19s. The names are
+validated against `test-axl.sh --list-apps`, the suite's own list, published
+rather than copied.
+
+**`scripts/lint.sh [FILE...]`** narrows the clang-tidy passes.
+
+**`run-integration.sh --for=<paths>`** derives the covering tests by asking
+`which-gates.sh --porcelain`, and feeds the answer to the existing `--only`
+path.
+
+#### The measurement moved the target — twice
+
+**The lint job's cost was never clang-tidy.** Warm, idle, before any of this:
+`bear -- make` 31s, clang `-Wall -Wextra` 2s, all three clang-tidy passes 2s.
+The tidy passes are nearly free because `lint-cache.py` already skips every TU
+whose own text and whose headers' text are unchanged — which is a *better* key
+than a file list, since a header's bytes are in every dependent TU's key while
+naming a header's consumer misses every other TU that includes it. The long
+pole was a full **serial** build into a throwaway prefix, with no `-j` at all.
+At `-j$(nproc)` it is 6s and the whole job is 10-11s. So `--lint-files` saves
+~0s on a warm cache and ~34s on a cold one (49.7s -> 15.8s), and the 3.4x came
+from a flag nobody had asked for.
+
+**After `--apps`, the arch jobs are no longer the long pole.** A scoped
+`--only=x64,aa64,lint,make,makeimg --apps=AxlTestSsh` is 85s, of which `make`
+is 45s and the serial-by-necessity `makeimg` is 38s. Whoever optimises this
+next should start there and not with the QEMU boots.
+
+| run | wall |
+|---|---|
+| `verify.sh` (full, idle) | 111s |
+| `verify.sh --only=x64,aa64,lint,make,makeimg --apps=AxlTestSsh` | 85s |
+| `verify.sh --only=x64,aa64 --apps=AxlTestSsh` | 19s |
+| `verify.sh --only=lint --lint-files=<one file>` | 10s |
+| `run-integration.sh` (full, cache on, 86 cached) | 244s |
+| `run-integration.sh --for=src/net/axl-ssh-server.c` | 155s |
+
+#### `--for` against §12.5, which said this was unsafe
+
+§12.5 says a changed-files -> related-tests map is *specifically unsafe here*:
+`8af4e530` touched `src/log/` and the `Makefile`, every relevance map picks
+"the logging tests", and the real risk surface was every image in the tree,
+failing at link. That decision stands, and `--for` does not violate it:
+
+- **It is not a relevance map.** `which-gates.sh` answers a syntactic
+  question — which file under `test/` *names this path* — not an include-graph
+  or coverage question, and it refuses to attribute a name too common to grep
+  for (`Makefile` matches 23 tests, so it is reported `vague=` and attributed
+  to none).
+- **Run against the §12.5 example itself**, `--for=src/log/axl-log.c,Makefile`
+  resolves to NOTHING and exits non-zero. It does not select the logging
+  tests. The hazard §12.5 describes is structurally unreachable, not merely
+  argued against.
+- **...and it says WHY, which is a separate requirement.** The first version
+  of this refusal printed "No file under test/ names any of those paths" for
+  `Makefile`, which 23 test files name — it read only `cover=` and never
+  `vague=`. Review caught it. A name too common to attribute is now its own
+  message, and in a MIXED selection (one attributable path, one vague) the
+  unattributable path is named again with "this run is narrower than the
+  paths you named" — otherwise `2 path(s) -> 1 covering test(s)` reads as
+  both accounted for. The affected files are the tree's highest-coverage
+  ones (`scripts/run-qemu.sh` 79, `scripts/axl` 36, `Makefile` 23), so being
+  wrong there was being wrong where it costs most.
+- **It never certifies.** A `--for` run is PARTIAL and cannot write the
+  release stamp (§12.8, §10.3), and CI stays unrestricted (§12.9).
+- **Empty means refusal, never the suite.** Five empty answers get five
+  messages — the lookup could not run; nothing covers these paths; the name
+  is too common to attribute; something covers them but discovery selects
+  none of it; and a path not in the worktree at all, which would otherwise
+  read as "no test covers this".
+- **An empty VALUE is refused too.** `--for=` and `--only=` — which is how
+  `--only="$VAR"` with `VAR` unset arrives — used to read as "flag absent"
+  and select all 204 tests: a run that believed it had scoped, running the
+  whole suite. The same shape was live in `verify.sh --only=`/`--apps=`/
+  `--lint-files=`, in `lint.sh --files` (which then printed the tree-wide
+  summary line the release gate reads), and in `which-gates.sh --files`
+  (which silently answered about the git diff instead). All refuse now.
+
+The honest limit: most *library* files have no integration test naming them
+(`include/axl/axl-json.h` resolves to nothing), because the integration suite
+covers tools and scenarios while the library is covered by the unit binaries.
+`--for` and `--apps` are complements, not alternatives.
+
+#### What the guard found
+
+Scoping made "is this file in the compile database?" a question a caller could
+ask, so `lint.sh` had to answer it. Handed a file it has no compile command
+for, clang-tidy prints "Compile command not found", analyses it with default
+flags and exits **zero** — the silent skip `lint.sh`'s header had warned about
+since it was written, with nothing checking for it. The new `db_check` failed
+on its first run, naming `tools/axl.c`: the busybox dispatcher, compiled by no
+target the lint build ran, linted with no `-I` and no `-D` for as long as it
+had existed. Fixed by building `axl-busybox` in the lint build, not by
+excluding the file.
 
 ### 12.12 Rollout — revised by what §12.10 and §12.11 measured
 
@@ -1456,6 +1778,10 @@ in files that cannot import each other.
 
 ### 13.8 NOT done: moving the integration job to nightly
 
+> **Answered 2026-10-21 by §14:** not nightly — dispatch-only, with the
+> release gate composed from a dispatched run, or a local uncached run plus
+> the cheap push CI.
+
 §13.4 proposed it. Building §13.6 showed why it does not compose with §13.1:
 **the release gate depends on the integration job having run on the commit
 being released.** Move it to a schedule and a push run can never satisfy the
@@ -1562,6 +1888,9 @@ unrelated to the question:
 
 ### 13.12 SHIPPED: the ci-only class, and why it is allowed where "shell" is not
 
+> **Removed 2026-10-21 (§14.2)** — and it never took effect: the plan job
+> never exported `ci_only`.
+
 Mike said it twice, which is the signal to stop explaining and count. Nine
 pushes on 2026-09-05: **none touched a C file, and eight ran the full QEMU
 suite.** Only one — pure docs, no deletions — took the 4-second path. The
@@ -1622,3 +1951,386 @@ reckon with a SIGTERM case that has just demonstrated it can fail under load.
 Until then `run-integration.sh --only` is exercised by a self-test that nothing
 runs, which is the honest state rather than a fixed one.
 
+
+## 14. REVISION 2026-10-21 — integration off push, owner decision
+
+**Decided by Mike, both parts:**
+
+1. **Split CI.** Every push to `main` runs only the cheap jobs — `plan`,
+   `gcc x64` + `gcc aa64` (a clean checkout in `ubuntu:24.04`), `clang-tidy`.
+   The `QEMU integration (full suite)` job — unit tests in QEMU,
+   `install.sh --arch all --cpp`, `run-integration.sh --ci` and the harness
+   self-tests — runs **only on `workflow_dispatch`**: by hand
+   (`gh workflow run ci.yml --ref main`) or from `cut-release.sh --ci-gate`.
+   Nothing nightly.
+2. **A release is certified by EITHER** (a) a CI run whose suite job succeeded
+   on the release commit or its release-only parent, **OR** (b) a complete
+   **local release-suite run** — `scripts/release-suite.sh`, the same steps as
+   CI's integration job (§14.4) — accepted **only if** the cheap push CI
+   (`gcc x64`, `gcc aa64`, `clang-tidy`, by job name, every one `success`) is
+   green on that same tree.
+
+### 14.1 What it reverses, and why that is not a contradiction
+
+§11.2 brought CI back to push after dispatch-only CI let ~40 commits of red
+sit for five days. §12.9 ("CI stays unrestricted on push") and §13 (opening,
+§13.4, §13.8) declined the same split this section adopts. Each of those
+reasons is accounted for:
+
+- **§11.2's two structural misses stay caught.** A clean checkout that does not
+  link is the `build` job's to catch, and it still runs on every push. Docs
+  under CI's doxygen were never `ci.yml`'s (there is no Sphinx in it — §13.9);
+  `build-docs.sh --ci-doxygen` before a tag is still that gate.
+- **§13.8's composition problem is answered, not waived.** It said the split
+  "does not compose with §13.1: the release gate depends on the integration
+  job having run on the commit being released," and left open "a way for a
+  release to know the suite covered its tree without the suite having run on
+  its push." That way is rule 2 above. The suite's coverage comes from either a
+  dispatched run or the local uncached run; the clean-checkout coverage a dev
+  box structurally lacks comes from the cheap push run, which is now a
+  **required half** of the local path rather than an assumption about it.
+- **§13.4's cost estimate is now the trade.** ~481 s of QEMU per push
+  (measured on `b1c6fde6`) against the suite running up to "the next dispatch
+  or release" late. The owner weighed it and took it.
+
+### 14.2 What changed in the tree
+
+| file | change |
+|---|---|
+| `.github/workflows/ci.yml` | `integration` gets `github.event_name == 'workflow_dispatch'` in its `if:` and `needs: build` (it no longer reads `plan`); the run-level concurrency group is per event, `ci-<ref>-<event>`, so a push no longer CANCELS a running dispatched suite — the one a cut may be waiting on |
+| `test/integration/lib/release-gate.sh` | the gate names jobs: `AXL_CI_CHEAP_JOBS` (`gcc x64`, `gcc aa64`, `clang-tidy`) and `AXL_CI_SUITE_JOB`. `release_gate_ci_covers` needs a run with the suite and the cheap jobs green; `release_gate_covers` (the stamp) additionally needs a green cheap push run, through the same bounded inert-diff walk. **Every** green run at a commit is examined (it stopped at the first, and the push run is often the newest). Exit 2 means "could not check" — no `gh`, a failing `gh run list` or `gh run view` — distinct from 1, "not covered"; both refuse. Every refusal says why |
+| `scripts/cut-release.sh` | when nothing covers the commit it prints both refusals and both remedies (dispatch, or the local release suite plus the cheap push CI) and refuses (§14.4 R-B); `wait_for_ci` reads dispatched runs only (`--event workflow_dispatch`), so the release commit's all-skipped push run can no longer answer for it; `--resume` dispatches on `main` too, and waits on a dispatched run still in progress rather than replacing it |
+| `scripts/check-main-ci.sh` | "green" is the cheap jobs passing, walked back from an inert tip (§14.4 R-E); a push run without the suite is normal. Exit 2 for "could not check" |
+| `scripts/release-suite.sh` (new, §14.4 R-A) | CI's integration job as one script; the only writer of the release stamp |
+| `scripts/ci-plan.sh` | the `ci_only`/`only_tests` outputs (§13.12) are **removed**. They shrank a push run of the integration job, which no longer runs on push. They had also **never worked**: the plan job never listed them in its `outputs:`, and a job reading an undeclared output gets the empty string, so `!= 'true'` was always true and every `.github`-only push since 2026-09-05 ran the whole suite. `test-ci-plan.sh` now asserts every `needs.plan.outputs.X` that `ci.yml` reads is exported, and that the plan job exports exactly what the script emits |
+
+### 14.3 What is guaranteed, and the residual risk
+
+**The guarantee, after the review rulings in §14.4:** no tag is created
+unless, on the released tree, EITHER CI's integration job went green in a
+dispatched run, OR `scripts/release-suite.sh` — the very same steps — passed
+completely on a clean checkout of that commit on a dev box AND the cheap push
+jobs (`gcc x64`, `gcc aa64`, `clang-tidy`) passed on that commit in CI. The
+only way past is `cut-release.sh --tag-untested`, which says so in the
+release notes and the tag. The second path is not equal to the first in one
+respect, said plainly: it runs the suite on the dev box's toolchain and
+firmware images rather than CI's; the clean-checkout build in CI is what
+covers the 2026-08-18 class, not a fresh-OS run of the suite. A change where
+"it passed on my box" is the question (a toolchain bump, a workflow change)
+wants `--force-ci`.
+
+**Residual risk: an integration-only regression can sit on `main` until the
+next dispatch or release.** Nothing on a push boots a QEMU guest. The release
+gate cannot be satisfied without the suite having passed on the released
+tree, so the risk is latency to discovery, not an untested tag (barring
+`--tag-untested`). The mitigations are habits, not mechanisms: dispatch after
+a risky landing, and run the covering tests (or `run-integration.sh`,
+cached) before pushing a change the build table in `CLAUDE.md` routes there.
+
+### 14.4 Review rulings, same day — what the first cut got wrong
+
+An independent review of the first implementation found the split itself
+sound and the gate weaker than this section claimed. The rulings, all
+implemented:
+
+- **R-A — the local path certified less than CI.** The stamp came from
+  `run-integration.sh` alone, while CI's integration job also ran
+  `test-axl.sh` (unit tests in QEMU), `install.sh --arch all --cpp` and
+  `run-selftests.sh`. Now ONE script, `scripts/release-suite.sh`, holds the
+  steps; CI's job is `release-suite.sh --ci` and a local release run is
+  `release-suite.sh`. Only its complete success, on a tree with no tracked
+  changes that is still the same commit at the end, writes the stamp, which
+  carries `suite=release-suite`; the gate refuses any other stamp by name.
+  `run-integration.sh` stopped writing it and says so where it used to.
+  `make check-test-est` now accepts `release-suite.sh --ci` as the workflow's
+  suite invocation (and still refuses it without `--ci`). A second review
+  pass found the end-of-run check failing on every commit that added unit
+  assertions, because `test-axl.sh` raises the tracked `.last-pass-count`: the
+  unit step now hands the ratchet a temp copy of the COMMITTED baseline and
+  prints a NOTE (old -> new, "commit the new baseline") instead. A git that
+  cannot answer is "could not check", never "clean"; a run retires HEAD's old
+  stamp as it starts.
+- **R-B — the gate warned instead of enforcing.** `cut-release.sh` with
+  nothing certifying the commit printed a WARNING and tagged. It now refuses
+  by default, through one function (`release_gate_decide`) for the normal flow
+  and `--resume` alike, and decides BEFORE the version bump so a refusal
+  strands no release commit. `--ci-gate` dispatches and waits;
+  `--tag-untested` is the explicit, loud override and is written into the
+  release's CHANGELOG section (the published notes) and the tag message; the
+  cut dies if the line did not land, and the extraction `release.yml`
+  publishes with is now `scripts/changelog-section.sh`, which a fixture test
+  runs over the inserted note. `--resume --tag-untested` is refused: the
+  release commit is already pushed, so the note could not reach the notes.
+- **R-C — the `[release-cut]` push could cancel its parent's cheap run.**
+  The run-level `cancel-in-progress` is now false for a `[release-cut]` push
+  (the job guard's expression, both halves), and `cut-release.sh` waits for
+  the push run of the commit it releases to finish before pushing the release
+  commit, refusing if that run did not succeed. A docs-only push can still
+  cancel a code push's cheap run; when the walk reaches such a run the gate
+  says "cancelled — re-dispatch or re-push" rather than a generic refusal.
+- **R-D — this section and RELEASING.md/CLAUDE.md claimed more than was
+  true.** §14.3 above is the reworded guarantee.
+- **R-E — `check-main-ci.sh` misread inert tips.** It now walks back from a
+  docs-only or `[release-cut]` tip with the gate's own walk, and reports
+  "pending" only when the run that decides the answer is still going.
+
+## 15. REVISION 2026-11-07 — the suite is scheduled by CPU, not by load
+
+**What changed.** The integration suite's `ctest` call (`release-suite.sh`
+and `run-integration.sh`; not verify, below) dropped `--test-load` and
+treats `-j` as a CPU budget: each test holds the slots its test-meta `cpu=`
+names (CTest's `PROCESSORS`, default 1), and the default budget is
+`suite_cpu_slots`, `nproc + 4` (`test/integration/lib/discover.sh`).
+Ordering uses ctest's own measured averages, kept across CI's fresh
+checkouts.
+
+### 15.1 Why the load gate went
+
+Read off CI runs 42446170083, 42434153831 and 42415133113 (`-j16 --test-load
+10`, 12 CPUs). ctest's `--test-load` reads the ONE-minute load average, which
+lags a burst by about a minute: after each burst the gate stayed shut while
+workers idled -- 3,165-4,016 idle worker-seconds per run, concurrency
+swinging 16 -> 3-9 -> 16, and seconds with nothing running and tests
+queued. Average concurrency was 9.7-10.7 of 16; wall 597-645 s after the
+prep for 6,229-6,401 s of work. And the gate counts every process on the
+box, so an agent's build made CI slower: a local `-j16 --test-load 10` run
+beside one verify and two single-test runs (2026-11-07) took **1,461 s**
+for 6,553 s of work -- 4.5 average concurrency, 0-1 tests running for
+minutes at a time with the one-minute load at 8-10.
+
+### 15.2 cpu=, from measurement
+
+Each test's CPU-seconds over its wall time, from a full local run (a
+`/proc` sampler summing utime+stime+cutime+cstime over each `run-one.sh`
+subtree) and solo re-runs; podman tests add their container scopes' cgroup
+`usage_usec`, because a container's processes live under conmon, outside
+the test's tree. `cpu = ceil(ratio - 0.25)`: a quarter of a CPU is noise.
+
+| test | CPU/wall | cpu= |
+|---|---|---|
+| test-cmake-ccache | 4.77-4.90 | 5 |
+| test-standard-guest | 3.28 | 4 |
+| test-host-deps-minimal | 1.88 (containers) | 2 |
+| test-http-rebind-storm-qemu | 1.86 | 2 |
+| test-install-lifecycle | 1.61 (containers) | 2 |
+| test-task-pool-mp-qemu | 1.35-1.44 | 2 |
+| test-consumer-install | 1.33 (containers; 0.23 without) | 2 |
+| test-sshd-rtk-qemu | 1.33 | 2 |
+| test-toolchain-variant | 1.09-1.30 | 2 |
+
+**The premise that the build tests are the heavy ones was wrong.** Inside
+the suite, `integration.prep` has already built every test's `builds=`
+fixtures and ccache is warm, so `test-efi-pack-*` (0.52-1.03),
+`test-make-test-release` (1.00), `test-install-idempotent` /
+`-concurrent` (0.85-1.05), `test-sdk-tarball` (0.63-1.06) and
+`test-host-toolchain*` (0.96-1.03) are one-CPU tests. Across the suite the
+mean was **0.48 CPU per second of wall**: a booted guest is half idle, which
+is why the budget is larger than `nproc`.
+
+### 15.3 The budget, measured
+
+Full x64-ci runs on this 12-CPU host with the tree's cost data present, the
+host shared with other sessions' work (load 8-25 from outside the suite at
+times), so read the differences, not the absolute times:
+
+| `-j` | wall after prep | work | avg concurrency | retries |
+|---|---|---|---|---|
+| 12 | 626 s | 6,870 s | 11.0 | 2 |
+| 16 | 475 s | 6,773 s | 14.3 | 3 |
+| 20 | 429 s | 7,687 s | 17.9 | 1 |
+
+`-j20` was 10% faster than `-j16` but each test ran 13% slower (work
+7,687 s against 6,773 s): the box was saturated, and with no load gate a
+timing-sensitive test has only its own margin. `nproc + 4` keeps the worker
+count the suite's timings were validated at (`-j16`) while removing the
+gate's idle time. The retries were the suite's known flakes, at every
+`-j`: concurrent ninja runs on one tree (`test-9p-server-qemu`,
+`test-sshd-lifecycle-qemu` "sshd.efi was not built"), and the
+Ctrl-C-within-3 s check in `test-sshd-qemu`.
+
+**Old against new, back to back under the same conditions** (00:14-00:37,
+two other sessions building and testing on the host, outside load 6-19):
+
+| flags | wall after prep | work | avg concurrency | idle worker-s (of 16) | retries | failed |
+|---|---|---|---|---|---|---|
+| `-j16 --test-load 10`, est= order | 760 s | 6,347 s | 8.4 | 5,124 | 2 | 1 |
+| `-j16`, cpu= budget, measured order | 512 s | 7,426 s | 14.5 | 592 | 1 | 1 |
+
+-33% wall. The one failure in each was `test-net-latency-qemu` (p90 round
+trip over its 5 ms bound, with the host's own load at 15-19) -- a latency
+bound that a contended host fails under either scheduler; on the quieter
+host it passed at `-j12`, `-j16` and `-j20`. The 17% more work under the
+new flags is the same contention made visible: the old gate kept the suite
+off a busy box by running it at half width, which is exactly the
+behaviour that made CI's time depend on its neighbours.
+
+### 15.4 Ordering: the measured times outlive the checkout
+
+ctest orders a parallel run costliest-first by the averages it keeps in
+`<tree>/Testing/Temporary/CTestCostData.txt`. Two things kept CI from ever
+using them:
+- **CI's workspace is recreated per run**, so the file never existed and
+  every test's `COST` was its `est=` -- which sums to 1.9x the real work, and
+  started `test-ctest-integration` (est 60, ran 78 s) and
+  `test-install-idempotent` (est 45, ran 63 s) late. Both est= are now
+  measured (80 and 65).
+- **A `COST` property overrides the measurement** (confirmed against ctest
+  3.31: with both present, the order is `COST`'s), and ctest folds the
+  `COST` into the average it writes back. The registration therefore emits
+  `COST est=` only for a test NOT in `AXL_IT_COSTED` -- the tests the tree's
+  cost data names, read at ctest time by `AxlIntegrationTests.cmake.in`
+  exactly as ctest reads it (it abandons the file at the first line with
+  fewer than three fields, and so does the registration).
+
+`release-suite.sh` seeds the tree from
+`~/.cache/axl-ci/ctest-cost-<preset>.txt` (`AXL_CI_COST_DIR` moves it) before
+the suite, and writes the tree's file back after it whatever its verdict,
+through a temporary name and a rename. The store wins over a tree's own file:
+ctest rewrites that file after EVERY run, `-j1` included (where it does not
+load the averages and writes back `elapsed/(runs+1)`), and a cache hit is a
+~0 s pass, so a developer tree's record drifts low; the store holds only
+this script's cache-off suite runs. A tree's own file is used only when
+there is no store yet. The store is the whole file, `unit.*` and `gate.*`
+lines from verify's runs in the same tree included -- ctest ignores lines
+for tests a run does not have. A hosted runner has a fresh `$HOME`, so it
+orders by est= as before, and says so. Local `run-integration.sh` runs
+(cache on) still order by the tree's drifting file; ordering only, never a
+verdict.
+
+### 15.5 verify keeps its gate
+
+`verify.sh` runs two ctest processes at once, one per tree, and a
+`PROCESSORS` budget is per process: neither could see the other's. What they
+run are the unit guests and the gates, whose lint and docs jobs fan out to
+every CPU themselves, not tests with a measured `cpu=`. The load average is
+the one signal both share; verify's trees take about two minutes and its
+173 s was measured with the gate on.
+
+### 15.6 Risks
+
+- **No back-off for outside load.** The suite no longer slows down when
+  something else loads the box; that was the point (CI time stopped
+  depending on unrelated work), and the cost is that a timing-sensitive test
+  beside a heavy neighbour has only its own margin. CI's runner runs one job
+  at a time; locally, do not stack the suite on other heavy work.
+- **A `cpu=` goes stale.** It is a measurement, and nothing re-measures it.
+  A test that starts compiling in parallel and keeps `cpu=1` oversubscribes
+  the box by the difference.
+
+## 16. REVISION 2026-11-09 — UNJUDGED in the integration suite
+
+§15.6's first risk arrived: `test-net-latency-qemu.sh` (p90 round trip under
+5 ms, the first exchange under 15) failed four or five times in one day, every
+time at load 18 or more, once in a dispatched CI run (5.136 ms against 5), and
+passed every time alone -- once straight after a miss. A busy box turned the
+release certificate red with nothing wrong in the code.
+
+### 16.1 The witness is qloop's
+
+`verify.sh`'s quiet slot (docs/AXL-Build-System-Design.md §10.14) already
+had the answer for one timing test (`scripts/qloop-verdict.sh`): measure how long the guest's QEMU threads
+waited for a CPU (schedstat run delay, `thread_run_delays` in
+`scripts/axl-common.sh`), and read a FAIL made only of timing misses while
+that exceeded the limit as UNJUDGED. Net-latency reuses the reading and the
+limit, `AXL_STARVE_MAX_MS` (50 ms), now one variable in `axl-common.sh` that
+`qloop-verdict.sh` sources. What differs is the window: qloop reads its whole
+~28 s run; net-latency reads each guest's round trips only (~0.1-0.5 s), just
+before and just after `tcp-rtt.py` -- the window its timing checks judge, not
+the boot before it. Measured on 12 CPUs: under 1 ms quiet; 72-280 ms beside 24
+busy loops, where p90 missed in 4 of 8 windows, each miss at 105 ms or more.
+Five full runs on the box at its usual load (~5) read 0-34 ms per window and
+all passed; five beside 18 busy loops (load 17-20) read 15-179 ms, four went
+UNJUDGED with 13 p90 misses between them (5.11-8.89 ms, each in a window of
+78 ms or more), one passed. One limit separates both.
+
+The window is read PER THREAD (`thread_run_delays`, `run_delay_window_ms`),
+not as one sum: QEMU's I/O worker threads retire after ~10 s idle, about
+when a guest's round trips start, and a summed reading loses an exiting
+thread's whole history -- a starved window can read idle, or negative.
+qloop's sampler summed too, on the reasoning that over a 28 s run the loss is
+small against the figure. That held only for a guest booted for the run: a
+LEASED guest's QEMU has lived for hours, so a retiring worker takes hours of
+history out of the last reading, and qloop's row read about -59 ms. The
+sampler now accumulates `run_delay_window_ns` from each reading to the next
+(`vcpu_starve_sampler`), so an exiting thread keeps what it accrued up to its
+last reading and subtracts nothing (one per-thread first-against-last pair
+would still drop that share). The pid is pinned by its start time: once it
+names another process, sampling stops and the figure so far stands. Fewer
+than two readings read "not measured", never a number. Steal time stays in
+the line beside it: box-wide, no thread can take it away, and the verdict
+never judges it. `test-vcpu-starve-witness.sh` holds all of it, with a real
+thread exiting mid-window.
+
+The reading must be of the REAL QEMU: `run-qemu.sh --background` prints the
+pid of its `timeout` wrapper, whose single thread never waits for anything --
+read through it, the witness reports 0 ms under any load
+(`qemu_real_pid`). The starvation test's control is what shows that: sabotaged
+to read the wrapper, it fails.
+
+### 16.2 Which failures can be UNJUDGED
+
+TIMING: the p90 and first-exchange bounds. FUNCTIONAL: everything else -- a
+guest launched, the round trips measured at all (a reply, echoed right), the
+tick at ready and at done, the exit check. "Measured at all" is new for the
+three `firmware/*` measurements, which bound nothing: a `tcp-rtt.py` error
+there used to pass silently, and is now a FAIL. A run is UNJUDGED only when every
+failure is a timing miss AND each miss's own window waited over the limit; a
+functional failure, a miss in a window that did not wait, or one whose wait was
+not measured, keeps it FAIL. It prints `UNJUDGED: <why>` and exits 77.
+
+`test-net-latency-starved-qemu.sh` drives each case through the real test,
+restricted by test-only knobs (refused outside a restricted run): the
+guest's QEMU pinned (just before its round trips) onto a CPU running six busy
+loops, with the p90 bound tightened so the miss is certain -- UNJUDGED, and
+the wait over the limit (the control that the witness MOVES); the same miss
+unpinned with the limit raised out of reach -- FAIL; a functional failure
+beside a starved miss -- FAIL; no round trip timed at all, starved -- FAIL;
+and two pinned misses, one window read with no wait -- FAIL, because each
+miss is judged by its own window. The other half of the control -- the
+witness invents no wait -- is a process asleep through a window, which reads
+0 ms: an unpinned guest's own figure cannot show it on a shared box (it read
+176 ms at load 21). The verdict rule (functional failures counted, the
+limit, the per-window wait, the unmeasured window, the missing-figures
+check) and the witness's pid were each sabotaged and caught. The
+first-exchange bound shares `timing()` with p90 but no case drives it: under
+pinning its miss is not certain, and a third bound knob was not worth it.
+
+### 16.3 How the suite carries it
+
+- `lib/run-one.sh`: a 77 with an `UNJUDGED:` line is RETRIED like a failure
+  (an unjudged run is no verdict, so the retry's stands) and reads `UNJUDGED`
+  only when no attempt judged. Never cached.
+- `scripts/ctest-report.py runner`: counted apart (`N UNJUDGED`, never among
+  the passes), named, and the exit is 3 when nothing failed -- as verify's.
+  `run-integration.sh` exits 3 for it.
+- CTest sees the 77 as a skip, so nothing that reads ctest's status goes red.
+- `scripts/release-suite.sh`: a skip passes a ctest run, so after a green
+  suite it lists the UNJUDGED tests (`ctest-report.py unjudged`) and re-runs
+  each ALONE under the same preset -- the quiet slot. A judged PASS
+  certifies; still UNJUDGED alone is exit 3 and no stamp.
+
+### 16.4 Decision: a release run does not certify an unjudged bound
+
+The same in `--ci`. The dispatched suite is the only place CI runs these tests
+(§14), and a green one IS a release certificate (`release-gate.sh` accepts it),
+so green over an unjudged bound would tag code on a check nobody made. The
+quiet re-run is what keeps that from turning CI red for load: every observed
+miss passed when run alone. A run goes red for load only when even a lone run
+is starved, and it then says UNJUDGED, not FAIL. Considered and not built: CI
+green, with the gate reading the run's JUnit artifact to refuse it -- a second
+channel into the gate for a case the quiet re-run makes rare.
+
+### 16.5 What the witness cannot see
+
+The host-side client (`tcp-rtt.py`) starved while QEMU is not, and a slowdown
+that does not preempt (a slower core, a frequency drop): neither shows as run
+delay, so a miss from either still reads FAIL -- the safe direction.
+
+Two limits of the measure itself. The wait is an ABSOLUTE total over a window
+whose length the code under test sets: a regression that makes the round
+trips slower lengthens the window, so on a loaded box it gathers more wait
+and is likelier to read UNJUDGED than FAIL. The quiet re-run in
+`release-suite.sh` judges it alone; a rate (ms waited per second) would be
+the refinement if it bites. And the 50 ms limit was measured on X64 (KVM);
+AARCH64 runs under TCG, where a vCPU is busier and the quiet figure is the
+one to re-measure before trusting the limit there.

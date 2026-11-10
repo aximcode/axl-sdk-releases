@@ -168,6 +168,62 @@ dependencies.
 These use a different subsystem value in the PE/COFF header and
 the driver provides its own entry point (no axl-crt0).
 
+### Packed images (`--compress`)
+
+`axl-cc --compress` (CMake: `COMPRESS` on `axl_add_app` /
+`axl_add_driver`) writes a packed, self-extracting image: the linked image
+is LZMA-compressed behind the raw-UEFI axl-pack stub, which unpacks it and
+has the firmware load it, so it runs exactly as the raw image would --
+argv, stdio, its own device path and its exit status included. The format
+and the stub are described in `src/pack/README.md`. Off by default: a build
+without the flag never reaches any of this, and its output is byte-for-byte
+what it was before the option existed.
+
+```
+axl-cc --compress tool.c -o tool.efi
+  │
+  ├─ (the normal link)          → tool.raw.efi + tool.so
+  ├─ axl-pack stub, empty payload → its size, measured now, by this toolchain
+  ├─ axl-efi-pack --stub-size N -o payload.pack tool.raw.efi
+  │     exit 0  wrap: payload in section .axlpack, linked with the stub
+  │     exit 3  keep: a byte copy of tool.raw.efi
+  │     else    the build fails, the previous tool.efi untouched
+  └─ → tool.efi (renamed into place; never half-written)
+```
+
+The decision is `axl-efi-pack`'s alone: wrap when the image shrinks by at
+least 16 KB and to at most 80% of its raw size; below that the stub
+(~17 KB) costs more than it saves, so a small app is left raw. The rule,
+the branch filter and the LZMA settings live only in that tool, and callers
+pass it nothing but the measured stub size -- the same tool, called the
+same way, as the build's `axl_wrap_efi` (`cmake/AxlWrapEfi.cmake`) that
+builds the shipped tools. `gate.check-flag-parity` compares the two call
+sites and the stub link's objcopy section list.
+
+- **Names.** `<out>.efi` keeps its name; the linked image stays beside it
+  as `<out>.raw.efi`, and `<out>.so` holds the RAW image's symbols (the stub
+  writes `axl-pack-stub` as its own module name, so a crash dump names the
+  stub and the image it loaded differently).
+- **`--service NAME`.** Only the launcher is packed. The driver travels
+  inside it, already compressed by the launcher's packing.
+- **`-c`.** Ignored, so a CMake `OPTIONS --compress` reaching the compile
+  step is harmless.
+- **Secure Boot.** The stub hands the firmware the UNPACKED inner image,
+  and `LoadImage` authenticates that image on its own. A signature on the
+  wrapped `.efi` covers only the stub (AXL's own loaders never load the
+  stub at all, so for them it covers nothing), so under Secure Boot a
+  wrapped image runs only if the inner image was signed BEFORE it was
+  packed -- and neither `axl-cc` nor the CMake build signs. The SDK's own
+  release tools are unsigned, so nothing changes for them.
+- **What the SDK ships for it.** `bin/axl-efi-pack` (a host tool, kept off
+  `PATH` like `pe-set-debug`) and one prebuilt stub object set per
+  architecture in `lib/axl/<arch>/pack/`: `axl-pack-stub.o`,
+  `axl-pack-format.o` (the format module, whose decoder carries that
+  architecture's branch converter only), and the LZMA SDK's `LzmaDec.o`,
+  `Bra.o`, `Bra86.o`. The stub links those, the crt0/reloc/`.dbgdir`
+  objects every image links, and the linker script's `KEEP(*(.axlpack))`;
+  no source is compiled in the consumer.
+
 ### C++ support
 
 axl-sdk supports C++ consumers as a first-class build target.
@@ -372,7 +428,8 @@ split. (This paragraph said "into `out/`" until 2026-08-29, contradicting the
    ```
    **Shipped 2026-08-29.** This doc promised the workflow in the present
    tense for years while nothing built it; it is real now, produced by
-   `scripts/make-sdk-tarball.sh` and published as a release asset. The
+   `scripts/make-release-assets.sh sdk` (CPack, since 2026-11-10; the
+   retired `make-sdk-tarball.sh` before) and published as a release asset. The
    archive unpacks to a single `axl-sdk-<version>/` directory, so extracting
    into `/opt` gives the versioned root of
    AXL-Distribution-Design.md §12.2 with nothing to rename.

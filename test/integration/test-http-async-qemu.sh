@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=openssl est=23 local-only=0
+# test-meta: arch=x64 needs=openssl est=23 local-only=0 guest=standard
 # test-http-async-qemu.sh — exercises the ASYNC HTTP client
 # (axl_http_get_async / axl_http_post_async).
 #
@@ -34,7 +34,7 @@ fi
 PLAIN_PORT=$(test_port 0)   # plain-http server
 TLS_PORT=$(test_port 1)     # https server
 
-make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 \
     all tests 2>&1 | tail -3
 test_add_efi "$(test_build_dir x64)/AxlTestNet.efi"
 
@@ -53,53 +53,17 @@ sleep 1
 echo "  Host plain server PID: $PLAIN_SERVER_PID, port: $PLAIN_PORT"
 echo "  Host https server PID: $TLS_SERVER_PID, port: $TLS_PORT"
 
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo === TEST-GET-ASYNC-HTTP ===
-AxlTestNet.efi get-async http://10.0.2.2:${PLAIN_PORT}/hello
-
-echo === TEST-POST-ASYNC-HTTP ===
-AxlTestNet.efi post-async http://10.0.2.2:${PLAIN_PORT}/echo async-post-body
-
-echo === TEST-GET-ASYNC-HTTPS ===
-AxlTestNet.efi get-async https://10.0.2.2:${TLS_PORT}/hello
-
-echo === TEST-POST-ASYNC-HTTPS ===
-AxlTestNet.efi post-async https://10.0.2.2:${TLS_PORT}/echo async-post-tls
-
-echo === TEST-GET-SYNC-RTPL ===
-AxlTestNet.efi get-sync-rtpl http://10.0.2.2:${PLAIN_PORT}/hello
-
-echo === TEST-GET-LARGE-SINGLE ===
-AxlTestNet.efi get-size http://10.0.2.2:${PLAIN_PORT}/large?size=1572864
-
-echo === TEST-GET-LARGE-SINGLE-HTTPS ===
-AxlTestNet.efi get-size https://10.0.2.2:${TLS_PORT}/large?size=1572864
-
-echo === TEST-END ===
-reset -s
-NSHEOF
+# The startup commands live in test-http-async-qemu.nsh; the plain server
+# port is %1, the https one %2.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$PLAIN_PORT" "$TLS_PORT"
 
 test_build_image
 
 echo "=== async HTTP client Integration Test ($TEST_ARCH) ==="
 
 test_build_qemu_cmd
-TEST_QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev "user,id=net0"
-)
+test_add_network
 test_run_foreground 90
 
 test_clean_log

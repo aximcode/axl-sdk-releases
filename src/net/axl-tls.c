@@ -31,6 +31,7 @@
 #include <mbedtls/error.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/oid.h>
+#include <mbedtls/platform_util.h>
 
 AXL_LOG_DOMAIN("tls");
 
@@ -45,9 +46,20 @@ int axl_mbedtls_entropy_poll(void *data, unsigned char *output,
 // Global TLS state
 // ---------------------------------------------------------------------------
 
-static mbedtls_ssl_config       g_tls_config;
-static mbedtls_x509_crt         g_server_cert;
-static mbedtls_pk_context        g_server_key;
+/* A server credential: the certificate, its key, and the mbedTLS config
+   that offers them. Reference-counted: the current one (g_server_cred) holds
+   a reference, and so does every connection accepted under it, for as long
+   as it lives -- its handshake keeps pointers into the config's key/cert
+   list. Replacing the certificate builds a NEW credential and swaps it in;
+   the old one goes when the last connection using it does. */
+typedef struct {
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt   cert;
+    mbedtls_pk_context key;
+    size_t             refs;
+} TlsServerCred;
+
+static TlsServerCred            *g_server_cred;
 static mbedtls_ctr_drbg_context  g_ctr_drbg;
 static mbedtls_entropy_context   g_entropy;
 static bool                      g_initialized = false;
@@ -74,6 +86,15 @@ struct AxlTlsContext {
     size_t               out_len;
     size_t               out_cap;
     bool                 buffered_mode;
+
+    /* The peer's close_notify has been read: the stream ended in order. A
+       transport EOF without it is a cut (RFC 8446 6.1), so a reader of a
+       body framed by the close needs to tell the two apart. */
+    bool                 peer_closed;
+
+    /* The server credential this connection was accepted under (a held
+       reference); NULL for a client connection. */
+    TlsServerCred       *cred;
 };
 
 // ---------------------------------------------------------------------------
@@ -125,6 +146,7 @@ tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 // ---------------------------------------------------------------------------
 
 static void axl_tls_cleanup_thunk(void *unused);
+static bool tls_peer_closed(AxlTlsContext *ctx);
 
 bool
 axl_tls_available(void)
@@ -144,7 +166,49 @@ static const AxlHttpClientTlsOps g_http_client_tls_ops = {
     .read            = axl_tls_read,
     .handshake_async = axl_tls_handshake_async,
     .write_async     = axl_tls_write_async,
+    .peer_closed     = tls_peer_closed,
 };
+
+/* Has @p ctx read the peer's close_notify? (AxlHttpClientTlsOps.peer_closed) */
+static bool
+tls_peer_closed(
+    AxlTlsContext *ctx
+    )
+{
+    return ctx != NULL && ctx->peer_closed;
+}
+
+static void
+tls_cred_unref(
+    TlsServerCred *c
+    )
+{
+    if (c == NULL || --c->refs != 0) {
+        return;
+    }
+    mbedtls_ssl_config_free(&c->conf);   /* frees the key/cert list */
+    mbedtls_x509_crt_free(&c->cert);
+    mbedtls_pk_free(&c->key);
+    axl_free(c);
+}
+
+/// Free the module contexts: the current server credential (connections
+/// still open keep theirs), the DRBG and the entropy source. Factored out
+/// because axl_tls_init()'s failure paths must undo exactly what
+/// axl_tls_cleanup() undoes -- and those paths became REACHABLE when the
+/// entropy poll started failing closed on a platform with no
+/// EFI_RNG_PROTOCOL. Returning AXL_ERR with the contexts still live leaked
+/// what they had allocated and left them half-built for a retry.
+static void
+tls_free_contexts(
+    void
+    )
+{
+    tls_cred_unref(g_server_cred);
+    g_server_cred = NULL;
+    mbedtls_ctr_drbg_free(&g_ctr_drbg);
+    mbedtls_entropy_free(&g_entropy);
+}
 
 int
 axl_tls_init(void)
@@ -153,9 +217,6 @@ axl_tls_init(void)
         return AXL_OK;
     }
 
-    mbedtls_ssl_config_init(&g_tls_config);
-    mbedtls_x509_crt_init(&g_server_cert);
-    mbedtls_pk_init(&g_server_key);
     mbedtls_ctr_drbg_init(&g_ctr_drbg);
     mbedtls_entropy_init(&g_entropy);
 
@@ -173,21 +234,13 @@ axl_tls_init(void)
                                 &g_entropy,
                                 (const unsigned char *)"AXL", 3);
     if (ret != 0) {
+        /* The entropy poll has already said WHY at error level (no
+           EFI_RNG_PROTOCOL, weak fallback not opted in); this line only
+           adds the mbedTLS code. */
         axl_debug("CTR-DRBG seed failed: -0x%04x", (unsigned)-ret);
+        tls_free_contexts();
         return AXL_ERR;
     }
-
-    /* Default server config (TLS 1.2) */
-    ret = mbedtls_ssl_config_defaults(&g_tls_config,
-        MBEDTLS_SSL_IS_SERVER,
-        MBEDTLS_SSL_TRANSPORT_STREAM,
-        MBEDTLS_SSL_PRESET_DEFAULT);
-    if (ret != 0) {
-        axl_debug("SSL config defaults failed: -0x%04x", (unsigned)-ret);
-        return AXL_ERR;
-    }
-
-    mbedtls_ssl_conf_rng(&g_tls_config, mbedtls_ctr_drbg_random, &g_ctr_drbg);
 
     /* Wire the always-linked HTTP client to this (now-linked) TLS module, so
        its https path works. A consumer that never calls axl_tls_init (or
@@ -208,11 +261,7 @@ axl_tls_cleanup(void)
         return;
     }
 
-    mbedtls_ssl_config_free(&g_tls_config);
-    mbedtls_x509_crt_free(&g_server_cert);
-    mbedtls_pk_free(&g_server_key);
-    mbedtls_ctr_drbg_free(&g_ctr_drbg);
-    mbedtls_entropy_free(&g_entropy);
+    tls_free_contexts();
 
     g_initialized = false;
 }
@@ -274,11 +323,14 @@ axl_tls_generate_self_signed(
         return AXL_ERR;
     }
 
-    /* Export private key to DER */
+    /* Export private key to DER. key_buf holds the private key in the clear,
+       so every exit from here on scrubs it (a failed export may have written
+       part of it). */
     uint8_t key_buf[256];
     ret = mbedtls_pk_write_key_der(&pk, key_buf, sizeof(key_buf));
     if (ret < 0) {
         axl_debug("key export failed: -0x%04x", (unsigned)-ret);
+        mbedtls_platform_zeroize(key_buf, sizeof(key_buf));
         mbedtls_pk_free(&pk);
         return AXL_ERR;
     }
@@ -305,11 +357,36 @@ axl_tls_generate_self_signed(
     ret = mbedtls_x509write_crt_set_issuer_name(&crt, subject);
     if (ret != 0) goto cert_fail;
 
-    /* Random serial (8 bytes, MSB cleared to keep positive) */
+    /* Random 8-byte serial. mbedTLS prepends 0x00 to a serial whose top bit
+       is set, but never strips one, so a leading 0x00 we supply goes out as
+       a non-minimal INTEGER (00 xx with xx < 0x80). OpenSSL 3 rejects that
+       certificate outright, so curl failed every handshake for the life of
+       the server, even with --insecure. Clear the top bit, which keeps the
+       serial at exactly 8 octets, and redraw a zero first byte; the mask
+       alone left one draw in 256 bad, and no mask one in 512. Each draw
+       succeeds with probability 127/128, so the cap is never reached by a
+       working DRBG. */
     uint8_t serial_buf[8];
-    mbedtls_ctr_drbg_random(&g_ctr_drbg, serial_buf, sizeof(serial_buf));
-    serial_buf[0] &= 0x7F;
-    mbedtls_x509write_crt_set_serial_raw(&crt, serial_buf, sizeof(serial_buf));
+    int     serial_tries = 0;
+    do {
+        if (++serial_tries > 16) {
+            axl_debug("serial: no non-zero first byte in 16 draws");
+            goto cert_fail;
+        }
+        ret = mbedtls_ctr_drbg_random(&g_ctr_drbg, serial_buf,
+                                      sizeof(serial_buf));
+        if (ret != 0) {
+            axl_debug("serial: DRBG failed: -0x%04x", (unsigned)-ret);
+            goto cert_fail;
+        }
+        serial_buf[0] &= 0x7F;
+    } while (serial_buf[0] == 0);
+    ret = mbedtls_x509write_crt_set_serial_raw(&crt, serial_buf,
+                                               sizeof(serial_buf));
+    if (ret != 0) {
+        axl_debug("serial: set_serial_raw failed: -0x%04x", (unsigned)-ret);
+        goto cert_fail;
+    }
 
     /* Validity: now to +10 years (dynamic from system time) */
     {
@@ -417,6 +494,9 @@ axl_tls_generate_self_signed(
 
         if (*cert_der == NULL || *key_der == NULL) {
             axl_free(*cert_der);
+            if (*key_der != NULL) {
+                mbedtls_platform_zeroize(*key_der, klen);
+            }
             axl_free(*key_der);
             *cert_der = NULL;
             *key_der = NULL;
@@ -424,6 +504,7 @@ axl_tls_generate_self_signed(
         }
     }
 
+    mbedtls_platform_zeroize(key_buf, sizeof(key_buf));
     mbedtls_x509write_crt_free(&crt);
     mbedtls_pk_free(&pk);
 
@@ -431,6 +512,7 @@ axl_tls_generate_self_signed(
     return AXL_OK;
 
 cert_fail:
+    mbedtls_platform_zeroize(key_buf, sizeof(key_buf));
     mbedtls_x509write_crt_free(&crt);
     mbedtls_pk_free(&pk);
     return AXL_ERR;
@@ -452,40 +534,58 @@ axl_tls_server_set_cert(
         return AXL_ERR;
     }
 
-    int ret;
+    /* Build the whole credential before touching the current one: a
+       certificate or key that does not parse leaves the server serving what
+       it served (it used to free the one global pair first, so a bad upload
+       left every later handshake with nothing). */
+    TlsServerCred *c = axl_new(TlsServerCred);
+    if (c == NULL) {
+        return AXL_ERR;
+    }
+    c->refs = 1;
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_x509_crt_init(&c->cert);
+    mbedtls_pk_init(&c->key);
 
-    /* Parse certificate */
-    mbedtls_x509_crt_free(&g_server_cert);
-    mbedtls_x509_crt_init(&g_server_cert);
-
-    ret = mbedtls_x509_crt_parse_der(&g_server_cert,
-                                     cert_der, cert_len);
+    const char *step = "cert parse";
+    int ret = mbedtls_x509_crt_parse_der(&c->cert, cert_der, cert_len);
+    if (ret == 0) {
+        step = "key parse";
+        ret  = mbedtls_pk_parse_key(&c->key, key_der, key_len, NULL, 0,
+                                    mbedtls_ctr_drbg_random, &g_ctr_drbg);
+    }
+    if (ret == 0) {
+        /* Both parse, but is the key the certificate's? A mismatched pair
+           -- the likeliest wrong upload -- would fail every handshake. */
+        step = "key/certificate pair check";
+        ret  = mbedtls_pk_check_pair(&c->cert.pk, &c->key,
+                                     mbedtls_ctr_drbg_random, &g_ctr_drbg);
+    }
+    if (ret == 0) {
+        step = "SSL config defaults";   /* TLS 1.2 server */
+        ret  = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_SERVER,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT);
+    }
+    if (ret == 0) {
+        mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &g_ctr_drbg);
+        step = "conf_own_cert";
+        ret  = mbedtls_ssl_conf_own_cert(&c->conf, &c->cert, &c->key);
+    }
     if (ret != 0) {
-        axl_debug("cert parse failed: -0x%04x", (unsigned)-ret);
+        axl_debug("%s failed: -0x%04x; the current certificate stays",
+                  step, (unsigned)-ret);
+        tls_cred_unref(c);
         return AXL_ERR;
     }
 
-    /* Parse private key */
-    mbedtls_pk_free(&g_server_key);
-    mbedtls_pk_init(&g_server_key);
-
-    ret = mbedtls_pk_parse_key(&g_server_key,
-                               key_der, key_len,
-                               NULL, 0,
-                               mbedtls_ctr_drbg_random, &g_ctr_drbg);
-    if (ret != 0) {
-        axl_debug("key parse failed: -0x%04x", (unsigned)-ret);
-        return AXL_ERR;
-    }
-
-    /* Attach to config */
-    ret = mbedtls_ssl_conf_own_cert(&g_tls_config,
-                                    &g_server_cert, &g_server_key);
-    if (ret != 0) {
-        axl_debug("conf_own_cert failed: -0x%04x", (unsigned)-ret);
-        return AXL_ERR;
-    }
-
+    /* Swap: publish the new one FIRST, so an accept that preempts this (a
+       driver-tick server, at TPL_CALLBACK) never takes a reference on the
+       old one as it is released. Connections accepted under the old
+       credential keep it alive until they are freed. */
+    TlsServerCred *old = g_server_cred;
+    g_server_cred = c;
+    tls_cred_unref(old);
     axl_debug("server certificate loaded");
     return AXL_OK;
 }
@@ -498,6 +598,10 @@ AxlTlsContext *
 axl_tls_accept(AxlTcp *sock)
 {
     if (!g_initialized || sock == NULL) {
+        return NULL;
+    }
+    if (g_server_cred == NULL) {
+        axl_debug("accept: no server certificate (axl_tls_server_set_cert)");
         return NULL;
     }
 
@@ -518,13 +622,16 @@ axl_tls_accept(AxlTcp *sock)
 
     mbedtls_ssl_init(&ctx->ssl);
 
-    int ret = mbedtls_ssl_setup(&ctx->ssl, &g_tls_config);
+    int ret = mbedtls_ssl_setup(&ctx->ssl, &g_server_cred->conf);
     if (ret != 0) {
         axl_debug("ssl_setup failed: -0x%04x", (unsigned)-ret);
+        mbedtls_ssl_free(&ctx->ssl);
         axl_free(ctx->out_buf);
         axl_free(ctx);
         return NULL;
     }
+    ctx->cred = g_server_cred;
+    ctx->cred->refs++;
 
     mbedtls_ssl_set_bio(&ctx->ssl, ctx, tls_bio_send, tls_bio_recv, NULL);
 
@@ -620,6 +727,28 @@ log_handshake_failure(int ret)
     }
 }
 
+/* Send the handshake output buffered so far. A send that fails or times out
+   may have handed the peer part of a record (axl_tcp_send stops at a piece
+   boundary), and no later byte on this stream can make sense of it -- so the
+   handshake fails rather than carrying on over a torn stream. */
+static bool
+tls_flush_handshake(AxlTlsContext *ctx)
+{
+    int rc;
+
+    if (!ctx->buffered_mode || ctx->out_len == 0) {
+        return true;
+    }
+    rc = axl_tcp_send(ctx->sock, ctx->out_buf, ctx->out_len,
+                      TLS_SEND_TIMEOUT_MS);
+    if (rc != AXL_OK) {
+        axl_warning("handshake: flushing %zu byte(s) failed (%d, %zu sent)",
+                    ctx->out_len, rc, axl_tcp_send_get_sent(ctx->sock));
+    }
+    ctx->out_len = 0;
+    return rc == AXL_OK;
+}
+
 AxlTlsStatus
 axl_tls_handshake(AxlTlsContext *ctx)
 {
@@ -631,10 +760,8 @@ axl_tls_handshake(AxlTlsContext *ctx)
 
     if (ret == 0) {
         /* Handshake complete — flush buffered output and switch to direct */
-        if (ctx->buffered_mode && ctx->out_len > 0) {
-            axl_tcp_send(ctx->sock, ctx->out_buf, ctx->out_len,
-                         TLS_SEND_TIMEOUT_MS);
-            ctx->out_len = 0;
+        if (!tls_flush_handshake(ctx)) {
+            return AXL_TLS_ERR;
         }
         ctx->buffered_mode = false;
         return AXL_TLS_OK;
@@ -643,10 +770,8 @@ axl_tls_handshake(AxlTlsContext *ctx)
     if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
         ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
         /* Flush any buffered handshake output */
-        if (ctx->buffered_mode && ctx->out_len > 0) {
-            axl_tcp_send(ctx->sock, ctx->out_buf, ctx->out_len,
-                         TLS_SEND_TIMEOUT_MS);
-            ctx->out_len = 0;
+        if (!tls_flush_handshake(ctx)) {
+            return AXL_TLS_ERR;
         }
         return AXL_TLS_WANT_MORE;  /* need more data */
     }
@@ -679,8 +804,12 @@ axl_tls_read(
         *out_len = (size_t)ret;
         return AXL_TLS_OK;
     }
-    if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-        return AXL_TLS_ERR;  /* connection closed */
+    if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+        ctx->peer_closed = true;   /* closed in order */
+        return AXL_TLS_ERR;
+    }
+    if (ret == 0) {
+        return AXL_TLS_ERR;  /* the transport closed, no close_notify */
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
         return AXL_TLS_WANT_MORE;  /* need more data */
@@ -977,7 +1106,7 @@ axl_tls_free(AxlTlsContext *ctx)
     /* No write-completion back-pointer to disarm any more. It existed only
        so a DEFERRED handshake flush could be resumed from the completion
        (`0a9f81fe`), and it carried its own use-after-free hazard —
-       do_reset_connection frees this context BEFORE axl_tcp_close cancels
+       do_reset_connection frees this context BEFORE axl_tcp_close retires
        the send, so the completion can run afterwards. The AxlTcp send
        queue removed the deferral, so the pointer, the severing, and the
        hazard all go together. docs/AXL-Tcp-Queue-Design.md §6 step 2. */
@@ -987,6 +1116,7 @@ axl_tls_free(AxlTlsContext *ctx)
     mbedtls_ssl_close_notify(&ctx->ssl);
 
     mbedtls_ssl_free(&ctx->ssl);
+    tls_cred_unref(ctx->cred);   /* after the context that used it */
     axl_free(ctx->out_buf);
     axl_free(ctx);
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=driver-parent-leak-test guest=standard
 # Shared-driver "transient launcher orphans the resident driver" image leak.
 #
 # A launcher built on the shared-driver pattern records ParentImageHandle =
@@ -31,8 +31,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     driver-parent-leak-test 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -42,13 +42,7 @@ test_add_efi "$NATIVE_DIR/driver-parent-leak-test.efi"
 # that synthesizes a LoadedImageDevicePath and triggers the cross-image leak.
 test_add_efi "$NATIVE_DIR/stdio-bridge-fix.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "driver-parent-leak-test.efi"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=61 local-only=0
+# test-meta: arch=x64 needs= est=61 local-only=0 builds=exit-status-selftest,exit-status-selftest-minimal guest=plain
 # test-exit-status-qemu.sh -- end-to-end proof that axl_set_exit_status sets the
 # UEFI shell's %lasterror% to a caller-chosen, VERBATIM EFI_STATUS.
 #
@@ -21,7 +21,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# run-qemu.sh takes the uppercase arch (X64/AARCH64); the Makefile takes the
+# run-qemu.sh takes the uppercase arch (X64/AARCH64); the build takes the
 # lowercase one (x64/aa64). Ask for the prefix rather than composing it -- and
 # note this must come AFTER PROJECT_DIR, which it did not when the path was a
 # literal and ordering did not matter.
@@ -46,7 +46,7 @@ fail() { echo "FAIL: $1"; [[ -n "${2:-}" ]] && echo "  $2"; FAIL=$((FAIL + 1)); 
 MIN="$OUT/exit-status-selftest-minimal.efi"
 if [[ ! -x "$APP" || ! -x "$MIN" ]]; then
     echo "Building exit-status selftests (ARCH=$MAKE_ARCH)..."
-    make exit-status-selftest exit-status-selftest-minimal ARCH="$MAKE_ARCH" || true
+    "$PROJECT_DIR/scripts/axl-build.sh" exit-status-selftest exit-status-selftest-minimal ARCH="$MAKE_ARCH" || true
 fi
 [[ -f "$APP" ]] || { echo "FAIL: $APP not found"; exit 1; }
 [[ -f "$MIN" ]] || { echo "FAIL: $MIN not found"; exit 1; }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=16 local-only=0
+# test-meta: arch=both needs= est=16 local-only=0 builds=AXL_CPP=1,cxx-json-selftest guest=standard
 # test-cxx-json-qemu.sh — the C++ JSON API (C6), run under QEMU.
 #
 # Covers AXL-Cxx-Design.md §9 phase C6 and the C additions it required:
@@ -59,8 +59,8 @@ check() {  # check <msg> <cmd...>
 echo "=== C++ JSON Test ($TEST_ARCH) ==="
 
 echo "--- building the DEBUG fixture (AXL_MEM_DEBUG on) ---"
-make -C "$PROJECT_DIR" ARCH="$_native_arch" AXL_CPP=1 \
-    ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} cxx-json-selftest 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" AXL_CPP=1 \
+    cxx-json-selftest 2>&1 | tail -3
 
 EFI="$NATIVE_DIR/cxx-json-selftest.efi"
 if [[ ! -f "$EFI" ]]; then
@@ -83,21 +83,7 @@ else
     check "SKIP balancer: staged SDK absent, so no consumer-toolchain build" true
 fi
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo JSON_BEGIN"
-    echo "cxx-json-selftest.efi read"
-    echo "cxx-json-selftest.efi chain"
-    echo "cxx-json-selftest.efi range"
-    echo "cxx-json-selftest.efi write"
-    echo "cxx-json-selftest.efi splice"
-    echo "cxx-json-selftest.efi scan"
-    echo "cxx-json-selftest.efi own"
-    echo "echo JSON_DONE"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

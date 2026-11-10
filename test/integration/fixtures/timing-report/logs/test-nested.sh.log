@@ -1,0 +1,4 @@
+TIMING: guest kind=booted via=fg guest=3.000 boot=1.000 rc=0
+TIMING: test=test-inner.sh total=3.500 setup=0.200 guest=3.000 boot=1.000 between=0.000 post=0.300 booted=1 pooled=0 start=- lease=-
+TIMING: test=test-nested.sh total=5.000 setup=- guest=0.000 boot=0.000 between=- post=- booted=0 pooled=0 start=- lease=-
+TIMING: runner test=test-nested.sh attempt=1 via=boot wall=5.200 cpu=2.500 rc=1

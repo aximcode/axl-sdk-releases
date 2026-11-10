@@ -1,5 +1,9 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=93 local-only=0
+# test-meta: arch=both needs= est=93 local-only=0 builds=fake-nic-driver-info guest=none
+# guest=none: six machines in one test -- two NICs on per-run socket netdevs,
+#   link-down driven over a QMP socket of its own, option-ROM-less NICs --
+#   and scripts naming fs0:\drivers\... throughout; a lease is one class,
+#   and the two plain-machine runs alone would pool.
 # test-netload-qemu.sh — netload tool: scaffold, NVRAM state machine, driver
 # discovery, and the crash-recovery quarantine flow. Real driver-load/link/DHCP
 # is HW-validated, not covered here (no NIC drivers in QEMU).
@@ -12,8 +16,16 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # allocator is needed by the mid-file netdev fixtures too.
 source "$DIR/scripts/axl-common.sh"
 TOOLS="$("$DIR/scripts/build-prefix.sh" --abs "$NAT")/tools"
-make -C "$DIR" ARCH="$NAT" tools >/dev/null 2>&1 || true
+# A failed fixture build fails the test, with its output: booting whatever
+# stale images are in the tree would test the wrong thing.
+if ! "$DIR/scripts/axl-build.sh" ARCH="$NAT" tools fake-nic-driver-info > "${TMPDIR:-/tmp}/netload-make.$$" 2>&1; then
+  tail -30 "${TMPDIR:-/tmp}/netload-make.$$"; rm -f "${TMPDIR:-/tmp}/netload-make.$$"
+  echo "ERROR: building the netload fixtures failed"; exit 1
+fi
+rm -f "${TMPDIR:-/tmp}/netload-make.$$"
 [[ -x "$TOOLS/netload.efi" ]] || { echo "ERROR: netload.efi not built"; exit 1; }
+FAKENIC="$(dirname "$TOOLS")/fake-nic-driver-info.efi"
+[[ -f "$FAKENIC" ]] || { echo "ERROR: fake-nic-driver-info.efi not built"; exit 1; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 NSH="$TMP/startup.nsh"; LOG="$TMP/serial.log"
 
@@ -62,6 +74,11 @@ cp "$TOOLS/hexdump.efi" "$TMP/idrv/Bcm.efi"
 cp "$TOOLS/hexdump.efi" "$TMP/idrv/Rtk.efi"
 cp "$TOOLS/hexdump.efi" "$TMP/idrv/Usb.efi"
 
+# The longest path a release stick gives a driver: a test release's versioned
+# directory (<VERSION>-test-<date>-<sha>) with the longest driver name.
+LPATH="\\axl-sdk-uefi-tools-$(cat "$DIR/VERSION")-test-20261021-0123abcd-$NAT\\drivers\\$NAT\\UsbCdcNcm.efi"
+LPATH_FILE="${LPATH#\\}"; LPATH_FILE="${LPATH_FILE//\\//}"   # the same path, for --extra
+
 {
   echo '@echo -off'; echo 'fs0:'
   echo 'echo MARK_HELP';   echo 'netload.efi --help'
@@ -74,6 +91,13 @@ cp "$TOOLS/hexdump.efi" "$TMP/idrv/Usb.efi"
   echo 'echo MARK_MARK2';  echo 'netload.efi --_mark Bbb.efi'
   echo 'echo MARK_DUMP2';  echo 'netload.efi --dump'
   echo 'echo MARK_LIST';   echo "netload.efi --list --dir fs0:\\drivers\\$NAT"
+  # Default driver directory (no --dir), R28: beside netload.efi first, then
+  # the volume-root forms. Flat stick: netload.efi at the root -> \drivers\<arch>.
+  # Nested stick: a copy of netload.efi under \nest finds ITS drivers\<arch>
+  # (Nst.efi), not the root's.
+  echo 'echo MARK_DEF_FLAT'; echo 'netload.efi --list'
+  echo 'echo MARK_DEF_NEST'; echo 'fs0:\nest\netload.efi --list'
+  echo 'echo MARK_DEF_END'
   # Per-driver probe seam: clear NVRAM, then probe one dummy driver by name.
   # A dummy .efi (hexdump.efi) is a valid PE axl_driver_load can load, but
   # axl_driver_start won't bind a NIC -- outcome is PR_LOAD_FAIL/PR_NO_NIC,
@@ -231,10 +255,29 @@ cp "$TOOLS/hexdump.efi" "$TMP/idrv/Usb.efi"
   echo 'echo MARK_DGAUTO'; echo "netload.efi -a -d --dir fs0:\\drivers\\$NAT"
   # --dump now appends the shell 'drivers' list after the NVRAM findings.
   echo 'echo MARK_DUMP_DRV'; echo 'netload.efi --dump'
-  echo 'echo MARK_DONE';   echo 'reset -s'
+  echo 'echo MARK_DONE'
+  # --- A bound driver's whole file path, end to end (after MARK_DONE, so no
+  # window above reaches it). A firmware-first row names the NIC's driver by
+  # the path its loaded image records, and from a test release's versioned
+  # directory that path is ~80 bytes: DriverReport.name, the --json
+  # round-trip, the result-log record and --dump's table each once cut it at
+  # 64 or 128. --_fwwin reports a firmware-first win by the named driver
+  # through the SAME tail a real one takes (summary or --json, and the SWEEP
+  # record); --_log seeds the OK record the probe writes.
+  echo 'echo MARK_LPATH_CLR';  echo 'netload.efi --clear'
+  echo "netload.efi --_log OK --_logname $LPATH"
+  echo 'echo MARK_LPATH_SUM';  echo "netload.efi --_fwwin $LPATH"
+  echo 'echo MARK_LPATH_JSON'; echo "netload.efi --_fwwin $LPATH --json"
+  echo 'echo MARK_LPATH_DUMP'; echo 'netload.efi --dump'
+  # The library's own copy: a fake NIC owned by an image run FROM that path
+  # (fake-nic-driver-info.efi staged as it), named by axl_net_get_driver_info.
+  echo 'echo MARK_LPATH_LIB';  echo "fs0:$LPATH"
+  echo 'echo MARK_LPATH_END';  echo 'reset -s'
 } > "$NSH"
 "$DIR/scripts/run-qemu.sh" --arch "$ARCH" --timeout 60 --nsh "$NSH" \
   --extra "$TMP/drv/Aaa.efi:drivers/$NAT/Aaa.efi" \
+  --extra "$TOOLS/netload.efi:nest/netload.efi" \
+  --extra "$TMP/drv/Aaa.efi:nest/drivers/$NAT/Nst.efi" \
   --extra "$TMP/drv/Bbb.efi:drivers/$NAT/Bbb.efi" \
   --extra "$TMP/drv/Ccc.efi:drivers/$NAT/Ccc.efi" \
   --extra "$TMP/cdrv/Nic.efi:drivers2/$NAT/Nic.efi" \
@@ -249,6 +292,7 @@ cp "$TOOLS/hexdump.efi" "$TMP/idrv/Usb.efi"
   --extra "$TMP/idrv/Bcm.efi:drivers4/$NAT/Bcm.efi" \
   --extra "$TMP/idrv/Rtk.efi:drivers4/$NAT/Rtk.efi" \
   --extra "$TMP/idrv/Usb.efi:drivers4/$NAT/Usb.efi" \
+  --extra "$FAKENIC:$LPATH_FILE" \
   "$TOOLS/netload.efi" > "$LOG" 2>&1 || true
 # Assertions use `sect … | grep -q`; grep -q closes the pipe on first match, so
 # sed takes SIGPIPE (exit 141) and pipefail would propagate that as a spurious
@@ -264,15 +308,22 @@ sect MARK_RECOVER MARK_DUMP2 | grep -aqiE "CRASH.*BadDrv\.efi|quarantin.*BadDrv\
   && echo "PASS: crash breadcrumb -> quarantine" || { echo "FAIL: crash recovery"; fail=1; }
 sect MARK_RECOVER MARK_DUMP2 | grep -aqiE "BadDrv\.efi" \
   && echo "PASS: quarantine listed in --dump" || { echo "FAIL: dump quarantine"; fail=1; }
-sect MARK_LIST MARK_PROBE | grep -aqE "Aaa\.efi" && sect MARK_LIST MARK_PROBE | grep -aqE "Ccc\.efi" \
+sect MARK_DEF_FLAT MARK_DEF_NEST | grep -aqE "[0-9]\) Aaa\.efi" \
+  && echo "PASS: default dir, flat stick: \\drivers\\<arch>" || { echo "FAIL: default dir flat"; fail=1; }
+sect MARK_DEF_NEST MARK_DEF_END | grep -aqE "[0-9]\) Nst\.efi" && ! sect MARK_DEF_NEST MARK_DEF_END | grep -aqE "Aaa\.efi" \
+  && echo "PASS: default dir, nested stick: beside netload.efi" || { echo "FAIL: default dir nested"; fail=1; }
+# The --list --dir window ends at MARK_DEF_FLAT: the default-dir listings
+# after it name the same drivers, so a window reaching MARK_PROBE passed with
+# --dir broken.
+sect MARK_LIST MARK_DEF_FLAT | grep -aqE "Aaa\.efi" && sect MARK_LIST MARK_DEF_FLAT | grep -aqE "Ccc\.efi" \
   && echo "PASS: driver scan lists staged .efi" || { echo "FAIL: driver scan"; fail=1; }
 # Bbb.efi was quarantined by the MARK_MARK2/MARK_DUMP2 cycle above; --list
 # must tag it [crashed] while Aaa.efi/Ccc.efi (never quarantined) are not.
-sect MARK_LIST MARK_PROBE | grep -aqE "Bbb\.efi.*\[crashed\]" \
+sect MARK_LIST MARK_DEF_FLAT | grep -aqE "Bbb\.efi.*\[crashed\]" \
   && echo "PASS: quarantined driver tagged [crashed]" || { echo "FAIL: is_quarantined tag"; fail=1; }
-sect MARK_LIST MARK_PROBE | grep -aqE "Aaa\.efi.*\[crashed\]" \
+sect MARK_LIST MARK_DEF_FLAT | grep -aqE "Aaa\.efi.*\[crashed\]" \
   && { echo "FAIL: Aaa.efi wrongly tagged [crashed]"; fail=1; } || echo "PASS: Aaa.efi not tagged [crashed]"
-sect MARK_LIST MARK_PROBE | grep -aqE "Ccc\.efi.*\[crashed\]" \
+sect MARK_LIST MARK_DEF_FLAT | grep -aqE "Ccc\.efi.*\[crashed\]" \
   && { echo "FAIL: Ccc.efi wrongly tagged [crashed]"; fail=1; } || echo "PASS: Ccc.efi not tagged [crashed]"
 # --probe: the dummy driver survives a load it cannot bind as a NIC. The
 # breadcrumb must be set/logged before load, and cleared after (no crash).
@@ -574,6 +625,43 @@ sect MARK_DGAUTO MARK_DUMP_DRV | grep -aqE "=== netload diagnostic dump ===" \
 # --dump appends the shell 'drivers' list after the findings.
 sect MARK_DUMP_DRV MARK_DONE | grep -aqE "=== shell: drivers ===" \
   && echo "PASS: --dump includes the drivers list" || { echo "FAIL: --dump drivers"; fail=1; }
+
+# --- The long driver path (the MARK_LPATH block after MARK_DONE) ---
+# Exact whole lines, colours stripped: a cut path is a line that does not match.
+lpsect() { sed -n "/$1/,/$2/p" "$LOG" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r'; }
+lpcheck() {   # what count-wanted count-got
+  if [[ "$3" == "$2" ]]; then echo "PASS: long path: $1 ($3)"
+  else echo "FAIL: long path: $1 ($3, want $2)"; fail=1; fi
+}
+LPJ="${LPATH//\\/\\\\}"   # the path JSON-escaped
+LPSWEEP="up lease=$LPATH link=0 noreach=0 nonic=0 fail=0 skip=0"
+lpsect MARK_LPATH_SUM MARK_LPATH_JSON > "$TMP/lpsum"
+lpsect MARK_LPATH_JSON MARK_LPATH_DUMP > "$TMP/lpjson"
+lpsect MARK_LPATH_DUMP MARK_LPATH_LIB > "$TMP/lpdump"
+sed -n '/netload findings/,/netload raw result log/p' "$TMP/lpdump" > "$TMP/lptable"
+sed -n '/netload raw result log/,/netload saved config/p' "$TMP/lpdump" > "$TMP/lpraw"
+# The control: a path no longer than the bounds it once crossed proves nothing.
+lpcheck "control: the path is longer than 64 and its SWEEP record than 128" 1 \
+  "$(( ${#LPATH} > 64 && ${#LPSWEEP} + 6 > 128 ))"
+lpcheck "the summary row names the driver whole" 1 "$(grep -cxF -- \
+  "  $LPATH firmware:LEASED 02:00:00:00:00:01  leased 10.0.2.15  layer=NII3.1" "$TMP/lpsum")"
+lpcheck "the outcome line names the driver whole" 1 "$(grep -cxF -- \
+  "  outcome: NETWORKING IS UP via $LPATH  (10.0.2.15)" "$TMP/lpsum")"
+lpcheck "--json names the driver whole" 1 "$(grep -cxF -- \
+  "{\"driver\":\"$LPJ\",\"method\":\"dhcp\",\"ip\":\"10.0.2.15\",\"mask\":\"\",\"gw\":\"\",\"link\":true,\"retries\":1,\"result\":\"up\"}" \
+  "$TMP/lpjson")"
+lpcheck "the --json driver field round-trips (no INTERNAL ERROR)" 0 \
+  "$(grep -c 'INTERNAL ERROR' "$TMP/lpjson")"
+lpcheck "--dump's findings table keeps the OK row whole" 1 \
+  "$(grep -cxF -- "  $LPATH LEASED" "$TMP/lptable")"
+lpcheck "--dump's findings table keeps the sweep row whole, counters included (the log dedups the two runs' identical record)" 1 \
+  "$(grep -cxF -- "  -- sweep: $LPSWEEP" "$TMP/lptable")"
+lpcheck "the raw log keeps the OK record whole" 1 \
+  "$(grep -cxF -- "OK $LPATH" "$TMP/lpraw")"
+lpcheck "the raw log keeps the SWEEP record whole, counters included" 1 \
+  "$(grep -cxF -- "SWEEP $LPSWEEP" "$TMP/lpraw")"
+lpcheck "axl_net_get_driver_info names a disk-loaded NIC driver by its whole path" 1 \
+  "$(lpsect MARK_LPATH_LIB MARK_LPATH_END | grep -cxF -- "FAKENIC: driver=$LPATH layer=NII3.1")"
 # --- Firmware-first end-to-end + recursive-connect regression guard ---
 # A SEPARATE --net boot (so the firmware NIC doesn't short-circuit the no-net
 # sweeps above): QEMU's OVMF ships the whole network stack incl. VirtioNetDxe.
@@ -586,6 +674,10 @@ sect MARK_DUMP_DRV MARK_DONE | grep -aqE "=== shell: drivers ===" \
 FWLOG="$TMP/fw.log"; FWNSH="$TMP/fw.nsh"
 { echo '@echo -off'; echo 'fs0:'; echo 'echo MARK_FWNET'
   echo 'netload.efi --connect'; echo 'echo MARK_FWNET_DONE'
+  # The modern Shell's ifconfig after AXL brought the NIC up: pinned whole,
+  # so the old-shell compatibility protocols AXL now adds to the NIC handle
+  # provably change nothing here.
+  echo 'echo MARK_IFCFG'; echo 'ifconfig -l'; echo 'echo MARK_IFCFG_DONE'
   # -a with no staged drivers present (no --dir / no --extra on this image):
   # the firmware-first probe still runs first and, on this --net boot, still
   # wins -- this is the reports[0] regression guard: the -a summary must
@@ -619,6 +711,43 @@ fsect MARK_FWNET MARK_FWNET_DONE | grep -aqiE "networking is UP via a firmware d
 fsect MARK_FWNET MARK_FWNET_DONE | grep -aqiE "driver=<unknown>|driver=<firmware volume>" \
   && { echo "FAIL: firmware NIC driver name unresolved (ComponentName2 not consulted)"; fail=1; } \
   || echo "PASS: firmware NIC driver name resolved via ComponentName2 (not a placeholder)"
+# The modern Shell's `ifconfig -l` for the NIC netload just leased, exactly as
+# it printed before AXL published the pre-UEFI-2.4 protocols on that handle.
+# Trailing blanks are stripped from the capture only because the Shell ends
+# the "DNS server   : " line with one, which no editor keeps in a literal.
+IFCFG_WANT='
+-----------------------------------------------------------------
+
+name         : eth0
+Media State  : Media present
+policy       : dhcp
+mac addr     : 52:54:00:12:34:56
+
+ipv4 address : 10.0.2.15
+
+subnet mask  : 255.255.255.0
+
+default gateway: 10.0.2.2
+
+  Routes (2 entries):
+    Entry[0]
+     Subnet : 10.0.2.0
+     Netmask: 255.255.255.0
+     Gateway: 0.0.0.0
+    Entry[1]
+     Subnet : 0.0.0.0
+     Netmask: 0.0.0.0
+     Gateway: 10.0.2.2
+
+DNS server   :
+      10.0.2.3
+
+
+-----------------------------------------------------------------'
+IFCFG_GOT=$(fsect '^MARK_IFCFG$' '^MARK_IFCFG_DONE$' | tr -d '\r' | sed -e '1d;$d' -e 's/[[:space:]]*$//')
+[[ "$IFCFG_GOT" == "$IFCFG_WANT" ]] \
+  && echo "PASS: modern ifconfig -l after netload is unchanged (exact)" \
+  || { echo "FAIL: modern ifconfig -l after netload changed:"; echo "$IFCFG_GOT" | sed 's/^/  | /'; fail=1; }
 # --- reports[0]: the firmware-first result belongs in the -a summary, always ---
 # Under --net the firmware NIC leases via SLIRP DHCP (proved above), so -a's
 # firmware-first probe WINS here -- the regression this guards is cmd_auto
@@ -655,6 +784,20 @@ IDXLOG="$TMP/idx.log"; IDXNSH="$TMP/idx.nsh"
 { echo '@echo -off'; echo 'fs0:'; echo 'echo MARK_IDX'
   echo 'netload.efi --connect --mac 52:54:00:12:34:57'; echo 'echo MARK_IDX_DONE'
   echo 'echo MARK_IDX_LIST'; echo 'netload.efi --diag'; echo 'echo MARK_IDX_LIST_DONE'
+  # The DHCP wait must wait for THE NIC it configured. ...57 holds a lease
+  # (above); ...56 is on the dead socket netdev, so DHCP on it can never
+  # complete and the wait must run its whole -t 3. The bug: the wait's
+  # condition was "ANY NIC has an address", already true here, so it returned
+  # at once and netload printed "no DHCP lease in 3s" after ~0 s -- under host
+  # load that also failed a NIC whose lease was merely a few ms away (the
+  # efi-pack-release iPXE flake). The decisive check is the read-back warning
+  # below, which only the early return can produce. `time` brackets the WHOLE
+  # netload call (connect, link wait and read-back too), so its >= 3 s is a
+  # floor on the wait, not a measurement of it: on a slow guest the old code
+  # could reach 3 s on that overhead alone.
+  echo 'echo MARK_WAIT'; echo 'time'
+  echo 'netload.efi --connect --mac 52:54:00:12:34:56 -t 3'
+  echo 'time'; echo 'echo MARK_WAIT_DONE'
   echo 'reset -s'; } > "$IDXNSH"
 # virtio-net-pci (native VirtioNetDxe on BOTH arches -- unlike e1000, whose
 # iPXE UNDI option ROM is x86-only). The SNP child-handle dupes that cause the
@@ -683,6 +826,41 @@ IDXN=$(isect MARK_IDX_LIST MARK_IDX_LIST_DONE | grep -acE '^ *NIC [0-9A-Fa-f:]+ 
 [[ "$IDXN" -eq 2 ]] \
   && echo "PASS: 2 NICs list as 2 interfaces (SNP child handles deduped)" \
   || { echo "FAIL: expected 2 interfaces, got $IDXN (SNP child dupes leaking?)"; fail=1; }
+
+# The per-NIC DHCP wait (see MARK_WAIT above). Precondition first: the other
+# NIC really holds a lease, or "any NIC has an address" is false too and the
+# elapsed check below passes for the wrong reason.
+isect MARK_IDX MARK_IDX_DONE | tr -d '\r' | grep -axE '  \[ok\] address up: 10\.0\.2\.15' >/dev/null \
+  && echo "PASS: per-NIC wait setup: ...57 holds a lease (another NIC has an address)" \
+  || { echo "FAIL: per-NIC wait setup -- ...57 did not lease, the wait check cannot discriminate"; fail=1; }
+# The Shell's `time` line is "HH:MM:SS (<zone>)"; a log line's own stamp is
+# "HH:MM:SS.uuuuuu [LEVEL]", so the " (" is what tells the two apart.
+mapfile -t WAITT < <(isect MARK_WAIT MARK_WAIT_DONE | tr -d '\r' \
+  | grep -aE '^[0-9]{2}:[0-9]{2}:[0-9]{2} \(' | cut -c1-8 || true)
+if [[ ${#WAITT[@]} -eq 2 ]]; then
+  tsec() { local h m s; IFS=: read -r h m s <<< "$1"; echo $((10#$h * 3600 + 10#$m * 60 + 10#$s)); }
+  WAITS=$(( ($(tsec "${WAITT[1]}") - $(tsec "${WAITT[0]}") + 86400) % 86400 ))
+  [[ "$WAITS" -ge 3 ]] \
+    && echo "PASS: DHCP on a server-less NIC waits its own -t 3 (${WAITS}s) though another NIC has an address" \
+    || { echo "FAIL: DHCP wait returned after ${WAITS}s, not its -t 3 -- it waited on ANY NIC's address, not the one it configured"; fail=1; }
+else
+  echo "FAIL: per-NIC wait: expected 2 'time' stamps around the call, got ${#WAITT[@]}"; fail=1
+fi
+isect MARK_WAIT MARK_WAIT_DONE | tr -d '\r' | grep -axF '  link is up but no DHCP lease in 3s (data plane may be stalled;' >/dev/null \
+  && echo "PASS: per-NIC wait: the server-less NIC reports no lease" \
+  || { echo "FAIL: per-NIC wait: no 'no DHCP lease in 3s' verdict for the server-less NIC"; fail=1; }
+# THE decisive check, independent of guest speed: the read-back warning. It is
+# reached only when the wait reports success and the configured NIC then has
+# no address -- certain under the old any-NIC condition (...57's lease ends
+# the wait at once; ...56 can never lease), impossible under the per-NIC one
+# (the wait times out first, and bring_up returns before any read-back). The
+# "no DHCP lease in 3s" check above is what keeps this absence from being
+# satisfied by a netload that never ran or never got this far.
+WAITWARN=$(isect MARK_WAIT MARK_WAIT_DONE | tr -d '\r' \
+  | grep -acF "bring_up: NIC 52:54:00:12:34:56 has no address yet - reporting another NIC's would be wrong" || true)
+[[ "$WAITWARN" -eq 0 ]] \
+  && echo "PASS: per-NIC wait: no read-back of an address-less NIC (the wait did not end on another NIC's lease)" \
+  || { echo "FAIL: per-NIC wait: the DHCP wait ended on another NIC's address -- read back ...56 with no address ($WAITWARN)"; fail=1; }
 
 # --- axl_net_bring_up addr_out must describe the NIC it CONFIGURED (BUG B) ---
 # The wrong-answer bug this guards: bring_up used to fill addr_out by calling
@@ -782,89 +960,14 @@ fi
 # ======================================================================
 # Link-down NIC tests: AUTO link-up preference + firmware-all-down wording
 # ======================================================================
-# A guest-visible link-down virtio NIC was impossible in QEMU until we learned
-# TWO things (see local/docs/handoff-qemu-linkdown-optionA.md):
-#
-#   (1) `romfile=` (empty) is LOAD-BEARING, not decoration. QEMU ships an iPXE
-#       UNDI option ROM for virtio-net (1af4:1000). When present OVMF binds the
-#       iPXE UNDI -- an NII3.1 SNP producer whose MediaPresent does NOT track
-#       virtio link status (reports UP regardless). `romfile=` disables that ROM
-#       so OVMF's native VirtioNetDxe, which DOES read virtio config.status into
-#       SNP MediaPresent, is the SNP producer. Without `romfile=` a link-down NIC
-#       still reads UP and every link-down test here is a silent no-op. This is
-#       why the prior session's "set_link off doesn't work" experiments (all run
-#       WITHOUT romfile=) were dead ends -- they were reading the iPXE UNDI.
-#
-#   (2) Two ways to actually put that native NIC's link down, applied
-#       BELT-AND-SUSPENDERS so these tests run whether or not the QEMU patch is
-#       present (CI / another dev runs stock QEMU):
-#         a. `x-link-down=on` -- a virtio-net device property added by a LOCAL
-#            patch to ~/projects/qemu/qemu-10.0.0. Realizes the NIC with virtio
-#            config.status LINK_UP clear, so OVMF reads MediaPresent=FALSE at
-#            bind. Deterministic, no timing, no host tooling -- but the property
-#            only exists on the patched QEMU (stock QEMU ABORTS on an unknown
-#            property, so it is applied ONLY when probed-present, never blindly).
-#         b. QMP `set_link <netdev> off` -- works on STOCK QEMU. Driven early and
-#            continuously (before OVMF binds the NIC) so the NIC is down by the
-#            time VirtioNetDxe reads it; OVMF's MNP background poll also refreshes
-#            MediaPresent live, so the registry (which reads Mode->MediaPresent
-#            without its own GetStatus) still sees DOWN. Needs `socat`.
-#       On the patched dev box BOTH apply (x-link-down does it; set_link is
-#       redundant insurance). On stock QEMU set_link alone does it. If NEITHER is
-#       available (unpatched QEMU AND no socat) the two tests SKIP, loudly, rather
-#       than fail -- the netload logic they guard is otherwise real-hardware-only.
-LD_QEMU=$(find_qemu "$ARCH" 2>/dev/null || true)
-LD_HAVE_XLD=0
-if [[ -n "$LD_QEMU" ]] && "$LD_QEMU" -device virtio-net-pci,help 2>&1 | grep -q 'x-link-down'; then
-  LD_HAVE_XLD=1
-fi
-LD_HAVE_SOCAT=0; command -v socat >/dev/null 2>&1 && LD_HAVE_SOCAT=1
-# `x-link-down=on,` prefix for a link-down NIC's -device string (empty on stock).
-LD_XLD=""; [[ "$LD_HAVE_XLD" -eq 1 ]] && LD_XLD="x-link-down=on,"
+# A guest-visible link-down virtio NIC: `romfile=` plus x-link-down and/or QMP
+# set_link -- why both, and why romfile= is load-bearing, is in
+# lib/linkdown-lib.sh, shared with test-sshd-start-nonet-qemu.sh.
+source "$DIR/test/integration/lib/linkdown-lib.sh"
+ld_setup "$ARCH" "$TMP"
 
-# QMP injector: drive `set_link off` on the named netdev(s) until killed. Written
-# once, reused by both tests. Self-contained (own qmp_capabilities handshake per
-# connect); errors ignored so it never disturbs the run if QMP is momentarily
-# unavailable. Continuous 1 Hz loop guarantees it lands before OVMF binds the NIC
-# regardless of host boot speed. Started before run-qemu, killed (own captured
-# PID + children only -- never `pkill -f`, which once killed a colleague's
-# softbmc) after.
-cat > "$TMP/setlink-off.sh" <<'INJECTOR'
-#!/bin/bash
-sock="$1"; shift; nets=("$@")
-for _ in $(seq 1 120); do [[ -S "$sock" ]] && break; sleep 0.25; done
-# Bounded loop (~300s), NOT `while :`. ld_inject runs us inside a `$(...)`
-# subshell, so we are reparented to init if the test dies before ld_inject_stop
-# kills us -- an unbounded loop would then spin forever in CI. 300 iterations far
-# outlast any single boot (run-qemu --timeout 120) yet guarantee self-exit.
-for _ in $(seq 1 300); do
-  { printf '{"execute":"qmp_capabilities"}\n'; sleep 0.2
-    for n in "${nets[@]}"; do
-      printf '{"execute":"set_link","arguments":{"name":"%s","up":false}}\n' "$n"; sleep 0.1
-    done
-  } | socat -t 3 - "UNIX-CONNECT:$sock" >/dev/null 2>&1 || true
-  sleep 1
-done
-INJECTOR
-chmod +x "$TMP/setlink-off.sh"
-# ld_inject <sock> <netdev...>  -> echoes injector PID ("" if socat absent).
-# The background child's fds MUST be redirected off the command-substitution
-# pipe: an inherited stdout keeps `$(...)` blocked until the (forever-looping)
-# child closes it -- i.e. hangs the whole test. </dev/null in too, so it never
-# competes for the run's stdin.
-ld_inject() {
-  [[ "$LD_HAVE_SOCAT" -eq 1 ]] || { echo ""; return 0; }
-  "$TMP/setlink-off.sh" "$@" </dev/null >/dev/null 2>&1 & echo "$!"
-}
-ld_inject_stop() {  # <pid>
-  [[ -n "$1" ]] || return 0
-  pkill -P "$1" 2>/dev/null || true
-  kill "$1" 2>/dev/null || true
-  wait "$1" 2>/dev/null || true
-}
-
-if [[ "$LD_HAVE_XLD" -eq 0 && "$LD_HAVE_SOCAT" -eq 0 ]]; then
-  echo "SKIP: link-down tests need the QEMU x-link-down patch OR socat for QMP set_link (have neither) -- see local/docs/handoff-qemu-linkdown-optionA.md"
+if [[ "$LD_HAVE_XLD" -eq 0 && "$LD_HAVE_QMP" -eq 0 ]]; then
+  echo "SKIP: link-down tests need the QEMU x-link-down patch OR python3 qemu.qmp for QMP set_link (have neither) -- see local/docs/handoff-qemu-linkdown-optionA.md"
   echo "SKIP: AUTO link-up preference (no link-down mechanism available)"
   echo "SKIP: firmware-all-down wording (no link-down mechanism available)"
 else

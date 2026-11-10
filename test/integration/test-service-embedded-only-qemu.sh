@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=svc-embonly guest=standard
 # test-service-embedded-only-qemu.sh — AxlServiceDeploy.embedded_only must load
 # the baked-in driver and SKIP the disk search, so a stale loose driver beside
 # the launcher cannot shadow it.
@@ -31,8 +31,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     svc-embonly 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -42,14 +42,7 @@ test_add_efi "$NATIVE_DIR/svc_embonly.efi"
 test_add_efi "$NATIVE_DIR/svc_embonly-decoy-dxe.efi" "svc-embonly-dxe.efi"
 
 MARKER="AXL-EMBONLY-SHELL-SURVIVED"
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "svc_embonly.efi start"
-    echo "echo $MARKER"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh "$MARKER"
 
 test_build_image
 

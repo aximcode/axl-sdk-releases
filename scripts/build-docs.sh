@@ -22,11 +22,22 @@ if [[ "${1:-}" == "--ci-doxygen" ]]; then
     engine=$(command -v podman || command -v docker) \
         || { echo "need podman or docker to reproduce CI's doxygen"; exit 2; }
     echo "Reproducing CI's doxygen (ubuntu:24.04 apt package)..."
+    # pkg_install (scripts/container-pkg.sh) bounds the install and names a
+    # mirror failure. And a run that never reached doxygen is a FAILURE: this
+    # used to send apt's output to /dev/null and then report "clean" over an
+    # install that had failed -- no diagnostics, because nothing ran.
     out=$("$engine" run --rm -v "$ROOT_DIR":/src:z -w /src ubuntu:24.04 bash -c \
-        'apt-get update -qq >/dev/null 2>&1 \
-         && apt-get install -y -qq doxygen >/dev/null 2>&1 \
-         && echo "doxygen $(doxygen --version)" >&2 \
-         && cd docs/sphinx && doxygen Doxyfile' 2>&1) || true
+        "$(cat "$ROOT_DIR/scripts/container-pkg.sh")"'
+         pkg_install doxygen
+         echo "doxygen $(doxygen --version)" >&2
+         cd docs/sphinx && doxygen Doxyfile' 2>&1) || true
+    # A here-string, not `printf | grep -q`: under pipefail grep's early exit
+    # can SIGPIPE the printf and turn a match into a failure.
+    if ! grep -qE '^doxygen [0-9]' <<< "$out"; then
+        printf '%s\n' "$out" | tail -12
+        echo "FAIL: CI's doxygen never ran in the container, so nothing was checked."
+        exit 1
+    fi
     diag=$(printf '%s\n' "$out" | grep -E ": (error|warning):" || true)
     printf '%s\n' "$out" | grep -E '^doxygen ' || true
     if [[ -n "$diag" ]]; then
@@ -85,9 +96,10 @@ fi
 # docs change matters, reproduce CI's exact version instead of trusting a newer
 # local one:
 #
-#   podman run --rm -v "$PWD":/src:z -w /src ubuntu:24.04 bash -c \
-#     'apt-get update -qq && apt-get install -y -qq doxygen && \
-#      cd docs/sphinx && doxygen Doxyfile'
+#   ./scripts/build-docs.sh --ci-doxygen
+#
+# (it runs that doxygen in ubuntu:24.04, with the bounded install of
+# scripts/container-pkg.sh).
 #
 # Same shape as the clang-tidy container in docs/RELEASING.md, same reason.
 # --------------------------------------------------------------------------

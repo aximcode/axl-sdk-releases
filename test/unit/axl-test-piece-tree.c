@@ -1506,6 +1506,36 @@ test_piece_tree_save_reports_a_failed_flush(void)
     ff_fs_down();
 }
 
+/* Regression: the promote deleted the target and then renamed the temp
+   over it, so a rename that failed after the delete lost the target. The
+   fixture fails only renames OF a ".tmp" file, so the target can be set
+   aside and put back while the promote itself fails. */
+static void
+test_piece_tree_save_keeps_the_target_when_the_promote_fails(void)
+{
+    if (!ff_fs_up()) {
+        test_skip_n(2, "piece_tree promote fail (no shell map for the published volume)");
+        return;
+    }
+    ff_set_flush_ok(true);
+    ff_tmp_stuck = true;
+
+    AxlPieceTree *pt    = axl_piece_tree_new();
+    bool          built = (pt != NULL
+                           && axl_piece_tree_insert(pt, 0, "clobber\n", 8)
+                                  == AXL_OK);
+
+    test_check(built && ff_seed("doc", "keepme\n", 7)
+               && axl_piece_tree_save(pt, FF_PATH("doc")) == AXL_ERR,
+               "pt promote-fail: save whose rename fails returns AXL_ERR");
+    test_check(ff_content_is("doc", "keepme\n", 7) && !ff_exists("doc.tmp")
+               && ff_count_prefix("~AXL") == 0,
+               "pt promote-fail: the target holds exactly what it held, no temp, no aside");
+
+    axl_piece_tree_free(pt);
+    ff_fs_down();
+}
+
 int
 test_piece_tree_main(int argc, char **argv)
 {
@@ -1531,6 +1561,7 @@ test_piece_tree_main(int argc, char **argv)
     test_piece_tree_load_encoded_cached();
     test_piece_tree_save_over_self();
     test_piece_tree_save_reports_a_failed_flush();
+    test_piece_tree_save_keeps_the_target_when_the_promote_fails();
 
     return test_print_results();
 }

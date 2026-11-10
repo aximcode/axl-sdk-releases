@@ -24,8 +24,8 @@
 // Globals
 // ---------------------------------------------------------------------------
 
-/* Embedded 9p-serve-dxe.efi blob - spliced in by the Makefile's
-   EMBED_BLOB(serve9p_dxe, ...). */
+/* Embedded 9p-serve-dxe.efi blob - spliced in by the build's
+   axl_embed_blob(serve9p_dxe ...). */
 AXL_EMBED_DECLARE(serve9p_dxe);
 
 // ---------------------------------------------------------------------------

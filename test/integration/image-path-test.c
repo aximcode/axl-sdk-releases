@@ -62,31 +62,47 @@ run_from_path(const char *path)
     return AXL_OK;
 }
 
+/* What axl_app_image_dir_path makes of @rel, from \app\ -- the nested case the
+   unit binary (staged at the root) cannot reach. */
+static void
+report_image_dir_path(const char *rel)
+{
+    char out[256];
+
+    axl_printf("IMGPATH: dir[%s]=%s\n", rel,
+               axl_app_image_dir_path(rel, out, sizeof(out)) == AXL_OK ? out : "(err)");
+}
+
 int
 main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
 
-    /* Resolve the driver beside us so the test works wherever the harness
-       stages the pair. axl_app_boot_path is not usable here (it anchors on
-       the volume root, not our directory), so build it from our own image
-       path — which, being a shell-loaded app, is exactly what this change
-       leaves untouched. */
     const char *self = axl_app_image_path();
     if (self == NULL) {
         axl_printf("IMGPATH: FAIL launcher has no image path\n");
         return 1;
     }
     axl_printf("IMGPATH: launcher self=%s\n", self);
+    report_image_dir_path("sshd.conf");
+    report_image_dir_path("keys\\ak");
+    report_image_dir_path("");
+    report_image_dir_path("\\keys\\ak");
+    report_image_dir_path("fs1:\\x.conf");
 
-    AXL_AUTO_FREE char *dir  = axl_path_get_dirname(self);
-    AXL_AUTO_FREE char *drv  = axl_path_join(dir != NULL ? dir : "",
-                                             IMGPATH_DRIVER);
-    if (drv == NULL) {
+    /* The driver beside us, wherever the harness stages the pair. */
+    char drv[256];
+    if (axl_app_image_dir_path(IMGPATH_DRIVER, drv, sizeof(drv)) != AXL_OK) {
         axl_printf("IMGPATH: FAIL cannot build driver path\n");
         return 1;
     }
+
+    /* The driver search's first candidate is this image's own directory:
+       in a SUBDIRECTORY it must name \app\, once. */
+    char loc[256];
+    axl_printf("IMGPATH: locate=%s\n",
+               axl_driver_locate(IMGPATH_DRIVER, loc, sizeof(loc)) == AXL_OK ? loc : "(err)");
 
     int rc = run_from_buffer(drv);
     if (rc == AXL_OK) {

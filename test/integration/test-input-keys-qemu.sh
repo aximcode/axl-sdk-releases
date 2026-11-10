@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=9 local-only=0
+# test-meta: arch=x64 needs=socat est=9 local-only=0 guest=none
+# guest=none: it injects keys over --serial-socket and QMP into a
+#   --background guest with its own USB keyboard: a machine no class gives.
 # test-input-keys-qemu.sh — empirically pin the Ctrl+letter encoding that
 # axl-input delivers, across the two UEFI console-input paths.
 #

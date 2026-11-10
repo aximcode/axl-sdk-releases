@@ -141,7 +141,7 @@ carry a `/* axl-pool-direct: <reason> */` comment naming why the memory is
 firmware-owned — e.g. `freed by firmware`, `installed protocol interface`,
 `device path to LoadImage`, `firmware-returned buffer`. This is the
 allocation-axis analogue of the `axl-uefi-direct:` marker, and it is
-enforced: `scripts/check-dogfood.py` (`make check-dogfood`, in CI) fails on
+enforced: `scripts/check-dogfood.py` (`gate.check-dogfood`, in CI) fails on
 an *unmarked* raw pool call, so the default really is `axl_malloc` /
 `axl_free` and each firmware-pool exception is justified in place.
 
@@ -581,7 +581,7 @@ apply_image_identity(EFI_HANDLE h)
     }
 ```
 
-Enforced by `make check-log-levels`, which requires every `axl_info`
+Enforced by `gate.check-log-levels`, which requires every `axl_info`
 under `src/` to carry a justification marker:
 
 ```c

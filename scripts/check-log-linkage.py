@@ -11,9 +11,10 @@ warns, and no test that is not specifically watching for it can tell.
 
 So the linkage is checked on the ARTIFACT, not on the command line that
 produced it. Reading the built `.so` covers every producer at once -- the
-Makefile's five link macros, `axl-cc`, and the CMake package `install.sh`
-generates -- which a Makefile grep would not: `check-flag-parity`'s whole
-reason for existing is that those three copies drift.
+build's link rules (cmake/AxlImages.cmake), `axl-cc`, and the CMake package
+`install.sh` generates -- which a grep of any one of them would not:
+`check-flag-parity`'s whole reason for existing is that those three copies
+drift.
 
 The rule, per image:
 
@@ -33,16 +34,14 @@ Reads the `.so` rather than the `.efi`: every `.efi` is `--strip-all`ed
 (`check-pe-stripped` enforces it), so the PE has no symbol table left to read.
 The `.so` is the same link, one step earlier.
 
-**A local pass on an incremental tree is weaker than a CI pass, and knowingly
-so.** Objects and images do not depend on the Makefile, so editing a link macro
-relinks NOTHING -- the images this reads are the ones the previous macro
-produced, and the gate reports on them. That was demonstrated while verifying
-this script: sabotaging `LINK_EFI_DRIVER` went undetected until `driver.efi`
-was deleted, at which point it failed immediately. CI builds from scratch and
-so always reads the current macros; locally, `rm` the image (or `make clean`)
-if a link rule is what you changed. Making every image depend on the Makefile
-would close the hole and rebuild the world on every comment edit, which is a
-worse trade than saying this out loud.
+**A local pass reads the images the tree last linked.** Under the retired
+Makefile that was a real hole: images did not depend on the Makefile, so
+editing a link macro relinked NOTHING, and sabotaging `LINK_EFI_DRIVER` went
+undetected until `driver.efi` was deleted. Ninja re-runs a rule whose command
+line changed, so an edited link rule in cmake/AxlImages.cmake relinks; a
+change it cannot see (a `cmake -P` script's body) still needs the image
+`rm`ed, or the build tree deleted. CI builds from scratch and so always reads
+the current rules.
 
 Usage: check-log-linkage.py IMAGE.efi [IMAGE.efi ...]
 """
@@ -90,8 +89,9 @@ def main(argv: list[str]) -> int:
         return 2
 
     # The same cross toolchain that produced the images. CROSS is exported by
-    # the Makefile rule; a bare `nm` on a cross object reads fine for symbol
-    # names, so the fallback is safe rather than merely convenient.
+    # the gate's CTest entry (cmake/AxlIntegrationTests.cmake.in); a bare `nm`
+    # on a cross object reads fine for symbol names, so the fallback is safe
+    # rather than merely convenient.
     nm = os.environ.get("CROSS", "") + "nm"
 
     failures: list[str] = []
@@ -137,8 +137,8 @@ def main(argv: list[str]) -> int:
             failures.append(
                 f"{efi}: references {EMITTER} but does not link {ENGINE}.\n"
                 f"    Every log call in this image is discarded, silently.\n"
-                f"    In-tree: the link macro is missing $(LOG_ENGINE_PULL) "
-                f"(Makefile).\n"
+                f"    In-tree: the link rule is missing AXL_LOG_ENGINE_PULL "
+                f"(cmake/AxlImages.cmake).\n"
                 f"    Via axl-cc: pass --minimal-runtime=log, or "
                 f"--minimal-runtime=nolog\n"
                 f"    if the silence is intended (and then say so in "

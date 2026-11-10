@@ -11,6 +11,9 @@
  *      W^X-clean — R-X .text, RW .data — so they should advertise NX
  *      compatibility for firmware that enforces memory protection, which is
  *      the norm under Secure Boot). Verified by scripts/check-pe-nx.py.
+ *   6. Drops a COFF string table objcopy left for a long section name,
+ *      truncating the name to eight bytes as the PE spec says an image's
+ *      must be (drop_string_table). Verified by scripts/check-pe-stripped.py.
  *
  * Usage: pe-set-debug <file.efi> [module-name]
  *
@@ -39,8 +42,13 @@
 /* DllCharacteristics bit: image is compatible with NX / memory protection. */
 #define IMAGE_DLLCHARACTERISTICS_NX_COMPAT 0x0100
 
-/* Section header size */
+/* Offsets within the COFF file header (after the "PE\0\0" signature) */
+#define COFF_PTR_TO_SYMTAB_OFF  8
+#define COFF_NUM_SYMBOLS_OFF    12
+
+/* Section header size, and its name field */
 #define SECTION_HEADER_SIZE     40
+#define SECTION_NAME_LEN        8
 
 /* Debug directory entry layout (28 bytes) */
 #define DDE_TYPE_OFF            12
@@ -97,7 +105,7 @@ w16(uint8_t *p, uint16_t v)
  * FNV-1a over the whole file with the GUID field itself ZEROED. Zeroing is
  * what makes it idempotent: the id is written INTO the image, so hashing the
  * file as-is would hash a file containing its own hash and give a different
- * answer on every run -- `make` would never reach a fixed point.
+ * answer on every run -- the build would never reach a fixed point.
  *
  * FNV-1a, not a cryptographic digest, and the distinction is deliberate: this
  * identifies a build, it does not authenticate one. Nothing here resists an
@@ -124,6 +132,95 @@ build_id(const uint8_t *data, size_t len, size_t guid_off, uint8_t out[16])
     for (int i = 0; i < 16; i++) {
         out[i] = (uint8_t)(h >> (8 * (15 - i)));   /* big-endian */
     }
+}
+
+/* drop_string_table -- an image carries no COFF string table.
+ *
+ * WHY. objcopy's ELF -> PE step writes a section name longer than eight
+ * bytes into a COFF string table after the last section, names the section
+ * `/N` (its offset there), and points PointerToSymbolTable at the table with
+ * NumberOfSymbols zero: --strip-all removes the symbols, not the table a long
+ * name needs. aa64's `.rela.dyn` is nine bytes (elf_aarch64_efi.lds says why
+ * it must be that name), so every aa64 image carried one, and
+ * check-pe-stripped failed on it.
+ *
+ * THE RULE, PE/COFF spec section 3.4: "Executable images do not use a string
+ * table and do not support section names longer than 8 characters. Long
+ * names in object files are truncated if they are emitted to an executable
+ * file." So each `/N` name becomes the first eight bytes of its string, the
+ * pointer becomes zero, and the table -- the file's tail -- is cut off.
+ * Nothing reads a section by name at load time (the crt0 finds relocations
+ * through DT_RELA in .dynamic).
+ *
+ * Only a table with NO symbols: one with symbols is check-pe-stripped's to
+ * report, and its names live in the table too. A table that is not the
+ * file's tail is a layout nothing here produces, so it is refused rather
+ * than cut with bytes left after it.
+ *
+ * Returns 0 (done, or nothing to do) or 1 (refused; *file_size unchanged).
+ */
+static int
+drop_string_table(const char *path, uint8_t *coff, uint8_t *sections,
+                  uint16_t num_sections, uint8_t *data, long *file_size)
+{
+    uint32_t sym_ptr = r32(coff + COFF_PTR_TO_SYMTAB_OFF);
+    uint32_t num_syms = r32(coff + COFF_NUM_SYMBOLS_OFF);
+    if (sym_ptr == 0 || num_syms != 0) {
+        return 0;
+    }
+    /* The table must lie after every section's raw data: a pointer into a
+     * section whose length happens to reach the end of the file would
+     * otherwise cut that section's bytes off. */
+    for (uint16_t i = 0; i < num_sections; i++) {
+        const uint8_t *sh = sections + i * SECTION_HEADER_SIZE;
+        uint64_t raw_end = (uint64_t)r32(sh + 20) + r32(sh + 16);  /* PointerToRawData + SizeOfRawData */
+        if (r32(sh + 16) != 0 && raw_end > sym_ptr) {
+            fprintf(stderr, "%s: COFF string table at 0x%x overlaps section %u's "
+                    "data -- refusing to cut it\n", path, sym_ptr, i);
+            return 1;
+        }
+    }
+    /* ...and be the file's tail. */
+    if ((uint64_t)sym_ptr + 4 > (uint64_t)*file_size
+        || (uint64_t)sym_ptr + r32(data + sym_ptr) != (uint64_t)*file_size) {
+        fprintf(stderr, "%s: COFF string table at 0x%x is not the end of the "
+                "file -- refusing to cut it\n", path, sym_ptr);
+        return 1;
+    }
+    const uint8_t *strtab = data + sym_ptr;
+    uint32_t strtab_len = r32(strtab);
+
+    for (uint16_t i = 0; i < num_sections; i++) {
+        uint8_t *name = sections + i * SECTION_HEADER_SIZE;
+        if (name[0] != '/') {
+            continue;
+        }
+        uint32_t off = 0;
+        int digits = 0;
+        for (int k = 1; k < SECTION_NAME_LEN && name[k] != '\0'; k++) {
+            if (name[k] < '0' || name[k] > '9') {
+                digits = 0;
+                break;
+            }
+            off = off * 10 + (uint32_t)(name[k] - '0');
+            digits++;
+        }
+        if (digits == 0 || off < 4 || off >= strtab_len) {
+            fprintf(stderr, "%s: section %u's long name '%.8s' does not index "
+                    "the string table -- refusing to cut it\n", path, i, name);
+            return 1;
+        }
+        size_t len = strnlen((const char *)strtab + off, strtab_len - off);
+        if (len > SECTION_NAME_LEN) {
+            len = SECTION_NAME_LEN;
+        }
+        memset(name, 0, SECTION_NAME_LEN);
+        memcpy(name, strtab + off, len);
+    }
+
+    w32(coff + COFF_PTR_TO_SYMTAB_OFF, 0);
+    *file_size = (long)sym_ptr;
+    return 0;
 }
 
 int
@@ -304,15 +401,19 @@ main(int argc, char **argv)
         return 0;
     }
 
+    if (drop_string_table(path, coff, sections, num_sections, data, &file_size) != 0) {
+        free(data);
+        return 1;
+    }
+
     /* Write module name into RSDS filename field */
     uint8_t *name_field = rsds + RSDS_NAME_OFF;
     uint32_t name_space = debug_raw_size - DDE_SIZE - RSDS_NAME_OFF;
-    size_t name_len = strlen(mod_name);
-    if (name_len >= name_space) {
-        name_len = name_space - 1;
-    }
+    /* The whole field zeroed first -- the padding after the name is hashed
+     * into the build id below, so it must not be whatever was there -- then
+     * the name, truncated to fit and always NUL-terminated. */
     memset(name_field, 0, name_space);
-    memcpy(name_field, mod_name, name_len);
+    snprintf((char *)name_field, name_space, "%s", mod_name);
 
     /* The build identity, LAST: it must cover the module name written just
      * above and every other patch this tool makes, or two images differing

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=8 local-only=0
+# test-meta: arch=x64 needs= est=8 local-only=0 guest=ipmi_kcs
 # test-ipmi-qemu.sh — run AxlTestIpmi against QEMU's built-in BMC
 # simulator to exercise the real KCS transport.
 #
@@ -39,18 +39,16 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_DIR="$(dirname "$PROJECT_DIR")"
 
 _native_arch="x64"
-make -C "$PROJECT_DIR" ARCH="$_native_arch" all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/AxlTestIpmi.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "AxlTestIpmi.efi hw"
-    echo "reset -s"
-} | test_set_startup
+# Its commands are in test-ipmi-qemu.nsh; booted, test_use_nsh appends the
+# reset -s that powers the guest off. Pooled, the ipmi_kcs class is the
+# standard guest plus the BMC simulator test_add_ipmi_bmc_sim_kcs adds
+# (test/pool/classes.toml).
+test_use_nsh
 
 test_build_image
 

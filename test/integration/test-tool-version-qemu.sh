@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=10 local-only=0
+# test-meta: arch=both needs= est=10 local-only=0 guest=plain
 # test-tool-version-qemu.sh — every axl-sdk tool reports the SDK release
 # version uniformly. The version is stamped ONCE at the AXL_TOOL_MAIN layer
 # (so it covers framework tools AND custom-parser tools) from AXL_VERSION_STRING,
@@ -35,16 +35,35 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TOOLS="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools"
+# AXL_TEST_TOOLS_DIR points this at a COPY of tools/ (a stale or foreign .efi in
+# the shared one can then be kept out without touching it); it is not rebuilt.
+TOOLS="${AXL_TEST_TOOLS_DIR:-$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools}"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
-make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
+[[ -n "${AXL_TEST_TOOLS_DIR:-}" ]] || "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 [[ -d "$TOOLS" ]] || { echo "ERROR: $TOOLS not built"; exit 1; }
+# These tests run EVERY .efi in the dir. One older than libaxl.a was not built
+# from this tree's current code (a release's RTK image, a missed rebuild): say
+# so rather than test it silently. A warning, not a failure -- the point is that
+# nobody is surprised which binary was under test.
+if ! _stale=$(source "$PROJECT_DIR/scripts/axl-common.sh"; tools_dir_stale "$TOOLS"); then
+    echo "WARNING: could not check $TOOLS for stale tools"
+elif [[ -n "$_stale" ]]; then
+    echo "WARNING: older than libaxl.a, so not built from this tree's current code:" \
+         "$(echo $_stale) -- tested anyway (rebuild, or point AXL_TEST_TOOLS_DIR at a clean copy)"
+fi
 
 # Tools that intentionally do NOT carry the version stamp (dev/bench only, or
 # resident DRIVERS staged in tools/ that are loaded not run — no AXL_TOOL_MAIN
-# and no --version arg path). Everything else must carry the stamp.
-EXCLUDE="axbench crashtest kbtune-drv"
+# and no --version arg path: kbtune-drv, and SftpServer, which sshd loads).
+# Everything else must carry the stamp.
+EXCLUDE="axbench crashtest kbtune-drv SftpServer"
+
+# The name a tool's --version line carries, where it is not the file's stem:
+# sshd-full.efi is sshd's own launcher around a bigger driver -- one service,
+# one name, as sshd-rtk.efi is.
+declare -A VNAME=([sshd-full]=sshd [sshd-rtk]=sshd [sshd-full-rtk]=sshd)
+vname() { echo "${VNAME[$1]:-$1}"; }
 
 # Collect the staged tool basenames (stem, no .efi).
 mapfile -t ALL < <(cd "$TOOLS" && ls *.efi 2>/dev/null | sed 's/\.efi$//' | sort)
@@ -101,7 +120,7 @@ echo "=== version string in use: $VERSION ==="
 missing=()
 for t in "${VERSIONED[@]}"; do
     # The tool's --version line must read exactly "<stem> <VERSION>".
-    if ! grep -aqE "^${t} ${VERSION}([[:space:]]|$)" "$LOG"; then
+    if ! grep -aqE "^$(vname "$t") ${VERSION}([[:space:]]|$)" "$LOG"; then
         missing+=("$t")
     fi
 done

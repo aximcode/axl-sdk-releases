@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=8 local-only=0
+# test-meta: arch=x64 needs= est=8 local-only=0 guest=standard
 # axl busybox dispatch test — boots QEMU, runs axl.efi with a few
 # representative subcommands, verifies the dispatcher routes argv
 # correctly and each tool's body produces the same output it does as
@@ -21,8 +21,8 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     axl-busybox 2>&1 | tail -5
 
 NATIVE_DIR="$(test_build_dir)"
@@ -37,24 +37,7 @@ echo "=== axl busybox dispatch test ($TEST_ARCH) ==="
 
 # Probe a handful of dispatch shapes: usage/help, two tool subcommands
 # that produce well-known stdout, and the unknown-tool error path.
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo BUSYBOX-HELP-START"
-    echo "axl.efi --help"
-    echo "echo BUSYBOX-HELP-END"
-    echo "echo BUSYBOX-CAT-START"
-    echo "axl.efi cat testdata.txt"
-    echo "echo BUSYBOX-CAT-END"
-    echo "echo BUSYBOX-GREP-START"
-    echo "axl.efi grep needle match.txt"
-    echo "echo BUSYBOX-GREP-END"
-    echo "echo BUSYBOX-UNKNOWN-START"
-    echo "axl.efi nope"
-    echo "echo BUSYBOX-UNKNOWN-END"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

@@ -65,7 +65,7 @@ def _shell_shebang(path: Path) -> bool:
 
 
 def tracked_build_files() -> list[Path]:
-    """Makefile + the shell glue CI actually executes.
+    """The shell glue CI actually executes.
 
     Globs alone are not enough, and the gap was load-bearing: the two scripts
     that SHIP to consumers -- `scripts/axl-cc` and its `axl-c++` alias -- carry
@@ -78,7 +78,7 @@ def tracked_build_files() -> list[Path]:
     day it is written, where a hardcoded name list would have to remember it.
     """
     out = subprocess.run(
-        ["git", "ls-files", "-z", "Makefile", "*.mk", "scripts/*.sh",
+        ["git", "ls-files", "-z", "scripts/*.sh",
          "test/integration/*.sh", "test/integration/lib/*.sh",
          ".github/workflows/*.yml"],
         cwd=ROOT, capture_output=True, text=True, check=True,

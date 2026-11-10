@@ -1,25 +1,46 @@
 #!/bin/bash
-# run-integration.sh — the integration-suite execution engine, used both
-# locally and in CI. A -jN job pool runs tests concurrently; --shard i/K splits
-# the set across machines. Reads per-test metadata via lib/discover.sh.
+# run-integration.sh — the integration suite's front end over CTest.
+#
+# It CHOOSES and REFUSES; CTest RUNS (slice 5a step 6, decision 1;
+# docs/AXL-Build-System-Design.md §10.8). Selection is lib/discover.sh's, as
+# it always was -- --arch, --only, --for, --ci, --only-local, --shard -- and
+# every refusal below stands. The run itself is ONE ctest call on the arch's
+# tree (build/<arch>-debug), whose registration runs each test through
+# lib/run-one.sh --retry (cache, pool rerun, the retry). Its JUnit file is
+# rendered by scripts/ctest-report.py.
 #
 # Usage:
 #   run-integration.sh [--arch X64|AARCH64] [--timeout SECONDS] [-jN] [--list]
+#                      (--arch also takes x64/x86_64 and aa64/aarch64, any
+#                      case; anything else is refused)
+#                      [--only a,b | --for paths] [--ci | --only-local]
+#                      [--shard i/K] [--logdir DIR] [--no-build] [--no-cache]
+#                      [--pool[=SOCK] | --no-pool] [--print-ctest]
 #
-# Concurrency: -jN sets the worker count. With no -j, the default leaves two
-# cores of headroom (nproc-2, min 1; 1 on hosts with <3 cores) — a saturated
-# host can starve a QEMU during its boot/setup window, which surfaces as empty
-# serial output and a spurious failure. For the same reason, do NOT stack the
-# full -jN suite on top of other heavy jobs (a concurrent `lint.sh`, a build):
-# the combined overcommit reintroduces those contention flakes. Run them
-# sequentially, or lower -j, if you must overlap. A transient failure is
-# retried once (see run_one) so a lone contention blip doesn't fail the suite.
+# Concurrency: -j is a CPU budget. Each test holds the slots its test-meta
+# cpu= names (CTest's PROCESSORS, default 1), and with no -j the budget is
+# suite_cpu_slots (lib/discover.sh) -- more slots than CPUs, because a booted
+# guest keeps about half a CPU busy. -jN is a budget of exactly N. There is no
+# load-average gate: ctest's --test-load reads the one-minute load, which lags
+# a burst by a minute and counts every other process on the box
+# (docs/AXL-CI-Release-Speed-Design.md §15). Do not stack the suite on other
+# heavy jobs -- nothing here backs off for them.
 #
-# Output: one `  <name> PASS|FAIL|TIMEOUT <dur>s` line per test, then a totals
-# line. Exit non-zero if any test failed or timed out.
+# --print-ctest prints the ctest environment, the selected tests and the
+# argv, and runs nothing: the self-tests pin the translation through it.
 #
-# RUN_INTEGRATION_DIR (env) overrides the test directory and runs every
-# test-*.sh in it verbatim — the host-only self-test seam (no QEMU).
+# Output: one `  <name>.sh PASS|FAIL|TIMEOUT|SKIP|UNJUDGED|CACHED <n>s` line per
+# test (sorted), the totals line, the PARTIAL banners and `logs: <dir>`. Exit 0
+# when nothing failed, 1 when something did, 2 for a refusal, 3 when nothing
+# failed but a timing test was UNJUDGED (lib/run-one.sh: its bounds missed
+# while the host starved its guest of CPU, even on the retry).
+#
+# RUN_INTEGRATION_DIR (env) overrides the test directory -- the host-only
+# self-test seam (no QEMU). Its tests are DISCOVERED as the real ones are
+# (arch, local-only, test-meta), the same selection CTest registers from it.
+# RUN_PROJECT_DIR and RUN_TEST_CACHE_DIR override the tree the pre-builds run
+# against and where the cache lives, so that seam can drive the fixture
+# pre-build against a stub CMake project without touching the real tree or cache.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # THE -delay 0 SHELL LAUNCHER, ON FOR THE SUITE AND OFF FOR CONSUMERS.
@@ -56,11 +77,32 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export AXL_SHELL_LAUNCHER
 
 source "$SCRIPT_DIR/lib/discover.sh"
+# axl_test_tmpdir_check, and nothing else of it, is used here.
+# shellcheck source=../../scripts/axl-common.sh
+source "$SCRIPT_DIR/../../scripts/axl-common.sh"
 # shellcheck source=lib/test-cache.sh
 source "$SCRIPT_DIR/lib/test-cache.sh"
 
-ARCH="X64"; TIMEOUT=900; LIST_ONLY=0; JOBS=0; SHARD=""; LOGDIR=""  # JOBS=0 => auto
+# THE CI PER-TEST LIMIT IS THE x64-ci TEST PRESET'S, read back from it -- not
+# a copy. It was a literal in ci.yml that nothing compared with anything, then
+# a copy here that a test held equal to the preset. CI runs that preset;
+# `gate.check-test-est` grades against it; --ci applies it. One number.
+ci_limit() {
+    jq -er '.testPresets[] | select(.name == "x64-ci") | .environment.AXL_IT_TIMEOUT' \
+        "$SCRIPT_DIR/../../CMakePresets.json" 2>/dev/null
+}
+ARCH="X64"; TIMEOUT=900; TIMEOUT_SET=0; LIST_ONLY=0; JOBS=0; SHARD=""; LOGDIR=""  # JOBS=0 => auto
+PRINT_CTEST=0
+CI_MODE=0
 ONLY_TESTS=""   # --only: an EXPLICIT subset, named by the caller
+FOR_PATHS=""    # --for: the same subset, derived from paths by which-gates.sh
+# SEEN is tracked apart from the VALUE. `--only=` and `--only="$V"` with V
+# unset are the same string, and the second is how it happens -- an empty
+# value used to read as "flag absent" and select all 204 tests, so a run
+# driven by an unset variable ran the WHOLE SUITE believing it had scoped.
+# Silently widening is the failure this file is arranged against, and it was
+# reachable through its own selection flags.
+ONLY_SEEN=0; FOR_SEEN=0
 # Local-only tests need a capability the GitHub runners lack (a patched QEMU
 # for the SMBus/SPD memdev device, usb-mouse pointer delivery, ...). The dev
 # box HAS those, so the local run includes them by default; --ci drops them.
@@ -69,21 +111,20 @@ ONLY_LOCAL=0
 # ON BY DEFAULT. An opt-in flag does not get typed: this cache was built and
 # then not used once in the session that built it, while the full uncached gate
 # was run after every change. `--no-cache` turns it off, and it is what a
-# pre-push or release run must use -- only an uncached run writes the
-# release-gate stamp (see the stamp block at the bottom, and
-# AXL-CI-Release-Speed-Design.md §12.16).
+# release run uses -- scripts/release-suite.sh passes it; the stamp is that
+# script's now, not this one's (AXL-CI-Release-Speed-Design.md §12.16, §14).
 # $SCRIPT_DIR, not a repo-relative path: the runner is invoked from wherever
 # the caller happens to be, and a relative default resolved against THAT --
 # test-runner-selftest.sh cd's into test/integration and created
 # test/integration/test/integration/.test-cache. One cache per checkout,
 # wherever it is run from.
-CACHE_DIR="$SCRIPT_DIR/.test-cache"
-CACHE_HITS=0
-TESTDIR="${RUN_INTEGRATION_DIR:-$SCRIPT_DIR}"
+CACHE_DIR="${RUN_TEST_CACHE_DIR:-$SCRIPT_DIR/.test-cache}"
+POOL_SOCK=""
+POOL_ASKED=0 NO_POOL=0 POOL_AUTO=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)    ARCH="$2"; shift 2 ;;
-        --timeout) TIMEOUT="$2"; shift 2 ;;
+        --timeout) TIMEOUT="$2"; TIMEOUT_SET=1; shift 2 ;;
         --list)    LIST_ONLY=1; shift ;;
         --shard)   SHARD="$2"; shift 2 ;;   # i/K (0-based)
         # --only=a,b — run exactly these, named by the caller.
@@ -96,16 +137,33 @@ while [[ $# -gt 0 ]]; do
         # (scripts/ci-plan.sh, via the plan job) is itself fixture-tested and
         # its allowlist is sabotage-verified; the judgement stays there, where
         # it can be tested, instead of moving in here where it cannot.
-        --only=*)  ONLY_TESTS="${1#--only=}"; shift ;;
-        --only)    ONLY_TESTS="${2:?--only needs a comma-separated list}"; shift 2 ;;
+        --only=*)  ONLY_TESTS="${1#--only=}"; ONLY_SEEN=1; shift ;;
+        --only)    ONLY_TESTS="${2:?--only needs a comma-separated list}"; ONLY_SEEN=1; shift 2 ;;
+        # --for=a.c,b.sh — the same subset, named by what you CHANGED rather
+        # than by which tests cover it. The lookup is which-gates.sh's, asked
+        # for machine-readably; see the resolution block below.
+        --for=*)   FOR_PATHS="${1#--for=}"; FOR_SEEN=1; shift ;;
+        --for)     FOR_PATHS="${2:?--for needs a comma-separated list of paths}"; FOR_SEEN=1; shift 2 ;;
         --logdir)  LOGDIR="$2"; shift 2 ;;  # keep per-test output here
-        --no-build) RUN_NO_BUILD=1; shift ;; # skip the one-time pre-build (CI: built in a prior job)
+        # EXPORTED: the pre-build is lib/suite-prep.sh, a child process.
+        --no-build) export RUN_NO_BUILD=1; shift ;; # skip the one-time pre-build (CI: built in a prior job)
         # --ci also turns the cache OFF. CI is the backstop -- §11.2 records
         # five days of undetected red when it was not run at all -- and a
         # backstop that skips tests is not one. (A fresh checkout has no cache
         # dir anyway, so this is belt and braces, and it is the belt that
         # matters if anyone ever runs --ci on a working tree.)
-        --ci)      INCLUDE_LOCAL=""; CACHE_DIR=""; shift ;;
+        #
+        # And it sets the per-test limit to the x64-ci preset's, unless --timeout says
+        # otherwise (in either order: resolved after the loop).
+        --ci)      INCLUDE_LOCAL=""; CACHE_DIR=""; CI_MODE=1; shift ;;
+        # The est gate moved to scripts/check-test-est.py (make
+        # check-test-est), which grades what CTest will run. Refused by name,
+        # not as an unknown option, so an old habit learns where it went.
+        --print-ctest) PRINT_CTEST=1; shift ;;
+        --check-est)
+            echo "run-integration.sh: --check-est moved -- run scripts/check-test-est.py" \
+                 "(gate.check-test-est), which grades ctest --preset x64-ci." >&2
+            exit 2 ;;
         # The inverse of --ci: ONLY what CI cannot run. For the inner loop,
         # where the other 78% of the wall clock is work a push repeats for
         # free. NOT a substitute for the full run before pushing -- see the
@@ -113,44 +171,81 @@ while [[ $# -gt 0 ]]; do
         --only-local) INCLUDE_LOCAL="--only-local"; ONLY_LOCAL=1; shift ;;
         # Accepted and a no-op: caching is the default now, and this spelling
         # exists so an invocation written before that still works.
-        --cache)      CACHE_DIR="$SCRIPT_DIR/.test-cache"; shift ;;
-        # Turn the cache OFF. Required for a run that must certify the tree:
-        # only an uncached run writes the release-gate stamp. lib/test-cache.sh
+        --cache)      CACHE_DIR="${RUN_TEST_CACHE_DIR:-$SCRIPT_DIR/.test-cache}"; shift ;;
+        # Turn the cache OFF. Required for a run that must certify the tree,
+        # which is why scripts/release-suite.sh passes it. lib/test-cache.sh
         # documents what the key does and does not cover -- the host
         # environment is the gap, and it is why this switch exists at all.
         --no-cache)   CACHE_DIR=""; shift ;;
         -j)        JOBS="$2"; shift 2 ;;
         -j*)       JOBS="${1#-j}"; shift ;;
-        *) shift ;;
+        # Run guest= tests on a pooled guest (docs/AXL-Test-Guest-Pool-Design.md
+        # §6) through the service on SOCK (default: the user unit's). THE
+        # DEFAULT without either flag, when that service serves this arch;
+        # --pool ASKS for it (the run refuses to start without it), --no-pool
+        # boots everything.
+        --pool)    POOL_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/axlpool/pool.sock"; POOL_ASKED=1; shift ;;
+        --pool=*)  POOL_SOCK="${1#--pool=}"; POOL_ASKED=1; shift ;;
+        --no-pool) NO_POOL=1; shift ;;
+        # REFUSE anything else. This arm used to be `*) shift ;;`, which
+        # silently ate a typo and then ran the WHOLE suite: measured,
+        # `--fro=src/net/axl-ssh-server.c --list` selected all 204 tests with
+        # no diagnostic. That is the widening direction -- the same one the
+        # empty-value refusals above exist for -- and it is how `--for`
+        # itself was swallowed while it was being written. verify.sh has
+        # always refused an unknown option; these two runners now agree.
+        *)
+            echo "run-integration.sh: unknown option '$1'." >&2
+            echo "  known: --arch --timeout --list --only --for --shard -j" \
+                 "--logdir --no-build --ci --only-local --cache --print-ctest" \
+                 "--no-cache --pool[=SOCK] --no-pool" >&2
+            exit 2 ;;
     esac
 done
-[[ -z "$LOGDIR" ]] && LOGDIR=$(mktemp -d)
-mkdir -p "$LOGDIR"
+# ONE SPELLING PER ARCH from here on. Everything below compares ARCH against
+# "X64"/"AARCH64" exactly, so `--arch aa64` -- the build trees' and
+# axl-build.sh's spelling -- used to build and run the X64 tree, select a
+# set matching neither arch, label it "(aa64)" and miss the pool's agent
+# check, exiting 0 (test-run-integration-arch.sh). Normalise or refuse.
+case "${ARCH,,}" in
+    x64|x86_64)    ARCH=X64 ;;
+    aa64|aarch64)  ARCH=AARCH64 ;;
+    *)  echo "run-integration: --arch $ARCH: not an arch (X64 or AARCH64; x64, aa64 and aarch64 are accepted too)" >&2
+        exit 2 ;;
+esac
+for _f in "--only:$ONLY_SEEN:$ONLY_TESTS" "--for:$FOR_SEEN:$FOR_PATHS"; do
+    _n="${_f%%:*}"; _rest="${_f#*:}"; _seen="${_rest%%:*}"; _val="${_rest#*:}"
+    if [[ "$_seen" == "1" && -z "$_val" ]]; then
+        echo "run-integration: $_n= was given an EMPTY value. That is a typo" >&2
+        echo "                 (or an unset variable), not a request to run the" >&2
+        echo "                 whole suite. Drop the flag if that is what you want." >&2
+        exit 2
+    fi
+done
+if [[ "$CI_MODE" -eq 1 && "$ARCH" != X64 ]]; then
+    echo "run-integration: --ci is CI's x64 run (the x64-ci test preset); there is" >&2
+    echo "                 no aa64 CI run to stand in for. Drop --ci for AARCH64." >&2
+    exit 2
+fi
+if [[ "$CI_MODE" -eq 1 && "$TIMEOUT_SET" -eq 0 ]]; then
+    TIMEOUT=$(ci_limit) || {
+        echo "run-integration: --ci cannot read the x64-ci preset's AXL_IT_TIMEOUT from" >&2
+        echo "                 CMakePresets.json (jq), so it has no limit to apply." >&2
+        exit 2
+    }
+fi
+# Every test learns the limit it runs under. common-test.sh's _test_killed
+# reads it, so a test the limit kills says so and names the limit, instead of
+# leaving its last output -- often a wait that the kill cut short -- to read
+# as the verdict.
+export AXL_TEST_TIMEOUT="$TIMEOUT"
 # Wall-clock origin for the totals line at the end. $SECONDS is shell
 # uptime, so this is taken once, here, rather than inferred later.
 _RUN_T0=$SECONDS
-: > "$LOGDIR/_durations.txt"
-# The two tally files exist from the start, EMPTY, because their readers count
-# them with `wc -l < FILE 2>/dev/null`. That 2>/dev/null is on `wc`, but the `<`
-# redirect is performed by the SHELL, so a missing file prints
-# "No such file or directory" to the script's stderr and nothing can suppress it
-# at the call site. Every uncached run printed one; the counts were right (the
-# reader defaults to 0), so it was pure noise -- the kind that trains a reader
-# to skim a release run's stderr.
-#
-# Created here rather than guarded at each reader: there were TWO readers and
-# only one was ever reported, so the fix that scales is to remove the
-# precondition instead of defending it twice.
-: > "$LOGDIR/_skipped.txt"
-: > "$LOGDIR/_cached.txt"
 
-# Auto job count when -j was not given: leave two cores of headroom so a guest
-# isn't starved during boot/setup (starvation there -> empty serial output ->
-# spurious failure). Only parallelize with >=3 cores; otherwise stay serial.
-if [[ "$JOBS" -le 0 ]]; then
-    _ncpu=$(nproc 2>/dev/null || echo 1)
-    if [[ "$_ncpu" -ge 3 ]]; then JOBS=$(( _ncpu - 2 )); else JOBS=1; fi
-fi
+# The CPU budget when -j was not given (see the header). An explicit -jN is
+# a budget of exactly N.
+[[ "$JOBS" -le 0 ]] && JOBS=$(suite_cpu_slots)
 
 # This used to `export AXL_TLS=1` for every test subprocess, and had to: the
 # Makefile WIPED every object whenever the flag toggled, so ~64 plain tests and
@@ -161,20 +256,173 @@ fi
 # mbedTLS is unconditional now, so there is one configuration, nothing to
 # toggle and nothing to standardise. The strip contract that made this safe is
 # still enforced, by test-tls-strippable.sh.
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# EVERY PATH HANDED ON IS ABSOLUTE: ctest, the registration and the tests
+# each run from a directory of their own, and the registration refuses a
+# relative one (integration.bad-env). A relative --logdir is the caller's.
+_abs() { [[ -z "$1" || "$1" == /* ]] && printf '%s' "$1" || printf '%s/%s' "$PWD" "$1"; }
+LOGDIR=$(_abs "$LOGDIR")
+[[ -n "$CACHE_DIR" ]] && CACHE_DIR=$(_abs "$CACHE_DIR")
+[[ -n "${RUN_TEST_CACHE_DIR:-}" ]] && RUN_TEST_CACHE_DIR=$(_abs "$RUN_TEST_CACHE_DIR")
+[[ -n "${RUN_INTEGRATION_DIR:-}" ]] && RUN_INTEGRATION_DIR=$(_abs "$RUN_INTEGRATION_DIR")
+[[ -n "${RUN_PROJECT_DIR:-}" ]] && RUN_PROJECT_DIR=$(_abs "$RUN_PROJECT_DIR")
+[[ -n "${AXL_QEMU_TMPDIR:-}" ]] && AXL_QEMU_TMPDIR=$(_abs "$AXL_QEMU_TMPDIR")
+PROJECT_DIR="${RUN_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+# THE POOL. --pool: refuse a run that ASKED for it when it cannot serve it,
+# rather than quietly booting everything. No flag: the DEFAULT -- the user
+# service, when its socket accepts a connection and it serves this arch (the
+# pool exists to cut boots and wall time; Mike, 2026-11-06), else booted.
+# --no-pool boots. --ci pools as any run does (Mike, 2026-11-07: the runners
+# on this host use the pool; a runner with no service boots, said). Every
+# case SAYS which, and why. A defaulted run hands ctest AXL_IT_POOL=auto, NOT the
+# socket: the registration re-decides at run time and keeps its pool check
+# in AUTO mode, so a service that dies mid-run lets the tests boot rather
+# than failing every one. lib/pool-check.sh is the one check; a listing or
+# --print-ctest asks no service.
+if (( POOL_ASKED && NO_POOL )); then
+    echo "run-integration: --pool and --no-pool contradict each other" >&2
+    exit 2
+fi
+# (The default's decision is _pool_decide, below, made after the last
+# refusal: a refusal comes out alone, before the pool is asked anything.)
 MAKE_ARCH=x64; [[ "$ARCH" == "AARCH64" ]] && MAKE_ARCH=aa64
 
-if [[ -n "$CACHE_DIR" ]]; then
-    mkdir -p "$CACHE_DIR"
-    # Absolute: tests run with their own cwd, and run-qemu.sh is a separate
-    # process again.
-    AXL_TEST_CACHE="$(cd "$CACHE_DIR" && pwd)"; export AXL_TEST_CACHE
-fi
 
 if [[ -n "${RUN_INTEGRATION_DIR:-}" ]]; then
-    mapfile -t TESTS < <(ls "$TESTDIR"/test-*.sh 2>/dev/null)
+    # The stub directory, discovered by the same rules -- and the same
+    # discover.sh -- the registration uses (AXL_DISCOVER_DIR), so the runner
+    # and CTest select one set.
+    mapfile -t TESTS < <(AXL_DISCOVER_DIR="$RUN_INTEGRATION_DIR" discover_tree_tests --arch "$ARCH" $INCLUDE_LOCAL)
 else
-    mapfile -t TESTS < <(discover_tests --arch "$ARCH" $INCLUDE_LOCAL)
+    # What the arch's TREE registers (discover_tree_tests: no arch=none tests
+    # on AARCH64), or the run would name tests its tree does not have.
+    mapfile -t TESTS < <(discover_tree_tests --arch "$ARCH" $INCLUDE_LOCAL)
+fi
+
+# --for=<paths>: DERIVE the subset, then hand it to --only.
+#
+# THE LOOKUP IS ASKED FOR, NOT REIMPLEMENTED. scripts/which-gates.sh already
+# answers "which test names this file?", and it answers it by grepping test/
+# rather than from a table, precisely because a table drifts when a test is
+# renamed. A copy of that grep here would be the second source of truth the
+# original was written to avoid -- so this asks it, over --porcelain, and
+# never parses its prose.
+#
+# THREE OUTCOMES, THREE MESSAGES. "the lookup could not RUN", "nothing covers
+# these paths" and "something covers them but discovery selects none of it"
+# are the same empty list and three different facts; only the first is a bug
+# in the tooling and only the last has an obvious next step (run-selftests.sh,
+# usually). None of them widens to the suite: a scoping flag that falls back
+# to running everything when it is confused is worse than no flag, because the
+# confusion is invisible in a green log.
+#
+# AXL_WHICH_GATES is the self-test seam, like RUN_INTEGRATION_DIR above.
+if [[ -n "$FOR_PATHS" ]]; then
+    if [[ -n "$ONLY_TESTS" ]]; then
+        echo "run-integration: --for and --only both name a selection." >&2
+        echo "                 They are two spellings of the same thing; pick one." >&2
+        exit 2
+    fi
+    IFS=',' read -r -a _for_paths <<< "$FOR_PATHS"
+    _wg="${AXL_WHICH_GATES:-$PROJECT_DIR/scripts/which-gates.sh}"
+    if [[ ! -x "$_wg" ]]; then
+        echo "run-integration: --for needs $_wg, which is not executable." >&2
+        exit 2
+    fi
+    _wg_out=$("$_wg" --porcelain --files "${_for_paths[@]}" 2>&1); _wg_rc=$?
+    if [[ $_wg_rc -ne 0 ]]; then
+        echo "run-integration: --for: the covering-test lookup FAILED (exit $_wg_rc)." >&2
+        echo "                 That is not 'no test covers this' -- the question" >&2
+        echo "                 was never answered. Its output:" >&2
+        printf '%s\n' "$_wg_out" | sed 's/^/                     /' >&2
+        exit 2
+    fi
+    _for_missing=$(sed -n 's/^missing=//p' <<<"$_wg_out")
+    if [[ -n "$_for_missing" ]]; then
+        echo "run-integration: --for names path(s) that are not in the worktree:" >&2
+        printf '%s\n' "$_for_missing" | sed 's/^/                     /' >&2
+        echo "                 (a typo'd path covers nothing, which would" >&2
+        echo "                  otherwise read as 'no test covers this')" >&2
+        exit 2
+    fi
+    _for_cover=$(sed -n 's/^cover=//p' <<<"$_wg_out")
+    # vague= IS THE FOURTH OUTCOME, and consuming only three of them made
+    # this lie. which-gates declines to attribute a name matched by more than
+    # twelve test files, because a list that broad is not coverage -- and
+    # those are the tree's HIGHEST-coverage files (scripts/run-qemu.sh is
+    # named by 78 tests, scripts/axl by 36, the Makefile by 23). Reading only
+    # cover= turned "too common to attribute" into "no file under test/ names
+    # any of those paths", which is false, about exactly the paths where
+    # being wrong costs most.
+    _for_vague=$(sed -n 's/^vague=//p' <<<"$_wg_out")
+    if [[ -n "$_for_vague" ]]; then
+        # Worded as which-gates words it, so the two tools describe one fact
+        # the same way ("CANNOT ATTRIBUTE ... the name is too common").
+        echo "run-integration: --for: CANNOT ATTRIBUTE a covering test for these" >&2
+        echo "                 -- the name is too common to grep for, and a list" >&2
+        echo "                 that broad would not be coverage:" >&2
+        printf '%s\n' "$_for_vague" | sed 's/^/                     /' >&2
+        echo "                 Find the real consumer by grepping the SYMBOL or" >&2
+        echo "                 STRING you changed, and name it with --only." >&2
+    fi
+    if [[ -z "$_for_cover" ]]; then
+        echo "run-integration: --for=$FOR_PATHS resolved to NO covering test." >&2
+        if [[ -z "$_for_vague" ]]; then
+            echo "                 No file under test/ names any of those paths." >&2
+        fi
+        echo "                 Refusing to widen to the ${#TESTS[@]}-test suite:" >&2
+        echo "                 run it deliberately if that is what you want." >&2
+        exit 2
+    fi
+    # Intersect with DISCOVERY, which is the authority on what this runner can
+    # run -- which-gates deliberately reports lib/*.sh helpers and
+    # *-selftest.sh files too, and neither is a discovered test.
+    declare -a _for_run=() _for_drop=()
+    while IFS= read -r _c; do
+        [[ -n "$_c" ]] || continue
+        _cb=$(discover_test_basename "$_c"); _hit=""
+        for _t in "${TESTS[@]}"; do
+            _tb=$(discover_test_basename "$_t")
+            if [[ "$_tb" == "$_cb" ]]; then _for_run+=("$_cb"); _hit=1; break; fi
+        done
+        [[ -n "$_hit" ]] || _for_drop+=("$_c")
+    done <<<"$_for_cover"
+    if [[ ${#_for_run[@]} -eq 0 ]]; then
+        # ONE LINE for the discriminating phrase. Split over two, it cannot
+        # be grepped for -- and the assertion that tells this case apart from
+        # "nothing covers it" is exactly such a grep.
+        echo "run-integration: --for: covering file(s) found, but none is a runnable test (--arch $ARCH):" >&2
+        printf '%s\n' "${_for_drop[@]}" | sed 's/^/                     /' >&2
+        echo "                 A lib/ helper is not a test; a *-selftest.sh runs" >&2
+        echo "                 under scripts/run-selftests.sh, not here. Run those," >&2
+        echo "                 or name a real test with --only." >&2
+        exit 2
+    fi
+    # PRINT WHAT WAS CHOSEN, and what was not. A derived selection the human
+    # cannot see is a selection they cannot veto.
+    echo "for: ${#_for_paths[@]} path(s) -> ${#_for_run[@]} covering test(s)," \
+         "derived by $(basename "$_wg") --porcelain:"
+    printf '    %s\n' "${_for_run[@]}"
+    if (( ${#_for_drop[@]} )); then
+        # NAMES THE CAUSES DISCOVERY ACTUALLY HAS, not two of five.
+        # lib/discover.sh also drops test-axl.sh/test-all.sh, an arch=
+        # mismatch, and local-only=1 under --ci -- so under --ci or
+        # --arch AARCH64 a two-cause explanation names a reason that does
+        # not apply.
+        echo "for: ${#_for_drop[@]} covering file(s) DROPPED --"
+        discover_drop_explanation "$ARCH" "${INCLUDE_LOCAL:+, local-only included}" | sed 's/^/     /'
+        printf '    %s\n' "${_for_drop[@]}"
+    fi
+    # A vague path in a selection that PROCEEDS must still be reported, or
+    # "2 path(s) -> 1 covering test(s)" reads as both accounted for and the
+    # caller believes a green run covered a file nothing in it touched.
+    if [[ -n "$_for_vague" ]]; then
+        echo "for: and the path(s) above that could not be attributed are NOT covered by"
+        echo "     this run -- it is narrower than the ${#_for_paths[@]} path(s) you named."
+    fi
+    # Hand off to --only, which already refuses a name discovery did not find,
+    # already marks the run PARTIAL. (No run of this script writes the release
+    # stamp any more; scripts/release-suite.sh does.)
+    ONLY_TESTS=$(IFS=,; echo "${_for_run[*]}")
 fi
 
 # --only selection, before sharding: a caller naming tests wants those tests,
@@ -251,6 +499,10 @@ fi
 # already exists and needs no new metadata. It is an ESTIMATE: being wrong
 # costs some packing efficiency and nothing else, since order cannot change a
 # result. Ties keep discovery order (`sort -s`), so a run stays reproducible.
+#
+# UNDER CTEST this orders only --list and the printed selection: ctest
+# schedules by each test's COST, which the registration sets from the same
+# est=, so the run itself starts longest-first all the same.
 if [[ ${#TESTS[@]} -gt 1 ]]; then
     mapfile -t TESTS < <(
         for _t in "${TESTS[@]}"; do
@@ -261,22 +513,65 @@ if [[ ${#TESTS[@]} -gt 1 ]]; then
     )
 fi
 
-# Warn when --timeout is too tight for what was selected. stderr only, so
-# --list's stdout stays machine-parseable. Every test declares
-# an `est=` in its test-meta header, and a test that blows the wall clock is
-# reported as a TIMEOUT with no hint that the limit -- not the test -- was the
-# problem. Under the parallel pool a test routinely takes well over its est
-# (that is why run_one retries at all), so the bar is 2x rather than 1x.
-if [[ ${#TESTS[@]} -gt 0 ]]; then
-    _max_est=0; _max_est_name=""
+# EVERY SELECTED TEST'S est= MUST FIT THE PER-TEST LIMIT. One rule, applied
+# three ways:
+#   - `gate.check-test-est` FAILS on it (scripts/check-test-est.py, against
+#     the x64-ci preset CI now runs).
+#   - A `--ci` run that takes CI's limit (no --timeout of its own) REFUSES to
+#     start on it, so CI checks itself even on a push that skipped the gate:
+#     the invocation that applies the limit also refuses what the limit
+#     cannot hold, in seconds instead of after the suite has run.
+#   - Any other run WARNS on stderr: advice for a hand-picked --timeout.
+#
+# THE BAR IS est ITSELF, NOT A MULTIPLE OF IT. This warning used to fire at
+# 2 x est, on the premise that "under the parallel pool a test routinely takes
+# well over its est". The estimates do not mean that any more: since
+# a18c783c the convention is to set est from a POOLED run, x1.3 + 2 for
+# headroom, so the pool is already inside the number. Measured across five CI
+# runs (6 workers, 2026-09-05 to 09-18), no test with est >= 50 ran past
+# 1.02 x its est; the largest overrun anywhere was 2 s. At 2 x, three tests CI
+# has passed every time would fail the gate -- test-cpu-spike-qemu.sh (est
+# 233, ran 169-170 s), test-host-toolchain-qemu.sh (180, ran 3-4 s) and
+# test-consumer-install.sh (150, ran 43-51 s) -- which grades the estimates'
+# padding, not the risk.
+#
+# IT GRADES WHAT A TEST DECLARES, NOT WHAT IT TAKES. An est that understates
+# its test is invisible to it -- which is exactly how test-ssh-hostile-qemu.sh
+# got killed: est=250 was its unpadded standalone time, against 240. The
+# convention is the only defence; set est by it.
+#
+# Prints one line per selected test the limit cannot hold, including one
+# whose est is not a number -- an estimate that cannot be read cannot be said
+# to fit.
+est_offenders() {
+    local t e
     for t in "${TESTS[@]}"; do
-        _e=$(test_meta_field "$t" est 2>/dev/null)
-        [[ "$_e" =~ ^[0-9]+$ ]] || continue
-        if [[ "$_e" -gt "$_max_est" ]]; then _max_est="$_e"; _max_est_name=$(basename "$t"); fi
+        e=$(test_meta_field "$t" est 2>/dev/null)
+        if [[ ! "$e" =~ ^[0-9]+$ ]]; then
+            printf '%s: est=%s is not a number\n' "$(basename "$t")" "$e"
+        elif [[ "$e" -gt "$TIMEOUT" ]]; then
+            printf '%s: est=%ss > %ss\n' "$(basename "$t")" "$e" "$TIMEOUT"
+        fi
     done
-    if [[ "$_max_est" -gt 0 && "$TIMEOUT" -lt $(( _max_est * 2 )) ]]; then
-        echo "warning: --timeout ${TIMEOUT}s is tight for $_max_est_name (est=${_max_est}s)." >&2
-        echo "         Under -j${JOBS} a test commonly exceeds its est; consider --timeout $(( _max_est * 2 ))s or more." >&2
+}
+
+# The offender list, as the gate and the --ci refusal both print it.
+est_report() {   # $1 = the heading's lead-in
+    echo "$1 -- $(printf '%s\n' "$2" | grep -c .) test(s) declare an est= the ${TIMEOUT}s per-test limit cannot hold:"
+    printf '%s\n' "$2" | sed 's/^/    /'
+    echo "  Split the test, or measure it and correct its est (pooled time x1.3 + 2)."
+    echo "  Raising the limit is a CI decision: AXL_IT_TIMEOUT in the x64-ci test preset (CMakePresets.json)."
+}
+
+if [[ ${#TESTS[@]} -gt 0 ]]; then
+    _off=$(est_offenders)
+    if [[ -n "$_off" && "$CI_MODE" -eq 1 && "$TIMEOUT_SET" -eq 0 ]]; then
+        est_report "run-integration: --ci REFUSES to start" "$_off" >&2
+        exit 2
+    elif [[ -n "$_off" ]]; then
+        echo "warning: the ${TIMEOUT}s per-test limit cannot hold:" >&2
+        printf '%s\n' "$_off" | sed 's/^/           /' >&2
+        echo "         Those tests will be killed at the limit, not failed by a check." >&2
     fi
 fi
 
@@ -285,341 +580,249 @@ if [[ $LIST_ONLY -eq 1 ]]; then
     exit 0
 fi
 
-# Build ONCE up front (real mode only; the self-test seam uses stubs that need
-# no build). This populates the shared prefix before the pool starts, so the
-# per-test makes that follow are consistent-flag no-ops instead of a thundering
-# herd of concurrent first-builds. --no-build skips it (CI builds in a prior job).
-if [[ -z "${RUN_INTEGRATION_DIR:-}" && "${RUN_NO_BUILD:-0}" != "1" ]]; then
-    echo "pre-building once (ARCH=$MAKE_ARCH all tests tools axl-busybox)..."
-    if ! make -C "$PROJECT_DIR" ARCH="$MAKE_ARCH" all tests tools axl-busybox \
-            > "$LOGDIR/_prebuild.log" 2>&1; then
-        echo "pre-build FAILED — see $LOGDIR/_prebuild.log"; exit 1
-    fi
+# A caller's AXL_QEMU_TMPDIR is used as-is (see own_qtmp below), and tests make
+# UNIX sockets under it. Check it ONCE, before the pre-build: too long, and
+# every test's own check would refuse it one by one, which reads as a broken
+# suite rather than one wrong setting.
+if [[ -n "${AXL_QEMU_TMPDIR:-}" ]]; then
+    axl_test_tmpdir_check "$AXL_QEMU_TMPDIR" || exit 1
 fi
 
-# A STALE STAGED SDK is a precondition, not a test result.
-#
-# Several tests assert that the staged include/axl-sdk/axl matches include/axl,
-# because they exercise the STAGED copy and an unstaged header edit means they
-# silently report on the previous one. That assertion is right, but as a
-# per-test failure it is diagnosis-hostile: editing one public header surfaces
-# as two unrelated-looking C++ tests failing at the END of a seven-minute run,
-# and the reader has to open a log to learn the cause is one missing command.
-# It happened twice in one evening, and cost a re-run each time.
-#
-# So it is checked ONCE, here, before anything runs. Same condition, same
-# remedy, stated when it is cheap to act on. The per-test assertions stay --
-# they are what protects a test run from a stage that goes stale MID-run, which
-# this cannot see.
-if [[ -d "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/include/axl-sdk/axl" ]]; then
-    if ! diff -rq "$PROJECT_DIR/include/axl" \
-                  "$("$PROJECT_DIR/scripts/sdk-prefix.sh" --abs)/include/axl-sdk/axl" >"$LOGDIR/_stage.diff" 2>&1; then
-        echo
-        echo "*** STAGED SDK IS STALE — run: ./scripts/install.sh --arch all --cpp"
-        echo "    include/axl and the staged copy differ, so any test that"
-        echo "    exercises the staged SDK would report on the PREVIOUS build."
-        sed 's/^/      /' "$LOGDIR/_stage.diff" | head -8
-        echo
-        exit 1
-    fi
-fi
-
-# Run one test under a timeout. Host ports are NOT assigned here: each test
-# claims its own from the shared allocator in scripts/axl-common.sh (see
-# common-test.sh's test_port), which verifies each port is free right now and
-# holds it for the test's lifetime.
-#
-# This used to be `TEST_PORT_BASE=$((20000 + idx*200))`. That kept ONE
-# invocation's tests apart but nothing else: a second run-integration.sh —
-# another developer, a consumer repo's suite, a second agent — derives the
-# identical bases and collides on every one of them. Worse, the retry below
-# reused the same base, so a genuine collision was retried straight into it.
-# Leaving TEST_PORT_BASE unset is what routes both attempts through the
-# allocator, so a retry draws different ports.
-# Write the runner's OWN per-test duration to the profile. Not a second
-# measurement of the same thing -- it IS the measurement run_one already makes
-# and prints, written where profile-report.py can read it. The report needs
-# totals for all 164 tests to derive seconds-per-boot for the ones instrumented
-# by count only (see scripts/run-qemu.sh).
-_prof_test_total() {
-    # Always recorded, profile or not: the totals line at the end reports how
-    # much test work the run actually did, and that number is what makes the
-    # difference between "the suite is slow" and "there are 47 minutes of work
-    # in it" a measurement rather than an argument. One append per test.
-    printf '%s\n' "$2" >> "$LOGDIR/_durations.txt"
-    [[ -n "${AXL_TEST_PROFILE:-}" ]] || return 0
-    printf 'test|%s|%s\n' "$1" "$2" >> "$AXL_TEST_PROFILE"
-}
-
-run_one() {  # <idx> <test_path>
-    local idx="$1" t="$2" name start dur rc
-    name=$(basename "$t"); start=$SECONDS
-    # Name the profile records for this test. run-qemu.sh runs as a separate
-    # process and has no other way to know which test launched it.
-    export AXL_TEST_PROFILE_NAME="$name"
-
-    # SKIP CACHE. Decided here and nowhere else, because this is the only place
-    # that sees every test exactly once -- common-test.sh's test_setup runs
-    # three times in some tests, and the run-qemu-only tests never reach it.
-    if [[ -n "$CACHE_DIR" ]] && cache_is_fresh "$name"; then
-        dur=$(( SECONDS - start ))
-        echo "  $name CACHED ${dur}s (inputs identical to its last green run)"
-        echo "$name" >> "$LOGDIR/_cached.txt"
-        return 0
-    fi
-    # A real run rewrites the input list from scratch, so a test that stages
-    # FEWER things than last time does not inherit stale entries.
-    [[ -n "$CACHE_DIR" ]] && cache_begin_inputs "$name"
-    timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
-    rc=$?
-    # 77 = SKIPPED (the automake convention). Handled BEFORE the retry, because
-    # a test that cannot run will not run any better the second time, and
-    # before the cache, because the reason it skipped -- an absent corpus, a
-    # missing host tool -- is not in the key, so committing one would skip it
-    # forever afterwards.
-    if [[ $rc -eq 77 ]]; then
-        dur=$(( SECONDS - start ))
-        _prof_test_total "$name" "$dur"
-        [[ -n "$CACHE_DIR" ]] && cache_invalidate "$name"
-        echo "$name" >> "$LOGDIR/_skipped.txt"
-        echo "  $name SKIP ${dur}s ($(grep -m1 -oE 'SKIP[:( ].{0,60}' "$LOGDIR/$name.log" 2>/dev/null || echo 'declined to run'))"
-        return 0
-    fi
-    if [[ $rc -ne 0 ]]; then
-        # Retry once. Most failures under the parallel pool are transient
-        # resource-contention flakes (a QEMU starved during boot emits empty
-        # serial output -> the test's greps miss). A genuine failure fails
-        # again. Preserve the first attempt's log for post-mortem and let the
-        # host drain briefly before the retry so the contention can ease.
-        cp -f "$LOGDIR/$name.log" "$LOGDIR/$name.attempt1.log" 2>/dev/null
-        sleep 3
-        timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
-        rc=$?
-        if [[ $rc -eq 0 ]]; then
-            dur=$(( SECONDS - start ))
-            _prof_test_total "$name" "$dur"
-            [[ -n "$CACHE_DIR" ]] && cache_commit "$name"
-            echo "  $name PASS ${dur}s (retry; attempt 1 failed — see $name.attempt1.log)"
-            return 0
-        fi
-    fi
-    dur=$(( SECONDS - start ))
-    _prof_test_total "$name" "$dur"
-    if [[ $rc -eq 0 ]]; then
-        [[ -n "$CACHE_DIR" ]] && cache_commit "$name"
-        echo "  $name PASS ${dur}s"; return 0
-    fi
-    # A red test must never be skippable next time, even if its inputs are
-    # somehow identical again.
-    [[ -n "$CACHE_DIR" ]] && cache_invalidate "$name"
-    # Failure/timeout (twice): replay the test's captured output (logs live in
-    # an ephemeral dir that CI discards, so surface the reason inline). Tail
-    # keeps the job log readable when many tests fail at once.
-    if [[ $rc -eq 124 ]]; then
-        # Name the declared est: a TIMEOUT is ambiguous between "the test hung"
-        # and "the limit was too low for it", and the metadata already knows.
-        local est; est=$(test_meta_field "$t" est 2>/dev/null)
-        if [[ "$est" =~ ^[0-9]+$ ]]; then
-            echo "  $name TIMEOUT ${dur}s (after retry; test declares est=${est}s, limit was ${TIMEOUT}s)"
-        else
-            echo "  $name TIMEOUT ${dur}s (after retry)"
-        fi
+# THE POOL DECISION, for a run that did not ask (see "THE POOL" above).
+# _pool_decide QUERY -- QUERY 0 (--print-ctest): ask no service; a defaulted
+# run hands ctest AXL_IT_POOL=auto and the registration decides at run time.
+# QUERY 1 (a real run): called after EVERY refusal -- the tree-busy check
+# and owner drift included -- so a refusal comes out alone, before the pool
+# is asked anything; prints one "run-integration: pool..." line. The service
+# must ANSWER and serve this arch (lib/pool-check.sh, auto mode): a socket
+# that accepts is not enough, the installed unit is socket-activated.
+_pool_decide() {
+    local query="$1" dsock say=""
+    dsock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/axlpool/pool.sock"
+    if (( NO_POOL )); then
+        say="pool: off (--no-pool) -- guest= tests boot"
+    elif (( ! query )); then
+        [[ -S "$dsock" ]] && POOL_AUTO=1   # what a real run would hand ctest
+    elif [[ ! -S "$dsock" ]]; then
+        say="pool: none (no service at $dsock) -- guest= tests boot"
+    elif _pool_status=$("$SCRIPT_DIR/lib/pool-check.sh" "$dsock" "$ARCH" "$PROJECT_DIR" \
+                            "run-integration" auto) && [[ "$_pool_status" != "pool: unavailable"* ]]; then
+        POOL_AUTO=1
+        say="pool (default): $_pool_status"
     else
-        echo "  $name FAIL ${dur}s (after retry)"
+        say="$_pool_status"
     fi
-    echo "    --- $name output (last 25 lines) ---"
-    tail -n 25 "$LOGDIR/$name.log" 2>/dev/null | sed 's/^/    | /'
-    echo "    --- end $name ---"
-    return 1
-}
-
-# Give every run-qemu invocation a per-run temp base we own (on tmpfs when
-# available) and remove it wholesale at exit. run-qemu honors AXL_QEMU_TMPDIR
-# for its disk-image/pflash scratch, so this guarantees no per-run temp dir
-# leaks regardless of which run-qemu mode a test uses — the background /
-# --mount / --cpu-report paths have their own cleanup lifecycles that get
-# skipped when the launcher is killed (8.6 GB of such leaks were found
-# accumulating). Respect a caller-provided base (don't delete what we didn't
-# create).
-own_qtmp=0
-if [[ -z "${AXL_QEMU_TMPDIR:-}" ]]; then
-    qbase=/tmp; [[ -d /dev/shm && -w /dev/shm ]] && qbase=/dev/shm
-    AXL_QEMU_TMPDIR=$(mktemp -d -p "$qbase" axl-itest.XXXXXX)
-    export AXL_QEMU_TMPDIR
-    own_qtmp=1
-fi
-
-# Job pool: at most JOBS tests in flight. Each finished test writes its exit
-# status (0 = pass) to results/<idx>; we tally after the barrier.
-results=$(mktemp -d)
-
-# Cleaning up a signalled run has two halves, and both are needed.
-#
-# Half 1 -- the workers. They are background jobs, so the runner exiting does
-# NOT stop them. Left alive they see their test "fail", hit run_one's
-# retry-once path, and relaunch a guest INTO the tree that was just deleted,
-# recreating the leak moments after it was cleaned. They cannot be matched by
-# command line (a subshell shares this script's argv), so they are tracked by
-# PID and killed by descent -- the test script, its `timeout` wrapper and the
-# guest all sit below them.
-WORKERS=()
-
-# STOP before descending, KILL after. Signalling a worker's child first and the
-# worker second loses a race: the retry path sees the child die and relaunches,
-# and the replacement appears after the walk has already passed that branch. A
-# stopped process cannot fork, which closes the race rather than narrowing it.
-# KILL, not TERM, because a STOPped process does not act on TERM until it is
-# continued.
-_kill_tree() {
-    local pid="$1" c
-    kill -STOP "$pid" 2>/dev/null
-    for c in $(pgrep -P "$pid" 2>/dev/null); do
-        _kill_tree "$c"
-    done
-    kill -KILL "$pid" 2>/dev/null
-}
-
-kill_worker_trees() {
-    local pid
-    for pid in "${WORKERS[@]:-}"; do
-        [[ -n "$pid" ]] || continue
-        _kill_tree "$pid"
-    done
-}
-
-# Half 2 -- the guests, reaped BEFORE their disks are removed and never after.
-# A guest that outlives its disk keeps it open as a DELETED inode: the
-# directory is gone, so every directory-based check reports clean while tmpfs
-# cannot reclaim the pages. `du` cannot see it; only a `df` delta can. 365 MB
-# accumulated that way from five orphans of a single interrupted run.
-#
-# This is a belt-and-braces pass for anything the worker walk missed (a guest
-# already reparented to init, say). Two filters, and BOTH matter:
-#
-#   - the run's own temp dir, which every guest carries on its command line via
-#     `-drive file=$TMPDIR/...`; and
-#   - the process actually being a guest.
-#
-# The second is not redundant. `pgrep -f` matches any process whose command
-# line merely CONTAINS the path, which in practice includes an editor, a
-# grep, or an agent shell that happens to mention it -- killing one of those
-# would be far worse than the leak. run-qemu.sh's sweeper can use the path
-# alone because a false match there means "don't delete" (harmless); here a
-# false match would mean "kill it", so the comm check is what keeps this from
-# being the blanket `pkill qemu-system` it must never become.
-_guest_pids() {
-    local base="$1" pid comm
-    for pid in $(pgrep -f -- "$base" 2>/dev/null); do
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
-        case "$comm" in
-            qemu-system*|virtiofsd) echo "$pid" ;;
-        esac
-    done
-}
-
-reap_pool() {
-    local base="$1" i pids
-    [[ -n "$base" ]] || return 0
-    pids=$(_guest_pids "$base"); [[ -n "$pids" ]] || return 0
-    # shellcheck disable=SC2086
-    kill -TERM $pids 2>/dev/null
-    # Bounded wait, then escalate. Without the wait, the rm below can still
-    # beat a slow guest and recreate the very leak this exists to prevent.
-    for ((i = 0; i < 40; i++)); do
-        pids=$(_guest_pids "$base"); [[ -n "$pids" ]] || return 0
-        sleep 0.25
-    done
-    # shellcheck disable=SC2086
-    kill -KILL $pids 2>/dev/null
-    sleep 0.2
-}
-
-# Note what is NOT here: kill_worker_trees. On a normal exit the pool has
-# already been reaped by `wait`, so those PIDs are stale -- and a stale PID is
-# not merely a no-op to signal, it may have been RECYCLED to an unrelated
-# process by then (this box wraps its PID counter routinely). Killing by
-# remembered PID is only safe on the signal path, where the workers are known
-# to still be ours. reap_pool stays: it resolves live processes by path AND
-# comm every time, so it has no stale-PID exposure and still catches a guest
-# that somehow outlived a clean run.
-_cleanup() {
-    reap_pool "${AXL_QEMU_TMPDIR:-}"
-    rm -rf "$results"
-    [[ "$own_qtmp" == 1 ]] && rm -rf "$AXL_QEMU_TMPDIR"
+    # Said by _pool_say, after the last refusal; an unexplained failure still
+    # says something (every run says which, and why).
+    if (( query )) && [[ -z "$say" ]] && (( ! POOL_AUTO )); then
+        say="pool: unavailable (lib/pool-check.sh gave no reason) -- guest= tests boot"
+    fi
+    POOL_SAY="$say"
     return 0
 }
-
-# One handler for both signals, so the selftest's SIGTERM case exercises the
-# identical body the SIGINT path uses. (It cannot drive SIGINT directly: a
-# background job of a non-interactive shell starts with SIGINT *ignored*
-# -- /proc SigIgn carries bit 2 -- and bash cannot trap a signal ignored on
-# entry, so `kill -INT` at the runner is swallowed. A terminal Ctrl-C is a
-# different delivery: it reaches the whole foreground process group, where the
-# runner is not a background job and this trap does fire.)
-#
-# The signal handlers exit; the EXIT handler preserves the script's own status.
-# Without an explicit exit, bash runs the handler and then RESUMES the `wait`
-# below, so a signalled runner would delete the tree and keep running.
-_signal_exit() {
-    trap - EXIT
-    kill_worker_trees
-    _cleanup
-    exit "$1"
-}
-trap '_rc=$?; _cleanup; exit $_rc' EXIT
-trap '_signal_exit 130' INT
-trap '_signal_exit 143' TERM
-# HUP and PIPE deliberately get no handler of their own. Measured: bash runs
-# the EXIT trap even for untrapped fatal signals, so `... | head -3` (SIGPIPE)
-# and a closed terminal (SIGHUP) already clean up through the line above.
-# Adding traps for them would look protective while changing nothing but the
-# exit status. SIGKILL is the one that truly escapes; run-qemu.sh's stale-dir
-# sweeper is the net for it.
-
-idx=0; running=0
-for t in "${TESTS[@]}"; do
-    ( run_one "$idx" "$t"; echo $? > "$results/$idx" ) &
-    WORKERS+=($!)
-    idx=$((idx+1)); running=$((running+1))
-    if [[ $running -ge $JOBS ]]; then
-        wait -n 2>/dev/null || true
-        running=$((running-1))
-    fi
-done
-wait
-
-pass=0; failc=0
-for f in "$results"/*; do
-    if [[ "$(cat "$f")" == "0" ]]; then pass=$((pass+1)); else failc=$((failc+1)); fi
-done
-
-echo ""
-_nskip=$(wc -l < "$LOGDIR/_skipped.txt" 2>/dev/null | tr -d ' ' || echo 0)
-[[ -n "$_nskip" ]] || _nskip=0
-# Skips are reported in the headline, not buried. A suite that skipped a third
-# of itself and said "N passed" is the same failure shape as a gate that cannot
-# see the change it was run for.
-if [[ "$_nskip" -gt 0 ]]; then
-    echo "integration: $pass passed, $failc failed, $_nskip SKIPPED ($ARCH)"
-    sed 's/^/    skipped: /' "$LOGDIR/_skipped.txt"
-else
-    echo "integration: $pass passed, $failc failed ($ARCH)"
+POOL_SAY=""
+_pool_say() { [[ -n "$POOL_SAY" ]] && echo "run-integration: $POOL_SAY"; return 0; }
+# Absolute: ctest and its tests run from other directories than the caller.
+[[ -n "$POOL_SOCK" && "$POOL_SOCK" != /* ]] && POOL_SOCK="$PWD/$POOL_SOCK"
+if (( POOL_ASKED )) && [[ "${LIST_ONLY:-0}" != 1 && "$PRINT_CTEST" != 1 ]]; then
+    _pool_status=$("$SCRIPT_DIR/lib/pool-check.sh" "$POOL_SOCK" "$ARCH" "$PROJECT_DIR" \
+                       "run-integration: --pool") || exit 2
+    POOL_SAY="$_pool_status"   # said after the other refusals (_pool_say)
 fi
 
-# WALL TIME, WORKERS, and the work that was actually done. Without these the
-# suite's cost is invisible and every conversation about it is a guess: the
-# honest shape is ~47 minutes of test work packed into $JOBS workers, so the
-# floor is (summed work / JOBS), not the slowest test. Printing all three shows
-# which one you are up against, and whether the cache is doing its job.
-#
-# JOBS defaults to nproc-2 deliberately -- these are timing-sensitive QEMU
-# guests, and a saturated host makes them flake. That is a correctness choice,
-# not a tuning oversight; raise it only for a run whose failures you are
-# prepared to re-triage.
+# ---------------------------------------------------------------------------
+# THE RUN IS CTEST'S. Everything above chose what to run and refused what it
+# should; from here this only translates that into ONE ctest call on the
+# arch's tree, and renders the result. The worker pool, cache decision, retry
+# and reaper this script used to carry are CTest's and lib/run-one.sh's.
+# ---------------------------------------------------------------------------
+# The REAL tree, always: RUN_PROJECT_DIR is the self-test's stub project for
+# the prep's builds, handed on to the prep below -- it has no ctest tree.
+# -P: the registration names the tree by its real path (CMake's binary
+# dir), so a symlinked spelling here would read as owner-record drift.
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+TREE="$REPO_DIR/build/${MAKE_ARCH}-debug"
+# The pinned CMake and ctest (scripts/axl-cmake-pin.sh), for the prep, ctest
+# and every test it runs; cts_tree_current below redoes a tree another cmake
+# configured before ctest reads its registration.
+# shellcheck source=../../scripts/axl-cmake-pin.sh
+source "$REPO_DIR/scripts/axl-cmake-pin.sh"
+axl_use_pinned_cmake || exit 2
+# ctest in a session of its own, taken down whole on an interrupt; the tree
+# checks; the guest reap by path (lib/ctest-session.sh, shared with verify.sh).
+# shellcheck source=lib/ctest-session.sh
+source "$SCRIPT_DIR/lib/ctest-session.sh"
+CTS_WHO=run-integration
+# The tree's owner record (lib/ctest-tmpbase.sh; the registration's
+# ${_logs}/.run-owner): computed, not read from the registration, so it can
+# be asked BEFORE anything -- a reconfigure included -- touches a tree another
+# run is using.
+QOWNER="$TREE/integration-logs${RUN_INTEGRATION_DIR:+-stub}/.run-owner"
+_print_logdir="${LOGDIR:-<a fresh mktemp -d>}"
+[[ $PRINT_CTEST -eq 1 ]] || { [[ -z "$LOGDIR" ]] && LOGDIR=$(mktemp -d); }
+_ld="${LOGDIR:-$_print_logdir}"
+
+# WHAT THE RUNNER DOES NOT SET, IT DOES NOT PASS ON. A caller's run settings
+# -- its shell's, or an outer ctest run's, whose tests carry them -- would
+# override a flag (an inherited AXL_TEST_CACHE re-enables the cache under
+# --no-cache; AXL_IT_POOL turns the pool on) or this run's prep. The old
+# runner unset AXL_TEST_CACHE and AXL_ONE_POOL_SOCK for the same reason.
+# The list is the library's (cts_inherited), shared with verify.sh.
+declare -a CT_UNSET=()
+mapfile -t CT_UNSET < <(cts_inherited)
+declare -a CT_UNSET_ARGS=()
+for _v in ${CT_UNSET[@]+"${CT_UNSET[@]}"}; do CT_UNSET_ARGS+=(-u "$_v"); done
+
+# THE ARGV IS BUILT ONCE: --print-ctest prints exactly what would run.
+declare -a CT_ENV=() CT_ARGS=()
+CT_ENV+=("AXL_IT_LOGDIR=$_ld" "AXL_IT_TIMEOUT=$TIMEOUT")
+if [[ -z "$CACHE_DIR" ]]; then
+    CT_ENV+=("AXL_IT_CACHE=0")
+elif [[ -n "${RUN_TEST_CACHE_DIR:-}" ]]; then
+    CT_ENV+=("AXL_IT_CACHE_DIR=$CACHE_DIR")
+fi
+[[ -n "$POOL_SOCK" ]] && CT_ENV+=("AXL_IT_POOL=$POOL_SOCK")
+[[ "${RUN_NO_BUILD:-0}" == 1 ]] && CT_ENV+=("RUN_NO_BUILD=1")
+[[ -n "${RUN_INTEGRATION_DIR:-}" ]] && CT_ENV+=("AXL_IT_DIR=$RUN_INTEGRATION_DIR")
+[[ -n "${RUN_PROJECT_DIR:-}" ]] && CT_ENV+=("RUN_PROJECT_DIR=$RUN_PROJECT_DIR")
+[[ -n "${AXL_QEMU_TMPDIR:-}" ]] && CT_ENV+=("AXL_IT_QEMU_TMPDIR=$AXL_QEMU_TMPDIR")
+CT_ARGS=(ctest --test-dir "$TREE" --tests-from-file "$_ld/_selected.txt" -j "$JOBS")
+CT_ARGS+=(--no-tests=error --output-junit "$_ld/ctest-junit.xml"
+          --test-output-size-passed 65536 --test-output-size-failed 65536)
+
+_names() { local t; for t in ${TESTS[@]+"${TESTS[@]}"}; do echo "integration.$(basename "$t" .sh)"; done; }
+
+if [[ $PRINT_CTEST -eq 1 ]]; then
+    (( POOL_ASKED )) || _pool_decide 0
+    (( POOL_AUTO )) && CT_ENV+=("AXL_IT_POOL=auto")
+    # printf repeats its format for NO arguments too: guard the lists that
+    # can be empty, or they print a bare "ctest-unset: " line.
+    (( ${#CT_UNSET[@]} )) && printf 'ctest-unset: %s\n' "${CT_UNSET[@]}"
+    printf 'ctest-env: %s\n' "${CT_ENV[@]}"
+    (( ${#TESTS[@]} )) && printf 'ctest-prep-tests: %s\n' "${TESTS[@]}"
+    _names | sed 's/^/ctest-test: /'
+    printf 'ctest:'; printf ' %q' "${CT_ARGS[@]}"; echo
+    exit 0
+fi
+
+# AN EMPTY SELECTION RUNS NOTHING (an empty shard, --only-local on an arch
+# with none): never hand ctest an empty --tests-from-file, which ran the
+# whole tree.
+if (( ${#TESTS[@]} == 0 )); then
+    echo "integration: 0 passed, 0 failed ($ARCH)"
+    echo "integration: no test was selected -- nothing ran."
+    echo "logs: $LOGDIR"
+    exit 0
+fi
+
+# ONE RUN PER TREE, asked FIRST. The registration's temp-base fixture refuses
+# a second concurrent run too, but that shows as every test NOT RUN -- and
+# by then a reconfigure here could already have rewritten the tree under the
+# live run.
+# (lib/ctest-session.sh: the tree helpers shared with verify.sh.)
+# The default's service query is made HERE, before the ownership check, so
+# it does not widen the window between that check and this run's owner
+# record; what it found is said after the last refusal (_pool_say).
+(( POOL_ASKED )) || _pool_decide 1
+if _owner=$(cts_tree_busy "$QOWNER"); then
+    echo "run-integration: another ctest run (pid $_owner) is using $TREE" >&2
+    echo "                 (owner record $QOWNER). One run per tree at a time;" >&2
+    echo "                 wait for it, or use the other arch's tree." >&2
+    exit 2
+fi
+
+mkdir -p "$LOGDIR"
+cts_tree_current "$TREE" "${MAKE_ARCH}-debug" "$REPO_DIR" "$LOGDIR/_configure.txt" || exit 2
+
+# The temp base, from the setup fixture's own command: where this run's
+# guests and disks will live, for the reap below. Its owner record must be
+# the one computed above, or the pre-check guarded nothing.
+_CT_FULLENV=(${CT_UNSET_ARGS[@]+"${CT_UNSET_ARGS[@]}"} "${CT_ENV[@]}")
+if ! cts_tree_base "$TREE" _CT_FULLENV; then
+    echo "run-integration: cannot read $TREE's temp-base fixture (integration.tmp-setup)" >&2
+    echo "                 -- is the tree's integration registration broken? ctest -N -V says:" >&2
+    printf '%s\n' "${CTS_BASE_RAW:-<nothing>}" | sed 's/^/                     /' >&2
+    exit 2
+fi
+QBASE="$CTS_BASE"
+if [[ "$CTS_OWNER_REG" != "$QOWNER" ]]; then
+    echo "run-integration: the registration's owner record ($CTS_OWNER_REG) is not the one" >&2
+    echo "                 this script checked ($QOWNER) -- the two have drifted." >&2
+    exit 2
+fi
+
+_pool_say
+(( POOL_AUTO )) && CT_ENV+=("AXL_IT_POOL=auto")
+_names > "$LOGDIR/_selected.txt"
+# This run's report and tallies only: a reused --logdir must not lend a run
+# that wrote none the previous run's JUnit file.
+rm -f "$LOGDIR/ctest-junit.xml"
+: > "$LOGDIR/_durations.txt"; : > "$LOGDIR/_skipped.txt"; : > "$LOGDIR/_cached.txt"
+# The prep builds the SELECTION's fixtures, not every registered test's.
+CT_ENV+=("AXL_PREP_TESTS=$(printf '%s\n' "${TESTS[@]}")")
+
+
+# An interrupt takes the run down with the library's cts_take_down: it asks
+# whether THIS run owns the tree (the owner record names its ctest) BEFORE the
+# kill, kills, then -- only if it did -- reaps the guests and removes what the
+# cleanup fixture would have (the temp base, never a caller's, and the owner
+# record). A run that lost the race to another must not kill that run's
+# guests or remove its base, which sits at the same path.
+_on_signal() {
+    local sig="$1"
+    cts_take_down
+    echo "run-integration: interrupted (SIG$sig) -- logs: $LOGDIR" >&2
+    case "$sig" in INT) exit 130 ;; HUP) exit 129 ;; *) exit 143 ;; esac
+}
+trap '_on_signal INT' INT
+trap '_on_signal TERM' TERM
+# A dropped terminal (SSH) is a hangup: without this the run would carry on
+# in its own session, guests and all, holding the tree's owner record.
+trap '_on_signal HUP' HUP
+# Any other way out while ctest runs (an error, `set -u`) takes it down too.
+trap 'cts_kill_all' EXIT
+
+_RUN_T0=$SECONDS
+printf 'ctest:'; printf ' %q' "${CT_ARGS[@]}"; echo
+_CT_FULLENV=(${CT_UNSET_ARGS[@]+"${CT_UNSET_ARGS[@]}"} "${CT_ENV[@]}")   # AXL_PREP_TESTS added since
+cts_own run "$QOWNER" "$QBASE" "$CTS_BASE_FOREIGN"
+cts_start run "$LOGDIR/_ctest.txt" _CT_FULLENV CT_ARGS
+_CT_PID=${CTS_PID[run]:-}
+# Progress, as ctest reports each test done -- not silence until the end.
+tail -n +1 --pid="$_CT_PID" -F "$LOGDIR/_ctest.txt" 2>/dev/null \
+    | grep --line-buffered -E '^ *[0-9]+/[0-9]+ Test +#' &
+_TAIL_PID=$!
+cts_wait run; _ct_rc=$?
+wait "$_TAIL_PID" 2>/dev/null
+# A guest that outlived its test, reaped -- only if this run owned the tree:
+# ITS setup fixture ran (another run's base sits at the same path).
+cts_reap_after "$LOGDIR/ctest-junit.xml" "$QBASE"
+
+echo ""
+python3 "$REPO_DIR/scripts/ctest-report.py" runner \
+    --junit "$LOGDIR/ctest-junit.xml" --arch "$ARCH" --expect "$LOGDIR/_selected.txt"
+_rep_rc=$?
+if (( _rep_rc == 2 )); then
+    echo "run-integration: ctest left no report it could read (ctest exit $_ct_rc) -- see $LOGDIR/_ctest.txt" >&2
+    tail -12 "$LOGDIR/_ctest.txt" | sed 's/^/    /' >&2
+    exit 1
+fi
+# 3: nothing failed, but a test could not judge (UNJUDGED) -- the runner exits
+# 3 for it, as verify.sh does for its quiet slot: not red, never green.
+failc=$(( _rep_rc == 0 || _rep_rc == 3 ? 0 : 1 ))
+# ctest's own verdict, cross-checked: it also fails on a fixture -- a cleanup
+# after the tests -- that the per-test lines above cannot show. Said, not
+# just counted.
+if (( _ct_rc != 0 )); then
+    failc=1
+    (( _rep_rc == 0 )) && echo "integration: ctest exited $_ct_rc although every test passed -- a fixture? see $LOGDIR/_ctest.txt"
+fi
+
+# WALL TIME, CONCURRENCY, and the work actually done -- without these the
+# suite's cost is invisible and every conversation about it is a guess.
 _wall=$(( SECONDS - _RUN_T0 ))
 _work=$(awk '{ s += $1 } END { print s + 0 }' "$LOGDIR/_durations.txt" 2>/dev/null || echo 0)
-printf 'integration: %ss wall, %s worker(s), %ss of test work' \
-       "$_wall" "$JOBS" "$_work"
+printf 'integration: %ss wall, -j %s, %ss of test work' "$_wall" "$JOBS" "$_work"
 if [[ "$_work" -gt 0 && "$_wall" -gt 0 ]]; then
     printf ' (%sx packing)' "$(( (_work + _wall / 2) / _wall ))"
 fi
@@ -634,17 +837,16 @@ _nc=$(wc -l < "$LOGDIR/_cached.txt" 2>/dev/null | tr -d ' ' || echo 0)
 # what a default-on cache would do -- it stops carrying information, and this
 # tree already has the rule that a banner which always fires is not a banner.
 # NOT "re-run with --no-cache for a pre-push gate", which this said until
-# 2026-09-02. ci.yml runs the full uncached suite on EVERY push to main, on a
-# self-hosted runner on this same machine, so a --no-cache run immediately
-# before pushing is the same tests twice on the same hardware -- several
-# minutes of duplicated wall time that also contend with each other.
-# --no-cache belongs to a RELEASE cut (docs/RELEASING.md), where the tagged
-# commit must be certified locally before the tag exists.
+# 2026-09-02. A push gate is the covering tests, cached; the whole suite runs
+# uncached in CI on a DISPATCH (since 2026-10-21 a push runs only the cheap
+# jobs -- AXL-CI-Release-Speed-Design.md §14), and --no-cache here belongs to
+# a RELEASE cut (docs/RELEASING.md), where it is one of the two ways to
+# certify the tagged commit.
 if [[ -n "$CACHE_DIR" && "$_nc" -gt 0 ]]; then
     echo "integration: PARTIAL -- cache: $_nc test(s) SKIPPED as unchanged" \
          "since their last green run. Inputs only; the host environment is not" \
-         "in the key. Pushing? CI re-runs the whole suite uncached anyway --" \
-         "--no-cache here is for cutting a release."
+         "in the key. --no-cache is for certifying a release; the uncached" \
+         "suite in CI runs on dispatch (gh workflow run ci.yml --ref main)."
 fi
 if [[ $ONLY_LOCAL -eq 1 ]]; then
     echo "integration: PARTIAL -- only-local: ran the $(printf %d "${#TESTS[@]}") test(s) CI cannot," \
@@ -653,26 +855,29 @@ elif [[ -z "$INCLUDE_LOCAL" ]]; then
     echo "integration: PARTIAL -- --ci: local-only tests were SKIPPED."
 fi
 [[ -n "$SHARD" ]] && echo "integration: PARTIAL -- shard $SHARD of the suite only."
-[[ -n "$ONLY_TESTS" ]] && echo "integration: PARTIAL -- --only: ran $(printf %d "${#TESTS[@]}") named test(s), not the suite."
+if [[ -n "$FOR_PATHS" ]]; then
+    # Named for the flag the human TYPED. --for sets ONLY_TESTS internally, so
+    # without this branch a --for run reported itself as a --only run and the
+    # log gave no way to tell a derived selection from a hand-named one.
+    echo "integration: PARTIAL -- --for: ran the $(printf %d "${#TESTS[@]}") test(s) derived from" \
+         "$FOR_PATHS, not the suite."
+elif [[ -n "$ONLY_TESTS" ]]; then
+    echo "integration: PARTIAL -- --only: ran $(printf %d "${#TESTS[@]}") named test(s), not the suite."
+fi
 echo "logs: $LOGDIR"
 
-# Stamp a clean, COMPLETE run so a release can skip dispatching CI for an
-# answer this run already has (AXL-CI-Release-Speed-Design.md §10.3). Only a
-# full run counts: a --shard or a filtered run did not test everything, so it
-# must not be able to satisfy a release gate.
-#
-# --only-local and --ci are filtered runs by construction and are excluded for
-# exactly that reason. --ci was NOT excluded before and could write the stamp
-# having skipped every local-only test -- the same defect this flag would have
-# introduced, one flag earlier.
-# --only joins that list for the same reason: it ran a subset the caller chose,
-# so it cannot certify the tree.
+# THIS RUN NO LONGER WRITES THE RELEASE STAMP (review ruling R-A,
+# AXL-CI-Release-Speed-Design.md §14). It certified the suite alone, while
+# CI's integration job -- which the stamp stands in for -- also runs the unit
+# tests in QEMU, stages the SDK and runs the harness self-tests. Both now go
+# through scripts/release-suite.sh, and only its complete success stamps.
+# Said where the stamp USED to be written -- a clean, complete, uncached run --
+# because that is exactly when someone expects one.
 if [[ $failc -eq 0 && -z "$SHARD" && $ONLY_LOCAL -eq 0 && -n "$INCLUDE_LOCAL" \
       && -z "$CACHE_DIR" && -z "$ONLY_TESTS" ]]; then
-    # shellcheck source=lib/release-gate.sh
-    source "$SCRIPT_DIR/lib/release-gate.sh"
-    release_gate_write "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" \
-                       "$ARCH" "$pass" "$failc"
+    echo "integration: this run does not certify a release -- scripts/release-suite.sh does"
 fi
 
-[[ $failc -eq 0 ]]
+(( failc == 0 )) || exit 1
+(( _rep_rc == 3 )) && exit 3
+exit 0

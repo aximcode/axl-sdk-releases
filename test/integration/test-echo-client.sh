@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=16 local-only=0
+# test-meta: arch=x64 needs= est=16 local-only=0 builds=echo-client guest=standard
 # echo-client integration test — boots QEMU with networking, runs the
 # sync echo-client example against a host-side TCP echo server via
 # the SLIRP gateway at 10.0.2.2, verifies the round-trip.
@@ -18,32 +18,18 @@ ECHO_MESSAGE="hello from UEFI"
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     all echo-client 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/echo-client.efi"
 
 # Startup: init network, run echo-client against host gateway
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo ""
-    echo "echo Connecting drivers..."
-    echo "connect -r"
-    echo "stall 1000000"
-    echo ""
-    echo "echo Configuring network via DHCP..."
-    echo "ifconfig -s eth0 dhcp"
-    echo "stall 3000000"
-    echo ""
-    echo "echo Running echo-client test..."
-    echo "echo-client.efi 10.0.2.2 ${ECHO_HOST_PORT} \"${ECHO_MESSAGE}\""
-    echo ""
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-echo-client.nsh; the echo port is %1.
+# Its message is ECHO_MESSAGE's text, spelled there (it has spaces).
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$ECHO_HOST_PORT"
 
 test_build_image
 

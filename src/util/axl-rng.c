@@ -51,6 +51,23 @@ get_rng(
     return cached;
 }
 
+/* The RNG's test seam: true at "fail" makes axl_rng_bytes fail as it does on
+   a platform with no EFI_RNG_PROTOCOL. The library's definition is WEAK and
+   always false, so production carries no trace of a test control; a unit
+   image that must start life without an RNG links a strong one
+   (test/unit/axl-test-ssh-host-key-weak.c), the _axl_service_stage_test_point
+   pattern. Keep the `*_test_point` name: test-efi-pack-release-qemu.sh
+   finds the seams in a shipped image by that suffix alone. */
+bool
+_axl_rng_test_point(const char *point);
+
+__attribute__((weak)) bool
+_axl_rng_test_point(const char *point)
+{
+    (void)point;
+    return false;
+}
+
 int
 axl_rng_bytes(
     void   *out,
@@ -58,6 +75,9 @@ axl_rng_bytes(
     )
 {
     if (out == NULL || len == 0) {
+        return AXL_ERR;
+    }
+    if (_axl_rng_test_point("fail")) {
         return AXL_ERR;
     }
     EfiRngProtocol *rng = get_rng();

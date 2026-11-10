@@ -55,7 +55,7 @@ fi
 PREFIX="$(dirname "$(dirname "$SCRIPT_DIR")")"
 ROOT="$(dirname "$PREFIX")"
 CONF="$PREFIX/share/axl/axl-toolchains.conf"
-# THE MANAGER SHIPS NO MANIFEST. make-host-tools-tarball.sh writes
+# THE MANAGER SHIPS NO MANIFEST. Its archive (packaging/host-tools) carries
 # share/axl/version and nothing else, and since §20 M2 `axl` is linked out of
 # the manager -- so a stock `axl prune` looked for the manifest in a prefix
 # that never has one and silently skipped every toolchain root. The families
@@ -100,9 +100,42 @@ if [[ -e "$ROOT/axl-sdk" ]]; then
     CURRENT="$(cd -P "$ROOT/axl-sdk" 2>/dev/null && pwd)"
 fi
 
+# The PACKAGES' current root, which they manage with alternatives under a
+# link of their own (<root>/axl-sdk-package, never <root>/axl-sdk: two
+# managers must not share one link). A package root is skipped by its receipt
+# anyway; this protects it even if its receipt were lost.
+PKG_CURRENT=""
+if [[ -e "$ROOT/axl-sdk-package" ]]; then
+    PKG_CURRENT="$(cd -P "$ROOT/axl-sdk-package" 2>/dev/null && pwd)"
+fi
+
 REMOVED=0
 
-# prune_family <dir> <need-receipt 0|1> <regex at the family stem> <protected...>
+# NOT FROM A PACKAGE'S ROOT (§17.5): `axl update`, `use` and `uninstall`
+# refuse there, and so does prune -- run from a root apt or dnf owns, it would
+# prune install.sh's versions and the toolchains on behalf of a user whose
+# SDK the package manager manages.
+_own=""
+if [[ -e "$PREFIX/share/axl/$RECEIPT" ]]; then
+    if [[ -r "$PREFIX/share/axl/$RECEIPT" ]]; then
+        _own="$(sed -n 's/^AXL_RECEIPT_SOURCE=//p' "$PREFIX/share/axl/$RECEIPT" | head -1)"
+    else
+        _own=unreadable
+    fi
+fi
+case "$_own" in
+    deb) echo "axl prune: this SDK ($(basename "$PREFIX")) is a deb package, which apt manages -- 'axl prune' is for install.sh's versions." >&2
+         echo "           Remove a package with: sudo apt remove axl-sdk-<version>" >&2
+         exit 1 ;;
+    rpm) echo "axl prune: this SDK ($(basename "$PREFIX")) is an rpm package, which dnf manages -- 'axl prune' is for install.sh's versions." >&2
+         echo "           Remove a package with: sudo dnf remove axl-sdk-<version>" >&2
+         exit 1 ;;
+    unreadable)
+         echo "axl prune: this SDK's receipt cannot be read by this user -- not pruning on behalf of an owner it cannot see." >&2
+         exit 1 ;;
+esac
+
+# prune_family <dir> <need-receipt 0|1|sdk> <regex at the family stem> <protected...>
 #
 # NEED-RECEIPT is §21, and the asymmetry is deliberate. `axl-sdk-<semver>` and
 # `axl-sdk-host-tools-<ver>` are OUR namespace by construction -- nothing else
@@ -147,6 +180,37 @@ prune_family() {
         # wrote -- as "not ours", which reads as the SDK failing to recognise
         # its own install.
         #
+        # SDK ROOTS (`sdk`): the pattern stopped being enough when the
+        # .deb/.rpm returned (AXL-Distribution-Design.md §17.5) -- a package
+        # installs /opt/axl-sdk-<ver> too, and `rm -rf` of it would leave
+        # dpkg/rpm listing files that are gone. So the SDK half of §21's
+        # receipt decides: install.sh's (SOURCE=install.sh) licenses a
+        # removal, a package's is named with the command that does remove
+        # it, and any other owner is not ours to judge. A root with NO
+        # receipt predates receipts (every install before 5.0.0) and keeps
+        # the old pattern rule -- glob may discover, the receipt decides, and
+        # its absence must not strand the machines that never had one.
+        if [[ "$need_receipt" == "sdk" ]]; then
+            if [[ -e "$d/share/axl/$RECEIPT" && ! -r "$d/share/axl/$RECEIPT" ]]; then
+                # Present but unreadable: an owner we cannot see, never "none".
+                echo "  skipped $(basename "$d"): its receipt cannot be read by this user"
+                continue
+            elif [[ -r "$d/share/axl/$RECEIPT" ]]; then
+                local src
+                src="$(sed -n 's/^AXL_RECEIPT_SOURCE=//p' "$d/share/axl/$RECEIPT" | head -1)"
+                case "$src" in
+                    install.sh) ;;
+                    deb) echo "  skipped $(basename "$d"): a deb package -- remove it with: sudo apt remove $(basename "$d")"
+                         continue ;;
+                    rpm) echo "  skipped $(basename "$d"): an rpm package -- remove it with: sudo dnf remove $(basename "$d")"
+                         continue ;;
+                    *)   echo "  skipped $(basename "$d"): its receipt names an owner prune does not know (${src:-none})"
+                         continue ;;
+                esac
+            fi
+            cands+=("$d")
+            continue
+        fi
         # `!= "0"` and not `-eq 1`: `-eq` evaluates its operand as ARITHMETIC,
         # so an empty or non-numeric parameter is false and the gate silently
         # turns OFF -- falling toward `rm -rf`. The comment above promises the
@@ -224,7 +288,7 @@ echo "[axl prune] root: $ROOT   keep: $KEEP$( [[ $DRY -eq 1 ]] && echo '   (dry 
 _pfx_name="$(basename "$PREFIX")"
 if [[ "$_pfx_name" =~ ^axl-sdk-[0-9] ]] \
    || [[ "$_pfx_name" =~ ^axl-sdk-host-tools-[0-9] ]]; then
-    prune_family "$ROOT" 0 '^axl-sdk-[0-9]' "$PREFIX" "$CURRENT"
+    prune_family "$ROOT" sdk '^axl-sdk-[0-9]' "$PREFIX" "$CURRENT" "$PKG_CURRENT"
 
     # --- manager roots ------------------------------------------------------
     # §20 keeps the manager OUTSIDE `^axl-sdk-[0-9]` so `axl use` and `axl

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=10 local-only=0
+# test-meta: arch=x64 needs= est=10 local-only=0 guest=plain
 # test-pk-verify-qemu.sh — axl_pk_verify() ECDSA-P256 against a real mbedTLS.
 #
 # Auxiliary single-binary test (opt out of the test-axl.sh ratchet).
@@ -27,7 +27,7 @@ export TEST_SKIP_RATCHET=1
 
 PREFIX_DIR="$("$PROJECT_DIR/scripts/build-prefix.sh" x64)"
 EFI="$PROJECT_DIR/$PREFIX_DIR/AxlTestCrypto.efi"
-make -C "$PROJECT_DIR" ARCH=x64 all tests 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 all tests 2>&1 | tail -1
 [[ -f "$EFI" ]] || { echo "FAIL: build did not produce $EFI"; exit 1; }
 
 LOG="$(mktemp)"

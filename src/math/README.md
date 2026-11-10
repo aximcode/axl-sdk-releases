@@ -86,12 +86,18 @@ fused-multiply-add per term (~30% faster + one extra bit of
 precision per term).  Without FMA, the same expression compiles to
 plain `mul + add`.
 
-Build with `make CFLAGS_EXTRA='-march=x86-64-v3'` (or higher) to
-opt into the additional fast paths.  axl-sdk's `-fno-math-errno`
+The build pins `-march=x86-64` (`AXL_GCC_ARCH` in
+`cmake/AxlFlags.cmake`) and has no knob for a higher level: a
+`-DCMAKE_C_FLAGS=-march=...` does not reach it, because CMake places
+the target's own `-march` after it and GCC takes the last. The fast
+paths are for a build that opts in by changing that pin -- and
+`x86-64-v3` means AVX, which `#UD`s under UEFI unless the image
+enables it (`CR4.OSXSAVE` is clear at boot) and which
+`gate.check-no-avx` rejects.  axl-sdk's `-fno-math-errno`
 and `-fno-trapping-math` flags are what let GCC actually inline
 `__builtin_sqrt` etc. instead of emitting libm calls — these are
-on by default in our Makefile (the freestanding UEFI build has no
-errno + we don't catch FP exceptions).
+on by default in our build (`cmake/AxlFlags.cmake`; the freestanding
+UEFI build has no errno + we don't catch FP exceptions).
 
 ### QEMU CPU compatibility
 

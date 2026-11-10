@@ -99,3 +99,36 @@ through the existing `axl_handle_get_protocol(h, "device-path", ...)`
 `parity` and `stop_bits` are raw enum codes the consumer names (e.g.
 `"N"`, `"8N1"`); `baud_rate` is the firmware's `UINT64` BaudRate
 narrowed to 32 bits (every real UART rate fits).
+
+### The console's own port
+
+A serial port is often also the machine's console: the firmware's terminal
+driver sits on it, and the Shell's output reaches a terminal or a BMC's
+serial-over-LAN through it. Writing raw bytes to that port disturbs the
+console even when every write succeeds. The terminal driver draws by
+absolute cursor position (`ESC[row;colH`) from a cursor model of its own,
+so a line it did not write scrolls the operator's screen under it, and
+everything it draws afterwards -- the Shell's typed line, its output --
+lands on the wrong row, over the foreign line.
+
+`axl_serial_is_console(h)` answers whether a console output or
+standard-error device (a member of the ConOut or StdErr fan-out) is bound
+on the port: a child its serial I/O is opened for, as a terminal driver
+binds it. By binding, not by device path -- a serial driver rewrites the
+port's Uart node in place when its line settings change. Ask it before
+choosing a port for a log:
+
+```c
+AxlHandle h = NULL;
+while ((h = axl_serial_next(h)) != NULL && axl_serial_is_console(h)) {
+}
+if (h != NULL) {
+    axl_serial_open(h, &port);   // a port the console does not use
+}
+```
+
+A terminal that is console input only does not count, and with no console
+at all every port answers false. The answer is the
+console as it is now: a take-over that removed the terminal's console-out
+tag (`AxlConsoleDevice` without `passthrough_local`) makes the port answer
+false until it is restored.

@@ -113,6 +113,11 @@ typedef struct {
  *                     `UnloadImage` reverses the load but not the
  *                     observability hooks. Pass `consult_db = false`
  *                     when those side effects are unacceptable.
+ *                     At `TPL_CALLBACK` or above a call with
+ *                     @p consult_db true is refused (AXL_UNSUPPORTED,
+ *                     and a log line naming the rule) rather than
+ *                     answered presence-only: UEFI 2.11 Table 7.3
+ *                     allows `LoadImage()` only below `TPL_CALLBACK`.
  * @param info         [out] receives the inspection result. Must be
  *                     non-NULL. Caller frees via
  *                     axl_image_signature_info_free. When
@@ -121,7 +126,8 @@ typedef struct {
  *                     further work — so on a -1 return the struct
  *                     is in a defined "unknown / nothing detected"
  *                     state, not arbitrary leftover bytes.
- * @return AXL_OK on success (with @p info populated), AXL_ERR if the file is
+ * @return AXL_OK on success (with @p info populated); AXL_UNSUPPORTED for
+ *     @p consult_db at `TPL_CALLBACK` or above; AXL_ERR if the file is
  *     missing/unreadable, the bytes are not a recognizable PE
  *     image, or @p info is NULL.
  */

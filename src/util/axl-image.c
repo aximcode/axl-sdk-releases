@@ -19,6 +19,7 @@
 
 #include "../backend/axl-backend.h"
 #include "axl-image-internal.h"
+#include "axl-driver-internal.h"   /* _axl_image_tpl_refused */
 #include "../fv/axl-fv-internal.h"
 #include <axl/axl-image.h>
 #include <axl/axl-driver.h>
@@ -39,13 +40,20 @@ axl_image_load(
     AxlImage   **out
     )
 {
+    if (_axl_image_tpl_refused("axl_image_load")) {
+        if (out != NULL) {
+            *out = NULL;
+        }
+        return AXL_UNSUPPORTED;
+    }
     if (path == NULL || out == NULL) {
         return AXL_ERR;
     }
     *out = NULL;
 
     AxlDriverHandle h = NULL;
-    if (axl_driver_load(path, &h) != AXL_OK || h == NULL) {
+    /* Its own path included: see _axl_driver_load_self_ok. */
+    if (_axl_driver_load_self_ok(path, &h) != AXL_OK || h == NULL) {
         return AXL_ERR;
     }
 
@@ -74,21 +82,38 @@ axl_image_set_load_options(
     return axl_driver_set_load_options(img->handle, data, size);
 }
 
+/* axl_image_start without its deferred-exit check, for image_run_and_unload,
+   which must unload the image first. */
+static int image_start_nocheck(AxlImage *img, int *exit_code);
+
 int
 axl_image_start(
     AxlImage  *img,
     int       *exit_code
     )
 {
+    int rc = image_start_nocheck(img, exit_code);
+
+    /* An exit a callback of this image asked for while the child ran happens
+       now -- the child has returned (see axl_backend_exit_defer). */
+    axl_backend_exit_if_deferred();
+    return rc;
+}
+
+static int
+image_start_nocheck(
+    AxlImage  *img,
+    int       *exit_code
+    )
+{
+    if (_axl_image_tpl_refused("axl_image_start")) {
+        return AXL_UNSUPPORTED;
+    }
     if (img == NULL || img->handle == NULL) {
         return AXL_ERR;
     }
 
-    UINTN       exit_data_size = 0;
-    EFI_STATUS  status = axl_bs()->StartImage(
-        (EFI_HANDLE)img->handle,
-        &exit_data_size,
-        NULL);
+    EFI_STATUS  status = (EFI_STATUS)axl_backend_start_image(img->handle);
 
     if (exit_code != NULL) {
         /* EFI_SUCCESS == 0 round-trips cleanly. For images that call
@@ -153,8 +178,9 @@ image_run_and_unload(
         }
     }
 
-    int rc = axl_image_start(img, out_exit_code);   /* blocks */
+    int rc = image_start_nocheck(img, out_exit_code);   /* blocks */
     axl_image_unload(img);
+    axl_backend_exit_if_deferred();     /* after the unload: see axl_image_start */
     return rc;
 }
 
@@ -167,6 +193,9 @@ axl_image_run(
 {
     if (out_exit_code != NULL) {
         *out_exit_code = 0;
+    }
+    if (_axl_image_tpl_refused("axl_image_run")) {
+        return AXL_UNSUPPORTED;
     }
     if (path == NULL) {
         return AXL_ERR;
@@ -243,6 +272,9 @@ axl_image_run_fv_file(
 {
     if (out_exit_code != NULL) {
         *out_exit_code = 0;
+    }
+    if (_axl_image_tpl_refused("axl_image_run_fv_file")) {
+        return AXL_UNSUPPORTED;
     }
     if (name_guid == NULL) {
         return AXL_ERR;

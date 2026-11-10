@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=20 local-only=0
+# test-meta: arch=x64 needs= est=20 local-only=0 guest=none
+# guest=none: --mount, --gpu and devices of its own (--qemu-arg): a capture
+#   of the whole machine, fixed when QEMU starts.
 # test-mkfixture-qemu.sh -- end-to-end test for tools/mkfixture.efi.
 #
 # Captures a fixture from a running OVMF guest into a virtiofs-mounted
@@ -46,7 +48,7 @@ count_glob() {
 # Build mkfixture / sysinfo if missing (runs in <1s on a warm tree).
 if [[ ! -x "$MKFIXTURE" ]] || [[ ! -x "$SYSINFO" ]]; then
     echo "Building tools..."
-    make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -3
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -3
 fi
 [[ -x "$MKFIXTURE" ]] || { echo "FAIL: mkfixture.efi not found at $MKFIXTURE"; exit 1; }
 [[ -x "$SYSINFO" ]]   || { echo "FAIL: sysinfo.efi not found at $SYSINFO"; exit 1; }

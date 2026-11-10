@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs=gpu est=12 local-only=0
+# test-meta: arch=both needs=gpu est=12 local-only=0 builds=console-reshape-selftest guest=gpu
 # test-console-reshape-qemu.sh — a passthrough take-over device must not hide the
 # physical console's text modes, and must reshape through them.
 #
@@ -41,7 +41,7 @@ case "$WHICH" in
     *) echo "usage: $0 [X64|AARCH64|both]" >&2; exit 2 ;;
 esac
 
-EXPECTED_CHECKS=20
+EXPECTED_CHECKS=21
 
 overall_fail=0
 
@@ -55,8 +55,8 @@ run_one() {
     efi="$out/console-reshape-selftest.efi"
 
     echo "=== console reshape ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" \
-        ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} console-reshape-selftest 2>&1 | tail -1
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" \
+        console-reshape-selftest 2>&1 | tail -1
 
     log="$(mktemp)"
     timeout 180s "$PROJECT_DIR/scripts/run-qemu.sh" \

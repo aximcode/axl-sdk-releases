@@ -17,6 +17,7 @@
 #include <stddef.h>
 
 #include "../backend/axl-backend.h"
+#include "axl-runtime-internal.h"
 #include "axl-signal-internal.h"
 #include <axl/axl-signal.h>
 #include <axl/axl-log.h>
@@ -60,7 +61,16 @@ axl_interrupted(void)
 AXL_NORETURN void
 axl_exit(int rc)
 {
+    /* A child image this one started is running and this is one of its
+       callbacks: gBS->Exit would fail. Unwind the callback and exit when the
+       child returns (axl_backend_exit_defer). Does not return when it
+       defers. */
+    if (axl_backend_exit_defer(rc, axl_exit)) {
+        __builtin_unreachable();
+    }
+    _axl_cleanup_note_exit(rc);
     _axl_cleanup();
+    _axl_cleanup_finish_exit();
     axl_backend_boot_exit(rc);
 }
 

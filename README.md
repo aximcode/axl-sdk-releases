@@ -180,7 +180,36 @@ C++ consumer.
 
 ### Install the SDK
 
-Three commands, the same on every distribution:
+**Which install should I use?**
+
+| | `install.sh` (recommended for you, the user) | `.deb` / `.rpm` (for a machine) |
+|---|---|---|
+| where | `~/.local/share/axl-sdk-<v>`, commands linked into `~/.local/bin` (or `--prefix`) | `/opt/axl-sdk-<v>`, on every user's `PATH` through `/etc/profile.d/axl-sdk.sh` |
+| root needed | no | yes (`apt` / `dnf`) |
+| several versions, switching | `axl use <v>`, `axl update`, `axl list`, `axl prune` | install several packages side by side; the newest is current, `sudo update-alternatives --config axl-sdk-package` picks another |
+| removing | `axl uninstall` | `sudo apt remove axl-sdk-<v>` / `sudo dnf remove axl-sdk-<v>` |
+| QEMU stack | detected, and the install command printed | pulled in as `Recommends` (weak; decline with `--no-install-recommends`) |
+| cross toolchain | `sh install.sh --toolchain x64` or `axl-install-toolchain` | `axl-install-toolchain x64` (never part of the package) |
+
+Pick one per user and stay with it. They coexist without colliding — the
+package puts nothing in `/usr/bin`, keeps its own link
+(`/opt/axl-sdk-package`), and APPENDS to `PATH`, so a user's own
+`install.sh` copy in `~/.local/bin` always wins. `axl list` shows both
+kinds of install, each labelled `install.sh`, `deb` or `rpm` (`*` marks
+install.sh's current version, `+` the packages'). `axl update`, `use` and
+`uninstall` only manage install.sh's versions: run from a package's copy
+they refuse and print the `apt`/`dnf` command instead, and `axl prune` never
+removes a package's directory.
+
+**Moving between them.** From a package to install.sh: run install.sh as
+below, then `sudo apt remove axl-sdk-<v>` (or `dnf`) when nothing needs it.
+From install.sh to a package: install the package, then `axl uninstall` (per
+version) and remove the `~/.local/bin` links it names if you want the
+package's commands to be the ones found. The old `axl-sdk` package of 4.4.0
+and earlier (which did put `axl` in `/usr/bin`) is removed automatically when
+you install any new one.
+
+**With install.sh** — three commands, the same on every distribution:
 
 ```bash
 curl -fsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/install.sh
@@ -218,7 +247,9 @@ axl update            # move to the newest release (and re-install the
                       #   downloaded, and AXL_TOOLCHAIN=host declines)
 axl update --no-toolchain   # ... or skip that: SDK and manager only
 axl use 4.4.0         # switch to a version; downloads it only if absent
-axl list              # installed versions, * marking current
+                      #   (with no version, names the project's pin from
+                      #   a .axl-sdk-version here or in a parent)
+axl list              # installed versions, each with its owner, * marking current
 axl uninstall         # remove a version, its links and its current marker
 ```
 
@@ -227,12 +258,20 @@ QEMU tooling without the compiler, `--prefix` / `--bin-dir` to
 relocate, `--base-url` to install from a mirror or a local
 directory.
 
-> **The `.deb` and `.rpm` are retired.** The installer covers what
-> they did. The one thing a script cannot do is *declare* a
-> dependency, so it probes for the QEMU stack and prints your
-> distribution's install command instead of pulling it in. If your
-> policy requires a signed package, ask — that is better than
-> keeping two package layouts for everyone.
+**With a package** — download `axl-sdk-<v>_<v>-1_amd64.deb` or
+`axl-sdk-<v>-<v>-1.x86_64.rpm` from the
+[releases page](https://github.com/aximcode/axl-sdk-releases/releases)
+(both are in its `SHA256SUMS`), then:
+
+```bash
+sudo apt install ./axl-sdk-<v>_<v>-1_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./axl-sdk-<v>-<v>-1.x86_64.rpm     # Fedora, RHEL
+axl-install-toolchain x64                           # the cross toolchain, as above
+```
+
+Log in again (or `. /etc/profile.d/axl-sdk.sh`) for `axl` and `axl-cc` to be
+on `PATH`. The packages are x86-64 only (the SDK's host tools are x86-64
+binaries) and unsigned; check them against `SHA256SUMS`.
 
 **Windows:** use WSL. The installer is distribution-agnostic, so
 there is nothing different to do inside Ubuntu / Debian / Fedora
@@ -246,8 +285,8 @@ only, so `axl-install-toolchain` has nothing to fetch. Run the
 Linux SDK in a container or VM. Two things that look like
 workarounds are not: a **glibc-targeted** cross (`*-linux-gnu`)
 cannot build the tree — `deps/` needs genuine bare-metal newlib
-headers and it fails on the first `<stdlib.h>` — and `make
-CROSS=<prefix>-` selects **binutils only**, so it leaves the
+headers and it fails on the first `<stdlib.h>` — and a binutils
+prefix alone (the retired Makefile's `CROSS=<prefix>-`) leaves the
 compiler pointing at nothing. Apple Clang cannot produce the ELF
 intermediates either (`gcc → ld -T linker.lds → objcopy --target
 pei-*`). If you already have a bare-metal cross for your host, see
@@ -295,15 +334,18 @@ bare-metal cross.
 
 ```bash
 # the default: whatever axl-install-toolchain put in /opt
-make
+cmake --preset x64-debug && cmake --build --preset x64-debug
 
 # your own bare-metal cross -- the defaults are not consulted
 export AXL_TOOLCHAIN=cross
 export AXL_X64_GCC=/path/to/x86_64-elf-gcc
 export AXL_X64_GXX=/path/to/x86_64-elf-g++
 export AXL_X64_BINUTILS_PREFIX=/path/to/x86_64-elf-
-make
+cmake --preset x64-debug && cmake --build --preset x64-debug
 ```
+
+A build tree keeps the toolchain its first configure chose: to switch, start
+it afresh (`cmake --fresh --preset x64-debug`, or delete `build/x64-debug`).
 
 `axl-cc` honours the same variables, so a consumer build picks up
 the choice without changing its own build files. Force a specific
@@ -338,6 +380,18 @@ cd axl-sdk-releases
 ```
 
 `--prefix /opt/axl-sdk` puts the same layout anywhere you like.
+
+**CMake: no particular version on the box, or none at all.** Building
+from a checkout needs Ninja, `curl`, `tar` and `sha256sum`, but not your
+own CMake: `scripts/install.sh`, `scripts/axl-build.sh` and the test and
+gate scripts run the ONE CMake CI and the release use (pinned in
+`scripts/ci-cmake.sh`, 4.3.6), installing Kitware's checksum-verified
+tarball on first use into `~/.cache/axl-sdk/cmake/` (~50 MB, once per
+user, one line saying so). A failed download is an error, never a
+fall-back to the system cmake. A `cmake` you type by hand is your own;
+this README's `cmake --preset` lines work with any CMake 3.29 or
+newer. The *installed* SDK is unaffected: an app's CMake build uses
+whatever CMake its project uses.
 
 **Use `stage/bin/axl-cc`, not `scripts/axl-cc`.** The latter is not
 a standalone driver and refuses by name from a checkout, because it
@@ -407,6 +461,8 @@ option list. The tarball ships these `.efi` binaries:
 | `cat`      | Concatenate files to stdout (UEFI `cat(1)` equivalent). |
 | `cut`      | Select sections from each line — bytes `-b`, characters (UTF-8 codepoints) `-c`, or fields `-f` split on `-d` DELIM (default TAB), with `-s` (only-delimited), `--complement`, `--output-delimiter`, `-z` (NUL-terminated). Reads files or stdin. Port of POSIX `cut(1)`. |
 | `tr`       | Translate, squeeze (`-s`), or delete (`-d`) bytes from stdin, with `-c` complement and `-t` truncate. SET syntax: ranges `a-z`, C escapes (`\n \t \\ \ooo`…), and POSIX `[:classes:]`. Byte-oriented like GNU `tr`. Port of POSIX `tr(1)`. |
+| `md5sum`   | Print or check MD5 checksums, as GNU `md5sum(1)`: `<hex>  <name>` per file (`-` or none = stdin), streamed so a file of any size costs one buffer, with `-b`, `-t`, `--tag` and `-z`; `-c LIST` checks a list (`<name>: OK` / `FAILED` / `FAILED open or read`, then GNU's `WARNING:` lines) in untagged, `--tag` or escaped form, with `--quiet`, `--status`, `-w`, `--strict` and `--ignore-missing`. UEFI paths are not escaped on output; a list written through a Shell `>` checks as written. |
+| `sha256sum`| The same for SHA-256, as GNU `sha256sum(1)` — verify a download or an image on read-only media before you flash or boot it. |
 | `clip`     | Copy stdin to the AXL clipboard (`pbcopy`-style) — `some-tool \| clip`, `-m` MIME tag, `--clear`. Cross-app within a boot (AxlShm-backed). |
 | `dmidecode`| SMBIOS / DMI table decoder (UEFI `dmidecode(8)` equivalent) — dumps every record or filter by `-t <type>`; single-value query via `-s <keyword>` (`bios-vendor`, `system-uuid`, etc.). |
 | `fetch`    | HTTP/HTTPS client (curl-like) — `GET`/`POST`/`PUT`/`DELETE`/`HEAD` with custom headers, file upload (`-T`), and response-to-file (`-o`, `-O`). |
@@ -431,7 +487,9 @@ option list. The tarball ships these `.efi` binaries:
 | `scsi`     | SCSI/SAS logical units with INQUIRY identity, READ CAPACITY geometry and health. |
 | `fwtool`   | Firmware image inspector — `list`, `extract` and `find` over a raw `.fd` or SPI dump, walking firmware volumes, FFS files and sections with on-demand LZMA decompression. Works offline on an image file; no live `EFI_FIRMWARE_VOLUME2_PROTOCOL` needed. |
 | `i2c`      | I2C/SMBus explorer — the `i2c-tools` surface (`detect`, `get`, `set`, `dump`) over AxlSmbus, for FRU EEPROMs, fan and voltage controllers, temperature sensors, TCPCs and retimers. |
-| `netload`  | Load a NIC driver, bring the link up and try DHCP, reporting each step — the breadcrumb tool for "which stage does networking die at" on unfamiliar firmware. Static addressing, ping, DNS resolve and `--json` too. |
+| `netload`  | Load a NIC driver, bring the link up and try DHCP, reporting each step — the breadcrumb tool for "which stage does networking die at" on unfamiliar firmware. Static addressing, ping, DNS resolve and `--json` too. Once a NIC is up, the EFI 1.x shell's `ifconfig -l` shows its address as well (AXL publishes the pre-UEFI-2.4 protocols that shell reads). |
+| `agent`    | Runs whole Shell command lines sent over HTTP and answers JSON: whether each ran (in a Shell started `-nonest`), its status, and its stdout and stderr captured separately — `curl -d 'ls fs0:' host:8080/exec` drives a UEFI machine with nothing typed. The test-guest pool's transport, and a lab machine's; the protocol is `tools/agent.c`'s header. |
+| `sshd`     | The live UEFI Shell over SSH. `sshd` deploys a resident driver that takes over the console — the local display keeps painting — and returns to the prompt; `ssh -t` then lands at that same Shell, every session seeing and typing into one console, and a late joiner is repainted with the current screen. Logins by `authorized_keys` (`-k`, default `authorized_keys` beside `sshd.efi`) or a demo password (`-P`); `-R` read-only, `-x CIDR` exempts a range from login penalties. Settings also come from `sshd.conf` beside `sshd.efi` (OpenSSH `sshd_config` keywords; flags win) and `sshd -T` prints them; the tools tarball ships one listing every supported keyword, commented out at its default (`tools/sshd.conf`). `sshd stop` / `sshd status` (after the served Shell exits, status says `stopped`, or `running` if fbcon has taken the console since; `sshd stop` unloads it either way). To try it without hardware: `scripts/ssh-demo.sh` boots QEMU with `sshd` running and prints the `ssh -tt` line to connect with (disconnect: Enter, then `~.`); `exit` ends the Shell for every session, and a command (`ssh host cmd`) is refused. |
 | `rndisfix` | Sends the `REMOTE_NDIS_SET_MSG` packet filter that EDK2's `UsbRndis` driver stubs out — without it an RNDIS USB NIC shows link UP and delivers no inbound frames. |
 | `tar`      | Create, list and extract ustar archives with gzip (`-c`/`-t`/`-x`, `-z`, `-f`, `-C`, `-v`). |
 | `mkfixture`| Captures a running platform's ACPI, SMBIOS and configuration tables into a fixture directory that `axl emulate` replays under QEMU — how real-hardware behaviour gets a reproducible test. |
@@ -465,7 +523,26 @@ axl-cc --arch aa64 hello.c -o hello-aa64.efi
 ```cmake
 find_package(axl REQUIRED)
 axl_add_app(hello hello.c)
+axl_add_app(big-tool big-tool.c COMPRESS)   # packed when it pays
 ```
+
+CMake 3.20 or newer (tested under 3.20.6 as well as the current release);
+on an older CMake `find_package(axl)` reports the package not found,
+with a reason naming 3.20 (so `REQUIRED` stops configure).
+Editing a header rebuilds the objects that include it, under Ninja and
+Makefiles alike.
+
+### Packed (compressed) images
+
+```bash
+axl-cc --compress big-tool.c -o big-tool.efi
+```
+
+`--compress` (CMake: `COMPRESS` on `axl_add_app` / `axl_add_driver`) writes
+a self-extracting image that runs exactly like the raw one, when that saves
+at least 16 KB and 20%; otherwise the output is the raw image unchanged.
+The linked image is kept as `big-tool.raw.efi`. Off by default. See
+`docs/AXL-SDK-Design.md`, "Packed images".
 
 ### Build a driver
 

@@ -78,7 +78,7 @@ OVMF_CODE=/home/mgosha/uefi/build/firmware/OVMF_CODE.fd \
 OVMF_VARS=/home/mgosha/uefi/build/firmware/OVMF_VARS.fd \
 ./scripts/run-qemu.sh --gdb --background \
     --serial-log /tmp/srv.log --debugcon /tmp/dc.log \
-    out/native-x64/AxlTestCpuIdle.efi
+    build/x64-debug/AxlTestCpuIdle.efi
 ```
 
 Flags:
@@ -87,7 +87,7 @@ Flags:
 |------|--------|
 | `--gdb [PORT]` | Expose QEMU GDB stub on `tcp::PORT` (default 1234), free-running boot |
 | `--gdb-halt` | With `--gdb`, also pass `-S` (halt before instruction 0) — for SecMain/PEI debugging |
-| `--debugcon FILE` | Capture OVMF DEBUG output (port 0x402). Required for `gdb-syms.py` to recover module load addresses |
+| `--debugcon FILE` | Capture the firmware's DEBUG output: X64, OVMF's port 0x402 (required for `gdb-syms.py` to recover module load addresses); AARCH64, the guest's debug UART, which every AARCH64 guest has (without the flag its log is `<serial-log>-firmware-debug.log` beside `--serial-log`, or `firmware-debug.log` in the run's temp or `--state-dir` directory) |
 
 Notes:
 
@@ -96,7 +96,55 @@ Notes:
   TCG is slower but needed for breakpoint reliability.
 - The `Loading driver at 0x... NAME.efi` lines do NOT appear on the
   regular serial console for this OVMF build — they only land on
-  port 0x402, which `--debugcon` captures.
+  port 0x402, which `--debugcon` captures. A booted X64 run has no such
+  port unless asked (each byte written to it is a VM exit); every POOLED X64
+  guest has it (`qemu_fw_debug_uart`, `--state-dir`), its log the guest's
+  `firmware-debug.log`, and a pooled run reads and surfaces its own part of
+  it exactly as an AARCH64 run reads its debug UART (below).
+- AARCH64 guests get a SECOND serial port for the firmware's DEBUG output
+  (`qemu_fw_debug_uart` in `scripts/axl-common.sh`), booted and pooled
+  alike: the bundled ArmVirtQemu firmware sends DEBUG, ASSERTs included, to
+  it, so the console carries no DEBUG output. It logs at ERROR level -- no
+  `Loading driver` lines. A CPU exception is split: the `<type> Exception
+  at ...` header (Synchronous, SError, IRQ, FIQ) stays on the console, the
+  registers, backtrace and stack dump go to the debug UART. When a run hit
+  an ASSERT or an exception, run-qemu.sh prints the debug UART's log after
+  the app's output as `[firmware-debug] ...` lines, and common-test.sh
+  appends it to a foreground run's `TEST_LOG` under `--- firmware debug
+  UART ---` (a background run's log is live: read `TEST_FW_DEBUG_LOG`) --
+  so `rsod-decode` input is still where you look for it.
+
+---
+
+## Tests that need a DEBUG OVMF
+
+A few integration tests boot a DEBUG build of OVMF on purpose: its pool is
+cleared when freed and its ASSERTs are compiled in, so a use-after-free
+faults instead of landing quietly (`test-stderr-stale-qemu.sh`, the
+`test-console-device-*-qemu.sh` group). They all find it through ONE
+function, `find_debug_ovmf` in `scripts/axl-common.sh`:
+
+| Setting | Where it looks |
+|---------|----------------|
+| `AXL_OVMF_DEBUG_DIR=DIR` | `DIR/OVMF_CODE.fd` + `DIR/OVMF_VARS.fd`, and nowhere else |
+| unset, `EDK2_DIR` set | `$EDK2_DIR/Build/OvmfX64/DEBUG_GCC5/FV`, then the next row |
+| unset | `$HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV` -- not searched when `HOME` is unset |
+
+**`OVMF_CODE`/`OVMF_VARS` are REMOVED as overrides for these tests.** They
+used to pick the DEBUG firmware for the console-device group; they no longer
+do, and there is no alias -- one knob is the design. Use
+`AXL_OVMF_DEBUG_DIR`. (`OVMF_CODE`/`OVMF_VARS` still choose the ordinary
+firmware for `run-qemu.sh` and every other test, as above.)
+
+When it finds none, the message names every place it looked and why each
+had none -- `missing`, `unreadable` (this account cannot read it, which is
+not the same as absent), `no CODE file` or `no VARS file`.
+
+Without one such a test SKIPs (exit 77). `scripts/release-suite.sh` sets
+`AXL_REQUIRE_DEBUG_OVMF=1`, which makes it FAIL instead, so a release is
+never certified by a run that skipped it -- set `AXL_OVMF_DEBUG_DIR` on any
+machine (or runner account) that certifies one.
+`test-debug-ovmf-discovery.sh` pins all of this.
 
 ---
 
@@ -112,8 +160,15 @@ TEST_QEMU_GDB=1234 TEST_QEMU_DEBUGCON=/tmp/dc.log \
 ```
 
 The two `TEST_QEMU_*` env vars are read by `common-test.sh` and
-add `-gdb` / `-debugcon` to the harness's QEMU command without
-changing any other test behaviour. The test still runs to
+add `-gdb` / the firmware's debug port (X64: `-chardev
+file,...,append=on -device isa-debugcon,iobase=0x402,...`, added at
+launch) to the harness's QEMU command without changing any other test
+behaviour. `TEST_QEMU_DEBUGCON` also names the
+log the harness's ASSERT checks read (`TEST_FW_DEBUG_LOG`): on AARCH64 the
+debug UART's, on X64 the debugcon's. Without it the log is
+`$TEST_TMPDIR/firmware-debug.log` on AARCH64 and on a pooled X64 guest
+(which always has the port, and serves `TEST_QEMU_DEBUGCON` too); a booted
+X64 guest then has none. The test still runs to
 completion (or timeout); attach GDB during the test phase.
 
 ---
@@ -126,7 +181,7 @@ symbols for. The debugcon log tells us those bases. The script:
 ```bash
 ./scripts/gdb-syms.py /tmp/dc.log \
     --build-dir /home/mgosha/uefi/Build/OvmfX64/DEBUG_GCC5/X64 \
-    --axl-build-dir out/native-x64 \
+    --axl-build-dir build/x64-debug \
     > /tmp/syms.gdb
 ```
 
@@ -164,10 +219,10 @@ where the CPU actually was. It is the "perf record/report" for a UEFI app.
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `--arch X64\|AARCH64` | `X64` | target arch (selects `out/native-<arch>`) |
+| `--arch X64\|AARCH64` | `X64` | target arch (selects `build/<arch>-debug`) |
 | `--samples N` | 200 | number of stack samples |
 | `--port N` | 1234 | GDB stub TCP port |
-| `--build-dir DIR` | `out/native-<arch>` | axl build dir holding the app's `.so` |
+| `--build-dir DIR` | `build/<arch>-debug` | axl build dir holding the app's `.so` |
 | `--interval S` | 0.05 | seconds between samples |
 | `--out STEM` | `/tmp/axl-profile` | report path stem |
 | `--ovmf-build-dir DIR` | (none) | also symbolize firmware frames |
@@ -304,7 +359,8 @@ likely TCP-close failure modes:
   pre-shell, so this rarely bites.
 - **AXL EFI symbols depend on the matching build.** `gdb-syms.py`
   reads the `.so` next to the `.efi` for the `.text` offset; if
-  you `make tests` between attaching and re-attaching, regenerate.
+  you rebuild (`scripts/axl-build.sh tests`) between attaching and
+  re-attaching, regenerate.
 - **Stripped EDK2 modules.** A handful of modules (notably
   `CpuDxe_<GUID>.debug`) ship with a GUID-suffixed filename. The
   script handles this with a `<NAME>_*.debug` glob fallback;

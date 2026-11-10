@@ -63,7 +63,7 @@ void    axlk_close(int fd);
 
 ```
 # X64 (native)
-make ARCH=x64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server
+scripts/axl-build.sh ARCH=x64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server
 ./test/integration/test-kernel-poc.sh      --arch X64     # K1+K2
 ./test/integration/test-axlk-echo.sh       --arch X64     # K3
 ./test/integration/test-axlk-hwinfo.sh     --arch X64     # K6 (HwInfo port)
@@ -71,7 +71,7 @@ make ARCH=x64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-ser
 ./test/integration/test-axlk-reqlog.sh     --arch X64     # ReqLog port (RAM ring)
 
 # AARCH64 (cross)
-make ARCH=aa64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server
+scripts/axl-build.sh ARCH=aa64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server
 ./test/integration/test-kernel-poc.sh      --arch AARCH64 # K1+K2
 ./test/integration/test-axlk-echo.sh       --arch AARCH64 # K3
 ./test/integration/test-axlk-hwinfo.sh     --arch AARCH64 # K6

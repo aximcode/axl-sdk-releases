@@ -167,6 +167,49 @@ README. Being MIT, libvterm imposes no attribution obligation beyond
 reproducing the copyright and permission notice, which
 `deps/libvterm/LICENSE` carries.
 
+## Ed25519 (OpenSSH's bundled SUPERCOP implementation)
+
+- **Source:** https://github.com/openssh/openssh-portable
+- **Version shipped:** tag `V_10_5_P1`, commit
+  `b3f7344209832eea8ece447d871ea748767c444b`
+- **Vendored path in source tree:** `deps/ed25519-ref10/`
+- **Copyright:** Daniel J. Bernstein, Niels Duif, Tanja Lange,
+  Peter Schwabe (lead), Bo-Yin Yang. `crypto_api.h` is "Assembled from
+  generated headers and source files by Markus Friedl."
+- **License:** **public domain** — both files carry the dedication in
+  their own headers; upstream ships no separate licence file for them.
+- **Full license text:** `deps/ed25519-ref10/README.md`, which
+  reproduces the dedication and the provenance. That README is what the
+  release tarball stages as this component's licence record.
+
+Ed25519 signing and verification, backing `AXL_PK_ED25519` behind
+`AxlPkKey`'s weak-symbol provider seam. OpenSSH's copy rather than
+SUPERCOP's directly, because OpenSSH is the conformance oracle for this
+code's first consumer.
+
+Derived from `supercop-20221122`, and specifically from its **`ref`**
+implementation, not `ref10` — the vendored file's own section comments
+say `supercop-20221122/crypto_sign/ed25519/ref/…`. The directory name is
+inherited from the design documents, which assumed `ref10`; the code is
+`ref`, whose base-point table is 108,800 bytes rather than 30,720.
+
+**`ed25519.c` is byte-identical to upstream** (SHA-256
+`ac65b7840b922f11d7618320714f5cf22bd6cece8efab146e9688c70ffbe9895`).
+There are no local patches to it, deliberately: the three externals it
+calls but does not define — `crypto_hash_sha512`, `explicit_bzero`,
+`randombytes` — are supplied from `src/net/axl-ed25519-glue.c` instead,
+which keeps a resync a copy rather than a merge.
+
+Two files sit **beside** it and are not upstream code:
+`crypto_api.h` is upstream's, **trimmed** to the typedefs, sizes and
+prototypes `ed25519.c` uses (upstream's `#include "includes.h"` dropped,
+`randombytes` and `crypto_hash_sha512` left as prototypes, and the
+SNTRUP761 / ML-KEM / ML-DSA / SHA-3 declarations removed); `includes.h`
+is **AXL-authored and empty**, standing in for OpenSSH's autoconf
+umbrella so the vendored source needs no edit. Being public domain,
+this component imposes no attribution obligation on redistributed
+binaries; this entry is documentary.
+
 ## LZMA SDK (LZMA codec)
 
 - **Source:** LZMA SDK by Igor Pavlov (https://7-zip.org/sdk.html)
@@ -236,30 +279,14 @@ driver binaries (`NetworkCommon`, `UsbCdcEcm`, `UsbCdcNcm`,
 `UsbRndis`) ship alongside under the same source/license/build
 recipe. See `third_party/edk2/README.md`.
 
-## iPXE — universal NIC driver
+## Formerly distributed: iPXE
 
-- **Source:** https://github.com/ipxe/ipxe
-- **Vendored at:** `third_party/ipxe/{COPYING,COPYING.GPLv2,COPYING.UBDL,README.md}`
-  (license texts only — the binary is built from upstream at a pinned
-  commit by [`scripts/build-ipxe.sh`](scripts/build-ipxe.sh))
-- **Pinned commit:** see `IPXE_COMMIT=` in `scripts/build-ipxe.sh`
-- **License (aggregate):** [GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html)
-- **Full license texts:** `third_party/ipxe/COPYING.GPLv2`,
-  `third_party/ipxe/COPYING.UBDL`
-
-`axl-sdk-uefi-tools-*-{x64,aa64}.tar.gz` ships
-`drivers/<arch>/ipxe-all.efidrv` — an unmodified upstream iPXE build
-of `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB) — as a universal NIC driver
-fallback. Covers Intel (e1000 / e1000e / i219 / i225), Broadcom
-(BCM4401 / 5760x / 957454), Realtek (RTL8139 / 8169 / 8125 / 8153
-USB), Atheros, 3Com, AMD, NSC, VIA, USB CDC-ECM / CDC-NCM / RNDIS,
-AX88179, and many more — ~2.9k chip IDs total.
-
-The binary ships in the tools tarball alongside our Apache-2.0 tools
-under "mere aggregation" (GPL-2.0 §3) — no static linking into our
-binaries. The build is reproducible from the pinned commit; per
-GPL §3(b) the upstream URL + commit hash printed by
-`scripts/build-ipxe.sh` constitutes the "written offer" for source.
+Releases up to the last one cut before 2026-10-21 shipped
+`drivers/<arch>/ipxe-all.efidrv`, an unmodified upstream iPXE build, under
+GPL-2.0-or-later with a GPL-2.0 section 3(b) written offer for its source;
+that offer still runs for three years from each such release. The pinned
+upstream commit and how to restore the bundle are in `docs/ROADMAP.md`
+("Removed: bundled iPXE").
 
 ## Not part of this distribution
 

@@ -1,0 +1,6 @@
+=== boot fg ===
+TIMING: guest kind=booted via=fg guest=6.000 boot=1.500 rc=0
+  PASS: first boot
+TIMING: guest kind=booted via=fg guest=4.000 boot=1.000 rc=0
+TIMING: test=test-boot-fg.sh total=12.000 setup=1.000 guest=10.000 boot=2.500 between=0.500 post=0.500 booted=2 pooled=0 start=- lease=-
+TIMING: runner test=test-boot-fg.sh attempt=1 via=boot wall=12.400 cpu=6.000 rc=0

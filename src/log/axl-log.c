@@ -14,6 +14,7 @@
 #include "../backend/axl-backend.h"
 #include <axl/axl-log.h>
 #include "axl-log-dispatch.h"
+#include "axl-log-line.h"
 #include <axl/axl-str.h>
 #include <axl/axl-format.h>
 
@@ -25,9 +26,9 @@
 #define MAX_HANDLERS  8
 #define DOMAIN_LEN    16
 #define MSG_BUF_SIZE  512
-
-// Default console attribute (light gray on black)
-#define DEFAULT_ATTR  EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK)
+/* A console line: time (24), tag, domain, an 80-byte function and its line
+   number, the whole message, CRLF and NUL. */
+#define CONSOLE_LINE_SIZE  (MSG_BUF_SIZE + 192)
 
 /* Sentinel return values for parse_level_keyword. Both are negative
  * integers far below AXL_LOG_ERROR (=0) so the filter check
@@ -89,16 +90,20 @@ static bool           mEnvInitDone      = false;
 static bool           mFatalTriggered   = false;
 static EFI_HANDLE     mFatalImageHandle = NULL;
 
+/* The console redirect (axl_log_set_console_serial): while set, each
+   finished console line goes here instead of to standard error. */
+static AxlLogConsoleSink mConsoleSink   = NULL;
+
 // ---------------------------------------------------------------------------
 // Level Prefixes
 // ---------------------------------------------------------------------------
 
-static const unsigned short *mLevelPrefix[] = {
-    L"[ERROR] ",
-    L"[WARN]  ",
-    L"[INFO]  ",
-    L"[DEBUG] ",
-    L"[TRACE] "
+static const char *mLevelPrefix[] = {
+    "[ERROR] ",
+    "[WARN]  ",
+    "[INFO]  ",
+    "[DEBUG] ",
+    "[TRACE] "
 };
 
 static size_t mLevelColor[] = {
@@ -126,16 +131,16 @@ get_effective_level(const char *domain)
     return mGlobalLevel;
 }
 
-static void
-print_console_timestamp(const AxlRealtime *stamp)
+/* "HH:MM:SS[.uuuuuu] " into @a buf (24 bytes); its length, 0 with no stamp. */
+static size_t
+format_console_timestamp(const AxlRealtime *stamp, char *buf)
 {
     if (stamp == NULL) {
-        return;
+        return 0;
     }
     const AxlRealtime time = *stamp;
 
-    char buf[24];
-    int pos = 0;
+    size_t pos = 0;
     buf[pos++] = '0' + (time.hour / 10);
     buf[pos++] = '0' + (time.hour % 10);
     buf[pos++] = ':';
@@ -176,23 +181,78 @@ print_console_timestamp(const AxlRealtime *stamp)
         buf[pos++] = '0' + (usec % 10);
     }
     buf[pos++] = ' ';
-    buf[pos] = '\0';
-
-    unsigned short wide[24];
-    axl_utf8_to_ucs2_buf(buf, wide, 24);
-    axl_backend_console_write_err(wide);
+    return pos;
 }
 
 // ---------------------------------------------------------------------------
 // Core Log Dispatch
 // ---------------------------------------------------------------------------
 
+/* Append @a len bytes of @a src to the console line, as far as they fit
+   (the CRLF and NUL are reserved by the caller's limit). */
+static void
+cline_put(char *buf, size_t *pos, size_t limit, const char *src, size_t len)
+{
+    if (*pos + len > limit) {
+        len = limit - *pos;
+    }
+    axl_memcpy(buf + *pos, src, len);
+    *pos += len;
+}
+
+/* The console's line for one record, NUL-terminated, CRLF-ended:
+
+       HH:MM:SS.uuuuuu [INFO]  domain:func:line: message
+
+   the time when @a stamp is given, the location only for DEBUG and TRACE.
+   The domain is cut to DOMAIN_LEN - 1 bytes and the function name to 80;
+   the message is cut, never dropped, so the line always ends. Returns its
+   length, excluding the NUL. */
+static size_t
+format_console_line(char *buf, int level, const char *domain, const char *func,
+                    int line, const char *msg, const AxlRealtime *stamp)
+{
+    const size_t limit = CONSOLE_LINE_SIZE - 3;   /* room for CRLF + NUL */
+    size_t       pos   = format_console_timestamp(stamp, buf);
+
+    if (level >= 0 && level <= AXL_LOG_TRACE) {
+        cline_put(buf, &pos, limit, mLevelPrefix[level], axl_strlen(mLevelPrefix[level]));
+    }
+    bool located = func != NULL && line > 0 && level >= AXL_LOG_DEBUG;
+    if (domain != NULL) {
+        size_t dlen = axl_strlen(domain);
+        cline_put(buf, &pos, limit, domain, dlen < DOMAIN_LEN ? dlen : DOMAIN_LEN - 1);
+        if (located) {
+            cline_put(buf, &pos, limit, ":", 1);
+        }
+    }
+    if (located) {
+        char   num[12];
+        size_t flen = axl_strlen(func);
+        cline_put(buf, &pos, limit, func, flen > 80 ? 80 : flen);
+        cline_put(buf, &pos, limit, ":", 1);
+        cline_put(buf, &pos, limit, num, (size_t)axl_snprintf(num, sizeof num, "%d", line));
+    }
+    if (domain != NULL || located) {
+        cline_put(buf, &pos, limit, ": ", 2);
+    }
+    cline_put(buf, &pos, limit, msg, axl_strlen(msg));
+    buf[pos++] = '\r';
+    buf[pos++] = '\n';
+    buf[pos]   = '\0';
+    return pos;
+}
+
+void
+_axl_log_set_console_sink(AxlLogConsoleSink sink)
+{
+    mConsoleSink = sink;
+}
+
 static void
 log_dispatch(int level, const char *domain, const char *func,
              int line, const char *msg_buf)
 {
-    unsigned short wide[MSG_BUF_SIZE];
-
     /* Stamp the record ONCE, here, and hand the same value to the console and
      * to every sink. Each sink used to read the clock itself, which cost N
      * firmware GetTime calls per record for N sinks and -- worse -- let two
@@ -229,108 +289,25 @@ log_dispatch(int level, const char *domain, const char *func,
         }
     }
 
-    // Console output
-    if (mConsoleEnabled && axl_st() != NULL &&
-        (axl_st()->StdErr != NULL || axl_st()->ConOut != NULL)) {
-        if (mConsoleColor && level <= AXL_LOG_TRACE) {
-            axl_backend_console_set_attr_err(mLevelColor[level]);
-        }
-
-        if (mConsoleTimestamp) {
-            print_console_timestamp(stampp);
-        }
-
-        if (level <= AXL_LOG_TRACE) {
-            axl_backend_console_write_err((const unsigned short *)mLevelPrefix[level]);
-        }
-
-        if (domain != NULL) {
-            unsigned short wide_domain[DOMAIN_LEN];
-            axl_utf8_to_ucs2_buf(domain, wide_domain, DOMAIN_LEN);
-            axl_backend_console_write_err(wide_domain);
-
-            if (func != NULL && line > 0 && level >= AXL_LOG_DEBUG) {
-                /* Format :func:line */
-                char loc[128];
-                BufCtx bc = { loc, 0, sizeof (loc) };
-                loc[0] = ':';
-                bc.pos = 1;
-                size_t flen = axl_strlen(func);
-                if (flen > 80) {
-                    flen = 80;
-                }
-                axl_memcpy(loc + bc.pos, func, flen);
-                bc.pos += flen;
-                loc[bc.pos++] = ':';
-                /* Format line number */
-                char num[12];
-                int npos = 0;
-                int tmp = line;
-                if (tmp == 0) {
-                    num[npos++] = '0';
-                } else {
-                    char rev[12];
-                    int rpos = 0;
-                    while (tmp > 0) {
-                        rev[rpos++] = '0' + (tmp % 10);
-                        tmp /= 10;
-                    }
-                    while (rpos > 0) {
-                        num[npos++] = rev[--rpos];
-                    }
-                }
-                axl_memcpy(loc + bc.pos, num, npos);
-                bc.pos += npos;
-                loc[bc.pos] = '\0';
-
-                unsigned short wide_loc[128];
-                axl_utf8_to_ucs2_buf(loc, wide_loc, 128);
-                axl_backend_console_write_err(wide_loc);
-            }
-            axl_backend_console_write_err((const unsigned short *)L": ");
-        } else if (func != NULL && line > 0 && level >= AXL_LOG_DEBUG) {
-            char loc[128];
-            size_t pos = 0;
-            size_t flen = axl_strlen(func);
-            if (flen > 80) {
-                flen = 80;
-            }
-            axl_memcpy(loc, func, flen);
-            pos = flen;
-            loc[pos++] = ':';
-            char num[12];
-            int npos = 0;
-            int tmp = line;
-            if (tmp == 0) {
-                num[npos++] = '0';
+    // Console output: one line, built once, written once -- to standard
+    // error, or to the redirect's port.
+    if (mConsoleEnabled
+        && (mConsoleSink != NULL
+            || (axl_st() != NULL
+                && (axl_st()->StdErr != NULL || axl_st()->ConOut != NULL)))) {
+        char   cline[CONSOLE_LINE_SIZE];
+        size_t clen = format_console_line(cline, level, domain, func, line,
+                                          msg_buf, mConsoleTimestamp ? stampp : NULL);
+        if (mConsoleSink != NULL) {
+            mConsoleSink(cline, clen);
+        } else {
+            unsigned short wide[CONSOLE_LINE_SIZE];
+            axl_utf8_to_ucs2_buf(cline, wide, CONSOLE_LINE_SIZE);
+            if (mConsoleColor && level <= AXL_LOG_TRACE) {
+                axl_backend_console_write_err_attr(wide, mLevelColor[level]);
             } else {
-                char rev[12];
-                int rpos = 0;
-                while (tmp > 0) {
-                    rev[rpos++] = '0' + (tmp % 10);
-                    tmp /= 10;
-                }
-                while (rpos > 0) {
-                    num[npos++] = rev[--rpos];
-                }
+                axl_backend_console_write_err(wide);
             }
-            axl_memcpy(loc + pos, num, npos);
-            pos += npos;
-            loc[pos++] = ':';
-            loc[pos++] = ' ';
-            loc[pos] = '\0';
-
-            unsigned short wide_loc[128];
-            axl_utf8_to_ucs2_buf(loc, wide_loc, 128);
-            axl_backend_console_write_err(wide_loc);
-        }
-
-        axl_utf8_to_ucs2_buf(msg_buf, wide, MSG_BUF_SIZE);
-        axl_backend_console_write_err(wide);
-        axl_backend_console_write_err((const unsigned short *)L"\r\n");
-
-        if (mConsoleColor) {
-            axl_backend_console_set_attr_err(DEFAULT_ATTR);
         }
     }
 
@@ -423,9 +400,9 @@ axl_log_set_domain_level(const char *domain, int level)
             if (level == -1) {
                 // Clear: shift remaining entries down
                 if (i < mDomainCount - 1) {
-                    axl_memcpy(&mDomains[i], &mDomains[i + 1],
+                    axl_memmove(&mDomains[i], &mDomains[i + 1],
                              (mDomainCount - i - 1) * DOMAIN_LEN);
-                    axl_memcpy(&mDomainLevels[i], &mDomainLevels[i + 1],
+                    axl_memmove(&mDomainLevels[i], &mDomainLevels[i + 1],
                              (mDomainCount - i - 1) * sizeof (int));
                 }
                 mDomainCount--;
@@ -699,15 +676,15 @@ axl_log_remove_handler(AxlLogHandler handler)
         if (mHandlers[i] == handler) {
             if (i < mHandlerCount - 1) {
                 size_t remaining = mHandlerCount - i - 1;
-                axl_memcpy(&mHandlers[i], &mHandlers[i + 1],
+                axl_memmove(&mHandlers[i], &mHandlers[i + 1],
                          remaining * sizeof (AxlLogHandler));
-                axl_memcpy(&mHandlerData[i], &mHandlerData[i + 1],
+                axl_memmove(&mHandlerData[i], &mHandlerData[i + 1],
                          remaining * sizeof (void *));
-                axl_memcpy(&mHandlerDomains[i], &mHandlerDomains[i + 1],
+                axl_memmove(&mHandlerDomains[i], &mHandlerDomains[i + 1],
                          remaining * sizeof (const char *));
-                axl_memcpy(&mHandlerMaxLevel[i], &mHandlerMaxLevel[i + 1],
+                axl_memmove(&mHandlerMaxLevel[i], &mHandlerMaxLevel[i + 1],
                          remaining * sizeof (int));
-                axl_memcpy(&mHandlerFiltered[i], &mHandlerFiltered[i + 1],
+                axl_memmove(&mHandlerFiltered[i], &mHandlerFiltered[i + 1],
                          remaining * sizeof (bool));
             }
             mHandlerCount--;
@@ -720,6 +697,12 @@ void
 axl_log_set_console_enabled(bool enable)
 {
     mConsoleEnabled = enable;
+}
+
+bool
+axl_log_get_console_enabled(void)
+{
+    return mConsoleEnabled;
 }
 
 void

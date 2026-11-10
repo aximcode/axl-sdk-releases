@@ -4,7 +4,7 @@
  * Draws colored rectangles and text on the screen if GOP is available.
  * Falls back to a text message on headless/serial systems.
  *
- * Build with: make gfx-demo
+ * Build with: scripts/axl-build.sh gfx-demo
  */
 
 #include <axl.h>

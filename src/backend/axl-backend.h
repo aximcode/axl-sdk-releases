@@ -78,8 +78,17 @@ axl_backend_console_write(
     );
 
 /**
- * @brief Write a UCS-2 string to the error console (gST->StdErr).
- *        Falls back to gST->ConOut when StdErr is NULL. NULL-safe.
+ * @brief Write a UCS-2 string to standard error. NULL-safe.
+ *
+ *        On the console -- neither stdout nor stderr redirected -- the
+ *        line goes through gST->ConOut, the stream stdout uses, so the
+ *        two share one cursor as on a Unix terminal (gST->StdErr is a
+ *        separate splitter whose cursor the Shell's prompt never sees),
+ *        and also to every StdErr device that is not a ConOut device.
+ *        Redirected (`2>`, `>`, `|`), or with the ConOut/StdErr pair no
+ *        longer the one axl_backend_console_err_init() recorded, it goes to
+ *        gST->StdErr, so `2>` captures it and `>` does not. ConOut when
+ *        there is no StdErr.
  */
 void
 axl_backend_console_write_err(
@@ -87,22 +96,34 @@ axl_backend_console_write_err(
     );
 
 /**
+ * @brief Record the console standard error belongs to: the
+ *        gST->ConOut/StdErr pair now. axl_backend_console_write_err()
+ *        writes through ConOut only while that pair is unchanged, so a
+ *        resident image writing while another command runs under `>` does
+ *        not write into that command's file. Called by axl_stream_init()
+ *        at image start; the first write calls it when nothing has.
+ */
+void
+axl_backend_console_err_init(
+    void
+    );
+
+/**
+ * @brief axl_backend_console_write_err() in a text attribute: each
+ *        output it reaches is set to @a attr for the string and put back
+ *        to its own attribute afterwards. NULL-safe.
+ */
+void
+axl_backend_console_write_err_attr(
+    const unsigned short  *str,  ///< UCS-2 string to output
+    uint32_t               attr  ///< attribute bitmask for the string
+    );
+
+/**
  * @brief Set console text attribute (color/style).
  */
 void
 axl_backend_console_set_attr(
-    uint32_t  attr  ///< attribute bitmask
-    );
-
-/**
- * @brief Set the error console's text attribute (color/style).
- *        Targets gST->StdErr so escape bytes emitted by ANSI/serial
- *        consoles (TerminalDxe) land on the same sink as
- *        axl_backend_console_write_err() output. Falls back to
- *        gST->ConOut when StdErr is NULL. NULL-safe.
- */
-void
-axl_backend_console_set_attr_err(
     uint32_t  attr  ///< attribute bitmask
     );
 
@@ -293,6 +314,64 @@ axl_backend_clock_gettime(
     AxlTimespec  *out        ///< [out] populated on success
 );
 
+/**
+ * @brief The raw cycle counter: one RDTSC on x64, one CNTPCT_EL0 read on
+ *     aarch64, and 0 on any other architecture.
+ *
+ * No conversion, no calibration, no firmware call: safe at any TPL,
+ * including inside a TPL_NOTIFY notify. Compare two readings against a
+ * tick count derived from axl_backend_counter_hz().
+ */
+uint64_t
+axl_backend_counter_ticks(void);
+
+/**
+ * @brief Counter ticks per second for axl_backend_counter_ticks(), or 0
+ *     when unknown.
+ *
+ * On x64 the first call in a process may calibrate (a ~10 ms gBS->Stall)
+ * or read the calibration another image published, so call it at
+ * TPL_APPLICATION, never from a notify.
+ */
+uint64_t
+axl_backend_counter_hz(void);
+
+/**
+ * @brief The cycle-counter frequency a set of calibration samples gives.
+ *
+ * Each sample is the number of counter ticks across one `gBS->Stall`: the
+ * @a short_ticks ones of @a short_us microseconds, the @a long_ticks ones
+ * of @a long_us. The frequency is the least long sample minus the least
+ * short one, over the difference of the two lengths, so a cost every Stall
+ * carries whatever its length -- the call, the reference timer's reads --
+ * cancels exactly instead of reading as extra ticks. The x86 calibration
+ * in axl_backend_clock_gettime's first call is the one caller; this is its
+ * arithmetic, apart from the firmware, so a test can hand it samples.
+ *
+ * The least long sample alone, over @a long_us, can only overstate the
+ * frequency (the fixed cost and any overshoot both add ticks), while an
+ * overshoot on the short Stalls makes the difference understate it --
+ * without bound when every short sample is disturbed. The result is
+ * therefore never above the long-alone value and never more than 2 % below
+ * it: a disturbed short Stall leaves the clock at most 2 % fast. When no
+ * short sample is non-zero the difference is taken against 0 (so the
+ * long-alone value is returned); when the least long sample is not larger
+ * than the least short one, the 2 % floor is.
+ *
+ * @return ticks per second; 0 only when no frequency follows at all:
+ *     @a count is 0, @a long_ticks is NULL or holds no non-zero sample,
+ *     @a long_us is not longer than @a short_us, or the least long sample
+ *     comes to under one tick per second.
+ */
+uint64_t
+axl_backend_counter_freq_from_samples(
+    const uint64_t *short_ticks,  ///< ticks across each short Stall
+    const uint64_t *long_ticks,   ///< ticks across each long Stall
+    size_t          count,        ///< samples in each array
+    uint64_t        short_us,     ///< length of each short Stall, microseconds
+    uint64_t        long_us       ///< length of each long Stall, microseconds
+);
+
 // ===================================================================
 // Low-level platform I/O (for AxlIpmi, future AxlPci/AxlSpd)
 // ===================================================================
@@ -343,7 +422,9 @@ typedef void *AxlFileHandle;
 /**
  * @brief Open a file by UCS-2 path.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * @return AXL_OK on success; AXL_NOT_FOUND when the volume resolved and the
+ *     file system reported no such file (EFI_NOT_FOUND from the open) -- an
+ *     unmapped volume is NOT this; AXL_ERR on any other failure.
  */
 int
 axl_backend_file_open(
@@ -366,12 +447,49 @@ axl_backend_file_close(
 /**
  * @brief Read from a file.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * Asks the firmware for at most AXL_FS_READ_CHUNK (64 KB) per Shell
+ * ReadFile / EFI_FILE_PROTOCOL.Read call, looping until @p size bytes are
+ * read: on BMC virtual media larger single reads have been measured coming
+ * back corrupt (src/fs/axl-fs-read-chunk.h).
+ *
+ * The loop also stops at a SHORT read, fewer bytes than that call asked
+ * for: for a file that is end of file (a 0-byte read is its limit case); a
+ * directory returns one entry per call and a pipe what it holds, so a
+ * request of up to one chunk is exactly one call. A caller that needs the
+ * whole file must compare *size with what it asked for.
+ *
+ * An error after some bytes were read is NOT reported by this call: it
+ * returns AXL_OK with *size = the bytes read before the failing call, since
+ * the file position has already passed them. The next call retries the
+ * device from the failing chunk and reports the error if the fault recurs
+ * (the POSIX read() contract): the error is not sticky, and media whose
+ * fault was transient simply delivers the rest. Only a failure of the first call returns AXL_ERR, with *size 0.
+ *
+ * @return AXL_OK on success (*size = bytes read, possibly fewer than asked);
+ *     AXL_ERR when nothing could be read.
  */
 int
 axl_backend_file_read(
     AxlFileHandle  handle,  ///< file handle
     size_t        *size,    ///< (in/out) bytes to read / bytes read
+    void          *buf      ///< destination buffer
+    );
+
+/**
+ * @brief Read ONE directory entry (an EFI_FILE_INFO) in one firmware call.
+ *
+ * Unlike axl_backend_file_read this keeps the firmware's probe contract: an
+ * entry larger than @p buf is not consumed, and its size is reported so the
+ * caller can read it with a larger buffer.
+ *
+ * @return AXL_OK with *size the entry's size (0 at the end of the
+ *     directory); AXL_NO_RESOURCES when @p buf is too small, *size then the
+ *     size the entry needs and nothing consumed; AXL_ERR otherwise.
+ */
+int
+axl_backend_dir_read_entry(
+    AxlFileHandle  handle,  ///< directory handle
+    size_t        *size,    ///< (in/out) buffer size / entry size
     void          *buf      ///< destination buffer
     );
 
@@ -460,6 +578,18 @@ axl_backend_file_get_size(
     );
 
 /**
+ * @brief Is an already-open handle a directory?
+ *
+ * @return AXL_OK with @p is_dir set, or AXL_ERR when the file info cannot
+ *     be read.
+ */
+int
+axl_backend_file_handle_is_dir(
+    AxlFileHandle   handle,  ///< open file handle
+    bool           *is_dir   ///< [out] true for a directory
+    );
+
+/**
  * @brief Check if a path is a directory.
  *
  * @return true if path is a directory.
@@ -487,6 +617,58 @@ axl_backend_file_stat(
     );
 
 /**
+ * @brief Get file metadata through an already-open handle.
+ *
+ * axl_backend_file_stat for a handle: it describes the file the handle is
+ * open on wherever it now is, and can also report its CURRENT basename.
+ *
+ * @return AXL_OK on success, AXL_ERR on error (including a file deleted
+ *     through another handle, which the FAT driver answers with a device
+ *     error).
+ */
+int
+axl_backend_file_handle_stat(
+    AxlFileHandle   handle,      ///< open file handle
+    uint64_t       *size,        ///< [out] file size (NULL OK)
+    uint64_t       *alloc_size,  ///< [out] allocation size (NULL OK)
+    uint64_t       *mtime_unix,  ///< [out] modification time, Unix seconds (NULL OK, 0 = unknown)
+    bool           *is_dir,      ///< [out] directory flag (NULL OK)
+    bool           *read_only,   ///< [out] read-only attribute (NULL OK)
+    unsigned short *name,        ///< [out] current basename, UCS-2, NUL-terminated, cut at a character boundary to fit (NULL OK)
+    size_t          name_cap,    ///< capacity of @p name in characters
+    bool           *name_cut     ///< [out] true when @p name was cut to fit (NULL OK)
+    );
+
+/**
+ * @brief Write a file's modification time through an open handle.
+ *
+ * Writes @p mtime_unix as UTC calendar fields with the time zone
+ * unspecified, leaving every other field as it was. Unverified: the caller
+ * re-reads the time to learn what the filesystem kept.
+ *
+ * @return AXL_OK if SetInfo accepted it, AXL_ERR otherwise.
+ */
+int
+axl_backend_file_set_mtime(
+    AxlFileHandle  handle,      ///< open file handle (write access)
+    uint64_t       mtime_unix   ///< Unix seconds, UTC
+    );
+
+/**
+ * @brief Days since 1970-01-01 to a Gregorian year, month and day.
+ *
+ * The inverse of the backend's days-from-civil conversion; shared so the
+ * library holds one calendar conversion in each direction.
+ */
+void
+axl_backend_civil_from_days(
+    int64_t   z,  ///< days since the Unix epoch
+    int      *y,  ///< [out] year
+    unsigned *m,  ///< [out] month, 1..12
+    unsigned *d   ///< [out] day, 1..31
+    );
+
+/**
  * Convert a 16-byte EFI_TIME value to Unix epoch seconds. The input
  * is read out of EFI_FILE_INFO.ModificationTime (or any of the other
  * EFI_TIME fields) by either the backend or the axl-fs.c dir-entry
@@ -494,9 +676,10 @@ axl_backend_file_stat(
  * indicate an unset / zero date.
  *
  * Treats TimeZone as UTC when EFI_UNSPECIFIED_TIMEZONE (0x07FF) is
- * stored; otherwise subtracts TimeZone-minutes to convert to UTC.
- * Daylight bit is ignored (the timezone offset already accounts for
- * it on platforms that bother to set it).
+ * stored; otherwise ADDS TimeZone-minutes to convert to UTC: UEFI 2.11
+ * section 8.3 defines Localtime = UTC - TimeZone. Daylight bit is ignored
+ * (the timezone offset already accounts for it on platforms that bother
+ * to set it). A pre-1970 time is 0.
  */
 uint64_t
 axl_backend_efi_time_to_unix(
@@ -504,14 +687,72 @@ axl_backend_efi_time_to_unix(
     );
 
 /**
- * @brief Rename a file by path.
+ * The inverse of axl_backend_efi_time_to_unix: Unix seconds (UTC) as the
+ * 16 bytes of an EFI_TIME -- UTC calendar fields, nanoseconds 0, TimeZone
+ * unspecified (0x07FF), Daylight 0 -- which that function reads back
+ * unchanged. Every file time AXL writes is written this way.
+ */
+void
+axl_backend_unix_to_efi_time(
+    uint64_t  secs,         ///< Unix seconds, UTC
+    void     *efi_time_16   ///< [out] 16 bytes in EFI_TIME layout
+    );
+
+/// Capacity, in UCS-2 characters with the NUL, of the volume-relative path
+/// axl_backend_path_locate writes.
+#define AXL_BACKEND_VOL_PATH_MAX  512u
+
+/**
+ * @brief Resolve a path to the filesystem it lands on and its place there.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * Resolution is the backend's own, the same one axl_backend_file_open
+ * uses: the current directory, either separator, map-name case and
+ * aliases. Two paths are on the same volume exactly when their @p volume
+ * handles are equal. Nothing is opened, so the path need not exist.
+ *
+ * @p rel receives the path below the volume root with `\` separators and
+ * no leading or trailing one ("" is the root). `.` and `..` components are
+ * passed through unresolved.
+ *
+ * @return AXL_OK; AXL_ERR when the volume does not resolve or @p rel does
+ *     not fit in @p rel_cap characters.
  */
 int
-axl_backend_file_rename(
-    const unsigned short  *old_path,  ///< current UCS-2 path
-    const unsigned short  *new_path   ///< new UCS-2 filename (not full path)
+axl_backend_path_locate(
+    const unsigned short  *path,     ///< UCS-2 path
+    void                 **volume,   ///< [out] the volume's SimpleFileSystem EFI_HANDLE
+    unsigned short        *rel,      ///< [out] volume-relative path
+    size_t                 rel_cap   ///< capacity of @p rel in characters
+    );
+
+/**
+ * @brief Delete the entry an open handle refers to, and close the handle.
+ *
+ * The handle is closed in every case and set to NULL.
+ *
+ * @return AXL_OK if the entry was deleted; AXL_ERR otherwise (including
+ *     the firmware's "closed but not deleted" warning).
+ */
+int
+axl_backend_file_handle_delete(
+    AxlFileHandle  *handle   ///< open handle, write access; NULL on return
+    );
+
+/**
+ * @brief Rename or move the entry an open handle refers to.
+ *
+ * One SetInfo carrying the entry's current metadata (times included) and
+ * @p file_name: a bare name renames within the directory, a `\`-anchored
+ * path moves within the volume. Unverified -- the caller re-reads the name.
+ *
+ * @return AXL_OK if SetInfo succeeded; AXL_UNSUPPORTED if the filesystem
+ *     answered EFI_UNSUPPORTED (it cannot take @p file_name; nothing
+ *     changed); AXL_ERR otherwise.
+ */
+int
+axl_backend_file_handle_rename(
+    AxlFileHandle          handle,     ///< open handle, write access
+    const unsigned short  *file_name   ///< new name or `\`-anchored path
     );
 
 /**
@@ -650,9 +891,45 @@ AxlFileHandle
 axl_backend_shell_stderr(void);
 
 /**
+ * @brief axl_backend_shell_stdout(), and WHOSE handle it is: @p *owner is 0
+ *     when it is this image's own (or NULL), else the token of the launcher
+ *     dispatch that lends it through the stdio bridge. Every launcher's
+ *     console handle is the same Shell file, so the handle alone cannot
+ *     tell one launcher from the next; the pair can.
+ */
+AxlFileHandle
+axl_backend_shell_stdout_owned(
+    uint64_t  *owner   ///< [out] 0, or the lending dispatch's token
+    );
+
+/**
+ * @brief axl_backend_shell_stderr() and whose handle it is, as
+ *     axl_backend_shell_stdout_owned().
+ */
+AxlFileHandle
+axl_backend_shell_stderr_owned(
+    uint64_t  *owner   ///< [out] 0, or the lending dispatch's token
+    );
+
+/**
+ * @brief Whether @p h IS the Shell's console file for stdout (@p err false)
+ *        or stderr (@p err true): the handle EFI_SHELL_PROTOCOL's
+ *        OpenFileByName returns for ">o" / ">e". That file prints what it
+ *        is given as a NUL-terminated UCS-2 string, whatever the size, so
+ *        raw bytes must not be written to it. False for NULL, for any other
+ *        file (`NUL`, `>v name`, a real file, a pipe), and when the Shell
+ *        cannot be asked.
+ */
+bool
+axl_backend_shell_handle_is_console(
+    AxlFileHandle  h,    ///< a Shell std handle, or NULL
+    bool           err   ///< true for stderr (">e"), false for stdout (">o")
+    );
+
+/**
  * @brief Get the current working directory.
  *
- * @return UCS-2 path (pointer to Shell-owned storage), or NULL.
+ * @return UCS-2 path, valid until the next call (do not free), or NULL.
  */
 const unsigned short *
 axl_backend_shell_getcwd(void);
@@ -675,6 +952,68 @@ axl_backend_shell_chdir(
 int
 axl_backend_shell_execute(
     const unsigned short  *command  ///< UCS-2 command line
+    );
+
+/**
+ * @brief Backend of axl_timer_resolution_begin(): arguments already checked
+ *     (@p period_us in range, @p out_id non-NULL).
+ *
+ * @return AXL_OK, AXL_UNSUPPORTED or AXL_ERR, as the public call.
+ */
+int
+axl_backend_timer_resolution_begin(
+    uint32_t  period_us,       ///< wanted tick, microseconds
+    uint32_t *out_id,          ///< [out] the request
+    uint32_t *out_granted_us   ///< [out, optional] the tick afterwards
+    );
+
+/**
+ * @brief Backend of axl_timer_resolution_end().
+ *
+ * @return AXL_OK, or AXL_INVALID if @p id is not this image's active request.
+ */
+int
+axl_backend_timer_resolution_end(
+    uint32_t id   ///< a request from axl_backend_timer_resolution_begin()
+    );
+
+/**
+ * @brief The firmware's timer period in microseconds; 0 when unknown.
+ *
+ * @return the period, or 0.
+ */
+uint32_t
+axl_backend_timer_period_us(void);
+
+/**
+ * @brief Execute a shell command string and report what the Shell said.
+ *
+ * Modern Shell only (`EFI_SHELL_PROTOCOL`). `*status` is preset to a
+ * sentinel and @p written says whether `Execute` overwrote it -- EDK2's
+ * nested mode always writes it (the nested Shell's exit code), a `-nonest`
+ * Shell only when the command ran. @p execute_status is
+ * `Execute`'s own return.
+ *
+ * @return AXL_OK when `Execute` was called (whatever it returned); AXL_ERR
+ *     when there is no `EFI_SHELL_PROTOCOL` or an argument is NULL.
+ */
+int
+axl_backend_shell_execute_status(
+    const unsigned short  *command,         ///< UCS-2 command line
+    uint64_t              *status,          ///< [out] the StatusCode Execute wrote (valid when *written)
+    bool                  *written,         ///< [out] whether Execute wrote it
+    uint64_t              *execute_status   ///< [out] Execute's own return
+    );
+
+/**
+ * @brief Look up a Shell alias.
+ *
+ * @return the alias's UCS-2 value (Shell-owned), or NULL when there is no such
+ *     alias or no `EFI_SHELL_PROTOCOL`.
+ */
+const unsigned short *
+axl_backend_shell_get_alias(
+    const unsigned short  *name   ///< UCS-2 alias name
     );
 
 /**
@@ -736,6 +1075,13 @@ axl_backend_shell_map_alias(
     size_t  out_size      ///< capacity of @p out
     );
 
+/* Longest volume name a caller joins a path onto ("FS0", "fs12", a SetMap
+   alias), NUL included -- for axl_backend_volume_name_for_handle, which fails
+   rather than truncate, so an over-long alias degrades to the prefix-less path,
+   not a wrong one. ONE size for every caller (axl_app_*, axl_driver_locate): a
+   smaller one in one place lost candidates the other found. */
+#define AXL_BACKEND_VOLUME_NAME_MAX  64u
+
 /**
  * @brief Name the volume a device HANDLE represents, e.g. "FS0" or "fs0".
  *
@@ -761,6 +1107,18 @@ axl_backend_volume_name_for_handle(
     void   *device_handle,  ///< opaque EFI_HANDLE for the volume
     char   *out,            ///< [out] receives the volume name, no ':'
     size_t  out_size        ///< capacity of @p out
+    );
+
+/**
+ * @brief Total size of a device path in bytes, its END node included.
+ *
+ * Bounded walk (256 nodes); a node claiming Length < 4 makes it malformed.
+ *
+ * @return the size, or 0 for a malformed chain.
+ */
+size_t
+axl_backend_dp_size(
+    const void  *dp  ///< opaque EFI_DEVICE_PATH_PROTOCOL
     );
 
 /**
@@ -879,6 +1237,19 @@ axl_backend_shell_set_map(
 size_t
 axl_backend_wcslen(
     const unsigned short  *s  ///< UCS-2 string
+    );
+
+/**
+ * @brief Copy a UCS-2 string whole, or not at all.
+ *
+ * @return true with @p src and its NUL copied into @p dst; false (and
+ *     @p dst untouched) when it would not fit in @p cap characters.
+ */
+bool
+axl_backend_wcs_copy(
+    unsigned short        *dst,  ///< [out] destination
+    size_t                 cap,  ///< capacity of @p dst in characters
+    const unsigned short  *src   ///< NUL-terminated UCS-2 source
     );
 
 /**
@@ -1016,6 +1387,34 @@ int
 axl_backend_event_create_before_exit_boot(
     void  (*notify)(void *ctx),  ///< notify function (TPL_CALLBACK)
     void   *ctx,                 ///< opaque context passed to @p notify
+    AxlEventHandle *event        ///< (out) receives event handle
+    );
+
+/**
+ * @brief Register a notify to run on every idle pass of the foreground's
+ *     gBS->WaitForEvent.
+ *
+ * Joins EDK2's idle-loop event group (gIdleLoopEventGuid), which the DXE
+ * core signals from gBS->WaitForEvent on every pass that finds none of
+ * the waiter's events signalled; EDK2's CpuDxe member then halts the CPU
+ * until the next interrupt. With @p before_halt the notify runs at
+ * TPL_NOTIFY, at the pass itself, on EDK2 (see the implementation for the
+ * ordering it relies on) -- and may then do no more than read
+ * axl_backend_counter_ticks() and store. Without it, it runs at
+ * TPL_CALLBACK after the halt, ahead of any timer notify the waking
+ * interrupt queued. Either may run very often while the foreground waits.
+ * It is an EDK2 mechanism, not a UEFI one: on firmware that does not
+ * signal the group the notify never runs.
+ *
+ * Pair with `axl_backend_event_close`.
+ *
+ * @return AXL_OK on success, AXL_ERR on error or table-full.
+ */
+int
+axl_backend_event_create_idle_notify(
+    void  (*notify)(void *ctx),  ///< notify function
+    void   *ctx,                 ///< opaque context passed to @p notify
+    bool    before_halt,         ///< TPL_NOTIFY, before the halt (else TPL_CALLBACK)
     AxlEventHandle *event        ///< (out) receives event handle
     );
 
@@ -1370,6 +1769,85 @@ axl_backend_resolve_exit_status(
 void
 axl_backend_clear_exit_status(void);
 
+/**
+ * @brief gBS->StartImage on @p handle, counted as a child of this image.
+ *
+ * While it runs, the child -- not this image -- is the firmware's current
+ * image, so a gBS->Exit from this image (one of its event callbacks calling
+ * axl_exit) FAILS. _axl_cleanup_note_exit reads the count to know that such
+ * an exit will not unload this image and must not tear it down. Every place
+ * libaxl starts an image goes through here, and every call that can make the
+ * FIRMWARE start one on this image's behalf -- ConnectController, RamDisk
+ * Register, the Shell's Execute -- is bracketed with
+ * axl_backend_child_image_enter/leave. (The pack stub calls StartImage
+ * itself, and is exempt: it is raw UEFI and links no AXL runtime.) A
+ * consumer calling gBS->StartImage itself under AXL_ALLOW_UEFI is not seen.
+ *
+ * @return the EFI_STATUS StartImage returned.
+ */
+uint64_t
+axl_backend_start_image(
+    void *handle   ///< the loaded image to start
+    );
+
+/**
+ * @brief Bracket a call that runs images of its own -- the Shell's Execute --
+ *        as one child (see axl_backend_start_image).
+ */
+void axl_backend_child_image_enter(void);
+void axl_backend_child_image_leave(void);
+
+/** @brief True while an image this one started (or a Shell command it ran)
+ *         is running. */
+bool axl_backend_child_images_running(void);
+
+/**
+ * @brief Defer an exit that cannot happen now, by unwinding the callback.
+ *
+ * While a child image runs, the CHILD is the firmware's current image, so a
+ * gBS->Exit from one of this image's notify callbacks fails -- and an exit
+ * must not return, so axl_exit used to spin there at callback TPL, which
+ * starves the child: a deadlock. Instead, when a child is running and the
+ * call is inside an AXL notify callback, this records @p rc and unwinds to
+ * that callback's trampoline (axl_backend_notify_unwind): the callback is
+ * abandoned, the child runs on, and when the last child returns
+ * (axl_backend_exit_if_deferred, after the starting function's cleanup)
+ * @p exit_fn(rc) runs from the caller's own context, where the exit succeeds.
+ *
+ * @return false when the exit can happen now (no child, or not inside a
+ *     notify callback); it does not return otherwise.
+ */
+bool axl_backend_exit_defer(int rc, void (*exit_fn)(int rc));
+
+/**
+ * @brief Perform an exit axl_backend_exit_defer recorded, once no child
+ *        remains. Does not return when it does.
+ *
+ * Called by every libaxl function that started a child, AFTER it has
+ * released what it owns that teardown cannot reclaim (firmware pool, a
+ * child's load options, the AxlImage) -- never from inside the counting
+ * itself, which would skip that. Composite functions call it last; the
+ * pieces they are built from use non-checking internals.
+ */
+void axl_backend_exit_if_deferred(void);
+
+/** @brief Notify nesting depth: AXL notify callbacks currently active. */
+unsigned axl_backend_notify_depth(void);
+
+/** @brief True when the innermost AXL notify callback was entered at a depth
+ *         above @p newer_than and is running at the TPL it was called at --
+ *         the only callback a deferred exit may unwind. */
+bool axl_backend_notify_unwind_ok(unsigned newer_than);
+
+/** @brief Abandon the current notify callback and return from its
+ *         trampoline to the firmware. Returns only outside one. */
+void axl_backend_notify_unwind(void);
+
+/** @brief Have @p state saved on every notify callback's entry and put back
+ *         when that callback is abandoned (one counter; AxlLoop's callback
+ *         depth). */
+void axl_backend_notify_track_state(unsigned *state);
+
 // ===================================================================
 // MP Services (used by axl-task-pool.c)
 // ===================================================================
@@ -1379,6 +1857,16 @@ typedef struct AxlMpContext AxlMpContext;
 
 /// AP worker procedure (EFIAPI calling convention required by firmware)
 typedef void (EFIAPI *AxlApProc)(void *arg);
+
+/**
+ * How long the BSP waits on an AP to do anything -- answer a probe,
+ * acknowledge quit, or be retired by the firmware -- in wall-clock
+ * microseconds. One value for every such wait, because they all wait on
+ * the same thing: a processor that, on a virtual machine, makes no
+ * progress at all while its host thread is descheduled. See
+ * axl-task-pool.c's tunables for the measurements behind it.
+ */
+#define AXL_AP_ANSWER_TIMEOUT_US  10000000u
 
 /**
  * @brief Initialize MP services and enumerate available APs.
@@ -1432,7 +1920,27 @@ axl_backend_mp_get_ap_number(
     );
 
 /**
+ * @brief Give up on AP @a ap_index's dispatch: the caller has no
+ *        confirmation that its procedure returned, so cleanup must not
+ *        wait for the firmware to retire it.
+ *
+ * axl_backend_mp_cleanup then checks that AP's completion event once and
+ * leaks it if unsignalled, rather than spending AXL_AP_ANSWER_TIMEOUT_US
+ * on an AP that has already failed to answer for that long. Out-of-range
+ * indices and a NULL context are ignored.
+ */
+void
+axl_backend_mp_abandon_ap(
+    AxlMpContext  *ctx,       ///< MP context
+    size_t         ap_index   ///< AP index (0..worker_count-1)
+    );
+
+/**
  * @brief Free MP context. NULL-safe.
+ *
+ * Waits up to AXL_AP_ANSWER_TIMEOUT_US for the firmware to retire each
+ * dispatched AP that was not abandoned (axl_backend_mp_abandon_ap), so
+ * its completion event can be closed rather than leaked.
  */
 void
 axl_backend_mp_cleanup(

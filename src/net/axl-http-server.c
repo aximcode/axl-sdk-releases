@@ -108,6 +108,7 @@ server_free_impl(AxlHttpServer *s, bool abortive)
         return;
     }
 
+    s->freeing = true;
     axl_debug("server free on port %u%s", (unsigned)s->port,
               abortive ? " (abortive)" : "");
 
@@ -166,7 +167,60 @@ server_free_impl(AxlHttpServer *s, bool abortive)
 void
 axl_http_server_free(AxlHttpServer *s, AxlTeardown mode)
 {
+    if (s == NULL || s->freeing) {
+        return;   /* already being freed: an app hook freeing again */
+    }
+    if (s->dispatch_depth > 0) {
+        /* Called from one of this server's own handlers: the code that
+           called the handler still uses the connection and the server when
+           it returns. Completed by http_dispatch_end as the stack unwinds --
+           and under axl_http_server_run, whose private loop nothing else can
+           end, the loop is quit so that run can complete it. */
+        s->free_pending   = true;
+        s->free_abortive |= (mode == AXL_TEARDOWN_RESET);
+        if (s->run_loop && s->loop != NULL) {
+            axl_loop_quit(s->loop);
+        }
+        return;
+    }
     server_free_impl(s, mode == AXL_TEARDOWN_RESET);
+}
+
+void
+http_dispatch_begin(AxlHttpServer *s)
+{
+    if (s != NULL) {
+        s->dispatch_depth++;
+    }
+}
+
+bool
+http_dispatch_end(AxlHttpServer *s)
+{
+    if (s == NULL) {
+        return false;
+    }
+    s->dispatch_depth--;
+    if (s->dispatch_depth == 0 && s->free_pending) {
+        s->free_pending = false;
+        server_free_impl(s, s->free_abortive);
+        return true;
+    }
+    return false;
+}
+
+bool
+http_dispatch(AxlHttpServer *s, AxlTcpCallback body, AxlTcp *sock,
+              AxlStatus status, void *data)
+{
+    bool keep;
+
+    http_dispatch_begin(s);
+    keep = body(sock, status, data);
+    if (http_dispatch_end(s)) {
+        return false;   /* the socket this callback was for is closed */
+    }
+    return keep;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,9 +480,26 @@ axl_http_server_run(AxlHttpServer *s)
     }
 
     {
-        int rc = axl_loop_run(loop);
+        int  rc;
+        bool freed;
+
+        /* The whole run is one dispatch: a handler that frees the server
+           only records it (and quits this loop, which nothing else can);
+           the free completes here, once the loop is no longer running. */
+        s->run_loop = true;
+        http_dispatch_begin(s);
+        rc = axl_loop_run(loop);
+        if (s->free_pending) {
+            /* This loop is about to be freed, so no loop is left to finish
+               a graceful close on: complete the free synchronously. */
+            s->free_abortive = true;
+        }
+        freed = http_dispatch_end(s);
+        if (!freed) {
+            s->run_loop = false;
+            s->loop     = NULL;
+        }
         axl_loop_free(loop);
-        s->loop = NULL;
         return rc;
     }
 }
@@ -438,7 +509,25 @@ axl_http_server_run(AxlHttpServer *s)
 // ---------------------------------------------------------------------------
 
 static bool
+on_accept_ready_body(
+    AxlTcp    *client,
+    AxlStatus  status,
+    void      *data
+    );
+
+static bool
 on_accept_ready(
+    AxlTcp    *client,
+    AxlStatus  status,
+    void      *data
+    )
+{
+    return http_dispatch((AxlHttpServer *)data, on_accept_ready_body,
+                         client, status, data);
+}
+
+static bool
+on_accept_ready_body(
     AxlTcp    *client,
     AxlStatus  status,
     void      *data
@@ -550,7 +639,26 @@ on_accept_ready(
 // ---------------------------------------------------------------------------
 
 static bool
+on_tls_handshake_data_body(
+    AxlTcp    *sock,
+    AxlStatus  status,
+    void      *data
+    );
+
+static bool
 on_tls_handshake_data(
+    AxlTcp    *sock,
+    AxlStatus  status,
+    void      *data
+    )
+{
+    /* @p data is always a live pool connection here. */
+    return http_dispatch(((HttpConn *)data)->server, on_tls_handshake_data_body, sock,
+                         status, data);
+}
+
+static bool
+on_tls_handshake_data_body(
     AxlTcp    *sock,
     AxlStatus  status,
     void      *data

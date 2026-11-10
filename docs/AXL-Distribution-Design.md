@@ -1478,6 +1478,14 @@ is not a reason to weaken those.
 
 ## 17. `install.sh` replaces the packages
 
+> **Partly reversed 2026-11-10 (§17.5):** the `.deb`/`.rpm` ship again,
+> beside install.sh rather than instead of it -- versioned names under
+> `/opt`, nothing in `/usr/bin`. install.sh stays the install path for a
+> user (and the only one that manages versions side by side with `axl use`
+> and `axl update`); the packages serve system-wide installs and policies
+> that require a package. §17.1-§17.4 are the record of the 2026-09
+> decision.
+
 **Decision: a stable `install.sh` becomes the install path, and the `.deb` and
 `.rpm` retire once it is proven.** Not coexistence — the point is to stop
 maintaining two package layouts, `fpm`, `rpmbuild`, `Replaces`/`Obsoletes`
@@ -1599,6 +1607,273 @@ migration and a confusing afternoon.
 - **`curl | sh` as a trust model.** It is what the ecosystem does, and the
   hash check in step 2 is what makes it defensible rather than customary.
 
+### 17.5 The packages return (2026-11-10) -- BUILT
+
+**Status: built, as amended by the owner** (the recommendations below were
+approved 2026-11-10, with five amendments recorded under "As built"; where
+the two differ, "As built" is what shipped). Mike reversed D2's retirement on 2026-11-10:
+`.deb` and `.rpm` ship again on the releases page, built by CPack's DEB and RPM
+generators from the SAME `install()` rules that now make `stage/` and the three
+tarballs (AXL-Build-System-Design.md §10.9). What the old packages cost us --
+`fpm`, `rpmbuild` driven by hand, a second staging layout in
+`build-packages.sh` -- was the case for retiring them (§17), and CPack removes
+most of it: no second layout, no `fpm`. What remains is every question a
+package raises that a tarball does not, answered below. Each row ends in a
+recommendation; the decisions are listed at the end.
+
+**What history says.** The last packages shipped in v4.4.0 as `axl-sdk.deb` and
+`axl-sdk.rpm` (unversioned asset names), package name `axl-sdk`, built by
+`fpm` from `install.sh --prefix $STAGE/usr` -- an FHS install into **`/usr`**,
+so `/usr/bin/axl`, `/usr/bin/axl-cc`. Hard `Depends:` on `gcc`, `binutils`,
+`gcc-aarch64-linux-gnu`, `binutils-aarch64-linux-gnu` (stale: the SDK compiles
+with the bare-metal cross since §4.1b), and a `postinst.sh` that printed a
+hint. Deleted by D7 (`4ab207f8`).
+
+**The live constraint: a deployed consumer removes `axl-sdk` on sight.** The
+flagship consumer's `install-axl-sdk.sh` (pinned at 4.7.5) runs
+`dpkg -s axl-sdk && sudo apt-get remove -y axl-sdk` (and the `rpm -q` /
+`dnf remove` twin) on every run, because the 4.4.0 package's `/usr/bin/axl`
+sorts ahead of install.sh's `~/.local/bin/axl` and kept an old `axl-cc` on
+PATH. That script lives in checkouts at pinned commits we cannot recall, so
+whatever we ship must be safe against it **as it is today**, not as it could
+be edited to be. `packaging/install.sh` has the matching check (warns that
+"/usr/bin/axl will win on PATH").
+
+#### Prior art -- SDKs that ship BOTH a script/tarball installer and distro packages
+
+| project | how the two coexist | verdict here -- what we take |
+|---|---|---|
+| **.NET SDK** (`dotnet-install.sh` + `dotnet-sdk-8.0` deb/rpm) | Packages are **versioned by name** (`dotnet-sdk-8.0`, `-9.0`) and install side by side into one root; one host binary (`dotnet`, our `axl`) picks the version. Microsoft's docs warn that mixing the script and the packages on one machine "causes conflicts" -- they collide in `/usr/bin/dotnet`. | Take **versioned package names**, which give D2's side-by-side roots without a second mechanism. Avoid their collision by putting nothing in `/usr/bin` (below). |
+| **Eclipse Temurin** (tarballs + `temurin-17-jdk` deb/rpm) | Versioned names; each JDK in its own versioned directory `/usr/lib/jvm/temurin-17-jdk-amd64`; the `/usr/bin/java` entry points are **`update-alternatives`** links with a priority, so the newest wins and an admin can `--config` another. | Take **alternatives** to own the `current` link -- the distro-native, reference-counted way for several packages to share one name. |
+| **Google Cloud CLI** (`install.sh` tarball + `google-cloud-cli` deb/rpm) | The package-installed copy **disables the self-updater**: `gcloud components update` on a package install refuses and names `apt-get`/`dnf`. | Take this mechanism exactly: `axl update`/`use`/`uninstall`/`prune` refuse on a package-owned root and print the package-manager command. Two managers of one tree is the failure mode. |
+| **Node.js** (nodejs.org tarballs + NodeSource `nodejs` deb/rpm) | One upgrading package into `/usr`; per-user managers (nvm) win by PATH order. | Counter-example: an unversioned `/usr` package is exactly our 4.4.0 shape and exactly what shadowed install.sh. Not taken. |
+
+#### P1. Package name and versioning -- RECOMMEND versioned names, `axl-sdk-<ver>`
+
+| | one upgrading package (`axl-sdk`, or a new name) | versioned names (`axl-sdk-4.8.0`) |
+|---|---|---|
+| side-by-side versions (D2) | lost -- dpkg holds one version per name | kept; each package owns its own root |
+| `apt upgrade` | would upgrade -- **but only from a repository, and we publish GitHub release assets, not a repo**, so it never sees a new version anyway | install the next one by hand, as today with install.sh |
+| removing an old one | implicit on upgrade | `apt remove axl-sdk-4.7.5` (the package-world `axl prune`) |
+| the consumer's `dpkg -s axl-sdk` | matches if named `axl-sdk` -> **removed on every consumer run** | never matches -> never removed |
+
+**Recommend versioned names, full version** (`axl-sdk-4.8.0`, version field
+`4.8.0`, release `1`). The upgrade convenience a single name buys is zero
+without an apt/dnf repository, and the full version -- not `major.minor` as
+.NET does -- matches how consumers pin (by exact version and SHA-256). If a
+repository is ever published, an unversioned metapackage `axl-sdk-latest`
+depending on the newest can be added then; not now.
+
+#### P2. Install prefix -- RECOMMEND `/opt/axl-sdk-<ver>`, the tarball's own root
+
+The package payload is the SDK tarball's tree, unmodified, at
+`CPACK_PACKAGING_INSTALL_PREFIX=/opt/axl-sdk-<ver>` -- the D1 root-install
+default (§12.2) and the path `find_package(axl)` already searches (§12.1). Not
+`/usr` (4.4.0's choice, and §12.2's "packages keep `/usr`"): `/usr` cannot
+hold two versions, and it is what put `axl` into `/usr/bin`. §12.2's
+"usrmerge handling `axl-cc` was patched for" stays in axl-cc harmlessly. The
+same `install()` rules produce both, so `test-packages` (P8) can assert the
+package's file list equals the tarball's.
+
+#### P3. Coexistence with install.sh -- the shadowing collision (NAMED DECISION)
+
+**Recommend: the packages put NOTHING in `/usr/bin`, and own no file
+install.sh writes.**
+- **`current` -> alternatives** (AMENDED: the link is `/opt/axl-sdk-package`,
+  not `/opt/axl-sdk` -- see "As built"). Each package's `postinst` runs
+  `update-alternatives --install /opt/axl-sdk axl-sdk /opt/axl-sdk-<ver> <prio>`
+  (RPM's `alternatives` takes the same arguments), priority derived from the
+  version (`MAJOR*10000+MINOR*100+PATCH`), and `prerm` removes it. Auto mode
+  makes the newest installed package `current`; `update-alternatives --config
+  axl-sdk` is the package-world `axl use`. `axl-prune.sh` already protects what
+  `/opt/axl-sdk` resolves to, through any number of links.
+- **PATH -> `/etc/profile.d/axl-sdk.sh`, APPENDING `/opt/axl-sdk/bin`.** A
+  slave of the same alternative (each package ships its copy under
+  `share/axl/`), so no two packages own the file. Appended, not prepended:
+  `/etc/profile.d` runs before `~/.profile`, which puts `~/.local/bin` FIRST,
+  so **a per-user install.sh install always wins over the system package** --
+  the reverse of 4.4.0. This also closes §17.4's "nothing makes the tools
+  appear on every user's PATH": that is precisely what a system package is for.
+- **The old package goes by package metadata, never `rm` (§12.5).** deb
+  `Conflicts: axl-sdk` + `Replaces: axl-sdk`, rpm `Obsoletes: axl-sdk < 4.5`:
+  installing any new package removes a leftover 4.4.0 `/usr` install, the thing
+  that actually shadowed.
+- **The deployed consumer's `apt-get remove axl-sdk`** then matches nothing
+  new (P1), so it keeps doing its one job -- removing the 4.4.0 leftover -- and
+  never touches a new package. Had the name stayed `axl-sdk`, every run of
+  that script would uninstall a package an admin installed on purpose, which
+  is not acceptable. **This is the reason the name must differ**, and versioned
+  names give it for free.
+- **install.sh's own check** (`dpkg -s axl-sdk`) stays as it is for the old
+  package; a second, informational line names any `axl-sdk-*` package under
+  `/opt` and says the `~/.local/bin` one takes precedence. No refusal: they
+  compose.
+- **The manager verbs refuse on a package root** (the gcloud mechanism;
+  AMENDED: the §21 receipt, not a new marker -- see "As built"): the
+  package installs a marker, `share/axl/install-method` containing `package`
+  (DEB/RPM component only; not in the tarball), and `axl update`, `use`,
+  `uninstall` and `prune` run from that root print the `apt`/`dnf` command and
+  exit 1 (as built: all four, prune in axl-prune.sh itself). `axl prune` run from an install.sh root also never removes a root
+  carrying the marker (dpkg would still list its files).
+
+#### P4. Dependencies -- RECOMMEND §12.6's set, refreshed
+
+- `Depends:` `curl`, `xz-utils` (rpm `xz`), `tar` -- what `axl-install-toolchain`
+  genuinely runs. **Not** `gcc`/`binutils`/`gcc-aarch64-linux-gnu`: 4.4.0's
+  hard dependencies are stale (the SDK compiles with its own bare-metal cross;
+  x64 falls back to host gcc only under `AXL_TOOLCHAIN=auto`, which a user
+  chooses).
+- `Recommends:` (deb `CPACK_DEBIAN_PACKAGE_RECOMMENDS`, rpm
+  `CPACK_RPM_PACKAGE_RECOMMENDS` -- both native in CPack 4.3, no `--rpm-tag`
+  workaround): deb `qemu-system-x86, qemu-system-arm, ovmf, qemu-efi-aarch64,
+  virtiofsd, mtools, dosfstools`; rpm `qemu-system-x86, qemu-system-aarch64,
+  edk2-ovmf, edk2-aarch64, virtiofsd, mtools, dosfstools` -- the lists
+  host-tools README's install hints carry (`cmake/AxlQemuDeps.cmake`, one copy, shared).
+- Architecture `amd64` / `x86_64` only: `bin/pe-set-debug` and
+  `bin/axl-efi-pack` are x86-64 ELF, as the tarball's name already says.
+- CPack's automatic `shlibdeps`/`AUTOREQ` OFF: they would scan the shipped
+  `.o`/`.a` and the shell scripts and invent requirements.
+
+#### P5. The toolchain -- RECOMMEND: not packaged; the package says how to get it
+
+The bare-metal cross toolchains stay outside the package, exactly as outside
+the tarball (§12.3's one exception, 739 MB shared across versions). Fetching
+them in a maintainer script is ruled out (no network in `postinst`; Debian
+policy, and an offline install must succeed). `postinst` prints one line:
+`axl-install-toolchain x64|aa64` (on PATH via P3). Packaging the toolchains as
+`axl-toolchain-<triple>-<ver>` is possible later with the same generator; not
+in this slice -- nobody has asked, and it is 739 MB of release assets per tag.
+
+#### P6. Uninstall and upgrade
+
+(As built, the link below is `/opt/axl-sdk-package`, not `/opt/axl-sdk`.)
+
+- **Uninstall:** `apt remove axl-sdk-<ver>` / `dnf remove axl-sdk-<ver>`;
+  `prerm` drops the alternative, so `current` moves to the next-newest or
+  disappears with the last one. Nothing outside `/opt/axl-sdk-<ver>`,
+  `/opt/axl-sdk` and the profile.d link is touched -- §12.3 holds for the
+  package payload, and the test asserts it. Toolchains are not removed (they
+  are not the package's).
+- **Upgrade:** install the newer package beside the older; auto-mode
+  alternatives makes it current; remove the older when its pins are gone.
+  From 4.4.0's `axl-sdk`: installing any new package removes it (P3).
+
+#### P7. Asset names -- RECOMMEND the distro-conventional filenames
+
+The packages are new assets, so no consumer pins them yet. `axl-sdk-4.8.0_4.8.0-1_amd64.deb`
+(`CPACK_DEBIAN_FILE_NAME DEB-DEFAULT`) and `axl-sdk-4.8.0-4.8.0-1.x86_64.rpm`
+(`RPM-DEFAULT`): long, but what `apt install ./` users and mirror tooling
+expect, and both carry the version that §14.1a requires of every non-stable
+asset. Both go into `SHA256SUMS`. The six existing asset names are unchanged
+(pinned by `test-release-asset-names.sh`). **Unsigned**, as the tarballs are,
+verified by `SHA256SUMS`; signing (a GPG key for `dpkg-sig`/`rpm --addsign`)
+is the §17.4 "mandates signed packages" audience's need and is the owner's call.
+
+#### P8. How CI tests them -- RECOMMEND one container test per family, with the real package manager
+
+(AMENDED: it runs in CI, `local-only=0`; release.yml builds the packages and
+the dispatched CI suite runs this test -- see "As built".)
+`test-packages.sh` (`local-only=1`, `needs=podman`, through
+`lib/podman-run.sh` as `test-host-deps-minimal.sh` does), in
+`debian:stable-slim` and `fedora:latest`:
+1. `apt install ./axl-sdk-<ver>_*.deb` / `dnf install ./axl-sdk-<ver>-*.rpm`
+   -- real dependency resolution; with `--no-install-recommends` /
+   `--setopt=install_weak_deps=False` it must still succeed, and with defaults
+   the QEMU stack must arrive (weak deps proven both ways).
+2. The package's file list equals the SDK tarball's (P2), every path under
+   `/opt/axl-sdk-<ver>`; NOTHING under `/usr/bin`; `/opt/axl-sdk` resolves to
+   the root.
+3. `bash -lc 'command -v axl-cc'` names `/opt/axl-sdk/bin/axl-cc` (profile.d
+   works); with `~/.local/bin/axl` present, that one wins (P3).
+4. Compile `hello.c` with `AXL_TOOLCHAIN=auto` (host gcc, installed in the
+   container) -> a PE32+ image.
+5. Two fabricated versions side by side: the newer is current; removing it
+   moves `current` back; removing both leaves `/opt` and `/etc/profile.d`
+   clean.
+6. `axl update` from the package root exits 1 naming `apt`/`dnf`.
+7. A fake 4.4.0-shaped `axl-sdk` package (built in the test with CPack, owning
+   `/usr/bin/axl`) is removed by installing a new one.
+Release: `release.yml` builds the packages with the tarballs and runs the test
+before upload; the RPM generator needs `rpmbuild` on the runner
+(`apt-get install rpm`), the DEB generator needs nothing beyond CMake.
+
+#### As built -- the owner's amendments, and what measurement decided
+
+**Decided 2026-11-10:** every recommendation above, with these amendments.
+
+1. **The §21 receipt, not a new marker.** `share/axl/.axl-receipt`, in the
+   toolchain receipt's `AXL_RECEIPT_*` shape, `KIND=sdk` and `SOURCE=` one of
+   `install.sh`, `deb`, `rpm`. install.sh (packaging/install.sh) writes it
+   LAST into the staged tree before renaming it into place, with what the tree
+   cannot say about itself: the tarball's SHA-256, whether TLS was skipped,
+   when. Each package carries its own (a `pkg_deb` / `pkg_rpm` install
+   component). Not the version (`share/axl/version` says that). Inside the
+   prefix, so `rm -rf <prefix>` stays a complete uninstall for install.sh
+   roots (§12.3). §21 records the SDK half shipping.
+2. **`axl prune` deletes an SDK root only on an install.sh receipt.** The
+   §21.6 asymmetry ("`axl-sdk-<semver>` is our namespace by construction")
+   stopped being true the day a package could install `/opt/axl-sdk-<ver>`.
+   Now: an install.sh receipt -> prunable; a deb/rpm receipt -> skipped, named
+   with `sudo apt remove axl-sdk-<v>` / `sudo dnf remove axl-sdk-<v>`; any
+   other owner -> skipped, named; **no receipt -> the old pattern rule**, so a
+   machine whose roots all predate receipts still prunes (glob may discover,
+   the receipt decides, and its absence must not strand existing machines).
+   install.sh likewise refuses to extract over, select (`--use`) or uninstall
+   a package's root. `axl use`, `update` and `uninstall` run FROM a package
+   root refuse and print the package-manager or alternatives command.
+   Tests: `test-axl-prune.sh` (both ways and the pre-receipt transition),
+   `test-installer-receipt.sh`, `test-axl-package-roots.sh`, each RED first.
+3. **Two managers do not share one `current`.** install.sh (`--prefix /opt`)
+   and `axl use` own `/opt/axl-sdk`; the packages' alternatives link is
+   **`/opt/axl-sdk-package`**, and `/etc/profile.d/axl-sdk.sh` (its slave)
+   appends `/opt/axl-sdk-package/bin`. `axl list` shows both managers' roots,
+   labelled by receipt (`install.sh`, `deb`, `rpm`, `(no receipt)`), `*`
+   marking install.sh's current and `+` the packages'. On a packages-only
+   machine `axl version` and `axl --print-prefix` name the package's
+   versioned root (`/opt/axl-sdk-<v>`, not the link), and `axl version` adds
+   an `owner deb|rpm  managed by apt|dnf` line.
+4. **Release tooling knows the packages**: `make-release-assets.sh deb|rpm`
+   (the asset names), `scripts/release-sums.sh` (SHA256SUMS), release.yml
+   (built in the SDK job, eight staged assets), `gate.check-asset-names`,
+   `scripts/check-published-release.sh` (the pair, named for the tag's
+   version), `test-release-asset-names.sh` (the published set: v4.7.5's plus
+   the two packages).
+5. **`test-packages.sh` runs in CI** (`local-only=0`, ~45 s warm): it builds
+   both packages and installs them with dpkg/rpm in debian:stable-slim and
+   fedora:latest -- replacing a fabricated 4.4.0 `axl-sdk` that owns
+   `/usr/bin/axl`, files only under the root, the alternatives link, the
+   receipt, profile.d APPENDING (the package bin is the last PATH entry) and a
+   `~/.local/bin` axl winning, `axl` from the package root, hello.c with the
+   host gcc, a fabricated newer package beside it, removal of each, and
+   nothing left in `/opt` or `/etc/profile.d`. The weak dependencies are
+   asserted in the metadata (exact `Recommends`): letting apt/dnf resolve them
+   would download the QEMU stack. Sabotaged: profile.d prepending, and prerm
+   not removing the alternative, each fail it.
+
+**Measured, before choosing the package writers** (two freshly made ext4
+filesystems as the staging area, then XFS against ext4):
+
+| writer | two ext4 | ext4 vs XFS | builder uid / umask | chosen |
+|---|---|---|---|---|
+| CPack DEB | identical (it sorts `data.tar`) | **differs**: the control file's `Installed-Size` sums every staged path's length, directories included, and a directory's `st_size` is the filesystem's | -- | no: **`dpkg-deb --root-owner-group`** through `cpack -G External` (`packaging/system/AxlPackDeb.cmake`), with every staged mtime set to `SOURCE_DATE_EPOCH` first (dpkg-deb only CLAMPS a newer one) and an `Installed-Size` from the files alone |
+| CPack RPM | **differs**: `BUILDTIME`, and `BUILDHOST` named the build machine | -- | -- | yes, with rpmbuild's own reproducibility macros: `use_source_date_epoch_as_buildtime`, `clamp_mtime_to_source_date_epoch`, a fixed `_buildhost`, and every file's mtime set to the commit's in `%install` |
+
+Both now pass `test-release-reproducible.sh` (two ext4 filesystems, and a
+different uid and umask on a third); without each fix the matching assertion
+fails (sabotaged). nFPM (the fallback the owner named) was not needed.
+
+#### Decisions for the owner
+
+1. **Package names:** versioned `axl-sdk-<ver>` (recommended) vs one upgrading
+   package under a new name. Not `axl-sdk`: the deployed consumer removes it.
+2. **Prefix:** `/opt/axl-sdk-<ver>` (recommended) vs 4.4.0's `/usr`.
+3. **PATH:** profile.d appending `/opt/axl-sdk/bin` (as built:
+   `/opt/axl-sdk-package/bin`), nothing in `/usr/bin`
+   (recommended) vs alternatives links in `/usr/bin` (shadows install.sh again).
+4. **Manager verbs refuse on a package root** (recommended).
+5. **Toolchain not packaged** (recommended) vs `axl-toolchain-*` packages.
+6. **Unsigned packages verified by SHA256SUMS** (recommended for now) vs a
+   signing key now.
 
 ## 18. Prior art for the installer — what exists, and what we copy
 
@@ -2341,8 +2616,11 @@ otherwise need on a bare machine.
 INSTALLED. Not `share/axl/` — a toolchain root is ARM's tree and has no such
 directory — and a dotfile keeps it out of the way of the tree's own contents.
 
-For an SDK or manager root the natural home *is* `share/axl/`, and that half
-is not built (§21.3).
+For an SDK or manager root the natural home *is* `share/axl/`.
+**The SDK half SHIPPED 2026-11-10** (§17.5), once the packages gave
+something to read it: `share/axl/.axl-receipt`, `AXL_RECEIPT_KIND=sdk`,
+`SOURCE=install.sh|deb|rpm`, and for install.sh's roots `SHA256`,
+`INSECURE_FETCH` and `INSTALLED`. Manager roots carry none yet.
 
 **The first field already exists.** `share/axl/bin-dir` shipped 2026-09-03,
 for exactly this reason: `axl use`/`uninstall` were recomputing the bin
@@ -2358,9 +2636,12 @@ wrong directory. A choice made at install time has to be recorded.
    **SHIPPED 2026-09-03.** `install-toolchain.sh` writes `.axl-receipt` into
    every root it installs — written LAST, so a half-extracted tree is never
    marked ours — and `axl prune` requires one before deleting a TOOLCHAIN
-   root. SDK and manager roots keep the pattern, per the §21.6 asymmetry:
-   `axl-sdk-<semver>` is our namespace by construction and nothing else
-   creates it. `--dry-run` names what it skipped and why (`not ours`).
+   root. SDK and manager roots kept the pattern, per the §21.6 asymmetry:
+   `axl-sdk-<semver>` was our namespace by construction and nothing else
+   created it. **Changed 2026-11-10 for SDK roots** (§17.5): the packages
+   create `/opt/axl-sdk-<ver>` too, so an SDK root is pruned only on an
+   install.sh receipt; a package's is skipped and named, and a root with no
+   receipt (from before receipts) keeps the pattern rule. `--dry-run` names what it skipped and why (`not ours`).
 
    The measured case it closes: two foreign `arm-none-eabi` trees beside ours
    made the older one a deletion candidate **and** crowded out the generation
@@ -2410,7 +2691,9 @@ exclusion list that fixes it is itself a drift surface.
 - **The migration asymmetry**: the anchored pattern stays for
   `axl-sdk-<semver>` (our namespace, unambiguous), and a receipt is required
   for TOOLCHAIN roots, where the name belongs to ARM and the collision is
-  real.
+  real. (Superseded for SDK roots 2026-11-10, §17.5: the packages made the
+  namespace shared, so the receipt decides there too, with "no receipt"
+  keeping the pattern for roots installed before receipts.)
 
   **What that costs, and it is not nothing:** every toolchain installed before
   receipts existed is unmarked, and an unmarked root is not merely spared — it

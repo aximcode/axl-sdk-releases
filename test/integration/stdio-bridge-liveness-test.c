@@ -18,7 +18,7 @@
  * Scenario 2 (the token-inequality branch, current NONZERO): Scenario 1 reaps
  * via the cell->current==0 short-circuit, so it does not exercise the
  * `b->token == cell->current` comparison itself. Here a decoy bears a token no
- * monotonic counter can reach; driving axl_shared_driver_install_stdio_bridge()
+ * monotonic counter can reach; driving axl_shared_driver_install_stdio_bridge(NULL)
  * stamps current = a fresh nonzero token and reaps, dropping the decoy ONLY
  * because token != the nonzero current — directly pinning the gate's compare.
  *
@@ -143,7 +143,7 @@ main(int argc, char **argv)
 
     /* --- Scenario 2: the token-inequality branch with a NONZERO current. ---
        Install a decoy whose token cannot equal any monotonic value (top bit
-       set), then drive axl_shared_driver_install_stdio_bridge(): it stamps
+       set), then drive axl_shared_driver_install_stdio_bridge(NULL): it stamps
        cell->current = a fresh (nonzero) token and reaps. The decoy is dropped
        ONLY because its token != that nonzero current — this exercises the
        gate's comparison, not the current==0 short-circuit Scenario 1 used. */
@@ -164,7 +164,7 @@ main(int argc, char **argv)
     } else {
         /* Stamps cell->current = fresh nonzero token, then reaps. This image
            has shell stdio (launched from the shell), so install runs fully. */
-        axl_shared_driver_install_stdio_bridge();
+        axl_shared_driver_install_stdio_bridge(NULL);
         /* Assert our exact decoy interface `&b2` is no longer installed
            anywhere. NOT via HandleProtocol(b2_handle): reaping frees b2_handle
            and install then allocates a handle for its OWN bridge, which UEFI

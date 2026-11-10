@@ -33,20 +33,48 @@
 #include <axl/axl-log.h>
 #include "axl-9p-internal.h"
 #include "axl-9p-server-internal.h"
+#include "../fs/axl-fs-internal.h"   /* axl_fs_volume_facts */
 
 AXL_LOG_DOMAIN("9p");
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/* Tsetattr `valid` bits (9P2000.L). SIZE (0x8) is the only one this server
-   acts on; MODE (0x1), UID (0x2), GID (0x4) and the ATIME/MTIME bits above
-   them are accepted as no-ops -- see s9p_handle_tsetattr for why. */
-#define P9_SETATTR_SIZE   0x00000008u
+/* Tsetattr `valid` bits are AXL_9P_SETATTR_* (axl-9p-internal.h). This
+   server acts on SIZE and MTIME (with MTIME_SET); MODE, UID, GID and ATIME
+   are accepted as no-ops -- see s9p_handle_tsetattr for why. */
 
 // ---------------------------------------------------------------------------
 // Helpers
+// ---------------------------------------------------------------------------
+
+/* The errno rename(2) documents for what axl_file_replace() answered: the
+   table the newlib rename() wrapper uses (src/cxxrt/axl-cxxrt-stubs.c), in
+   Linux numbering. AXL_DENIED is both a read-only volume (EROFS) and an
+   entry that may not change (EACCES); the volume decides which. */
+static uint32_t
+s9p_replace_errno(int rc, const char *old_path, const char *new_path)
+{
+    AxlFsVolumeFacts facts;
+    switch (rc) {
+    case AXL_NOT_FOUND:    return P9_ENOENT;
+    case AXL_NOT_DIR:      return P9_ENOTDIR;
+    case AXL_IS_DIR:       return P9_EISDIR;
+    case AXL_NOT_EMPTY:    return P9_ENOTEMPTY;
+    case AXL_INVALID:      return P9_EINVAL;
+    case AXL_UNSUPPORTED:  return P9_EXDEV;
+    case AXL_DENIED:
+        if ((axl_fs_volume_facts(old_path, &facts) == AXL_OK && facts.read_only)
+            || (axl_fs_volume_facts(new_path, &facts) == AXL_OK && facts.read_only)) {
+            return P9_EROFS;
+        }
+        return P9_EACCES;
+    case AXL_NO_RESOURCES: return P9_ENOSPC;
+    case AXL_CANCELLED:    return P9_EINTR;
+    case AXL_EXISTS:       return P9_EEXIST;
+    default:               return P9_EIO;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers (names)
 // ---------------------------------------------------------------------------
 
 /* Resolve `dfid` + a wire-supplied `name` into a full export path.
@@ -166,7 +194,7 @@ bool
 s9p_handle_tlcreate(S9pConn *conn, Axl9pReader *r, uint16_t tag)
 {
     uint32_t dfid = axl_9p_r_u32(r);
-    char     name[256];
+    char     name[AXL_9P_NAME_MAX];
     size_t   wire_n = axl_9p_r_str(r, name, sizeof(name));
     uint32_t flags  = axl_9p_r_u32(r);
     axl_9p_r_u32(r);                            /* mode -- no POSIX model */
@@ -283,7 +311,7 @@ bool
 s9p_handle_tmkdir(S9pConn *conn, Axl9pReader *r, uint16_t tag)
 {
     uint32_t dfid = axl_9p_r_u32(r);
-    char     name[256];
+    char     name[AXL_9P_NAME_MAX];
     size_t   wire_n = axl_9p_r_str(r, name, sizeof(name));
     axl_9p_r_u32(r);                            /* mode -- no POSIX model */
     axl_9p_r_u32(r);                            /* gid  -- no POSIX model */
@@ -400,22 +428,20 @@ s9p_handle_tremove(S9pConn *conn, Axl9pReader *r, uint16_t tag)
 
 /* Trename: fid[4] dfid[4] name[s] -> Rrename (empty body).
 
-   SAME-DIRECTORY ONLY. A rename whose target parent differs from the
-   source's is answered EXDEV, which is NOT on the phase-4 plan's errno list
-   and is added here deliberately, for two reasons that point the same way:
+   rename(2), by axl_file_replace() with no flags: an existing destination
+   is REPLACED (a file, or an empty directory), the node moves between
+   directories of the export in one SetInfo, a case-only change takes, and
+   every refusal is rename(2)'s, mapped by s9p_replace_errno. It never
+   copies: a filesystem that cannot make the move as one rename -- a
+   provider without a rename callback under the export -- is EXDEV, which
+   every rename(2) caller (mv(1)) answers by copying on ITS side of the wire,
+   in bounded Twrites the loop can interleave.
 
-     - AxlFs cannot do it atomically. axl_file_rename refuses a
-       cross-directory rename outright (most UEFI FAT drivers cannot move a
-       file between directories via SetFileInfo), and the only fallback,
-       axl_file_move, is a whole-file COPY. That copy is unbounded,
-       synchronous, and single-threaded -- the same one-message stall that
-       forced a ceiling on Tsetattr's grow, except a rename has no natural
-       ceiling to apply.
-     - EXDEV is precisely what a client already knows how to handle.
-       mv(1) and every rename(2) caller falls back to copy-then-unlink on
-       it, which comes back as ordinary bounded Twrites the loop can
-       interleave. Refusing with EXDEV is therefore not a missing feature;
-       it moves the copy to the side of the wire that can afford it.
+   Other fids are path-based. One that named the replaced destination now
+   names whatever is at that path -- the moved node -- and qid.path, a hash
+   of the path, is reused for it; bytes another fid wrote to the replaced
+   file and has not flushed are lost with it, as POSIX loses an unlinked
+   file's. Fids below a moved directory keep the old path (see the README).
 
    The fid's open handles are dropped before the rename and NOT reopened
    after, so a renamed fid is left bound-but-closed and must be re-Tlopen'd.
@@ -434,7 +460,7 @@ s9p_handle_trename(S9pConn *conn, Axl9pReader *r, uint16_t tag)
 {
     uint32_t fid  = axl_9p_r_u32(r);
     uint32_t dfid = axl_9p_r_u32(r);
-    char     name[256];
+    char     name[AXL_9P_NAME_MAX];
     size_t   wire_n = axl_9p_r_str(r, name, sizeof(name));
     if (r->error) {
         return s9p_send_rlerror(conn, tag, P9_EINVAL);
@@ -455,35 +481,13 @@ s9p_handle_trename(S9pConn *conn, Axl9pReader *r, uint16_t tag)
         return s9p_send_rlerror(conn, tag, ecode);
     }
     if (axl_strcmp(newpath, f->path) == 0) {
-        /* Renaming a node onto itself: nothing to do, and letting it reach
-           axl_file_rename would trip the destination-exists check below on
-           the node's own name. */
+        /* Renaming a node onto itself: nothing to do, and no reason to drop
+           the fid's handles for it. */
         Axl9pWriter self;
         if (!s9p_reply_begin(conn, &self, AXL_9P_RRENAME, tag)) {
             return false;
         }
         return s9p_send_reply(conn, &self);
-    }
-
-    /* Same-parent check. axl_path_get_dirname is separator-aware, so this
-       works for both the "/export/sub" and "fs0:\\sub" root conventions. */
-    char *src_parent = axl_path_get_dirname(f->path);
-    char *dst_parent = axl_path_get_dirname(newpath);
-    bool  same_dir   = (src_parent != NULL && dst_parent != NULL
-                        && axl_strcmp(src_parent, dst_parent) == 0);
-    axl_free(src_parent);
-    axl_free(dst_parent);
-    if (!same_dir) {
-        return s9p_send_rlerror(conn, tag, P9_EXDEV);
-    }
-
-    AxlFsEntry existing;
-    if (axl_file_info(newpath, &existing) == AXL_OK) {
-        /* axl_file_rename would fail on a taken name anyway; answering
-           EEXIST rather than EIO says WHY. POSIX rename overwrites, but
-           overwriting through this server would mean an unlogged delete the
-           client never asked for. */
-        return s9p_send_rlerror(conn, tag, P9_EEXIST);
     }
 
     /* Let go of the firmware handles before the node moves, so the fid is
@@ -507,9 +511,11 @@ s9p_handle_trename(S9pConn *conn, Axl9pReader *r, uint16_t tag)
         s9p_fid_restore_open(conn, f, had_view, had_wstream, had_dir);
         return s9p_send_rlerror(conn, tag, P9_EIO);
     }
-    if (axl_file_rename(f->path, newpath) != AXL_OK) {
+    int rc = axl_file_replace(f->path, newpath, 0, NULL);
+    if (rc != AXL_OK) {
+        uint32_t e = s9p_replace_errno(rc, f->path, newpath);
         s9p_fid_restore_open(conn, f, had_view, had_wstream, had_dir);
-        return s9p_send_rlerror(conn, tag, P9_EIO);
+        return s9p_send_rlerror(conn, tag, e);
     }
     if (axl_strlcpy(f->path, newpath, sizeof(f->path)) >= sizeof(f->path)) {
         /* Unreachable: newpath was built into a buffer of the same size.
@@ -527,16 +533,49 @@ s9p_handle_trename(S9pConn *conn, Axl9pReader *r, uint16_t tag)
     return s9p_send_reply(conn, &w);
 }
 
+/* "Now" as the FAT driver stamps it: the RTC's calendar fields, read back as
+   UTC with the zone ignored, exactly as a FAT time is (both store the
+   fields and drop the zone). 0 if the RTC cannot be read. */
+static uint64_t
+s9p_now_as_stamped(void)
+{
+    AxlTime t;
+    if (axl_backend_get_time(&t) != AXL_OK) {
+        return 0;
+    }
+    uint8_t b[16] = { 0 };
+    b[0]  = (uint8_t)(t.year & 0xFFu);
+    b[1]  = (uint8_t)(t.year >> 8);
+    b[2]  = t.month;
+    b[3]  = t.day;
+    b[4]  = t.hour;
+    b[5]  = t.minute;
+    b[6]  = t.second;
+    b[12] = 0xFF;   /* TimeZone 0x07FF: unspecified */
+    b[13] = 0x07;
+    return axl_backend_efi_time_to_unix(b);
+}
+
 /* Tsetattr: fid[4] valid[4] mode[4] uid[4] gid[4] size[8] atime_sec[8]
    atime_nsec[8] mtime_sec[8] mtime_nsec[8] -> Rsetattr (empty body).
 
-   Only ATTR_SIZE is honored. mode/uid/gid are accepted as no-ops because
-   AxlFs has no POSIX permission or ownership model, and the times are
-   accepted as no-ops because the SDK exposes no mtime setter -- a Linux
-   client expects ATTR_SIZE to bump mtime/ctime and it will NOT, since
-   axl_file_truncate documents that it writes the file's existing times back
-   unchanged. That is a documented v1 divergence, not something this reply
-   claims otherwise: Rsetattr carries no field asserting what was set.
+   ATTR_SIZE and ATTR_MTIME are honored, the size FIRST so that a time set
+   in the same message is not overwritten by the resize. mode/uid/gid are
+   accepted as no-ops because AxlFs has no POSIX permission or ownership
+   model; the access time because FAT stamps its own. A Linux client expects
+   ATTR_SIZE alone to bump mtime/ctime and it will NOT, since
+   axl_file_truncate writes the file's existing times back unchanged -- a
+   documented divergence: Rsetattr carries no field asserting what was set.
+
+   ATTR_MTIME with ATTR_MTIME_SET sets mtime_sec (nanoseconds are dropped;
+   FAT keeps two-second steps); without it, "now" as the FAT driver stamps
+   it. A time FAT cannot keep is CLAMPED, as Linux vfat clamps it, to
+   AXL_FS_MTIME_KEPT_MIN below (the EDK2 driver drops the year of a 1980
+   time) and AXL_FS_MTIME_MAX above -- `cp -p` of an epoch-stamped file must
+   not fail. Through a fid holding a write stream the time goes through
+   that stream (axl_fset_mtime), which writes the buffered bytes out first:
+   they would otherwise land at the clunk and stamp the current time over
+   it -- write, Tsetattr, Tclunk is the order cp -p sends.
 
    The size itself is bounded before it reaches axl_file_truncate. See
    s9p_setattr_size_ok and AXL_9P_SERVER_MAX_GROW: a wire-supplied grow is
@@ -561,7 +600,8 @@ s9p_handle_tsetattr(S9pConn *conn, Axl9pReader *r, uint16_t tag)
     axl_9p_r_u32(r);                            /* gid  -- no POSIX model */
     uint64_t size = axl_9p_r_u64(r);
     axl_9p_r_u64(r); axl_9p_r_u64(r);           /* atime_sec, atime_nsec */
-    axl_9p_r_u64(r); axl_9p_r_u64(r);           /* mtime_sec, mtime_nsec */
+    uint64_t mtime = axl_9p_r_u64(r);
+    axl_9p_r_u64(r);                            /* mtime_nsec -- FAT keeps 2 s */
     if (r->error) {
         return s9p_send_rlerror(conn, tag, P9_EINVAL);
     }
@@ -570,7 +610,7 @@ s9p_handle_tsetattr(S9pConn *conn, Axl9pReader *r, uint16_t tag)
         return s9p_send_rlerror(conn, tag, P9_EBADF);
     }
 
-    if ((valid & P9_SETATTR_SIZE) != 0u) {
+    if ((valid & AXL_9P_SETATTR_SIZE) != 0u) {
         AxlFsEntry e;
         if (axl_file_info(f->path, &e) != AXL_OK) {
             return s9p_send_rlerror(conn, tag, P9_ENOENT);
@@ -595,6 +635,24 @@ s9p_handle_tsetattr(S9pConn *conn, Axl9pReader *r, uint16_t tag)
                    same AXL_ERR for both -- so both are reported as EIO. */
                 return s9p_send_rlerror(conn, tag, P9_EIO);
             }
+        }
+    }
+    if ((valid & AXL_9P_SETATTR_MTIME) != 0u) {
+        uint64_t t = ((valid & AXL_9P_SETATTR_MTIME_SET) != 0u) ? mtime
+                                                                : s9p_now_as_stamped();
+        if (t < AXL_FS_MTIME_KEPT_MIN) {
+            t = AXL_FS_MTIME_KEPT_MIN;
+        } else if (t > AXL_FS_MTIME_MAX) {
+            t = AXL_FS_MTIME_MAX;
+        }
+        int rc = (f->wstream != NULL) ? axl_fset_mtime(f->wstream, t)
+                                      : axl_file_set_mtime(f->path, t);
+        if (rc != AXL_OK) {
+            uint32_t e = (rc == AXL_NOT_FOUND) ? P9_ENOENT
+                       : (rc == AXL_DENIED)    ? P9_EACCES
+                       : (rc == AXL_INVALID)   ? P9_EINVAL
+                       :                         P9_EIO;
+            return s9p_send_rlerror(conn, tag, e);
         }
     }
     Axl9pWriter w;

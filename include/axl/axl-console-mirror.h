@@ -176,10 +176,12 @@ axl_console_mirror_inject_key(
  * @brief Inject a run of terminal input bytes (xterm/VT), decoded to keys.
  *
  * Decodes CSI/SS3 escape sequences (arrows, F-keys, Home/End,
- * PgUp/PgDn, Delete) and UTF-8 printables (BMP) from a raw terminal
- * byte stream into the keystrokes of @ref axl_console_mirror_inject_key.
- * This is the reusable half that makes `edit` usable from a browser:
- * feed raw xterm.js keydown bytes straight in.
+ * PgUp/PgDn, Insert/Delete), C0 control bytes and UTF-8 printables (BMP)
+ * from a raw terminal byte stream into the keystrokes a USB keyboard
+ * delivers for the same keys, modifiers included -- the key shape is
+ * @ref axl_console_tap_inject_text's. This is the reusable half that
+ * makes `edit` usable from a browser: feed raw xterm.js keydown bytes
+ * straight in.
  *
  * Each call is self-contained: feed whole escape / multi-byte UTF-8
  * sequences in a single call (xterm.js delivers a complete sequence per

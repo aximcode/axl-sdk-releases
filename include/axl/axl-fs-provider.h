@@ -68,13 +68,21 @@ extern "C" {
 // Versioning
 // ---------------------------------------------------------------------------
 
-/// Current `AxlFsProvider.version` and `AxlFsEntry.version`
-/// value emitted by the SDK. Bumped when either struct gains a new
-/// field. Forward-compat: consumers and providers test
-/// `instance.struct_size >= offsetof(struct, new_field) +
-/// sizeof(new_field)` before reading any field added in a version
-/// later than the one they were built against.
-#define AXL_FS_PROVIDER_VERSION  1
+/// `AxlFsProvider.version` and `AxlFsProviderVolumeInfo.version` as this
+/// SDK writes them (`AxlFsEntry.version` is #AXL_FS_ENTRY_VERSION).
+///   - 2: optional `rename` after `backend_ctx`; `set_info` may be handed a
+///     modification time; `get_info`'s time reaches EFI callers.
+/// Publish reads `rename` only when `struct_size` covers all of it, so a
+/// provider built against version 1 publishes unchanged; a size ending
+/// inside `rename` is refused. Not a binary shim across a static link:
+/// rebuild.
+#define AXL_FS_PROVIDER_VERSION  2
+
+/// Longest path, NUL included, the thunk hands a provider (512 UCS-2 units
+/// at up to 3 bytes each). A longer one, or one with a component over 765
+/// bytes or 255 UTF-16 units, is EFI_INVALID_PARAMETER before any callback
+/// runs -- never cut.
+#define AXL_FS_PROVIDER_PATH_MAX  1536u
 
 // ---------------------------------------------------------------------------
 // Status codes
@@ -175,6 +183,10 @@ typedef struct AxlFsProviderFile AxlFsProviderFile;
  * "is root?" checks, rename source path) must copy it into the
  * `AxlFsProviderFile` they return.
  *
+ * @p utf8_path is at most #AXL_FS_PROVIDER_PATH_MAX bytes and no component
+ * exceeds 765 bytes or 255 UTF-16 units -- a name FAT could create -- so
+ * every handle's name fits `AxlFsEntry.name`.
+ *
  * @return AXL_FS_OK on success; AXL_FS_ERR_* otherwise.
  */
 typedef AxlFsStatus (*AxlFsProviderOpen)(
@@ -224,6 +236,25 @@ typedef AxlFsStatus (*AxlFsProviderRead)(
  *
  * The thunk re-marshals the populated `AxlFsEntry` into
  * `EFI_FILE_INFO` (header + UCS-2 trailer) per call.
+ *
+ * An entry whose name is not ONE path component is never handed up: an
+ * empty name, "." or "..", or one holding `\` or `/`. Joined onto a path
+ * such a name is several components -- `..\x` climbs out of the directory
+ * being walked -- so every consumer that walks the volume would otherwise
+ * have to defend itself. "." and ".." are dropped quietly; the rest are
+ * reported with the provider (`default_label`) and the escaped name, the
+ * first in a directory at warning and the rest at debug. A `:` is passed
+ * up: inside a joined path it is a character, not a volume. A provider
+ * passing remote names through (a 9P mount) needs no filtering of its own.
+ *
+ * A name that does not fit `AxlFsEntry.name` (over 765 bytes of UTF-8)
+ * must be SKIPPED, never cut: a cut name can be a sibling's. The thunk
+ * cannot see a name already cut, so this rule is the provider's. The thunk
+ * itself skips (warning once per directory) a name over 255 UTF-16 units:
+ * no FAT volume holds one, UEFI readers size their buffers for FAT's names,
+ * and no path to it could be opened. A Read whose buffer is too small for
+ * the next entry answers EFI_BUFFER_TOO_SMALL and keeps that entry for the
+ * next Read, as the FAT driver does.
  */
 typedef AxlFsStatus (*AxlFsProviderReadDir)(
     AxlFsProviderFile *file,
@@ -285,6 +316,12 @@ typedef AxlFsStatus (*AxlFsProviderFlush)(AxlFsProviderFile *file) AXL_CB_NOEXCE
  * The thunk converts to `EFI_FILE_INFO` for UEFI consumers,
  * including the UCS-2 trailer with the UTF-8-decoded
  * `AxlFsEntry.name`.
+ *
+ * `name` is the file's current basename (empty for "/"). `mtime_unix`
+ * reaches EFI callers as `ModificationTime` in UTC calendar fields,
+ * TimeZone unspecified, as AXL writes every file time; 0 is an all-zero
+ * `EFI_TIME`. `CreateTime` and `LastAccessTime` are zero. Report the
+ * current time, not a cached one: the thunk compares against it.
  */
 typedef AxlFsStatus (*AxlFsProviderGetInfo)(
     AxlFsProviderFile *file,
@@ -292,21 +329,79 @@ typedef AxlFsStatus (*AxlFsProviderGetInfo)(
 ) AXL_CB_NOEXCEPT;
 
 /**
- * @brief Apply changes to this file's metadata.
+ * @brief Apply metadata changes: size, attributes, time -- and, for a
+ *     provider without `rename`, a new name in the same directory.
  *
- * EFI consumers use `SetInfo(EFI_FILE_INFO)` for two purposes:
- * (1) renaming (the trailing UCS-2 name in the buffer differs
- * from the file's current basename), and (2) attribute changes.
- * The thunk decodes both and presents them as a normalized
- * `AxlFsEntry` with the new name and attributes already
- * in axl form.
+ * Called only when something differs from what `get_info` reports; @p in
+ * carries every field, changed or not:
+ *   - `name`: a BASENAME, never a path. A FileName naming another
+ *     directory goes to `rename`, or is `EFI_UNSUPPORTED` without one.
+ *     A provider WITH `rename` always sees its current name here: every
+ *     name change goes to `rename`. A FileName too long for `name` is
+ *     `EFI_INVALID_PARAMETER`, never cut.
+ *   - `mtime_unix`: 0 = leave the time -- the caller's ModificationTime
+ *     was all zero (UEFI 2.11 13.5.16), or equal to `get_info`'s while
+ *     `size` is unchanged. Otherwise set it AFTER any size change, so a
+ *     resize that echoes the old time keeps it. A non-zero time that is
+ *     not a valid EFI_TIME, or is not after 1970-01-01 00:00:00 UTC, is
+ *     `EFI_INVALID_PARAMETER` before this is called.
+ *   - `size`, `attributes`: as given; a change to the DIRECTORY bit is
+ *     refused first (`EFI_ACCESS_DENIED`, as FAT).
+ * A provider that cannot keep a time returns AXL_FS_OK and keeps its own;
+ * axl_file_set_mtime() then fails verification. A SetInfo that also
+ * renames calls `rename` first; a `set_info` failing after it leaves the
+ * entry renamed. A handle opened read-only may change only `attributes`
+ * (`EFI_ACCESS_DENIED`, UEFI 2.11 13.5.14).
  *
- * NULL in the vtable means SetInfo is unsupported (thunk returns
- * `EFI_WRITE_PROTECTED`).
+ * NULL in the vtable means SetInfo is unsupported (`EFI_WRITE_PROTECTED`).
  */
 typedef AxlFsStatus (*AxlFsProviderSetInfo)(
     AxlFsProviderFile       *file,
     const AxlFsEntry *in
+) AXL_CB_NOEXCEPT;
+
+/**
+ * @brief Move @p file to @p new_path, in its directory or another.
+ *
+ * Optional (version 2). Every name change a SetInfo asks for comes here.
+ * @p new_path is absolute on this provider: '/' separators, '.' and '..'
+ * resolved -- a FileName without a leading separator is taken from the
+ * file's PARENT directory, as the EDK2-derived FAT driver takes it -- no
+ * trailing separator, within #AXL_FS_PROVIDER_PATH_MAX.
+ *
+ * The thunk answers these without calling it:
+ *   - @p file is the root: `EFI_ACCESS_DENIED`; @p new_path climbing
+ *     above the root: `EFI_INVALID_PARAMETER`;
+ *   - a directory into itself or below itself, compared byte for byte
+ *     on component boundaries: `EFI_ACCESS_DENIED` (a provider that folds
+ *     case must refuse one spelled differently itself);
+ *   - a directory with any handle open below it: `EFI_ACCESS_DENIED`, as
+ *     the FAT driver refuses it;
+ *   - @p new_path equal to @p file's own path: success, no call.
+ *
+ * The provider must:
+ *   - MOVE, never copy: whatever fails, the entry is at exactly one of
+ *     its old path and @p new_path. One that could only copy returns
+ *     AXL_FS_ERR_UNSUPPORTED with nothing changed (axl_file_move() then
+ *     copies with its own guarantees); axl_file_replace() reads an entry
+ *     at @p new_path after a failed rename as "the move happened".
+ *   - refuse an EXISTING @p new_path -- an entry other than @p file under
+ *     another spelling -- with AXL_FS_ERR_ACCESS_DENIED, nothing changed.
+ *     A provider that can only check first leaves a window in which
+ *     another writer's entry is replaced (axl_file_replace(), "Other
+ *     writers").
+ *   - act on @p file itself, not a path remembered at open; keep it usable
+ *     and report @p new_path's last component from `get_info`.
+ *   - return AXL_FS_ERR_NOT_FOUND for a missing destination directory and
+ *     AXL_FS_ERR_NOT_DIR for one that is a file.
+ *
+ * On success the thunk records @p new_path as @p file's path.
+ *
+ * @return AXL_FS_OK once moved; AXL_FS_ERR_* with nothing changed.
+ */
+typedef AxlFsStatus (*AxlFsProviderRename)(
+    AxlFsProviderFile *file,      ///< the entry to move
+    const char        *new_path   ///< absolute destination; valid for the call
 ) AXL_CB_NOEXCEPT;
 
 /**
@@ -347,6 +442,9 @@ typedef AxlFsStatus (*AxlFsProviderVolumeInfoFn)(
  *   - `set_info`    — NULL → EFI_WRITE_PROTECTED for SetInfo
  *   - `flush`       — NULL → EFI_SUCCESS no-op
  *   - `volume_info` — NULL → thunk synthesizes from `default_label`
+ *   - `rename`      — NULL → a SetInfo naming another directory is
+ *     EFI_UNSUPPORTED (axl_file_move copies); a rename within the
+ *     directory goes to `set_info`
  *
  * Required callbacks: `open`, `close`, `read`, `read_dir`, `seek`,
  * `get_info`. Missing any of these is a publish-time validation
@@ -370,6 +468,8 @@ typedef struct {
     const char               *default_label; ///< used when volume_info NULL; "" allowed
 
     void                     *backend_ctx;  ///< passed to open / volume_info
+
+    AxlFsProviderRename       rename;       ///< optional (version 2)
 } AxlFsProvider;
 
 // ---------------------------------------------------------------------------
@@ -400,8 +500,9 @@ typedef struct {
  * gets its own handle).
  *
  * @return AXL_OK on success, AXL_ERR if @p provider is malformed
- *     (missing required callback, wrong struct_size, unsupported
- *     version) or the protocol install fails.
+ *     (missing required callback, a `struct_size` other than version 1's
+ *     -- ending at `backend_ctx` -- or one covering all of `rename`,
+ *     unsupported version) or the protocol install fails.
  */
 AXL_WARN_UNUSED int
 axl_fs_provider_publish(

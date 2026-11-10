@@ -65,15 +65,12 @@ done
 # ---------------------------------------------------------------------------
 
 source "$LIBAXL_DIR/scripts/axl-common.sh"
-# The libexec staging rule, shared with make-host-tools-tarball.sh so the two
-# staging paths cannot disagree about which files are commands.
-# shellcheck source=./stage-host-tools.sh
-source "$LIBAXL_DIR/scripts/stage-host-tools.sh"
 
 # ---------------------------------------------------------------------------
 # Content-preserving installs
 # ---------------------------------------------------------------------------
-# Every copy below goes through `install -C` (--compare): if the destination
+# Every file published below goes through `install -C` semantics (--compare),
+# generated ones (axl.pc, axl-config.cmake, share/axl metadata) included: if the destination
 # already holds identical bytes, it is left ALONE — mtime included.
 #
 # This is not a micro-optimization, it is the contract consumers depend on. A
@@ -91,32 +88,49 @@ source "$LIBAXL_DIR/scripts/stage-host-tools.sh"
 # is the semantics that actually matches intent. Both GNU and BSD install
 # implement -C this way.
 
-# Write stdin to $1, but only if that changes the file. The generated-content
-# equivalent of `install -C` — a regenerated .pc / .cmake / metadata file whose
-# bytes are unchanged must not bump its mtime either.
-write_if_changed() {
-    local dst="$1" tmp rc=0
-    # A directory destination would make `install` silently write INTO it under
-    # the scratch file's random name and report success — the plain `>` this
-    # replaced failed loudly ("Is a directory"). Keep failing loudly.
-    if [[ -d "$dst" ]]; then
-        log_error "write_if_changed: destination is a directory: $dst"
-        return 1
-    fi
-    tmp=$(mktemp "${dst}.XXXXXX")
-    # EVERY exit path below removes the scratch explicitly. errexit would
-    # otherwise abort mid-function (a full disk or quota during `cat`) and strand
-    # a random-suffixed file in the install tree that no later run ever matches
-    # — straight into whatever a packaging step scoops up.
-    if ! cat > "$tmp"; then
-        rm -f "$tmp"
-        log_error "write_if_changed: failed writing $dst"
-        return 1
-    fi
-    install -C -m 644 "$tmp" "$dst" || rc=$?
-    rm -f "$tmp"
-    return "$rc"
+# install_c MODE SRC... DEST -- `install -C -m MODE`, with every CHANGED file
+# landing by RENAME. A test may be linking from this prefix while another
+# install refreshes it (run-integration.sh restages before its pool), and an
+# in-place copy lets that reader see half a file; a rename gives it the old
+# file or the new one. As with `install -C`, identical bytes leave the
+# destination alone, mtime included -- test-install-idempotent.sh pins that --
+# and a SYMLINK destination is always replaced, never written through.
+# Unlike it, a destination whose bytes match but whose mode differs has its
+# mode fixed in place rather than being re-copied (which keeps the mtime).
+# The scratch is a dotfile beside the destination, so a run killed between
+# the copy and the rename cannot leave something that looks like a command
+# in libexec/axl. DEST is a directory when it is one, else the target path.
+install_c() {
+    local mode="$1" dest="${!#}" src dst base tmp
+    shift
+    local -a srcs=("${@:1:$#-1}")
+    for src in "${srcs[@]}"; do
+        if [[ -d "$dest" && ! -L "$dest" ]]; then
+            dst="$dest/${src##*/}"
+        else
+            dst="$dest"
+        fi
+        if [[ ! -L "$dst" && -f "$dst" ]] && cmp -s "$src" "$dst"; then
+            [[ "$(stat -c %a "$dst")" == "$mode" ]] || chmod "$mode" "$dst"
+            continue
+        fi
+        base="${dst##*/}"
+        tmp=$(mktemp "${dst%/*}/.${base}.axl-tmp.XXXXXX")
+        if ! install -m "$mode" "$src" "$tmp" || ! mv -f "$tmp" "$dst"; then
+            rm -f "$tmp"
+            log_error "install_c: could not stage $dst"
+            return 1
+        fi
+    done
 }
+
+# axl_install_trace EVENT -- append EVENT to $AXL_INSTALL_TRACE when set: the
+# order of the build-tree lock's events, which test-install-concurrent.sh
+# asserts. A no-op otherwise.
+axl_install_trace() {
+    [[ -z "${AXL_INSTALL_TRACE:-}" ]] || echo "$*" >> "$AXL_INSTALL_TRACE"
+}
+
 
 # Validate tools
 log_info "Backend: native (gcc + ld + objcopy)"
@@ -132,7 +146,7 @@ done
 # feature they didn't ask for.  In "require" mode (--cpp) the same
 # absence is a hard error with the install instruction.  "skip"
 # (--no-cpp) bypasses detection entirely.
-# Toolchain locations come from ONE file shared with the Makefile, axl-cc and
+# Toolchain locations come from ONE file shared with the CMake build, axl-cc and
 # the axl-config.cmake generated below -- see scripts/axl-toolchains.conf.
 TOOLCHAIN_CONF="$SCRIPT_DIR/axl-toolchains.conf"
 if [[ ! -r "$TOOLCHAIN_CONF" ]]; then
@@ -142,18 +156,18 @@ fi
 # shellcheck source=/dev/null
 . "$TOOLCHAIN_CONF"
 
-# AXL_TOOLCHAIN -- the same variant the Makefile and axl-cc take. This is the
-# THIRD build path, and it resolves the compiler independently in order to bake
+# AXL_TOOLCHAIN -- the same variant the CMake build and axl-cc take. This is
+# the THIRD build path, and it resolves the compiler independently in order to bake
 # a real path into the generated axl-config.cmake, so a variant the other two
-# honour and this one ignores is exactly the drift `make check-flag-parity`
+# honour and this one ignores is exactly the drift `gate.check-flag-parity`
 # exists over. The failure was the quiet kind: under `cross` with a locator
 # left unset, the ${:-} fallbacks below would stamp the /opt default into a
 # consumer's CMake package, and the detection a few lines down would announce
 # "C++ toolchain detected" about a toolchain the caller never named.
 #
-# It also has to happen HERE, before detection: make catches an unknown variant
-# eventually, but only after this script has logged two reassuring lines and
-# started a build.
+# It also has to happen HERE, before detection: the CMake configure catches an
+# unknown variant eventually, but only after this script has logged two
+# reassuring lines and started a build.
 AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-axl}"
 case "$AXL_TOOLCHAIN" in
     axl) ;;
@@ -169,9 +183,9 @@ case "$AXL_TOOLCHAIN" in
     host)
         # Refused with its own reason rather than falling into the
         # unknown-variant arm below: `host` IS a variant, just not one that
-        # builds this. Same three facts as the Makefile and axl-cc's help --
+        # builds this. Same three facts as the CMake build and axl-cc's help --
         # a variant the three build paths describe differently is the drift
-        # `make check-flag-parity` exists over.
+        # `gate.check-flag-parity` exists over.
         log_error "AXL_TOOLCHAIN=host does not build the SDK."
         log_error "It governs what a CONSUMER compiles with axl-cc; the SDK"
         log_error "builds ITSELF with the bare-metal toolchain on both arches"
@@ -229,8 +243,8 @@ case "$BUILD_ARCHS" in
 esac
 
 # --print-build-lock: report the lock path(s) the build below would take, then
-# exit before doing anything. It runs the same `make print-prefix` QUERY the
-# build runs, so a caller cannot end up reasoning about a path this script does
+# exit before doing anything. It runs the same `axl-build.sh --print-prefix`
+# QUERY the build runs, so a caller cannot end up reasoning about a path this script does
 # not take -- which is the whole reason it is reported rather than documented.
 if [[ "$PRINT_BUILD_LOCK" == "1" ]]; then
     for arch in "${ARCHES[@]}"; do
@@ -238,8 +252,7 @@ if [[ "$PRINT_BUILD_LOCK" == "1" ]]; then
         # the prefix out and appended -tls by hand, and was already wrong by
         # one suffix against the build ten lines down -- which is why this asks
         # rather than composes, and why dropping the suffix touched nothing here.
-        _p="$(make -s -C "$LIBAXL_DIR" ARCH="$arch" BUILD=RELEASE \
-            print-prefix)"
+        _p="$("$LIBAXL_DIR/scripts/axl-build.sh" --print-prefix ARCH="$arch" BUILD=RELEASE)"
         printf '%s\n' "$LIBAXL_DIR/$_p.buildlock"
     done
     exit 0
@@ -257,27 +270,31 @@ wants_arch() {  # <arch>
     return 1
 }
 
-# Under `cross` the C compiler is mandatory and nobody else will say so early.
-# make does refuse, but only after this script logs "Building (x64, ...)" and
-# hands off -- so the reader sees a build start and then a Makefile error, when
-# the actual fault was an unset variable known before any of that. C++ stays
-# optional here exactly as it is under `axl`; this is only about C, which every
-# build needs.
+# Under `cross` every locator is mandatory, and nobody else will say so early.
+# The build does refuse (cmake/AxlToolchain.cmake, which always builds C, C++
+# and the image pipeline's binutils), but only after this script logs
+# "Building (x64, ...)" and hands off -- so the reader sees a build start and
+# then a build error, when the fault was an unset variable known before any of
+# that.
 if [[ "$AXL_TOOLCHAIN" == "cross" ]]; then
     for _a in "${ARCHES[@]}"; do
         case "$_a" in
-            x64)  _cc="$X64_GCC"; _var="AXL_X64_GCC" ;;
-            aa64) _cc="$ARM_GCC"; _var="AXL_AA64_GCC" ;;
+            x64)  _need=("AXL_X64_GCC=$X64_GCC" "AXL_X64_GXX=$X64_GXX"
+                         "AXL_X64_BINUTILS_PREFIX=$X64_BINUTILS_PREFIX") ;;
+            aa64) _need=("AXL_AA64_GCC=$ARM_GCC" "AXL_AA64_GXX=$ARM_GXX"
+                         "AXL_AA64_BINUTILS_PREFIX=$ARM_BINUTILS_PREFIX") ;;
             *)    continue ;;
         esac
-        if [[ -z "$_cc" ]]; then
+        for _kv in "${_need[@]}"; do
+            [[ -n "${_kv#*=}" ]] && continue
+            _var="${_kv%%=*}"
             log_error "AXL_TOOLCHAIN=cross needs $_var set to your own"
-            log_error "bare-metal C compiler for $_a. The axl-toolchains.conf"
+            log_error "bare-metal toolchain's for $_a. The axl-toolchains.conf"
             log_error "defaults are deliberately not consulted under this"
             log_error "variant -- set it, or unset AXL_TOOLCHAIN to use the"
             log_error "toolchain the SDK installs."
             exit 1
-        fi
+        done
     done
 fi
 
@@ -300,714 +317,187 @@ if [[ "$CPP_MODE" != "skip" ]]; then
     # auto-mode + missing toolchain: silently fall through to C-only
 fi
 
-# Build and package per-arch.
-#
-# FHS-polished layout (files the package manager owns):
-#
-#   <prefix>/bin/axl-cc, pe-set-debug
-#   <prefix>/include/axl.h, axl/, uefi/
-#   <prefix>/lib/axl/<arch>/libaxl.a, libaxl-standin.a, axl-crt0-*.o,
-#                          axl-reloc.o, ...
-#   <prefix>/lib/axl/elf_<arch>_efi.lds
-#   <prefix>/lib/cmake/axl/axl-config.cmake       (find_package(axl))
-#   <prefix>/lib/pkgconfig/axl{,-<arch>}.pc        (pkg-config)
-#   <prefix>/share/axl/{version,build-date,backend}      (metadata)
-#   <prefix>/share/axl/*.json5  (pci-ids, usb-ids, jedec)
-#                                                        (optional sidecars)
-#   <prefix>/share/axl/scripts/{pci,usb}-ids-to-json5.py + _ids_parser.py
-#                                                        (bulk converters)
-#
-# Everything is relocatable — the cmake, pkg-config, and axl-cc files
-# resolve paths relative to their own installed location, so a .deb
-# dropping these under /usr works identically to a tarball unpacked
-# under /opt/axl-sdk.
 
-# Headers are namespaced under include/axl-sdk/ rather than living
-# directly under include/. This keeps /usr/include itself out of the
-# axl-cc command line on system installs (PREFIX=/usr) — otherwise
-# `-isystem /usr/include` shadows cross-gcc's freestanding stdint.h
-# with host glibc's, which then chains to gnu/stubs-32.h and breaks
-# aa64 cross-builds on hosts (RHEL/Alma) that don't ship 32-bit stubs.
-# axl-cc / cmake / pkg-config all point at <prefix>/include/axl-sdk
-# so user `#include <axl.h>` and `#include <axl/axl-mem.h>` resolve
-# unchanged.
-mkdir -p "$PREFIX/bin" \
-         "$PREFIX/include/axl-sdk/axl" \
-         "$PREFIX/include/axl-sdk/uefi/generated" \
-         "$PREFIX/lib/axl" "$PREFIX/lib/cmake/axl" "$PREFIX/lib/pkgconfig" \
-         "$PREFIX/share/axl"
+# ---------------------------------------------------------------------------
+# Build, install, publish.
+#
+# WHAT THE PREFIX HOLDS IS NOT DECIDED HERE. It is cmake/AxlInstall.cmake's
+# install() rules, which CPack's release archives are built from too
+# (docs/AXL-Build-System-Design.md §10.16). This script builds each arch's
+# RELEASE tree, runs `cmake --install` of it into a private scratch prefix,
+# and PUBLISHES the scratch into --prefix with install_c: content-compared and
+# by rename, which `cmake --install` straight into --prefix would not be (it
+# compares mtimes, so an identical rebuild refreshes every mtime, and it
+# writes in place, so a concurrent reader can see half a file).
+#
+# The layout (relocatable: axl.pc uses ${pcfiledir}, axl-config.cmake and
+# axl-cc resolve their prefix from their own location):
+#
+#   <prefix>/bin/        axl, axl-cc, axl-c++, axl-install-toolchain,
+#                        pe-set-debug, axl-efi-pack
+#   <prefix>/include/axl-sdk/   axl.h, axl/, uefi/
+#   <prefix>/lib/axl/<arch>/    libaxl.a, libaxl-standin.a, runtime objects,
+#                               pack/ (the axl-cc --compress stub)
+#   <prefix>/lib/axl/           linker scripts, efi-localize.ver
+#   <prefix>/lib/cmake/axl/axl-config.cmake, lib/pkgconfig/axl{,-<arch>}.pc
+#   <prefix>/libexec/axl/       the host tools `axl <cmd>` runs
+#   <prefix>/share/axl/         version, build-date, backend, sidecars,
+#                               converters, axl-toolchains.conf
+# ---------------------------------------------------------------------------
 
-AXL_VERSION=$(cat "$SDK_DIR/VERSION")
+# This script runs `cmake --install` itself, so it takes the pinned CMake
+# like every other entry point (scripts/axl-cmake-pin.sh, §10.13).
+# shellcheck source=./axl-cmake-pin.sh
+source "$LIBAXL_DIR/scripts/axl-cmake-pin.sh"
+axl_use_pinned_cmake || exit 1
+
+mkdir -p "$PREFIX"
+SCRATCH="$(mktemp -d -t axl-install.XXXXXXXX)"
+# On INT/TERM too: a bare EXIT trap does not run when a signal kills the
+# shell, and what would be left is a whole two-arch SDK in $TMPDIR.
+axl_trap_cleanup 'rm -rf "$SCRATCH"'
+# A DESTDIR in the environment (packaging environments export one) would send
+# `cmake --install` to $DESTDIR$SCRATCH, and the publish below would find the
+# scratch empty. This script's destination is --prefix, nothing else.
+unset DESTDIR
+
+# The arch-neutral components come from ONE tree: the last built, which also
+# supplies the unsuffixed axl.pc ("the last arch built", as it always has).
+LAST_ARCH="${ARCHES[${#ARCHES[@]}-1]}"
 
 for arch in "${ARCHES[@]}"; do
-    # Build into a BUILD-mode-segregated prefix so install.sh's
-    # RELEASE artifacts don't poison the in-tree DEBUG cache that
-    # `make ARCH=$arch tests` (default BUILD=DEBUG) reuses. Sharing
-    # the prefix used to silently produce a mixed-flag libaxl.a:
-    # the .o cache key includes only the .c timestamp, not the
-    # BUILD mode, so a RELEASE-built axl-mem.o would survive into
-    # a subsequent DEBUG build and the alloc-fill / fence machinery
-    # would be missing — visible as the test_debug_features 0xDA
-    # flake.
-    # ASK for the prefix, never compose it. Passing PREFIX on make's command
-    # line OVERRIDES the Makefile's own rule, and this line used to hardcode
-    # "out/native-$arch-release" -- which silently defeated the tree split of
-    # the day and made two configurations wipe each other's objects (~300 at a
-    # time), or, concurrently, corrupt them: "the input file ... is empty" and
-    # a stale staged prefix both came from here. The AXL_TLS half of that split
-    # is gone, but the rule that prevented it is why removing it was safe.
-    local_prefix="$(make -s -C "$LIBAXL_DIR" ARCH="$arch" BUILD=RELEASE \
-        print-prefix)"
+    # THE BUILD TREE: scripts/axl-build.sh's RELEASE preset tree, ASKED of
+    # it, never composed -- a hardcoded prefix once silently defeated the
+    # tree split of the day and made two configurations wipe each other's
+    # objects. RELEASE, not the DEBUG tree the tests build, so the two never
+    # share objects of different flags.
+    local_prefix="$("$LIBAXL_DIR/scripts/axl-build.sh" --print-prefix ARCH="$arch" BUILD=RELEASE)"
     log_info "Building ($arch, gcc, RELEASE)..."
-    # SERIALISED on the build tree, not on install.sh. --prefix says where to
-    # STAGE; the build always lands in local_prefix, so two install.sh runs
-    # with different prefixes still aim `make -j` at one target set. Under the
-    # integration suite that is routine rather than exotic: three tests invoke
-    # install.sh, so they collide on out/native-<arch>-release. Observed
-    # symptoms were a partial archive and objcopy's "the input file ... is
-    # empty"; one such loss left a test linking against a three-week-old staged
-    # prefix and failing on a missing symbol, which reads as a library defect.
-    #
-    # This guards two builds of the SAME configuration. There is only one
-    # configuration now, which makes the collision MORE likely, not less.
-    #
-    # The lock is keyed on the tree so unrelated configurations still run in
-    # parallel, and it is held only across the build -- staging into distinct
-    # prefixes is genuinely concurrent and stays that way.
+    # SERIALISED on the build tree, not on install.sh: --prefix says where to
+    # STAGE, but every run builds the same tree, and three integration tests
+    # run install.sh concurrently. Held across the build AND the install out
+    # of the tree -- releasing it between the two let a run copy a
+    # half-written archive while another rebuilt it. Keyed on the tree, so
+    # unrelated configurations still run in parallel.
     _build_lock="$LIBAXL_DIR/$local_prefix.buildlock"
     mkdir -p "$(dirname "$_build_lock")"
+    # `sdk`: what the install rules read (cmake/AxlGoals.cmake; CMake's `all`
+    # is every image). The build's output goes to a log: its last lines on
+    # success, ALL of it on failure -- a configure error is many lines, and
+    # its last three name none of the cause.
     _do_build() {
-        make -C "$LIBAXL_DIR" \
-            ARCH="$arch" PREFIX="$local_prefix" BUILD=RELEASE \
-            $( [[ "$BUILD_CPP" == "1" ]] && echo "AXL_CPP=1" ) \
-            -j "$(nproc)" 2>&1 | tail -3
+        local _log
+        _log="$(mktemp -t axl-install-build.XXXXXXXX)"
+        if ! "$LIBAXL_DIR/scripts/axl-build.sh" -j"$(nproc)" \
+                ARCH="$arch" BUILD=RELEASE \
+                $( [[ "$BUILD_CPP" == "1" ]] && echo "AXL_CPP=1" ) \
+                sdk > "$_log" 2>&1; then
+            cat "$_log" >&2
+            rm -f "$_log"
+            log_error "the $arch RELEASE build failed (above)"
+            return 1
+        fi
+        tail -3 "$_log"
+        rm -f "$_log"
     }
     if command -v flock >/dev/null 2>&1; then
-        # fd 9, and the subshell scopes it so the lock is released even if the
-        # build fails under `set -e`. No timeout: waiting is the correct
-        # behaviour, and a bounded wait that gave up would reintroduce exactly
-        # the corruption this prevents.
-        ( flock 9 || exit 1; _do_build ) 9>"$_build_lock"
+        # fd 9, held until the install below is done; a failure under `set -e`
+        # ends the process, which closes the fd and releases it. No timeout:
+        # a bounded wait that gave up would reintroduce the corruption.
+        exec 9>"$_build_lock"
+        flock 9
+        axl_install_trace "lock $arch"
     else
-        # No flock (a stripped container). Build unserialised rather than
-        # refusing -- a single install.sh is the common case and is unaffected
-        # -- but say so, because a silent downgrade of a correctness measure is
-        # how the original defect stayed invisible.
+        # A stripped container. Build unserialised rather than refusing, but
+        # say so: a silent downgrade of a correctness measure is how the
+        # original defect stayed invisible.
         log_warning "flock not found: concurrent install.sh runs may corrupt $local_prefix"
-        _do_build
     fi
+    _do_build
+    axl_install_trace "build $arch"
 
-    mkdir -p "$PREFIX/lib/axl/$arch"
-    install -C -m 644 "$LIBAXL_DIR/$local_prefix/lib/libaxl.a"              "$PREFIX/lib/axl/$arch/"
-    # THE STAND-IN LIBC (AXL-Host-Toolchain-Design.md §5.3) -- eleven weak leaf
-    # functions that complete a link with no libc at all (AXL_TOOLCHAIN=host).
-    # A separate archive from libaxl.a; staged unconditionally, same as it.
-    install -C -m 644 "$LIBAXL_DIR/$local_prefix/lib/libaxl-standin.a"      "$PREFIX/lib/axl/$arch/"
-    install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-native.o"   "$PREFIX/lib/axl/$arch/"
-    install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-minimal.o"  "$PREFIX/lib/axl/$arch/"
-    if [[ "$BUILD_CPP" == "1" ]]; then
-        # THE C++ RUNTIME GLUE, staged as OBJECTS rather than as
-        # libaxl-cxxrt.a, and the ONLY C++-specific thing the SDK ships now:
-        # P4 deleted libaxl-cxx.a and put the toolchain's real libstdc++ on
-        # every C++ link instead (AXL-Libc-Substrate-Design.md §4d).
-        #
-        # axl-cxxrt-alloc.o supplies the sbrk newlib's dlmalloc grows into,
-        # and axl-cxxrt-terminate.o preempts libstdc++'s verbose terminate
-        # handler (~112 KB of demangler and stdio that prints nothing under
-        # UEFI). Neither works from an archive: the member being displaced
-        # gets pulled for some other symbol and either multiply-defines or
-        # arrives with its dependencies intact. axl-cc names all four
-        # individually on every C++ link.
-        # axl-cxxrt-nothrow.o is the --no-eh-frame alternative to
-        # axl-cxxrt-eh.o: the two are mutually exclusive on a link, and
-        # axl-cc picks one. Both are staged so the choice is the consumer's.
-        for _ehobj in axl-cxxrt-alloc.o axl-cxxrt-eh.o axl-cxxrt-nothrow.o \
-                      axl-cxxrt-stubs.o axl-cxxrt-terminate.o; do
-            if [[ -f "$LIBAXL_DIR/$local_prefix/build/$_ehobj" ]]; then
-                install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/$_ehobj" \
-                    "$PREFIX/lib/axl/$arch/"
-            fi
-        done
+    # The components (cmake/AxlInstall.cmake). The C++ glue only when C++ is
+    # in: a C-only install (--no-cpp) ships no half of it.
+    _components=(sdk_arch)
+    [[ "$BUILD_CPP" == "1" ]] && _components+=(sdk_cxxrt)
+    [[ "$arch" == "$LAST_ARCH" ]] && _components+=(sdk_host sdk_common)
+    _ilog="$SCRATCH/install-$arch.log"
+    for _c in "${_components[@]}"; do
+        if ! cmake --install "$LIBAXL_DIR/$local_prefix" --prefix "$SCRATCH/$arch" \
+                --component "$_c" >> "$_ilog" 2>&1; then
+            cat "$_ilog" >&2
+            log_error "cmake --install of $arch's $_c component failed (above)"
+            exit 1
+        fi
+    done
+
+    # The last read of the built tree: the lock can go.
+    axl_install_trace "copied $arch"
+    if command -v flock >/dev/null 2>&1; then
+        flock -u 9
+        exec 9>&-
+        axl_install_trace "unlock $arch"
     fi
-
-    # GCC needs: assembly CRT0, reloc object, linker script
-    if [[ "$arch" == "aa64" ]]; then
-        install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-gcc-aarch64.o" "$PREFIX/lib/axl/$arch/"
-    else
-        install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-crt0-gcc-x86_64.o"  "$PREFIX/lib/axl/$arch/"
-    fi
-    install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-reloc.o"      "$PREFIX/lib/axl/$arch/"
-    install -C -m 644 "$LIBAXL_DIR/$local_prefix/build/axl-debug-info.o" "$PREFIX/lib/axl/$arch/"
-    install -C -m 755 "$LIBAXL_DIR/$local_prefix/build/pe-set-debug"     "$PREFIX/bin/"
-
-    # Per-arch pkg-config file. Uses pkg-config's built-in ${pcfiledir}
-    # so the resulting file is relocatable — the prefix is computed
-    # relative to the .pc file's own location.
-    pc_arch="$PREFIX/lib/pkgconfig/axl-$arch.pc"
-    sed -e "s|@AXL_ARCH@|$arch|g" -e "s|@AXL_VERSION@|$AXL_VERSION|g" <<'PCEOF' | write_if_changed "$pc_arch"
-prefix=${pcfiledir}/../..
-exec_prefix=${prefix}
-libdir=${prefix}/lib/axl/@AXL_ARCH@
-includedir=${prefix}/include/axl-sdk
-
-Name: axl
-Description: AximCode Library - GLib-inspired C library for UEFI (@AXL_ARCH@)
-URL: https://axl.aximcode.com
-Version: @AXL_VERSION@
-Libs: -L${libdir} -laxl
-Cflags: -I${includedir}
-PCEOF
-
-    # Plain `axl.pc` so `pkg-config axl` works without an arch suffix.
-    # In multi-arch installs this reflects the last arch built; single
-    # arch installs get exactly that arch.
-    install -C -m 644 "$pc_arch" "$PREFIX/lib/pkgconfig/axl.pc"
-
-    log_info "Installed libraries for $arch"
+    log_info "Installed $arch (${_components[*]})"
 done
-log_info "Installed axl.pc (pkg-config)"
 
-# Headers (including uefi/generated/ subdirectory).
-# Staged under include/axl-sdk/ so the axl-cc -isystem flag points
-# at a SDK-only directory, not /usr/include directly. See note above.
-install -C -m 644 "$LIBAXL_DIR/include/axl.h"                     "$PREFIX/include/axl-sdk/"
-install -C -m 644 "$LIBAXL_DIR/include/axl/"*.h                   "$PREFIX/include/axl-sdk/axl/"
-# The C++ layer. Shipped unconditionally, not gated on AXL_CPP: these are
-# header-only and guarded by `#ifndef __cplusplus -> #error`, so a pure-C
-# consumer that never includes one pays nothing, and a C++ consumer of a
-# C-only build gets a clear diagnostic instead of a missing file.
-install -C -m 644 "$LIBAXL_DIR/include/axl/"*.hpp                 "$PREFIX/include/axl-sdk/axl/"
-install -C -m 644 "$LIBAXL_DIR/include/uefi/"*.h                  "$PREFIX/include/axl-sdk/uefi/"
-install -C -m 644 "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/axl-sdk/uefi/generated/"
-# Point out a staged SDK left at either HISTORICAL default -- ./out (where
-# --prefix pointed before O1 moved it to ./stage) or the source root itself
-# (`install.sh --prefix .`, older still). Neither is stale the day it is
-# written; both go stale silently, and the source-root one is the case that
-# makes scripts/axl-cc answer for a build weeks behind its own checkout.
-#
-# The candidates and the removal advice live in axl-common.sh, not here: two
-# spellings of "where a stale SDK can hide" is precisely how the source root
-# went uncovered for the whole life of the ./out warning.
+# publish_tree SRC DEST -- every directory and file under SRC into DEST,
+# files through install_c with the mode the install rules gave them. The
+# listing is taken FIRST and checked: read through a process substitution,
+# a find that could not run would publish nothing and return 0, and "found
+# nothing" and "could not look" must not read the same. A symlink, or a file
+# whose destination is a directory, is refused: no rule makes either, and
+# install_c would copy into the directory.
+publish_tree() {
+    local src="$1" dest="$2" list kind mode rel n=0
+    list="$SCRATCH/publish-${src##*/}.list"
+    if ! (cd "$src" && find . -mindepth 1 -printf '%y %m %P\n') > "$list.raw" \
+            || ! LC_ALL=C sort -k3 "$list.raw" > "$list"; then
+        log_error "publish: could not list $src"
+        return 1
+    fi
+    while IFS=' ' read -r kind mode rel; do
+        case "$kind" in
+            d) mkdir -p "$dest/$rel" ;;
+            f) if [[ -d "$dest/$rel" && ! -L "$dest/$rel" ]]; then
+                   log_error "publish: $dest/$rel is a directory, not a file"
+                   return 1
+               fi
+               install_c "$mode" "$src/$rel" "$dest/$rel"
+               n=$((n + 1)) ;;
+            *) log_error "publish: $src/$rel is neither a file nor a directory"
+               return 1 ;;
+        esac
+    done < "$list"
+    if (( n == 0 )); then
+        log_error "publish: cmake --install put no file in $src"
+        return 1
+    fi
+}
+# SERIALISED on the prefix: each file lands atomically, but two runs
+# publishing at once -- or one publishing an older build after another
+# published a newer -- could leave a prefix of mixed builds. The lock is the
+# prefix DIRECTORY itself, so nothing is written beside or inside it.
+if command -v flock >/dev/null 2>&1; then
+    exec 7<"$PREFIX"
+    flock 7
+fi
+for arch in "${ARCHES[@]}"; do
+    publish_tree "$SCRATCH/$arch" "$PREFIX"
+done
+log_info "Installed axl-config.cmake, axl.pc, axl-cc, axl-c++, axl-install-toolchain"
+log_info "Installed axl dispatcher + host tools"
+
+# Point out a staged SDK left at either HISTORICAL default -- ./out or the
+# source root itself. Neither is stale the day it is written; both go stale
+# silently. The candidates live in axl-common.sh, the one list.
 axl_warn_stale_sdk_prefix "$PREFIX" "$LIBAXL_DIR"
 
-# Remove a compat/ left behind by an OLDER install into this same prefix.
-# install.sh stopped CREATING it, which is not the same as removing it: an
-# in-place upgrade would keep serving the stale shims -- and their
-# `typedef void FILE` would shadow the toolchain's real <stdio.h> for every
-# consumer, silently, on a tree that looks correctly installed.
+# Remove a compat/ left behind by an OLDER install into this same prefix: an
+# in-place upgrade would keep serving its stale shims, whose `typedef void
+# FILE` shadowed the toolchain's real <stdio.h> (AXL-Libc-Substrate-Design.md
+# §4.1b). install.sh stopped creating it; that is not the same as removing it.
 rm -rf "$PREFIX/include/axl-sdk/compat"
-
-# NOTE: the hosted-libc shims that used to be staged here are gone. They
-# existed because a consumer including <string.h> had nowhere else to get one —
-# the aa64 cross-gcc ships no glibc at all, and x64 would silently borrow
-# /usr/include. Both are answered properly now: axl-cc compiles C with the
-# bare-metal cross on both arches, whose newlib supplies the genuine headers,
-# and the SDK uses no host headers or libraries.
-# docs/AXL-Libc-Substrate-Design.md §4.1b.
-
-# GCC linker scripts live next to the per-arch lib data.
-install -C -m 644 "$LIBAXL_DIR/scripts/elf_x86_64_efi.lds"  "$PREFIX/lib/axl/"
-install -C -m 644 "$LIBAXL_DIR/scripts/elf_aarch64_efi.lds" "$PREFIX/lib/axl/"
-# The EXCEPTIONS variants, selected by axl-cc when -fexceptions is in play.
-# Separate files because the KEEP(*(.eh_frame)) they carry costs a C-only image
-# +16.8% for tables it can never use (AXL-Cxx-Unwinder-Design.md §U2).
-install -C -m 644 "$LIBAXL_DIR/scripts/elf_x86_64_efi_eh.lds"  "$PREFIX/lib/axl/"
-install -C -m 644 "$LIBAXL_DIR/scripts/elf_aarch64_efi_eh.lds" "$PREFIX/lib/axl/"
-# Linker version script: localizes symbols so --gc-sections shrinks the .efi.
-install -C -m 644 "$LIBAXL_DIR/scripts/efi-localize.ver"    "$PREFIX/lib/axl/"
-
-# Metadata — lives under share/ since it's arch-independent plain text
-# that axl-cc reads for --version output and sanity checks.
-echo "native"          | write_if_changed "$PREFIX/share/axl/backend"
-cat "$SDK_DIR/VERSION" | write_if_changed "$PREFIX/share/axl/version"
-# build-date is genuinely time-varying, so it updates when the UTC day rolls
-# over and is stable within a day — write_if_changed keeps it that way rather
-# than bumping it on every install.
-date -u '+%Y-%m-%d'    | write_if_changed "$PREFIX/share/axl/build-date"
-
-# Optional JSON5 sidecars consumed by axl_*_ids_load. Shipped as
-# reference content so consumers don't have to clone the SDK to get
-# a starter database — they typically copy these next to their .efi
-# (the auto-discovery companion path) or pass --ids-file explicitly.
-# New class triplets, USB vendors, JEDEC manufacturer codes can all
-# land via a JSON5 update without rebuilding any consumer binary.
-# BY GLOB, never a list. The identical list in release.yml's tools-tarball
-# step named the PCI files only and was never revisited when lsusb and memspd
-# grew sidecars, so v4.6.0 shipped both tools without their databases. Two
-# staging paths, one of them silently a subset, and nothing compared them --
-# `make check-tools-sidecars` now checks BOTH read share/ by glob.
-shopt -s nullglob
-_sidecars=("$LIBAXL_DIR"/share/*.json5)
-shopt -u nullglob
-for sidecar in "${_sidecars[@]}"; do
-    install -C -m 644 "$sidecar" "$PREFIX/share/axl/$(basename "$sidecar")"
-done
-
-# Bulk-conversion scripts for the canonical pci.ids / usb.ids text
-# databases. Installed under share/axl/scripts/ so consumers who
-# need the full tail (vs the curated starter sets above) can run
-# e.g. `python3 /usr/share/axl/scripts/usb-ids-to-json5.py
-# /usr/share/hwdata/usb.ids > usb-ids.json5` to generate fleet-
-# scale OEM-rebadge coverage. JEDEC has no canonical text database
-# so no jedec-to-json5.py — manual curation, see share/jedec.json5.
-mkdir -p "$PREFIX/share/axl/scripts"
-for converter in _ids_parser.py pci-ids-to-json5.py usb-ids-to-json5.py; do
-    if [[ -f "$LIBAXL_DIR/scripts/$converter" ]]; then
-        install -C -m 755 "$LIBAXL_DIR/scripts/$converter" \
-                          "$PREFIX/share/axl/scripts/$converter"
-    fi
-done
-
-
-# ---------------------------------------------------------------------------
-# Generate axl-config.cmake (enables `find_package(axl)`)
-# ---------------------------------------------------------------------------
-
-# The heredoc is QUOTED so CMake's own ${...} survives verbatim; the toolchain
-# path is injected through a sed placeholder instead, the same way the
-# pkg-config file above handles @AXL_ARCH@. That keeps this third build path
-# reading from scripts/axl-toolchains.conf rather than carrying its own copy.
-# Escape the sed REPLACEMENT metacharacters before injecting. Unescaped, `&`
-# expands to the whole match (a path containing one is silently corrupted into
-# ".../@AXL_AA64_GXX@..."), `|` ends the s-command and hard-errors mid-install,
-# and `\` is swallowed. Only reachable through an override with an exotic path,
-# but silent corruption of a shipped CMake package is not worth the risk.
-sed_escape_repl() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
-_arm_gxx_esc="$(sed_escape_repl "$ARM_GXX")"
-_x64_gxx_esc="$(sed_escape_repl "$X64_GXX")"
-_arm_gcc_esc="$(sed_escape_repl "$ARM_GCC")"
-_x64_gcc_esc="$(sed_escape_repl "$X64_GCC")"
-_arm_binutils_esc="$(sed_escape_repl "$ARM_BINUTILS_PREFIX")"
-_x64_binutils_esc="$(sed_escape_repl "$X64_BINUTILS_PREFIX")"
-
-sed -e "s|@AXL_AA64_GXX@|$_arm_gxx_esc|g" \
-    -e "s|@AXL_X64_GXX@|$_x64_gxx_esc|g" \
-    -e "s|@AXL_AA64_GCC@|$_arm_gcc_esc|g" \
-    -e "s|@AXL_X64_GCC@|$_x64_gcc_esc|g" \
-    -e "s|@AXL_AA64_BINUTILS_PREFIX@|$_arm_binutils_esc|g" \
-    -e "s|@AXL_X64_BINUTILS_PREFIX@|$_x64_binutils_esc|g" \
-    << 'CMAKE_SUPPORT' | write_if_changed "$PREFIX/lib/cmake/axl/axl-config.cmake"
-# axl-config.cmake — CMake support for building AXL applications (GCC toolchain).
-#
-# Usage (preferred):
-#   find_package(axl REQUIRED)
-#   axl_add_app(myapp myapp.c)                  # → myapp.efi
-#   axl_add_app(myapp myapp.cpp)                # C++, std::vector/string/map included
-#                                               # (HOSTED was removed; it is an error)
-#   axl_add_driver(myDxe myDxe.c)               # → myDxe.efi (DriverEntry, subsystem 11)
-#   axl_add_app(myapp myapp.c ALLOW_UEFI)       # app that needs <uefi/...>
-#                                               # (drivers get it from TYPE)
-#   axl_add_app(my-launcher launcher.c          # launcher embeds the driver:
-#       EMBEDS ${CMAKE_CURRENT_BINARY_DIR}/myDxe.efi=my_driver
-#   )                                           # → my-launcher.efi (with .incbin'd blob)
-#
-# Also works via explicit include:
-#   include(/usr/lib/cmake/axl/axl-config.cmake)
-#   axl_add_app(myapp myapp.c)
-
-# Resolve the SDK root from this file's installed location:
-#   <prefix>/lib/cmake/axl/axl-config.cmake  →  <prefix>
-if(NOT DEFINED AXL_SDK_DIR)
-    get_filename_component(AXL_SDK_DIR "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
-endif()
-
-if(NOT DEFINED AXL_ARCH)
-    set(AXL_ARCH "x64")
-endif()
-
-set(AXL_INCLUDE_DIR "${AXL_SDK_DIR}/include/axl-sdk")
-set(AXL_LIB_DIR     "${AXL_SDK_DIR}/lib/axl/${AXL_ARCH}")
-
-if(AXL_ARCH STREQUAL "x64")
-    # Our own binutils, so a consumer needs no system development tools.
-    # CMake list (unquoted) so ${AXL_GCC_ARCH} expands to multiple
-    # args in COMMAND — a quoted string would pass as one arg and
-    # gcc would reject "-mno-red-zone -march=x86-64" wholesale.
-elseif(AXL_ARCH STREQUAL "aa64")
-    # @AXL_AA64_BINUTILS_PREFIX@, not apt's aarch64-linux-gnu-: a consumer
-    # should need no system development tools, and ARM's toolchain ships the
-    # pei-aarch64-little target this package converts to. x64 keeps the empty
-    # prefix (host binutils) until its toolchain is rebuilt with PE support --
-    # see AXL-Libc-Substrate-Design.md §4.1d.
-    # -ffixed-x18: UEFI AArch64 binding (UEFI 2.11 §2) reserves x18
-    # as the platform register; without this gcc may clobber it,
-    # leading to post-ExitBootServices OS-side corruption.
-endif()
-
-# The driver every image is built by. This package used to reimplement what it
-# does; it calls it now, so there is one place the flags live.
-set(AXL_CC "${AXL_SDK_DIR}/bin/axl-cc")
-if(NOT EXISTS "${AXL_CC}")
-    message(FATAL_ERROR
-        "axl: ${AXL_CC} is missing -- this SDK install is incomplete.")
-endif()
-
-# Stack-smashing detection, matching the Makefile and axl-cc.
-#
-# -mstack-protector-guard=global is the load-bearing half on x86-64: GCC
-# otherwise reads the canary from %fs:0x28, glibc's TLS block, which UEFI never
-# sets up -- so the plain flag faults instead of protecting. AArch64 already
-# defaults to the global symbol. libaxl.a supplies __stack_chk_guard and
-# __stack_chk_fail.
-#
-# THE COMPILE FLAGS ARE NOT HERE ANY MORE, and that is the point.
-#
-# This used to be a THIRD copy of them (Makefile, axl-cc, here), and it
-# drifted: it kept -fno-stack-protector after the other two turned the
-# protector on, so a CMake-built app was unprotected while an axl-cc-built one
-# was not -- same SDK, same source, different security posture depending on
-# which build path the consumer picked. It drifted again later, missing
-# -fexceptions support entirely.
-#
-# _axl_build_efi calls axl-cc now, so the flags live in one place and this file
-# cannot disagree with it. `make check-flag-parity` still polices the remaining
-# two paths and asserts THIS one delegates -- reintroduce a hand-rolled compile
-# here and it rejoins the comparison.
-
-if(AXL_ARCH STREQUAL "aa64")
-    # The Linux-ABI cross's libstdc++ headers pull hosted typedefs; the
-    # bare-metal "none-elf" toolchain is the one that works. Matches axl-cc.
-    # Substituted at install time from scripts/axl-toolchains.conf, so this
-    # file cannot drift from the Makefile and axl-cc.
-    set(AXL_CXX_COMPILER "@AXL_AA64_GXX@")
-    set(AXL_C_COMPILER   "@AXL_AA64_GCC@")
-else()
-    set(AXL_CXX_COMPILER "@AXL_X64_GXX@")
-    set(AXL_C_COMPILER   "@AXL_X64_GCC@")
-endif()
-
-# Internal helper: build a TARGET.efi from C sources, optional embedded
-# blobs, and a chosen image type (app / driver). Most consumers reach
-# this via axl_add_app or axl_add_driver — call _axl_build_efi directly
-# only if you need behavior neither wrapper exposes.
-function(_axl_build_efi TARGET TYPE)
-    cmake_parse_arguments(_AXL "HOSTED;ALLOW_UEFI" "" "SOURCES;EMBEDS;OPTIONS" ${ARGN})
-
-    # THIS FUNCTION CALLS axl-cc. It used to re-implement it -- its own compile
-    # line per source, its own ld, its own objcopy, its own pe-set-debug, ~200
-    # lines mirroring scripts/axl-cc.
-    #
-    # That duplication was the THIRD of the three build paths
-    # `make check-flag-parity` exists to police, and it was not merely untidy:
-    # when axl-c++ gained -fexceptions, this copy did not, so a consumer asking
-    # for exceptions here got an image that compiled, linked, and died at the
-    # first throw -- and the parity gate could not see it, because the gate
-    # compares flag SPELLINGS and both paths named the same objcopy sections.
-    # It also had no way to pass a compile flag at all: axl_add_app produces a
-    # custom target, so target_compile_options() errors with "non-compilable
-    # target type", which is how the missing -fexceptions was found.
-    #
-    # Calling the driver fixes all of that by construction. Anything axl-cc
-    # learns, CMake consumers get; there is one place for the flags to live.
-    # The cost is one process per image instead of one per source, which is
-    # nothing next to the compile itself, and losing per-source parallelism --
-    # acceptable because axl-cc is what a consumer would type by hand anyway.
-    if(_AXL_HOSTED)
-        message(FATAL_ERROR
-            "axl: HOSTED was removed -- C++ is compiled hosted unconditionally, "
-            "so the keyword selects nothing. Delete it from ${TARGET}; the "
-            "output is unchanged. (docs/AXL-Cxx-Design.md 6a-T3)")
-    endif()
-
-    if(NOT _AXL_SOURCES)
-        message(FATAL_ERROR "axl: ${TARGET} has no SOURCES")
-    endif()
-
-    # Raw UEFI access follows the IMAGE TYPE, matching axl-cc: a driver
-    # implements the protocol types it produces or interposes on, an app does
-    # not get them by default. ALLOW_UEFI is the deliberate opt-out, visible in
-    # the CMakeLists rather than buried in an #include. axl-cc applies the
-    # type rule itself, so only the explicit opt-out has to be forwarded.
-    set(_AXL_CC_ARGS "")
-    if(_AXL_ALLOW_UEFI)
-        list(APPEND _AXL_CC_ARGS --allow-uefi)
-    endif()
-
-    # EMBEDS: `PATH` or `PATH=name`, forwarded verbatim -- axl-cc takes the
-    # same spelling and owns the .incbin sidecar, the symbol-name derivation
-    # and the validation that a derived name is a C identifier.
-    #
-    # A relative path is resolved against the BINARY dir, not the source dir,
-    # because the overwhelmingly common embed is a driver .efi that another
-    # axl_add_driver() just produced. That was this function's behaviour before
-    # and is preserved deliberately.
-    set(_EMBED_DEPS "")
-    foreach(SPEC ${_AXL_EMBEDS})
-        if(SPEC MATCHES "^(.+)=([^=]+)$")
-            set(_EMBED_PATH "${CMAKE_MATCH_1}")
-            set(_EMBED_NAME "=${CMAKE_MATCH_2}")
-        else()
-            set(_EMBED_PATH "${SPEC}")
-            set(_EMBED_NAME "")
-        endif()
-        if(NOT IS_ABSOLUTE "${_EMBED_PATH}")
-            set(_EMBED_PATH "${CMAKE_CURRENT_BINARY_DIR}/${_EMBED_PATH}")
-        endif()
-        list(APPEND _AXL_CC_ARGS --embed "${_EMBED_PATH}${_EMBED_NAME}")
-        list(APPEND _EMBED_DEPS "${_EMBED_PATH}")
-    endforeach()
-
-    # Sources as ABSOLUTE paths: axl-cc runs in the build dir, and CMake
-    # resolves a relative SOURCES entry against the source dir.
-    set(_SRC_ABS "")
-    foreach(SRC ${_AXL_SOURCES})
-        get_filename_component(_A "${SRC}" ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-        list(APPEND _SRC_ABS "${_A}")
-    endforeach()
-
-    set(_EFI_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi")
-
-    # TWO STEPS -- compile each source, then link -- rather than one axl-cc
-    # invocation over all of them. Two reasons, and the second is the one that
-    # forces it:
-    #
-    #   - per-source objects keep `make -jN` parallelism, which a single
-    #     compile-and-link call would throw away;
-    #   - dependency files are COMPILE-ONLY (they describe one TU), so a
-    #     one-shot call cannot produce one, and header dependency tracking is
-    #     the thing this package most needs. The previous re-implementation had
-    #     NONE -- its DEPENDS listed only the source -- so editing an SDK or
-    #     project header rebuilt nothing.
-    #
-    # The LINK step needs no COMPILE flags repeated to it. axl-cc derives what
-    # the link needs (libstdc++/libsupc++, the C++ linker script and the
-    # cxxrt glue objects) from the OBJECTS via `nm -u`,
-    # precisely so a staged build works -- so re-passing -O2 or -D would be
-    # noise, and forgetting to would be a silent defect. This is that design
-    # paying off.
-    #
-    # OPTIONS is forwarded to the link anyway, and the reason is at that call
-    # site: it is the only flag channel this package offers, so it legitimately
-    # carries link-side entries (-Wl,-Map=..., --minimal-runtime). Compile-only
-    # entries are inert there. An earlier version of this paragraph said the
-    # link "deliberately gets no OPTIONS", which described the code before that
-    # fix and shipped to consumers inside axl-config.cmake.
-    # PLAIN gcc -MD, not an axl-cc-specific flag. There was a `--depfile`
-    # option that post-processed the .d to make every path absolute, invented
-    # because a RELATIVE source made gcc emit compile-cwd-relative
-    # prerequisites that CMake resolved against the wrong directory. This
-    # function passes ABSOLUTE sources, so gcc's own output is already absolute
-    # and the workaround has nothing left to do.
-    #
-    # -MD and NOT -MMD, which is what --depfile used internally and is why this
-    # is not merely a rename: -MMD omits SYSTEM headers, the SDK arrives via
-    # -isystem, so editing an SDK header did NOT rebuild a consumer's object.
-    # Caught by the tracking assertions in test-cmake-package.sh.
-    set(_DEPFILE_ARGS "")
-    if(POLICY CMP0116)
-        cmake_policy(SET CMP0116 NEW)
-    endif()
-
-    set(_OBJS "")
-    set(_I 0)
-    foreach(SRC ${_SRC_ABS})
-        get_filename_component(_BASE "${SRC}" NAME_WE)
-        set(_OBJ "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.${_I}.${_BASE}.o")
-        set(_DEP "${_OBJ}.d")
-        set(_DEPFILE_ARGS "")
-        set(_CC_DEPFILE_ARGS "")
-        if(POLICY CMP0116)
-            set(_DEPFILE_ARGS DEPFILE "${_DEP}")
-            set(_CC_DEPFILE_ARGS -MD -MP -MF "${_DEP}")
-        endif()
-        add_custom_command(
-            OUTPUT ${_OBJ}
-            COMMAND ${AXL_CC}
-                    --arch ${AXL_ARCH}
-                    --type ${TYPE}
-                    ${_AXL_CC_ARGS}
-                    ${_AXL_OPTIONS}
-                    ${_CC_DEPFILE_ARGS}
-                    -c ${SRC}
-                    -o ${_OBJ}
-            DEPENDS ${SRC}
-            ${_DEPFILE_ARGS}
-            COMMENT "axl-cc: ${TARGET}.${_BASE}.o"
-            VERBATIM
-        )
-        list(APPEND _OBJS "${_OBJ}")
-        math(EXPR _I "${_I} + 1")
-    endforeach()
-
-    # OPTIONS reaches the LINK as well as the compile. It is the only flag
-    # channel this package offers, and a consumer's OPTIONS legitimately holds
-    # link-side ones -- `-Wl,-Map=...`, `-Xlinker`, `--entry`,
-    # `--minimal-runtime`. Compile-only entries (`-O2`, `-D...`) are inert
-    # here, which is the cheap direction to be wrong in; dropping the link-side
-    # ones was silent, which is not.
-    add_custom_command(
-        OUTPUT ${_EFI_FILE}
-        COMMAND ${AXL_CC}
-                --arch ${AXL_ARCH}
-                --type ${TYPE}
-                ${_AXL_CC_ARGS}
-                ${_AXL_OPTIONS}
-                ${_OBJS}
-                -o ${_EFI_FILE}
-        DEPENDS ${_OBJS} ${_EMBED_DEPS}
-        COMMENT "axl-cc: ${TARGET}.efi"
-        VERBATIM
-    )
-
-    add_custom_target(${TARGET} ALL DEPENDS ${_EFI_FILE})
-endfunction()
-
-# Public: build an application image (subsystem APPLICATION, main()).
-#
-#   axl_add_app(myapp myapp.c)
-#   axl_add_app(my-launcher launcher.c
-#       EMBEDS ${CMAKE_CURRENT_BINARY_DIR}/myDxe.efi=my_driver
-#   )
-#
-# EMBEDS entries each take the form `path` or `path=name`. Each blob is
-# wrapped in a .incbin sidecar and linked into the app; consumer code
-# reaches it via <axl/axl-embed.h>'s AXL_EMBED_DECLARE / DATA / SIZE.
-function(axl_add_app TARGET)
-    # OPTIONS: extra flags forwarded verbatim to axl-cc, e.g.
-    #   axl_add_app(app app.cpp OPTIONS -fexceptions -O2)
-    # target_compile_options() CANNOT be used on these targets -- axl_add_app
-    # produces a custom target, so CMake rejects it with "non-compilable target
-    # type". Until OPTIONS existed there was no way to pass a compile flag
-    # through this package AT ALL, which is how -fexceptions was unreachable
-    # here long after axl-c++ supported it.
-    cmake_parse_arguments(_AXL_ADD "HOSTED;ALLOW_UEFI" "" "EMBEDS;OPTIONS" ${ARGN})
-    # Forwarded explicitly: cmake_parse_arguments STRIPS a recognised option
-    # from UNPARSED_ARGUMENTS, so without this the flag silently does nothing.
-    if(_AXL_ADD_HOSTED)
-        set(_HOSTED_ARG HOSTED)
-    else()
-        set(_HOSTED_ARG "")
-    endif()
-    if(_AXL_ADD_ALLOW_UEFI)
-        set(_UEFI_ARG ALLOW_UEFI)
-    else()
-        set(_UEFI_ARG "")
-    endif()
-    _axl_build_efi(${TARGET} "app" ${_HOSTED_ARG} ${_UEFI_ARG}
-        SOURCES ${_AXL_ADD_UNPARSED_ARGUMENTS}
-        EMBEDS  ${_AXL_ADD_EMBEDS}
-        OPTIONS ${_AXL_ADD_OPTIONS}
-    )
-    # Re-export the .efi path so a launcher can EMBED it without
-    # re-deriving the path.
-    set(${TARGET}_EFI_PATH "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi"
-        PARENT_SCOPE)
-endfunction()
-
-# Public: build a DXE-style driver image (subsystem BOOT_SERVICE_DRIVER,
-# DriverEntry). Used for the "shared driver" pattern where a launcher
-# loads + LocateProtocol's into a resident driver image.
-#
-#   axl_add_driver(my-dxe my-dxe.c)
-#   axl_add_app(my-launcher launcher.c
-#       EMBEDS ${my-dxe_EFI_PATH}=my_driver
-#   )
-#   add_dependencies(my-launcher my-dxe)
-function(axl_add_driver TARGET)
-    # ALLOW_UEFI is accepted and ignored: a driver already has raw UEFI from its
-    # TYPE. Unregistered, cmake_parse_arguments would leave it in
-    # UNPARSED_ARGUMENTS, where it becomes a SOURCE named "ALLOW_UEFI" and the
-    # build fails with "no such file" instead of "you do not need it".
-    cmake_parse_arguments(_AXL_DRV "HOSTED;ALLOW_UEFI" "" "OPTIONS" ${ARGN})
-    if(_AXL_DRV_HOSTED)
-        set(_HOSTED_ARG HOSTED)
-    else()
-        set(_HOSTED_ARG "")
-    endif()
-    _axl_build_efi(${TARGET} "driver" ${_HOSTED_ARG}
-        SOURCES ${_AXL_DRV_UNPARSED_ARGUMENTS}
-        OPTIONS ${_AXL_DRV_OPTIONS})
-    set(${TARGET}_EFI_PATH "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi"
-        PARENT_SCOPE)
-endfunction()
-CMAKE_SUPPORT
-
-log_info "Installed axl-config.cmake"
-
-# ---------------------------------------------------------------------------
-# Generate axl-cc
-# ---------------------------------------------------------------------------
-
-# Install axl-cc — standalone bash script lives at scripts/axl-cc.
-# Until 2026-05-28 this was a ~390-line heredoc embedded here, which
-# made the script hard to review, hard to iterate on (edit-then-
-# install round-trip), and invisible to shellcheck. Extracting it
-# cost nothing and gained all those.
-install -C -m 755 "$LIBAXL_DIR/scripts/axl-cc" "$PREFIX/bin/axl-cc"
-# axl-c++ ships UNCONDITIONALLY, unlike the C++ glue objects. It is a 9-line `exec
-# axl-cc -x c++` wrapper with no build step and no dependency on the C++
-# toolchain, so BUILD_CPP would not be saving anything — and gating it made the
-# failure WORSE. axl-cc already diagnoses both C++ failure modes precisely at
-# the moment of use ("g++ not found ... run axl-install-toolchain aa64",
-# "axl-cxxrt-alloc.o ... run ./scripts/install.sh --cpp"). Withholding
-# the wrapper replaces those with the shell's bare "axl-c++: command not
-# found", which names no remedy. It was also incoherent: `axl-cc hello.cpp`
-# reached the good diagnostic on a C-only install while `axl-c++ hello.cpp`
-# did not, for identical intent.
-install -C -m 755 "$LIBAXL_DIR/scripts/axl-c++" "$PREFIX/bin/axl-c++"
-
-# The toolchain manifest and its installer must SHIP, not just exist in the
-# source tree. axl-cc reads the manifest to locate the C++ cross compiler, and
-# its "toolchain missing" diagnostic names the installer as the remedy -- but
-# only bin/, include/, lib/ and share/ are packaged, so a .deb/.rpm user has no
-# scripts/ directory. The old message pointed at scripts/install-arm-toolchain.sh
-# and was therefore a dead end for exactly the users who needed it most.
-install -C -m 644 "$LIBAXL_DIR/scripts/axl-toolchains.conf" \
-                  "$PREFIX/share/axl/axl-toolchains.conf"
-install -C -m 755 "$LIBAXL_DIR/scripts/install-toolchain.sh" \
-                  "$PREFIX/bin/axl-install-toolchain"
-log_info "Installed axl-cc + axl-c++ + axl-install-toolchain"
-
-# ---------------------------------------------------------------------------
-# The `axl` dispatcher and the host-side tools it fronts
-# (AXL-Distribution-Design.md SS13).
-#
-# Ten of these scripts reach a package user at a full path and on no PATH at
-# all, which is why a crash report prints a `rsod-decode.py ...` line that is
-# `command not found` for them. One name on PATH makes the install location
-# stop mattering to every printed hint and README.
-#
-# A SHEBANG IS THE MANIFEST. `axl` offers exactly the EXECUTABLE files as
-# commands, so what decides is whether a file can be run at all: one with a
-# shebang is staged 755 and becomes a command, one without is staged 644 and
-# is present only for its siblings to find. That classifies both non-commands
-# correctly from the file itself -- axl-common.sh is SOURCED by run-qemu.sh,
-# and gdb-sample.py is loaded INSIDE gdb (it opens with a docstring, and is
-# 755 in the tree despite having no shebang, so the mode bit alone would have
-# offered it as a command that cannot run). No second list of "which of these
-# are commands" to drift from this one.
-#
-# REAL FILENAMES, deliberately: these scripts locate each other by name from
-# their own directory (`source "$(dirname "$0")/axl-common.sh"`,
-# `$SCRIPT_DIR/gdb-syms.py`, axl-emulate's `Path(__file__).resolve().parent`).
-# Staging them under stripped names would leave each one correct and unable to
-# find the others; `axl` maps names instead.
-mkdir -p "$PREFIX/libexec/axl"
-# axl_version.py has no shebang, so it stages 0644 and `axl`'s command list
-# (executables in libexec/axl/) correctly does NOT pick it up as a subcommand.
-# Read from the Makefile rather than restated here: this set and release.yml's
-# host-tools tarball must not drift, and they did.
-_host_tools=$(make -C "$LIBAXL_DIR" -s print-HOST_TOOL_FILES) || {
-    log_error "could not read HOST_TOOL_FILES from the Makefile"; exit 1; }
-[[ -n "$_host_tools" ]] || { log_error "HOST_TOOL_FILES is empty"; exit 1; }
-for _tool in $_host_tools; do
-    _src="$LIBAXL_DIR/scripts/$_tool"
-    [[ -f "$_src" ]] || { log_error "missing host tool: scripts/$_tool"; exit 1; }
-    install -C -m "$(axl_host_tool_mode "$_src")" \
-            "$_src" "$PREFIX/libexec/axl/$_tool"
-done
-# The installer ships INSIDE the install, so `axl self-update` and
-# `axl uninstall` work without re-fetching it. QtIFW's MaintenanceTool idea
-# (AXL-Distribution-Design.md §18.6): the install knows its own version,
-# prefix and links; a script on a web server knows none of them.
-#
-# 0644 DELIBERATELY. `axl` lists the EXECUTABLES in libexec/axl as commands,
-# so a mode bit is what keeps this from also appearing as `axl install` --
-# a third way to reach the same thing. Same reason axl_version.py is 0644.
-install -C -m 644 "$LIBAXL_DIR/packaging/install.sh" "$PREFIX/libexec/axl/install.sh"
-
-install -C -m 755 "$LIBAXL_DIR/scripts/axl" "$PREFIX/bin/axl"
-log_info "Installed axl dispatcher + host tools"
 
 # ---------------------------------------------------------------------------
 # `current` symlink (AXL-Distribution-Design.md §12.2)

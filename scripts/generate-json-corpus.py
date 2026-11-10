@@ -16,7 +16,7 @@ The class is the file-name prefix JSONTestSuite defines:
 Documents are emitted as byte arrays, not C string literals, on
 purpose: the corpus deliberately contains embedded NULs, raw control
 characters and ill-formed UTF-8, none of which survive a string
-literal, and the repo's ``make check-ascii`` gate requires the
+literal, and the repo's ``gate.check-ascii`` gate requires the
 generated source itself stay pure ASCII.
 
 Two files are held back because they are recursion bombs measured in

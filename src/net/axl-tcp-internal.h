@@ -38,14 +38,20 @@ typedef struct AxlTcpToken {
     struct AxlTcpToken *next;       /* EDK2: LIST_ENTRY TokenList */
     struct AxlTcp      *sock;       /* EDK2: SOCKET *Sock — a cancelling token
                                        must find the queue it sits on */
-    const uint8_t      *buf;        /* BORROWED from the caller until done */
+    const uint8_t      *buf;        /* BORROWED from the caller until done;
+                                       the firmware only ever sees a copy */
     size_t              len;
-    /* EDK2: RemainDataLen — bytes not yet confirmed on the wire. The active
-       send walks it down one bounded Transmit at a time (TCP_SEND_CHUNK_MAX),
-       so buf + (len - remaining) is the next chunk. A PARTIAL POSIX send()
-       retires part of a token the same way, which is where AxlTcp is going
-       (design §3.7). */
-    size_t              remaining;
+    /* Bytes handed to the firmware so far -- whole pieces, counted when each
+       Transmit is accepted -- so buf + committed is the next piece. This is
+       what axl_tcp_send_get_sent reports (BSD send()'s partial count): a
+       piece once handed over cannot be recalled, so it counts even if the
+       send is later cancelled or fails. EDK2's RemainDataLen is len minus
+       this. */
+    size_t              committed;
+    /* Every piece's Transmit completed. False for a send retired while its
+       last piece was still armed (a cancel of a fully-armed send), which the
+       sync wrapper reports as a timeout rather than a success. */
+    bool                finished;
     AxlTcpCallback      cb;
     void               *cb_data;
     AxlCancellable     *cancel;
@@ -79,6 +85,21 @@ typedef struct AxlTcpToken {
    §7's open question. */
 #define TCP_SEND_QUEUE_WARN_BYTES   (1024u * 1024u)
 
+/* Transmit pacing: ONE per loop that has a send pending on it, shared by every
+   socket whose active send belongs to that loop (and, for a moment after it
+   retires, the socket's receive: AxlTcpPacing.linger_us). See the "transmit pacing"
+   section of axl-tcp-async.c for why it exists. `idle` is the loop source that
+   polls the members every iteration; it is 0 while the pacer has backed off
+   (no send on this loop made progress for AxlTcpPacing.idle_backoff_ms), and the next
+   progress re-adds it. The slot is free when `loop` is NULL. */
+typedef struct AxlTcpPacer {
+    AxlLoop            *loop;
+    AxlSourceId         idle;
+    uint64_t            progress_ms;    /* monotonic ms of the last progress */
+    bool                progress_known; /* false: the clock could not be read */
+    struct AxlTcp      *head;           /* members, linked through pace_next */
+} AxlTcpPacer;
+
 struct AxlTcp {
     EFI_TCP4_PROTOCOL           *tcp4;
     EFI_HANDLE                  tcp_handle;
@@ -103,6 +124,11 @@ struct AxlTcp {
        op on the same sock. recv/send/accept cancels are NOT terminal
        and leave the sock/listener valid. */
     AxlLoop        *async_loop;
+    /* axl_net_set_latency's list of live sockets (axl-net-latency.c): linked
+       once the socket has a TCP instance, unlinked in finalize_sock before
+       that instance goes. Changed only at TPL_CALLBACK. */
+    struct AxlTcp  *lat_next;
+    bool            lat_linked;
     /* accept */
     AxlTcpCallback  on_accept;
     void           *accept_data;
@@ -114,14 +140,31 @@ struct AxlTcp {
     void           *recv_data;
     AxlSourceId     recv_source;
     AxlSourceId     recv_cancel_source;
+    /* The loop recv_source and recv_cancel_source are registered on, valid
+       while either is set. Not async_loop: every op stamps that one (a send
+       on another loop moves it), and source ids are unique across loops, so
+       removing a receive's source from any other loop is a silent no-op
+       that leaves it registered. */
+    AxlLoop        *recv_loop;
+    /* Counts for the "recv-stats" test point (_axl_tcp_test_point): the
+       receives completed, the lingers begun (AxlTcpPacing.linger_us), and
+       the receives that completed while one was in force -- each a request
+       taken at once rather than at the firmware's next 10 ms timer. */
+    uint32_t        stat_recvs;
+    uint32_t        stat_lingers;
+    uint32_t        stat_linger_recvs;
     EFI_TCP4_IO_TOKEN           rx_token;
     EFI_TCP4_RECEIVE_DATA       rx_data;
     void           *recv_buf;
     size_t          recv_capacity;  /* buffer capacity — preserved across re-arms */
     size_t          recv_size;      /* bytes received last fire (see axl_tcp_recv_get_size) */
+    EFI_STATUS      recv_end;       /* how the last recv ended: EFI_SUCCESS while
+                                       data flows, EFI_CONNECTION_FIN at an orderly
+                                       close, the transport's error otherwise (a
+                                       reset, a timeout); see _axl_tcp_recv_fin */
     /* send. A single async send is chunk-chained over the transport: the
        caller's buffer is submitted as a sequence of bounded Transmits
-       (TCP_SEND_CHUNK_MAX each) so no one Transmit is unbounded — an
+       (AxlTcpPacing.chunk_bytes each) so no one Transmit is unbounded — an
        unbounded Transmit to a client that can't drain it monopolizes the
        shared one-send-in-flight path and wedges the loop. The active token's
        `remaining` tracks progress across chunks; the user callback fires
@@ -133,6 +176,44 @@ struct AxlTcp {
     EFI_TCP4_IO_TOKEN           tx_token;
     EFI_TCP4_TRANSMIT_DATA      tx_data;
     EFI_TCP4_FRAGMENT_DATA      tx_frag;
+    /* Bytes handed to the firmware by the Transmit in flight, for the
+       diagnostics -- the token's `committed` is what advances. */
+    size_t                      tx_armed;
+    /* AxlTcp's own copy of the piece in flight: the firmware is handed THIS,
+       never the caller's buffer, so no caller memory is referenced once its
+       callback has run and a Transmit never has to be cancelled to get a
+       buffer back. At least one piece long; allocated on the first send,
+       grown only between Transmits (one is in flight at a time), and freed
+       in finalize_sock once the firmware has released the socket. */
+    uint8_t                    *tx_bounce;
+    size_t                      tx_bounce_cap;
+    /* A Transmit is armed that no send owns any more: its send was
+       cancelled (or its sync caller timed out or was interrupted) after the
+       piece was handed over. EFI_TCP4.Cancel on a Transmit TcpDxe is still
+       processing frees its token and leaves its data queued, which the next
+       segmentation trips over (SockDataSent's ASSERT on DEBUG firmware), so
+       AxlTcp never cancels one: the orphan goes out on its own, and the next
+       send is armed only once its token has signalled. */
+    bool                        tx_orphan;
+    /* A Transmit on tx_token has been accepted and its completion not yet
+       consumed -- whoever owns it (the active send or the orphan). The one
+       fact finalize_sock needs: if the firmware's release FAILS while this is
+       set, the firmware may still read tx_bounce, so the buffer is kept. */
+    bool                        tx_inflight;
+    /* The loop send_source sits on: the active send's loop, or -- while an
+       orphan is waiting to complete -- the loop of the send queued behind it
+       (none if nothing is queued). Kept separately from async_loop, which the
+       recv/connect paths and the sync wrappers also rewrite. */
+    AxlLoop                    *send_source_loop;
+    /* Some send was retired with 0 < committed < len: the peer holds a
+       message cut short. Never cleared -- a later close is always abortive,
+       because a FIN would make the truncated stream look complete. */
+    bool                        stream_torn;
+    /* The count and completion of the send whose callback most recently
+       started, or that axl_tcp_send most recently returned: what
+       axl_tcp_send_get_sent reports and the sync wrapper maps to a status. */
+    size_t                      send_last_sent;
+    bool                        send_last_finished;
     /* Deferred sends — EDK2 SndTokenList. FIFO: promoted head-first from
        on_send_complete once the active send retires. send_queued_bytes counts
        what is accepted but not yet handed to the firmware. */
@@ -153,11 +234,25 @@ struct AxlTcp {
        other loop source on this struct requires (axl-tcp.h). */
     AxlTcpToken                *send_done_head;
     AxlTcpToken                *send_done_tail;
+    /* The pacer this socket is a member of while its active send is on the
+       wire (NULL otherwise), and the next member of that pacer. Membership
+       follows send_active: tcp_pace_update joins, moves or leaves. */
+    AxlTcpPacer                *pacer;
+    struct AxlTcp              *pace_next;
+    /* Still a member after its last send retired, while a receive is armed
+       on the same loop: until this monotonic time in us (0: not lingering).
+       See AxlTcpPacing.linger_us. */
+    uint64_t                    pace_linger_us;
     /* Set while callbacks are being delivered. finalize_sock must not free the
        socket underneath that — it records free_deferred and the delivery does
        the free once the last callback has returned. */
     bool                        send_draining;
     bool                        free_deferred;
+    /* The firmware's release failed with a Transmit in flight
+       (finalize_sock): TcpDxe may still write tx_token's status and read
+       tx_data / tx_frag -- which live INSIDE this struct -- and tx_bounce.
+       Neither free site may release the socket then; it is leaked whole. */
+    bool                        firmware_holds;
     /* Set by tcp_close_impl when teardown starts. A socket is torn down once:
        a second close (typically from a callback the teardown itself fired) is
        a no-op, and new sends/receives are refused rather than armed against
@@ -212,8 +307,39 @@ void axl_tcp_connect_drop_sources(AxlTcp *sock);
 void axl_tcp_recv_drop_sources   (AxlTcp *sock);
 void axl_tcp_send_drop_sources   (AxlTcp *sock);
 
+/* Test seams (axl-test-net's linger tests): whether a transmit-pacer slot is
+   bound to @p loop, and whether @p sock is a lingering pacer member. A slot
+   bound to a loop the caller has freed is the use-after-free the linger rules
+   exist to prevent. */
+bool _axl_tcp_pacer_bound(const AxlLoop *loop);
+bool _axl_tcp_lingering(const AxlTcp *sock);
+
+/**
+ * Test seam: true at @p point turns on a test-only behaviour. One point:
+ *
+ *   "recv-stats"  axl_tcp_close logs (INFO) the socket's receive counts
+ *                 (stat_recvs, stat_lingers, stat_linger_recvs) if it
+ *                 received at all -- how test-sshd-linger-qemu.sh measures
+ *                 what AxlTcpPacing.linger_us promises, in the guest.
+ *
+ * The library's definition is WEAK and always false, so production carries
+ * no trace of a test control; a test image links a strong one
+ * (test/integration/sshd-test-hook.c). EVERY TEST SEAM IS NAMED
+ * `*_test_point`: test-efi-pack-release-qemu.sh finds the seams in a shipped
+ * image by that suffix alone, and fails one whose size is not the weak
+ * always-false stub's.
+ */
+bool
+_axl_tcp_test_point(
+    const char *point
+    );
+
 /* Retire every pending send — the ACTIVE one and everything queued behind it —
-   with @p status, then run their callbacks before returning. Port of EDK2
+   then run their callbacks before returning. Queued sends are always
+   AXL_CANCELLED. The active send is AXL_CANCELLED in an abortive close; a
+   @p graceful close (which only happens when the active send, if any, is
+   fully armed) retires it AXL_OK, or with the status its last Transmit
+   already completed with. Port of EDK2
    SockConnFlush, which runs SockFlushPendingToken over the processing list as
    well as SndTokenList (design §3.5).
 
@@ -226,7 +352,7 @@ void axl_tcp_send_drop_sources   (AxlTcp *sock);
    this socket re-enters a close that is already torn down (`closed`), which
    returns without finalizing, and a finalize from an OUTER drain defers its
    free until the drain is done. */
-void axl_tcp_send_flush          (AxlTcp *sock, AxlStatus status);
+void axl_tcp_send_flush          (AxlTcp *sock, bool graceful);
 
 /* Run the retired-send callbacks queued on @p sock. The loop's deferred-work
    queue calls this; axl_tcp_send_flush calls it directly. */
@@ -234,8 +360,14 @@ void axl_tcp_send_drain_done     (AxlTcp *sock);
 
 /* True when @p sock already has an accepted send that has not been retired —
    on the wire or waiting behind one. The async API does not care (it queues);
-   axl_tcp_send does, because it cannot outlive its own call. */
+   axl_tcp_send does, because it cannot outlive its own call. An orphan piece
+   is not a pending send: no caller owns it. */
 bool axl_tcp_send_pending        (const AxlTcp *sock);
+
+/* True when a close now would drop accepted bytes or end a truncated stream:
+   a send is queued, the active send is only partly armed, or the stream is
+   already torn. axl_tcp_close promotes a graceful close to abortive then. */
+bool axl_tcp_send_close_drops    (const AxlTcp *sock);
 
 /* Abandon the send identified by (@p cb, @p cb_data) — wherever it sits: on the
    wire, on the queue, or retired and waiting for its drain. It is dropped
@@ -244,6 +376,11 @@ bool axl_tcp_send_pending        (const AxlTcp *sock);
    points at its own stack frame and at an ephemeral loop it is about to free.
    Every other abandonment is a cancel (AXL_CANCELLED) or a close
    (axl_tcp_send_flush).
+
+   A send on the wire is abandoned the way a cancel stops it: its armed piece
+   is left to the firmware as the socket's orphan, never cancelled. The
+   bytes it had committed are left in send_last_sent for axl_tcp_send to
+   report.
 
    Returns true if a token was found. */
 bool axl_tcp_send_drop_token     (AxlTcp *sock, AxlTcpCallback cb,
@@ -284,5 +421,22 @@ axl_tcp_connect_addr_async(
     void                  *data,
     AxlTcp               **out_pending
     );
+
+/* Did the socket's last recv end at an ORDERLY close -- the peer's FIN
+   (EFI_CONNECTION_FIN)? false while data flows, and after a reset, a
+   timeout, a cancel or any other transport error. A recv reports every
+   ending as a failure (AXL_ERR to its callback); this tells the clean one
+   apart, which a body framed by the close needs: only a FIN ends it. */
+bool
+_axl_tcp_recv_fin(
+    const AxlTcp *sock
+    );
+
+// axl_net_set_latency hooks (axl-net-latency.c). link/unlink keep the list
+// of live sockets the latency poll walks; activity is called wherever an
+// operation is armed or completes, and keeps a WINDOW policy fast.
+void _axl_net_latency_link(AxlTcp *sock);
+void _axl_net_latency_unlink(AxlTcp *sock);
+void _axl_net_latency_activity(void);
 
 #endif /* AXL_TCP_INTERNAL_H */

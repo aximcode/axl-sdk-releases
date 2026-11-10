@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=9 local-only=0
+# test-meta: arch=x64 needs= est=9 local-only=0 guest=none
+# guest=none: thirteen machines, most built from ACPI tables and SMBIOS
+#   files it generates per run (-acpitable/-smbios file=<per-run path>):
+#   neither a fixed class nor one lease can give them.
 # test-lsacpi-qemu.sh — lsacpi against the firmware's own ACPI tables.
 #
 # The unit suite tests the AML walker and the typed readers against
@@ -21,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/tools/lsacpi.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: lsacpi.efi not built"; exit 1; }
 

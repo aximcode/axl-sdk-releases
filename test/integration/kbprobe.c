@@ -37,7 +37,7 @@
  * consumption cadence is. `--throttle` reproduces the editor's slow pass;
  * `--debounce` proves the fix (drop a same-key repeat inside a short window).
  *
- * Build:  make ARCH=x64 kbprobe   (-> out/native-x64/kbprobe.efi)
+ * Build:  scripts/axl-build.sh ARCH=x64 kbprobe   (-> build/x64-debug/kbprobe.efi)
  * Run over the KVM console, press keys deliberately, press Esc to finish.
  */
 

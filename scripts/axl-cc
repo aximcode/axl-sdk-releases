@@ -23,7 +23,7 @@ _axl_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd -P "$(dirname "$_axl_self")" && pwd)"
 SDK_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Toolchain locations come from ONE file so this driver, the Makefile and the
+# Toolchain locations come from ONE file so this driver, the CMake build and the
 # GENERATED axl-config.cmake cannot drift -- the same three-build-path split
 # check-flag-parity polices for compile flags. It sits beside this script in a
 # source tree and under share/axl/ when installed from a package, so try both
@@ -42,11 +42,11 @@ for _axl_conf in "$SCRIPT_DIR/axl-toolchains.conf" \
 done
 
 # AXL_TOOLCHAIN -- WHICH toolchain supplies the compiler and binutils. Same
-# variant the Makefile takes, same two values, deliberately the same spelling:
-# a variant one build path understands and the other ignores is precisely the
-# drift `make check-flag-parity` exists to catch, one layer up. Every known
-# consumer enters through this script rather than the Makefile, so this is the
-# copy that actually faces users.
+# variant the CMake build (cmake/AxlToolchain.cmake) and install.sh take,
+# deliberately the same spelling: a variant one build path understands and the
+# other ignores is precisely the drift `gate.check-flag-parity` exists to catch,
+# one layer up. Every known consumer enters through this script rather than the
+# CMake build, so this is the copy that actually faces users.
 #
 #   auto   (x64 default) `axl` where the bare-metal x64 compiler is installed,
 #          `host` where it is not. Resolved further down, once the arch block
@@ -62,9 +62,9 @@ done
 #          conf defaults are NOT consulted, so an unset locator resolves empty
 #          and the existing "compiler not found" diagnostic fires by name.
 #
-# See the Makefile's block for why the pairing exists (Zephyr, EDK2 and the
-# Linux kernel all pair a variant with a locator) and why `llvm` is absent
-# rather than a silent no-op.
+# Why the pairing exists (Zephyr, EDK2 and the Linux kernel all pair a
+# variant with a locator): docs/AXL-Build-System-Design.md §5.1. `llvm` is
+# absent rather than a silent no-op.
 AXL_TOOLCHAIN="${AXL_TOOLCHAIN:-auto}"
 # WHAT THE VARIANT RESOLVED TO, which is not always what was asked for: `auto`
 # picks between `axl` and `host` by probing the compiler. $AXL_TOOLCHAIN keeps
@@ -133,12 +133,14 @@ AXL_PROG="${AXL_CC_PROGNAME:-$(basename "$0")}"
 # 2026-07-08)" inside a checkout that had just staged 4.2.0.
 #
 # So refuse by name instead of resolving against whatever is lying around.
-# Checked BOTH ways: living in a directory called scripts/ AND next to a
-# Makefile and a src/. Neither alone is enough -- /usr/src exists on most
-# systems, and an SDK installed to /usr would otherwise refuse to run.
+# Checked BOTH ways: living in a directory called scripts/ AND next to the
+# checkout's build definition (CMakePresets.json; the Makefile until 5.0.0
+# retired it, which left this check silently never firing) and a src/.
+# Neither alone is enough -- /usr/src exists on most systems, and an SDK
+# installed to /usr would otherwise refuse to run.
 axl_cc_in_source_tree() {
     [[ "${SCRIPT_DIR##*/}" == "scripts" ]] &&
-    [[ -d "$SDK_DIR/src" ]] && [[ -f "$SDK_DIR/Makefile" ]]
+    [[ -d "$SDK_DIR/src" ]] && [[ -f "$SDK_DIR/CMakePresets.json" ]]
 }
 
 axl_cc_refuse_source_tree() {
@@ -166,7 +168,7 @@ RUNTIME_FORCE=()
 # that forward to a WEAK _axl_log_vdispatch, so without this `-u` an image
 # links the emitters and discards every record. Every ordinary link takes it;
 # --minimal-runtime is the one that does not, and says so with `log` / `nolog`.
-# Mirrors $(LOG_ENGINE_PULL) in the Makefile.
+# Mirrors AXL_LOG_ENGINE_PULL in cmake/AxlImages.cmake.
 LOG_ENGINE_SYM="_axl_log_vdispatch"
 # "" = the caller has not said; "log" / "nolog" = they have. Only consulted
 # under --minimal-runtime; every other link pulls the engine unconditionally.
@@ -213,6 +215,10 @@ STD_CXX_SET=false
 LDFLAGS_USER=()
 EMBEDS=()
 SERVICE_NAME=""
+# --compress: write the image as a packed, self-extracting .efi when that pays
+# (axl-efi-pack decides), keeping the linked image as <out>.raw.efi. Off by
+# default; a build without it is untouched by any of the packing code.
+COMPRESS=false
 # -x c++ / -x c override — when set, ALL subsequent source files are
 # compiled with the corresponding compiler regardless of extension
 # (mirrors gcc/g++'s -x flag semantics, though we don't reset on
@@ -288,6 +294,7 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --embed)    EMBEDS+=("$2"); shift 2 ;;
         --service)  SERVICE_NAME="$2"; shift 2 ;;
+        --compress) COMPRESS=true; shift ;;
         --hosted)
             echo "ERROR: --hosted was removed. C++ is compiled hosted" >&2
             echo "       unconditionally now -- the freestanding C++ mode it" >&2
@@ -372,7 +379,7 @@ auto-appends the toolchain's libstdc++/libsupc++ and AXL's C++
 runtime glue when any C++ reaches the link; pure-C builds skip
 both.
 
-Toolchain selection (environment, not flags -- the Makefile takes
+Toolchain selection (environment, not flags -- the CMake build takes
 the same ones, so a consumer build and an SDK build agree):
 
   AXL_TOOLCHAIN=auto    x64 default. The toolchain axl-toolchains.conf
@@ -449,6 +456,21 @@ Options:
                         AXL_SERVICE(svc) macro in the source. -o is
                         ignored; output goes to NAME{,-dxe}.efi in
                         the current directory.
+  --compress            Write a packed (LZMA-compressed, self-extracting)
+                        image when that saves at least 16 KB and 20% --
+                        axl-efi-pack decides, with the same rule the
+                        SDK's own tools are built under. The output keeps
+                        its name and runs exactly as the raw image would;
+                        the linked image is kept beside it as
+                        <out>.raw.efi, and <out>.so holds its symbols.
+                        Under the threshold <out>.efi is a byte copy of
+                        <out>.raw.efi. With --service, only the launcher
+                        is packed. Ignored with -c. Off by default.
+                        Secure Boot authenticates the UNPACKED image
+                        on its own: a signature on <out>.efi covers
+                        only the stub, so a packed image runs under
+                        Secure Boot only if it was signed before
+                        packing (axl-cc signs nothing).
   --allow-host-paths    Permit -I/-L into the host's /usr tree, and host
                         headers reached from source. OFF by default: a
                         UEFI image cannot use them -- they describe
@@ -551,6 +573,10 @@ Options:
                         block could run, and an image whose handlers
                         are silently dead is a correctness failure
                         rather than the size trade this flag offers.
+                        libsupc++'s emergency exception pool, which
+                        such an image could never use, is left out too:
+                        an image that never mallocs takes no C heap and
+                        links no allocator (~15 KB smaller than with it).
   -v, --verbose         Print compiler/linker commands
   --print-toolchain     Print the RESOLVED toolchain variant for --arch
                         -- axl, host or cross, never auto -- and exit.
@@ -568,6 +594,7 @@ Examples:
   @PROG@ containers.cpp -o app.efi           # std::vector / map / string
   @PROG@ --embed mydriver.efi=my_driver launch.c -o launch.efi
   @PROG@ --service my-service service.c
+  @PROG@ --compress big-tool.c -o big-tool.efi   # packed if it pays
   @PROG@ -c lib1.cpp -o lib1.o                 # compile-only
   ar rcs libfoo.a lib1.o lib2.o                # archive your sources
   @PROG@ hello.cpp libfoo.a -o hello.efi       # link against your .a
@@ -689,7 +716,11 @@ if [[ -n "$SERVICE_NAME" ]]; then
         "${SOURCES[@]}" -o "${SERVICE_NAME}-dxe.efi" \
         || { echo "ERROR: --service: driver build failed" >&2; exit 1; }
 
-    # Pass 2: launcher app, embedding the driver from pass 1
+    # Pass 2: launcher app, embedding the driver from pass 1. --compress goes
+    # HERE ONLY: the driver travels inside the launcher, which the launcher's
+    # own packing already compresses, and a packed driver would put a second
+    # stub and a second decode on its load path for nothing.
+    [[ "$COMPRESS" == "true" ]] && fwd+=("--compress")
     exec "$SCRIPT_DIR/axl-cc" "${fwd[@]}" \
         --embed "${SERVICE_NAME}-dxe.efi=${SERVICE_NAME}" \
         "${SOURCES[@]}" -o "${SERVICE_NAME}.efi"
@@ -818,7 +849,7 @@ case "$ARCH" in
     aa64) # ld/ar/objcopy from ARM's bare-metal toolchain, not apt's
           # aarch64-linux-gnu-*: a consumer should need no system development
           # tools (AXL-Libc-Substrate-Design.md §4.1d), and ARM's ships the
-          # pei-aarch64-little target this converts to. The Makefile and the
+          # pei-aarch64-little target this converts to. The CMake build and the
           # generated CMake package read the same manifest key -- all three
           # build paths, which is the drift check-flag-parity exists over.
           CROSS="${AXL_AA64_BINUTILS_PREFIX:-${AXL_AA64_BINUTILS_PREFIX_DEFAULT:-}}"
@@ -1309,6 +1340,33 @@ RELOC_OBJ="$LIB_DIR/axl-reloc.o"
 DEBUG_INFO_OBJ="$LIB_DIR/axl-debug-info.o"
 PE_SET_DEBUG="$SDK_DIR/bin/pe-set-debug"
 
+# --compress: the packed-image wrap, the consumer's copy of the build's
+# axl_wrap_efi (cmake/AxlWrapEfi.cmake, src/pack/README.md). The stub is linked
+# from the objects the SDK ships prebuilt in lib/axl/<arch>/pack/ -- the same
+# six cmake/AxlImages.cmake names in AXL_PACK_STUB_OBJS, compiled once by the
+# SDK build rather than in every consumer -- plus the crt0, reloc and .dbgdir
+# objects every image links. `gate.check-flag-parity` compares this path's stub
+# objcopy -j list and its axl-efi-pack arguments with the build's wrap.
+AXL_EFI_PACK="$SDK_DIR/bin/axl-efi-pack"
+PACK_SECTION=".axlpack"
+PACK_STUB_OBJS=("$GCC_CRT0" "$RELOC_OBJ" "$DEBUG_INFO_OBJ"
+                "$LIB_DIR/pack/axl-pack-stub.o" "$LIB_DIR/pack/axl-pack-format.o"
+                "$LIB_DIR/pack/axl-backend-native-lines.o"
+                "$LIB_DIR/pack/LzmaDec.o" "$LIB_DIR/pack/Bra.o" "$LIB_DIR/pack/Bra86.o")
+# Checked before anything compiles: an SDK staged before --compress existed
+# lacks these, and the remedy is a re-stage, not a code change.
+if [[ "$COMPRESS" == "true" && "$COMPILE_ONLY" != "true" ]]; then
+    for _p in "$AXL_EFI_PACK" "${PACK_STUB_OBJS[@]}"; do
+        if [[ ! -f "$_p" ]]; then
+            echo "ERROR: --compress: this SDK has no $_p." >&2
+            echo "       It was staged before packed images were supported;" >&2
+            echo "       re-run scripts/install.sh." >&2
+            rm -rf "$TMPDIR"
+            exit 1
+        fi
+    done
+fi
+
 # Compile.  Per-source: dispatch to gcc (.c) or g++ (.cpp).  The C++
 # flag set is constrained per docs/ROADMAP.md axlmm Toolchain section:
 # -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++23 are
@@ -1456,7 +1514,7 @@ for src in "${COMPILE_SOURCES[@]}"; do
     # forced rather than chosen. gcc has ONE dependency mechanism, so attaching
     # `-MD -MF` here collides with a consumer forwarding their own
     # -MD/-MMD/-MF -- and they do: the generated CMake package passes
-    # `-MD -MP -MF` on every source, and AGT's Makefile likewise. Measured, the
+    # `-MD -MF` on every source, and AGT's Makefile `-MD -MP -MF`. Measured, the
     # attached form took the -MF they asked for and broke 11 of this suite's
     # dependency assertions. An isolated pass cannot perturb the real compile
     # at all.
@@ -2179,8 +2237,16 @@ if [[ "$CXX_LINK" == "true" ]]; then
     fi
 fi
 
-run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
-    --no-warn-rwx-segments --no-undefined --gc-sections \
+# The flags every image link starts from: the image's own link below and the
+# --compress stub link (pack_stub_link) share this ONE list, so a flag added
+# for one cannot silently miss the other. -z noexecstack: a PE image has no
+# stack-exec flag, but ld warns when some inputs carry a .note.GNU-stack (an
+# --embed blob, the --compress payload, a host-gcc object) and others none
+# (the bare-metal toolchain's objects, newlib's assembly memset).
+LD_BASE_FLAGS=(-nostdlib -shared -Bsymbolic
+               --no-warn-rwx-segments --no-undefined -z noexecstack --gc-sections)
+
+run_cmd ${CROSS}ld "${LD_BASE_FLAGS[@]}" \
     ${NO_EH_LD_ARGS[@]+"${NO_EH_LD_ARGS[@]}"} \
     -T "$LINK_LDS" \
     ${VERSION_SCRIPT_ARGS[@]+"${VERSION_SCRIPT_ARGS[@]}"} \
@@ -2213,7 +2279,7 @@ run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
 # is the KEEP() in the linker script that would break it -- which is why that
 # lives in the separate _eh script and this does not. Gating these as well was
 # the first shape here, and check-flag-parity correctly rejected it: the
-# Makefile and the CMake package would have had to grow the same conditional.
+# CMake build and the CMake package would have had to grow the same conditional.
 # CONSTRUCTORS THAT NOTHING WILL RUN. AXL walks .init_array only; the linker
 # scripts also define __CTOR_LIST__/__CTOR_END__ around the legacy .ctors, and
 # nothing reads them. So a non-empty .ctors is silently dead code that a
@@ -2308,24 +2374,104 @@ fi
 
 # --strip-all: objcopy's ELF->PE writes a COFF symbol table the firmware never
 # reads -- ~20% of a small image. Symbols stay in the .so beside it, which is
-# what pe-set-debug points the PE debug directory at. Must match the Makefile's
-# OBJCOPY_STRIP; `make check-pe-stripped` reads the produced image to catch a
+# what pe-set-debug points the PE debug directory at. Must match the build's
+# AXL_OBJCOPY_STRIP; `gate.check-pe-stripped` reads the produced image to catch a
 # path that drifts.
+#
+# One list for both links below (the image's own, and the --compress stub's).
+OBJCOPY_SECTIONS=(
+    -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym
+    -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir
+    -j .eh_frame -j .gcc_except_table
+)
+
+# --compress links the image to <out>.raw.efi and makes <out>.efi from it
+# below. The module name is <out>.efi's either way -- the name the image is
+# run and debugged by -- so the raw image is byte-identical to the one a build
+# without --compress writes.
+LINKED="$OUTPUT"
+[[ "$COMPRESS" == "true" ]] && LINKED="${OUTPUT%.efi}.raw.efi"
+
 run_cmd ${CROSS}objcopy \
-    -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
-    -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir \
-    -j .eh_frame -j .gcc_except_table \
+    "${OBJCOPY_SECTIONS[@]}" \
     --strip-all \
     --output-target="$PE_TARGET" --subsystem=$SUBSYSTEM \
-    "$SO_FILE" "$OUTPUT" || { echo "ERROR: objcopy failed" >&2; rm -rf "$TMPDIR"; exit 1; }
+    "$SO_FILE" "$LINKED" || { echo "ERROR: objcopy failed" >&2; rm -rf "$TMPDIR"; exit 1; }
 
 # Patch PE debug directory with module name
-"$PE_SET_DEBUG" "$OUTPUT" "$(basename "$OUTPUT")" || {
+"$PE_SET_DEBUG" "$LINKED" "$(basename "$OUTPUT")" || {
     echo "ERROR: pe-set-debug failed" >&2; rm -rf "$TMPDIR"; exit 1;
 }
 
 # Keep the ELF .so alongside the .efi (has DWARF symbols for addr2line/debugging)
 cp "$SO_FILE" "${OUTPUT%.efi}.so"
+
+if [[ "$COMPRESS" == "true" ]]; then
+    # pack_stub_link BLOB.o SO OUT.efi SUBSYSTEM -- cmake/AxlWrapEfi.cmake's
+    # stub link and PE step: the stub objects and one payload object,
+    # entry axl_pack_stub_entry, module name `axl-pack-stub` so a crash dump
+    # names the stub and the image it loaded differently. LD_BASE_FLAGS'
+    # -z noexecstack covers the payload object's .note.GNU-stack.
+    pack_stub_link() {
+        run_cmd ${CROSS}ld "${LD_BASE_FLAGS[@]}" \
+            -T "$EFI_LDS" \
+            ${VERSION_SCRIPT_ARGS[@]+"${VERSION_SCRIPT_ARGS[@]}"} \
+            --defsym=_AxlEntry=axl_pack_stub_entry \
+            -o "$2" "${PACK_STUB_OBJS[@]}" "$1" || return 1
+        run_cmd ${CROSS}objcopy "${OBJCOPY_SECTIONS[@]}" -j "$PACK_SECTION" --strip-all \
+            --output-target="$PE_TARGET" --subsystem="$4" "$2" "$3" || return 1
+        "$PE_SET_DEBUG" "$3" axl-pack-stub
+    }
+    # pack_payload_obj PACK OBJ -- PACK's bytes as axl_embedded_pack{,_end}
+    # in their own section, which is how a loader holding only the file finds
+    # them (axl_pack_find_payload). cmake/AxlWrapEfi.cmake's, same shape.
+    pack_payload_obj() {
+        cat > "$2.s" <<PACK_S
+    .section $PACK_SECTION,"a"
+    .balign 8
+    .globl axl_embedded_pack
+    .globl axl_embedded_pack_end
+axl_embedded_pack:
+    .incbin "$1"
+axl_embedded_pack_end:
+
+    .section .note.GNU-stack, "", %progbits
+PACK_S
+        run_cmd "$GCC_BIN" -c "$2.s" -o "$2"
+    }
+    pack_fail() {
+        echo "ERROR: --compress: $1" >&2
+        rm -f "$OUTPUT.tmp"; rm -rf "$TMPDIR"; exit 1
+    }
+    case "$SUBSYSTEM" in
+        10)    _pack_sub=10 ;;
+        11|12) _pack_sub=11 ;;
+    esac
+    # --stub-size is MEASURED: the stub linked here, now, with an empty
+    # payload, by this toolchain -- not a constant that drifts from it.
+    : > "$TMPDIR/empty.pack"
+    pack_payload_obj "$TMPDIR/empty.pack" "$TMPDIR/empty.o" \
+        || pack_fail "assembling the empty payload failed"
+    pack_stub_link "$TMPDIR/empty.o" "$TMPDIR/stub-empty.so" "$TMPDIR/stub-empty.efi" "$_pack_sub" \
+        || pack_fail "linking the axl-pack stub failed"
+    _stub_size=$(wc -c < "$TMPDIR/stub-empty.efi" | tr -d ' ')
+
+    # The decision is axl-efi-pack's alone: exit 0 wrap, 3 keep, else fail.
+    # <out>.efi is replaced only by a rename, so a failure leaves the previous
+    # one (older than its inputs) rather than half an image.
+    rm -f "$OUTPUT.tmp"
+    _pack_rc=0
+    "$AXL_EFI_PACK" --stub-size "$_stub_size" -o "$TMPDIR/payload.pack" "$LINKED" || _pack_rc=$?
+    case $_pack_rc in
+        0)  pack_payload_obj "$TMPDIR/payload.pack" "$TMPDIR/payload.o" \
+                || pack_fail "assembling the payload failed"
+            pack_stub_link "$TMPDIR/payload.o" "$TMPDIR/stub.so" "$OUTPUT.tmp" "$_pack_sub" \
+                || pack_fail "linking the axl-pack stub failed" ;;
+        3)  cp "$LINKED" "$OUTPUT.tmp" || pack_fail "copying $LINKED failed" ;;
+        *)  pack_fail "axl-efi-pack failed on $LINKED (exit $_pack_rc)" ;;
+    esac
+    mv -f "$OUTPUT.tmp" "$OUTPUT" || pack_fail "renaming $OUTPUT.tmp failed"
+fi
 
 rm -rf "$TMPDIR"
 echo "$OUTPUT"

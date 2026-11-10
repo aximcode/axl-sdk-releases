@@ -1,0 +1,181 @@
+# test/pool/classes.toml -- the machines the guest pool keeps.
+#
+# A CLASS is a machine a test needs: everything fixed when QEMU starts
+# (docs/AXL-Test-Guest-Pool-Design.md §6.1). A test names the class it needs
+# in its `# test-meta:` header (`guest=<class>`); a test whose subject IS the
+# boot -- the launcher, the boot path, a reset -- says `guest=none` and keeps
+# launching its own QEMU.
+#
+# Format (axlpool/classes.py checks it; a typo is refused, never a new
+# machine):
+#   [defaults]           slots, keep, reset for every class that omits them
+#   [class.<name>]
+#     extends = "<name>"  inherit a class; this one's args are APPENDED
+#     args    = [...]     run-qemu.sh options beyond the pool's own
+#     arches  = [...]     restrict to X64 / AARCH64 (default: both)
+#     slots   = N         guests of this class at once
+#     keep    = "idle"    resident until the pool's idle timeout (default)
+#             | "lease"   stopped when its last lease ends; its snapshot
+#                         stays on disk, so the next lease cold-starts in
+#                         ~0.4 s instead of booting -- for a ONE-OFF machine
+#     reset   = "snapshot" restore after every lease (default)
+#             | "reuse"    nothing left behind: no restore
+#             | "reset"    a full system_reset
+#     agent_latency = "always"   the agent's ~1 ms round trips (default)
+#                   | "firmware" the firmware's 10 ms tick, untouched: for a
+#                                class whose tests TYPE on a USB keyboard --
+#                                at a 1 ms tick 0 of 10 keys arrived
+#   [class.<name>.arch.<ARCH>]
+#     args    = [...]     appended for that arch only
+#
+# A one-off machine is a named class here too -- `extends = "standard"`,
+# its own args, `keep = "lease"` -- never options written into a test: every
+# machine stays visible, and costs memory only while it is leased.
+
+[defaults]
+slots = 4
+keep = "idle"
+reset = "snapshot"
+agent_latency = "always"
+
+# The standard guest (phase 0b): the root port with the virtio-rng behind
+# it, xHCI with mouse, hub and tablet -- what 65-71% of today's launches use.
+[class.standard]
+# 8, not the default 4: ~110 tests lease it, many for 60-100 s, and a test
+# waits for a slot before it starts. Measured on the twenty hostile_boot ssh
+# tests run alone (X64, -j 16): 100 s booted, 220 s pooled at 4 slots, 127 s
+# at 8 (AARCH64 pooled at 8: 151 s). The full X64 suite is CPU-bound and
+# moved neither way (572 -> 571 s). Memory is bounded by the service's cap
+# (`axlpool serve --mem-cap-mb`, default half of MemTotal), not by slots.
+slots = 8
+args = ["--bridges"]
+
+# run-qemu.sh's own plain guest, for its pooled mode (design §6.9): the bare
+# machine a plain `run-qemu.sh app.efi` boots -- no root port, no USB --
+# plus only what the agent needs and that guest lacks: a NIC (run-qemu.sh's
+# default virtio-net, no option ROM -- exactly `run-qemu.sh --net`) and the
+# virtio-fs share. A test whose run-qemu.sh calls name neither --bridges nor
+# a NIC option declares guest=plain.
+[class.plain]
+args = []
+
+# The NIC a BOOTED test gets (common-test.sh _test_nic_device): an e1000 with
+# QEMU's iPXE ROM on X64 -- run-qemu.sh's own default is virtio-net -- so a
+# pooled test exercises the same driver path (the iPXE SNP's 15-frame limit
+# test-http-throughput guards would otherwise go untested wherever the pool
+# serves). AARCH64's booted NIC is virtio-net already.
+[class.standard.arch.X64]
+args = ["--nic-model", "e1000"]
+
+# The unit suite's guest (test-axl.sh pooled, design §6.7): the standard
+# guest plus the TCP peers AxlTestNet connects to at 10.0.2.100 -- an echo on
+# 9994/9996/9998/9999 and a sink (reads, never replies) on 9997 -- as slirp
+# guestfwds that spawn a program per connection. Fixed arguments, so no host
+# port and no server for the pool to manage. (Its UDP echo, 10.0.2.2:35555 --
+# the host's loopback -- is the pool SERVICE's: axlpool serve --udp-echo-port.)
+[class.unit]
+extends = "standard"
+# 4, not standard's 8: a unit guest is 768M, and one test-axl.sh run per arch
+# leases it -- the slots standard raised for its ~110 tests are not needed here.
+slots = 4
+# The unit binaries assert the FIRMWARE's 10 ms tick (AxlTestNet's latency
+# cases, AxlTestUtil's timer_res): the agent's 1 ms tick would fail them.
+agent_latency = "firmware"
+# 768M: the 512M default the binaries had booted, plus the 64 MB FAT RAM
+# disk test-axl.sh makes in GUEST RAM -- with it at 512M, AxlTestFw's LZMA
+# compress failed on AARCH64 (it passed from the share with no RAM disk).
+args = [
+    "--mem", "768M",
+    "--guestfwd", "tcp:10.0.2.100:9994-cmd:cat",
+    "--guestfwd", "tcp:10.0.2.100:9996-cmd:cat",
+    "--guestfwd", "tcp:10.0.2.100:9998-cmd:cat",
+    "--guestfwd", "tcp:10.0.2.100:9999-cmd:cat",
+    "--guestfwd", "tcp:10.0.2.100:9997-cmd:sh -c 'cat > /dev/null'",
+]
+
+# ---------------------------------------------------------------------------
+# One-off machines (design §6.7 step 8 items 9-10). Each is the machine its
+# tests' run-qemu.sh calls name, option for option: run-qemu.sh's pooled mode
+# runs a call on the lease only when the call's machine parses to the class's
+# (§6.9), so a test changing its options boots instead of testing on the
+# wrong machine. keep = "lease": stopped when its last lease ends, its
+# snapshot kept for a ~0.4 s cold start next time.
+# ---------------------------------------------------------------------------
+
+# run-qemu.sh --gpu: the GPU device whose GOP the firmware initializes (the
+# AARCH64 virt machine has none without it). The gfx/console selftests.
+[class.gpu]
+args = ["--gpu"]
+keep = "lease"
+
+# The plain machine with the firmware's own 10 ms tick: the agent requests no
+# finer one (agent_latency), so a test can pin the tick itself
+# (test-timer-resolution-qemu.sh's PERIOD=10000 at the start of each image).
+[class.plain_firmware]
+agent_latency = "firmware"
+keep = "lease"
+
+# mkfixture's capture, POSTed over the network: the standard PCI tree and a
+# GPU, with run-qemu.sh's own NIC (virtio-net, not standard's X64 e1000).
+[class.fixture_net]
+arches = ["X64"]
+args = ["--bridges", "--gpu"]
+keep = "lease"
+
+# HF4 NIC address replay (test-mac-replay-qemu.sh): the fixture's MAC -- what
+# `axl-emulate --mac` passes run-qemu.sh, and what the test also passes it
+# directly. (Its CPU twin, cpu-replay, cannot pool: on its replayed qemu64
+# model the agent's network bring-up fails -- measured, booted too.)
+[class.mac_replay]
+arches = ["X64"]
+args = ["--mac", "de:ad:be:ef:00:01"]
+keep = "lease"
+
+# Four vCPUs (-smp 4): test-task-pool-mp-qemu.sh's workers on real APs.
+[class.smp4]
+args = ["--qemu-arg", "-smp", "--qemu-arg", "4"]
+keep = "lease"
+
+# Storage controllers over QEMU's null-co (zeros, no file -- the tools read
+# identity, health and capacity, never media), one class per test. (No NVMe:
+# QEMU's nvme device is not migratable, so a guest with one has no snapshot.)
+[class.ata]
+arches = ["X64"]
+keep = "lease"
+args = [
+    "--qemu-arg", "-device", "--qemu-arg", "ich9-ahci,id=ahci",
+    "--qemu-arg", "-drive", "--qemu-arg", "driver=null-co,size=64M,read-zeroes=on,if=none,id=satadisk",
+    "--qemu-arg", "-device", "--qemu-arg", "ide-hd,drive=satadisk,bus=ahci.0,model=AXLSATA,serial=ATA12345",
+]
+
+[class.scsi]
+arches = ["X64"]
+keep = "lease"
+args = [
+    "--qemu-arg", "-device", "--qemu-arg", "virtio-scsi-pci,id=scsi0",
+    "--qemu-arg", "-drive", "--qemu-arg", "driver=null-co,size=48M,read-zeroes=on,if=none,id=scsidisk",
+    "--qemu-arg", "-device", "--qemu-arg", "scsi-hd,drive=scsidisk,bus=scsi0.0,vendor=AXLVND,product=AXLSCSIDISK,serial=SCSI98765",
+    "--qemu-arg", "-drive", "--qemu-arg", "driver=null-co,size=16M,read-zeroes=on,if=none,id=scsicd",
+    "--qemu-arg", "-device", "--qemu-arg", "scsi-cd,drive=scsicd,bus=scsi0.0",
+]
+
+# QEMU's IPMI BMC simulator on the standard guest, as common-test.sh's
+# test_add_ipmi_bmc_sim_kcs / _ssif add it (the test's own arguments must be
+# exactly these: common-test.sh _test_pool_machine_check).
+[class.ipmi_kcs]
+extends = "standard"
+arches = ["X64"]
+keep = "lease"
+args = [
+    "--qemu-arg", "-device", "--qemu-arg", "ipmi-bmc-sim,id=bmc0",
+    "--qemu-arg", "-device", "--qemu-arg", "isa-ipmi-kcs,bmc=bmc0,ioport=0xca2",
+]
+
+[class.ipmi_ssif]
+extends = "standard"
+arches = ["X64"]
+keep = "lease"
+args = [
+    "--qemu-arg", "-device", "--qemu-arg", "ipmi-bmc-sim,id=bmc0",
+    "--qemu-arg", "-device", "--qemu-arg", "smbus-ipmi,bmc=bmc0,address=0x10",
+]

@@ -595,6 +595,11 @@ axl_walk_lines(
 /**
  * @brief Set the stream position.
  *
+ * Bytes still held in the stream's own write buffer
+ * (axl_stream_set_buffering) are written out first, at the position they
+ * were written at, as stdio's `fseek` does; if that fails, the position is
+ * not changed and this returns AXL_ERR.
+ *
  * @return AXL_OK on success, AXL_ERR on error or if not supported.
  */
 int
@@ -606,6 +611,16 @@ axl_fseek(
 
 /**
  * @brief Get the current stream position.
+ *
+ * Counts bytes still held in the stream's own write buffer
+ * (axl_stream_set_buffering) as written, as stdio's `ftell` does, so a
+ * position saved here and restored with axl_fseek() lands after them.
+ * Nothing is written out by the query. The position is in the bytes of
+ * the stream's wire encoding (axl_stream_set_encoding): buffered text
+ * counts as the code points it will become -- two bytes each in UCS-2,
+ * one in ASCII -- and a trailing incomplete UTF-8 sequence counts nothing
+ * yet. On the read side, a caller part-way through a character whose
+ * wire bytes were already read is at that character's start.
  *
  * @return position in bytes, or -1 on error.
  */
@@ -1314,6 +1329,16 @@ axl_pread(
  * Sets the sticky error flag (axl_ferror()) if the backend fails, as
  * axl_write() does. A short count is not an error and sets nothing.
  * @see axl_pread for the flag rules in full.
+ *
+ * On a stream axl_fopen() returned, an @a offset past the end of the file
+ * writes zeros from the old end up to @a offset first, so the gap reads
+ * back as zeros, as a POSIX hole does -- and never as whatever the volume
+ * held there before, which is what the EDK2-derived FAT driver alone would
+ * leave. Filling it is a real write of that many bytes. The same holds for
+ * axl_write() after axl_fseek() past the end, or after the file was shrunk
+ * below the stream's position by AXL in this image (axl_file_truncate(),
+ * axl_ftruncate() on any stream); a shrink by a writer AXL cannot see is
+ * not noticed until the stream seeks.
  *
  * @return bytes written, -1 on error or if not supported.
  */

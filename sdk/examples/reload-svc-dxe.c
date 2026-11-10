@@ -1,32 +1,30 @@
 /**
- * reload-svc-dxe.c — verification driver for axl_service_reload.
+ * reload-svc-dxe.c — the service half of the axl_service_reload example.
  *
- * A minimal AXL_SERVICE_DRIVER service that self-reloads via the SDK built-in:
- * serves :8080, and ~3 s in calls axl_service_reload() to hot-swap itself to a
- * fresh copy of the same image, handing off the port. Its teardown
- * abortive-frees the server so the port is free when the replacement binds it.
+ * A minimal AXL_SERVICE_DRIVER service: it serves :8080 and reports its
+ * generation. It never reloads itself. A resident service's own code runs in
+ * event callbacks, at TPL_CALLBACK, where UEFI forbids LoadImage and
+ * StartImage (2.11 Table 7.3) -- so the replacement is asked for by an
+ * application: reload-svc.c, run from the Shell, calls axl_service_reload().
+ * That loads the new image, stops this one (its teardown abortive-frees the
+ * server, so the port is free) and starts the replacement, which rebinds it.
  *
- * A generation counter kept in a volatile UEFI variable (test-only; the
- * framework's own handoff rides LoadOptions) lets the harness tell OLD (gen 0)
- * from NEW (gen 1). Driven by test-service-reload-qemu.sh.
+ * A generation counter kept in a volatile UEFI variable (test-only) lets the
+ * harness tell OLD (gen 0) from NEW (gen 1); the launcher bumps it. Driven by
+ * test-service-reload-qemu.sh.
  */
 #include <axl.h>
 
 #define SVC_PORT 8080
-
-/* Staged only by the start-failure harness — see reload_trigger_cb. */
-#define POISON_PATH "fs0:\\reload-svc-fail-dxe.efi"
 
 static const AxlGuid RSVC_NS_GUID =
     AXL_GUID(0x71c0de11, 0x4a22, 0x4e55,
              0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01);
 
 static AxlHttpServer *g_server;
-static AxlLoop       *g_loop;
 static uint32_t       g_gen;
 
-static const AxlService reload_svc;                 /* forward */
-static bool reload_trigger_cb(void *data);          /* forward */
+static const AxlService reload_svc;   /* forward: setup names it */
 
 static int
 on_version(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
@@ -43,7 +41,6 @@ static int
 rsvc_setup(AxlLoop *loop, void *user)
 {
     (void)user;
-    g_loop = loop;
 
     /* The generation counter lives in this namespace — without it the
        reload demo cannot count, so a failed bind is fatal to setup. */
@@ -72,46 +69,14 @@ rsvc_setup(AxlLoop *loop, void *user)
     }
     axl_printf("RSVC: gen%u SETUP on :%d\n", (unsigned)g_gen, SVC_PORT);
 
+    /* What a service must not do: ask for its own reload. Even here, at
+       TPL_APPLICATION (setup runs inside the loader's StartImage), the call
+       is refused -- this image cannot unload itself -- and nothing changes. */
     if (g_gen == 0) {
-        axl_loop_add_timeout(loop, 3000, reload_trigger_cb, NULL);
+        int self = axl_service_reload(&reload_svc, "fs0:\\reload-svc-dxe.efi");
+        axl_printf("RSVC: gen%u self-reload rc=%d\n", (unsigned)g_gen, self);
     }
     return AXL_OK;
-}
-
-static bool
-reload_trigger_cb(void *data)
-{
-    (void)data;
-    axl_printf("RSVC: gen%u triggering self-reload\n", (unsigned)g_gen);
-
-    /* A replacement that cannot be LOADED tears nothing down — this service is
-       still serving afterwards, and the return code says so (distinct from the
-       start-failure code below). */
-    int miss = axl_service_reload(&reload_svc, "fs0:\\no-such-image.efi");
-    axl_printf("RSVC: gen%u load-miss rc=%d\n", (unsigned)g_gen, miss);
-
-    /* Poison image staged? Then this boot is the start-failure scenario
-       (test-service-reload-fail-qemu.sh): the replacement loads fine but its
-       setup fails on purpose, so it never attaches. This service is DOWN
-       afterwards, so there is nothing left to do but report the rc. */
-    AxlFsEntry poison;
-    if (axl_file_info(POISON_PATH, &poison) == AXL_OK
-        && !axl_fs_entry_is_dir(&poison)) {
-        int frc = axl_service_reload(&reload_svc, POISON_PATH);
-        axl_printf("RSVC: gen%u start-fail rc=%d\n", (unsigned)g_gen, frc);
-        return AXL_SOURCE_REMOVE;
-    }
-
-    /* Bump the generation the replacement will read (test observability). */
-    uint32_t next = g_gen + 1;
-    axl_nvstore_set("rsvc", "gen", &next, sizeof(next), AXL_NV_VOLATILE);
-
-    int rc = axl_service_reload(&reload_svc, "fs0:\\reload-svc-dxe.efi");
-    if (rc != AXL_OK) {
-        axl_printf("RSVC: gen%u reload FAIL rc=%d\n", (unsigned)g_gen, rc);
-    }
-    /* On success the replacement reclaims us shortly. */
-    return AXL_SOURCE_REMOVE;
 }
 
 static int

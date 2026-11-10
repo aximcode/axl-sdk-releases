@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=16 local-only=0
+# test-meta: arch=x64 needs= est=16 local-only=0 guest=none
+# guest=none: the child Shell's `edit` writes fs0:\mtxt.txt, which on a
+#   leased guest is the pool's own disk, not the test's.
 # test-console-mirror-edit-qemu.sh — the AxlConsoleMirror ACCEPTANCE GATE.
 #
 # Design §6 rung 3, the headline proof: the Shell's full-screen interactive
@@ -28,8 +30,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
@@ -63,8 +65,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID"
 echo "  Driving edit over the mirror (this takes ~15s)..."
 
-if ! test_wait_for "MIRROR_EDIT_DONE" 120; then
-    echo "FAIL: edit session did not finish within 120 seconds"
+if ! test_wait_boot "MIRROR_EDIT_DONE" 120; then
+    echo "FAIL: edit session did not finish within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log (mirror lines) ---"
     grep -a "MIRROR_EDIT" "$TEST_CLEAN_LOG" | tail -20

@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=125 local-only=1
+# test-meta: arch=x64 needs= est=175 local-only=1 guest=none
+# test-meta: builds=ARCH=x64,console-device-smoke,console-device-restore-smoke,console-device-wide-smoke,console-device-passthrough-smoke,console-device-input-smoke,console-device-input-restore-smoke,console-device-wide-restore-smoke,console-device-cycle-smoke,fbcon
+# guest=none: not converted yet (pool design §6.7 step 8 item 10):
+#   --debugcon, --screenshot and --sendkey, a machine no class gives.
 # test-console-device-fbcon-life-qemu.sh — fbcon's teardown and relaunch: the ctrl+\\ hotkey, auto-restore when the hosted
 #
 # fbcon's teardown and relaunch: the Ctrl+\\ hotkey, auto-restore when the hosted
@@ -18,7 +21,7 @@
 #
 # Ratchet-exempt (end-to-end scenario, not a unit binary's assertion count).
 #
-# Usage: [OVMF_CODE=/path/DEBUG/OVMF_CODE.fd OVMF_VARS=...] \
+# Usage: [AXL_OVMF_DEBUG_DIR=/path/to/DEBUG/FV] \
 #            ./test/integration/test-console-device-fbcon-life-qemu.sh [--arch X64]
 
 CD_NAME="console-device fbcon lifecycle test"
@@ -33,6 +36,17 @@ source "$(dirname "$0")/lib/console-device-lib.sh"
 run_fbcon_serial_scenario "fbcon-leave" "ctrl-backslash" \
     "fbcon: Ctrl.*restoring the firmware console" \
     "Ctrl+\\ drops the take-over and restores the firmware console"
+
+# Scenario 7b — the same Ctrl+\ while the guest is NOT reading: `stall 90 s`, then
+# 70 keys of type-ahead (more than the device's 63-key ring), then Ctrl+\. The device
+# reads the keyboard ahead of the ring and runs key_filter as each key ARRIVES, so the
+# escape hatch still fires -- the case it exists for (a hung or busy guest). Were the
+# filter run only when a key reaches the ring, Ctrl+\ would wait behind the stall,
+# past the end of this run.
+FBCON_BUSY_KEYS="s t a l l spc 9 0 0 0 0 0 0 0 ret$(printf ' y%.0s' $(seq 1 70)) ctrl-backslash"
+run_fbcon_serial_scenario "fbcon-leave-busy" "$FBCON_BUSY_KEYS" \
+    "fbcon: Ctrl.*restoring the firmware console" \
+    "Ctrl+\\ behind 70 unread keys, the guest stalled, still drops the take-over"
 
 # Scenario 8 — fbcon auto-restore on shell exit: fbcon takes over the ONE shell it was
 # loaded into; typing `exit` makes that shell's EFI_SHELL_PROTOCOL disappear, which the

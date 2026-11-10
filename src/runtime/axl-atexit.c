@@ -33,6 +33,12 @@ static uint64_t  mNextSeq = 1;
  * axl-atexit-internal.h for why that matters. */
 static bool      mIsDriverImage;
 
+/* True while a DriverEntry built by an AXL macro (AXL_DRIVER and what expands
+ * to it, AXL_SERVICE_DRIVER) is running: the window in which an exit with an
+ * EFI error makes the firmware unload the image. See
+ * _axl_driver_entry_begin in axl.h. */
+static bool      mDriverEntryLive;
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -47,6 +53,24 @@ bool
 _axl_atexit_is_driver_image(void)
 {
     return mIsDriverImage;
+}
+
+void
+_axl_driver_entry_begin(void)
+{
+    mDriverEntryLive = true;
+}
+
+void
+_axl_driver_entry_end(void)
+{
+    mDriverEntryLive = false;
+}
+
+bool
+_axl_atexit_driver_entry_live(void)
+{
+    return mDriverEntryLive;
 }
 
 void
@@ -85,11 +109,16 @@ axl_atexit(AxlAtexitFn fn, void *data)
         }
     }
 
-    /* Append a fresh slot. */
+    /* Append a fresh slot. A table that cannot grow is a failed
+       registration, reported as 0 as the header promises -- the length it
+       used to return named the LAST slot, which is another caller's. */
     slot.fn   = fn;
     slot.data = data;
-    slot.seq  = mNextSeq++;
-    axl_array_append(mAtexit, &slot);
+    slot.seq  = mNextSeq;
+    if (axl_array_append(mAtexit, &slot) != AXL_OK) {
+        return 0;
+    }
+    mNextSeq++;
     return (uint32_t)axl_array_len(mAtexit);
 }
 

@@ -34,27 +34,6 @@ format_uint(char *buf, size_t buf_size, unsigned val, size_t width)
     return width;
 }
 
-/**
- * Inverse of the backend's days_from_civil (Howard Hinnant's
- * civil_from_days, public domain): convert a count of days since the
- * Unix epoch (1970-01-01) into a Gregorian year/month/day. Valid for
- * the full proleptic Gregorian range; axl_time_set_unix only feeds it
- * the post-epoch range it pre-validates.
- */
-static void
-civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
-{
-    z += 719468;
-    int64_t era  = (z >= 0 ? z : z - 146096) / 146097;
-    unsigned doe = (unsigned)(z - era * 146097);                  // [0, 146096]
-    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);       // [0, 365]
-    unsigned mp  = (5 * doy + 2) / 153;                           // [0, 11]
-    *d = doy - (153 * mp + 2) / 5 + 1;                            // [1, 31]
-    *m = mp < 10 ? mp + 3 : mp - 9;                               // [1, 12]
-    *y = (int)((int64_t)yoe + era * 400 + (*m <= 2));
-}
-
 // ---------------------------------------------------------------------------
 // Public API — formatting
 // ---------------------------------------------------------------------------
@@ -201,6 +180,36 @@ axl_time_get_us(void)
 }
 
 int
+axl_timer_resolution_begin(
+    uint32_t              period_us,
+    AxlTimerResolutionId *out_id,
+    uint32_t             *out_granted_us
+    )
+{
+    if (out_id == NULL || period_us == 0 || period_us > AXL_TIMER_RESOLUTION_MAX_US) {
+        return AXL_INVALID;
+    }
+    if (period_us < AXL_TIMER_RESOLUTION_MIN_US) {
+        period_us = AXL_TIMER_RESOLUTION_MIN_US;
+    }
+    return axl_backend_timer_resolution_begin(period_us, out_id, out_granted_us);
+}
+
+int
+axl_timer_resolution_end(
+    AxlTimerResolutionId id
+    )
+{
+    return axl_backend_timer_resolution_end(id);
+}
+
+uint32_t
+axl_timer_period_us(void)
+{
+    return axl_backend_timer_period_us();
+}
+
+int
 axl_time_realtime(AxlRealtime *out)
 {
     if (out == NULL) {
@@ -259,7 +268,7 @@ axl_time_set_unix(int64_t unix_secs)
 
     int      y;
     unsigned mo, d;
-    civil_from_days(days, &y, &mo, &d);
+    axl_backend_civil_from_days(days, &y, &mo, &d);
 
     AxlRealtime rt = { 0 };
     rt.year             = (uint16_t)y;

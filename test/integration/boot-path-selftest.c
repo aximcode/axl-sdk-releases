@@ -147,6 +147,26 @@ main(
         check(false, "delete it again");
     }
 
+    /* ---- 3b. the same path spelled with '/' ----------------------- */
+    /* Every path AXL takes reads '/' as '\', with or without a shell. */
+    char slashed[256] = { 0 };
+    axl_strlcpy(slashed, boot, sizeof(slashed));
+    for (char *p = slashed; *p != '\0'; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    void   *sdata = NULL;
+    size_t  slen  = 0;
+    bool    sok   = rc == AXL_OK
+                    && axl_file_set_contents(slashed, SEED_CONTENT,
+                                             axl_strlen(SEED_CONTENT)) == AXL_OK
+                    && axl_file_get_contents(boot, &sdata, &slen) == AXL_OK
+                    && slen == axl_strlen(SEED_CONTENT)
+                    && axl_file_delete(slashed) == AXL_OK;
+    axl_free(sdata);
+    check(sok, "a '/'-spelled path writes, reads back as '\\' and deletes");
+
     /* ---- 4. the reported image path opens the running image ------- */
     /* Pins the prefix to the volume the image actually came from: a path
        naming the WRONG volume would still parse and could still open some

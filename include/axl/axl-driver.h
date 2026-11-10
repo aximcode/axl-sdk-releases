@@ -17,6 +17,25 @@
  *     axl_driver_unload(drv);
  * }
  * @endcode
+ *
+ * **TPL rule.** UEFI 2.11 Table 7.3 allows `LoadImage()` and `StartImage()`
+ * only below `TPL_CALLBACK`. Every call here that would reach either --
+ * the loads, axl_driver_start, the ensure family when the protocol is not
+ * yet published, axl_driver_load_dir -- refuses at `TPL_CALLBACK` or above:
+ * it returns AXL_UNSUPPORTED before touching the firmware and logs one
+ * error line naming the call and the rule. That includes every AxlLoop
+ * callback (timers, I/O, idle) and any event notify. Load and start images
+ * from an application, such as a Shell command or a launcher, or from a
+ * driver's entry point (which runs inside its loader's `StartImage`, at
+ * `TPL_APPLICATION`).
+ *
+ * The rule bites in practice, not only on paper. EDK2's `CoreFreePages`
+ * hands freed pages back to the memory map and releases its lock -- which
+ * dispatches pending callbacks -- before it applies the NX policy for free
+ * memory to them. An image loaded in a callback dispatched there can land in
+ * the pages of an application that just exited, and then be made RW +
+ * execute-never under it: an instruction abort at its first call, on any
+ * firmware with NX on free memory.
  */
 
 #ifndef AXL_DRIVER_H
@@ -257,7 +276,40 @@ axl_driver_binding_uninstall(void);
  *
  * Loads the .efi file into memory but does not start it.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * Accepts a raw PE/COFF image or one packed by `axl-efi-pack`, deciding by
+ * the file's CONTENT (its section table), never its name. A packed file is
+ * unpacked in-process and the original image is loaded with the file's own
+ * device path, so the returned handle is the ORIGINAL image's -- its
+ * LoadedImage->FilePath is the file's, and no stub image stays resident.
+ *
+ * Either way AXL reads the file itself, in reads of at most 64 KB, and hands
+ * LoadImage the bytes together with the file's device path, so a raw image's
+ * FilePath and DeviceHandle are the file's too. The firmware is never asked
+ * to read the file in one large call -- on BMC virtual media such reads have
+ * been measured coming back corrupt -- except when AXL cannot open the file
+ * or learn its size. A file AXL can size but not read whole, an empty one,
+ * or one over 64 MB is refused with a warning, not handed to the firmware.
+ * @p path may name its volume by any shell mapping, not only an `fsN:`
+ * alias.
+ *
+ * The file the RUNNING image was loaded from is refused (AXL_ERR, with an
+ * error line), however its path is spelled -- another case, an 8.3 alias,
+ * "." or ".." segments: loading the caller as a driver is never what a
+ * driver load means. The same holds for axl_driver_load_sibling, the
+ * axl_driver_ensure* family and the axl_shared_driver_locate* family.
+ * Identity is the file as the filesystem stores it, so a copy of the image
+ * in another file -- even under the same name in another directory -- is
+ * not the image, and loads. axl_image_load and axl_image_run are NOT
+ * refused: loading or running one's own path (a self-update probing the
+ * file it staged over itself, a re-exec) is the caller's choice.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
+ *
+ * @return AXL_OK on success, AXL_ERR on error -- including a packed file
+ *     that cannot be unpacked, which is logged with the pack status and
+ *     never loaded as its stub.
  */
 int
 axl_driver_load(
@@ -270,9 +322,11 @@ axl_driver_load(
  *
  * Resolves @p file_name strictly within the directory the current
  * application image was loaded from (derived from
- * axl_app_image_path()), then loads it via axl_driver_load — so the
+ * axl_app_image_path()), then loads it from that file — so the
  * loaded image gets a real on-disk MEDIA_FILEPATH device path (never
- * NULL). Use this to load a companion driver staged next to the app
+ * NULL). A raw image or one packed by `axl-efi-pack` loads alike (see
+ * axl_driver_load); the handle is always the original image's. Use
+ * this to load a companion driver staged next to the app
  * while refusing to pick one up from anywhere else (an
  * attacker-controlled volume root, another `fsN:`, a parent
  * directory).
@@ -280,10 +334,15 @@ axl_driver_load(
  * @p file_name must be a bare filename: any `/`, `\\`, or `:` is
  * rejected so the name cannot escape the app directory.
  *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
+ *
  * @return AXL_OK on success (`*out_handle` is set); AXL_INVALID if
  *     @p file_name contains a path separator or drive prefix; AXL_ERR
- *     on NULL arguments or when the app has no filesystem image path
- *     (network / RAM-disk boot); AXL_NOT_FOUND if the file is not
+ *     on NULL arguments, when the app has no filesystem image path
+ *     (network / RAM-disk boot), or for a packed file that cannot be
+ *     unpacked; AXL_NOT_FOUND if the file is not
  *     present in the app directory. `*out_handle` is set to NULL on
  *     any failure.
  */
@@ -314,8 +373,17 @@ axl_driver_load_sibling(
  *
  * The driver is loaded but NOT started.
  *
+ * @p buf may hold a raw PE/COFF image or one packed by `axl-efi-pack`
+ * (the whole wrapped .efi file); a packed one is unpacked in-process and
+ * the returned handle is the original image's, never the stub's.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
+ *
  * @return AXL_OK on success (`*out_handle` is set); AXL_ERR on
- *     argument validation failure or LoadImage failure
+ *     argument validation failure, a packed image that cannot be
+ *     unpacked (logged with the pack status), or LoadImage failure
  *     (`*out_handle` is set to NULL).
  */
 int
@@ -345,8 +413,16 @@ axl_driver_load_buffer(
  * synthesis is best-effort — if it fails the driver still loads
  * (AXL_OK) and a warning is logged, leaving the firmware's defaults.
  *
+ * Like axl_driver_load_buffer, @p buf may be raw or packed by
+ * `axl-efi-pack`; the identity above is given to the ORIGINAL image.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
+ *
  * @return AXL_OK on success (`*out_handle` is set); AXL_ERR on
- *     argument validation failure or LoadImage failure
+ *     argument validation failure, a packed image that cannot be
+ *     unpacked (logged with the pack status), or LoadImage failure
  *     (`*out_handle` is set to NULL).
  */
 int
@@ -362,6 +438,19 @@ axl_driver_load_buffer_with_image_info(
  *
  * Calls the driver's entry point. The driver registers its
  * binding protocol(s) but does not yet bind to devices.
+ *
+ * Once the entry point has returned, any load-options copy installed by
+ * axl_driver_set_load_options() is taken back: the image's
+ * `LoadedImage->LoadOptions` is cleared (if it still points at the copy) and
+ * the copy freed. An image therefore reads its options during its entry
+ * point and copies whatever it needs later. Taking them back here, not at
+ * unload, is what keeps a launcher from leaking them: it typically exits
+ * while the driver stays resident, and the eventual unload runs in another
+ * image.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
@@ -399,11 +488,11 @@ axl_driver_disconnect(
  * @brief Unload a driver image from memory.
  *
  * The driver must be disconnected first. Also frees any load-options
- * copy installed via axl_driver_set_load_options() on this handle —
- * the firmware retains the LoadOptions pointer for the loaded-image
- * lifetime, so the AXL-side copy must be released here. Release runs
- * BEFORE gBS->UnloadImage so a UnloadImage failure still doesn't leak
- * the copy.
+ * copy still installed via axl_driver_set_load_options() on this handle
+ * (one set but never started) -- AFTER gBS->UnloadImage succeeds. Nothing is
+ * released before a call that can refuse: when the unload is refused the
+ * image stays resident with its load options, and the copy is freed by the
+ * unload that later succeeds.
  *
  * Safe to call on an image the firmware already unloaded — it auto-unloads
  * an image whose entry point returned an error (and any application). This
@@ -411,7 +500,12 @@ axl_driver_disconnect(
  * skips the redundant UnloadImage, and returns AXL_OK; it never double-frees
  * a synthesized device path the firmware already reclaimed.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * A buffer-loaded image's synthesized identity (its LoadedImageDevicePath
+ * and LoadedImage->FilePath) is released only AFTER UnloadImage succeeds:
+ * when the driver's Unload refuses, the image stays resident with that
+ * identity intact, and AXL_ERR is returned.
+ *
+ * @return AXL_OK on success, AXL_ERR on error (including a refused unload).
  */
 int
 axl_driver_unload(
@@ -424,10 +518,12 @@ axl_driver_unload(
  * Provides configuration data (e.g., a URL) that the driver reads
  * from EFI_LOADED_IMAGE_PROTOCOL.LoadOptions during startup.
  * The data is copied internally — caller's buffer can be freed after.
- * The copy is owned by AXL and freed by axl_driver_unload() (or by
- * a subsequent set on the same handle, which replaces the previous
- * copy). Pass NULL data to clear load options and free any previous
- * copy. Call between axl_driver_load and axl_driver_start.
+ * The copy is owned by AXL and lives until the image's entry point has
+ * returned: axl_driver_start() then clears `LoadOptions` and frees it, so the
+ * driver must copy anything it needs past its entry point. A subsequent set
+ * on the same handle replaces the copy, and axl_driver_unload() frees one
+ * that was never started. Pass NULL data to clear load options and free any
+ * previous copy. Call between axl_driver_load and axl_driver_start.
  *
  * AXL tracks at most 16 outstanding driver handles with load options
  * — a 17th call returns AXL_ERR and frees the would-be copy without
@@ -536,10 +632,26 @@ axl_driver_init(
  * unload function calls this while using a macro whose stub also
  * calls it does not double-run destructors.
  *
- * @note **TPL.** On the self-reload path
- *       (@ref axl_service_reload) the unload is issued from a timer
- *       notify, so destructors can run as high as `TPL_CALLBACK`,
- *       where `gBS->WaitForEvent` returns `EFI_UNSUPPORTED`. A
+ * Its LAST step returns the C library's heap (the region newlib's
+ * `malloc`, and so `operator new`, allocate from) to the firmware,
+ * which does not reclaim an image's pages when it unloads. So this
+ * must be the last thing the image does before returning: nothing
+ * after it may call `malloc`, `free` or `new` -- and in C++ that
+ * includes the destructor of any local still in scope at the call
+ * (a `std::vector` declared in your entry function is destroyed
+ * AFTER the `return` that follows it; let it go out of scope first).
+ * Memory from `axl_malloc` is unaffected.
+ *
+ * Do NOT call this from an `AXL_SERVICE_DRIVER` service's own
+ * teardown: the service's unload stub runs the same cleanup itself
+ * and releases the heap only after its registry sweep, which may
+ * still free into it.
+ *
+ * @note **TPL.** UEFI allows `UnloadImage()` up to `TPL_CALLBACK`,
+ *       so an unload may be issued from a timer notify (a resident
+ *       service that stops itself when the Shell exits does), and
+ *       destructors can then run at `TPL_CALLBACK`, where
+ *       `gBS->WaitForEvent` returns `EFI_UNSUPPORTED`. A
  *       destructor must not block on an event or a synchronous
  *       network wait; do that work in your unload callback, which
  *       has the same constraint but is yours to reason about.
@@ -593,6 +705,18 @@ axl_driver_set_unload(
     void *unload_fn   ///< EFIAPI unload function pointer
 );
 
+/// @cond INTERNAL
+/* Bracket the AXL_DRIVER macro's call into the consumer's entry function
+ * (internal; not for direct use). Inside it, an axl_exit with an EFI error is
+ * known to make the firmware unload the image -- EDK2's StartImage does that
+ * without calling the image's Unload -- so the exit runs the image's
+ * destructors and releases its C library heap instead of keeping both as for a
+ * resident driver. Declared here, not in axl.h, so it has C linkage in a C++
+ * driver. */
+void _axl_driver_entry_begin(void);
+void _axl_driver_entry_end(void);
+/// @endcond
+
 /**
  * @brief Get the load options that were passed to the current image.
  *
@@ -616,6 +740,11 @@ axl_driver_get_load_options(void);
  * Used by AxlService to read its UTF-8 axl_config_to_string payload
  * without misinterpreting it as UCS-2.
  *
+ * The pointer is borrowed and, when the image was started by
+ * axl_driver_start() or the axl_driver_ensure family, valid only during the
+ * entry point: the loader takes its copy back when the entry point returns.
+ * Copy what you need before returning (AXL_SERVICE_DRIVER does).
+ *
  * @return AXL_OK on success (out params populated with a borrowed
  *     pointer into the firmware's LoadedImage struct — do NOT free),
  *     AXL_ERR if the image has no LoadOptions or HandleProtocol
@@ -630,8 +759,11 @@ axl_driver_get_load_options_raw(
 /**
  * @brief Get the filesystem path the current image was loaded from.
  *
- * Returns a UTF-8 path like "fs0:\\drivers\\MyDriver.efi".
- * Useful for finding companion files next to the driver.
+ * Returns the UTF-8 path WITHIN its volume, like "\\drivers\\MyDriver.efi"
+ * -- the loaded image's FILEPATH node, with no volume prefix. For a
+ * volume-qualified path ("FS0:\\drivers\\MyDriver.efi") use
+ * axl_app_image_path, and for a file beside the image
+ * axl_app_image_dir_path.
  * Caller frees with axl_free().
  *
  * Same contract as axl_app_image_path for the same condition: an image
@@ -707,6 +839,10 @@ axl_driver_disconnect_handle(
  * axl_driver_start(h);
  * @endcode
  *
+ * The running image's own file is never a candidate: a @p driver_name
+ * equal to the image's file name finds the next match (e.g. a
+ * `drivers/<arch>/` copy), not the image.
+ *
  * Same trust caveat as axl_driver_ensure: searches every mounted FAT
  * volume. Don't pass attacker-controlled @p driver_name.
  *
@@ -763,6 +899,10 @@ axl_driver_locate(
  * privileges. Only call this with driver names you trust, and don't
  * call it with attacker-controlled @p driver_name values.
  *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (see the file's TPL rule).
+ *
  * @return AXL_OK if the protocol is registered (was already, or after
  *     loading the driver); AXL_NOT_FOUND if no candidate path yielded a
  *     driver that loaded, started, and registered the protocol; AXL_ERR
@@ -807,8 +947,9 @@ axl_driver_ensure(
  * **LoadOptions** (`load_options` / `load_options_size`): when
  * non-NULL, AXL installs the bytes into the loaded image's
  * `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions` BEFORE `StartImage` is
- * called, via the same axl_driver_set_load_options path (so
- * unload-time release is automatic). Applied on BOTH the disk-load
+ * called, via the same axl_driver_set_load_options path, and takes the
+ * copy back once `StartImage` returns, as axl_driver_start() does -- the
+ * driver reads them in its entry point. Applied on BOTH the disk-load
  * path (steps 2/3) and the embedded path (step 4). Skipped on the
  * step-1 short-circuit — the firmware-provided protocol implies a
  * driver instance the consumer doesn't own. Used by AxlService to
@@ -820,6 +961,10 @@ axl_driver_ensure(
  * controlled @p driver_name or @p override_name. The embedded buffer
  * is whatever the build system baked in — caller's responsibility to
  * verify provenance.
+ *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (see the file's TPL rule).
  *
  * @return AXL_OK if the protocol is registered (was already, or after
  *     loading); AXL_NOT_FOUND if the disk search (and the embedded
@@ -860,6 +1005,10 @@ axl_driver_ensure_with_embedded(
  *      is unloaded and this reports failure — it does not fall back to
  *      anything.
  *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (see the file's TPL rule).
+ *
  * @return AXL_OK if the protocol is registered (was already, or after
  *     loading @p driver_path); AXL_NOT_FOUND if @p driver_path could not
  *     be loaded, failed to start, or started without registering the
@@ -897,6 +1046,10 @@ axl_driver_ensure_from_path(
  *      `StartImage`, then verify the protocol got registered. If it did
  *      not, the image is unloaded and this reports failure — no fallback.
  *
+ * **TPL:** an already-published protocol is AXL_OK at any TPL. A load is
+ * made only below `TPL_CALLBACK`; at `TPL_CALLBACK` or above it returns
+ * AXL_UNSUPPORTED and logs why (see the file's TPL rule).
+ *
  * @return AXL_OK if the protocol is registered (was already, or after
  *     loading the blob); AXL_NOT_FOUND if the blob failed to load, start,
  *     or register; AXL_INVALID on a NULL @p protocol_guid / @p embedded_buf
@@ -927,6 +1080,10 @@ axl_driver_ensure_embedded_only(
  * @p dir_path wedges the machine, and the next boot walks the same
  * directory in the same order and wedges identically. Use
  * axl_driver_load_dir_guarded() where that matters.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
  *
  * @return AXL_OK on success (even if no drivers found), AXL_ERR on error.
  */
@@ -962,6 +1119,10 @@ axl_driver_load_dir(
  * sweeping different directories keep separate quarantine lists.
  * Passing NULL is explicitly allowed and is exactly
  * axl_driver_load_dir(): no breadcrumb, no skipping.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (see the file's TPL rule).
  *
  * @return AXL_OK on success (even if no drivers found or all were
  *     quarantined), AXL_ERR on error.

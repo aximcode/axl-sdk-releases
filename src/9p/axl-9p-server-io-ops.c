@@ -522,6 +522,17 @@ s9p_handle_treaddir(S9pConn *conn, Axl9pReader *r, uint16_t tag)
         if (!s9p_path_append(full, sizeof(full), f->path, de.name)) {
             continue;   /* no path to qid it by; skip, cursor still advances */
         }
+        /* A record no reply at this msize could ever carry would stop every
+           fill here, and the client would read the listing as ended. AXL_9P_
+           MIN_MSIZE makes it unreachable for any name AxlFsEntry holds; skip
+           it rather than truncate the directory if that ever changes. */
+        if (AXL_9P_QID_LEN + 8u + 1u + 2u + axl_strlen(de.name)
+                > (size_t)conn->msize - AXL_9P_RDATA_HDR_LEN) {
+            /* log-level: the client's listing cannot say an entry is missing. */
+            axl_warning("9p: skipped an entry no reply at msize %u can carry",
+                        (unsigned)conn->msize);
+            continue;
+        }
         s9p_qid(&de, full, qidbuf);
         if (!s9p_dirent_put(&w, room - (w.len - data_start), qidbuf, rec_off,
                             axl_fs_entry_is_dir(&de) ? P9_DT_DIR : P9_DT_REG,

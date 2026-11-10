@@ -11,16 +11,38 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-fs.h>            /* AxlFsEntry */
 #include <axl/axl-inet-address.h>  /* AxlIPv4Address, needed by axl-tcp.h */
 #include <axl/axl-tcp.h>           /* AxlTcp */
 
 #define AXL_9P_NOFID      0xFFFFFFFFu
 #define AXL_9P_NONUNAME   0xFFFFFFFFu
 #define AXL_9P_MSIZE      8192u
-#define AXL_9P_MIN_MSIZE  512u                    /* no real server negotiates below this */
+/* The smallest msize a session may negotiate: below it a maximal Rreaddir
+   record -- qid, offset, type and a name of AXL_9P_NAME_MAX - 1 bytes, 789
+   bytes with the 11-byte reply header -- would not fit one reply. */
+#define AXL_9P_MIN_MSIZE  1024u
 #define AXL_9P_QID_LEN    13u
 #define AXL_9P_MAX_XFER_BYTES   (256u * 1024u * 1024u)  /* read_file total cap */
-#define AXL_9P_MAX_DIR_ENTRIES  (1u << 20)              /* list entry cap */
+/* Cap on the memory one directory listing may hold, in bytes of AxlFsEntry:
+   a count cap scales with the struct (1M entries of 808 bytes is 808 MB). */
+#define AXL_9P_MAX_DIR_BYTES    (64u * 1024u * 1024u)
+
+/* Capacity of every path buffer the client, the mount and the server carry,
+   NUL included -- the same figure as AXL_FS_PROVIDER_PATH_MAX, so a path the
+   provider thunk hands the mount always fits. ONE constant, so no handler
+   can build a path into a buffer smaller than the one it came from and
+   discover the mismatch as a silent cut. */
+#define AXL_9P_PATH_MAX  1536u
+
+/* Longest name the client, the mount and the server carry in one component,
+   NUL included: whatever AxlFsEntry.name holds, so a name the server can
+   create it can also list, and one the client lists fits the entry. */
+#define AXL_9P_NAME_MAX  sizeof(((AxlFsEntry *)0)->name)
+
+/* A request carrying one name -- Tlcreate, Tmkdir, Trename: the header,
+   fids and counts, and the name. */
+#define AXL_9P_NAME_REQ_MAX  (AXL_9P_NAME_MAX + 64u)
 
 /* Rgetattr's st_mode S_IFDIR bit -- shared by axl-9p-mount.c (dir-vs-file on
    Tlopen) and axl-9p-client.c (reclassifying a dirent whose dtype lied). */
@@ -165,6 +187,35 @@ int  axl_9p_client_split_parent(const char *path, char *parent, size_t cap,
                                 const char **name_out);
 int  axl_9p_client_getattr(struct Axl9pClient *c, uint32_t fid, uint64_t *out_size,
                            uint64_t *out_mtime, uint32_t *out_mode);
+/* The qid.path Rgetattr reports for @p fid: the server's identity of the
+   file, which two spellings of one entry share. */
+int  axl_9p_client_qid_path(struct Axl9pClient *c, uint32_t fid, uint64_t *out_path);
+/* Trename(fid, dfid, name) -> Rrename and nothing more: no fallback. On
+   AXL_ERR, c->last_errno holds the server's errno (0 for a wire failure). */
+int  axl_9p_client_trename(struct Axl9pClient *c, uint32_t fid, uint32_t dfid,
+                           const char *name);
+/* Tsetattr(fid, valid, size, mtime_sec) -> Rsetattr; @p valid is a
+   AXL_9P_SETATTR_* mask, and only the fields it names are meaningful. On
+   AXL_ERR, c->last_errno holds the server's errno. */
+int  axl_9p_client_setattr(struct Axl9pClient *c, uint32_t fid, uint32_t valid,
+                           uint64_t size, uint64_t mtime_sec);
+
+/* Tsetattr `valid` bits (9P2000.L, mirroring Linux ATTR_*). */
+#define AXL_9P_SETATTR_SIZE       0x00000008u
+#define AXL_9P_SETATTR_MTIME      0x00000020u
+#define AXL_9P_SETATTR_MTIME_SET  0x00000100u
+
+/* Linux errnos the client maps onto AxlFsStatus (axl_9p_errno_to_fs). */
+#define AXL_9P_EPERM     1u
+#define AXL_9P_ENOENT    2u
+#define AXL_9P_ENOMEM   12u
+#define AXL_9P_EACCES   13u
+#define AXL_9P_EEXIST   17u
+#define AXL_9P_ENOTDIR  20u
+#define AXL_9P_EISDIR   21u
+#define AXL_9P_EINVAL   22u
+#define AXL_9P_ENOSPC   28u
+#define AXL_9P_EROFS    30u
 
 /* Opaque forward declaration -- keeps this header self-sufficient without
    pulling in <axl/axl-array.h> for TUs that only need the codec/client

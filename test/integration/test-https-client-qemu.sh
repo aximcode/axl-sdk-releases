@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=openssl est=15 local-only=0
+# test-meta: arch=x64 needs=openssl est=15 local-only=0 guest=standard
 # test-https-client-qemu.sh — exercises the HTTP CLIENT over https.
 #
 # This is the one TLS path the serve-tls suite doesn't cover: axl_tls_connect
@@ -30,7 +30,7 @@ fi
 HOST_PORT=$(test_port 0)    # https server
 PLAIN_PORT=$(test_port 1)   # plain-http redirector -> the https server (cross-scheme)
 
-make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 \
     all tools 2>&1 | tail -3
 TOOLS_DIR="$(test_build_dir x64)/tools"
 test_add_efi "$TOOLS_DIR/fetch.efi"
@@ -57,38 +57,17 @@ sleep 1
 echo "  Host HTTPS server PID: $HOST_SERVER_PID, port: $HOST_PORT"
 echo "  Host plain redirector PID: $PLAIN_SERVER_PID, port: $PLAIN_PORT"
 
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo === TEST-HTTPS-GET ===
-fetch.efi https://10.0.2.2:${HOST_PORT}/hello
-
-echo === TEST-HTTPS-REDIRECT ===
-fetch.efi http://10.0.2.2:${PLAIN_PORT}/redirect
-
-echo === TEST-END ===
-reset -s
-NSHEOF
+# The startup commands live in test-https-client-qemu.nsh; the https port is
+# %1, the plain redirector's %2.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$HOST_PORT" "$PLAIN_PORT"
 
 test_build_image
 
 echo "=== https client Integration Test ($TEST_ARCH) ==="
 
 test_build_qemu_cmd
-TEST_QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev "user,id=net0"
-)
+test_add_network
 test_run_foreground 60
 
 test_clean_log
@@ -114,6 +93,22 @@ if [[ "$n_hello" -ge 2 ]]; then
     PASS=$((PASS + 1))
 else
     echo "  FAIL: http->https redirect did not complete ($n_hello/2 'hello from host' bodies)"
+    FAIL=$((FAIL + 1))
+fi
+
+# A body framed by the close ends in order over TLS only at close_notify:
+# with it, the body arrives whole; with a bare TCP close instead (a cut,
+# RFC 8446 6.1), the request fails and no part of the body is shown.
+sec() { awk -v a="=== $1 ===" -v b="=== $2 ===" '$0 ~ a {on=1; next} $0 ~ b {on=0} on' "$TEST_CLEAN_LOG"; }
+notify=$(sec TEST-TLS-CLOSE-NOTIFY TEST-TLS-CLOSE-CUT)
+cut=$(sec TEST-TLS-CLOSE-CUT TEST-END)
+if grep -qx "notify-body-intact" <<< "$notify" \
+   && grep -qx "Fetch: request failed" <<< "$cut" \
+   && ! grep -q "cut-body-no-notify" <<< "$cut"; then
+    echo "  PASS: TLS close-framed body: whole at close_notify; a close without it fails the request"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: TLS close-framed body (close_notify section: '$notify'; bare close section: '$cut')"
     FAIL=$((FAIL + 1))
 fi
 

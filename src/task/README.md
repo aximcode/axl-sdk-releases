@@ -54,6 +54,17 @@ boot outright (the firmware's own AP-relocation handler waits for an
 acknowledgement that never comes). After it fires the pool keeps
 working, synchronously.
 
+**A slow AP is still a worker.** `axl_task_pool_new()` counts only APs
+that answer a liveness probe, and waits up to 10 seconds of wall time
+for the answer. That bound is sized for virtual machines: a vCPU whose
+host thread is descheduled makes no progress until the host runs it
+again, so on a loaded host a healthy AP can take hundreds of
+milliseconds to answer. An AP that does not answer costs every creation
+those 10 seconds, with a warning, and is left out of
+`axl_task_pool_worker_count()`. `axl_task_pool_free()` waits on the same
+bound for each worker to finish its current task and acknowledge, and up
+to as long again for the firmware to retire it.
+
 **A worker slot is not the worker's memory.** The two are easy to
 conflate, and they have opposite lifetimes:
 

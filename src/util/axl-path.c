@@ -16,16 +16,82 @@
 #include "axl-image-internal.h"   /* _axl_app_image_anchor */
 AXL_LOG_DOMAIN("path");
 
-#define MAX_COMPONENTS  64
+/* Components axl_path_resolve keeps at once; more is AXL_ERR, never cut. */
+#define MAX_COMPONENTS  256
+
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+/* axl_path_resolve's right-to-left walk: ".." still to cancel, and the
+   components kept so far. With @c out set it also writes them, each
+   ending at @c wpos. */
+typedef struct {
+    size_t  skip;    /* ".." not yet matched by a component to their left */
+    size_t  depth;   /* components kept */
+    size_t  bytes;   /* their bytes, separators not counted */
+    char   *out;     /* NULL: measure only */
+    size_t  wpos;    /* write end, when writing */
+} PathWalk;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+static void path_walk(PathWalk *w, const char *src);
+
 static int
 is_sep(char c)
 {
     return c == '/' || c == '\\';
+}
+
+/* Walk @p src's components RIGHT TO LEFT into @p w: "." is dropped, ".."
+   cancels the next component to its left, any other component is kept --
+   counted and, when @p w->out is set, written ending at @p w->wpos with a
+   '/' before it unless it is the leftmost kept one (@p w->depth counts
+   down to it). Right to left, a ".." is resolved by what lies to its LEFT,
+   exactly as the left-to-right stack resolved it, without holding any
+   component: no stack array, no allocation. */
+static void
+path_walk(PathWalk *w, const char *src)
+{
+    size_t end = axl_strlen(src);
+    while (end > 0) {
+        if (is_sep(src[end - 1])) {
+            end--;
+            continue;
+        }
+        size_t start = end;
+        while (start > 0 && !is_sep(src[start - 1])) {
+            start--;
+        }
+        const char *comp = src + start;
+        size_t      clen = end - start;
+        end = start;
+
+        if (clen == 1 && comp[0] == '.') {
+            continue;
+        }
+        if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
+            w->skip++;
+            continue;
+        }
+        if (w->skip > 0) {
+            w->skip--;
+            continue;
+        }
+        if (w->out == NULL) {
+            w->depth++;
+            w->bytes += clen;
+        } else {
+            w->wpos -= clen;
+            axl_memcpy(w->out + w->wpos, comp, clen);
+            if (--w->depth > 0) {
+                w->out[--w->wpos] = '/';
+            }
+        }
+    }
 }
 
 /**
@@ -87,16 +153,12 @@ axl_path_get_dirname(const char *path)
     }
 
     len = (size_t)(last_sep - path);
-    if (len == 0) {
-        /* Path starts with separator, e.g. "/foo" -> "/" */
-        result = axl_malloc(2);
-        if (result == NULL) {
-            axl_debug("path allocation failed");
-            return NULL;
-        }
-        result[0] = path[0];
-        result[1] = '\0';
-        return result;
+    /* The separator IS the directory when nothing but a filesystem root
+       precedes it: "/foo" -> "/", and "fs0:\foo" -> "fs0:\". A bare "fs0:"
+       names the volume, not a directory UEFI can open, and a caller that
+       concatenates rather than joins would build "fs0:name". */
+    if (len == 0 || path[len - 1] == ':') {
+        len++;
     }
 
     result = axl_malloc(len + 1);
@@ -313,133 +375,53 @@ axl_path_resolve(
     char       *out,
     size_t      size)
 {
-    /* Component stack — pointers into the work buffer */
-    const char *stack[MAX_COMPONENTS];
-    size_t      stack_len[MAX_COMPONENTS];
-    int         depth = 0;
-    const char *src;
-    char        work[512];
-    size_t      wpos = 0;
-
     if (base == NULL || relative == NULL || out == NULL || size == 0) {
         return AXL_ERR;
     }
+    /* Two passes right to left over relative, then (unless relative is
+       absolute) base: one measures, one writes into @p out sized exactly.
+       Components come straight from the inputs, so a long path resolves
+       whole or fails -- never cut -- and nothing is allocated: this runs
+       inside firmware callbacks (a provider's Open and SetInfo), where
+       neither a large stack frame nor an out-of-memory failure is welcome. */
+    bool absolute = is_sep(relative[0]);
+    bool has_root = absolute || is_sep(base[0]);
 
-    /*
-     * Build a combined path in work[]. If relative is absolute,
-     * use it alone; otherwise prepend base + "/".
-     */
-    if (is_sep(relative[0])) {
-        /* Absolute relative — use directly */
-        for (size_t i = 0; relative[i] != '\0' && wpos < sizeof(work) - 1; i++) {
-            work[wpos++] = relative[i];
-        }
-    } else {
-        /* Prepend base */
-        for (size_t i = 0; base[i] != '\0' && wpos < sizeof(work) - 1; i++) {
-            work[wpos++] = base[i];
-        }
-        if (wpos > 0 && !is_sep(work[wpos - 1]) && wpos < sizeof(work) - 1) {
-            work[wpos++] = '/';
-        }
-        for (size_t i = 0; relative[i] != '\0' && wpos < sizeof(work) - 1; i++) {
-            work[wpos++] = relative[i];
-        }
+    PathWalk w = { 0 };
+    path_walk(&w, relative);
+    if (!absolute) {
+        path_walk(&w, base);
     }
-    work[wpos] = '\0';
-
-    /*
-     * Parse components: split on '/' and '\', resolve "." and "..".
-     */
-    src = work;
-
-    /* Skip leading separator (remember we have an absolute path) */
-    bool has_root = false;
-    if (is_sep(*src)) {
-        has_root = true;
-        src++;
+    if (w.skip > 0 && has_root) {
+        return AXL_ERR;   /* ".." above the root */
     }
-
-    while (*src != '\0') {
-        /* Skip consecutive separators */
-        if (is_sep(*src)) {
-            src++;
-            continue;
-        }
-
-        /* Find end of component */
-        const char *comp = src;
-        while (*src != '\0' && !is_sep(*src)) {
-            src++;
-        }
-        size_t clen = (size_t)(src - comp);
-        if (*src != '\0') {
-            src++;  /* skip separator */
-        }
-
-        if (clen == 1 && comp[0] == '.') {
-            continue;  /* skip "." */
-        }
-
-        if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
-            if (depth > 0) {
-                depth--;
-            } else if (has_root) {
-                return AXL_ERR;  /* underflow past root */
-            }
-            continue;
-        }
-
-        if (depth >= MAX_COMPONENTS) {
-            return AXL_ERR;  /* too many components */
-        }
-        stack[depth] = comp;
-        stack_len[depth] = clen;
-        depth++;
+    if (w.depth > MAX_COMPONENTS) {
+        return AXL_ERR;
     }
-
-    /*
-     * Reconstruct the normalized path into out[].
-     */
-    size_t opos = 0;
-
-    if (has_root) {
-        if (opos >= size) {
-            return AXL_ERR;
-        }
-        out[opos++] = '/';
-    }
-
-    for (int i = 0; i < depth; i++) {
-        if (i > 0) {
-            if (opos >= size) {
-                return AXL_ERR;
-            }
-            out[opos++] = '/';
-        }
-        if (opos + stack_len[i] >= size) {
-            return AXL_ERR;
-        }
-        for (size_t j = 0; j < stack_len[i]; j++) {
-            char ch = stack[i][j];
-            out[opos++] = is_sep(ch) ? '/' : ch;
-        }
-    }
-
-    /* Empty result (no root, all ".." consumed) */
-    if (opos == 0) {
+    if (w.depth == 0) {
+        /* The root itself, or (no root, everything cancelled) ".". */
         if (size < 2) {
             return AXL_ERR;
         }
-        out[0] = '.';
+        out[0] = has_root ? '/' : '.';
         out[1] = '\0';
         return AXL_OK;
     }
-
-    if (opos >= size) {
-        return AXL_ERR;
+    size_t len = (has_root ? 1u : 0u) + w.bytes + (w.depth - 1u);
+    if (len + 1u > size) {
+        return AXL_ERR;   /* does not fit whole */
     }
-    out[opos] = '\0';
+    w.skip = 0;
+    w.out  = out;
+    w.wpos = len;
+    path_walk(&w, relative);
+    if (!absolute) {
+        path_walk(&w, base);
+    }
+    if (has_root) {
+        out[0] = '/';
+    }
+    out[len] = '\0';
     return AXL_OK;
 }
 

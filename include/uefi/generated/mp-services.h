@@ -104,7 +104,7 @@ EFI_STATUS
   IN EFI_MP_SERVICES_PROTOCOL  *This,
   IN UINTN                     ProcessorNumber,
   IN BOOLEAN                   EnableAP,
-  IN UINT32                    HealthFlag     OPTIONAL
+  IN UINT32                    *HealthFlag     OPTIONAL
   );
 
 typedef

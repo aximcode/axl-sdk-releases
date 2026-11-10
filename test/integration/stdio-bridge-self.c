@@ -8,7 +8,7 @@
  * fast-path: axl_shared_driver_guid + axl_protocol_find_guid) instead of
  * through axl_shared_driver_locate. Because locate never runs, the stdio
  * bridge is NOT auto-installed — so this launcher calls the public escape
- * hatch axl_shared_driver_install_stdio_bridge() before dispatch. Without
+ * hatch axl_shared_driver_install_stdio_bridge(vt) before dispatch. Without
  * that call the resident driver's axl_stdin would be EOF.
  *
  * Relies on the sibling locate launcher (stdio-bridge-fix.efi) having run
@@ -38,7 +38,7 @@ main(int argc, char **argv)
     /* We self-located, so locate's auto-install never ran. Install the
        bridge explicitly so the resident driver's axl_stdin reflects THIS
        launcher's piped / redirected StdIn. */
-    if (axl_shared_driver_install_stdio_bridge() != AXL_OK) {
+    if (axl_shared_driver_install_stdio_bridge(vt) != AXL_OK) {
         axl_printf("stdio-bridge-self: bridge install failed\n");
         return 1;
     }

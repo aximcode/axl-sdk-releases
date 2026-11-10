@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=9 local-only=0
+# test-meta: arch=x64 needs= est=9 local-only=0 guest=standard
 # test-clip-paste.sh — cross-app clipboard proof. `clip` and `paste` are
 # separate image invocations within one boot; the clipboard is AXL shared
 # memory (axl-shm) in EfiBootServicesData pool + an installed protocol, so
@@ -22,41 +22,13 @@ source "$SCRIPT_DIR/common-test.sh"
 TEST_ARCH="X64"
 test_setup
 
-make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -1
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/tools/clip.efi"
 test_add_efi "$NATIVE_DIR/tools/paste.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo ""
-    # 1. Copy text in ONE app, paste it in ANOTHER. clip prints nothing,
-    #    so 'axl-cross-app-clip' in the log can only have come from paste
-    #    reading what the separate clip invocation stored.
-    echo "echo PROBE-1-START"
-    echo "echo axl-cross-app-clip | clip.efi"
-    echo "paste.efi"
-    echo "echo PROBE-1-END"
-    echo ""
-    # 2. A MIME tag set by clip is reported by a later paste --mime.
-    echo "echo PROBE-2-START"
-    echo "echo tagged | clip.efi -m application/x-axl-test"
-    echo "paste.efi --mime"
-    echo "echo PROBE-2-END"
-    echo ""
-    # 3. clip --clear empties it across apps: the following paste prints
-    #    nothing between the markers.
-    echo "echo PROBE-3-START"
-    echo "clip.efi --clear"
-    echo "paste.efi"
-    echo "echo PROBE-3-END"
-    echo ""
-    echo "echo === DONE ==="
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

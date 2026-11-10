@@ -15,6 +15,7 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>   /* axl_utf8_to_ucs2 */
 #include "axl-file-gen.h"
+#include "axl-fs-internal.h"
 
 struct AxlFileWriter {
     AxlFileHandle handle;
@@ -45,8 +46,14 @@ axl_file_writer_open(
         }
     }
 
-    unsigned short *wide = axl_utf8_to_ucs2(path);
+    /* Every allocation BEFORE the open: from the open on the file has
+       changed (created, or truncated below), so nothing after it may fail
+       for want of memory -- a writer allocated last emptied the file on OOM
+       and returned only NULL. */
+    AxlFileWriter  *w    = axl_calloc(1, sizeof(*w));
+    unsigned short *wide = (w != NULL) ? axl_utf8_to_ucs2(path) : NULL;
     if (wide == NULL) {
+        axl_free(w);
         return NULL;
     }
 
@@ -57,6 +64,7 @@ axl_file_writer_open(
         0, &handle);
     axl_free(wide);
     if (rc != AXL_OK) {
+        axl_free(w);
         return NULL;
     }
 
@@ -77,6 +85,7 @@ axl_file_writer_open(
         if (sz > 0) {
             if (axl_backend_file_set_position(handle, (uint64_t)sz) != AXL_OK) {
                 axl_backend_file_close(&handle);
+                axl_free(w);
                 return NULL;
             }
             start = (uint64_t)sz;
@@ -86,16 +95,12 @@ axl_file_writer_open(
            new payload leaves no stale tail. */
         if (axl_backend_file_set_size(handle, 0) != AXL_OK) {
             axl_backend_file_close(&handle);
+            axl_free(w);
             return NULL;
         }
         axl_backend_file_set_position(handle, 0);
     }
 
-    AxlFileWriter *w = axl_calloc(1, sizeof(*w));
-    if (w == NULL) {
-        axl_backend_file_close(&handle);
-        return NULL;
-    }
     w->handle  = handle;
     w->written = start;
     w->failed  = false;
@@ -157,4 +162,45 @@ axl_file_writer_close(
     int  rc     = axl_backend_file_close(&w->handle);
     axl_free(w);
     return (failed || frc != AXL_OK || rc != AXL_OK) ? AXL_ERR : AXL_OK;
+}
+
+int
+axl_file_writer_flush(
+    AxlFileWriter *w
+    )
+{
+    if (w == NULL || w->failed) {
+        return AXL_ERR;
+    }
+    return (axl_backend_file_flush(w->handle) == AXL_OK) ? AXL_OK : AXL_ERR;
+}
+
+int
+axl_file_writer_discard(
+    AxlFileWriter *w
+    )
+{
+    if (w == NULL) {
+        return AXL_OK;
+    }
+    int rc = axl_backend_file_handle_delete(&w->handle);
+    axl_file_gen_bump_key(w->gen_key);
+    axl_free(w);
+    return (rc == AXL_OK) ? AXL_OK : AXL_ERR;
+}
+
+AxlFsNameRead
+axl_file_writer_name(
+    const AxlFileWriter *w,
+    char                *out,
+    size_t               cap
+    )
+{
+    if (w == NULL || out == NULL || cap == 0) {
+        if (out != NULL && cap > 0) {
+            out[0] = '\0';
+        }
+        return AXL_FS_NAME_FAILED;
+    }
+    return axl_fs_handle_name(w->handle, out, cap);
 }

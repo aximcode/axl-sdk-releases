@@ -35,7 +35,8 @@ CRT0="$B/axl-crt0-gcc-x86_64.o"
 # The probe links against a cross-built libaxl.a, so it must be compiled by the
 # SAME compiler -- host gcc would resolve <string.h> to /usr/include and mix a
 # host object into a bare-metal link. Read the path from the one manifest that
-# holds it (scripts/axl-toolchains.conf), exactly as the Makefile and axl-cc do.
+# holds it (scripts/axl-toolchains.conf), exactly as the CMake build and axl-cc
+# do.
 # shellcheck source=/dev/null
 source "$PROJECT_DIR/scripts/axl-toolchains.conf"
 AXL_CC_BIN="${AXL_X64_GCC:-$AXL_X64_GCC_DEFAULT}"
@@ -44,7 +45,7 @@ if [[ ! -x "$AXL_CC_BIN" ]] && ! command -v "$AXL_CC_BIN" &>/dev/null; then
     exit 0
 fi
 
-make ARCH="$ARCH" 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$ARCH" 2>&1 | tail -1
 
 CFLAGS=(-std=gnu2x -ffreestanding -fshort-wchar -fno-stack-protector
         -fno-builtin -fpic -mno-red-zone -march=x86-64

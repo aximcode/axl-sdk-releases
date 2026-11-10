@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file cb-noexcept-fixture.cpp
-    Fixture for `make check-cb-noexcept`.
+    Fixture for `gate.check-cb-noexcept`.
 
     AXL invokes consumer callbacks from its own C frames. Those frames
     are compiled -fno-exceptions and carry no landing pads, so an

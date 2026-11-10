@@ -139,4 +139,12 @@ axl_file_gen_bump(
     const char *path   ///< file path (UTF-8)
 );
 
+/**
+ * @brief Record that EVERY file may have changed -- a directory moved, so
+ *     every path below it now names something else. Over-invalidates by
+ *     design: a false positive costs a re-stat, a false negative a stale read.
+ */
+void
+axl_file_gen_bump_all(void);
+
 #endif /* AXL_FILE_GEN_H */

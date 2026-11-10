@@ -19,7 +19,28 @@
  *   "keep.alive"      — connection reuse: "true" (default) or "false"
  *   "max.redirects"   — redirect limit (default: "5"), "0" to disable
  *   "tls.verify"      — certificate verification: "true" (default) or "false"
+ *   "tls.close_notify" — how a TLS body framed by the close must end:
+ *                       "required" (default) or "lenient" (see below)
  *   "header.<Name>"   — default header sent with every request
+ *
+ * A request is sent WHOLE: the URL's path and query, and every header, at
+ * whatever length -- nothing in a request line or header block is cut to
+ * fit a buffer (a cut path would name a different resource). A request
+ * whose header block cannot be allocated fails with AXL_NO_RESOURCES
+ * (AXL_ERR from axl_http_request_streaming).
+ *
+ * A response body is never returned cut. One framed by the connection's
+ * close (RFC 9112 §6.3) ends only at an ORDERLY close -- the peer's FIN,
+ * or over TLS its close_notify; a reset or any other transport error
+ * part-way, or a TLS stream that ends without close_notify, fails the
+ * request with AXL_INCOMPLETE, from axl_http_request_streaming too, and
+ * the error log names which. The idle deadline ("timeout.ms") passing
+ * part-way is AXL_TIMEOUT. A server known to end TLS without close_notify
+ * can be accepted with "tls.close_notify" = "lenient": a TCP FIN then ends
+ * the body, with a WARNING naming the server; a reset is still
+ * AXL_INCOMPLETE. Content-Length and chunked bodies end by their own
+ * framing and are unaffected in either mode. Interim 1xx responses are
+ * read past to the final one (at most 16); a 101 fails the request.
  */
 
 #ifndef AXL_HTTP_CLIENT_H
@@ -303,7 +324,10 @@ typedef int (*AxlRequestBodyStreamer)(
  * Callers who need either behavior must re-invoke this function
  * with a fresh streamer state.
  *
- * @return AXL_OK on success, AXL_ERR on failure (connection
+ * @return AXL_OK on success; AXL_TIMEOUT when the idle deadline
+ *     ("timeout.ms") passes while the response is awaited or mid-body;
+ *     AXL_INCOMPLETE for a body framed by the close that was cut (see
+ *     the file comment); AXL_ERR for any other failure (connection
  *     reset, streamer returned AXL_ERR, Content-Length mismatch,
  *     etc.).
  */

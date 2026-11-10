@@ -161,7 +161,7 @@ It snapshots, applies, runs, restores, and **`touch`es on restore**
 after verifying the file is byte-identical again.
 
 - Restoring with `sed -i.bak` + `mv` gives the source the BACKUP's
-  older mtime; `make` then skips the rebuild and the run reports
+  older mtime; Ninja then skips the rebuild and the run reports
   failures belonging to the PREVIOUS sabotage.
 - A sed that matches nothing leaves the file untouched and the suite
   green — which reads as "no test covers this" when the truth is "no
@@ -176,29 +176,124 @@ after verifying the file is byte-identical again.
 one table; prefer it over hand-running these individually.
 
 **MATCH THE GATE TO THE CHANGE — the full set is not the default.**
-`verify.sh` has exactly three jobs (`lint`, `make`, `docs`) and takes
-`--only=<csv>` / `--no-docs`. A filtered run PRINTS WHAT IT DID NOT RUN,
-so it cannot be mistaken for a full one.
+**Ask `scripts/which-gates.sh` and run what it names.** It prints the exact
+`--only=` list, derives the covering tests, and greps for consumers of
+strings your diff removed; the table below is what it encodes, kept here to
+be argued with, not to be typed from memory.
+
+`verify.sh` has SEVEN jobs (`x64 aa64 lint gates imggates qloop docs`; the two
+gate jobs were `make` and `makeimg` until 5.0.0, and those names are refused
+with the new one) and takes
+`--only=<csv>`, `--no-docs`, `--apps=<csv>` (one unit binary) and
+`--print-ctest` (the ctest calls it would make; runs nothing). It is a CTest
+front end: ONE ctest call per tree -- x64 (units, lint, gates, imggates, docs)
+and aa64 (units) concurrently -- then `qloop` alone. With the pool service
+answering (`AXL_VERIFY_POOL`, default auto) every unit binary runs on its own
+leased `unit` guest and qloop on one more, so a full verify boots NOTHING;
+without it a full unit job is `unit.one-boot` (every binary in one guest, its
+ratchet and budget). `--apps` runs the named binaries one test each.
+**219s full** (2026-11-07, pooled: x64 188s and aa64 198s side by side beside
+lint/gates/docs, then `qloop` 19s -- 38-48s booted) -- AxlTestLoop alone on
+x64, the quiet slot that judges the driver idle-budget timing the concurrent
+jobs SKIP (`docs/AXL-Build-System-Design.md` §10.14); it asks the pool to settle first, and its row says where it ran
+(on a leased guest / booted (no pool) / booted after a pool miss). Three results read
+`UNJUDGED`, never green (exit 3): every attempt void; a bound missed in the
+only judged attempt (the row names every such bound); and a FAIL made only
+of named timing misses while QEMU waited over `AXL_STARVE_MAX_MS` (50 ms,
+`scripts/axl-common.sh`) for a CPU -- load, not a verdict. Any other FAIL (a
+functional check such as an attach, a leak, a stall) stays FAIL. Every qloop
+row carries that wait figure; read it before believing a timing FAIL.
+**`test-net-latency-qemu.sh` follows the same rule** with the same witness,
+read over each guest's round-trip window: a run whose failures are ALL timing
+bounds (p90, first exchange) each missed while its own window waited over the
+limit exits 77 with an `UNJUDGED:` line; a missing reply, a wrong tick, or a
+miss in a window that did not wait (or was not measured) stays FAIL, and
+every measurement line carries its window's `cpu_wait_ms=` (or
+`cpu_wait=unmeasured`). `lib/run-one.sh` RETRIES an UNJUDGED test (the
+retry's verdict stands) and reads UNJUDGED only when no attempt judged;
+`run-integration.sh` names and counts it apart and exits 3; ctest sees the 77
+skip. `release-suite.sh` (CI's dispatched suite too) then re-runs it ALONE and
+certifies only a judged PASS -- still UNJUDGED alone is exit 3 and no stamp,
+because that run IS the release certificate (`docs/RELEASING.md`).
+A sustained slowdown that
+does not preempt (an E-core, a frequency drop) is seen by nothing and can
+still FAIL a timing bound -- `scripts/qloop-verdict.sh`'s header (the one
+copy of the verdict; `gate.qloop` runs it too) says what covers what. A
+filtered run PRINTS WHAT IT DID NOT RUN — and a scoped one prints what it no
+longer PROVES — so neither can be mistaken for a full run.
+
+**The long pole is the aa64 one-boot guest (~120s, TCG).** The x64 tree's
+gates finish under it; cut the guest before optimising the gates.
 
 | what changed | the gate |
 |---|---|
-| prose / design docs only | `verify.sh --only=docs` (~1m54s vs ~10m) |
+| one unit binary's C code | `verify.sh --only=x64,aa64 --apps=AxlTestFoo` — **~20s against 173s**. It does NOT check the ratchet, the wall-clock budget, or most of the cross-arch equality, and says so in its own output |
+| one or a few source files, for lint only | `verify.sh --only=lint` (or `scripts/lint.sh`). INCREMENTAL: the x64-lint CMake preset re-checks exactly the TUs a change reaches, headers included -- ~2s for one file, ~60s from a cold `build/x64-lint`. There is no file-scoped form any more; it proved less than this does |
+| a tool or harness script | `run-integration.sh --for=<the paths>` — it asks `which-gates.sh --porcelain` which tests name them, prints the list, and REFUSES rather than widening when nothing covers them |
+| a doc Sphinx BUILDS — the root `README.md`, `src/*/README.md`, or one of the twelve `docs/*.md` its guides include (`AXL-Design.md`, `AXL-SDK-Design.md`, `AXL-Coding-Style.md`, `ROADMAP.md`, `RELEASING.md`, …) | `verify.sh --only=docs` — it is a ZERO-WARNING gate |
+| prose no `.rst` includes (a handoff, `deps/*/README.md`) | **nothing** — ask `which-gates.sh`, which greps `docs/sphinx/` rather than guessing from the path. Read it yourself; that is the review prose gets |
+| `docs/sphinx/**`, the root `README.md`, `src/*/README.md` | `verify.sh --only=docs` |
+| C/C++, internal headers, `include/uefi/*`, `tools/`, `test/unit/`, `sdk/examples/` | `verify.sh --only=x64,aa64,lint,gates,imggates` — Doxygen reads only `include/axl/*.h`, so docs cannot see it |
+| a PUBLIC header (`include/axl/*.h`, `*.hpp`) | `verify.sh` — every job; Doxygen renders it |
 | shell tooling (`axl`, `axl-cc`, `install.sh`) | the covering integration test(s) DIRECTLY — not the suite |
-| C/C++/headers | `verify.sh` + the covering test |
-| before a push | `run-integration.sh` — cache ON (default), DEFAULT worker count |
-| cutting a release | add `--no-cache`; still the default worker count |
+| before a push | the covering tests, plus `run-integration.sh` ONLY when the change is one the next row names |
+| a change that reaches everything: the build system, the harness, a widely-included header, or any string/symbol `which-gates` finds a consumer for | `run-integration.sh` — cache ON (default), DEFAULT worker count |
+| cutting a release | `scripts/release-suite.sh` (its suite step is `ctest --preset x64-integration` with the cache off, on a CPU budget of `-j nproc+4` slots that each test draws its test-meta `cpu=` from (CTest `PROCESSORS`), no `--test-load`, ordered by measured times kept across CI checkouts (`docs/AXL-CI-Release-Speed-Design.md` §15) -- CI's is `check-test-est.py && ctest --preset x64-ci` -- plus the unit tests, SDK stage and self-tests CI runs) -- or dispatch CI |
+
+**Why the pre-push suite is now conditional, and what makes that safe.** A
+push to `main` runs only CI's CHEAP jobs -- `gcc x64`, `gcc aa64` (a clean
+checkout) and `clang-tidy`; the whole suite runs UNCACHED in CI only on
+`workflow_dispatch` (`gh workflow run ci.yml --ref main`, or
+`cut-release.sh --ci-gate`) -- owner decision 2026-10-21,
+`docs/AXL-CI-Release-Speed-Design.md` §14. So nothing re-checks a scoped push
+with the suite: an integration-only regression can sit on `main` until the
+next dispatch or release. Scope honestly, and dispatch after a risky landing.
+A release is certified by a green dispatched suite run, or by a complete local
+`scripts/release-suite.sh` run (the SAME steps as CI's integration job; the
+only writer of the release stamp) PLUS the cheap push CI green on that commit
+-- and `cut-release.sh` REFUSES otherwise unless given `--ci-gate` (dispatch
+and wait) or `--tag-untested` (recorded in the release notes).
+What used to make scoping unsafe was that the
+local run could not be trusted to see the change at all: the cache decision
+ran BEFORE a test built its own fixture, and no cache key contained
+`libaxl.a`, so an `src/net/axl-ssh-*.c` edit left five ssh tests reporting
+`CACHED 0s` with the change never exercised (81 targets across 79 of 203
+tests were exposed). Since each test declares `builds=` in its `test-meta`
+header and the runner pre-builds that union before deciding, a cached
+"green" means the tests actually ran against your code. Scope on that basis,
+not on a feeling that the change is small.
 
 **NEVER run `build-docs.sh` after `verify.sh`.** It runs INSIDE
-`verify.sh` (`scripts/verify.sh:121`), so calling it separately pays for
-Sphinx TWICE. Its own header says so at `:29`.
+`verify.sh` (`scripts/verify.sh:288`, the `docs` job), so calling it
+separately pays for Sphinx TWICE. `verify.sh`'s own header says so, at the
+`--only` rationale near the top.
 
 **Run ONE test by executing it directly** — `./test/integration/test-foo.sh`.
 `run-integration.sh` takes **`--only=a.sh,b.sh`** — an EXPLICIT list, named by
 you; it refuses a name discovery did not find rather than running nothing, and
-a filtered run is announced PARTIAL and cannot write the release stamp. It
+a filtered run is announced PARTIAL. (No run-integration.sh run writes the
+release stamp any more -- only `scripts/release-suite.sh` does.) It
 chooses nothing itself, deliberately (§12.5). Its other filters are `--ci`
 (drops `local-only=1`, cache OFF), `--only-local` (the inverse),
-`--shard i/K` and `--no-build`. The suite is 201 tests; the ten dearest
+`--shard i/K` and `--no-build`. **It POOLS BY DEFAULT** (2026-11-06): a
+`guest=` test runs on a leased, already-booted guest whenever the user's
+`axlpool` service serves the arch, and the run says so; `--no-pool` boots,
+`--pool` refuses to run without the pool. EVERY CTest preset defaults the same
+way (`AXL_IT_POOL_DEFAULT=auto`, so a caller's own `AXL_IT_POOL` still wins --
+`AXL_IT_POOL=0` boots) -- `x64-ci` and `x64-integration` too since 2026-11-07
+(Mike: the self-hosted runners on this host use the pool), and they lease
+with the TREE's own agent build (`AXL_IT_POOL_AGENT=tree`) so CI exercises
+the commit's agent; a runner with no service boots and says so
+(`docs/AXL-Test-Guest-Pool-Design.md` §6.7).
+**It is a front end over CTest** (since
+2026-11-06, design §10.8 step 6): it chooses and refuses, then makes ONE
+`ctest` call on `build/<arch>-debug` and renders that run's JUnit file
+(`scripts/ctest-report.py`). `--print-ctest` shows the exact argv and
+environment without running anything. With no `-j` its CPU budget is nproc+4
+slots, each test holding its `cpu=` (default 1) of them, with no load gate;
+`-jN` is a budget of exactly N. One run per tree: a second is
+refused by name. The suite is 204 tests (`--list | grep -c`,
+2026-09-26); the ten dearest
 declare ~1,260s between them, led by `test-cpu-spike-qemu.sh` (233s),
 `test-host-toolchain-qemu.sh` (180s) and `test-consumer-install.sh`
 (150s). Running all of it to check a message string is how a 30-second
@@ -212,37 +307,45 @@ is an interface — a message string can be exact-matched by a test in
 another file (`test-install-lifecycle.sh:546` broke exactly that way).
 `grep -rn` the string before deciding.
 
-Adding a gate is ONE edit: append it to `LINT_GATES` in the Makefile.
-`verify.sh` reads that list back via `make -s print-lint-gates` rather
-than keeping a second copy, and `NONCLEAN_GOALS` is built from it. The
-two lists used to be maintained by hand and drifted, which is not a
-cosmetic bug: an unexcluded gate WIPES `$(BUILDDIR)/*.o` and `libaxl.a`,
-and `verify.sh` runs the make job concurrently with both arch builds, so
-it deletes them mid-build. `check-tautology` did exactly that.
+Adding a gate is ONE edit: an `_axl_gate(check-<name> lint|artifact ...)`
+line in `cmake/AxlIntegrationTests.cmake.in` (§10.11 of
+`docs/AXL-Build-System-Design.md`). Every gate is a CTest test,
+`gate.check-<name>`, run straight against a CMake tree, and that
+registration IS the list: verify.sh's `gates` job selects the non-artifact
+ones, `imggates` the `artifact`-labelled ones (they read the tree's images
+and archives, and require the prep that built them), and CI's lint job runs
+`ctest -L check` on both trees. A gate that reads an arch's own compiler or
+images registers in each arch's tree. Run one alone:
+`ctest --test-dir build/x64-debug -R '^gate.check-<name>$'` (add `-N -V` to
+print the command it runs -- the script names do not all follow the gate's).
+The Makefile's `make check-<name>` goals went with it in 5.0.0, and so did
+its two gates of itself (check-dep-tracking: Ninja tracks every header;
+check-build-mode).
 
 | Gate | Catches |
 |------|---------|
-| `make check-ascii` | non-ASCII in an emittable string (draws as a console block) |
-| `make check-docs` | a public header with no `doxygenfile` directive |
-| `make check-dogfood` | a NEW raw UEFI protocol call bypassing the backend |
-| `make check-test-meta` | an integration test with no `# test-meta:` header |
-| `make check-nul` | a literal NUL byte in a tracked text file |
-| `make check-test-registered` | a `test_*` defined in `test/unit/` that nothing calls |
-| `make check-cxx-entry` | a mangled C++ firmware entry point |
-| `make check-examples` | an `sdk/examples/` source that no longer compiles — they ship in the distro packages, and 20 of 51 were reachable by no build rule at all |
-| `make check-json-dialect` | JSON parsed with a non-strict dialect in `src/`/`tools/` without a `/* json-dialect: local-file */` justification (design decision 40) |
-| `make check-uefi-scope` | UEFI reaching somewhere that promised not to have it: a type or `<uefi/…>` include in the PUBLIC API (held at zero, no allowlist), or shipped `tools/`/`sdk/examples/` code using UEFI without declaring why. Pairs with the `AXL_ALLOW_UEFI` guard in the uefi headers, which stops an application acquiring EDK2 by typing an `#include`; the gate catches what the guard cannot (a direct leaf-header include) |
-| `make check-nx-compat` | a produced image missing NX_COMPAT |
-| `make check-no-avx` | an UNGATED AVX instruction in a produced image (UEFI boots `CR4.OSXSAVE` clear, so it is `#UD`). Dispatched kernels are allowlisted per SYMBOL with a recorded justification -- not per object, so a second function acquiring VEX by accident still fails |
-| `make check-bss-clear` | a crt0 that stopped zeroing .bss |
-| `make check-flag-parity` | the three build paths (Makefile, `axl-cc`, the CMake package `install.sh` generates) disagreeing on an ABI/safety flag or an `objcopy -j` section. Both drifted in one afternoon: the stack protector reached 2 of 3, and a renamed relocation section reached 2 of 3 `-j` lists |
-| `make check-libc-overlap` | a name BOTH `libaxl.a` and newlib define where AXL's is STRONG. Two strong providers inside `axl-cc`'s `--start-group` resolve by whichever reference happens to be outstanding when each archive is scanned — adding one object once turned an uncaught `throw 42;` into five `multiple definition` errors. The line falls where the RUNTIME DEPENDENCY falls: leaf functions (`memcpy`, `strlen`) are weak so newlib's better version wins; hooks that need AXL's own init/teardown (`__cxa_atexit`, `__stack_chk_fail`, `__stack_chk_guard`) stay strong because newlib's are inert under UEFI. Checks BOTH directions |
-| `make check-build-mode` | `BUILD=release` (lowercase) meaning DEBUG. `CFLAGS_BUILD` compares against `RELEASE` while `PREFIX` lowercases, so it built debug objects into the directory named `release` — ALIASING the real release tree and wiping it on the next correct build |
-| `make check-dep-tracking` | a C/C++ object compiled WITHOUT `-MD -MP`, so it has no header dependency and a header edit rebuilds nothing. `CXXFLAGS` lacked them for the whole life of the C++ layer, which made a sabotage of `axl-istream.hpp` read as UNDETECTED — the code was never recompiled. The `.axl-build-state` signature does NOT cover this: it hashes which FLAGS an object used, not which HEADERS it depends on. Assembly is exempt only while it `#include`s nothing, and the gate re-checks that rather than assuming it |
+| `gate.check-ascii` | non-ASCII in an emittable string (draws as a console block) |
+| `gate.check-docs` | a public header with no `doxygenfile` directive |
+| `gate.check-dogfood` | a NEW raw UEFI protocol call bypassing the backend |
+| `gate.check-test-meta` | an integration test with no `# test-meta:` header, a test that still RUNS make (or declares the retired `build-backend=`), or a `builds=` declaration that disagrees with the test's own `scripts/axl-build.sh` line in either direction. `builds=` is what lets the runner build a test's fixtures BEFORE it decides the cache -- without it the cache keys on a fixture the test has not rebuilt yet, and 81 targets across 79 tests were in that position. It reads a relative `scripts/axl-build.sh` (six scripts `cd "$PROJECT_DIR"` first), one behind a command prefix (`flock`, `timeout 300`), and one split across a continuation; it strips comments first, because a build in prose is not a build; and it FAILS on an argument it cannot resolve rather than reporting clean. Getting *that* wrong is how the gate itself went blind twice |
+| `gate.check-test-inputs` | a tree file a test hands its guest OUTSIDE the skip-cache key -- a false hit waiting for an edit. The key reads a test's literal `$PROJECT_DIR/<file>` paths and its `builds=` products itself (`lib/test-cache.sh`, `lib/build-products.sh`); this fails a copy, redirect or tee into `$TEST_STAGING` (or a `--mount`ed dir) of a tree file that is none of those and not recorded (`test_record_input`), and any `--mount` of an in-repo path, unless the line says `# test-input: not-keyed -- <why>`. It asks the key's own readers, fails when they cannot answer or when it finds no staging write at all, and counts what it could not resolve in its clean line (`-v` lists every verdict) |
+| `gate.check-test-est` | a test CI cannot actually run within its own limit: an `est=` over the limit `ctest --preset x64-ci` applies, or CI running the suite some other way -- `release-suite.sh` without `--ci`, or a ctest call to that preset not preceded by this gate (ctest, unlike the runner's `--ci`, refuses nothing at run time). It reads the selection AND the limit from `ctest --show-only=json-v1` (`scripts/check-test-est.py`), so it keeps no copy of either, and fails before any test runs rather than relying on CI to kill the offender — `test-ssh-hostile-qemu.sh` was, at est=250 against 240, after every local run (900s, no per-test limit) had passed it. It never configures CMake: an unconfigured tree is a named failure |
+| `gate.check-size-gate-paths` | a file the build links into a size-capped image (`size-gate=`, e.g. sshd.efi) that lies outside the test's declared `size-gate-paths=` prefixes -- which-gates routes a change to the size test by those prefixes alone, so an undeclared input would scope the cap out. Derived from the CMake tree's own record (`ninja -t inputs` + `-t deps`, `scripts/size-gate-inputs.sh`), which refuses a tree older than its build definition |
+| `gate.check-nul` | a literal NUL byte in a tracked text file |
+| `gate.check-test-registered` | a `test_*` defined in `test/unit/` that nothing calls |
+| `gate.check-cxx-entry` | a mangled C++ firmware entry point |
+| `gate.check-examples` | an `sdk/examples/` source that no longer compiles — they ship in the distro packages, and 20 of 51 were reachable by no build rule at all |
+| `gate.check-json-dialect` | JSON parsed with a non-strict dialect in `src/`/`tools/` without a `/* json-dialect: local-file */` justification (design decision 40) |
+| `gate.check-uefi-scope` | UEFI reaching somewhere that promised not to have it: a type or `<uefi/…>` include in the PUBLIC API (held at zero, no allowlist), or shipped `tools/`/`sdk/examples/` code using UEFI without declaring why. Pairs with the `AXL_ALLOW_UEFI` guard in the uefi headers, which stops an application acquiring EDK2 by typing an `#include`; the gate catches what the guard cannot (a direct leaf-header include) |
+| `gate.check-nx-compat` | a produced image missing NX_COMPAT |
+| `gate.check-no-avx` | an UNGATED AVX instruction in a produced image (UEFI boots `CR4.OSXSAVE` clear, so it is `#UD`). Dispatched kernels are allowlisted per SYMBOL with a recorded justification -- not per object, so a second function acquiring VEX by accident still fails |
+| `gate.check-bss-clear` | a crt0 that stopped zeroing .bss |
+| `gate.check-flag-parity` | the build paths (the CMake build and its pack wrap, `axl-cc`, the CMake package `cmake/axl-config.cmake.in` installs -- which must delegate to axl-cc) disagreeing on an ABI/safety flag, a link flag, or an `objcopy -j` section. Both drifted in one afternoon: the stack protector reached 2 of 3, and a renamed relocation section reached 2 of 3 `-j` lists |
+| `gate.check-libc-overlap` | a name BOTH `libaxl.a` and newlib define where AXL's is STRONG. Two strong providers inside `axl-cc`'s `--start-group` resolve by whichever reference happens to be outstanding when each archive is scanned — adding one object once turned an uncaught `throw 42;` into five `multiple definition` errors. The line falls where the RUNTIME DEPENDENCY falls: leaf functions (`memcpy`, `strlen`) are weak so newlib's better version wins; hooks that need AXL's own init/teardown (`__cxa_atexit`, `__stack_chk_fail`, `__stack_chk_guard`) stay strong because newlib's are inert under UEFI. Checks BOTH directions |
 | `test-cxx-hosted-qemu.sh` (ctor fixture) | `--gc-sections` eating `.init_array`. Nothing REFERENCES an `.init_array` entry, so without `KEEP()` in the linker scripts it is collected and NO C++ global constructor runs -- silently, for as long as the C++ layer existed |
-| `make check-reloc-coverage` | a `DT_RELA` relocation table SPLIT across two sections (the crt0 walks `DT_RELASZ` bytes and reads past the end), or dropped by `objcopy -j`, which takes EXACT section names. A latent aa64 bug for years; `-frtti` was the first workload to trigger it |
+| `gate.check-reloc-coverage` | a `DT_RELA` relocation table SPLIT across two sections (the crt0 walks `DT_RELASZ` bytes and reads past the end), or dropped by `objcopy -j`, which takes EXACT section names. A latent aa64 bug for years; `-frtti` was the first workload to trigger it |
 | `test-stack-guard-qemu.sh` | the stack protector silently not applying. `-fstack-protector-strong -mstack-protector-guard=global` is ON by default; the `guard=global` half is load-bearing on x64, where GCC otherwise reads the canary from `%fs:0x28` (glibc TLS) that UEFI never sets up |
-| `scripts/lint.sh` | clang `-Wall -Wextra` diagnostics gcc never emits, plus clang-tidy over `src/` and (bugprone-only) `test/unit/` |
+| `scripts/lint.sh` | clang `-Wall -Wextra` diagnostics gcc never emits, plus clang-tidy over `src/` (full config) and, bugprone-only, `test/unit/`, `tools/` and `test/integration/`, plus the C++ TUs. A wrapper over the **x64-lint CMake preset** (`cmake/AxlLint.cmake`): clang-tidy runs beside each compile and Ninja re-checks only the TUs whose source, headers, `.clang-tidy` or clang-tidy changed. It takes no file arguments. **A source in no linted target is a CONFIGURE FAILURE, not a skip** -- the preset refuses to configure and names it. That is the old "in the `find` but not the database" rule made structural: a file in no target is never analysed and would read clean (`tools/axl.c` and 60 `test/integration/*.c` once sat exactly there). The host tools (pe-set-debug, axl-efi-pack, fwtool-host), built by the host compiler, get the bugprone pass too. The preset's CTest test adds the clang warnings pass |
 | `scripts/build-docs.sh` | any Doxygen/Sphinx warning |
 | `test_check_leaks` (in every `test_count_results` run) | a teardown memory leak, or a test binary that printed no leak verdict at all |
 
@@ -252,6 +355,24 @@ it deletes them mid-build. `check-tautology` did exactly that.
   `test-axl.sh`, ratcheted).
 - `test/integration/test-*-qemu.sh` for end-to-end tool/network
   scenarios (opt out of ratchet via `TEST_SKIP_RATCHET=1`).
+- `test/integration/test-*-selftest.sh` check the HARNESS, not the
+  library, and are deliberately excluded from discovery. Run them with
+  **`scripts/run-selftests.sh`** (~265s wall for ~355s of work over ten
+  files, 2026-11-08 — 444s serial in CI before; each file declares what it
+  cannot share with `# selftest-schedule: exclusive|tree`, the rest run in
+  parallel; each verdict line prints its file's time; the
+  `11 passed` counts an extra stray-guest assertion — led by
+  `test-runner-selftest.sh` (~140s), `test-duration-budget-selftest.sh`
+  (~72s of real sleeps) and `test-gate-scoping-selftest.sh` (~50s);
+  `test-lint-gate-selftest.sh` drives the real `lint.sh` (~9s warm, ~70s
+  cold, as on every CI run) and runs in parallel, outside the tree lane;
+  `test-discover-selftest.sh` fell from 91s to 2s when `test_meta_field`
+  stopped forking); CI runs it as its own
+  step AFTER the suite. Never inside the pool: as a discovered test they
+  took the suite to 121 passed / 59 failed, because the runner
+  self-test's SIGTERM case drives a hang and reaps it, and under six
+  workers the reap left two qemu processes and 108 MB of `/dev/shm`
+  competing with everything after them.
 
 ### When test-first genuinely doesn't apply
 
@@ -283,7 +404,10 @@ hang/`#GP`, not a clean `AXL_ERR`. See
   binary. `TEST_APPS_ONLY=AxlTestX ./test/integration/test-axl.sh` (or
   `run-qemu.sh --timeout 30 …AxlTestX.efi`) and confirm it prints its
   Results footer before the full suite. The harness now names a stalled
-  binary loudly (`*** STALLED:` + the ratchet "Culprit:" line).
+  binary loudly -- `*** STALLED:` when the guest ended on its own,
+  `*** TRUNCATED:` when the harness's OWN timeout fired (which says the
+  named binary was merely in flight, not that it hung) -- plus the matching
+  ratchet "Culprit:" / "Cut short by" line.
 
 ## Current State (May 2026)
 
@@ -468,15 +592,16 @@ Shell Spec 2.2 is PDF-only; Shell protocols remain hand-written in
 ## Build
 
 ```bash
-# Library (for development)
-make                                        # X64
-make ARCH=aa64                              # AARCH64 (cross-compile)
-make tests                                  # build test EFIs
-./test/integration/test-axl.sh               # 1081 unit tests in QEMU
+# Library, tests, tools, fixtures (for development) -- CMake + Ninja
+scripts/axl-build.sh ARCH=x64 all          # = cmake --build build/x64-debug
+scripts/axl-build.sh ARCH=aa64 all         # AARCH64 (cross-compile)
+scripts/axl-build.sh ARCH=x64 BUILD=RELEASE tools
+cmake --preset x64-debug && cmake --build --preset x64-debug   # by hand: see "pinned CMake" below
+./test/integration/test-axl.sh              # the unit tests in QEMU
 
 # SDK (for consumers, local staged build)
 ./scripts/install.sh --arch x64
-./out/bin/axl-cc sdk/examples/hello.c -o hello.efi
+./stage/bin/axl-cc sdk/examples/hello.c -o hello.efi
 
 # `packaging/install.sh` is the install path for end users — release.yml
 # publishes it plus VERSION, SHA256SUMS and three versioned tarballs.
@@ -487,57 +612,71 @@ make tests                                  # build test EFIs
 # README.md.
 ```
 
-**A CFLAGS change forces a rebuild.** Objects do not depend on the Makefile,
-so editing `CFLAGS_BASE` used to rebuild NOTHING — `make` printed the new
-flags on whichever file it happened to recompile and left the other 200
-objects built the old way. That produced four wrong readings while the stack
-protector was added, including "0 objects instrumented" on a build whose
-command line plainly carried the flag, and a sabotage that looked UNDETECTED
-because the restored source was never rebuilt.
+**The build is CMake + Ninja only** (`docs/AXL-Build-System-Design.md`;
+the Makefile was retired in 5.0.0, §10.12). Trees are `build/<preset>`
+(`x64-debug`, `aa64-debug`, `x64-release`, `aa64-release`, plus `x64-lint`
+and `fuzz`); `scripts/axl-build.sh --print-prefix ARCH=.. BUILD=..` names one.
+Every caller builds through `scripts/axl-build.sh`, which keeps the make-shaped
+arguments (`ARCH=`, `BUILD=`, goal names from `cmake/AxlGoals.cmake`), refuses
+any other variable rather than dropping it, and holds a per-tree `flock`
+(Ninja cannot run twice in one tree). Ninja tracks every header and every flag
+(a flag change rewrites the command, and the edge reruns); `make clean` is
+`rm -rf build/<preset>`.
 
-The build records a SIGNATURE (`$(BUILDDIR)/.axl-build-state`) covering a hash
-of `CFLAGS`/`CXXFLAGS`/`INCLUDES` (how objects compile) and `CC`/`CXX` (which
-compiler emits them); a change in either wipes the objects, both archives and
-every `.efi`/`.so` under `$(PREFIX)`. It once covered a third input, the
-`AXL_TLS` toggle (which sources compile) — that flag is gone, but the mechanism
-stayed, because the other two produce the same class of silently-stale build. `$(BUILDDIR)/.axl-flags` holds that
-compiler pair followed by the exact flag set the neighbouring objects were
-built with — read it first when a build looks wrong.
+**A tree keeps the toolchain its first configure chose**
+(`cmake/AxlToolchain.cmake`'s `AXL_TC_*` cache): a reconfigure naming another
+compiler or `AXL_TOOLCHAIN`, or a moved `axl-toolchains.conf` default, is
+refused with the way out (`cmake --fresh`). An existing tree does not notice a
+newly installed ccache (`cmake --preset <p>` again, §10.6).
 
-`CC`/`CXX` joined the signature after `AXL_X64_GXX=... AXL_CPP=1 make` reused
-host-g++ objects, so a full-suite run "with the bare-metal toolchain" silently
-measured the host one. It captures the compiler's SPELLING, not its identity:
-an in-place gcc upgrade or a ccache shim on PATH still hashes the same.
-
-The flags are written with `$(file ...)` and hashed from disk rather than piped
-through a shell: `CFLAGS` carries `-DMBEDTLS_CONFIG_FILE=...`, and in its
-original `'<axl-mbedtls-config.h>'` spelling the embedded quotes ended the shell
-argument and left `<...>` as a redirect — the first version hashed the empty
-string, and a constant signature is a check that never fires. The macro is now
-spelled `'"axl-mbedtls-config.h"'`, which removes the redirect hazard AND stops
-`bugprone-macro-parentheses` firing on it: `<name.h>` parses as a comparison,
-and a COMMAND-LINE macro has no file, so no clang-tidy header filter can
-suppress it.
-
-Incremental builds correctly handle public-header restructures
-(add / remove / rename a struct field, type, or function): the
-libaxl.a recipe deletes the archive before rebuilding it, so a
-renamed-and-removed source file's stale .o can't survive across
-builds. (Earlier the `ar rcs` insert-or-replace behavior left
-stale members in place, requiring `make clean` after structural
-changes — fixed since.)
-
-**DELETING a source file is the case that still bites, and it looks
-like your edit did nothing.** `rm`ing a .c and dropping it from
-`LIB_SOURCES` shrinks `$(LIB_OBJS)` — and **removing a prerequisite
-does not make a target out of date**, so the libaxl.a recipe never
-runs, its `rm -f $@` never fires, and the deleted file's .o stays an
-archive member. `make` prints "AXL library built" and the symbol is
-still exported. Measured while deleting `axl-str-compat.c` /
-`axl-intrinsics.c`: `nm` still showed `memcpy` after a clean-looking
-build. The rename case above genuinely is safe (the new .o is a NEWER
-prerequisite, so the recipe fires). After deleting a source, remove
-its stale .o and the archive explicitly, or `make clean`.
+**Every local entry point runs the pinned CMake (4.3.6), not the box's**
+(`scripts/axl-cmake-pin.sh`, design §10.13). CI and the release pin it in
+`scripts/ci-cmake.sh`; a test once passed on every local run (3.31) and failed
+only on CI (4.2 writes compile_commands.json's `output` absolute). What a
+developer needs to know:
+- **No particular cmake on the box, or none at all.** axl-build.sh (and so
+  install.sh, which builds through it), verify.sh, run-integration.sh, lint.sh,
+  release-suite.sh, check-fuzz-link.sh and every test that runs cmake/ctest
+  call `axl_use_pinned_cmake`, which puts the pinned cmake/ctest first on
+  PATH. `test-pinned-cmake.sh` fails a script that runs cmake or ctest
+  without calling it.
+- **The first build downloads ~50 MB once** (Kitware's tarball, checksum-
+  verified) into `${XDG_CACHE_HOME:-~/.cache}/axl-sdk/cmake/<version>/`,
+  shared by every checkout and worktree, and says so in one line. A failed
+  install (offline, checksum) is an ERROR naming the retry command -- never a
+  silent fall-back to the system cmake. On CI the pinned one is already first
+  on PATH and the helper does nothing.
+- **Existing trees migrate themselves.** A tree whose `CMakeCache.txt`
+  `CMAKE_COMMAND` is another cmake (not the one on PATH, and not reporting the
+  pinned version) is reconfigured `cmake --fresh` (with a
+  line saying why) by axl-build.sh, lint.sh, and -- before any ctest reads it
+  -- verify.sh/run-integration.sh/release-suite.sh. PATH alone moves nothing:
+  ninja's regeneration edge runs the cmake the cache names.
+- **A bare `cmake` you type is still yours.** For a hand-run `cmake --preset`
+  that matches CI, put the pinned bin first:
+  `PATH=~/.cache/axl-sdk/cmake/4.3.6/cmake-4.3.6-linux-$(uname -m)/bin:$PATH`.
+  If you do configure a tree with another cmake, the next axl-build.sh moves
+  it back.
+- **To bump the pin:** change `AXL_CI_CMAKE_VERSION` and both SHA-256s in
+  `scripts/ci-cmake.sh` (from Kitware's `cmake-<v>-SHA-256.txt`). Every tree
+  then reconfigures `--fresh` on its next build; delete the old version's
+  cache dir when nothing needs it.
+- **Consumers are untouched, and their floor is tested:** the installed SDK
+  (axl-cc, the CMake package, sdk/examples) builds with the consumer's own
+  CMake; nothing there sources the helper. The floor is **CMake 3.20**
+  (sdk/examples' `cmake_minimum_required(VERSION 3.20)`; below it the
+  generated package sets `axl_FOUND` false with a reason under
+  find_package(axl), and FATAL_ERRORs when loaded any other way (a bare
+  include(), another package's config) -- a package config must not call
+  cmake_minimum_required). `test-cmake-package.sh` runs every case under the
+  pin AND under CMake 3.20.6 (`ci-cmake.sh --floor-version`,
+  `axl_floor_cmake_bin`, same cache, ~45 MB once), so a newer feature in the
+  generated package or sdk/examples fails there, and checks the package
+  REFUSES 3.16.9 with its exact message (`--below-floor-version`,
+  `axl_below_floor_cmake_bin`, ~40 MB, x86_64 only). To move the floor:
+  `AXL_FLOOR_CMAKE_VERSION` and both SHA-256s in `scripts/ci-cmake.sh`,
+  every sdk/examples minimum and the package's version check (the test
+  checks all of them against the floor).
 
 ## Documentation
 
@@ -578,7 +717,7 @@ update in the SAME change, before the pre-commit review:
   serial README claimed "does not move bytes" through a whole byte-I/O addition.)
 
 **Gates (run before commit; see "Build gates" above for the full set):**
-- `make check-docs` (`scripts/check-doc-coverage.py`, also in CI) fails if a
+- `gate.check-docs` (`scripts/check-doc-coverage.py`, also in CI) fails if a
   public header has no `doxygenfile` directive — catches the *structural* gap
   (a new header with no docs). It does NOT catch prose staleness.
 - `./scripts/build-docs.sh` is a **zero-warning gate** — it fails on any

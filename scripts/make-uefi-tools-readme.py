@@ -3,10 +3,10 @@
 
 WHY THIS EXISTS. That file said "Tools included:" and listed **13 of 38**.
 AXL-Distribution-Design.md §14.3 counted the four places the shipped tool set
-is stated: `release.yml`'s sanity list is derived from `make print-TOOL_NAMES`
+is stated: `release.yml`'s sanity list is derived from `scripts/axl-list.sh TOOL_NAMES`
 and `devkit.conf` is gated by `check-devkit-conf`, so both are correct for
 free; the two hand-maintained prose lists had each drifted. README.md's copy
-was fixed by adding the missing rows behind `make check-tool-docs` -- its
+was fixed by adding the missing rows behind `gate.check-tool-docs` -- its
 entries are paragraphs, richer than any generator could produce. This one is
 different: its entries are flat ~40-character labels, which is exactly what
 `devkit.conf`'s `desc:` lines already are, so it is DERIVED.
@@ -17,10 +17,12 @@ without cutting a release. Generating it here gives it the local reproduction
 for the host-tools tarball.
 
 THE LICENCE TEXT BELOW IS NOT PROSE. It carries mbedTLS's Apache-2.0
-election, EDK2's BSD-2-Clause-Patent notice, iPXE's GPL-2.0-or-later notice
-and a GPL-2.0 §3(b) written offer. It was moved here byte-for-byte from the
-workflow, and the test asserts each survives, because a refactor that drops a
-paragraph of it is a licence violation rather than a typo.
+election and EDK2's BSD-2-Clause-Patent notice. It was moved here
+byte-for-byte from the workflow, and the test asserts each survives, because a
+refactor that drops a paragraph of it is a licence violation rather than a
+typo. (iPXE's GPL-2.0-or-later notice and its GPL-2.0 §3(b) written offer went
+with the bundled iPXE driver on 2026-10-21; docs/ROADMAP.md records how to
+restore both.)
 
 Usage: scripts/make-uefi-tools-readme.py --arch x64|aa64 --version X.Y.Z
 """
@@ -91,9 +93,8 @@ WRAP = 78
 ASCII_FOLD = {
     "\u2014": "--", "\u2013": "-", "\u2018": "'", "\u2019": "'",
     "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
-    # Spelled out, not dropped: this one appears inside iPXE's GPL-2.0
-    # section 3(b) written offer, where legibility at a UEFI Shell prompt is
-    # the whole point of carrying the notice.
+    # Spelled out, not dropped: a licence citation stays legible at a UEFI
+    # Shell prompt.
     "\u00a7": "section ",
 }
 
@@ -110,21 +111,21 @@ def fail(msg: str) -> int:
 
 
 def tool_names() -> list[str] | None:
-    """The shipped tool set, read back from the Makefile.
+    """The shipped tool set, read from scripts/axl-lists.conf.
 
-    Captures the exit status rather than reading the output alone: a make that
-    could not RUN and a make that named nothing are the same empty string and
+    Captures the exit status rather than reading the output alone: a reader
+    that could not RUN and one that named nothing are the same empty string and
     opposite facts.
     """
-    proc = subprocess.run(["make", "-s", "print-TOOL_NAMES"], cwd=ROOT,
+    proc = subprocess.run(["bash", str(ROOT / "scripts" / "axl-list.sh"), "TOOL_NAMES"], cwd=ROOT,
                           capture_output=True, text=True, check=False)
     if proc.returncode != 0:
-        fail(f"`make -s print-TOOL_NAMES` exited {proc.returncode}: "
+        fail(f"`scripts/axl-list.sh TOOL_NAMES` exited {proc.returncode}: "
              f"{proc.stderr.strip()}")
         return None
     names = sorted(proc.stdout.split())
     if len(names) < 25:
-        fail(f"print-TOOL_NAMES named only {len(names)} tools; refusing to "
+        fail(f"TOOL_NAMES named only {len(names)} tools; refusing to "
              "certify a tarball README against that")
         return None
     return names
@@ -195,7 +196,7 @@ def main() -> int:
     if missing:
         return fail(
             "no `desc:` line in devkit.conf for: " + ", ".join(missing) +
-            "\n  `make check-devkit-conf` is the gate that should have caught "
+            "\n  `gate.check-devkit-conf` is the gate that should have caught "
             "this first; a tool with no description would land in the tarball "
             "README as a bare name.")
 
@@ -248,11 +249,13 @@ def main() -> int:
 
 
 TAIL = """Drivers included (drivers/{arch}/):
-  ipxe-all.efidrv     Universal NIC driver — covers Intel,
-                      Broadcom, Realtek PCI/USB, Atheros, 3Com,
-                      AMD, USB CDC-ECM/NCM/RNDIS, and many more.
-  (also a few small auxiliary USB-network and RAM-disk
-   drivers — see third_party/ for full attribution.)
+  NetworkCommon.efi   USB-network glue (SNP over the USB NIC
+                      drivers below)
+  UsbCdcEcm.efi       USB CDC-ECM ethernet
+  UsbCdcNcm.efi       USB CDC-NCM ethernet
+  UsbRndis.efi        USB RNDIS ethernet
+  RamDiskDxe.efi      RAM disk (also embedded in mkrd)
+  See third_party/edk2/ for attribution.
 
 Usage:
   1. Format a USB stick as FAT32.
@@ -265,6 +268,13 @@ for the NIC, the staged drivers are unused. On minimal firmware
 (legacy Dell EDK1, custom BMCs, etc.) axl_net_ensure_drivers
 loads them on demand from drivers/{arch}/ before networking
 tools (netinfo, fetch, rfbrowse) attempt to use the network.
+
+sshd settings:
+  sshd.conf (beside sshd.efi) lists every setting sshd supports,
+  commented out at its default, OpenSSH sshd_config style. Remove
+  the "#" from a line to change it; flags win over the file, and
+  `sshd -T` prints the settings in effect. Password logins need a
+  password: AxlPassword in the file, or sshd -P.
 
 TLS / HTTPS:
   Built with mbedtls; fetch handles both http:// and
@@ -283,24 +293,6 @@ Third-party licenses:
   UsbRndis) are Copyright (c) Intel Corporation, licensed
   BSD-2-Clause-Patent (from the EDK2 MdeModulePkg). Full
   license text at third_party/edk2/LICENSE.
-
-  ipxe-all.efidrv is built from upstream iPXE
-  (https://github.com/ipxe/ipxe), licensed GPL-2.0-or-later.
-  Pinned commit + reproducible build recipe at
-  scripts/build-ipxe.sh in the axl-sdk source tree. Full
-  license text at third_party/ipxe/COPYING.GPLv2; mere-
-  aggregation rationale in third_party/ipxe/README.md.
-
-  GPL-2.0 §3(b) written offer: AximCode offers, for at
-  least 3 years from this distribution date, to provide
-  the complete machine-readable source for the iPXE
-  binary in this archive on a medium customarily used
-  for software interchange, at no more than the reasonable
-  cost of physical distribution. Requests:
-    support@aximcode.com  /  https://aximcode.com
-  (The source is also publicly available at the upstream
-  URL above at the pinned commit hash printed by
-  scripts/build-ipxe.sh.)
 
 Docs: https://axl.aximcode.com/
 """

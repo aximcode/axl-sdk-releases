@@ -17,10 +17,10 @@
 
 AXL_LOG_DOMAIN("app");
 
-/* Longest volume name we join a path onto ("FS0", "fs12", a SetMap alias),
-   NUL included. axl_backend_volume_name_for_handle fails rather than truncate,
-   so an over-long alias degrades to the prefix-less path, not a wrong one. */
-#define AXL_APP_VOLUME_NAME_MAX  64u
+/* Longest volume name we join a path onto (AXL_BACKEND_VOLUME_NAME_MAX:
+   axl_driver_locate names the image's volume with the same call and size, so
+   the two can never disagree over a long alias). */
+#define AXL_APP_VOLUME_NAME_MAX  AXL_BACKEND_VOLUME_NAME_MAX
 
 // ---------------------------------------------------------------------------
 // Saved args
@@ -539,6 +539,25 @@ axl_app_image_path(void)
     return mImagePath;
 }
 
+/* The name the image's volume answers to NOW ("FS0", "fs1"), in @vol.
+   Re-resolved from the handle rather than sliced off mImagePath: the name a
+   volume answers to can change during the run (a `map -r`; a volume removed
+   ahead of this one in the no-shell positional order), and the callers
+   promise a path that resolves now. AXL_ERR when this image was not loaded
+   from a file -- synthetic (buffer) load contexts, see axl_app_image_path's
+   contract -- or nothing names its volume (network boot, a RAM disk with no
+   source volume): refuse rather than produce a path that won't resolve. */
+static int
+app_volume_name(
+    char  *vol,
+    size_t cap)
+{
+    if (mImagePath == NULL) {
+        return AXL_ERR;
+    }
+    return axl_backend_volume_name_for_handle(mImageDeviceHandle, vol, cap);
+}
+
 int
 axl_app_boot_path(
     const char *relative_path,
@@ -548,25 +567,8 @@ axl_app_boot_path(
     if (relative_path == NULL || out == NULL || out_size == 0) {
         return AXL_ERR;
     }
-    if (mImagePath == NULL) {
-        /* No file this image came from, so no volume to hang a sibling off.
-           Synthetic (buffer) load contexts land here — see
-           axl_app_image_path's contract. */
-        return AXL_ERR;
-    }
-
-    /* Re-resolve the volume name from the handle rather than slicing the
-       prefix off mImagePath: the name a volume answers to can change during
-       the run (a `map -r`; a volume removed ahead of this one in the
-       no-shell positional order), and this call is the one that promises a
-       path that resolves NOW. */
     char vol[AXL_APP_VOLUME_NAME_MAX];
-    if (axl_backend_volume_name_for_handle(mImageDeviceHandle,
-                                           vol, sizeof(vol)) != AXL_OK)
-    {
-        /* Nothing names this volume — network boot, a RAM disk with no
-           source volume. Refuse rather than silently producing a path that
-           won't resolve. */
+    if (app_volume_name(vol, sizeof(vol)) != AXL_OK) {
         return AXL_ERR;
     }
 
@@ -585,4 +587,58 @@ axl_app_boot_path(
         return AXL_ERR;
     }
     return AXL_OK;
+}
+
+int
+axl_app_image_dir_path(
+    const char *relative_path,
+    char       *out,
+    size_t      out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+    out[0] = '\0';
+    if (relative_path == NULL) {
+        return AXL_ERR;
+    }
+
+    int rc;
+    if (axl_strchr(relative_path, ':') != NULL) {
+        /* Names its volume: nothing to anchor, and no image needed. */
+        rc = axl_strlcpy(out, relative_path, out_size) < out_size ? AXL_OK : AXL_ERR;
+    } else if (relative_path[0] == '\\' || relative_path[0] == '/') {
+        /* The volume's root, as the Shell reads a leading separator. */
+        rc = axl_app_boot_path(relative_path, out, out_size);
+    } else {
+        /* The image's directory: mImagePath after its volume prefix, up to
+           (not including) its last separator -- "\\tools" for
+           "FS0:\\tools\\app.efi", "" for an image at the root. */
+        char        vol[AXL_APP_VOLUME_NAME_MAX];
+        const char *colon = mImagePath != NULL ? axl_strchr(mImagePath, ':') : NULL;
+        if (colon == NULL || app_volume_name(vol, sizeof(vol)) != AXL_OK) {
+            return AXL_ERR;
+        }
+        const char *dir = colon + 1;
+        size_t      len = 0;
+        for (size_t i = 0; dir[i] != '\0'; i++) {
+            if (dir[i] == '\\' || dir[i] == '/') {
+                len = i;
+            }
+        }
+        int n;
+        if (len == 0) {
+            n = axl_snprintf(out, out_size, "%s:\\%s", vol, relative_path);
+        } else if (relative_path[0] == '\0') {
+            n = axl_snprintf(out, out_size, "%s:%.*s", vol, (int)len, dir);
+        } else {
+            n = axl_snprintf(out, out_size, "%s:%.*s\\%s", vol, (int)len, dir,
+                             relative_path);
+        }
+        rc = (n < 0 || (size_t)n >= out_size) ? AXL_ERR : AXL_OK;
+    }
+    if (rc != AXL_OK) {
+        out[0] = '\0';
+    }
+    return rc;
 }

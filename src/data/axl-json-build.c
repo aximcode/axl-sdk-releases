@@ -19,6 +19,8 @@
 
 #include "axl-json-internal.h"
 
+#define JSON_CTL_ESCAPE_LEN 6u   /* \u00XX */
+
 AXL_LOG_DOMAIN("json");
 
 /* One object member, reduced to what ordering needs: where its key token is,
@@ -108,6 +110,24 @@ u64_to_hex(char *buf, size_t buf_size, uint64_t val)
 // JSON String Escaping (utility, public)
 // ---------------------------------------------------------------------------
 
+/* A control character (< 0x20) as its RFC 8259 §7 escape, \u00XX -- the
+   form for every one without a short escape. Escaped, never dropped: a
+   relayed command's ESC or U+0000 is data. Both quoting paths use it. */
+static void
+json_ctl_escape(
+    unsigned char ch,
+    char          u[JSON_CTL_ESCAPE_LEN]
+    )
+{
+    static const char hex[] = "0123456789abcdef";
+    u[0] = '\\';
+    u[1] = 'u';
+    u[2] = '0';
+    u[3] = '0';
+    u[4] = hex[(ch >> 4) & 0xFu];
+    u[5] = hex[ch & 0xFu];
+}
+
 int
 axl_json_escape_string(const char *src, char *out, size_t size)
 {
@@ -145,7 +165,13 @@ axl_json_escape_string(const char *src, char *out, size_t size)
             else if (ch == '\n') { ESC_APPEND_STR("\\n");  }
             else if (ch == '\r') { ESC_APPEND_STR("\\r");  }
             else if (ch == '\t') { ESC_APPEND_STR("\\t");  }
-            else if (ch < 0x20)  { /* skip */               }
+            else if (ch < 0x20) {
+                char u[JSON_CTL_ESCAPE_LEN];
+                json_ctl_escape(ch, u);
+                for (size_t k = 0; k < JSON_CTL_ESCAPE_LEN; k++) {
+                    ESC_APPEND_CHAR(u[k]);
+                }
+            }
             else                 { ESC_APPEND_CHAR((char)ch); }
             continue;
         }
@@ -663,7 +689,11 @@ emit_quoted_n(AxlJsonWriter *w, const char *s, size_t n)
             else if (ch == '\n') wr_strn(w, "\\n",  2);
             else if (ch == '\r') wr_strn(w, "\\r",  2);
             else if (ch == '\t') wr_strn(w, "\\t",  2);
-            else if (ch < 0x20)  { /* skip control chars */ }
+            else if (ch < 0x20) {
+                char u[JSON_CTL_ESCAPE_LEN];
+                json_ctl_escape(ch, u);
+                wr_strn(w, u, sizeof(u));
+            }
             /* RFC 8259 §7 permits `/` and `\/` equally and requires neither,
                so this is opt-in: the escape is noise unless the document is
                going into a <script> block, where the byte pair `</` would

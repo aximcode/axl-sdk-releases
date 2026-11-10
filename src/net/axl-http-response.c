@@ -7,11 +7,46 @@
 
 #include "axl-http-server-internal.h"
 
+#include <stdarg.h>
+
 AXL_LOG_DOMAIN("http");
 
 // ---------------------------------------------------------------------------
 // Response sending (internal)
 // ---------------------------------------------------------------------------
+
+/* Append one formatted line to the header block, or mark it overflowed.
+   axl_snprintf returns the length it WOULD have written, so adding that to
+   the running length unchecked ran past the buffer on one long header (a
+   long CSP from a middleware) -- the next append's `size - len` wrapped, and
+   the final copy read past the stack buffer. A line that does not fit is
+   not written at all, and send_response turns an overflowed block into a
+   500 rather than send a truncated one. */
+static void
+hb_appendf(
+    HeaderBuildCtx *hb,
+    const char     *fmt,
+    ...
+    )
+{
+    va_list ap;
+    size_t  room;
+    int     n;
+
+    if (hb->overflow) {
+        return;
+    }
+    room = hb->buf_size - hb->len;
+    va_start(ap, fmt);
+    n = axl_vsnprintf(hb->buf + hb->len, room, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= room) {
+        hb->buf[hb->len] = '\0';
+        hb->overflow = true;
+        return;
+    }
+    hb->len += (size_t)n;
+}
 
 static void
 emit_header(
@@ -20,17 +55,8 @@ emit_header(
     void       *data
     )
 {
-    HeaderBuildCtx *ctx = (HeaderBuildCtx *)data;
-
-    if (ctx->len < ctx->buf_size) {
-        ctx->len += axl_snprintf(
-                      ctx->buf + ctx->len,
-                      ctx->buf_size - ctx->len,
-                      "%s: %s\r\n",
-                      (const char *)key,
-                      (const char *)value
-                      );
-    }
+    hb_appendf((HeaderBuildCtx *)data, "%s: %s\r\n",
+               (const char *)key, (const char *)value);
 }
 
 // ---------------------------------------------------------------------------
@@ -50,8 +76,9 @@ emit_header(
 // completions silently in driver mode — headers landed at TCP4
 // (Transmit was issued) but the body send was rejected because
 // sock->send_source was still set against the freed ephemeral
-// loop, and reset_connection's axl_tcp_close cancelled the send
-// before the body got queued. End-to-end symptom on the wire was
+// loop, and reset_connection's axl_tcp_close dropped the send
+// before the body got queued (a close drops a send still queued --
+// see axl_tcp_close; it never cancels a Transmit the firmware holds). End-to-end symptom on the wire was
 // "headers arrive, body never does, server stuck in CLOSE-WAIT."
 // Fully async send_response avoids the WaitForEvent dependency
 // entirely; works identically in foreground and driver mode.
@@ -93,7 +120,26 @@ end_stream_state(HttpConn *conn)
 }
 
 static bool
+on_response_sent_body(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data
+    );
+
+static bool
 on_response_sent(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data
+    )
+{
+    /* @p data is always a live pool connection here. */
+    return http_dispatch(((HttpConn *)data)->server, on_response_sent_body, sock,
+                         status, data);
+}
+
+static bool
+on_response_sent_body(
     AxlTcp   *sock,
     AxlStatus status,
     void     *data
@@ -101,6 +147,23 @@ on_response_sent(
 {
     HttpConn *conn = (HttpConn *)data;
     (void)sock;
+
+    /* Delivered from inside this connection's own teardown: axl_tcp_close
+       runs every callback it still owes before it returns, and a send that
+       had already FINISHED arrives with its real status -- AXL_OK here, not
+       AXL_CANCELLED. Acting on it would complete a 101 upgrade (firing the
+       app's WS CONNECT after do_reset_connection decided on DISCONNECT, for
+       a slot about to be zeroed and reused) or re-arm recv on the closing
+       socket. do_reset_connection owns tx_buf, the upload state and the
+       stream state from the moment it starts, so there is nothing to
+       release here. This one check also covers a streamed response: every
+       chunk and terminator send completes through this callback, which is
+       the only way into stream_pump_next (and teardown has already cleared
+       stream_active, so an owed chunk would otherwise land in the
+       keep-alive branch below and re-arm recv). */
+    if (conn->tearing_down) {
+        return AXL_SOURCE_REMOVE;
+    }
 
     /* Free the combined headers+body buffer first — reset_connection
        below also tries to free it as a safety net, so NULL-out to
@@ -127,12 +190,7 @@ on_response_sent(
         axl_free(conn->upload_buf);
         conn->upload_buf     = NULL;
         conn->upload_buf_len = 0;
-        if (conn->upload_resp.body != NULL) {
-            axl_free(conn->upload_resp.body);
-        }
-        if (conn->upload_resp.headers != NULL) {
-            axl_hash_table_free(conn->upload_resp.headers);
-        }
+        http_response_release(&conn->upload_resp);   /* a static body is the handler's */
         axl_memset(&conn->upload_resp, 0, sizeof(conn->upload_resp));
         conn->is_upload_stream = false;
         conn->upload_route     = NULL;
@@ -182,13 +240,19 @@ on_response_sent(
         conn->chunked_done    = false;
 
         /* Fire the deferred WebSocket CONNECT now that the 101 is on the
-           wire (P1): a greeting axl_ws_send from the handler is valid here,
-           and a handler returning AXL_ERR rejects the connection cleanly.
-           ws_connected (set only on an accepted CONNECT) gates DISCONNECT, so
-           a reject — or a 101 that never made it this far — fires no
-           DISCONNECT. */
+           wire (P1): a greeting axl_ws_send from the handler is valid here.
+           THE PAIRING RULE: a CONNECT the app receives and does not reject
+           gets exactly one DISCONNECT; a handler returning AXL_ERR rejects
+           the connection, and a rejected one gets none. So ws_connected
+           (which gates DISCONNECT) is set as CONNECT is delivered and cleared
+           again on a reject -- setting it only after an accept left a
+           handler that closed its own connection from inside CONNECT with no
+           DISCONNECT at all. A teardown asked for while the handler runs is
+           deferred (do_reset_connection) and run here, after it returns. */
         if (conn->is_websocket && conn->ws_connect_pending) {
             conn->ws_connect_pending = false;
+            conn->ws_connected       = true;
+            conn->ws_in_connect      = true;
             int crc = AXL_OK;
             if (conn->ws_conn_handler != NULL) {
                 crc = conn->ws_conn_handler((AxlWsConn *)conn, AXL_WS_CONNECT,
@@ -196,16 +260,21 @@ on_response_sent(
             } else if (conn->ws_handler != NULL) {
                 crc = conn->ws_handler(AXL_WS_CONNECT, NULL, 0, conn->ws_data);
             }
-            /* The handler may have closed the conn from within CONNECT
-               (axl_ws_conn_close -> reset_connection already ran). */
-            if (!conn->active) {
-                return AXL_SOURCE_REMOVE;
-            }
+            conn->ws_in_connect = false;
             if (crc != AXL_OK) {
-                reset_connection(conn);   /* ws_connected unset -> no DISCONNECT */
+                conn->ws_connected = false;   /* rejected: no DISCONNECT */
+            }
+            if (crc != AXL_OK || conn->ws_close_deferred) {
+                /* A rejected connection is closed silently; an accepted one
+                   whose close was asked for during CONNECT gets its
+                   DISCONNECT here. Either way honour an abortive request. */
+                if (conn->ws_close_abortive) {
+                    reset_connection_abortive(conn);
+                } else {
+                    reset_connection(conn);
+                }
                 return AXL_SOURCE_REMOVE;
             }
-            conn->ws_connected = true;
         }
 
         start_conn_recv(conn->server, conn);
@@ -273,12 +342,7 @@ stream_pump_next(AxlTcp *sock, AxlStatus status, void *data)
             axl_free(conn->upload_buf);
             conn->upload_buf     = NULL;
             conn->upload_buf_len = 0;
-            if (conn->upload_resp.body != NULL) {
-                axl_free(conn->upload_resp.body);
-            }
-            if (conn->upload_resp.headers != NULL) {
-                axl_hash_table_free(conn->upload_resp.headers);
-            }
+            http_response_release(&conn->upload_resp);
             axl_memset(&conn->upload_resp, 0, sizeof(conn->upload_resp));
             conn->is_upload_stream = false;
             conn->upload_route     = NULL;
@@ -466,33 +530,29 @@ send_response(
     AxlHttpResponse *resp
     )
 {
-    char   header[2048];
-    size_t header_len;
-    bool   has_streamer = (resp->streamer != NULL);
+    char           header[2048];
+    size_t         header_len;
+    bool           has_streamer = (resp->streamer != NULL);
+    bool           drop_body    = false;
+    HeaderBuildCtx hb = { header, sizeof(header), 0, false };
 
-    header_len = http_build_status_line(header, sizeof(header), resp->status_code);
+    hb.len = http_build_status_line(header, sizeof(header), resp->status_code);
 
     if (resp->content_type != NULL) {
-        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
-                 "Content-Type: %s\r\n", resp->content_type);
+        hb_appendf(&hb, "Content-Type: %s\r\n", resp->content_type);
     }
 
     if (has_streamer) {
         /* Streaming: Content-Length when total_size is known,
            Transfer-Encoding: chunked when not. */
         if (resp->streamer_total_size != (size_t)-1) {
-            header_len += axl_snprintf(header + header_len,
-                sizeof(header) - header_len,
-                "Content-Length: %llu\r\n",
+            hb_appendf(&hb, "Content-Length: %llu\r\n",
                 (unsigned long long)resp->streamer_total_size);
         } else {
-            header_len += axl_snprintf(header + header_len,
-                sizeof(header) - header_len,
-                "Transfer-Encoding: chunked\r\n");
+            hb_appendf(&hb, "Transfer-Encoding: chunked\r\n");
         }
     } else if (resp->body != NULL && resp->body_size > 0) {
-        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
-                 "Content-Length: %llu\r\n", (unsigned long long)resp->body_size);
+        hb_appendf(&hb, "Content-Length: %llu\r\n", (unsigned long long)resp->body_size);
     } else if (status_allows_body(resp->status_code)
                && !response_has_content_length(resp)) {
         /* Empty body, no streamer, but the status permits one (201 from
@@ -501,8 +561,7 @@ send_response(
            it blocks waiting for a body. Skipped when a handler already
            set its own Content-Length (HEAD reports the entity length
            with an empty body) so the two never collide. */
-        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
-                 "Content-Length: 0\r\n");
+        hb_appendf(&hb, "Content-Length: 0\r\n");
     }
 
     /* A 101 Switching Protocols response is an upgrade, not a keep-alive
@@ -514,11 +573,9 @@ send_response(
        that's the recv-rearm signal, distinct from the wire Connection
        token, so it must not leak into this header. */
     if (resp->status_code == 101) {
-        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
-                 "Connection: Upgrade\r\n");
+        hb_appendf(&hb, "Connection: Upgrade\r\n");
     } else {
-        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
-                 "Connection: %s\r\n",
+        hb_appendf(&hb, "Connection: %s\r\n",
                  conn->keep_alive ? "keep-alive" : "close");
     }
 
@@ -527,30 +584,38 @@ send_response(
        no WWW-Authenticate and browsers/Finder never prompt for creds. */
     if (resp->status_code == 401 && conn->server->auth_scheme != NULL) {
         if (conn->server->auth_realm != NULL) {
-            header_len += axl_snprintf(header + header_len,
-                sizeof(header) - header_len,
-                "WWW-Authenticate: %s realm=\"%s\"\r\n",
+            hb_appendf(&hb, "WWW-Authenticate: %s realm=\"%s\"\r\n",
                 conn->server->auth_scheme, conn->server->auth_realm);
         } else {
-            header_len += axl_snprintf(header + header_len,
-                sizeof(header) - header_len,
-                "WWW-Authenticate: %s\r\n", conn->server->auth_scheme);
+            hb_appendf(&hb, "WWW-Authenticate: %s\r\n", conn->server->auth_scheme);
         }
     }
 
     /* Emit any custom response headers */
     if (resp->headers != NULL) {
-        HeaderBuildCtx ctx;
-        ctx.buf      = header;
-        ctx.buf_size = sizeof(header);
-        ctx.len      = header_len;
-
-        axl_hash_table_foreach(resp->headers, emit_header, &ctx);
-        header_len = ctx.len;
+        axl_hash_table_foreach(resp->headers, emit_header, &hb);
     }
 
     /* End of headers */
-    header_len += axl_snprintf(header + header_len, sizeof(header) - header_len, "\r\n");
+    hb_appendf(&hb, "\r\n");
+
+    /* Headers that do not fit are not sent truncated: that is a malformed
+       response a client may misread. Answer 500, empty, and close -- and run
+       a streamer's cleanup, since it will never be pumped. */
+    if (hb.overflow) {
+        axl_error("send_response: headers for %zu exceed %zu bytes; sending 500",
+                  resp->status_code, sizeof(header));
+        if (has_streamer && resp->streamer_cleanup != NULL) {
+            resp->streamer_cleanup(resp->streamer_ctx);
+        }
+        has_streamer     = false;
+        drop_body        = true;
+        conn->keep_alive = false;
+        hb.overflow      = false;
+        hb.len = http_build_status_line(header, sizeof(header), 500);
+        hb_appendf(&hb, "Content-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+    header_len = hb.len;
 
     /* Defensive: if a previous response is still in flight on this
        conn, drop its tx_buf. Shouldn't happen — recv is single-armed
@@ -628,7 +693,7 @@ send_response(
        response struct can be freed by the dispatcher as soon as
        send_response returns — the in-flight tx_buf is the only thing
        the completion callback needs to reach. */
-    size_t body_size = (resp->body != NULL) ? resp->body_size : 0;
+    size_t body_size = (!drop_body && resp->body != NULL) ? resp->body_size : 0;
     size_t total = header_len + body_size;
 
     void *combined = axl_malloc(total);
@@ -667,6 +732,64 @@ send_response(
     }
 }
 
+/* Static: a send's buffer must outlive its callback, and this one is never
+   freed. TLS encrypts it synchronously; plain TCP copies each piece before
+   the firmware sees it. */
+static const char http_continue_line[] = "HTTP/1.1 100 Continue\r\n\r\n";
+
+/* Nothing to release, and nothing to do on failure: a connection whose send
+   failed is torn down by the receive armed after it, as a peer that went
+   away is. */
+static bool
+on_continue_sent(
+    AxlTcp   *sock,
+    AxlStatus status,
+    void     *data
+    )
+{
+    (void)sock;
+    (void)status;
+    (void)data;
+    return true;
+}
+
+bool
+send_continue(
+    HttpConn *conn
+    )
+{
+    size_t len = sizeof(http_continue_line) - 1;
+    int    rc  = (conn->tls_ctx != NULL)
+                 ? axl_tls_write_async(conn->tls_ctx, http_continue_line, len,
+                                       conn->server->loop, on_continue_sent, NULL)
+                 : axl_tcp_send_async(conn->sock, http_continue_line, len,
+                                      conn->server->loop, NULL, on_continue_sent, NULL);
+    if (rc != AXL_OK) {
+        /* As on_response_sent does for a failed send: a TLS record can fail
+           after it took its sequence number, and every later one would then
+           fail the peer's MAC check. */
+        axl_debug("100 Continue could not be queued - closing");
+        reset_connection(conn);
+        return false;
+    }
+    return true;
+}
+
+void
+send_middleware_refusal(
+    HttpConn        *conn,
+    AxlHttpResponse *resp
+    )
+{
+    if (resp->status_code == 200) {
+        resp->status_code = 500;
+    }
+    conn->keep_alive = false;
+    send_response(conn, resp);
+    /* send_response copied it into the transmit buffer. */
+    http_response_release(resp);
+}
+
 void
 send_error_response(
     HttpConn *conn,
@@ -689,6 +812,104 @@ send_error_response(
     conn->keep_alive = false;
 
     send_response(conn, &resp);
+}
+
+/* Collects the keys of the message-framing headers in a response's table:
+   send_response frames the response itself, and a copy the middleware set
+   would contradict it. */
+#define AXL_HTTP_FRAMING_MAX 8
+typedef struct {
+    const char *keys[AXL_HTTP_FRAMING_MAX];
+    size_t      n;
+} FramingKeys;
+
+static void
+note_framing_header(
+    const void *key,
+    void       *value,
+    void       *data
+    )
+{
+    FramingKeys *fk = (FramingKeys *)data;
+    const char  *k  = (const char *)key;
+
+    (void)value;
+    if (fk->n < AXL_HTTP_FRAMING_MAX
+        && (axl_strcasecmp(k, "Connection") == 0
+            || axl_strcasecmp(k, "Content-Length") == 0
+            || axl_strcasecmp(k, "Transfer-Encoding") == 0)) {
+        fk->keys[fk->n++] = k;
+    }
+}
+
+/* A streamer the response carries but will not be sent: run its cleanup and
+   clear it, as send_response would on taking it over. */
+void
+http_response_drop_streamer(
+    AxlHttpResponse *resp
+    )
+{
+    if (resp->streamer != NULL && resp->streamer_cleanup != NULL) {
+        resp->streamer_cleanup(resp->streamer_ctx);
+    }
+    resp->streamer         = NULL;
+    resp->streamer_ctx     = NULL;
+    resp->streamer_cleanup = NULL;
+}
+
+void
+http_response_strip_framing(
+    AxlHttpResponse *resp
+    )
+{
+    if (resp->headers != NULL) {
+        FramingKeys fk = { { NULL }, 0 };
+        axl_hash_table_foreach(resp->headers, note_framing_header, &fk);
+        for (size_t i = 0; i < fk.n; i++) {
+            axl_hash_table_remove(resp->headers, fk.keys[i]);
+        }
+    }
+}
+
+void
+http_response_release(
+    AxlHttpResponse *resp
+    )
+{
+    if (resp->body != NULL && !resp->body_static) {
+        axl_free(resp->body);
+    }
+    resp->body = NULL;
+    if (resp->headers != NULL) {
+        axl_hash_table_free(resp->headers);
+        resp->headers = NULL;
+    }
+}
+
+void
+send_error_response_headers(
+    HttpConn        *conn,
+    size_t           status_code,
+    AxlHttpResponse *resp
+    )
+{
+    /* The dispatcher's refusals (404, 401, 403) go out with the headers the
+       middleware set -- a consumer's security headers belong on an error as
+       much as on a success -- but not its body: the status is the answer.
+       The caller still owns and frees resp. */
+    AxlHttpResponse out;
+
+    /* Never sent here: a streamer the middleware set is cleaned up, and a
+       Connection / Content-Length / Transfer-Encoding it set is dropped --
+       on a bodyless error it would contradict the response's own framing
+       (a Content-Length: N with no body leaves the client waiting). */
+    http_response_drop_streamer(resp);
+    http_response_strip_framing(resp);
+    axl_memset(&out, 0, sizeof(out));
+    out.status_code = status_code;
+    out.headers     = resp->headers;
+    conn->keep_alive = false;   /* as send_error_response, for the same reason */
+    send_response(conn, &out);
 }
 
 // ---------------------------------------------------------------------------

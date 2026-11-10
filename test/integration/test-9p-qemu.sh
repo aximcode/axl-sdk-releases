@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=20 local-only=0
+# test-meta: arch=both needs= est=20 local-only=0 builds=9p-mount-selftest guest=standard
 # test-9p-qemu.sh — the AxlTestNet `9p-client` mode speaks 9P2000.L to a host
 # server: TCP connect, Tversion negotiate, Tattach the root, then walk + lopen
 # + chunked Tread /hello.txt, then walk + lopen + Treaddir /dir. Same boot
@@ -49,8 +49,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 9p-mount-selftest 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 9p-mount-selftest 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 test_add_efi "$TEST_BUILD_DIR/9p-mount-selftest.efi"
@@ -64,29 +64,9 @@ python3 "$(dirname "$0")/p9-server.py" "$P9_PORT" &
 P9_PID=$!
 trap 'test_cleanup; [[ $P9_PID -gt 0 ]] && kill $P9_PID 2>/dev/null || true' EXIT
 
-# Interpolated heredoc (unquoted) so $P9_PORT lands in the startup script.
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Running 9P client mode...
-AxlTestNet.efi 9p-client 10.0.2.2 ${P9_PORT}
-stall 1000000
-
-echo Running 9P mount selftest...
-9p-mount-selftest.efi 10.0.2.2 ${P9_PORT}
-stall 1000000
-reset -s
-NSHEOF
+# The startup commands live in test-9p-qemu.nsh; the server's port is %1.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$P9_PORT"
 
 test_build_image
 
@@ -97,8 +77,8 @@ test_run_background
 
 echo "  QEMU PID: $TEST_QEMU_PID; 9P server PID: $P9_PID on host :$P9_PORT"
 
-if ! test_wait_for "9P-CLIENT-OK\|9P-CLIENT-FAIL" 60; then
-    echo "FAIL: 9p-client did not finish within 60 seconds"
+if ! test_wait_boot "9P-CLIENT-OK\|9P-CLIENT-FAIL" 60; then
+    echo "FAIL: 9p-client did not finish within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"; tail -30 "$TEST_CLEAN_LOG"
     exit 1
@@ -223,6 +203,34 @@ grep -q "MOUNT: RO-READ=1" "$TEST_CLEAN_LOG" \
     && pass "read-only file opens O_RDONLY through the mount (MOUNT: RO-READ=1)" \
     || fail "read-only mode fix ($(grep 'MOUNT: RO-READ' "$TEST_CLEAN_LOG" | head -1))"
 
+# Provider version 2 through the mount: renames by Trename on the file's own
+# fid (p9-server.py refuses Tlcreate in /mv/b, so a copy cannot pass), the
+# server's EXDEV kept as AXL_UNSUPPORTED, times and sizes by Tsetattr.
+grep -Fxq "MOUNT: XDIR-RENAME=1" "$TEST_CLEAN_LOG" \
+    && pass "a move between directories goes by Trename (MOUNT: XDIR-RENAME)" \
+    || fail "mount cross-directory rename"
+grep -Fxq "MOUNT: XDIR-EXDEV=1" "$TEST_CLEAN_LOG" \
+    && pass "a server's EXDEV is AXL_UNSUPPORTED with nothing changed (MOUNT: XDIR-EXDEV)" \
+    || fail "mount EXDEV mapping"
+grep -Fxq "MOUNT: XDIR-MOVE=1" "$TEST_CLEAN_LOG" \
+    && pass "axl_file_move copies what the server will not rename (MOUNT: XDIR-MOVE)" \
+    || fail "mount EXDEV move by copy"
+grep -Fxq "MOUNT: MTIME=1" "$TEST_CLEAN_LOG" \
+    && pass "axl_file_set_mtime through the mount (MOUNT: MTIME)" \
+    || fail "mount set_mtime"
+grep -Fxq "MOUNT: RENAME-INPLACE=1" "$TEST_CLEAN_LOG" \
+    && pass "a rename within one directory (MOUNT: RENAME-INPLACE)" \
+    || fail "mount in-place rename"
+grep -Fxq "MOUNT: TRUNCATE=1" "$TEST_CLEAN_LOG" \
+    && pass "axl_file_truncate through the mount (MOUNT: TRUNCATE)" \
+    || fail "mount truncate"
+grep -Fxq "MOUNT: RENAME-CASE=1" "$TEST_CLEAN_LOG" \
+    && pass "a case-only rename through the mount (MOUNT: RENAME-CASE)" \
+    || fail "mount case-only rename"
+grep -Fxq "MOUNT: LONG-LIST=1" "$TEST_CLEAN_LOG" \
+    && pass "a 400-byte, 200-unit name lists whole; 300-unit and 800-byte ones are skipped (MOUNT: LONG-LIST)" \
+    || fail "mount long-name listing"
+
 grep -q "MOUNT: DONE" "$TEST_CLEAN_LOG" \
     && pass "9p-mount-selftest completed (MOUNT: DONE)" \
     || fail "9p-mount-selftest did not finish"
@@ -234,4 +242,4 @@ if [[ $FAIL -gt 0 ]]; then
     echo ""; echo "--- Serial log ---"; tail -40 "$TEST_CLEAN_LOG"
 fi
 
-[[ $FAIL -eq 0 && $PASS -eq 22 ]] && exit 0 || exit 1
+[[ $FAIL -eq 0 && $PASS -eq 30 ]] && exit 0 || exit 1

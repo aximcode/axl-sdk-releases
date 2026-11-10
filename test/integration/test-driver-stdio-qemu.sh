@@ -1,5 +1,6 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=12 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0 guest=standard
+# test-meta: builds=stdio-bridge-fix,stdio-bridge-self,stdio-bridge-leak,stdio-bridge-old
 # Shared-driver stdio bridge — acceptance test.
 #
 # A resident shared driver's axl_stdin/axl_stdout must reflect the
@@ -66,18 +67,19 @@ test_setup
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
-    stdio-bridge-fix stdio-bridge-self stdio-bridge-leak 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
+    stdio-bridge-fix stdio-bridge-self stdio-bridge-leak stdio-bridge-old 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 LAUNCHER="$NATIVE_DIR/stdio-bridge-fix.efi"
 SELF_LAUNCHER="$NATIVE_DIR/stdio-bridge-self.efi"
 LEAK_LAUNCHER="$NATIVE_DIR/stdio-bridge-leak.efi"
+OLD_LAUNCHER="$NATIVE_DIR/stdio-bridge-old.efi"
 
 # Skip-and-warn if the fixture could not be built/staged on this box
 # (matches the skip convention of the sibling driver tests).
-if [[ ! -f "$LAUNCHER" || ! -f "$SELF_LAUNCHER" || ! -f "$LEAK_LAUNCHER" ]]; then
+if [[ ! -f "$LAUNCHER" || ! -f "$SELF_LAUNCHER" || ! -f "$LEAK_LAUNCHER" || ! -f "$OLD_LAUNCHER" ]]; then
     echo "WARN: stdio-bridge fixtures not built on this box; skipping."
     echo "Driver stdio-bridge test: SKIP"
     exit 0
@@ -86,72 +88,17 @@ fi
 test_add_efi "$LAUNCHER"
 test_add_efi "$SELF_LAUNCHER"
 test_add_efi "$LEAK_LAUNCHER"
+test_add_efi "$OLD_LAUNCHER"
 
 # Stage the < redirect input files. The first line is the value the
 # driver should echo back through the bridge. in2.txt feeds the
 # self-locating launcher's redirect case.
 printf 'redirhello\nsecond line ignored\n' > "$TEST_STAGING/in.txt"
 printf 'selfredir\nsecond line ignored\n' > "$TEST_STAGING/in2.txt"
+printf 'oldredir\nsecond line ignored\n' > "$TEST_STAGING/in3.txt"
 : > "$TEST_STAGING/empty.txt"   # zero-byte file for the clean-EOF probe
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    # STALE-BRIDGE / WARM-PATH USE-AFTER-FREE REGRESSION (consumer do.efi):
-    #   1. load the driver resident via a NON-stdin verb (clean launcher),
-    #   2. a leaker launcher installs the bridge with a PIPE StdIn then exits
-    #      WITHOUT uninstalling -> a STALE bridge whose stdin_h is a freed
-    #      pipe handle,
-    #   3. a warm self-locating launcher reads a pipe. The driver must SKIP
-    #      the stale (dead-launcher) bridge and read THIS launcher's input
-    #      ("warmpipe") instead of dereferencing the freed handle (#GP/#PF
-    #      in Shell.dll — the exact do.efi symptom).
-    # Runs FIRST so the stale instance is the OLDEST (returned first by a
-    # naive LocateProtocol) — the precise ordering that crashed do.efi.
-    echo "echo STALE_BEGIN"
-    echo "stdio-bridge-fix.efi emit"
-    echo "echo poison |a stdio-bridge-leak.efi"
-    echo "echo warmpipe |a stdio-bridge-self.efi echo"
-    echo "echo STALE_DONE"
-    echo "echo PIPE_BEGIN"
-    # `|a` is the UEFI shell's ASCII pipe: it feeds the LHS output to the
-    # RHS StdIn as raw 8-bit bytes. The default `|` pipes UCS-2 (UTF-16LE),
-    # which axl_stdin (raw bytes) would read as 'h\0e\0...' -> GOT:h.
-    echo "echo hello |a stdio-bridge-fix.efi echo"
-    echo "echo TEXTPIPE_BEGIN"
-    # Default `|` pipes UCS-2; the echotext verb reads via axl_stdin_text(),
-    # which decodes it to UTF-8 — so this works WITHOUT the `|a` operator.
-    echo "echo textpipeinput | stdio-bridge-fix.efi echotext"
-    echo "echo REDIR_BEGIN"
-    echo "stdio-bridge-fix.efi echo < in.txt"
-    echo "echo EMIT_BEGIN"
-    echo "stdio-bridge-fix.efi emit > out.txt"
-    echo "echo TYPE_BEGIN"
-    echo "type out.txt"
-    echo "echo NOINPUT_BEGIN"
-    # Empty redirected file -> clean EOF (a file is never interactive, so the
-    # console line-reader fallback does not engage). A non-redirected read at
-    # an interactive console now blocks for a typed line instead — that path
-    # is covered by test-console-readline-qemu.sh.
-    echo "stdio-bridge-fix.efi echo < empty.txt"
-    # Self-locating launcher: resolves the resident driver itself (warm
-    # fast-path) and installs the bridge via the public escape hatch
-    # axl_shared_driver_install_stdio_bridge(). The driver is resident
-    # because the locate launcher above already loaded it. Distinct input
-    # values keep these GOT: tokens unambiguous from the locate cases.
-    echo "echo SELF_BEGIN"
-    echo "echo selfhello |a stdio-bridge-self.efi echo"
-    echo "echo selftext | stdio-bridge-self.efi echotext"
-    echo "stdio-bridge-self.efi echo < in2.txt"
-    echo "echo SELF_DONE"
-    echo "echo ESTAT_BEGIN"
-    echo "stdio-bridge-self.efi exitstatus"
-    echo "echo ESTAT=%lasterror%"
-    echo "echo ESTAT_DONE"
-    echo "echo STDIO_DONE"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 
@@ -200,6 +147,34 @@ stale_warm=$(sed -n '/STALE_BEGIN/,/STALE_DONE/p' "$TEST_CLEAN_LOG" \
 estat=$(sed -n '/ESTAT_BEGIN/,/ESTAT_DONE/p' "$TEST_CLEAN_LOG" \
     | grep -c 'ESTAT=0x12345678' || true)
 
+# Raw stdout, a launcher each: every line exact, the launchers' leak verdicts
+# aside. Decoder state carried over would show the second RAWPLAIN as
+# UTF-16 (after the mark) and the third with a U+FFFD before it (the C3).
+rawkey_win=$(sed -n '/^RAWKEY_BEGIN/,/^RAWKEY_DONE/p' "$TEST_CLEAN_LOG" \
+    | grep -v 'mem: no leaks detected' || true)
+rawkey_want=$'RAWKEY_BEGIN\nBOM\nRAWPLAIN\nSPLIT\nRAWPLAIN\nRAWKEY_DONE'
+if [[ "$rawkey_win" == "$rawkey_want" ]]; then
+    rawkey_ok=1
+else
+    rawkey_ok=0
+    echo "Raw stdout, a launcher each: want exactly"; printf '%s\n' "$rawkey_want" | sed 's/^/    | /'
+    echo "  got"; printf '%s\n' "$rawkey_win" | cat -v | sed 's/^/    | /'
+fi
+
+# The original-layout launcher: the driver read no bridge, so its StdIn is
+# EOF -- exactly, the launcher's leak verdict aside. GOT:oldredir means it
+# took the bridge, reading `target` past the end of the launcher's static.
+old_win=$(sed -n '/^OLD_BEGIN/,/^OLD_DONE/p' "$TEST_CLEAN_LOG" \
+    | grep -v 'mem: no leaks detected' || true)
+old_want=$'OLD_BEGIN\nGOT:<EOF>\nOLD_DONE'
+if [[ "$old_win" == "$old_want" ]]; then
+    old_ok=1
+else
+    old_ok=0
+    echo "Original-layout launcher: want exactly"; printf '%s\n' "$old_want" | sed 's/^/    | /'
+    echo "  got"; printf '%s\n' "$old_win" | cat -v | sed 's/^/    | /'
+fi
+
 # > probe — informational only. Disambiguate the source of DRIVEROUT:
 #   - between EMIT_BEGIN and TYPE_BEGIN  => printed to CONSOLE at the emit
 #     run; the `>` redirect did NOT capture the driver's StdOut.
@@ -217,6 +192,8 @@ printf "Self-locate (public install): pipe=%d textpipe=%d redir=%d\n" \
     "$self_pipe" "$self_textpipe" "$self_redir"
 printf "Stale-bridge warm read (no UAF): warmpipe=%d\n" "$stale_warm"
 printf "Cross-image exit-status reflection: estat=%d\n" "$estat"
+printf "Original-layout launcher ignored (no read past its bridge): old=%d\n" "$old_ok"
+printf "Raw decoder state per launcher: rawkey=%d\n" "$rawkey_ok"
 
 # Record the > probe verdict explicitly for the task report.
 if [[ "$type_readback" -ge 1 ]]; then
@@ -231,7 +208,8 @@ fi
 # and that the shell reached STDIO_DONE (script ran to completion).
 if [[ "$pipe" -ge 1 && "$textpipe" -ge 1 && "$redir" -ge 1 && "$noinput" -ge 1 && "$done_marker" -ge 1 \
       && "$self_pipe" -ge 1 && "$self_textpipe" -ge 1 && "$self_redir" -ge 1 \
-      && "$stale_warm" -ge 1 && "$estat" -ge 1 ]]; then
+      && "$stale_warm" -ge 1 && "$estat" -ge 1 && "$old_ok" -eq 1 \
+      && "$rawkey_ok" -eq 1 ]]; then
     echo "Driver stdio-bridge test: OK"
     exit 0
 else

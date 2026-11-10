@@ -18,10 +18,27 @@
 #include <axl/axl-str.h>
 #include <axl/axl-sys.h>
 #include <uefi/axl-uefi.h>
+#include "axl-fs-internal.h"
 
 AXL_LOG_DOMAIN("fs-provider");
 
-#define MAX_PATH_BYTES  512u
+bool axl_fs_provider_test_unfiltered;
+bool axl_fs_provider_test_unterminated;
+
+/* Longest path the thunk hands a provider, in UTF-8 bytes with the NUL. */
+#define MAX_PATH_BYTES  AXL_FS_PROVIDER_PATH_MAX
+/* The same path in UCS-2 units with the NUL: each unit is at most 3 bytes. */
+#define MAX_PATH_UNITS  (AXL_FS_PROVIDER_PATH_MAX / 3u)
+/* Longest name, in UTF-8 bytes, that AxlFsEntry.name holds whole. */
+#define ENTRY_NAME_BYTES  (sizeof(((AxlFsEntry *)0)->name) - 1u)
+/* Longest name in UTF-16 units: FAT's, which is what UEFI readers size
+   their buffers for. A provider name must fit both limits. */
+#define NAME_UNITS_MAX  255u
+/* Latest Unix second an EFI_TIME can hold: 9999-12-31 23:59:59 UTC. */
+#define EFI_TIME_UNIX_MAX  253402300799ULL
+/* EFI_TIME.Daylight: EFI_TIME_ADJUST_DAYLIGHT (0x01) and EFI_TIME_IN_DAYLIGHT
+   (0x02), UEFI 2.11 section 8.3; no other bit is defined. */
+#define EFI_TIME_DAYLIGHT_BITS  0x03u
 
 // ===================================================================
 // Internal types
@@ -87,6 +104,9 @@ struct FileThunk {
     AxlFsProviderFile   *backing;     ///< NULL once dead/closed
     char                 path[MAX_PATH_BYTES];   ///< absolute UTF-8, '/'
     bool                 is_dir;
+    bool                 writable;    ///< opened with EFI_FILE_MODE_WRITE
+    bool                 has_pending; ///< `pending` holds an entry a Read could not take
+    AxlFsEntry           pending;     ///< directory entry kept for the next Read
     bool                 dead;        ///< set on unpublish or force-close
 
     /* Linked-list pointers in pub->open_files. */
@@ -99,6 +119,10 @@ struct FileThunk {
 // ===================================================================
 
 static uint32_t attr_efi_to_axl(uint64_t efi_attr);
+static size_t utf16_units(const char *s, size_t n);
+static EFI_STATUS set_info_resolved(FileThunk *self, const EFI_FILE_INFO *fi,
+                                    size_t units, const AxlFsEntry *cur,
+                                    char *new_path, char *parent);
 
 // ===================================================================
 // AxlFsStatus → EFI_STATUS mapping
@@ -212,25 +236,110 @@ resolve_efi_path(
 {
     if (efi_name == NULL || out == NULL || out_size == 0) return AXL_ERR;
 
-    /* Convert to UTF-8 on the stack. EFI filename limit is 1023
-       CHAR16 (per spec); cap at MAX_PATH_BYTES which is plenty for
-       any realistic path. */
-    char name[MAX_PATH_BYTES];
-    axl_ucs2_to_utf8_buf((const unsigned short *)efi_name, name, sizeof(name));
+    /* A name longer than MAX_PATH_UNITS is refused, never cut: below it
+       the UTF-8 fits MAX_PATH_BYTES whole. */
+    size_t units = 0;
+    while (efi_name[units] != 0) {
+        if (++units >= MAX_PATH_UNITS) return AXL_ERR;
+    }
+    /* On the heap: Open and SetInfo run on whatever stack their caller has.
+       Out of memory is AXL_NO_RESOURCES -- EFI_OUT_OF_RESOURCES to the
+       caller -- never the AXL_ERR that says the NAME is bad. */
+    char *name = axl_malloc(MAX_PATH_BYTES);
+    if (name == NULL) return AXL_NO_RESOURCES;
+    axl_ucs2_to_utf8_buf((const unsigned short *)efi_name, name, MAX_PATH_BYTES);
 
     /* Normalize backslashes to forward slashes. */
     for (char *p = name; *p; p++) {
         if (*p == '\\') *p = '/';
     }
 
-    /* "" / "." → caller's path verbatim. */
+    int rc = AXL_OK;
     if (name[0] == '\0' || (name[0] == '.' && name[1] == '\0')) {
-        if (axl_strlen(base) >= out_size) return AXL_ERR;
-        axl_strlcpy(out, base, out_size);
-        return AXL_OK;
+        /* "" / "." → caller's path verbatim. */
+        if (axl_strlen(base) >= out_size) {
+            rc = AXL_ERR;
+        } else {
+            axl_strlcpy(out, base, out_size);
+        }
+    } else if (axl_path_resolve(base, name, out, out_size) != AXL_OK) {
+        rc = AXL_ERR;   /* too long, or ".." above the root */
+    } else {
+        /* Every component must fit AxlFsEntry.name, or a handle's name
+           could not be reported whole, and be one FAT could create (at most
+           255 UTF-16 units), as every listed name is. */
+        const char *comp = out;
+        for (const char *p = out; rc == AXL_OK; p++) {
+            if (*p == '/' || *p == '\0') {
+                size_t len = (size_t)(p - comp);
+                if (len > ENTRY_NAME_BYTES || utf16_units(comp, len) > NAME_UNITS_MAX) {
+                    rc = AXL_ERR;
+                }
+                comp = p + 1;
+            }
+            if (*p == '\0') {
+                break;
+            }
+        }
     }
+    axl_free(name);
+    return rc;
+}
 
-    return axl_path_resolve(base, name, out, out_size);
+/* UTF-16 units the first @p n bytes of UTF-8 @p s take: one per character,
+   two for one past the BMP (a four-byte sequence). */
+static size_t
+utf16_units(const char *s, size_t n)
+{
+    size_t units = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = (uint8_t)s[i];
+        if ((b & 0xC0u) != 0x80u) {
+            units += (b >= 0xF0u) ? 2u : 1u;
+        }
+    }
+    return units;
+}
+
+/* The directory part of absolute @p path into @p out ("/" for an entry at
+   the root). */
+static void
+path_parent(const char *path, char *out, size_t cap)
+{
+    size_t cut = 0;
+    for (size_t i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '/') {
+            cut = i;
+        }
+    }
+    if (cut == 0) {
+        axl_strlcpy(out, "/", cap);
+        return;
+    }
+    size_t n = (cut < cap) ? cut : cap - 1;
+    axl_memcpy(out, path, n);
+    out[n] = '\0';
+}
+
+/* The last component of absolute @p path. */
+static const char *
+path_last(const char *path)
+{
+    const char *last = path;
+    for (const char *p = path; *p != '\0'; p++) {
+        if (*p == '/') {
+            last = p + 1;
+        }
+    }
+    return last;
+}
+
+/* Is @p path strictly below @p dir, on a component boundary? */
+static bool
+path_below(const char *path, const char *dir)
+{
+    size_t n = axl_strlen(dir);
+    return axl_strncmp(path, dir, n) == 0 && path[n] == '/';
 }
 
 // ===================================================================
@@ -245,17 +354,18 @@ resolve_efi_path(
  * Multi-byte UTF-8 names produce fewer cells than bytes (one cell
  * per code-point), so we can never exceed the source byte count.
  *
- * Hard-caps the source at sizeof(AxlFsEntry.name) — 256 — so
- * a provider that hands back a non-NUL-terminated buffer can't make
- * us walk off the end. axl_utf8_to_ucs2_buf is itself NUL-driven
- * but we use a stack-local NUL-terminated copy to enforce the cap.
+ * Hard-caps the source at sizeof(AxlFsEntry.name) so a provider that
+ * hands back a non-NUL-terminated buffer can't make us walk off the end.
+ * axl_utf8_to_ucs2_buf is itself NUL-driven but we use a stack-local
+ * NUL-terminated copy to enforce the cap. Every byte is at most one unit,
+ * so a scratch of that many units holds any name whole.
  */
 static size_t
 efi_file_info_size(const char *utf8_name)
 {
-    char bounded[256];
+    char bounded[sizeof(((AxlFsEntry *)0)->name)];
     axl_strlcpy(bounded, utf8_name, sizeof(bounded));
-    unsigned short scratch[256];
+    unsigned short scratch[sizeof(bounded)];
     size_t cells = axl_utf8_to_ucs2_buf(bounded, scratch,
                                         sizeof(scratch) / sizeof(scratch[0]));
     return SIZE_OF_EFI_FILE_INFO + (cells + 1) * sizeof(CHAR16);
@@ -293,6 +403,31 @@ attr_efi_to_axl(uint64_t efi_attr)
     return (uint32_t)(efi_attr & AXL_EFI_ATTR_MASK);
 }
 
+/* Is @p t a valid EFI_TIME (UEFI 2.11 section 8.3, as the EDK2-derived FAT
+   driver's FatIsValidTime checks it)? The calendar fields must name a real
+   second, TimeZone must be within a day of UTC or unspecified, and only the
+   two defined Daylight bits may be set. */
+static bool
+efi_time_is_valid(const EFI_TIME *t)
+{
+    static const uint8_t days[12] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+    if (t->Year < 1900 || t->Year > 9999 || t->Month < 1 || t->Month > 12
+        || t->Day < 1 || t->Day > days[t->Month - 1]
+        || t->Hour > 23 || t->Minute > 59 || t->Second > 59
+        || t->Nanosecond > 999999999u) {
+        return false;
+    }
+    bool leap = (t->Year % 4u == 0 && t->Year % 100u != 0) || t->Year % 400u == 0;
+    if (t->Month == 2 && t->Day == 29 && !leap) {
+        return false;
+    }
+    if (t->TimeZone != 0x07FF && (t->TimeZone < -1440 || t->TimeZone > 1440)) {
+        return false;
+    }
+    return (t->Daylight & ~EFI_TIME_DAYLIGHT_BITS) == 0;
+}
+
 /**
  * @brief Lay out an EFI_FILE_INFO from an AxlFsEntry into
  *     @p buf. @p inout_size is the caller-provided buffer cap on
@@ -313,7 +448,9 @@ write_efi_file_info(
     }
 
     EFI_FILE_INFO *fi = buf;
-    axl_memset(fi, 0, needed);
+    /* The test hook leaves the NUL's unit as the caller's buffer had it. */
+    axl_memset(fi, 0, axl_fs_provider_test_unterminated
+                      ? needed - sizeof(CHAR16) : needed);
     fi->Size         = needed;
     fi->FileSize     = info->size;
     /* Spec PhysicalSize is "the amount of physical space allocated on
@@ -323,14 +460,27 @@ write_efi_file_info(
        FileSize so consumers always see a sane non-zero value. */
     fi->PhysicalSize = (info->alloc_size != 0) ? info->alloc_size : info->size;
     fi->Attribute    = attr_axl_to_efi(info->attributes);
-    /* CreateTime / LastAccessTime / ModificationTime intentionally
-       left zeroed; AxlFsEntry only carries a single mtime
-       and we don't lossily duplicate it across all three. Future:
-       add per-time accessors to the provider vtable per
-       AXL_FS_PROVIDER_VERSION bump. */
+    /* ModificationTime in UTC calendar fields, zone unspecified, as AXL
+       writes every file time; 0 (unknown) or a time EFI_TIME cannot hold
+       stays all zero. CreateTime and LastAccessTime stay zero: AxlFsEntry
+       carries one time and it is not duplicated across all three. */
+    if (info->mtime_unix != 0 && info->mtime_unix <= EFI_TIME_UNIX_MAX) {
+        axl_backend_unix_to_efi_time(info->mtime_unix, &fi->ModificationTime);
+    }
 
     /* Trailer: UCS-2 name + NUL into FileName[]. */
     size_t cells_cap = (needed - SIZE_OF_EFI_FILE_INFO) / sizeof(CHAR16);
+    if (axl_fs_provider_test_unterminated) {
+        /* The name without its NUL, the info sized to match: a driver
+           that omits it. Converted aside so the NUL is not written. */
+        unsigned short w[sizeof(info->name)];
+        size_t units = axl_utf8_to_ucs2_buf(info->name, w,
+                                            sizeof(w) / sizeof(w[0]));
+        axl_memcpy(fi->FileName, w, units * sizeof(CHAR16));
+        fi->Size    = SIZE_OF_EFI_FILE_INFO + units * sizeof(CHAR16);
+        *inout_size = fi->Size;
+        return EFI_SUCCESS;
+    }
     axl_utf8_to_ucs2_buf(info->name,
                          (unsigned short *)fi->FileName,
                          cells_cap);
@@ -432,9 +582,9 @@ thunk_open(
 
     Publication *pub = self->pub;
     char resolved[MAX_PATH_BYTES];
-    if (resolve_efi_path(self->path, file_name, resolved, sizeof(resolved))
-            != AXL_OK) {
-        return EFI_INVALID_PARAMETER;
+    int rrc = resolve_efi_path(self->path, file_name, resolved, sizeof(resolved));
+    if (rrc != AXL_OK) {
+        return (rrc == AXL_NO_RESOURCES) ? EFI_OUT_OF_RESOURCES : EFI_INVALID_PARAMETER;
     }
 
     /* Translate EFI_FILE_MODE_* → AXL_FS_OPEN_* and EFI_FILE_*
@@ -459,8 +609,9 @@ thunk_open(
         pub->provider.close(backing);
         return EFI_OUT_OF_RESOURCES;
     }
-    child->backing = backing;
-    child->is_dir  = is_dir;
+    child->backing  = backing;
+    child->is_dir   = is_dir;
+    child->writable = (open_mode & EFI_FILE_MODE_WRITE) != 0u;
     axl_strlcpy(child->path, resolved, sizeof(child->path));
     *new_handle = &child->file;
     return EFI_SUCCESS;
@@ -520,6 +671,48 @@ thunk_delete(EFI_FILE_PROTOCOL *this)
 // Read / ReadDir
 // -------------------------------------------------------------------
 
+/* Is @p e's name ONE entry a caller can join onto a path
+   (axl_fs_name_is_one_component)? "." and ".." are dropped quietly: any
+   directory may list them. The rest are dropped with the provider and the
+   name, escaped -- at warning for the first in directory @p dir (the ring
+   axl_fs_report_first keeps), at debug after that, so a remote directory
+   full of such names does not flood the log. */
+static bool
+entry_name_is_one(
+    const Publication  *pub,
+    const char         *dir,
+    const AxlFsEntry   *e
+    )
+{
+    const char *n = e->name;
+    if (axl_strcmp(n, ".") == 0 || axl_strcmp(n, "..") == 0) {
+        return false;
+    }
+    /* One entry name, and one FAT could create: at most 255 UTF-16 units.
+       UEFI readers size their buffers for FAT's names (EDK2's
+       FileHandleFindNextFile asserts no EFI_BUFFER_TOO_SMALL), and a longer
+       name could not be opened through a path anyway. */
+    if (axl_fs_name_is_one_component(n)
+        && utf16_units(n, axl_strlen(n)) <= NAME_UNITS_MAX) {
+        return true;
+    }
+    char esc[64];
+    axl_fs_escape_name(n, esc, sizeof(esc));
+    const char *label = (pub->provider.default_label != NULL)
+                        ? pub->provider.default_label : "";
+    if (axl_fs_report_first(axl_fs_report_key(pub, dir))) {
+        /* log-level: the walker the entry is hidden from sees only a shorter
+           listing; nothing it is returned says an entry was skipped. */
+        axl_warning("provider '%s' listed \"%s\", which is not one entry name, or "
+                    "is over 255 UTF-16 units; skipped (more in this directory are "
+                    "logged at debug)", label, esc);
+    } else {
+        axl_debug("provider '%s' listed \"%s\", which is not one entry name, or is "
+                  "over 255 UTF-16 units; skipped", label, esc);
+    }
+    return false;
+}
+
 static EFI_STATUS EFIAPI
 thunk_read(EFI_FILE_PROTOCOL *this, UINTN *buffer_size, VOID *buffer)
 {
@@ -528,21 +721,36 @@ thunk_read(EFI_FILE_PROTOCOL *this, UINTN *buffer_size, VOID *buffer)
     if (buffer_size == NULL) return EFI_INVALID_PARAMETER;
 
     if (self->is_dir) {
-        AxlFsEntry info = {
-            .struct_size = sizeof(info),
-            .version     = AXL_FS_ENTRY_VERSION,
-        };
-        bool end = false;
-        AxlFsStatus s = self->pub->provider.read_dir(self->backing,
-                                                      &info, &end);
-        if (s != AXL_FS_OK) return status_to_efi(s);
-        if (end) {
-            /* End-of-directory: spec says return success with
-               *BufferSize = 0. */
-            *buffer_size = 0;
-            return EFI_SUCCESS;
+        /* An entry a too-small buffer could not take is kept and handed
+           back on the next Read, as the FAT driver keeps it: a reader that
+           probes for the size and retries must get the SAME entry. */
+        if (!self->has_pending) {
+            for (;;) {
+                axl_memset(&self->pending, 0, sizeof(self->pending));
+                self->pending.struct_size = sizeof(self->pending);
+                self->pending.version     = AXL_FS_ENTRY_VERSION;
+                bool end = false;
+                AxlFsStatus s = self->pub->provider.read_dir(self->backing,
+                                                              &self->pending, &end);
+                if (s != AXL_FS_OK) return status_to_efi(s);
+                if (end) {
+                    /* End-of-directory: spec says return success with
+                       *BufferSize = 0. */
+                    *buffer_size = 0;
+                    return EFI_SUCCESS;
+                }
+                if (axl_fs_provider_test_unfiltered
+                    || entry_name_is_one(self->pub, self->path, &self->pending)) {
+                    break;
+                }
+            }
+            self->has_pending = true;
         }
-        return write_efi_file_info(&info, buffer_size, buffer);
+        EFI_STATUS rc = write_efi_file_info(&self->pending, buffer_size, buffer);
+        if (rc != EFI_BUFFER_TOO_SMALL) {
+            self->has_pending = false;
+        }
+        return rc;
     }
 
     /* Regular file. */
@@ -622,6 +830,9 @@ thunk_set_position(EFI_FILE_PROTOCOL *this, UINT64 position)
         if (position != 0) return EFI_UNSUPPORTED;
     }
     AxlFsStatus s = self->pub->provider.seek(self->backing, position);
+    if (s == AXL_FS_OK) {
+        self->has_pending = false;   /* a rewind starts the listing over */
+    }
     return status_to_efi(s);
 }
 
@@ -767,22 +978,151 @@ thunk_set_info(
                       (const AxlGuid *)&gEfiFileInfoGuid)) {
         return EFI_UNSUPPORTED;
     }
-    if (self->pub->provider.set_info == NULL) return EFI_WRITE_PROTECTED;
     if (buffer_size < SIZE_OF_EFI_FILE_INFO) return EFI_INVALID_PARAMETER;
 
-    EFI_FILE_INFO *fi = buffer;
+    Publication   *pub = self->pub;
+    EFI_FILE_INFO *fi  = buffer;
+
+    /* The FileName must end inside the buffer and convert whole. */
+    size_t name_max = (buffer_size - SIZE_OF_EFI_FILE_INFO) / sizeof(CHAR16);
+    size_t units    = 0;
+    while (units < name_max && fi->FileName[units] != 0) {
+        units++;
+    }
+    if (units == name_max) return EFI_INVALID_PARAMETER;
+
+    AxlFsEntry cur = {
+        .struct_size = sizeof(cur),
+        .version     = AXL_FS_ENTRY_VERSION,
+    };
+    AxlFsStatus s = pub->provider.get_info(self->backing, &cur);
+    if (s != AXL_FS_OK) return status_to_efi(s);
+
+    /* The new path, resolved as the EDK2-derived FAT driver resolves it: a
+       leading separator from the volume root, anything else from the
+       file's PARENT directory (the Shell's mv sends "..\x"). An empty
+       FileName keeps the name. The path buffers live on the heap: SetInfo
+       runs on whatever stack its caller has. */
+    char *new_path = axl_malloc(2u * MAX_PATH_BYTES);
+    if (new_path == NULL) return EFI_OUT_OF_RESOURCES;
+    EFI_STATUS rc = set_info_resolved(self, fi, units, &cur, new_path,
+                                      new_path + MAX_PATH_BYTES);
+    axl_free(new_path);
+    return rc;
+}
+
+/* thunk_set_info once the current metadata is read: @p new_path and
+   @p parent are MAX_PATH_BYTES of heap each. */
+static EFI_STATUS
+set_info_resolved(
+    FileThunk           *self,
+    const EFI_FILE_INFO *fi,
+    size_t               units,
+    const AxlFsEntry    *cur,
+    char                *new_path,
+    char                *parent
+    )
+{
+    Publication *pub      = self->pub;
+    AxlFsStatus  s;
+    bool         renaming = false;
+    new_path[0] = '\0';
+    if (units > 0) {
+        path_parent(self->path, parent, MAX_PATH_BYTES);
+        int rrc = resolve_efi_path(parent, fi->FileName, new_path, MAX_PATH_BYTES);
+        if (rrc != AXL_OK) {
+            /* too long, or above the root -- or out of memory */
+            return (rrc == AXL_NO_RESOURCES) ? EFI_OUT_OF_RESOURCES
+                                             : EFI_INVALID_PARAMETER;
+        }
+        renaming = axl_strcmp(new_path, self->path) != 0;
+    }
+
+    /* A non-zero time must be a valid EFI_TIME after 1970-01-01 00:00:00
+       UTC: 0 already means "unknown". All zero is UEFI's "leave it". */
+    static const EFI_TIME zero_time;
+    bool     time_given = axl_memcmp(&fi->ModificationTime, &zero_time,
+                                     sizeof(zero_time)) != 0;
+    uint64_t want_mtime = 0;
+    if (time_given) {
+        if (!efi_time_is_valid(&fi->ModificationTime)) {
+            return EFI_INVALID_PARAMETER;
+        }
+        want_mtime = axl_backend_efi_time_to_unix(&fi->ModificationTime);
+        if (want_mtime == 0) return EFI_INVALID_PARAMETER;
+    }
+
+    uint32_t want_attr    = attr_efi_to_axl(fi->Attribute);
+    bool     size_changed = !self->is_dir && fi->FileSize != cur->size;
+    bool     time_set     = time_given
+                            && (size_changed || want_mtime != cur->mtime_unix);
+    bool     attr_changed = want_attr != cur->attributes;
+
+    if (((want_attr ^ cur->attributes) & AXL_FS_ATTR_DIRECTORY) != 0u) {
+        return EFI_ACCESS_DENIED;   /* a file cannot become a directory */
+    }
+    /* UEFI 2.11 13.5.14: through a read-only handle only the Attribute
+       may change. */
+    if (!self->writable && (renaming || size_changed || time_set)) {
+        return EFI_ACCESS_DENIED;
+    }
+    /* Refused as the FAT driver refuses them, whether or not the provider
+       has `rename`: the root has no name to change and nothing can be
+       renamed onto it; a directory cannot move into itself or below
+       itself; and a directory with any handle open below it does not move
+       at all -- those handles' paths would keep the old name. */
+    if (renaming && (axl_strcmp(self->path, "/") == 0
+                     || axl_strcmp(new_path, "/") == 0)) {
+        return EFI_ACCESS_DENIED;
+    }
+    if (renaming && self->is_dir) {
+        if (path_below(new_path, self->path)) {
+            return EFI_ACCESS_DENIED;
+        }
+        for (const FileThunk *o = pub->open_first; o != NULL; o = o->next) {
+            if (o != self && !o->dead && path_below(o->path, self->path)) {
+                return EFI_ACCESS_DENIED;
+            }
+        }
+    }
+
+    AxlFsProviderRename rename_cb = pub->provider.rename;
+    bool                name_via_set_info = false;
+    if (renaming && rename_cb != NULL) {
+        s = rename_cb(self->backing, new_path);
+        if (s != AXL_FS_OK) return status_to_efi(s);
+        axl_strlcpy(self->path, new_path, sizeof(self->path));
+    } else if (renaming) {
+        /* Without `rename` a provider renames within the directory only:
+           a move elsewhere is EFI_UNSUPPORTED, nothing changed, which the
+           caller reads as "copy instead" (axl_file_move). The parents are
+           compared in place: everything before each path's last name. */
+        size_t from = (size_t)(path_last(self->path) - self->path);
+        size_t to   = (size_t)(path_last(new_path) - new_path);
+        if (from != to || axl_memcmp(self->path, new_path, from) != 0) {
+            return EFI_UNSUPPORTED;
+        }
+        name_via_set_info = true;
+    }
+
+    if (!(attr_changed || size_changed || time_set || name_via_set_info)) {
+        return EFI_SUCCESS;
+    }
+    if (pub->provider.set_info == NULL) return EFI_WRITE_PROTECTED;
+
     AxlFsEntry info = {
         .struct_size = sizeof(info),
         .version     = AXL_FS_ENTRY_VERSION,
         .size        = fi->FileSize,
-        .mtime_unix  = 0,
-        .attributes  = attr_efi_to_axl(fi->Attribute),
+        .mtime_unix  = time_set ? want_mtime : 0,
+        .attributes  = want_attr,
     };
-    /* Trailing UCS-2 name → UTF-8 in info.name. */
-    axl_ucs2_to_utf8_buf((const unsigned short *)fi->FileName,
-                         info.name, sizeof(info.name));
-
-    AxlFsStatus s = self->pub->provider.set_info(self->backing, &info);
+    axl_strlcpy(info.name, renaming ? path_last(new_path) : cur->name,
+                sizeof(info.name));
+    s = pub->provider.set_info(self->backing, &info);
+    if (s == AXL_FS_OK && name_via_set_info) {
+        axl_strlcpy(self->path, new_path, sizeof(self->path));
+    }
     return status_to_efi(s);
 }
 
@@ -826,8 +1166,10 @@ thunk_open_volume(
         pub->provider.close(backing);
         return EFI_OUT_OF_RESOURCES;
     }
-    f->backing = backing;
-    f->is_dir  = is_dir;
+    f->backing  = backing;
+    f->is_dir   = is_dir;
+    /* The FAT driver opens a volume's root read-write. */
+    f->writable = true;
     axl_strlcpy(f->path, "/", sizeof(f->path));
     *root = &f->file;
     return EFI_SUCCESS;
@@ -841,7 +1183,14 @@ static int
 provider_validate(const AxlFsProvider *p)
 {
     if (p == NULL) return AXL_ERR;
-    if (p->struct_size < sizeof(AxlFsProvider)) return AXL_ERR;
+    /* Exactly version 1's size (ending at backend_ctx), or one that covers
+       all of `rename`: a size ending INSIDE it would leave the thunk part
+       of a function pointer to call (axl_fs_provider_publish copies only
+       struct_size bytes). */
+    if (p->struct_size != offsetof(AxlFsProvider, rename)
+        && p->struct_size < offsetof(AxlFsProvider, rename) + sizeof(p->rename)) {
+        return AXL_ERR;
+    }
     if (p->version == 0 || p->version > AXL_FS_PROVIDER_VERSION) return AXL_ERR;
     if (p->open == NULL)     return AXL_ERR;
     if (p->close == NULL)    return AXL_ERR;
@@ -915,7 +1264,12 @@ axl_fs_provider_publish(
 
     Publication *pub = axl_calloc(1, sizeof(*pub));
     if (pub == NULL) return AXL_ERR;
-    pub->provider = *provider;
+    /* Copy only the bytes the provider declares and leave the rest zero, so
+       a vtable built against an older header neither over-reads nor
+       supplies a member it does not have. */
+    size_t have = (provider->struct_size < sizeof(pub->provider))
+                  ? provider->struct_size : sizeof(pub->provider);
+    axl_memcpy(&pub->provider, provider, have);
     pub->vendor_guid = *vendor_guid;
     pub_list_init(pub);
 

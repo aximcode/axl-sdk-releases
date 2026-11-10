@@ -3,13 +3,13 @@
 # test-sdk-prefix.sh — the STAGED SDK has its own accessor, separate from the
 # build directory's.
 #
-# WHY THIS EXISTS. Two different things live under out/ and both were called
-# "the prefix":
+# WHY THIS EXISTS. Two different things once both lived under out/ and were
+# both called "the prefix":
 #
-#   out/native-<arch>[-release][-tls]   the BUILD directory -- intermediate
-#                                       objects, a function of ARCH x BUILD x
-#                                       AXL_TLS. Answered by build-prefix.sh.
-#   out/{bin,lib,include,share}         the STAGED SDK -- what
+#   build/<arch>-<debug|release>        the BUILD directory -- intermediate
+#                                       objects, a function of ARCH x BUILD.
+#                                       Answered by build-prefix.sh.
+#   stage/{bin,lib,include,share}       the STAGED SDK -- what
 #                                       `install.sh --prefix` produces and what
 #                                       a consumer actually consumes.
 #

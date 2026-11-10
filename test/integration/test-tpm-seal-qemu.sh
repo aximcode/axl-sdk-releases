@@ -1,5 +1,9 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=swtpm est=16 local-only=0
+# test-meta: arch=x64 needs=swtpm est=16 local-only=0 guest=none
+# guest=none: its TPM is a swtpm process this test starts per run (a
+#   -chardev socket at a per-run path), and sealing depends on that TPM's
+#   state: a pooled guest's TPM would need a swtpm the pool starts and
+#   restores with the snapshot (the state lives in swtpm), which it has not.
 # test-tpm-seal-qemu.sh — axl_tpm_seal / axl_tpm_unseal against a
 # swtpm-backed TPM 2.0.
 #
@@ -26,7 +30,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export TEST_SKIP_RATCHET=1
 
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/AxlTestPlatform.efi"
-make -C "$PROJECT_DIR" ARCH=x64 tests 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tests 2>&1 | tail -1
 
 SWTPM="${SWTPM:-$(command -v swtpm || true)}"
 if [[ -z "$SWTPM" ]]; then

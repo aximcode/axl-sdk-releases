@@ -4,8 +4,11 @@
 WHY THIS EXISTS.  ``share/`` holds the curated JSON5 databases the shipped
 tools auto-discover beside their own ``.efi``: ``pci-ids.json5`` for ``lspci``,
 ``usb-ids.json5`` for ``lsusb``, ``jedec.json5`` for ``memspd``.  Two places
-stage them -- ``.github/workflows/release.yml`` into the UEFI-tools tarball,
-``scripts/install.sh`` into an installed SDK -- and each kept its own
+stage them -- the UEFI-tools tarball (staged inline in
+``.github/workflows/release.yml``, then by ``make-uefi-tools-tarball.sh``,
+now by the uefi_tools install rules in ``packaging/uefi-tools/CMakeLists.txt``) and an
+installed SDK (``scripts/install.sh``, now ``cmake/AxlInstall.cmake``) -- and
+each kept its own
 hand-maintained list.  The workflow's read ``pci-ids.json5 pci-class.json5``,
 written when PCI was the only tool with a database and never revisited when
 ``lsusb`` and ``memspd`` grew theirs.  So every published
@@ -29,6 +32,11 @@ fires when a release is cut, and ``verify.sh`` runs no integration test.  So
 the coverage check lives here too: adding a sidecar without describing it fails
 the local gate rather than the tag build.
 
+AND that release.yml DELEGATES.  Its "Package tools tarball" step must run
+``make-release-assets.sh uefi-tools`` in code.  Without that check the step could grow
+its own staging back inline, where only a tag would ever run it -- the state
+this script was extracted to end.
+
 WHY IT STRIPS COMMENTS FIRST.  The first version of this gate matched the glob
 as a substring of the whole step, and the fix comment in ``release.yml`` -- the
 one explaining why a glob is used -- contains the literal ``share/*.json5``.
@@ -49,16 +57,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SHARE = PROJECT_ROOT / "share"
 GENERATOR = PROJECT_ROOT / "scripts" / "make-uefi-tools-readme.py"
 
-# Each staging path: the file, and the region of it to read. A workflow step is
-# addressed by name; a shell script is read whole.
+# The two staging paths, each read whole. Both are install() rules since
+# 2026-11-10 (Build-System-Design §10.16).
+TARBALL_SCRIPT = PROJECT_ROOT / "packaging" / "uefi-tools" / "CMakeLists.txt"
+# The SDK's staging is install() rules since 2026-11-10 (install.sh runs
+# `cmake --install`), so the glob to find there is CMake's.
+INSTALLER = PROJECT_ROOT / "cmake" / "AxlInstall.cmake"
+# The workflow step that must delegate to TARBALL_SCRIPT, addressed by name.
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "release.yml"
-INSTALLER = PROJECT_ROOT / "scripts" / "install.sh"
 STEP_NAME = "Package tools tarball"
+# The call, in CODE: the script invoked as a command, not named in prose.
+DELEGATES_IN_CODE = re.compile(
+    r"^\s*(?:run:\s*)?\./scripts/make-release-assets\.sh\s+uefi-tools\s", re.MULTILINE)
 
 # The glob, in CODE: a shell array assignment or a for-list, not prose. Both
-# `_sidecars=("$DIR"/share/*.json5)` and `SIDECARS=(share/*.json5)` match.
+# `_sidecars=("$DIR"/share/*.json5)` and `SIDECARS=(share/*.json5)` match --
+# and CMake's `install(DIRECTORY <src>/share/ ... PATTERN "*.json5")`, a glob
+# the install evaluates when it runs -- with no EXCLUDE anywhere in that
+# call, which would take a sidecar back out of the glob.
 GLOB_IN_CODE = re.compile(
-    r"""(?:=\(|\bfor\s+\w+\s+in\b)[^\n#]*?share/\*\.json5""",
+    r"""(?:=\(|\bfor\s+\w+\s+in\b)[^\n#]*?share/\*\.json5
+      | file\(GLOB\s+\w+\s+\S*/share/\*\.json5
+      | install\(DIRECTORY\s+\S*/share/\s(?:(?!EXCLUDE)[^)])*?PATTERN\s+"\*\.json5"
+        (?:(?!EXCLUDE)[^)])*\)""",
     re.VERBOSE,
 )
 
@@ -119,27 +140,33 @@ def main() -> int:
 
     errors = 0
 
-    for path, step in ((WORKFLOW, STEP_NAME), (INSTALLER, None)):
+    for path in (TARBALL_SCRIPT, INSTALLER):
         rel = path.relative_to(PROJECT_ROOT)
         if not path.is_file():
             fail(f"check-tools-sidecars: FAIL -- {rel} not found")
             errors += 1
             continue
-        body: str | None = path.read_text()
-        if step is not None:
-            body = extract_step(body or "", step)
-            if body is None:
-                fail(f"check-tools-sidecars: FAIL -- no '{step}' step in "
-                     f"{rel}; the gate cannot see what it is meant to check "
-                     "(renamed step?)")
-                errors += 1
-                continue
+        body = path.read_text()
         if not GLOB_IN_CODE.search(strip_comments(body)):
             fail(f"check-tools-sidecars: FAIL -- {rel} does not stage "
                  "share/*.json5 by glob in code.")
             fail("  A hand-maintained list is what shipped lsusb.efi and "
                  "memspd.efi with no name database.")
             errors += 1
+
+    wf_rel = WORKFLOW.relative_to(PROJECT_ROOT)
+    step_body = (extract_step(WORKFLOW.read_text(), STEP_NAME)
+                 if WORKFLOW.is_file() else None)
+    if step_body is None:
+        fail(f"check-tools-sidecars: FAIL -- no '{STEP_NAME}' step in "
+             f"{wf_rel}; the gate cannot see what it is meant to check "
+             "(renamed step?)")
+        errors += 1
+    elif not DELEGATES_IN_CODE.search(strip_comments(step_body)):
+        fail(f"check-tools-sidecars: FAIL -- {wf_rel}'s '{STEP_NAME}' step "
+             f"does not run scripts/make-release-assets.sh uefi-tools; "
+             "staging inline again is how its lists drifted.")
+        errors += 1
 
     undocumented = [s for s in sidecars if s not in (documented_sidecars()
                                                      or set())]
@@ -160,7 +187,7 @@ def main() -> int:
         return 1
 
     print(f"check-tools-sidecars: clean -- {len(sidecars)} sidecar(s), "
-          "2 staging path(s) glob-driven, all documented")
+          "2 staging path(s) glob-driven, release.yml delegates, all documented")
     return 0
 
 

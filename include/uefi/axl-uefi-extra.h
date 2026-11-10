@@ -11,6 +11,9 @@
       - IPMI_PROTOCOL (EDK2 MdeModulePkg, not a UEFI/PI spec type)
       - DELL_IPMI_TRANSPORT (vendor-proprietary)
       - SMBIOS_TABLE_TYPE38 (DMTF SMBIOS spec, not UEFI/PI/ACPI)
+      - EFI_IP4_CONFIG_PROTOCOL (UEFI 2.3.1; removed from the spec in 2.4)
+      - EFI_NIC_IP4_CONFIG_PROTOCOL (EDK-private, pre-UEFI-2.4 network stack)
+      - EFIERR (the error encoding the generated TCP4 statuses use)
 
     Include via <uefi/axl-uefi.h> after generated/all.h.
 **/
@@ -27,6 +30,18 @@
 #endif
 
 #include "generated/all.h"
+
+// ===================================================================
+// EFIERR (UEFI Spec Appendix D's error encoding, as EDK2 spells it)
+//
+// The spec writes the TCP4 token statuses (generated/network.h) as
+// `EFIERR (104)` and never defines the macro in a block the generator can
+// extract; status.h spells the same encoding `(EFI_ERROR_BIT | n)`.
+// ===================================================================
+
+#ifndef EFIERR
+#define EFIERR(a)  (EFI_ERROR_BIT | (a))
+#endif
 
 // ===================================================================
 // EFI_SHELL_PROTOCOL (UEFI Shell Spec 2.2, Section 2.2)
@@ -119,6 +134,13 @@ typedef CONST CHAR16 * (EFIAPI *EFI_SHELL_GET_ENV)(
     IN CONST CHAR16  *Name
     );
 
+// Shell 2.2 §2.2.5: the alias's value, or NULL when none; *Volatile (optional)
+// says whether it lasts across a reset. Shell-owned storage.
+typedef CONST CHAR16 * (EFIAPI *EFI_SHELL_GET_ALIAS)(
+    IN  CONST CHAR16  *Alias,
+    OUT BOOLEAN       *Volatile OPTIONAL
+    );
+
 typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_ENV)(
     IN CONST CHAR16  *Name,
     IN CONST CHAR16  *Value,
@@ -147,6 +169,10 @@ typedef CONST CHAR16 *(EFIAPI *EFI_SHELL_GET_MAP_FROM_DEVICE_PATH)(
 
 typedef EFI_DEVICE_PATH_PROTOCOL *(EFIAPI *EFI_SHELL_GET_DEVICE_PATH_FROM_MAP)(
     IN CONST CHAR16  *Mapping
+    );
+
+typedef EFI_DEVICE_PATH_PROTOCOL *(EFIAPI *EFI_SHELL_GET_DEVICE_PATH_FROM_FILE_PATH)(
+    IN CONST CHAR16  *Path
     );
 
 typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_MAP)(
@@ -257,12 +283,12 @@ struct _EFI_SHELL_PROTOCOL {
     EFI_SHELL_EXECUTE              Execute;              // 2.2.2 (USED)
     EFI_SHELL_GET_ENV              GetEnv;               // 2.2.3 (USED)
     EFI_SHELL_SET_ENV              SetEnv;               // 2.2.4 (USED)
-    void                          *GetAlias;             // 2.2.5
+    EFI_SHELL_GET_ALIAS            GetAlias;             // 2.2.5 (USED)
     void                          *SetAlias;             // 2.2.6
     void                          *GetHelpText;          // 2.2.7
     EFI_SHELL_GET_DEVICE_PATH_FROM_MAP GetDevicePathFromMap; // 2.2.8 (USED)
     EFI_SHELL_GET_MAP_FROM_DEVICE_PATH GetMapFromDevicePath; // 2.2.9 (USED)
-    void                          *GetDevicePathFromFilePath; // 2.2.10
+    EFI_SHELL_GET_DEVICE_PATH_FROM_FILE_PATH GetDevicePathFromFilePath; // 2.2.10 (USED)
     void                          *GetFilePathFromDevicePath; // 2.2.11
     EFI_SHELL_SET_MAP              SetMap;               // 2.2.12 (USED)
     EFI_SHELL_GET_CUR_DIR         GetCurDir;             // 2.2.13 (USED)
@@ -360,6 +386,8 @@ typedef struct {
 
 #define HARDWARE_DEVICE_PATH              0x01
 #define HW_VENDOR_DP                      0x04
+#define MEDIA_DEVICE_PATH                 0x04
+#define MEDIA_FILEPATH_DP                 0x04
 #define END_DEVICE_PATH_TYPE              0x7F
 #define END_ENTIRE_DEVICE_PATH_SUBTYPE    0xFF
 
@@ -430,6 +458,11 @@ static __attribute__((unused)) EFI_GUID gEfiCpuArchProtocolGuid =
     { 0x26baccb1, 0x6f42, 0x11d4,
       {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81} };
 
+// PI Vol 2 §12.10 (generated/timer-arch.h): the firmware's periodic tick.
+static __attribute__((unused)) EFI_GUID gEfiTimerArchProtocolGuid =
+    { 0x26baccb3, 0x6f42, 0x11d4,
+      {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81} };
+
 // Console-device marker GUIDs (EDK2 MdeModulePkg.dec, NOT UEFI/PI spec, so the
 // spec-HTML manifest generator can't emit them — hand-written here). ConSplitter's
 // ConOut/ConIn DriverBinding.Supported binds a controller handle on the presence
@@ -445,6 +478,24 @@ static __attribute__((unused)) EFI_GUID gEfiConsoleOutDeviceGuid =
 static __attribute__((unused)) EFI_GUID gEfiConsoleInDeviceGuid =
     { 0xd3b36f2b, 0xd551, 0x11d4,
       {0x9a, 0x46, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d} };
+
+// The standard-error marker, the third of the set: ConSplitter's StdErr
+// DriverBinding binds a handle carrying it into the StdErr fan-out (what
+// gST->StdErr writes to). axl-console-device installs it beside the Out tag,
+// so a tool's error output reaches the take-over as it reaches a screen in
+// ErrOut; a take-over also moves it off the SCREENS it evicts from ConOut,
+// and leaves it on every other StdErr device (the serial terminal).
+static __attribute__((unused)) EFI_GUID gEfiStandardErrorDeviceGuid =
+    { 0xd3b36f2d, 0xd551, 0x11d4,
+      {0x9a, 0x46, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d} };
+
+// EFI 1.1's UGA Draw protocol, GOP's predecessor: no longer in the UEFI spec,
+// so the generator cannot extract it, but GraphicsConsole still binds to it
+// on firmware that has no GOP. axl-console-device asks for it (beside GOP)
+// to tell a screen console from a serial terminal.
+static __attribute__((unused)) EFI_GUID gEfiUgaDrawProtocolGuid =
+    { 0x982c298b, 0xf4fa, 0x41cb,
+      {0xb8, 0x38, 0x77, 0xaa, 0x68, 0x8f, 0xb8, 0x39} };
 
 // DXE Services Table GUID (PI spec DXE_SERVICES_TABLE_GUID). The spec macro
 // uses a flat 11-field initializer that the generator's GUID auto-extractor
@@ -466,6 +517,15 @@ static __attribute__((unused)) EFI_GUID gEfiEventBeforeExitBootServicesGuid =
     { 0x8be0e274, 0x3970, 0x4b44,
       {0x80, 0xc5, 0x1a, 0xb9, 0x50, 0x2f, 0x3b, 0xfc} };
 
+// The DXE core's idle-loop event group (EDK2 MdeModulePkg, not the UEFI
+// spec). CoreWaitForEvent signals it on every pass that finds none of the
+// caller's events signalled -- the moment the foreground has nothing to do;
+// EDK2's CpuDxe halts the CPU from it. Firmware that does not signal it
+// simply never runs a member of the group.
+static __attribute__((unused)) EFI_GUID gIdleLoopEventGuid =
+    { 0x3c8d294c, 0x5fc3, 0x4451,
+      {0xbb, 0x31, 0xc4, 0xc0, 0x32, 0x29, 0x5e, 0x6c} };
+
 static __attribute__((unused)) EFI_GUID gEfiShellProtocolGuid =
     { 0x6302d008, 0x7f9b, 0x4f30,
       {0x87, 0xac, 0x60, 0xc9, 0xfe, 0xf5, 0xda, 0x4e} };
@@ -473,6 +533,17 @@ static __attribute__((unused)) EFI_GUID gEfiShellProtocolGuid =
 static __attribute__((unused)) EFI_GUID gEfiShellParametersProtocolGuid =
     { 0x752f3136, 0x4e16, 0x4fdc,
       {0xa2, 0x2a, 0xe5, 0xf4, 0x68, 0x12, 0xf4, 0xca} };
+
+// The vendor GUID under which the EDK2 Shell mirrors its environment into
+// UEFI variables (ShellPkg.dec gShellVariableGuid; not in the Shell spec). A
+// volatile variable holds each volatile shell variable, `cwd` included
+// (ShellProtocol.c InternalEfiShellSetEnv). The backend reads `cwd` here only
+// as a change detector for its cached current directory -- a read that,
+// unlike EFI_SHELL_PROTOCOL.GetCurDir, parks nothing on the Shell's
+// per-command free list.
+static __attribute__((unused)) EFI_GUID gShellVariableGuid =
+    { 0x158def5a, 0xf656, 0x419c,
+      {0xb0, 0x27, 0x7a, 0x31, 0x92, 0xc0, 0x79, 0xd2} };
 
 // EFI 1.x shell (the EFI Toolkit "newshell") — predates the EDK2
 // EFI_SHELL_PROTOCOL and publishes neither of the two GUIDs above. It
@@ -793,6 +864,12 @@ struct _EFI_USB_IO_PROTOCOL {
 #endif
 #ifndef MSG_USB_DP
 #define MSG_USB_DP                  0x05
+#endif
+// Vendor-defined messaging node (UEFI Spec §10.3.5.11): TerminalDxe ends a
+// terminal's device path with one naming the terminal type (PC-ANSI,
+// VT-100, ...).
+#ifndef MSG_VENDOR_DP
+#define MSG_VENDOR_DP               0x0A
 #endif
 
 #pragma pack(1)
@@ -1665,6 +1742,127 @@ struct _EFI_HII_CONFIG_ACCESS_PROTOCOL {
     EFI_HII_ACCESS_EXTRACT_CONFIG  ExtractConfig;
     EFI_HII_ACCESS_ROUTE_CONFIG    RouteConfig;
     VOID                          *Callback;   // unused
+};
+
+// ===================================================================
+// EFI_IP4_CONFIG_PROTOCOL (UEFI 2.0 - 2.3.1; REMOVED in UEFI 2.4)
+//
+// The IPv4 configuration protocol UEFI 2.4 replaced with
+// EFI_IP4_CONFIG2_PROTOCOL. It is in no spec under deps/ (those are 2.11),
+// so it is written here from the UEFI 2.3.1 published layout: three members,
+// Start / Stop / GetData, and EFI_IP4_IPCONFIG_DATA. Modern firmware no
+// longer produces it; AXL's compatibility driver (src/net/axl-net-legacy-
+// ip4cfg-drv.c) does, backed by EFI_IP4_CONFIG2_PROTOCOL, so tools written
+// against UEFI 2.0 - 2.3 can still read a NIC's address.
+// ===================================================================
+
+#define EFI_IP4_CONFIG_PROTOCOL_GUID \
+    { 0x3b95aa31, 0x3793, 0x434b, \
+      {0x86, 0x67, 0xc8, 0x07, 0x08, 0x92, 0xe0, 0x5e} }
+
+static __attribute__((unused)) EFI_GUID gEfiIp4ConfigProtocolGuid =
+    EFI_IP4_CONFIG_PROTOCOL_GUID;
+
+typedef struct _EFI_IP4_CONFIG_PROTOCOL  EFI_IP4_CONFIG_PROTOCOL;
+
+/* UEFI 2.3.1: the address, mask and routes the policy produced. GetData
+   returns the route table in the caller's buffer, after this structure. */
+typedef struct {
+    EFI_IPv4_ADDRESS     StationAddress;
+    EFI_IPv4_ADDRESS     SubnetMask;
+    UINT32               RouteTableSize;
+    EFI_IP4_ROUTE_TABLE *RouteTable;      // OPTIONAL
+} EFI_IP4_IPCONFIG_DATA;
+
+typedef EFI_STATUS (EFIAPI *EFI_IP4_CONFIG_START)(
+    IN EFI_IP4_CONFIG_PROTOCOL  *This,
+    IN EFI_EVENT                 DoneEvent,
+    IN EFI_EVENT                 ReconfigEvent
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_IP4_CONFIG_STOP)(
+    IN EFI_IP4_CONFIG_PROTOCOL  *This
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_IP4_CONFIG_GET_DATA)(
+    IN     EFI_IP4_CONFIG_PROTOCOL  *This,
+    IN OUT UINTN                    *IpConfigDataSize,
+    OUT    EFI_IP4_IPCONFIG_DATA    *IpConfigData       // OPTIONAL
+    );
+
+struct _EFI_IP4_CONFIG_PROTOCOL {
+    EFI_IP4_CONFIG_START     Start;
+    EFI_IP4_CONFIG_STOP      Stop;
+    EFI_IP4_CONFIG_GET_DATA  GetData;
+};
+
+// ===================================================================
+// EFI_NIC_IP4_CONFIG_PROTOCOL (EDK-private, never in a UEFI spec)
+//
+// The per-NIC companion the pre-UEFI-2.4 EDK network stack installed beside
+// EFI_IP4_CONFIG_PROTOCOL: a name ("eth0"), the link address, and the
+// configured policy with its addresses. The old EFI 1.x shell's `ifconfig`
+// reads THIS, not EFI_IP4_CONFIG_PROTOCOL, for everything it prints: it
+// enumerates the handles carrying EFI_IP4_CONFIG_PROTOCOL, then requires this
+// protocol on each (a handle without it ends the walk), and calls GetInfo
+// (size probe with a NULL buffer, then the fill; EFI_NOT_FOUND means "Not
+// configured.") and GetName. Every offset below was confirmed against that
+// binary's disassembly: NIC_ADDR is 36 bytes, Source at 36, Perment at 40,
+// Ip4Info at 48 (RouteTableSize at 56, RouteTable at 64), name buffer
+// IP4_NIC_NAME_LENGTH CHAR16s.
+//
+// Source values are what that shell DISPLAYS and WRITES: it prints "DHCP" for
+// 0 and "STATIC" for 1, and `ifconfig -s <nic> dhcp` stores 0.
+// ===================================================================
+
+#define EFI_NIC_IP4_CONFIG_PROTOCOL_GUID \
+    { 0x0dca3d4d, 0x12da, 0x4728, \
+      {0xbf, 0x7e, 0x86, 0xce, 0xb9, 0x28, 0xd0, 0x67} }
+
+static __attribute__((unused)) EFI_GUID gEfiNicIp4ConfigProtocolGuid =
+    EFI_NIC_IP4_CONFIG_PROTOCOL_GUID;
+
+#define IP4_NIC_NAME_LENGTH        64
+#define IP4_CONFIG_SOURCE_DHCP     0
+#define IP4_CONFIG_SOURCE_STATIC   1
+
+typedef struct _EFI_NIC_IP4_CONFIG_PROTOCOL  EFI_NIC_IP4_CONFIG_PROTOCOL;
+
+typedef struct {
+    UINT16           Type;      // link type (SNP IfType; 1 = Ethernet)
+    UINT8            Len;       // link address length in bytes
+    EFI_MAC_ADDRESS  MacAddr;
+} NIC_ADDR;
+
+typedef struct {
+    NIC_ADDR               NicAddr;
+    UINT32                 Source;    // IP4_CONFIG_SOURCE_*
+    BOOLEAN                Perment;   // survives a reset (sic, as in the ABI)
+    EFI_IP4_IPCONFIG_DATA  Ip4Info;   // route table follows this structure
+} NIC_IP4_CONFIG_INFO;
+
+typedef EFI_STATUS (EFIAPI *EFI_NIC_IP4_CONFIG_GET_NAME)(
+    IN  EFI_NIC_IP4_CONFIG_PROTOCOL  *This,
+    OUT CHAR16                       *Name,      // OPTIONAL, IP4_NIC_NAME_LENGTH
+    OUT NIC_ADDR                     *NicAddr    // OPTIONAL
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_NIC_IP4_CONFIG_GET_INFO)(
+    IN     EFI_NIC_IP4_CONFIG_PROTOCOL  *This,
+    IN OUT UINTN                        *Len,
+    OUT    NIC_IP4_CONFIG_INFO          *NicConfig   // OPTIONAL
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_NIC_IP4_CONFIG_SET_INFO)(
+    IN EFI_NIC_IP4_CONFIG_PROTOCOL  *This,
+    IN NIC_IP4_CONFIG_INFO          *NicConfig,      // OPTIONAL: NULL clears
+    IN BOOLEAN                       Reconfig
+    );
+
+struct _EFI_NIC_IP4_CONFIG_PROTOCOL {
+    EFI_NIC_IP4_CONFIG_GET_NAME  GetName;
+    EFI_NIC_IP4_CONFIG_GET_INFO  GetInfo;
+    EFI_NIC_IP4_CONFIG_SET_INFO  SetInfo;
 };
 
 #endif /* AXL_UEFI_EXTRA_H */

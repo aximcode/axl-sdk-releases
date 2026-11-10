@@ -176,8 +176,8 @@ test_debug_features(void)
     }
     if (!all_da) {
         axl_printf("    (debug-fill failure: byte[%zu]=0x%02x; "
-                   "likely stale RELEASE-mode .o in libaxl.a — "
-                   "try `make clean && make`)\n",
+                   "likely stale RELEASE-mode .o in libaxl.a -- "
+                   "delete the build tree and rebuild)\n",
                    bad_index, bad_value);
     }
     test_check(all_da, "debug: alloc fill 0xDA");

@@ -42,6 +42,23 @@ extern "C" {
 #define AXL_CONSOLE_LEFT_CONTROL_PRESSED   0x00000008u ///< left Ctrl is held
 #define AXL_CONSOLE_RIGHT_ALT_PRESSED      0x00000010u ///< right Alt is held
 #define AXL_CONSOLE_LEFT_ALT_PRESSED       0x00000020u ///< left Alt is held
+#define AXL_CONSOLE_LEFT_LOGO_PRESSED      0x00000080u ///< left Logo (Windows/Meta/Super) is held
+/** @} */
+
+/**
+ * @name KeyToggleState bits for a producer's inject_key_ex
+ *
+ * The `EFI_KEY_STATE.KeyToggleState` counterparts of the shift aliases above
+ * (UEFI 2.11 §12.2.5), pinned to their `EFI_*` values by the same unit test.
+ * @{
+ */
+#define AXL_CONSOLE_TOGGLE_STATE_VALID     0x80u ///< the KeyToggleState field is valid
+#define AXL_CONSOLE_KEY_STATE_EXPOSED      0x40u ///< partial (modifier-only) keystrokes are reported
+/** What an OVMF USB keyboard reports with no lock key on: every keystroke
+ *  read through the console splitter carries exactly this toggle state, and
+ *  so does every key `inject_text` decodes. */
+#define AXL_CONSOLE_TOGGLE_KEYBOARD \
+    (AXL_CONSOLE_TOGGLE_STATE_VALID | AXL_CONSOLE_KEY_STATE_EXPOSED)
 /** @} */
 
 /**

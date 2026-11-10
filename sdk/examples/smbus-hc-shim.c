@@ -29,7 +29,7 @@
     AUX_BLK bit so the hardware buffers all payload bytes and delivers
     a single completion.
 
-    Build:  (automatic via Makefile SmbusHcShim target)
+    Build:  scripts/axl-build.sh smbus-hc-shim  (-> SmbusHcShim.efi)
     Load:   load SmbusHcShim.efi
     Use:    any AxlSmbus consumer will now find I2C Master
 **/

@@ -259,6 +259,21 @@ axl_log_set_console_enabled(
 );
 
 /**
+ * @brief Whether default console output is on.
+ *
+ * What axl_log_set_console_enabled() (or axl_log_suppress_console()) last
+ * set; true if neither has been called. For code that turns the console off
+ * for a while and must then put back what it found, rather than assume it
+ * was on -- turning on a console the image's own owner had silenced is as
+ * wrong as leaving it off.
+ *
+ * @return true when log records are written to the console (or to the
+ *     serial port axl_log_set_console_serial() named).
+ */
+bool
+axl_log_get_console_enabled(void);
+
+/**
  * @brief Suppress default console output.
  *
  * Call after adding custom handlers. Equivalent to
@@ -474,6 +489,40 @@ axl_log_serial_attach(
  */
 void
 axl_log_serial_detach(void);
+
+/**
+ * @brief Send this image's default console output to a serial port instead
+ *     of standard error.
+ *
+ * For an image whose standard error reaches someone it should not: a
+ * resident driver serving a remote console joins the firmware's standard
+ * error fan-out, so its own log lines would be drawn in every session it
+ * serves. OpenSSH's sshd logs to syslog and never to the user's terminal;
+ * this is that split.
+ *
+ * Unlike axl_log_serial_attach(), which adds a handler with the file
+ * sink's line format, this moves the console output ITSELF: the same
+ * level filter, and the same text -- time of day, `[INFO]  ` tag, domain,
+ * location for DEBUG and TRACE -- as the console would show, so a serial
+ * transcript reads the same before and after. Each line is written whole,
+ * once, with CRLF and no colour; a short write drops the rest of the line
+ * rather than retrying (see axl_log_serial_attach() for why, and for the
+ * port's write timeout). Standard error is not written while a port is set.
+ *
+ * axl_log_set_console_enabled(false) silences it as it silences the
+ * console. Handlers are unaffected. Per image, like every AxlLog setting:
+ * another image's console output, and this image's own axl_printerr(),
+ * still go to standard error.
+ *
+ * The port is CALLER-owned and must outlive the redirect: pass NULL to
+ * send console output back to standard error before closing it -- and
+ * before the image unloads, since its teardown leak verdict is console
+ * output too.
+ */
+void
+axl_log_set_console_serial(
+    AxlSerial *port  ///< open port from axl_serial_open (caller-owned), or NULL
+);
 
 // ---------------------------------------------------------------------------
 // File handler

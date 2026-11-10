@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=15 local-only=0
+# test-meta: arch=x64 needs= est=15 local-only=0 guest=none
+# guest=none: measured slower pooled (pool design §6.7 step 8 item 1): its
+#   file I/O on the virtio-fs share costs more than the boot it saves.
 # test-tool-redirect-pipe-qemu.sh — every axl-sdk tool's stdout survives the
 # four UEFI-shell output operators, and the byte encoding of each is correct.
 #
@@ -44,15 +46,33 @@ ARCH="X64"
 while [[ $# -gt 0 ]]; do case "$1" in --arch) ARCH="$2"; shift 2;; *) shift;; esac; done
 declare -A _M=([X64]=x64 [AARCH64]=aa64); NATIVE="${_M[$ARCH]:-x64}"
 
-TOOLS="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools"
+# AXL_TEST_TOOLS_DIR points this at a COPY of tools/ (a stale or foreign .efi in
+# the shared one can then be kept out without touching it); it is not rebuilt.
+TOOLS="${AXL_TEST_TOOLS_DIR:-$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools}"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
-make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
+[[ -n "${AXL_TEST_TOOLS_DIR:-}" ]] || "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 [[ -d "$TOOLS" ]] || { echo "ERROR: $TOOLS not built"; exit 1; }
+# These tests run EVERY .efi in the dir. One older than libaxl.a was not built
+# from this tree's current code (a release's RTK image, a missed rebuild): say
+# so rather than test it silently. A warning, not a failure -- the point is that
+# nobody is surprised which binary was under test.
+if ! _stale=$(source "$PROJECT_DIR/scripts/axl-common.sh"; tools_dir_stale "$TOOLS"); then
+    echo "WARNING: could not check $TOOLS for stale tools"
+elif [[ -n "$_stale" ]]; then
+    echo "WARNING: older than libaxl.a, so not built from this tree's current code:" \
+         "$(echo $_stale) -- tested anyway (rebuild, or point AXL_TEST_TOOLS_DIR at a clean copy)"
+fi
 
 # Non-versioned tools (dev/bench, or resident drivers loaded not run): no
 # "<tool> <VERSION>" line to assert. Same list test-tool-version-qemu.sh uses.
-EXCLUDE="axbench crashtest kbtune-drv fbcon"
+EXCLUDE="axbench crashtest kbtune-drv fbcon SftpServer"
+
+# The name a tool's --version line carries, where it is not the file's stem:
+# sshd-full.efi is sshd's own launcher around a bigger driver -- one service,
+# one name, as sshd-rtk.efi is.
+declare -A VNAME=([sshd-full]=sshd [sshd-rtk]=sshd [sshd-full-rtk]=sshd)
+vname() { echo "${VNAME[$1]:-$1}"; }
 
 mapfile -t ALL < <(cd "$TOOLS" && ls *.efi 2>/dev/null | sed 's/\.efi$//' | sort)
 VERSIONED=()
@@ -177,8 +197,8 @@ for t in "${VERSIONED[@]}"; do
     # Redirect: assert the tool's line in the `type` output ONLY (the region
     # after the type-fence marker), so a redirect that leaked to the console
     # cannot satisfy it.
-    sect "B_${t}_gtt" "B_${t}_gac" | grep -aqE "^${t} ${VERSION}([[:space:]]|$)" || gtmiss+=("$t")
-    sect "B_${t}_gat" "B_${t}_p"   | grep -aqE "^${t} ${VERSION}([[:space:]]|$)" || gamiss+=("$t")
+    sect "B_${t}_gtt" "B_${t}_gac" | grep -aqE "^$(vname "$t") ${VERSION}([[:space:]]|$)" || gtmiss+=("$t")
+    sect "B_${t}_gat" "B_${t}_p"   | grep -aqE "^$(vname "$t") ${VERSION}([[:space:]]|$)" || gamiss+=("$t")
     # Pipe: a hexdump offset line proves bytes traversed the pipe.
     sect "B_${t}_p"   "B_${t}_pa"  | grep -aq  "00000000:" || pmiss+=("$t")
     sect "B_${t}_pa"  "B_${t}_e"   | grep -aq  "00000000:" || pamiss+=("$t")

@@ -1,0 +1,2 @@
+AXLPOOL-MISS: no slot
+TIMING: runner test=test-miss.sh attempt=1 via=pool wall=1.000 rc=77

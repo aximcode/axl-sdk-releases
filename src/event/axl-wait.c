@@ -11,6 +11,7 @@
 
 #include "axl-wait-internal.h"
 #include "axl-cancellable-internal.h"
+#include "../backend/axl-backend.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -50,6 +51,7 @@ typedef struct {
     bool       condition_met;
     bool       timed_out;
     bool       cancelled;
+    AxlCancellable *cancel;   ///< for on_wait_break
 } WaitCtx;
 
 typedef struct {
@@ -96,6 +98,17 @@ on_wait_cancel(void *data)
     return AXL_SOURCE_REMOVE;
 }
 
+/* The Shell's break, for a cancellable that claims it: cancel the token (so
+   the waits after this one end at once) and end this one as cancelled. */
+static bool
+on_wait_break(void *data)
+{
+    WaitCtx *w = (WaitCtx *)data;
+
+    axl_cancellable_cancel(w->cancel);
+    return on_wait_cancel(data);
+}
+
 static bool
 on_wait_tick(void *data)
 {
@@ -135,6 +148,8 @@ _axl_event_wait_timeout_with_tick(
     AxlSourceId    timeout_source;
     AxlSourceId    tick_source;
     AxlSourceId    cancel_source;
+    AxlSourceId    break_source;
+    AxlEventHandle break_event;
     uint64_t       tick_ms;
     uint64_t       timeout_ms;
     bool           need_tick;
@@ -178,6 +193,8 @@ _axl_event_wait_timeout_with_tick(
     w.condition_met = false;
     w.timed_out = false;
     w.cancelled = false;
+    w.cancel = cancel;
+    break_source = 0;
     event_source = 0;
     timeout_source = 0;
     tick_source = 0;
@@ -200,6 +217,13 @@ _axl_event_wait_timeout_with_tick(
     if (cancel_event != NULL) {
         cancel_source = axl_loop_add_event(loop, cancel_event,
                                            on_wait_cancel, &w);
+    }
+
+    /* A cancellable that claims the Shell's break: in resident code the
+       loop itself never reads it (see axl_loop_set_intercept_break). */
+    break_event = _axl_cancellable_on_break(cancel) ? axl_backend_shell_break_event() : NULL;
+    if (break_event != NULL) {
+        break_source = axl_loop_add_event(loop, break_event, on_wait_break, &w);
     }
 
     /* Install a tick if the caller asked for one, or if we have a
@@ -234,6 +258,9 @@ _axl_event_wait_timeout_with_tick(
     }
     if (cancel_source != 0) {
         axl_loop_remove_source(loop, cancel_source);
+    }
+    if (break_source != 0) {
+        axl_loop_remove_source(loop, break_source);
     }
     axl_loop_free(loop);
 

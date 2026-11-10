@@ -136,6 +136,57 @@ axl_app_boot_path(
     size_t      out_size       ///< capacity of @p out in bytes
 );
 
+/**
+ * @brief Build a path beside the running image: @p relative_path resolved
+ *     the way the Shell would resolve it with the image's own directory as
+ *     the current one.
+ *
+ * For a tool that reads a file it ships with (`sshd.conf` beside
+ * `sshd.efi`, a `drivers\\<arch>` directory beside `netload.efi`) and so
+ * must keep working wherever the tree it came in was copied -- a release
+ * tarball's versioned directory on a stick, say. For an image loaded from
+ * `FS0:\\tools\\app.efi`:
+ *
+ * | @p relative_path  | @p out                    |
+ * |-------------------|---------------------------|
+ * | `"app.conf"`      | `"FS0:\\tools\\app.conf"` |
+ * | `"keys\\ak"`      | `"FS0:\\tools\\keys\\ak"` |
+ * | `""`              | `"FS0:\\tools"` (the directory itself) |
+ * | `"\\keys\\ak"`    | `"FS0:\\keys\\ak"` (a leading `\\` or `/` is the volume's root, as in the Shell -- the same answer as @ref axl_app_boot_path) |
+ * | `"fs1:\\x.conf"`  | `"fs1:\\x.conf"` (names a volume: copied as it is) |
+ *
+ * For an image at the volume root (`FS0:\\app.efi`) its directory IS the
+ * root: `"app.conf"` gives `"FS0:\\app.conf"` and `""` gives the root
+ * itself, so a tree laid out flat and the same tree inside a directory both
+ * work. When the image's path is a bare name (a Shell `path` search or a
+ * launch relative to the current directory) its real directory is unknown
+ * and this anchors at the volume root; a caller should name the path it
+ * used, as sshd and netload do.
+ *
+ * @p relative_path is otherwise used as it is: no `.`/`..` folding, and a
+ * `/` inside it is kept (the AXL filesystem API accepts either separator).
+ * The directory is the one the image was loaded from (@ref
+ * axl_app_image_path); the volume is named afresh on each call, as @ref
+ * axl_app_boot_path names it, so the result resolves now.
+ *
+ * Unlike axl_path_companion(), which joins onto argv[0] with `/` and knows
+ * nothing of volumes, this anchors on the loaded image, so it does not
+ * depend on how the Shell was asked to run it.
+ *
+ * @return AXL_OK on success (@p out is NUL-terminated). AXL_ERR, with @p
+ *     out set to `""` when @p out_size is non-zero, if @p relative_path or
+ *     @p out is NULL or @p out_size is 0, if the result does not fit in
+ *     @p out, or if @p relative_path names no volume and this image was not
+ *     loaded from a file (see @ref axl_app_image_path) or nothing names its
+ *     volume.
+ */
+int
+axl_app_image_dir_path(
+    const char *relative_path, ///< path relative to the image's directory (see the table)
+    char       *out,           ///< output buffer
+    size_t      out_size       ///< capacity of @p out in bytes
+);
+
 #ifdef __cplusplus
 }
 #endif

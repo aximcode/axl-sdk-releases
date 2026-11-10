@@ -4,18 +4,20 @@
 Two failures, both of which have precedent in this tree:
 
 1. INTERNAL CONSISTENCY. scripts/axl-toolchains.conf spells every path in full
-   because its KEY=VALUE subset has to parse as both `make` and `sh`, and
-   neither reads the other's interpolation syntax. That repetition is the price
-   of the shared format, so it gets asserted rather than trusted: the version
-   must appear in the directory, and the directory must prefix the compiler.
+   because its KEY=VALUE subset has to parse as both `sh` and CMake's
+   `^KEY=VALUE$` reader (cmake/AxlToolchain.cmake; `make` too, until 5.0.0),
+   and only one of them would expand an interpolation. That repetition is the
+   price of the shared format, so it gets asserted rather than trusted: the
+   version must appear in the directory, and the directory must prefix the
+   compiler.
 
 2. DRIFT. The AArch64 path used to be written out in five places -- the
-   Makefile, scripts/axl-cc, two spots in scripts/install.sh (one inside the
-   GENERATED axl-config.cmake), and the installer. Adding x64 would have made
-   ten. `make check-flag-parity` exists because the same three build paths
-   drifted on compile flags twice in one afternoon; the toolchain path had no
-   equivalent guard. So: no build-critical file may hardcode a toolchain path.
-   They must read the manifest.
+   (since retired) Makefile, scripts/axl-cc, two spots in scripts/install.sh
+   (one inside the GENERATED axl-config.cmake), and the installer. Adding x64
+   would have made ten. `gate.check-flag-parity` exists because the same
+   three build paths drifted on compile flags twice in one afternoon; the
+   toolchain path had no equivalent guard. So: no build-critical file may
+   hardcode a toolchain path. They must read the manifest.
 
 Docs are deliberately NOT scanned -- prose quoting a path is describing it, not
 depending on it, and rewriting that prose in a sweep is its own bug class.
@@ -49,15 +51,27 @@ CONF = REPO / "scripts" / "axl-toolchains.conf"
 
 # Files that must resolve paths through the manifest rather than restate them.
 SCANNED: list[str] = [
-    "Makefile",
+    # The in-tree build: its toolchain file reads the manifest, and the
+    # presets must not pin a compiler beside it.
+    "cmake/AxlToolchain.cmake",
+    "CMakePresets.json",
     "scripts/axl-cc",
     "scripts/axl-c++",
     "scripts/install.sh",
+    # The install rules that substitute the compilers into the CMake package,
+    # and the package template itself.
+    "cmake/AxlInstall.cmake",
+    "cmake/axl-config.cmake.in",
     "scripts/install-toolchain.sh",
-    "scripts/install-arm-toolchain.sh",
     # The workflow that CALLS the installer: an `export PATH=/opt/arm-gnu-...`
     # added here would pin a version the manifest no longer names.
     ".github/workflows/release.yml",
+    # What the release archives are staged and packed by.
+    "cmake/AxlPackage.cmake",
+    "packaging/uefi-tools/CMakeLists.txt",
+    "packaging/host-tools/CMakeLists.txt",
+    "scripts/make-release-assets.sh",
+    "scripts/make-test-release.sh",
     ".github/workflows/ci.yml",
     "sdk/examples/CMakeLists.txt",
 ]
@@ -78,16 +92,16 @@ def parse_conf(text: str) -> dict[str, str]:
         if "=" not in line:
             sys.exit(f"check-toolchain-conf: FAIL -- not KEY=VALUE: {raw!r}")
         key, _, value = line.partition("=")
-        # The dual sh/make contract: no spaces around '=', no interpolation.
+        # The sh/CMake contract: no spaces around '=', no interpolation.
         if key != key.strip() or value != value.strip():
             sys.exit(
-                f"check-toolchain-conf: FAIL -- spaces around '=' break `make`"
-                f" parsing: {raw!r}"
+                f"check-toolchain-conf: FAIL -- spaces around '=' break the"
+                f" CMake reader (cmake/AxlToolchain.cmake): {raw!r}"
             )
         if "$" in value:
             sys.exit(
                 "check-toolchain-conf: FAIL -- interpolation is not portable"
-                f" between sh and make: {raw!r}"
+                f" between sh and CMake: {raw!r}"
             )
         out[key] = value
     return out
@@ -206,6 +220,10 @@ def main() -> int:
     for rel in SCANNED:
         path = REPO / rel
         if not path.is_file():
+            # A scanned file that is gone is a list that no longer describes
+            # the tree (the Makefile sat here, silently skipped, after it was
+            # retired) -- not a file with nothing to report.
+            errors.append(f"{rel}: listed in SCANNED but missing -- update the list")
             continue
         for num, line in enumerate(path.read_text().splitlines(), start=1):
             stripped = line.strip()

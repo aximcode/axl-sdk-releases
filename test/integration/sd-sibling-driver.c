@@ -6,8 +6,8 @@
  * functions + one AXL_SHARED_DRIVER invocation.
  *
  * Built TWICE from this one source (-DDRIVER_TAG=A / -DDRIVER_TAG=B, see
- * the Makefile) so the probe fixture can tell WHICH copy of the driver
- * actually resolved a locate call: run() prints "SDSIB:tag=<TAG>\n".
+ * test/integration/CMakeLists.txt) so the probe fixture can tell WHICH copy
+ * of the driver actually resolved a locate call: run() prints "SDSIB:tag=<TAG>\n".
  */
 #include <axl.h>
 

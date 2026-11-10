@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=AXL_CPP=1,cxx-seam-selftest guest=standard
 # test-cxx-seam-qemu.sh — the C++ seams over AXL's C API, run under QEMU.
 #
 # Covers AXL-Cxx-Design.md §9 phases C2, C3 and C5:
@@ -85,7 +85,7 @@ check_absent() {  # check_absent <msg> <pattern> <file>
 echo "=== C++ Seam Test ($TEST_ARCH) ==="
 
 # ---------------------------------------------------------------------------
-# The image that RUNS is the Makefile's, built DEBUG so AXL_MEM_DEBUG is on.
+# The image that RUNS is the in-tree build's, built DEBUG so AXL_MEM_DEBUG is on.
 # scripts/install.sh stages RELEASE.
 #
 # NOT for the `cstr: freed` assertion, which an earlier revision of this
@@ -95,8 +95,8 @@ echo "=== C++ Seam Test ($TEST_ARCH) ==="
 # debug-only, and the leak gate at the bottom is the assertion that needs it.
 # ---------------------------------------------------------------------------
 echo "--- building the DEBUG fixture (AXL_MEM_DEBUG on) ---"
-make -C "$PROJECT_DIR" ARCH="$_native_arch" AXL_CPP=1 \
-    ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} cxx-seam-selftest 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" AXL_CPP=1 \
+    cxx-seam-selftest 2>&1 | tail -3
 
 EFI="$NATIVE_DIR/cxx-seam-selftest.efi"
 if [[ ! -f "$EFI" ]]; then
@@ -133,23 +133,7 @@ else
     check "SKIP balancer: staged SDK absent, so no consumer-toolchain build" true
 fi
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo SEAM_BEGIN"
-    echo "cxx-seam-selftest.efi cstr"
-    echo "cxx-seam-selftest.efi array"
-    echo "cxx-seam-selftest.efi ntree"
-    echo "cxx-seam-selftest.efi radix"
-    echo "cxx-seam-selftest.efi gfx"
-    # Runs LAST: it halts, and a halt that took the shell down with it would
-    # otherwise cost every verb after it.
-    echo "echo SEAM_MISMATCH"
-    echo "cxx-seam-selftest.efi mismatch"
-    echo "echo SEAM_DONE"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 test_build_qemu_cmd

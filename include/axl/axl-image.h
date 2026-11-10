@@ -52,6 +52,10 @@ typedef struct AxlImage AxlImage;
  * accepted and normalized internally. The image is loaded but
  * not yet started.
  *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (UEFI 2.11 Table 7.3).
+ *
  * @return AXL_OK on success, AXL_ERR if the file can't be read or the
  *     image format is rejected.
  */
@@ -108,6 +112,10 @@ axl_image_set_load_options(
  * value as "image did not succeed" rather than rely on a specific
  * code.
  *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (UEFI 2.11 Table 7.3).
+ *
  * @return AXL_OK on successful start (regardless of the image's exit
  *     code), AXL_ERR if the image could not be started at all.
  */
@@ -150,6 +158,10 @@ axl_image_unload(
  * Pair this with @ref axl_console_mirror_install to mirror the launched
  * app's console to a remote terminal.
  *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (UEFI 2.11 Table 7.3).
+ *
  * @return AXL_OK if the image was started and has now returned (its exit
  *     code is in @p out_exit_code); AXL_ERR if @p path is NULL or the
  *     image could not be loaded.
@@ -188,6 +200,10 @@ axl_image_run(
  * Cleanup is atomic: on any failure after the image loads, it is unloaded
  * before returning. @p out_exit_code is set to 0 up front, so it reads 0 on
  * every failure path.
+ *
+ * **TPL:** call it below `TPL_CALLBACK`, from an application such as a
+ * Shell command; at `TPL_CALLBACK` or above it returns AXL_UNSUPPORTED
+ * and logs why (UEFI 2.11 Table 7.3).
  *
  * @return AXL_OK if the file was found, started, and has now returned (its
  *     exit code is in @p out_exit_code); AXL_ERR if @p name_guid is NULL,

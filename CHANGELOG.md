@@ -3,6 +3,3498 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 5.0.0 — 2026-11-10
+
+### Breaking
+
+- **The CMake package and `sdk/examples` need CMake 3.20 or newer (was
+  3.16).** On an older CMake, `find_package(axl REQUIRED)` stops at
+  configure with the reason `axl: the AXL SDK's CMake package requires
+  CMake 3.20 or newer (this is CMake X.Y.Z).` (an optional
+  `find_package(axl)` reports not found), and `sdk/examples` declares
+  `cmake_minimum_required(VERSION 3.20)`. Why: `add_custom_command(DEPFILE)`,
+  which carries the header dependencies of every `axl_add_app` and
+  `axl_add_driver` object, reaches the Makefile generators only in 3.20, so
+  on 3.16-3.19 a Makefile build rebuilt nothing when a header changed. The
+  package is tested under 3.20.6 and the pinned 4.3.6, and its refusal
+  under 3.16.9. **What to do:** configure with CMake 3.20 or newer. Ubuntu
+  20.04's packaged cmake (3.16) and Debian 11's (3.18) are older; Kitware's
+  release tarball or `pip install cmake` replaces them without root. A
+  project of your own may keep a lower `cmake_minimum_required`; only the
+  CMake that runs it must be 3.20+.
+
+- **A service teardown that returns non-OK is called AGAIN, so it must
+  resume.** `AxlServiceTeardown`'s return used to be "logged but doesn't
+  affect the framework's teardown sequence". Now a non-OK return keeps the
+  image resident, and every later unload (`stop`, the Shell's `unload`,
+  `axl_service_reload`) runs the teardown again until it returns `AXL_OK`
+  (see "A service whose teardown fails stays whole" under Fixed). A
+  teardown that frees everything and then returns non-OK to report a soft
+  error will double-free on the next stop; one that always returns non-OK
+  makes its image impossible to unload. **What to do:** return non-OK only
+  while something you must release is still held; clear each pointer as
+  you free it, and make every release safe to repeat on a cleared pointer.
+  Return codes and output that change with it:
+  - `axl_service_reload` over a service whose teardown fails returns
+    `AXL_DENIED` (still published, nothing started), not `AXL_ERR`; check
+    `axl_service_state` to tell that from a serving service.
+  - `axl_service_start_embedded` and `axl_service_start_staged` return
+    `AXL_BUSY` for a service that is STOPPING (half-stopped), where they
+    returned `AXL_OK` because its GUID is published. That includes an image
+    the call just started whose setup returned the new
+    `AXL_SERVICE_SETUP_HELD`, or whose rollback teardown failed.
+  - The `status` verb of `axl_service_main` prints `<name>: stopping
+    (teardown failed; 'stop' retries; a reset clears it)` and exits 5
+    (`AXL_SERVICE_EXIT_STOPPING`) for such a service, and `<name>: degraded
+    (<reason>)` with exit 0 for a degraded one, where both printed
+    `running`. `start` refuses a stopping service with the same line.
+  - `axl_service_attach_driver` returns `AXL_ERR` for EVERY setup failure;
+    it used to pass setup's own code through. A failure that leaves setup's
+    resources held is also `AXL_ERR`, so a hand-rolled caller cannot tell it
+    from one that released everything: use `AXL_SERVICE_DRIVER`, which can.
+  - `sshd status` exits 5 while the driver is stopping, and
+    `SSHD_STUCK_GUID` is gone: the stuck state is now the service state.
+  - **One positive setup return now has a meaning.** A setup returning
+    `AXL_SERVICE_SETUP_HELD` (`0x48454C44`, 'HELD') keeps its image
+    resident instead of unloading it, and its teardown runs at the next
+    stop. Every other positive return -- a stray `return true;` included --
+    is still an ordinary failure, and HELD from a service with no teardown
+    is refused with a warning and treated as one.
+
+- **`axl_path_get_dirname` keeps the separator of a volume root.** The
+  directory of `fs0:\x.efi` is now `fs0:\` (as the directory of `/x` has
+  always been `/`), not the bare `fs0:`, which names a volume but no
+  directory UEFI can open. `axl_path_companion` and `axl_path_join` give the
+  same results as before, since a join re-inserted the separator; a caller
+  that compared or concatenated the old result sees the change. The 9P
+  server relied on it: a whole-volume export root is now stored as `fs0:\`
+  (a bare `fs0:` gains the separator), so the `..` guard still matches.
+
+- **Loading or starting an image at `TPL_CALLBACK` or above is refused.**
+  UEFI 2.11 Table 7.3 allows `LoadImage()` and `StartImage()` only below
+  `TPL_CALLBACK`. Every public call that reaches either now returns
+  `AXL_UNSUPPORTED` there, before touching the firmware, and logs one error
+  line naming the call and the rule:
+  - `axl_driver_load`, `_load_sibling`, `_load_buffer`,
+    `_load_buffer_with_image_info`, `axl_driver_start` and
+    `axl_driver_load_dir` / `_load_dir_guarded`;
+  - `axl_image_load`, `_start`, `_run` and `_run_fv_file`;
+  - the `axl_driver_ensure*` family, `axl_shared_driver_locate*` and
+    `axl_service_start_embedded`, when the protocol is not yet published.
+    An already-published one is still `AXL_OK` at any TPL.
+
+  `axl_image_verify_signature` with `consult_db` (a `LoadImage` dry run) is
+  refused there too -- it fails closed rather than answering presence-only,
+  which would report a present but invalid signature as valid; without
+  `consult_db` it loads nothing and is not refused. It was not only the
+  letter of the spec: EDK2 applies the NX policy to freed pages after
+  releasing its memory lock, so an image loaded in a callback could land in
+  an exiting application's pages and be made execute-never under it -- an
+  instruction abort at its first call, on any firmware with NX on free
+  memory. **Who is affected:** code that loads or starts an image from an
+  AxlLoop callback (a timer, I/O or idle callback, or any event notify).
+  Load from an application -- a Shell command or a launcher -- or from a
+  driver's entry point, which runs at `TPL_APPLICATION`.
+
+- **`axl_service_reload` and `axl_service_reload_buffer` are called by an
+  application, not by the service.** They used to be called from inside the
+  running service (typically from a timer or a request handler on its loop),
+  where both the load and the start broke the TPL rule above. Now an
+  application -- a Shell command or the service's launcher -- calls them
+  with the service's descriptor. They load the replacement, stop the running
+  service (as `axl_service_stop` does: detach, teardown, unload) and start
+  the replacement.
+  - From a callback they return `AXL_UNSUPPORTED`. So does a call from
+    inside the service's own image at `TPL_APPLICATION` (an application
+    calling into it), because an image cannot unload itself with that call
+    on its stack.
+  - The replacement starts with the options the caller's descriptor holds,
+    as `axl_service_start_embedded` starts a service; it no longer inherits
+    the running service's current ones.
+  - `AXL_INVALID` now also means "no image publishes this service".
+  - The `AXLSVR1` LoadOptions handoff and the replacement's reclaim of the
+    old image are gone: the old image is unloaded before the replacement
+    starts.
+  - **After `AXL_ERR` nothing is resident.** It still means, and only
+    means, "down", but the state it leaves changed: before, a replacement
+    that failed to start left the old image resident and publishing
+    (`axl_service_is_running` true); now the old image has already been
+    unloaded, so nothing serves and this call cannot bring it back.
+    Recovery is the caller's: keep the old image (its path or bytes) until
+    the call returns, and on `AXL_ERR` start it again with
+    `axl_service_start_embedded`, or reset.
+  - **A stop that leaves the service published is `AXL_DENIED`, not
+    `AXL_ERR`.** An image with no Unload handler (firmware-shipped,
+    foreign), or one whose unload refused before tearing down, is still
+    serving after the stop fails. The replacement is then unloaded and not
+    started, and the code is non-fatal ("untouched, serving"), so the
+    caller is not told to reset a healthy box.
+
+  **Who is affected:** a resident service that upgrades itself -- from an
+  `/upgrade` request or a downloaded image -- now gets `AXL_UNSUPPORTED`.
+  That code is non-fatal: the service is untouched and still serving. A
+  handler that treats only `AXL_ERR` as fatal stays safe; one that rolls
+  back and resets on any non-OK value will now reset on the self-reload's
+  `AXL_UNSUPPORTED` -- check for `AXL_ERR` alone. Have an application
+  perform the reload;
+  `sdk/examples/reload-svc-dxe.c` (the service) and the new
+  `sdk/examples/reload-svc.c` (the Shell command) are the pattern. A
+  headless service with no application to ask uses the new staged upgrade
+  instead (see Added): it stages the image from its own callback, resets,
+  and its launcher applies it at the next boot, with rollback.
+
+- **`axl_http_parse_request_line` refuses a request line that is not
+  exactly `method SP request-target SP HTTP/DIGIT.DIGIT`.** It accepted a
+  fourth part (`GET / HTTP/1.1 junk`), a missing version (`GET /`), a
+  version in any spelling (`http/1.1`, `HTTP/1.10`) and an empty target,
+  returning the method and path; each is now `AXL_ERR` with every output
+  NULL. Any major version still parses. A failed allocation is now
+  `AXL_NO_RESOURCES`, no longer `AXL_ERR`. **Who is affected:** callers
+  that parse lines other tools wrote loosely, or that compare `== AXL_ERR`.
+  The one in-tree caller, the axl-kernel experiment
+  (`experiments/axl-kernel/src/kernel.c`), checks `!= AXL_OK` and parses
+  real request lines, so it is unaffected.
+
+- **`axl_http_parse_status_line` refuses a status line holding a control
+  character** other than HTAB (a bare CR, NUL, another control, or DEL),
+  which it used to pass over, checking only the code's digits; such a line
+  is now `AXL_ERR`, and the SDK client fails the response. **Who is
+  affected:** callers parsing status lines from servers that put stray
+  control bytes in the reason phrase. In-tree, its one caller is the SDK
+  clients' response-head parser. See Fixed for the change itself.
+
+- **`AxlWebDavOps.write_open` is told the PUT body's length, and declares
+  whether it writes in place.** Its signature gains `uint64_t length` and,
+  after `out_ctx`, `bool *in_place`:
+  `write_open(user, path, length, out_ctx, in_place)`. `length` is the
+  request's `Content-Length` (0 for no body), or `AXL_WEBDAV_LENGTH_UNKNOWN`
+  for a chunked body; a backend needs it to decide how to write (serve-fs
+  answers 507 up front and chooses between atomic and in-place PUT by it).
+  `*in_place` (false on entry) is set by a backend that writes into the
+  target itself. For such a write only, the discard's return now means
+  something -- non-OK says the resource could not be restored -- and a
+  failed commit answers 500 "partially written"; for every other write
+  the discard's return is ignored, exactly as before. Affected: every
+  backend registered with `axl_http_server_add_webdav` /
+  `_add_webdav_auth` that implements `write_open` -- `axl-webfs`'s
+  `webfs-dav.c` among them; `axl_http_server_serve_fs` users are not. Each
+  must take both parameters (an atomic backend ignores them): a compile
+  error, not a silent change. A separate optional `write_open_sized` was
+  weighed and refused -- a copy of `axl_fs_webdav_ops()` overriding
+  `write_open` would be silently bypassed by the inherited sized one.
+
+- **`AxlFsEntry.name` holds 765 bytes (`AXL_FS_NAME_MAX`, 766 with the
+  NUL); the struct is 808 bytes, was 296.** Every name FAT creates -- 255
+  UTF-16 units, up to 765 bytes of UTF-8 -- now fits, so `axl_dir_read`
+  returns names of 256 to 765 bytes it used to skip, and `axl_fstat` names
+  such a file whole (a name longer still is left EMPTY, never cut).
+  `AXL_FS_ENTRY_VERSION` is 2. The fields after `name` moved: this is an ABI
+  break -- rebuild everything against one SDK. Sources break only if they
+  hard-code 255 or 256 for the name, or keep entries in stack arrays or one
+  per level of a recursion: at 808 bytes an array of 256 is 202 KB, more
+  than the 128 KiB of stack UEFI promises -- put them on the heap.
+- **`AXL_FS_PROVIDER_VERSION` is 2.** A provider gains an optional
+  `rename(file, new_path)` callback after `backend_ctx`; with it, EVERY name
+  change a SetInfo asks for -- in the directory or to another -- arrives
+  there as an absolute provider path, and `set_info` never sees a name
+  change. `set_info` may now be handed a real `mtime_unix` (0 = leave it),
+  is called only when something differs from `get_info`, and `get_info`'s
+  time reaches EFI callers as `ModificationTime`. A provider must SKIP,
+  never cut, a listed name too long for `AxlFsEntry.name`. A vtable built
+  against version 1 still publishes (only `struct_size` bytes are read);
+  rebuild to use the new member. The thunk now refuses, before calling the
+  provider, what FAT refuses: a directory moved into itself or with a
+  handle open below it, a DIRECTORY-bit change, and anything but an
+  attribute change through a read-only handle.
+- **`Axl9pServer`'s `Trename` replaces and moves across directories; its
+  `Tsetattr` sets the time.** `Trename` was same-directory only (`EXDEV`
+  otherwise) and refused an existing destination (`EEXIST`); it is now
+  rename(2), by `axl_file_replace`, with rename(2)'s errnos. `ATTR_MTIME`
+  was accepted and ignored; it now sets the time, clamped to
+  `AXL_FS_MTIME_KEPT_MIN`..`AXL_FS_MTIME_MAX`. `AXL_9P_MIN_MSIZE` rises from
+  512 to 1024, for both sides: the server refuses a smaller `Tversion`, and
+  `axl_9p_connect` refuses a server that negotiates less. Consequently
+  `axl_9p_rename` against `Axl9pServer` REPLACES an existing destination
+  where it returned `AXL_ERR`.
+- **`Axl9pServer`'s qid.path is hashed over the STORED spelling of a
+  path.** On a case-insensitive export (FAT), walking `a.txt` and `A.txt`
+  answered two different qid.paths for one file; both now answer the qid
+  of the name as stored, so a case-only rename keeps the qid. A client
+  that walked an alias or another case spelling sees a different qid.path
+  than before for the same file -- a v9fs or other qid-keyed cache treats
+  it as a new inode once, across a server upgrade.
+- **`tar -c` stores relative '/' member names, as GNU tar and bsdtar do.**
+  It stored the raw UEFI path -- `tar -c a.tar FS1:\src` wrote
+  `FS1:\src\probe.txt`, which host tar extracts as ONE file of that name in
+  the current directory; it now writes `src/probe.txt` (volume prefix and
+  leading separators dropped, '\' mapped to '/'). `tar -t` listings change
+  to match. Because AxlTar splits a long name at '/', a member path over
+  100 bytes now archives through the ustar prefix where it was refused; a
+  path no split can hold (a component over 100 bytes, or over 255 in all)
+  is still reported and skipped, never cut. Archives written in the old
+  spelling still extract.
+- **`AxlTarEntry` gains `name_refused`** (ABI: rebuild anything that
+  declares one). `axl_tar_reader_next` sets it, with an empty `name`, for
+  a member whose name it will not report whole -- a GNU/pax long name over
+  `AXL_TAR_NAME_MAX - 1` bytes, or a header name field with bytes after
+  its NUL -- where it used to cut the name. GNU-format headers no longer
+  have offset 345 read as a ustar prefix (GNU keeps atime/ctime there).
+- **The AxlTar reader tells a truncated archive from a whole one.**
+  `axl_tar_reader_read` returns -1, not 0, when the stream ends with entry
+  bytes still owed. `axl_tar_reader_next` returns `AXL_ERR` only for a
+  real end -- a zero block, or the stream ending exactly at a header
+  boundary, as GNU tar reads them -- and now `AXL_INCOMPLETE` for a stream
+  ending inside a header, data, padding or an `L`/`x` record (all
+  `AXL_ERR` before), `AXL_INVALID` for a header failing its checksum, and
+  `AXL_IO_ERROR` for a stream error; a stopped reader stays stopped on the
+  same status. A caller that looped `while (next == AXL_OK)` still stops
+  in the same place, but should now check the final status: anything but
+  `AXL_ERR` means the archive did not end cleanly. `tar -t` and `tar -x`
+  report "unexpected end of archive" and exit 1 where they exited 0.
+  Unlike GNU tar, a stream ending part-way into a header is a truncation,
+  not an end (GNU tar silently loses that member; libarchive reports it).
+- **A 9P directory listing is capped by memory, not entry count.** The
+  mount and `axl_9p_list` held at most 1,048,576 entries
+  (`AXL_9P_MAX_DIR_ENTRIES`); they now hold at most 64 MiB of `AxlFsEntry`
+  (`AXL_9P_MAX_DIR_BYTES`) -- about 226,000 entries, about 83,000 once an
+  entry is 808 bytes. A larger directory fails to list rather than listing
+  part of itself.
+- **`axl_file_move` and `axl_file_write_atomic` return specific codes;
+  `axl_file_rename` answers `AXL_EXISTS` for a taken name.** Both now run
+  on `axl_file_replace` and return its codes where they returned
+  `AXL_ERR`: `AXL_NOT_FOUND` (missing source or destination directory),
+  `AXL_NOT_DIR`, `AXL_IS_DIR`, `AXL_NOT_EMPTY` (rename(2)'s kind and
+  emptiness refusals), `AXL_INVALID` (a directory into itself),
+  `AXL_UNSUPPORTED` (`axl_file_write_atomic` on a filesystem that cannot
+  rename into place), `AXL_DENIED` (read-only entry or write-protected
+  volume), `AXL_NO_RESOURCES` (a volume short of the space the sequence
+  needs) and `AXL_CANCELLED` (Ctrl-C, undone). `axl_file_rename` onto an
+  existing name is `AXL_EXISTS` (was `AXL_ERR`). `axl_file_move` onto a
+  name differing from the source's only in letter case renames it to that
+  spelling, and onto another spelling of the source itself (an 8.3 alias,
+  through a directory alias too) changes nothing. Four status codes are
+  new: `AXL_IS_DIR` (-12), `AXL_NOT_DIR` (-13), `AXL_NOT_EMPTY` (-14),
+  `AXL_EXISTS` (-15). **Who is affected:** callers that compare these
+  functions' results `== AXL_ERR` rather than `!= AXL_OK` -- in this tree
+  none did; the WebDAV server maps `axl_file_move`'s `AXL_DENIED` to 403
+  where it answered 409. Consumers outside the tree that switch on
+  `AXL_ERR` from these three calls must handle the new codes.
+
+- **The C library's `rename()` no longer copies across volumes: it fails
+  with `errno = EXDEV`, as POSIX has it**, and sets `errno` on every
+  failure (`ENOENT`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY`, `EINVAL`, `EACCES`,
+  `ENOSPC`, `EINTR`, `EEXIST`, `EIO`); it used to return -1 with `errno`
+  untouched; a write-protected volume is `EROFS` and an empty path
+  `ENOENT`. It is `axl_file_replace(old, new, 0)`. **Who is affected:**
+  newlib-based C/C++ programs that relied on `rename()` moving a file to
+  another volume; they must copy on `EXDEV`, as `mv` does.
+
+- **WebDAV PUT: new statuses, the SDK checks `Content-Digest`, and
+  `write_close(true)` means discard.** For every `AxlWebDavOps` backend:
+  - A `write_open` returning `AXL_DENIED` is 403 and any other failure
+    409. A PUT with a body answered 500 for both; the empty-body PUT
+    already answered 409, and now answers 403 for `AXL_DENIED`.
+  - The commit (`write_close(ctx, false)`) may return `AXL_IS_DIR` or
+    `AXL_EXISTS` (409: the target changed while the body streamed -- a
+    collection appeared there, or a file on a no-overwrite mount),
+    `AXL_DENIED` (403) or `AXL_NO_RESOURCES` (507); any other failure
+    stays 500. A commit that fails must leave the resource as it was.
+    `write_open` may return the same codes, with the same statuses.
+  - A PUT while another PUT to the same mount is in flight is 503 with
+    `Retry-After: 1` (was 500), and an empty-body PUT obeys that too (it
+    went ahead); so does a `write_open` returning `AXL_BUSY`.
+  - `Content-Digest` is checked by the SDK over the body as it streams,
+    BEFORE the write is committed: RFC 9530's `sha-256=:<base64>:` form
+    as well as bare hex, every entry of the header read and the strongest
+    algorithm the SDK hashes checked (sha-512, else sha-256); a header
+    naming only other algorithms checks nothing. A mismatch discards the
+    write (`write_close(ctx, true)`) and is 400. Before, only bare hex was
+    read, only the header's FIRST entry, and the SDK stored the body,
+    asked the backend's `digest` callback for the stored file's digest,
+    and on a mismatch REMOVED the file -- after it had already replaced
+    the old one. `digest` now serves Want-Digest (the response side)
+    only.
+  - `write_close(ctx, true)` is now called for every way a PUT can fail
+    after `write_open` -- a hang-up, a `write_chunk` failure, a digest
+    mismatch -- and means DISCARD. After either `write_close` call the
+    ctx is dead; a commit is never followed by a discard.
+  - `AxlHttpRequest` gains `request_id`, which grows the struct: nonzero,
+    one sequence for the whole process, unrelated to any `X-Request-ID`
+    header.
+
+  **Who is affected:** a backend without a `digest` callback now answers
+  400 to a PUT whose `Content-Digest` is wrong (it answered 201 and kept
+  the body). A backend of your own whose write ops write IN PLACE -- one
+  whose `write_open` truncates the target -- must delete what it wrote on
+  `write_close(ctx, true)`, or a PUT the SDK discards (a digest mismatch,
+  which the SDK used to remove for it) leaves its body standing as the
+  resource; better, write to a temp sibling and replace the target on
+  `write_close(ctx, false)`, as `axl_fs_webdav_ops()` now does. And a
+  client or test matching the old 500s.
+
+- **`AxlWebDavOps` gains `caps`, and `AXL_WEBDAV_CAP_IDENTITY`.** A backend
+  that decides itself whether two paths name ONE entry -- by what its
+  filesystem stores, not by spelling -- sets this cap to receive a MOVE or
+  COPY with `Overwrite: F` whose destination differs from the source in
+  letter case only (a trailing '/' aside), forwarded with `overwrite`
+  false instead of refused 412; it must then refuse a destination that
+  exists and is a different entry with `AXL_EXISTS`. Without the cap such
+  a transfer is 412, as before. The case-variant test folds ASCII letters
+  only: a non-ASCII case-only rename with `Overwrite: F` is still 412.
+  `axl_fs_webdav_ops()` sets the cap; a copy of that table that overrides
+  `move` or `copy` must meet the obligation or clear `caps`. **Who is
+  affected:** source that fills an `AxlWebDavOps` -- with designated or
+  positional initializers -- compiles unchanged, with `caps` 0 (no cap);
+  the struct grows, so a prebuilt object that fills or passes one must be
+  rebuilt (ABI).
+
+- **WebDAV MOVE and COPY answer by the backend's status code.** A `move`
+  or `copy` op failure was 409 (403 for `AXL_DENIED`) whatever it was; it
+  now maps by code: 403 for `AXL_DENIED` and `AXL_INVALID`, 412 for
+  `AXL_EXISTS`, 409 for `AXL_NOT_FOUND`, `AXL_NOT_DIR`, `AXL_IS_DIR` and
+  `AXL_NOT_EMPTY`, 502 for `AXL_UNSUPPORTED`, 507 for `AXL_NO_RESOURCES`,
+  and 500 for `AXL_ERR` and anything else. `axl_http_server_serve_fs`
+  now moves through `axl_file_replace` and copies through its
+  transaction, so: a MOVE onto a collection holding the source, a MOVE
+  or COPY of a collection into its own subtree, and a MOVE or COPY onto
+  the source itself under its 8.3 alias are 403 (they were 409; the
+  alias COPY used to empty the source); a MOVE changing only the name's
+  letter case renames it on a case-insensitive volume, 204, with either
+  Overwrite value (it was 409 with `Overwrite: T` and 412 with
+  `Overwrite: F`), while on a case-sensitive volume the two names are two
+  entries and the transfer is refused or allowed like any overwrite --
+  every one of these decided by identity, not by spelling (see the
+  `AXL_WEBDAV_CAP_IDENTITY` entry); a COPY a.txt -> A.TXT with
+  `Overwrite: F` on FAT is 403 (one resource), not 412;
+  a COPY into its own subtree is refused before copying anything (it
+  copied the collection into itself until the depth limit); a volume
+  without the room is 507 -- the room counted for what will be copied, so
+  a `Depth: 0` COPY counts the collection alone; a MOVE or COPY onto an existing destination
+  on an `AXL_SERVE_FS_NO_OVERWRITE` mount is 412 (it was 409); and a
+  replaced destination is set aside as `~AXLhhhh.TMP` (it was
+  `~axlmvN.tmp`), the name a leftover keeps when it cannot be removed
+  whole. **Who is affected:** an `axl_http_server_add_webdav` backend
+  whose `move` or `copy` returns `AXL_ERR` for an ordinary refusal -- it
+  now answers 500, not 409, until it returns the specific code -- and a
+  client or test matching the old 409s.
+
+- **`axl_file_rename` moves within a volume, never replaces, and says
+  why it failed.** A `new_path` in another directory of the same volume
+  used to be refused with `AXL_ERR`; it now MOVES the entry (file or
+  directory) in one `SetInfo`, keeping its times and attributes. The
+  result is verified by re-reading the name through the same handle. New
+  return codes: `AXL_NOT_FOUND` for a missing source (was `AXL_ERR`) and
+  `AXL_UNSUPPORTED` for another volume, or a filesystem that cannot move
+  between directories (an `AxlFsProvider` volume) -- nothing changed in
+  either case. An existing `new_path` is refused on every filesystem, not
+  only FAT. A FAT rename that changes only letter case is now `AXL_ERR`
+  (the driver ignores it; it used to report success). A new name FAT
+  stores rewritten -- trailing dots and spaces dropped -- verifies as the
+  rewritten form, and a long name of up to 255 characters verifies whole. It is now
+  `AXL_WARN_UNUSED`. **Who is affected:** code that relied on a
+  cross-directory rename failing, tested `== AXL_ERR` for a missing
+  source, or ignores the result under `-Werror`. `axl_file_move` now
+  copies only when the rename is `AXL_UNSUPPORTED`; any other rename
+  failure is returned without a copy.
+
+- **`axl_shared_driver_install_stdio_bridge(const void *iface)` takes the
+  interface the launcher dispatches through** (was `(void)`). A launcher's
+  stdio bridge is now aimed at that one published interface, and only the
+  image that published it reads the launcher's handles: before, every
+  resident image without Shell parameters of its own -- a detached service
+  writing on its own clock, a second shared driver -- read the newest live
+  bridge, so while any launcher ran `x 2> f` their standard error landed in
+  `f`. A self-locating launcher passes the vtable it found
+  (`axl_shared_driver_install_stdio_bridge(vt)`); `axl_shared_driver_locate*`
+  and `axl_shared_driver_dispatch` aim it themselves. The aimed bridge is
+  a new internal protocol (`AxlStdioBridge2`, its own GUID, starting with
+  its size); a launcher installs it AND the original layout, so a driver
+  built before this change reads the bridge as it did. A driver built with
+  this change reads only the new one: a launcher built before it lends it
+  nothing (stdin reads end-of-file) -- rebuild the launcher. Reading the
+  new `target` from an old launcher's bridge would have read past the end
+  of a static in the launcher's image. A 9th interface one image publishes
+  still publishes, but launchers' stdio does not reach it, and
+  `axl_shared_driver_publish` now logs a warning saying so.
+
+- **`AxlNetDriverInfo.driver` grew from 64 to 256 bytes
+  (`AXL_NET_DRIVER_NAME_MAX`, new in `<axl/axl-net.h>`).** A disk-loaded
+  driver's name is the file path its loaded image records, and from a
+  release's versioned directory on a stick
+  (`\axl-sdk-uefi-tools-<ver>-<arch>\drivers\<arch>\ipxe-all.efidrv`) that
+  path passed 63 bytes: `netload` and `netinfo` printed it cut off mid-name.
+  The field's documentation said "the `.efi` filename"; it now says what it
+  holds, the file path. **Who is affected:** code that sizes a copy of the
+  field by the old 64, or that relied on `sizeof(AxlNetDriverInfo)`;
+  rebuild against the new header.
+- **Keys from `inject_text` now carry what a USB keyboard reports.**
+  `axl_console_tap_inject_text()`, `axl_console_mirror_inject_text()`,
+  `axl_console_device_inject_text()` and `_partial()` used to give every
+  decoded key `KeyShiftState` 0 and `KeyToggleState` 0 and to discard the
+  xterm modifier parameter. Each key now has the shape an OVMF USB
+  keyboard delivers for the same key: `KeyShiftState` VALID plus its
+  modifiers, `KeyToggleState` `0xC0` (`AXL_CONSOLE_TOGGLE_KEYBOARD`, new in
+  `<axl/axl-console-ops.h>` with `AXL_CONSOLE_LEFT_LOGO_PRESSED`,
+  `AXL_CONSOLE_TOGGLE_STATE_VALID` and `AXL_CONSOLE_KEY_STATE_EXPOSED`).
+  - **C0 bytes become Ctrl chords:** `0x01`-`0x1a` (other than `0x08`,
+    `0x09`, `0x0d`) are the letter plus left Ctrl, `0x00` Ctrl+Space,
+    `0x1c`-`0x1f` Ctrl+`\ ] ^ _`. A byte-stream console therefore fires the
+    guest's Ctrl-qualified key notifies -- the Shell's Ctrl-C breaks and
+    Ctrl-S pauses output -- where it fired none before. The Simple
+    `ReadKeyStroke` still returns the C0 code for a Ctrl letter; Ctrl+Space
+    and Ctrl+`\ ] ^ _` read there as the plain character, because its fold
+    covers letters only.
+  - **Modified keys keep their modifiers:** `ESC[1;5F` is End + Ctrl, not
+    End; `ESC[1;2P` (Shift-F1) and `ESC[Z` (Shift-Tab), dropped before,
+    now decode; ESC + a key is that key + Alt (it was Esc, then the key);
+    SS3 cursor keys, CSI-u and modifyOtherKeys decode. A sequence with an
+    out-of-range modifier or parameter produces no key.
+  - **Who is affected:** any consumer of these functions. Plain text,
+    Enter, Tab, Backspace, Esc and unmodified cursor/function keys read the
+    same through `ReadKeyStroke`; through `ReadKeyStrokeEx` they now carry
+    VALID and `0xC0`. A guest that ignores modified keys sees them as a
+    real keyboard would make it: the Shell's `edit` answers Ctrl-End or
+    Shift-Up with "Unknown Command", exactly as on a USB keyboard.
+- **`axl_tcp_send()` and `axl_socket_send()` return `AXL_TIMEOUT` when the
+  timeout expires** (they returned `AXL_ERR`). A timeout is now a partial
+  send at a piece boundary on a connection that stays usable, and
+  `axl_tcp_send_get_sent()` says how far it got; `AXL_ERR` is left for a
+  refusal, a transport failure or an interrupted call. Code that tests
+  `!= AXL_OK` is unaffected; code that tests `== AXL_ERR` to detect a
+  timeout must also accept `AXL_TIMEOUT`.
+
+- **Every AxlPk key-handle algorithm is opt-in, in code:** call
+  `axl_pk_enable_mbedtls()` for ECDSA P-256/P-384 and RSA, and
+  `axl_pk_enable_ed25519()` for Ed25519 -- calling the function is what
+  links the provider, the way calling `axl_tls_init()` links TLS. Both are
+  new in `<axl/axl-crypto.h>`, idempotent, and callable at any point.
+  - **Who must call them:** an image that reaches an algorithm ONLY through
+    the generic `axl_pk_key_new()`, `axl_pk_key_load_private()`,
+    `axl_pk_key_load_public()` or `axl_pk_key_from_raw_public()`. Without
+    the call those return NULL and log one line --
+    `ECDSA/RSA unavailable: call axl_pk_enable_mbedtls() before using ECDSA/RSA keys`
+    or
+    `Ed25519 unavailable: call axl_pk_enable_ed25519() before using Ed25519 keys`
+    -- and `axl_pk_alg_available()` answers false. For ECDSA/RSA that is
+    new: until now they were always linked.
+  - **Who need not:** AxlJose users (it enables mbedTLS itself), AxlSsh
+    users (`axl_ssh_server_new()` enables Ed25519 itself), TLS users, and
+    callers of `axl_pk_verify()`, `axl_pk_key_from_ec_xy()`,
+    `axl_pk_key_get_ec_xy()`, `axl_pk_key_from_rsa_ne()` or
+    `axl_pk_key_get_rsa_ne()`, which live in the provider's own object.
+  - **The `-u _axl_pk_provider_ed25519` link flag is retired** (it still
+    links, but nothing documents or needs it), and the Makefile's
+    `ED25519_PULL` is gone. A build that passed it should call
+    `axl_pk_enable_ed25519()` instead.
+  - **Why:** the ECDSA/RSA provider carries mbedTLS's whole PK layer, which
+    reaches RSA by itself, and every image that touched any AxlPk algorithm
+    paid for it. The Ed25519-only `sshd` tool shrinks from 220,160 to
+    201,728 bytes shipped (x64 release) by not carrying it.
+  - `axl_pk_verify()` moved from `axl-pk-verify.c` to `axl-pk-mbedtls.c`;
+    its behaviour is unchanged.
+
+- **`AxlNetAutoOpts` companion drivers and reachability checks are opt-in in
+  code.** `load_deps` is replaced by `deps` (install
+  `axl_net_sweep_deps_sidecar()`), and `verify` with the `AxlNetVerify` enum
+  by `verifier` (install `axl_net_verify_reachable`, which reads the same
+  `ping_ipv4` / `ping_gateway` / `resolve_host`). Naming the function is what
+  links its code, so an image that installs neither no longer carries the
+  JSON5 sidecar reader or ping and DNS -- about 18 KB of `.text` that `sshd`
+  would otherwise have paid for a reachability check it never asks.
+  **The fields were replaced in place**, which breaks the struct's old
+  promise to be APPEND-ONLY: `deps` sits where `load_deps` was and
+  `verifier` where `verify` was, so source that names either old field no
+  longer compiles, and a binary built against the old header must be
+  rebuilt. Kept in place rather than appended because a bool beside a hook
+  that alone links the code would be two switches for one choice, one of
+  which does nothing -- the header now promises only that NEW fields are
+  added at the end. **Who is affected:** a caller that set `load_deps` or
+  `verify`; set `.deps = axl_net_sweep_deps_sidecar()` or
+  `.verifier = axl_net_verify_reachable` instead. A zero-initializing
+  caller is unaffected at the source level, but see `axl_net_driver_dir()`
+  for what a NULL `sweep_dir` now sweeps.
+- **`axl_net_ensure_drivers()` no longer falls back to iPXE.** When its
+  driver list (NetworkCommon, the USB-network drivers, Realtek/ASIX UNDI)
+  brought up no SNP, it loaded `ipxe-all.efidrv`, `ipxe-intel.efi` and
+  `ipxe-broadcom.efi` from any mounted volume. iPXE takes the USB host
+  controller, so on a BMC console the virtual keyboard and the virtual-media
+  stick (both USB) vanished under a tool that only wanted a NIC -- `netinfo`,
+  `fetch`, `sshd` and every `axl_net_auto_init` caller. It now loads only
+  the list; an iPXE driver loads only when named (`netload -p`,
+  `axl_net_try_driver()`). A NIC that only iPXE drives now gets
+  `AXL_NET_DRIVERS_NOT_FOUND` (or `_NO_LINK` if a listed driver loaded).
+  **Who is affected:** a caller that relied on the fallback to bring up a
+  NIC only iPXE drives; load the iPXE driver by name instead.
+  `test-net-no-ipxe-autoload-qemu.sh` stages iPXE-named images and asserts
+  none is started.
+
+### Breaking (packaging)
+
+- **The Makefile is gone: the SDK builds with CMake + Ninja only.** The
+  root `Makefile` (and with it every `make` goal, `make check-*` gate and
+  `make` variable) is deleted; the tree is a CMake project with presets.
+  **What to do:**
+  - Build from a checkout with `cmake --preset x64-debug && cmake --build
+    --preset x64-debug` (also `aa64-debug`, `x64-release`, `aa64-release`),
+    or with the same goal names the Makefile had through
+    `scripts/axl-build.sh ARCH=x64|aa64 [BUILD=RELEASE] <goal>...`
+    (`tools`, `tests`, `sshd`, `all`, ...). Ninja is required. The scripts
+    (`axl-build.sh`, `install.sh`, `verify.sh`, `run-integration.sh`,
+    `lint.sh`, `release-suite.sh`, the tests) run the CMake CI and the
+    release use, 4.3.6 (`scripts/ci-cmake.sh`), installing it on first use
+    into `~/.cache/axl-sdk/cmake/` (~50 MB, checksum-verified; a failed
+    download is an error, never a fall-back to the system cmake), and
+    reconfigure `--fresh` a tree another cmake configured. A `cmake` typed
+    by hand needs 3.29 or later.
+  - Images and objects are under `build/<arch>-debug|release/` (they were
+    under `out/native-<arch>[-release]/`); `scripts/axl-build.sh
+    --print-prefix ARCH=.. BUILD=..` names the tree. `make clean` is
+    removing that directory.
+  - `scripts/axl-build.sh` refuses any variable it does not know (`PREFIX=`,
+    `AXL_TLS=`, `CFLAGS_EXTRA=`, ...) rather than ignoring it, and
+    `AXL_BUILD_BACKEND=make` is refused by name.
+  - A gate is a CTest test: `ctest --test-dir build/x64-debug -R
+    '^gate.check-<name>$'` (`-N -V` prints the command it runs).
+    `verify.sh`'s `make` and `makeimg` jobs are `gates` and `imggates`;
+    the old names are refused with the new one.
+  - `AXL_TOOLCHAIN` (`axl`, `auto`, `cross`) works as it did, now read by
+    the CMake toolchain file, and a build tree keeps the toolchain its
+    first configure chose: switch with `cmake --fresh --preset <p>`.
+  - Consumers that drive this tree's build (`make -C <axl-sdk> tools`) must
+    call `scripts/axl-build.sh` instead. `devkit.conf`'s artifact paths are
+    the CMake trees (`build/<arch>-debug/tools/...`; sshd-rtk's are in the
+    `-rtk` tree). The installed SDK (`axl-cc`, `axl-c++`, the CMake package)
+    is unchanged.
+- **`libaxl.a`'s members are named `*.c.obj`** (CMake's naming), where the
+  Makefile's were `*.o`. Nothing that links against it changes, but a
+  link map or `ar t libaxl.a` shows the new names -- a script that greps
+  one for `libaxl.a(axl-log.o)` must accept `axl-log.c.obj` too.
+- **A `.efi`'s section names are at most eight bytes** (see Fixed: the
+  COFF string table): an AArch64 image's relocation section is `.rela.dy`,
+  and a C++ image's unwind tables, on both arches, are `.eh_fram` and
+  `.gcc_exc`. A tool that looked a PE section up by its long ELF name
+  (`objdump -h` resolved it through the string table) must use the first
+  eight bytes, as the PE spec says an image's section names are.
+
+- **The UEFI-tools tarball no longer ships the iPXE driver.**
+  `drivers/<arch>/ipxe-all.efidrv`, `third_party/ipxe/` and the README's
+  iPXE licence notice and GPL-2.0 section 3(b) offer are gone; the
+  `drivers/<arch>/` set is the five EDK2 drivers. In practice the bundle
+  never brought a NIC up where the USB-network drivers did, and loading it
+  took the USB host controller from the firmware, so a USB stick -- BMC
+  virtual media included -- left the map. `scripts/build-ipxe.sh`, the
+  Makefile's `ipxe` goal and `make-uefi-tools-tarball.sh --ipxe-optional`
+  are removed with it. An iPXE someone else supplies still loads when named:
+  netload and `axl_net_try_driver()` try it last and disarm its watchdog;
+  `axl_net_ensure_drivers` never loads one (see Breaking). `docs/ROADMAP.md`
+  names the last commit that had it and how to restore it.
+
+- **`sshd.efi` and `SftpServer.efi` must come from the same build.** The
+  SFTP helper's interface is version 2: its sessions report each request
+  as they dispatch it (a `consumed` callback), which is what paces a
+  client's input. An sshd refuses a helper of the other version, and a
+  client then sees `sshd: subsystem sftp: <path> is not an SFTP helper for
+  this sshd` and the channel exits 126. **Who is affected:** anyone who
+  copies a new `sshd.efi` beside an old `SftpServer.efi`, or the reverse;
+  every package ships the two together, and `sshd-full.efi` embeds its
+  own.
+
+### Added
+
+- **The `.deb` and `.rpm` are back, beside install.sh.** Each release
+  publishes `axl-sdk-<v>_<v>-1_amd64.deb` and `axl-sdk-<v>-<v>-1.x86_64.rpm`
+  (both in `SHA256SUMS`): the package `axl-sdk-<v>`, installing the same SDK
+  tree as the tarball in `/opt/axl-sdk-<v>`. Versions install side by side;
+  the newest is current (`/opt/axl-sdk-package`, an alternatives link;
+  `update-alternatives --config axl-sdk-package` picks another), and
+  `/etc/profile.d/axl-sdk.sh` puts it on every user's `PATH` -- APPENDED, and
+  nothing in `/usr/bin`, so a user's own install.sh copy in `~/.local/bin`
+  still wins. They recommend (do not require) the QEMU stack, require only
+  `curl`, `xz` and `tar`, and do not include the cross toolchain
+  (`axl-install-toolchain`). Installing one removes the old `axl-sdk`
+  package of 4.4.0 and earlier, whose `/usr/bin/axl` shadowed install.sh's.
+  README's "Which install should I use?" compares the two.
+
+- **Install receipts for SDK versions.** install.sh now writes
+  `share/axl/.axl-receipt` into every SDK version it installs (who installed
+  it, the SHA-256 it was verified against, whether TLS was skipped, when);
+  each package carries one naming `deb` or `rpm`.
+
+- **`axl list` shows every installed version with its owner** --
+  `install.sh`, `deb`, `rpm`, or `(no receipt)` for versions installed
+  before receipts -- including the packages' versions under `/opt`, `*`
+  marking install.sh's current and `+` the packages'. `axl version` names a
+  package's owner.
+
+- **`axl use` with no version names your project's pin.** If a
+  `.axl-sdk-version` file in the current directory or a parent holds a
+  version, it prints `axl: this project pins 4.7.5 (/path/.axl-sdk-version)
+  -- to switch to it: axl use 4.7.5` (it does not switch, and still exits 2).
+  `axl update` prints the same pin when the newest release it moves to is
+  not it.
+
+- **`agent`: run Shell command lines over HTTP.** `agent.efi` listens
+  (default port 8080) and runs each `POST /exec` body -- one Shell command
+  line -- answering JSON: whether it ran (definite in a Shell started
+  `-nonest`), its status, and its stdout and stderr captured separately,
+  each with a state (`captured`, `truncated` at 1 MiB, `redirected` by the
+  line itself, `unreadable`, `lost`). `POST /exec?output=console` runs the
+  line uncaptured instead, its output on the console (the serial log) as it
+  happens -- kept even when the line crashes or hangs, which a capture read
+  after the line ends would lose. `GET /ping`, `GET /info` (protocol 2),
+  `POST /quit`. `curl -d 'ls fs0:' host:8080/exec` drives a UEFI machine with
+  nothing typed; it is the test-guest pool's transport. The protocol is
+  `tools/agent.c`'s header comment. Defaults to `axl_net_set_latency`
+  ALWAYS; pass `--latency firmware` on a machine someone types on. An
+  `exit` that slips past the refusal -- in a script, a pipe, a `%var%` --
+  poisons the Shell (later scripts stop early reporting success, and the
+  Shell exits when the agent returns); a canary after each line detects it,
+  the answer carries `shell_exiting`, and later lines get 409.
+- **`axl_shell_execute_status()` (`<axl/axl-shell.h>`): whether a line ran,
+  and its status.** `axl_shell_execute` cannot say either: EDK2's default
+  nested Shell reports 0 for a command that never ran. In a Shell started
+  `-nonest` the new call reads `%lasterror%` (reset first with a quiet
+  `cd .`) and answers `RAN` / `NOT_RUN` with the status; under a nesting
+  Shell every answer is `UNKNOWN`, stated rather than guessed. `exit` as
+  the first word, in any spelling the Shell accepts, is refused with
+  `AXL_DENIED`: in a `-nonest` Shell it would end the caller's Shell while
+  reporting 0.
+- **`axl_timer_resolution_begin` / `_end` and `axl_timer_period_us`
+  (`<axl/axl-time.h>`): ask for a faster firmware tick, and give it back.**
+  The tick is firmware-global, so requests from every image are tracked in
+  one registry (a UEFI configuration table) and the fastest live one wins;
+  the period is restored when the last ends, at exit included. 1 to 100 ms.
+  **A 1 ms tick makes OVMF's USB keyboard drop keys under QEMU** (1 of 10
+  presses delivered; 10 of 10 at 5 ms) -- stated in the header.
+- **`axl_net_set_latency` (`<axl/axl-net.h>`): fast AxlTcp round trips,
+  opt-in.** EDK2's network stack has no receive interrupt, so a frame waits
+  for the 10 ms firmware tick and the stack's own 10 ms receive timer: an
+  event-loop server measured a 10-20 ms p90 round trip. `WINDOW` (fast for
+  250 ms after any AxlTcp activity) and `ALWAYS` (while any socket lives)
+  hold a 1 ms tick, poll every live socket and shorten every
+  driver-attached loop's tick: p90 0.4-1.1 ms on X64 and AARCH64. Off by
+  default (`FIRMWARE`) because of the USB keyboard hazard above.
+- **`AXL_SHELL_OPTIONS`: the test launcher passes Shell options.**
+  `run-qemu.sh` and the integration harness boot the Shell through the
+  launcher with these options appended (`-nonest` for the status call
+  above); setting it forces the launcher, and a launcher that is turned
+  off is an error rather than a silent drop.
+
+- **`axl_service_upgrade_in_flight()`**: whether the launcher is trialling or
+  promoting a candidate of this service right now, in this boot (a volatile
+  marker the launcher sets around the trial and promotion -- not the NV
+  record, which outlives a boot that died). A service reports "upgrade in
+  progress" from it without trying a stage.
+
+- **A persistent SSH host key: `<axl/axl-ssh-host-key.h>` and
+  `axl_ssh_server_set_host_key()` (AxlSsh P5).** The default store is the
+  UEFI variable `AxlSshHostKeyEd25519` (its own vendor GUID, non-volatile and
+  boot-services only); `axl_ssh_host_key_nv_load_or_create()` loads it or, on
+  a first start, makes and stores one. A stored key that is present but
+  unusable, unreadable, or carries any attribute but NV+BS (runtime access,
+  an authenticated bit) is refused by name and never silently regenerated;
+  a key made from weak entropy, or one whose write fails or does not read
+  back, serves as `AXL_SSH_HOST_KEY_EPHEMERAL` and is not stored. The
+  provider-free half -- OpenSSH's `SHA256:` fingerprint, the public line,
+  an openssh-key-v1 parser (`ssh-keygen -t ed25519 -N ''` files; encrypted,
+  PKCS#8 and other key types refused by name) and read/write/delete of the
+  variable -- links without the Ed25519 provider.
+  `axl_ssh_host_key_load()` checks the seed derives the stored public key;
+  `axl_ssh_host_key_record_from_key()` serves an application with a
+  configuration store of its own. `axl_ssh_server_host_key_fingerprint()`
+  and `axl_ssh_server_host_key_public_line()` report a server's key.
+
+- **sshd keeps its host key: `HostKey` / `--host-key`, `sshd hostkey`, and
+  the fingerprint at start and in `status`.** With no `HostKey`, sshd keeps
+  its key in the UEFI variable `AxlSshHostKeyEd25519` (NV+BS) and makes it at
+  the first start, which prints `sshd: generated a new host key`; every start
+  and `sshd status` print `sshd: host key ED25519 key fingerprint is
+  SHA256:...`. `HostKey` (repeatable, up to 8) and `--host-key` (which
+  replaces the file's lines) name an unencrypted `ssh-ed25519` key file, with
+  sshd's skip-and-report posture and its `no hostkeys available -- exiting.`;
+  `sshd -T` prints `hostkey` lines. `sshd hostkey` prints the key and its
+  `known_hosts` line; `--regenerate` deletes the stored key, naming the old
+  fingerprint; `--import FILE [--force]` stores a key file in the variable
+  (`--force` puts the replaced key back if the write fails) and asks for the
+  fingerprint to be confirmed at a start before the file is removed.
+  A stored key that is unusable or unreadable stops the start with the fix
+  named; one that cannot be stored serves anyway and `status` reports
+  `degraded: host key not saved; it changes at every start`.
+
+- **`AXL_SSH_DISCONNECT_LINGER_MS`: a DISCONNECT is delivered.** A
+  connection AxlSsh ends with SSH_MSG_DISCONNECT on a healthy stream now
+  sends nothing after it, releases its channels and principal at once, keeps
+  flushing, and waits up to 1 s for the peer to hang up before resetting it,
+  so ssh(1) prints the reason (`Received disconnect from ...:14: Too many
+  authentication failures`) instead of racing a reset. One server-wide timer
+  bounds every linger; a lingering connection is the first eviction
+  candidate, and its penalty accrues when the DISCONNECT is sent.
+
+- **`AxlTcpPacing.linger_us` (`<axl/axl-tcp.h>`), and sshd's `AxlTcpLinger` /
+  `--tcp-linger`.** After a socket's last send retires with a receive armed
+  on the same loop, AxlTcp keeps polling it this many microseconds (0-20000),
+  so a request/response peer's next request is answered at once instead of
+  at the firmware's next 10 ms timer and the next driver tick. Off by default
+  (0), and 0 is also implied by `idle_backoff_ms` 0: it is a per-platform
+  knob. Measured on QEMU at 9000 us, a 16 MiB `sftp -R 1` download: 1.5 to
+  16.3 MB/s on virtio-net, 3.0 to 13.3 on e1000, 3.2 to 4.1 on aarch64; but
+  on QEMU's e1000 uploads got slower, 5.5 to 0.9 MB/s (the e1000 discards
+  frames when its receive ring is full, as the real controller does, and
+  iPXE's driver posts only 8 buffers). An idle connection stops polling within the linger, and a linger
+  lasts only while its receive does: the receive completing or being
+  cancelled, the close, or the pacer's back-off ends it.
+
+- **A service state: `axl_service_state`, `axl_service_state_reason` and
+  `axl_service_set_degraded`.** A half-stopped service (a teardown failed,
+  or setup returned `AXL_SERVICE_SETUP_HELD`) looked exactly like a serving
+  one: published, so `status` said running and `start` said already
+  running and skipped a staged upgrade. The driver now tags its image
+  handle with name-derived `<name>/stopping` and `<name>/degraded` GUIDs,
+  and any image reads the state (STOPPED, RUNNING, DEGRADED, STOPPING; the
+  worst wins) from the handle database. STOPPING is the framework's: set at
+  both half-stopped sites, cleared when the image unloads. DEGRADED is the
+  service's own: `axl_service_set_degraded(true, why)` from setup or from
+  the loop at `TPL_CALLBACK`, with the reason (80 bytes, copied) readable
+  from any image, cleared by the service or when the image unloads, so a
+  reload's replacement starts healthy. `status` treats degraded as up (exit
+  0, with the reason), as systemd counts it active.
+- **`AXL_SERVICE_SETUP_HELD`: a setup that failed but cannot unwind.** A
+  setup that took something calling into its image and cannot give it back
+  returns it (`0x48454C44`, a value nothing returns by accident): the driver
+  stays resident in STOPPING and the next stop's teardown finishes the
+  unwinding, instead of the entry failing and the firmware freeing the image
+  under it (or setup returning `AXL_OK` with nothing serving, which sshd
+  did). It needs a teardown; from a service with none it is refused.
+- **`stop --reset`.** The `stop` verb's last resort for a teardown that
+  keeps failing: it stops as `stop` does, which retries the teardown, and
+  ONLY if the service is then STOPPING it flushes the log, warns and resets
+  the machine. A stop that fails for another reason -- a foreign image with
+  no Unload handler publishing the name, a protocol another agent holds, an
+  allocation failure -- is reported, with a line saying the reset does not
+  apply. There is no forced unload; freeing an image something still calls
+  into is a use-after-free.
+- The state tags are derived in a namespace of their own, so a service
+  named `x/stopping` cannot read as service `x`'s stopping tag, and the
+  degraded reason's struct is a frozen `{ uint32_t size; char why[]; }`
+  read by the UEFI size rule, so a launcher and a driver from different SDK
+  versions still read each other's reason.
+
+- **A driver-mode loop uses most of its tick when the foreground is waiting
+  (`<axl/axl-loop.h>`).** A tick extended by a busy idle source -- AxlTcp's
+  transmit pacer, during a send -- used to stop at half its period, so that a
+  busy foreground keeps the other half. That half went unused when the
+  foreground was only waiting, which held a resident service to half the CPU.
+  Example: sshd at the Shell prompt served an SFTP download at about 50% vCPU,
+  with the rest idle.
+  - A tick that finds the foreground halted in `gBS->WaitForEvent` now
+    extends to the new **idle budget**, `axl_loop_set_driver_idle_budget_ms()`.
+    Its default is min(interval x 9/10, `AXL_LOOP_DRIVER_BUDGET_MAX_MS`):
+    9 ms of a 10 ms tick, 25 ms of a 50 ms one.
+  - The loop learns this from EDK2's idle-loop event group. Its two
+    members note each idle pass and the end of each halt. A tick counts
+    as idle only when the foreground never ran in either of the two
+    periods before it, and its last halt ended in the interrupt that
+    queued this tick. A renderer whose wakes land on driver ticks (EDK2
+    fires every timer on its 10 ms system tick) keeps its full frame rate.
+  - `axl_loop_set_driver_budget_ms()` keeps its meaning as the
+    busy-foreground bound. Its 0 still turns off all extension. The idle
+    budget's 0 turns off only the idle extension.
+  - Firmware that does not signal the group behaves as before.
+  - Measured: a 16 MiB sftp get from sshd on QEMU x64 (RELEASE) went from
+    7.7 to 11.5 MB/s on e1000, and from 9.2 to 13.5 MB/s on virtio-net.
+  - An extended tick stops starting passes in time for the next tick, and a
+    tick queued behind the loop's own previous one (which ran into its
+    interrupt) neither extends nor counts against the foreground. Before
+    this, every overrun cost the extension three ticks: on aarch64 TCG, where
+    passes are slow, the same download ran at 3.7 MB/s; now 4.1 MB/s.
+  - Each attached loop now takes three slots of the backend's 64-entry
+    notify table instead of one.
+
+- **Staged upgrade for a resident service (`<axl/axl-service.h>`): stage
+  now, apply at the next start, roll back if it fails.** The unattended
+  path for a service with no application to perform a reload.
+  - `axl_service_stage(deploy, opts, image, len)`, called by the service
+    from its own callback, validates the image and writes it beside the
+    pinned `driver_path` as `P.new`. It refuses a non-driver or foreign
+    image, a quarantined one, or one the optional `verify` hook refuses.
+  - The service then resets. At the next boot the launcher's `start` (or
+    `axl_service_start_staged`) trial-runs the candidate under the UEFI
+    watchdog and a grace period, then promotes it (`P.bak` keeps the
+    previous image).
+  - A candidate that fails -- or hangs `tries` boots running -- is
+    quarantined, kept as `P.failed`, and `P`, never touched, runs.
+  - An NV breadcrumb records every phase before its change, so a power
+    loss at any point is resolved at the next start.
+  - New: `axl_service_unstage`, `axl_service_is_staged`,
+    `axl_service_last_upgrade` (the outcome, for the service to report) and
+    `axl_service_clear_quarantine`. `AxlServiceDeploy` gains `staged_opts`
+    (`tries`, `watchdog_sec`, `commit_grace_sec`), and the `start` verb
+    gains `--no-staged`.
+  - Not covered: a CPU exception in the candidate, which needs a hardware
+    or BMC watchdog, and anti-rollback.
+  - Example: `sdk/examples/upgrade-svc.c`. Tests:
+    `test-service-stage-qemu.sh` (end to end, with resets),
+    `-resume-` and `-trial-` (the resume table, a power loss cut at each
+    phase), and `-watchdog-` (a candidate that hangs).
+
+- **AxlSsh: a channel's inbound window can follow the application
+  (`<axl/axl-ssh-channel.h>`).** `axl_ssh_channel_set_window_mode()` with
+  `AXL_SSH_CHANNEL_WINDOW_ON_CONSUME` credits a delivered byte back to the
+  peer only when `axl_ssh_channel_consumed()` reports it, so a reader that
+  falls behind stops its peer after one window -- sshd's backpressure;
+  `axl_ssh_channel_unconsumed()` reads what is held, and
+  `AXL_SSH_CHANNEL_WINDOW_SIZE` / `AXL_SSH_CHANNEL_UNCONSUMED_MAX` size the
+  application's buffer. Reports only count; the `WINDOW_ADJUST` leaves from
+  the loop, one for any number of reports between two iterations. Every
+  channel starts in `AXL_SSH_CHANNEL_WINDOW_ON_ARRIVAL`, today's behaviour:
+  code that calls none of these is unaffected. Deliberate deviation from
+  sshd, ON_CONSUME channels only: a peer that would take the bytes held
+  past `AXL_SSH_CHANNEL_UNCONSUMED_MAX` is disconnected even when it
+  interleaves empty data packets, which reset sshd's 10% grace.
+
+- **`tls.close_notify` client option (`<axl/axl-http-client.h>`).** A TLS
+  body framed by the close ends in order only at the server's
+  close_notify; otherwise the request fails `AXL_INCOMPLETE`, and the
+  error now says "TLS ended without close_notify after N bytes", not just
+  that the body was cut. `"required"` is the default. `"lenient"` accepts
+  a TCP FIN without close_notify as the end of such a body, logging a
+  WARNING that names the server -- for a known embedded server that skips
+  it; a reset is still `AXL_INCOMPLETE`, and Content-Length and chunked
+  bodies are unaffected. Any other value is refused by
+  `axl_http_client_set`.
+
+- **`axl_http_parse_response_headers` and
+  `axl_http_find_response_header_end` (`<axl/axl-http-core.h>`) -- a
+  response read as a user agent reads one (RFC 9112).** The same tokenizer
+  as `axl_http_parse_headers`, with a user agent's rules: an obs-fold is
+  unfolded to one SP (5.2), Content-Length lines and `5, 5` lists merge
+  when identical and fail when they differ (6.3), whitespace before a
+  colon is trimmed and any name is kept (5.1), control characters other
+  than CR, LF and NUL are kept, a second Host is not checked, and a bare
+  LF ends a line (2.2) -- in the head's end too. A bare CR or NUL, a line
+  with no colon, a second Transfer-Encoding and a cut block still fail.
+  Both SDK clients use them.
+
+- **`axl_http_parse_content_length` (`<axl/axl-http-core.h>`) -- the
+  strict Content-Length reader.** `AXL_OK` with the length (0 when the
+  header is absent), or `AXL_INVALID` for an empty value, a non-digit, or
+  a number not below SIZE_MAX -- never a prefix, never wrapped. The server
+  answers such a request 400 with it; `axl_http_get_content_length` wraps
+  it.
+
+- **`AXL_WEBDAV_LENGTH_UNKNOWN` (`<axl/axl-http-server.h>`)** -- the
+  length `AxlWebDavOps.write_open` is told for a chunked PUT, whose
+  length nothing states up front.
+
+- **serve-fs PUT in place, opt-in, for files too large to replace
+  atomically.** `AXL_SERVE_FS_PUT_IN_PLACE_IF_SHORT` writes an existing
+  file in place only when the volume cannot hold a second copy of the
+  body (its `Content-Length` plus the directory room the temp and the
+  commit's replace take, counted as `axl_file_replace`'s own pre-flight
+  counts it, against the free space); `AXL_SERVE_FS_PUT_IN_PLACE` always
+  does. The default is
+  unchanged: atomic, through a temp. A new file always goes through the
+  temp. The refusals still come first (read-only 403, collection 409,
+  no-overwrite 409, live temp 403, too big even in place 507). While it
+  runs the file is busy for every mount in the process, known by the
+  names the filesystem stores (an 8.3 alias or another letter case of it
+  or of a directory on the way is the same file): another PUT to it is
+  503, a DELETE, MOVE or COPY that would replace or remove it is 423
+  Locked (a reason phrase the server now has). A PUT in
+  place that does not complete leaves the file PARTIALLY written, and says
+  so: an error naming the file and the bytes stored, 500 with `PUT failed
+  part-way: the resource is partially written`, or for a `Content-Digest`
+  mismatch 400 with `Content-Digest mismatch: the resource now holds the
+  body that did not match`.
+
+- **`axl_file_replace` (`<axl/axl-fs.h>`) -- `rename(2)` on FAT, which
+  cannot rename onto an existing name.** Moves a file or directory onto a
+  path, REPLACING what is there, as a sequence that puts both entries back
+  on any failure it can observe: every refusal decided first, the
+  destination renamed aside to `~AXLhhhh.TMP` in its own directory, a
+  check that the two were not one entry under two spellings, the source
+  renamed (or copied) into place, and only then the aside removed. Identity
+  is decided by the names the filesystem stores, read through a handle on
+  every component -- an 8.3 alias, `.\`, either separator and trailing
+  dots are the same entry -- and a letter-case-only change is performed.
+  Flags: `AXL_FILE_REPLACE_COPY` copies a file when no rename can move it
+  (another volume, or a provider), carrying its modification time;
+  `AXL_FILE_REPLACE_TREE` replaces a whole directory tree (WebDAV MOVE with
+  `Overwrite: T`) and, with `COPY`, moves a directory tree across volumes.
+  `AxlFileReplaceResult` says what happened: `CREATED`, `REPLACED`, `SAME`
+  or `RECASED`. Without `COPY`, a move across volumes is `AXL_UNSUPPORTED`
+  before any kind rule, as rename(2)'s `EXDEV` comes first. Refuses with
+  nothing changed: a read-only entry or
+  write-protected volume (`AXL_DENIED`), and a volume reporting less free
+  space than the directory entries the sequence appends and the copy need
+  (`AXL_NO_RESOURCES`). A Ctrl-C mid-sequence is undone (or, past the
+  point of no return, finished), answered `AXL_CANCELLED`, and left pending
+  for the caller's next yield. A directory copy whose names collide on the
+  destination (letter case, or trailing dots FAT drops: `D` and `d`, `foo.`
+  and `foo`) fails and removes what it created, rather than letting one
+  name overwrite the other.
+
+- **`axl_file_set_mtime`, and handle forms `axl_fstat`, `axl_ftruncate`,
+  `axl_fset_mtime` (`<axl/axl-fs.h>`).** `axl_file_set_mtime` is
+  `utimensat(2)` without the access time: Unix seconds, UTC, in FAT's range
+  (1980-01-01 to 2107-12-31, two-second steps; outside it `AXL_INVALID`
+  before any I/O), verified by re-reading and flushed, with the previous
+  time written back when the filesystem keeps another; a read-only file is
+  `AXL_DENIED`. The handle forms act on the file an `axl_fopen` stream was
+  opened on wherever it now is -- a rename or a new file at the old path
+  does not redirect them -- and `axl_fstat` reports the file's current
+  name. `axl_ftruncate` and `axl_fset_mtime` write the stream's buffered
+  bytes out first, so write, `axl_fset_mtime`, `axl_fclose` keeps the
+  time. Other streams are `AXL_UNSUPPORTED`; a stream opened `"r"` is
+  `AXL_DENIED` for the two that write.
+
+- **The EFI 1.x shell's `ifconfig` shows the address AXL brought up.** That
+  shell's `ifconfig` reads `EFI_IP4_CONFIG_PROTOCOL` (UEFI 2.0-2.3.1) and the
+  NIC configuration protocol the pre-2.4 network stack installed beside it;
+  current firmware produces neither, so it printed `Not configured.` for a
+  NIC `netload` or `sshd` had just leased. Every AXL bring-up that leaves a
+  NIC configured (`axl_net_auto_init`, `axl_net_auto_init_opts`,
+  `axl_net_bring_up`, `axl_net_set_static_ip*`) now loads, once per boot, a
+  small resident driver that publishes both on every NIC with
+  `EFI_IP4_CONFIG2_PROTOCOL` -- never over a real one -- answering from
+  IP4Config2 on every call, so the old `ifconfig -l` prints the address,
+  mask, gateway and routes. Read-only: the old `ifconfig -s`/`-c` get
+  `EFI_UNSUPPORTED`. The driver is its own image (embedded in libaxl.a,
+  about 10 KB), so the protocols outlive `netload`; it follows NICs that
+  appear and go away. New `axl_net_legacy_ip4cfg_install()` /
+  `axl_net_legacy_ip4cfg_uninstall()` (`<axl/axl-net.h>`) for a NIC
+  something else configured. One copy per boot, the newest: the driver
+  marks its image with `AXL_NET_LEGACY_IP4CFG_MARKER_GUID` and its
+  `AXL_NET_LEGACY_IP4CFG_REVISION` (`AxlNetLegacyIp4CfgMarker`), and an
+  older resident copy is replaced. The modern Shell's `ifconfig` is unchanged.
+  Cost: x64 RELEASE `sshd.efi` 246,784 -> 250,368 B (the release test's
+  limit moves with it).
+- **sshd serves SFTP**: `sftp` and `scp` (OpenSSH 9.0 and later) copy files
+  to and from the machine's volumes -- `get`, `put`, `rename` (between
+  directories too), `mkdir`, `rmdir`, `rm`, and a size or modification
+  time set with SETSTAT, so `put -p` and `scp -p` keep a file's time
+  (to FAT's two seconds; a time before 1981 is stored as 1981-01-01) --
+  answering with OpenSSH sftp-server's status for the same condition (the
+  sshd guide lists where it differs). `/` lists the mapped volumes,
+  and `/fs0/dir/file` and the Shell's `FS0:/dir/file` both name a file. The
+  server is a separate image, `SftpServer.efi`, which sshd loads from beside
+  `sshd.efi` as it starts and unloads as it stops -- OpenSSH's
+  sshd/sftp-server split. (Not per session: a session runs in an event
+  callback, at TPL_CALLBACK, where UEFI forbids `LoadImage` and
+  `StartImage`; on aarch64 such a load could be handed pages the firmware,
+  still unloading an exited command, then marked execute-never -- an
+  instruction abort at the first request.) A new `SftpServer.efi` takes
+  effect at the next sshd start, and a missing one is logged at start
+  (`sftp: SFTP helper FS0:\SftpServer.efi not found; sftp sessions are
+  refused`). sshd itself grew
+  only the subsystem hook and a relay. `sshd-full.efi` embeds the helper (one
+  file, no helper beside it), and `sshd-full-rtk.efi` embeds it alongside
+  sshd-rtk's NIC driver (built only with `RTK_USB_UNDI`, shipped only with
+  `--with-rtk`). The shipped `sshd.conf` turns it on with `Subsystem sftp
+  SftpServer.efi`; a file without the line serves no SFTP, as in OpenSSH, and
+  with no file it is on. **An sshd.conf written before this release has no
+  such line, so SFTP stays off with it: add `Subsystem sftp SftpServer.efi`
+  to it.** sshd says so when it starts, in its log: `sftp: off (sshd.conf
+  has no Subsystem line)`. A missing helper is reported to the client on
+  stderr (`sshd: subsystem sftp: FS0:\SftpServer.efi not found`) and the
+  channel exits 127. `AxlSftpReadOnly yes` in sshd.conf (or
+  `--sftp-read-only`) refuses every write with Permission denied while
+  reads still work, and `AxlReadOnly yes` (`-R`) implies it: a session that
+  cannot type cannot change files either; when that alone is why, sshd logs
+  `sftp: read-only (AxlReadOnly)` once as it starts. The server advertises
+  OpenSSH's `posix-rename@openssh.com` and `limits@openssh.com`: sftp(1)'s
+  `rename` then replaces an existing file as rename(2) does, through
+  `axl_file_replace` -- the old file is renamed aside until the new one is
+  in place, and a failure AXL sees puts both back, though it is not atomic
+  (the UEFI FAT driver's own rename can lose an entry on a full volume, and
+  a power loss leaves the old one at its `~AXLhhhh.TMP` name). A name onto
+  its own 8.3 alias succeeds and changes nothing; a case-only rename takes
+  the new spelling. `rename -l` never replaces, and no rename crosses
+  volumes (Failure); `limits` reports 256 KB packets, 32 KB reads, 255 KB writes
+  and 16 open handles. Read-only mode leaves `posix-rename` out of the
+  advertisement, as `sftp-server -R` does. One request may grow a file by at
+  most 16 MiB past its end (a size, or a write's gap; Failure beyond):
+  the UEFI FAT driver zero-fills a growth inside one call while every
+  session waits, so after one growth a session also yields the loop
+  before its next buffered request. The sshd guide's "Copying files" section covers paths,
+  scp's `glob(3)` caveat, limits, measured speed and the differences from
+  OpenSSH. The SFTP v3 codec, path normaliser and session handler are unit
+  tested (AxlTestSshdSftp).
+- **AxlSsh `subsystem` channel hook** (`AxlSshChannelOps.subsystem`,
+  `<axl/axl-ssh-channel.h>`): a peer's `subsystem` request (RFC 4254
+  section 6.5) -- `sftp`, which scp(1) also uses since OpenSSH 9.0 -- reaches
+  the application with the name it asked for, and the hook accepts or
+  refuses it as the `exec` hook answers a command. An accepted channel
+  starts and carries the subsystem's byte stream through the ordinary
+  `data`/`eof`/`writable`/`close` hooks. The same rules as `shell`/`exec`
+  apply: one per channel, refused unparsed after the start or once an exit
+  is pending, and before the start a name with a NUL inside it or bytes
+  after it ends the connection, as in sshd. An application that installs no
+  subsystem hook sees no change: the request is refused unparsed, as
+  before.
+- **`axl_serial_is_console()`** (`<axl/axl-serial.h>`): whether a console
+  output or standard-error device -- a ConOut or StdErr member -- is bound
+  on a serial port, i.e. whether writing raw bytes to it would disturb the
+  console. Decided by binding, so a line-setting change on the port does
+  not change the answer. Ask it before logging to a port.
+- **`sshd --log-port` / `AxlLogPort`**: the serial port sshd's log goes to
+  while it serves -- `auto` (default), `none`, or a port number.
+- **`sshd log`**: the server keeps the last 8 KB of its log in memory while
+  it serves, and `sshd log` prints it -- the one place the log goes on a
+  machine whose only serial port is the console's. A failed `sshd stop`
+  prints the server's newest error line from it.
+- **`md5sum` and `sha256sum`**, GNU coreutils' `md5sum(1)` /
+  `sha256sum(1)` for the UEFI Shell, in the tools tarball and the devkit
+  image. `<hex>  <name>` per file (`-` or none: stdin), streamed in 64 KB
+  reads so an image of any size costs one buffer, with GNU's `-b`, `-t`,
+  `--tag` (BSD lines) and `-z` (NUL-ended, written raw). `-c LIST` checks
+  a list -- `<name>: OK`, `FAILED` or `FAILED open or read`, then GNU's
+  `WARNING:` lines -- reading untagged lines (with the `*` binary marker),
+  `--tag` lines for the tool's own algorithm, GNU-escaped names (`\\`,
+  `\n`, `\r`), skipping `#` comments and empty lines and dropping one CR
+  before the line end as GNU does, so a list written through a Shell `>`
+  checks as written; with `--quiet`, `--status`, `-w` (last one wins),
+  `--strict` and `--ignore-missing`, and GNU's refusals of conflicting
+  options; exit 0 or 1. Output matches the host tools byte for byte
+  (`test-sum-qemu.sh` compares every case against them, both
+  architectures). The differences, each forced by UEFI: a name is escaped
+  on output only when it holds a line break (GNU also escapes `\`, which
+  every UEFI path holds); error lines print a name as given, without GNU's
+  shell quoting; a list line over 8 KiB is improperly formatted; and
+  standard input that is the console is refused, because the console has
+  no end of file. One implementation (`tools/sum.c`) behind two entry
+  points.
+
+- **The UEFI-tools tarball ships `sshd.conf` beside `sshd.efi`**, in
+  OpenSSH `sshd_config` style: every keyword `sshd` supports, commented out
+  at its default with a line on what it does (`AxlPassword` as a
+  placeholder, which `sshd` refuses at its line -- `AxlPassword: replace the
+  placeholder with a password` -- so uncommenting it unchanged leaves no
+  known password; `PasswordAuthentication` with a hint that password logins
+  need one). As shipped it changes nothing. The source is `tools/sshd.conf`;
+  `test-sshd-conf-qemu.sh` pins it to `sshd -T` -- every keyword `-T` prints
+  is documented once, and the file read as shipped, and with every keyword
+  uncommented, gives exactly the defaults -- and the release-image test
+  boots `sshd` reading the shipped file.
+- **`sshd` alone gets a box online, as `netload -a` would.** Every lab
+  system's cabled NIC is a USB dongle whose driver the firmware lacks, while
+  the firmware's own NICs are link-down: `sshd` used to load a curated driver
+  list only when NO NIC existed, so it never tried the dongle's driver and
+  said "no NIC has a link" -- `netload` had to run first. It now brings the
+  network up with `netload -a`'s engine (`axl_net_auto_init_opts`): the
+  firmware's NICs first, then a crash-safe sweep of the drivers in
+  `drivers\<arch>` BESIDE `sshd.efi` (the release tree's layout), with
+  `netload-drivers.json5` companions (NetworkCommon for USB CDC/RNDIS) and
+  `netload`'s quarantine shared. Each DHCP gets `netload`'s 15 s
+  (`AXL_NET_DHCP_ATTEMPT_SEC`) and the bring-up moves on, so a firmware NIC
+  no DHCP server answers (an onboard port on a VLAN without one) does not
+  keep the sweep from the dongle's driver. When `sshd.efi` has no drivers
+  directory, every volume's `\drivers\<arch>` is swept.
+  `test-sshd-sweep-qemu.sh` boots both shapes -- a link-down firmware NIC,
+  and a link-up one with no DHCP server, each with an e1000 whose driver is
+  only on the stick (or only on a second disk) -- and `sshd -P x` serves on
+  the swept NIC's address.
+- **`sshd` says what it is doing while it starts, and its network bring-up
+  is bounded.** It prints `sshd: starting -- bringing up the network (up to
+  60 s)` before anything else. A NIC that already has an address is used as
+  it is. Otherwise the firmware's NICs, the sweep, every link wait and every
+  DHCP share ONE 60 s deadline -- room for the firmware pass's link wait and
+  DHCP (5 + 15 s), the winning driver's (5 + 15 s) and 20 s of driver loads
+  -- and stop on Ctrl-C (the sweep before its next driver); link-down NICs
+  are skipped (read as `netload` reads them), and a DHCP `sshd` started and
+  gave up on is stopped (the policy is put back). It fails after the 5 s
+  link wait (a NIC may appear during it) with `sshd: no network: no NIC
+  driver produced an interface (searched the firmware and <dir>)` when no
+  NIC exists, naming the drivers directory it searched; after the same wait
+  with `sshd: no network: no NIC has a
+  link (N link down)` when every NIC is link-down; and with `sshd: no
+  network: no DHCP lease on any NIC with a link (N tried)` when no NIC
+  leased. A failed start installs nothing: a driver the sweep loaded that
+  brought no NIC up is unloaded, and so are the companions it loaded.
+  A server whose NICs were all link-down printed nothing for more than ten
+  minutes and ignored Ctrl-C. **That hang's root cause is not reproduced**
+  -- no test guest hangs -- so this is a diagnosis aid as much as a fix:
+  with `-v` the last line printed names the step that stalled -- the
+  firmware pass, each driver before its load, each NIC with its link state,
+  and each NIC before its DHCP.
+- **The link gate runs DHCP on every link-up NIC of a pass at once; the
+  first lease wins.** As Linux's in-kernel `ip=dhcp`, systemd-networkd and
+  dhcpcd do: `axl_net_auto_init_opts()` with `link_wait_sec` sets the DHCP
+  policy on all of a pass's link-up NICs (a `CONFIGURING` event each), waits
+  ONE `dhcp_timeout_sec` for them together, takes the first with an address
+  (in ordinal order when several have one; the verifier, when installed,
+  must accept it -- a NIC it rejects leaves the race, which goes on waiting
+  for the others in the same budget), and puts every other NIC back as it
+  was: its IP4Config2 policy, and for a NIC that was static its manual
+  address, gateway and DNS servers, which the firmware discards when the
+  policy changes (`test-net-gate-qemu.sh`: a static NIC loses the race and
+  comes back with all three). A pass costs the link wait plus one DHCP budget however many ports
+  are cabled: three firmware NICs on a network with no DHCP server used to
+  hold `sshd`'s sweep back 45 s (the USB NIC's lease came at ~50 s); it now
+  reaches the sweep after 15 (`test-sshd-sweep-qemu.sh`, boot C, serves in
+  19 s). Static addresses, and DHCP on firmware without IP4Config2, are
+  still tried one NIC at a time. `netload` does not use the gate and is
+  unchanged.
+- **`sshd-rtk.efi`: `sshd` with a NIC driver inside it.**
+  `scripts/axl-build.sh sshd-rtk
+  RTK_USB_UNDI=/path/<arch>/RtkUsbUndiDxe.efi` packs the given driver with
+  `axl-efi-pack` and embeds it in a second build of sshd's resident driver,
+  which offers it to the bring-up as the first candidate after the
+  firmware's NICs, before `drivers\<arch>`, loaded from memory under the same
+  quarantine, deadline and Ctrl-C (`-v`: `trying embedded driver
+  RtkUsbUndiDxe.efi`). For a box whose cabled NIC is a Realtek USB dongle:
+  one file, no drivers directory. It is sshd in every other way, and ONE
+  service with it (`sshd status`/`stop` reach a server `sshd-rtk` started,
+  and the reverse). Built only when given the driver, which never enters the
+  tree; `make-uefi-tools-tarball.sh` / `make-test-release.sh --with-rtk DIR`
+  ship it, saying in the README and notes that it embeds Realtek's driver.
+  `test-sshd-rtk-qemu.sh` embeds QEMU's e1000 driver through the same hook
+  (x64: it wins and serves; aarch64: an embedded UsbCdcNcm is tried first and
+  unloaded).
+- **`AxlNetAutoOpts.embedded` / `embedded_count` and
+  `AxlNetDriverEvent.is_embedded`** (`<axl/axl-net.h>`, appended; zero is
+  none): NIC drivers held in memory (`AxlNetEmbeddedDriver`), swept FIRST,
+  before the sweep directory's (iPXE-named ones after every other
+  candidate), as candidates in every other respect -- a sidecar naming one
+  as a companion does not hide it -- given the directory's volume as their
+  DeviceHandle, else the new `AxlNetAutoOpts.device_handle` (iPXE reads it
+  at entry and will not start without one). `sshd` passes the volume it was
+  run from, so `sshd-rtk.efi` works as one file with no drivers directory.
+- **`axl_driver_unload()` releases a buffer-loaded image's synthesized
+  identity only AFTER `UnloadImage` succeeds.** It used to tear down the
+  LoadedImageDevicePath and free `LoadedImage->FilePath` first, so a driver
+  whose Unload refused stayed resident with a NULL FilePath and no device
+  path -- a state the aarch64 Shell's `dh -v` is known to fault on. A refused
+  unload now leaves both intact (`test-net-gate-qemu.sh` checks the bytes).
+- **`AxlNetworkTimeout` in `sshd.conf`, and `sshd --net-timeout N`:** the
+  network bring-up's one deadline, in seconds (or OpenSSH's `1h30m` form),
+  1 s to one day (`AXL_NET_AUTO_TIMEOUT_MAX_SEC`), default 60. The flag
+  wins over the file; a value out of range is refused at its line
+  (`sshd.conf:3: AxlNetworkTimeout: 0 is out of range (1-86400)`); `sshd
+  -T` prints `axlnetworktimeout`; the starting line and the timeout message
+  name it. For a box whose USB NIC is slow to come up, or whose cabled
+  ports outnumber what 60 s allows. The shipped `sshd.conf` documents it
+  (`#AxlNetworkTimeout 60`).
+- **`sshd -v` / `-d` and `LogLevel`.** `-v` (`--verbose`), or `-d`
+  (OpenSSH sshd's), sets DEBUG in the launcher AND the resident driver, which
+  then names each step of the start before it runs -- every NIC with its
+  link state before its DHCP. `sshd.conf` takes OpenSSH's `LogLevel`
+  (`QUIET`/`FATAL`/`ERROR` -> errors, `INFO`, `VERBOSE`/`DEBUG`/`DEBUG1` ->
+  debug, `DEBUG2`/`DEBUG3` -> trace); `sshd -T` prints `loglevel` in
+  OpenSSH's place and spelling; the flags win over the file. With neither,
+  sshd sets no level, so `AXL_LOG_LEVEL` still applies. The shipped
+  `sshd.conf` documents it (`#LogLevel INFO`).
+- **`axl_net_auto_init_opts()` takes a deadline, a cancellable and a link
+  gate** -- three fields appended to `AxlNetAutoOpts`, all off when zero:
+  `timeout_sec` is ONE deadline (at most `AXL_NET_AUTO_TIMEOUT_MAX_SEC`, one
+  day) every wait in the bring-up is cut to and past which no driver is
+  swept (`AXL_TIMEOUT`); `cancel` ends a wait or the sweep before its next
+  driver (`AXL_CANCELLED`), Ctrl-C too when it claims the break; and
+  `link_wait_sec` waits for a link in each pass, gives a link-down NIC no
+  DHCP, and reports each NIC with the new `AXL_NET_DRV_EV_LINK_DOWN` /
+  `AXL_NET_DRV_EV_CONFIGURING` events. The NICs are listed afresh
+  throughout the link wait, so one whose interface appears during it (a USB
+  NIC still enumerating, or the ordinal asked for) is found; a pass that
+  ends its wait with no NIC it may use reports nothing
+  (`test-net-gate-qemu.sh` hot-plugs a USB NIC into the wait).
+  `AXL_NET_DRV_EV_TRYING` now also fires, as
+  `"firmware"`, before the firmware-first pass. A DHCP the bounded bring-up
+  gave up on has its IP4Config2 policy put back. When the sweep ends, the
+  companions it co-loaded are unloaded unless the winning driver DECLARES
+  them (its sidecar `requires`, transitively) -- one it relies on without
+  declaring is unloaded too. A candidate whose own Unload refuses stays
+  resident, its companions unloaded all the same, and the box stays sound
+  (`test-net-gate-qemu.sh` sweeps one and walks it with `dh -v`).
+  `AXL_NET_DHCP_ATTEMPT_SEC` (15 s) is the per-NIC DHCP wait `netload` and
+  `sshd` give a sweep; `netload -a`'s sweep used the engine's 10 s default
+  when `--dhcp-timeout` was not given, and now uses the 15 s its help
+  always stated. This replaces
+  `axl_net_init_bounded()` and `AXL_NET_BOUNDED_*`, added earlier in this
+  cycle and never released: its one caller, `sshd`, now rides the engine.
+- **`axl_net_driver_dir()` in `<axl/axl-net.h>`:** the NIC-driver directory
+  for a tool run from a stick -- `drivers\<arch>` beside the image, then
+  `drivers`, then `\drivers\<arch>` at its volume's root -- `netload`'s
+  rule, now the library's. `netload` and `sshd` both use it, and
+  `axl_net_auto_init_opts()` sweeps it when `sweep_dir` is NULL (before,
+  NULL swept every volume's `\drivers\<arch>`; that is now the fallback
+  when none of the three exists).
+- **`axl_net_sweep_deps_sidecar()` and `axl_net_verify_reachable()`:** the
+  engine's companion-driver co-loader and reachability check, installed by
+  code (see Breaking).
+- **`axl_cancellable_set_cancel_on_break()` in `<axl/axl-cancellable.h>`:**
+  resident code acting for a foreground command that waits on it (a driver's
+  setup) can have the Shell's Ctrl-C end its blocking waits, which a driver
+  image otherwise never reads.
+- **`sshd` reads `sshd.conf`** beside `sshd.efi` (or `-f PATH`) in OpenSSH
+  `sshd_config(5)` syntax and keywords: `Port`, `LoginGraceTime`,
+  `MaxAuthTries`, `MaxSessions`, `MaxStartups`, `ClientAliveInterval`,
+  `ClientAliveCountMax`, `UnusedConnectionTimeout`, `RekeyLimit`,
+  `PubkeyAuthentication`, `PasswordAuthentication`, `AuthorizedKeysFile`,
+  `Banner`, `PerSourcePenalties`, `PerSourcePenaltyExemptList`, and sshd's own
+  `AxlNic`, `AxlPassword`, `AxlReadOnly`, `AxlReportGeometry`. Command-line
+  flags win over the file; `-k ""` and `-P ""` mean none, clearing the file's
+  `AuthorizedKeysFile` or `AxlPassword` without turning that method on. An
+  unknown keyword, an invalid value or an
+  unsupported OpenSSH keyword stops `sshd` with `sshd.conf:<line>: <reason>`;
+  a missing `sshd.conf` runs on the defaults, an unreadable one refuses.
+  `sshd -T` prints the effective settings in OpenSSH's `sshd -T` format. The
+  `Banner` file's text is sent ahead of the console-size line. `sshd.conf`,
+  the `Banner` file and the `authorized_keys` file are each UTF-8 (a BOM
+  allowed) or UTF-16LE with a BOM, so a file made in the Shell with `echo
+  ... > file` or `edit` works. "Beside" is the directory `sshd.efi` is in,
+  wherever that is on its volume (a release unpacked onto a stick keeps its
+  versioned directory): the default `sshd.conf` and `authorized_keys` are
+  looked for there, and a relative path given to `-f`, `-k`, `Banner` or
+  `AuthorizedKeysFile` is resolved there (one starting with `\` is from the
+  volume's root). A start says which file it read --
+  `sshd: settings from FS0:\tools\sshd.conf` -- or which it looked for --
+  `sshd: no FS0:\tools\sshd.conf; using defaults`. See the sshd guide.
+- **`axl_log_set_console_serial()` in `<axl/axl-log.h>`** moves an image's
+  console log output from standard error to a serial port: the console's own
+  lines (time, `[INFO]  ` tag, domain), CRLF-ended, no colour, one write per
+  line. For an image whose standard error reaches someone it should not --
+  `sshd` uses it while it serves (see Fixed). NULL restores standard error.
+- **`axl_log_get_console_enabled()` in `<axl/axl-log.h>`** reads what
+  `axl_log_set_console_enabled()` last set (true by default), so code that
+  turns console logging off for a while can put back what it found. `sshd`
+  uses it: stopping the server restores the console log to the state it
+  found it in, where it used to turn it on unconditionally.
+- **`axl_app_image_dir_path()` in `<axl/axl-app.h>`** builds a path beside the
+  running image: a relative name is joined onto the directory the `.efi` was
+  loaded from (`app.conf` -> `FS0:\tools\app.conf` for
+  `FS0:\tools\app.efi`), `""` is that directory, a leading `\` is the
+  volume's root (as `axl_app_boot_path()`), and a path naming a volume is
+  copied as it is; an image launched by a bare name (a Shell `path` search)
+  has no known directory, so that anchors at the volume root. A tool reading
+  a file it ships with keeps working wherever its tree was copied -- a
+  release's versioned directory on a stick. `sshd` (`sshd.conf`, `-k`,
+  `Banner`) and `netload` (its default driver directory) now use it in
+  place of their own copies of that logic.
+- **`axl_text_to_utf8()` in `<axl/axl-str.h>`** reads a text file's bytes
+  as UTF-8 whichever way it was written: UTF-16LE with a BOM -- what the
+  UEFI Shell's `echo ... > file` and `edit` write -- is converted, a UTF-8
+  BOM is dropped, anything else is copied. UTF-16 that does not convert (an
+  unpaired surrogate, an odd trailing byte) is `AXL_INVALID`, with the text
+  still produced and the offset of the first bad unit, so a caller can name
+  the line. UTF-16 is decoded straight from the bytes (the text is the one
+  allocation), and the length and offset outputs are set on every return,
+  0 when no text was produced. `AxlConfigFile` now reads its files through
+  it (unchanged behaviour).
+- **`axl_args_is_set()`** says whether a flag or positional was given on the
+  command line rather than absent or defaulted -- what a tool needs to layer a
+  configuration file between a flag's default and the command line.
+- **`axl_ssh_penalty_range_check()`** judges one penalty-exempt range
+  (`A.B.C.D` or `A.B.C.D/N`) by exactly the rule
+  `axl_ssh_server_set_penalty_exempt()` applies, without a server, so a
+  configuration loader can refuse a bad range at its line.
+  `AXL_SSH_PENALTY_EXEMPT_MAX` (8), the list bound, is now public.
+- **`AxlConfigFile` reads OpenSSH `sshd_config(5)` syntax**, opt-in per map:
+  `axl_config_file_new_syntax(AXL_CONFIG_FILE_OPENSSH)` parses `Keyword args`
+  / `Keyword=args` with OpenSSH's quoting and comments, compares keywords
+  case-insensitively with first-wins values, and records every directive in
+  order with its line number (`axl_config_file_entry_count()` /
+  `axl_config_file_entry_at()`). `axl_config_file_read()` and
+  `axl_config_file_parse_bytes()` report a missing file (`AXL_NOT_FOUND`), an
+  unreadable one (`AXL_IO_ERROR`) and a syntax error (`AXL_INVALID` with the
+  line and reason) apart, parse all or nothing, and accept UTF-8 with or
+  without a BOM and UTF-16LE. `AXL_CONFIG_FILE_LINE_MAX` names the line cap
+  both grammars share. Existing key=value maps are unchanged.
+
+- **Test releases, built and gated locally: `scripts/make-test-release.sh`.**
+  It builds both arches, gates each on the release-image test booting a stick
+  extracted from the very tarball it publishes, and publishes the two
+  UEFI-tools tarballs plus `SHA256SUMS` as a Pre-release on
+  `aximcode/axl-sdk-releases`, tagged `test-<YYYYMMDD>-<8-hex sha>` and never
+  "Latest". It never pushes or tags axl-sdk, so no workflow runs; it keeps
+  the 3 newest test pre-releases (`--keep N`) and `--dry-run` prints the
+  `gh` commands instead of running them. See `docs/RELEASING.md`, "Test
+  releases".
+
+- **`scripts/make-uefi-tools-tarball.sh`**: the UEFI-tools tarball staging,
+  moved out of `release.yml` unchanged (the archive it writes has the same
+  files, bytes and listing; only timestamps differ). The release workflow, the release-image test and
+  `make-test-release.sh` all run it, so the stick that test boots is the
+  published layout -- README, licences and all -- rather than a restatement
+  of it.
+
+- **The release tools ship compressed.** Every shipped tool and driver that
+  LZMA shrinks by at least 16 KB and 20% ships as a small stub carrying the
+  original in an `.axlpack` section, under its original name. Run, the stub
+  unpacks it in memory and has the firmware load the original with the file's
+  own device path, handing over the command line, the Shell's redirection
+  (pipes and `>`), the exit status and ExitData -- the tool cannot tell. The
+  stub is 16,896 bytes (x64 release) and 16,910 (aa64). Release sizes, all
+  39 tools, before -> now: x64 4,466,688 -> 2,866,688 (23 wrap), aa64
+  4,642,850 -> 2,615,842 (30 wrap); `sshd.efi` x64 534,528 -> 201,728, aa64
+  555,022 -> 184,334; the iPXE driver 1,149,440 -> 474,624 (x64) and
+  1,150,464 -> 417,806 (aa64). The EDK2 network and RAM-disk drivers save
+  less than the stub costs and ship as before. In a build tree the raw image
+  is `tools/raw/<n>.efi`, `tools/<n>.so` holds its symbols (what
+  `rsod-decode.py --syms` wants), and a tree configured with
+  `-DAXL_PACK=OFF` builds every tool raw. Proved by booting the release
+  images from a read-only USB stick on both architectures
+  (`test-efi-pack-release-qemu.sh`).
+
+- **AXL's driver loaders take a compressed or a raw image alike, by content.**
+  `axl_driver_load()`, `axl_driver_load_dir()`, `axl_driver_load_buffer()`,
+  the sibling and shared-driver loads, and through them `netload` and `axl_net_ensure_drivers()`, unpack a
+  compressed driver in memory and load the original with the file's device
+  path, so no stub is left resident and the handle is the original's. A
+  damaged one is refused with one log line, `cannot load <path>: packed image
+  is corrupt`, never loaded as the stub. The decoder costs an image that links
+  the loaders about 12 KB (x64); it carries only its own architecture's
+  branch converter.
+
+- **`axl-cc --compress`, and `COMPRESS` on CMake's `axl_add_app()` /
+  `axl_add_driver()`.** A downstream image opts into the same wrap, under the
+  same rule (it stays raw when the saving is too small); with `--service`
+  only the launcher is packed. The SDK ships the packer as `bin/axl-efi-pack`
+  and the stub objects in `lib/axl/<arch>/pack/`. Under Secure Boot the
+  firmware authenticates the unpacked image on its own, so a packed image
+  runs only if it was signed before packing; nothing here signs.
+
+- **`axl_console_device_queued_keys()` in `<axl/axl-console-device.h>`.**
+  How many keys in the device's ring the guest has not read yet (0 for a
+  NULL or output-only device). A key's notifies fire when it is pushed, not
+  when it is read, so a caller that must have a notify chord act after the
+  keys typed ahead of it holds the chord until this is 0.
+
+- **`axl_console_device_inject_text_partial()` in
+  `<axl/axl-console-device.h>`.** Injects as much of a run of terminal input
+  as the 63-key ring has room for and reports how many bytes that was. Bytes
+  go in whole units -- a character, a complete escape sequence, a bare Esc --
+  and a unit goes in only if all of its keys fit, so the count is always a
+  unit boundary and the rest can be offered again later as a call of its own.
+  A caller holding a paste longer than the ring feeds it this way as the
+  guest reads.
+
+- **`sshd`: the live UEFI Shell over SSH.** A new tool in the 9p shape: the
+  `sshd.efi` launcher deploys an embedded resident driver that takes over the
+  running Shell's console in passthrough (the local console keeps painting)
+  and serves it to SSH shell sessions. Every session sees and types into the
+  one console; the login banner states the console's size, and a session
+  joining late is repainted with the current screen; a session that stops
+  reading is skipped and repainted once it drains, so it never holds up the
+  console or another session. Control keys arrive as Ctrl chords, in the
+  order they were typed, as a pty keeps them (the UEFI editor reads ^S ^Q ^K
+  as commands, so one must not act part-way through a paste); Ctrl-C alone
+  goes ahead of any input still waiting, so it breaks a running script --
+  even behind a paste the script never reads. Every other control key also
+  waits until the Shell has read the keys typed before it, because its
+  notify fires as it goes in: a Ctrl-S at the end of a burst
+  (`echo abcdef` + ^S in one write) halted output there and the key that
+  resumed it was one of the unread ones (`eho abcdef`); it now halts the next
+  output, and the key that resumes it is consumed, as at the local keyboard.
+  The cost: a Ctrl-S typed behind keys that a running command is not reading
+  waits until they are read. Nothing is lost by the wait -- at a local
+  keyboard one of those unread keys would resume the halt at once -- and
+  Ctrl-C is unchanged. Esc and a key are Alt+key only when they arrive in
+  the same packet, as a terminal sends Alt+key; an Esc whose next key comes
+  in a later packet stays a bare Esc, then that key, as at a USB keyboard --
+  unless that key is `[` or `O`, the start of a CSI/SS3 key sequence split
+  across packets, which is still decoded as the one key it encodes.
+  Logins by `authorized_keys` (`-k`; by default
+  `authorized_keys` beside `sshd.efi`) or a demo password (`-P`);
+  `-R` read-only, `-x CIDR` exempts a range from login penalties, `-p`/`-n`
+  as for `9p serve`. `exec` is refused: there is no private shell to run a command in.
+  A paste longer than the console's 63-key ring waits in a 64 KB
+  per-session queue and is typed in as the Shell reads; past that, input is
+  dropped and logged at DEBUG, because AxlSsh cannot hold back a client's
+  input. A session's output is whole flushes or a repaint, never a sequence
+  cut in two. A session's EOF does not end it: it keeps watching until its
+  channel closes, as a pty does. `exit` ends the Shell for everyone, as at
+  the local console, and sessions are told so on a line of its own below
+  the console's last line (a terminal larger than the console has its
+  scroll region reset with the cursor kept where the console left it); in
+  the next Shell,
+  `sshd status` reports `sshd: stopped (the Shell it served exited)` and
+  `sshd` replaces the server left behind. If the firmware will not let the
+  console go, the driver keeps its take-over in place and refuses to
+  unload rather than leave the console calling a freed image: `sshd status`
+  then reports `sshd: stuck - the console take-over could not be undone;
+  'sshd stop' tries again`, and `sshd` refuses to start. `sshd stop`,
+  `sshd status`. The host key is generated at each start. `--report-geometry`
+  writes each reshape of the console by a `mode` to the first serial port,
+  outside the console -- nothing appears on the GOP, on the serial terminal
+  or in a session -- as an APC string a VT terminal discards
+  (`ESC _ axl-console-size=80x25 ST`), at the point of the serial stream
+  where the new size begins: a serial terminal is never told the console's
+  size, and a test harness reading that stream needs it.
+  `scripts/ssh-demo.sh` boots QEMU with `sshd` running and prints the `ssh`
+  line that reaches it (`--port`, `--key`, `--password`, `--arch`; `--check`
+  makes one round trip and exits; `--dry-run` prints the lines and the
+  guest's startup script and boots nothing). The printed lines never write
+  `~/.ssh/known_hosts` (the guest's host key is new at every boot) and pass
+  `IdentitiesOnly=yes`.
+
+- **`axl_ssh_server_set_rekey_limit()`, `AXL_SSH_REKEY_LIMIT_DEFAULT` and
+  `AXL_SSH_REKEY_LIMIT_MIN` in `<axl/axl-ssh-server.h>`.** An authenticated
+  SSH connection now rekeys, started by either side. The server starts one
+  when either direction has carried more than the limit under its current
+  key (default 1 GiB, as OpenSSH's chacha20-poly1305 rekeys; 0 = never by
+  bytes; 1 to 15 refused with `AXL_INVALID`, sshd's own floor) and, whatever
+  the limit, after 2^31 packets. There is no time limit, as in sshd. The
+  setter reaches connections accepted afterwards. An application sees a
+  rekey, at most, as a short `AXL_BUSY` from `axl_ssh_channel_write()`.
+
+- **Idle handling for AxlSsh: `axl_ssh_server_set_unused_timeout()` and
+  `axl_ssh_server_set_client_alive()` in `<axl/axl-ssh-server.h>`, with
+  `AXL_SSH_UNUSED_TIMEOUT_DEFAULT_SEC` (300), `AXL_SSH_CLIENT_ALIVE_DEFAULT_SEC`
+  (60), `AXL_SSH_CLIENT_ALIVE_DEFAULT_MAX` (3) and `AXL_SSH_IDLE_MAX_SEC`
+  (30 days).** sshd's `UnusedConnectionTimeout` and `ClientAliveInterval` /
+  `ClientAliveCountMax`, rule for rule: an authenticated connection with no
+  channel in use is ended after the unused timeout, and a silent peer is
+  probed with `keepalive@openssh.com` and ended once `count_max` probes go
+  unanswered. Both end silently and abortively, as sshd's do, each with one
+  INFO audit line in sshd's words, rate-limited like the other audit lines:
+  `terminating inactive connection from user U A.B.C.D port N` and
+  `Timeout, client not responding from user U A.B.C.D port N`. Call both
+  before `axl_ssh_server_listen()`; a period of 0 turns that rule off.
+
+- **`axl_tcp_send_get_sent()` and `axl_tcp_send_queued_bytes()` in
+  `<axl/axl-tcp.h>`.** `get_sent` is the send counterpart of
+  `axl_tcp_recv_get_size()` with BSD `send()`'s partial-count meaning: read
+  inside a send callback (or after `axl_tcp_send()` returns) it reports how
+  many bytes of that send were handed to the firmware, whole pieces only --
+  0 for a send cancelled while queued, the committed pieces for one
+  cancelled, timed out or failed mid-stream. `queued_bytes` counts the
+  bytes of accepted sends not yet handed to the firmware (queued sends in
+  full plus the active send's unarmed remainder): the hook for a caller's
+  own backpressure, since the send queue stays unbounded.
+
+- **Transmit pacing settings in `<axl/axl-tcp.h>`: `axl_tcp_set_pacing()`,
+  `axl_tcp_get_pacing()`, `axl_tcp_pacing_defaults()`, the `AxlTcpPacing`
+  struct and its `AXL_TCP_PACING_*` limits.** Process-wide: `chunk_bytes`
+  is the largest piece of a send handed to the firmware per Transmit (8 KiB
+  by default, 1-32 KiB), and `idle_backoff_ms` how long a loop keeps polling
+  the firmware after a send last made progress (500 ms by default; 0 turns
+  the loop-driven polling off). The header records what was measured for
+  each choice, including that one 8 KiB piece per round trip caps a single
+  send near 80 KB/s at 100 ms of RTT, where 16 KiB is better for one distant
+  client and stalled several on iPXE.
+
+- **`axl_loop_add_idle_busy()` and `axl_loop_set_driver_budget_ms()` in
+  `<axl/axl-loop.h>`, with `AXL_LOOP_DRIVER_BUDGET_DEFAULT_MS` (5) and
+  `AXL_LOOP_DRIVER_BUDGET_MAX_MS` (25).** A BUSY idle source is one whose
+  work progresses only while it is called; while one exists the loop does
+  not block, and a driver-mode tick keeps making passes for up to its
+  budget (at most half the attached interval) instead of returning after
+  one. Plain idle sources are unchanged. AxlTcp's pacing is the first user.
+
+- **`axl_tcp_fail_next_send_schedule()` in `<axl/axl-tcp.h>`**, a test seam:
+  the Nth following send RETIREMENT -- finished, cancelled or failed to
+  arm, counted across all sockets -- finds nowhere to schedule its
+  callback, which is then delivered only when the socket is closed: the
+  path a send takes when the loop's defer queue and source table are both
+  full, held open on demand instead of hunted by timing. A synchronous
+  `axl_tcp_send()` whose retirement is the held one HANGS -- its timeout
+  does not rescue it -- so arm it only where every send in the window is
+  asynchronous.
+
+- **`axl_utf8_validate()` in `<axl/axl-str.h>`.** A bounded, refusing UTF-8
+  validator in GLib's `g_utf8_validate_len` shape: a length rather than a
+  terminator, an optional `endptr` receiving the first byte of the first
+  ill-formed sequence (or `s + len` when the range is valid), and **an
+  embedded NUL refused**, which RFC 3629 allows and `axl_utf8_encode(0, ...)`
+  writes. It applies the same well-formedness rules as `axl_utf8_decode()`
+  and differs in what it DOES with an ill-formed sequence -- decode to
+  display, validate to accept. It also makes `<axl/axl-stream.h>`'s
+  long-standing reference to `axl_utf8_validate` resolve; that function had
+  never existed.
+
+- **`axl_ssh_server_set_max_password_failures()` in
+  `<axl/axl-ssh-server.h>`, with `AXL_SSH_PASSWORD_FAILURES_DEFAULT` (3) and
+  `AXL_SSH_PASSWORD_FAILURES_MAX` (10).** AxlSsh's counterpart of sshd's
+  `MaxAuthTries`, counting only passwords the application's hook judged and
+  refused. **Settable while the server is listening**, and from an
+  authentication hook: the cap is copied into each connection at accept, so
+  a change applies to connections accepted afterwards and a connection
+  already open keeps the cap it arrived under -- which is what sshd's
+  fork-per-connection gives on a reload. Zero is refused; offering no
+  password authentication means installing no password hook.
+
+- **`axl_ssh_server_set_banner()` and `AXL_SSH_BANNER_MAX` (4096) in
+  `<axl/axl-ssh-server.h>`.** sshd's `Banner`: text sent as
+  `SSH_MSG_USERAUTH_BANNER` (RFC 4252 §5.4) ahead of the reply to a
+  connection's first authentication request, once per connection, whatever
+  user name or method it asks with. 4096 because the DoD Notice and Consent
+  Banner is about 1.3 KB and `AXL_SSH_AUTH_BANNER_MAX`'s 1024 would refuse
+  it; an over-long banner is refused rather than truncated. Settable at any
+  time from the server's loop, as sshd rereads its `Banner` file per
+  connection. It must be valid UTF-8, the encoding §5.4 specifies. If the
+  banner cannot be sent the connection is dropped rather than authenticated
+  without it.
+
+- **`axl_ssh_server_set_auth_hook_budget_ms()` in
+  `<axl/axl-ssh-server.h>`, with `AXL_SSH_AUTH_HOOK_BUDGET_DEFAULT_MS`
+  (1000) and `AXL_SSH_AUTH_HOOK_BUDGET_MAX_MS` (3600000).** How long an
+  authentication hook may hold the server before it is REPORTED.
+  **Reporting only** -- nothing is refused, delayed or cancelled at the
+  budget, because a knob that changed enforcement would invite an operator
+  to set it and believe they were protected when the library cannot take a
+  hook off the stack. Hooks run one at a time server-wide, so a hook that
+  blocks for W milliseconds delays every other login behind it; the default
+  of one second comes from that arithmetic (at the 16-connection cap and
+  the 60 s login grace, legitimate logins start being reaped near
+  W = 3.7 s), not from being a round number. Two lines, and they are not
+  the same event: one when a hook RETURNS over budget, naming the method,
+  the user, the source, the hold and how many connections were queued
+  behind it, and one BEST-EFFORT line while a hook is still running, at
+  most one per hook call -- it rides the login-grace sweep, so a hook that
+  returns within one sweep of passing the budget may produce none. **A hook
+  that blocks WITHOUT dispatching the loop produces no mid-hook line at
+  all**, since the sweep that would write it runs on the stack that hook is
+  holding; that case needs a watchdog outside the loop
+  (`axl_watchdog_set()`). Settable at any time from the server's loop,
+  including from inside a hook, and LATCHED at hook entry, so a change
+  reaches the next hook rather than the one it would describe. **`0` is
+  valid** and turns both reports off -- the deliberate divergence from
+  `axl_ssh_server_set_login_grace()` and
+  `axl_ssh_server_set_max_password_failures()`, which refuse it, because a
+  disabled grace and a cap of nothing are exploitable and this knob
+  enforces nothing.
+
+- **`AXL_PK_ED25519` keys, in an image that links the provider.** Build with
+  `-u _axl_pk_provider_ed25519` (it costs ~120 KB, so it is opt-in) and
+  `axl_pk_key_new()`, `axl_pk_key_sign()`, `axl_pk_key_verify()`, the raw and
+  RFC 8410 DER import/export functions all accept Ed25519; without it every
+  one of them still fails closed, as in 4.7.3. **`axl_pk_key_verify()` has a
+  second refusal for Ed25519: `AXL_NO_RESOURCES`** when the check could not be
+  made because memory ran out, before the signature was examined -- a fact
+  about the verifier, not the signer, so a server that punishes forgeries can
+  tell the two apart. Every other failure is still `AXL_ERR`, and ECDSA and RSA
+  never return it (the header says why: mbedTLS reports a signer's oversize
+  integer with the same allocation code). A caller written `if (rc == AXL_ERR)`
+  would read the new code as success; test `!= AXL_OK`. This is not a change
+  to released behaviour: no release has carried a working Ed25519 verify.
+
+- **Session channels: `<axl/axl-ssh-channel.h>`** (included by `<axl.h>`).
+  `ssh host`, `ssh -tt host`, `ssh host cmd` and every session multiplexed
+  through `ssh -o ControlMaster` now reach the application through hooks.
+  - `axl_ssh_server_set_channel_ops()` with `AxlSshChannelOps` (hooks
+    `open`, `pty`, `shell`, `exec`, `resize`, `data`, `eof`, `writable`,
+    `close`; all optional) is the opt-in, before listening. The `close` hook
+    receives the channel's `chan_data`, since the handle is already retired.
+  - `AxlSshChannel`, an integer handle: a call on one that is 0, never
+    issued or closed returns `AXL_NOT_FOUND` rather than touching freed
+    memory. `AxlSshPty` carries the terminal type and size for `pty` and
+    `resize`.
+  - `axl_ssh_channel_write()` and `axl_ssh_channel_write_stderr()`:
+    all-or-nothing and bounded -- the whole buffer is queued or the call
+    returns `AXL_BUSY` and queues nothing, and the `writable` hook fires once
+    per refusal when a retry would fit. A write longer than the per-channel
+    limit is `AXL_ERR`.
+  - `axl_ssh_channel_exit()` (drain, then `exit-status`, EOF, CLOSE) and
+    `axl_ssh_channel_close()` (CLOSE now, queue discarded).
+  - `axl_ssh_channel_set_user_data()`, `axl_ssh_channel_user_data()`,
+    `axl_ssh_channel_user()`, `axl_ssh_channel_principal()` and
+    `axl_ssh_channel_peer()`.
+  - `axl_ssh_server_set_max_sessions()` (sshd's `MaxSessions`) with
+    `AXL_SSH_MAX_SESSIONS_DEFAULT` and `AXL_SSH_MAX_SESSIONS_MAX` (both 10;
+    the setter can only lower the cap), and
+    `axl_ssh_server_set_channel_write_limit()` with
+    `AXL_SSH_CHANNEL_WRITE_LIMIT_DEFAULT` (256 KB),
+    `AXL_SSH_CHANNEL_WRITE_TOTAL_DEFAULT` (4 MB) and
+    `AXL_SSH_CHANNEL_WRITE_TOTAL_MAX` (64 MB). A fair-share floor keeps
+    channels whose peers stopped reading from starving the rest of the
+    server-wide total.
+  - The inbound rules are sshd's: a channel is confirmed with window 0 and
+    granted 2 MB when the shell or exec starts, up to 10% window overrun is
+    accepted, a packet over 32 KB is dropped, and a channel the server closed
+    keeps its wire slot until the peer's CLOSE, so messages that cross it are
+    ignored rather than fatal. The two open-failure reasons differ from
+    sshd's on purpose: `RESOURCE_SHORTAGE` past the session cap and
+    `ADMINISTRATIVELY_PROHIBITED` when the `open` hook refuses, where sshd
+    sends `CONNECT_FAILED` for both.
+
+- **`axl_console_device_present()` in `<axl/axl-console-device.h>`.** Whether
+  a take-over console device is installed anywhere on the system, by this
+  image or another. The singleton check in `axl_console_device_install()`
+  sees only the calling image's own instance, since every image links its own
+  copy of the library, so a second resident driver had no way to tell that
+  `fbcon` (say) already holds the console. The probe asks the firmware for the
+  device's handle by its exact device path, so a driver can refuse with its
+  own message before anything with side effects. Covered by
+  `test-console-device-hold-qemu.sh` on both arches, including a decoy
+  SimpleTextOut handle with an empty device path that a prefix match would
+  mistake for a take-over.
+
+- **`axl_usb_host_controller_count()` in `<axl/axl-usb.h>`.** The number of
+  `EFI_USB2_HC_PROTOCOL` handles, so a caller can tell "no USB host
+  controller" from "a controller with nothing attached" -- `axl_usb_next()`
+  returns NULL for both.
+
+- **`lsusb` says why its listing is empty** instead of printing nothing:
+  `lsusb: no USB host controller found` or `lsusb: no USB devices found`
+  (exit 0, in list and `-t` mode alike), and `lsusb: cannot enumerate USB
+  host controllers` or `lsusb: cannot enumerate USB devices` (exit 1) when
+  the controller count or the device enumeration fails. The
+  `usb-ids.json5` sidecar names QEMU's storage (`46f4:0001`, `QEMU USB
+  HARDDRIVE`) and hub (`0409:55aa`, `NEC Corp. Hub`). Covered by
+  `test-lsusb-qemu.sh` on both arches: no controller, a bare xHCI, and a
+  keyboard, mouse, hub-with-tablet and storage topology with exact output.
+
+### Changed
+
+- **`axl prune` removes an SDK version only if install.sh installed it.** A
+  version with an install.sh receipt is pruned as before; one a `.deb`/`.rpm`
+  installed is skipped and named with `sudo apt remove axl-sdk-<v>` /
+  `sudo dnf remove axl-sdk-<v>`. **Versions installed before receipts
+  (every one so far) keep the old rule** -- pruned by their name -- so
+  existing machines prune exactly as they did. `axl update`, `axl use` and
+  `axl uninstall`, run from a package's copy of `axl`, refuse and print the
+  package manager's command; install.sh will not extract over, select or
+  remove a package's version.
+
+- **The release archives are built by CPack, and every entry is now owned by
+  `0/0` with no owner names.** The SDK, UEFI-tools and host-tools tarballs keep their names,
+  their versioned top-level directory and their contents (compared file for
+  file, bytes and modes, before the switch). What changes for whoever extracts
+  them: every published `axl-sdk-uefi-tools-*` tarball so far recorded its
+  files as owned by `runner/runner` (the CI user) and its top-level directory
+  as `drwx------`, so extracting one as root on a machine with a `runner`
+  user gave that user the files, and other users could not read the
+  directory at all. Now every entry in every archive is `0/0` with no owner
+  names, sorted by name, with the commit's timestamp, and the top-level
+  directory is `drwxr-xr-x`. Two builds of one commit, by different users on
+  different machines, produce byte-identical archives.
+  `scripts/make-sdk-tarball.sh`, `make-uefi-tools-tarball.sh` and
+  `make-host-tools-tarball.sh` are replaced by
+  `scripts/make-release-assets.sh sdk|uefi-tools|host-tools` (same options),
+  and `SHA256SUMS` by
+  `scripts/release-sums.sh DIR`.
+
+- **`scripts/install.sh` stages the SDK from CMake `install()` rules.** The
+  prefix it produces is unchanged (compared file for file), and so is its
+  command line; a reinstall still leaves unchanged files' timestamps alone.
+  Two fixes came with it: an `AXL_<ARCH>_GCC`/`_GXX`/`_BINUTILS_PREFIX`
+  override for the arch NOT being built now reaches the installed
+  `axl-config.cmake` on every install, and a `DESTDIR` in the environment no
+  longer makes the install go elsewhere (it is ignored: `--prefix` is the
+  destination).
+
+- **The pinned CMake is 4.3.6 (was 4.2.8).** Every build and test script,
+  CI and the release use it (`scripts/ci-cmake.sh`); the first build after
+  updating downloads it once into `~/.cache/axl-sdk/cmake/4.3.6/` and
+  reconfigures each existing tree `--fresh`, saying so in one line. 4.3 is
+  the first CMake whose CPack can write archives owned by 0/0 (CMP0206).
+  Consumers are unaffected: the SDK's CMake package still needs only 3.20.
+
+- **`test-net-latency-qemu.sh` no longer reads host load as a timing FAIL.**
+  Its round-trip bounds (p90 under 5 ms, first exchange under 15) missed on a
+  busy box with nothing wrong. It now carries qloop's witness -- how long the
+  guest's QEMU waited for a CPU, read over each round-trip window
+  (`cpu_wait_ms=` on every measurement line) against the same 50 ms limit,
+  now `AXL_STARVE_MAX_MS` in `scripts/axl-common.sh` -- and a run whose
+  failures are all timing misses in starved windows prints `UNJUDGED:` and
+  exits 77. A functional failure, or a miss in a window that did not wait,
+  stays FAIL. New: a `firmware/*` measurement that produced no round-trip
+  figures is a FAIL (it used to pass silently), and the `NETLAT_TEST_*`
+  knobs the new `test-net-latency-starved-qemu.sh` drives it with are refused
+  outside a restricted run. The suite carries the new verdict: `run-one.sh` retries an
+  UNJUDGED test and reads UNJUDGED only when no attempt judged;
+  `run-integration.sh` names and counts it apart and exits 3;
+  `release-suite.sh` re-runs it alone and certifies only a judged PASS (still
+  UNJUDGED alone: exit 3, no stamp, in `--ci` too).
+
+- **`verify.sh`'s quiet slot (`qloop`) no longer reads host load as a timing
+  FAIL.** AxlTestLoop's driver idle-budget group fails a bound only if every
+  judged attempt missed it, with at least two judged; a miss in the only
+  judged attempt reads UNJUDGED and the row names the bound. And the harness
+  now measures how long the guest's QEMU waited for a CPU (schedstat run
+  delay, `TEST_VCPU_STARVE_FILE`): a FAIL made only of named timing misses
+  while that exceeded 50 ms reads UNJUDGED with the figure; a leak, a stall
+  or any other failure stays FAIL. The figure is on every qloop row.
+
+- **AxlSsh's two authentication caps send sshd's text: "Too many
+  authentication failures"** (OpenSSH auth.c:343), for the password cap and
+  the 20-request cap alike, where they sent "too many authentication
+  failures" and "too many authentication requests". The reason code stays
+  RFC 4253's 14 (NO_MORE_AUTH_METHODS); sshd sends 2 for everything. Since
+  the DISCONNECT is now delivered, this is what ssh(1) prints.
+
+- **In driver mode, `axl_defer` no longer yields to the firmware between
+  hops (`<axl/axl-defer.h>`, `<axl/axl-loop.h>`).** Deferred work keeps a
+  driver tick going as a busy idle source does: work a deferred callback
+  defers runs on the tick's next pass, at `TPL_CALLBACK`, for up to the
+  tick's budget (5 ms of a busy foreground's tick by default, up to nine
+  tenths of the period while it waits), instead of a whole period later.
+  - Who notices: a driver that split slow work into deferred pieces so that
+    co-located `TPL_CALLBACK` drivers (MNP, TCP4) run between them. Those
+    pieces now run back to back within the budget. A one-shot timer
+    (`axl_loop_add_timeout`) between pieces yields in most ticks, but not in
+    one idle-extended past the firmware's timer interrupt; a driver budget of
+    0 is the strict yield, and keeps the old behaviour.
+  - Why: sshd's channel flush defers its transport flush, so every SFTP
+    reply waited a tick. A one-request-at-a-time download (`sftp -R 1`) went
+    from 1.8 to 3.2 MB/s on aarch64 QEMU and from 1.5 to 3.2 MB/s on x64
+    e1000; bulk transfers are unchanged.
+
+- **AxlSsh sends `WINDOW_ADJUST` on OpenSSH's rule**: once the inbound
+  window is more than three maximum packets (96 KB) below its 2 MB size,
+  where it waited for more than half to be used. A peer streaming data now
+  sees 128 KB every fourth 32 KB packet instead of ~1 MB every 33; nothing
+  else changes on the wire. Measured: no throughput difference under QEMU
+  user-net, which caps a connection near 35 KB in flight -- the benefit at
+  a high bandwidth-delay product is OpenSSH parity, not measured here.
+- **sshd's `sftp` input is paced by the session.** The SFTP channel runs in
+  `AXL_SSH_CHANNEL_WINDOW_ON_CONSUME` and the session reports each request
+  as it dispatches it, so a session that is yielded or behind on its
+  replies stops its client after one window instead of buffering what the
+  client sends. `SftpServer.efi`'s interface is now version 2 (see
+  Breaking (packaging)).
+
+- **Queued deferred work no longer waits for the 10 ms poll tick.**
+  `axl_defer()` promised the next loop tick, but the queue was drained only
+  at the start of an iteration, so work a deferred callback queued sat in
+  the ring while the loop blocked until the poll timer or an unrelated
+  event (a loop with an idle source never blocked, so work queued there
+  did not wait). The loop now blocks
+  only while the queue is empty, and runs such work on the very next
+  iteration. **A deferred callback that re-queues itself forever now keeps
+  a core busy** (it used to run once per 10 ms tick): use a timer for
+  periodic work. Loops attached with `axl_loop_attach_driver()` are
+  unchanged: they never block, and run such work on their next driver
+  tick.
+- **`sshd` names the address it serves on.** The launcher's line is now
+  `sshd: serving the UEFI Shell on 10.0.2.15 port 22` (was `... on port
+  22`), the driver's log line `serving the UEFI Shell on 10.0.2.15 port 22
+  (console 80x25)`, and `sshd status` says `sshd: running on 10.0.2.15`
+  (was `sshd: running`); with several NICs addressed, each address,
+  comma-separated. A script matching the old lines must change.
+- **The `sshd.efi` x64 RELEASE size limit is 237,568 B (232 KiB)**: the
+  engine's DHCP race and embedded-driver candidates bring x64 RELEASE to
+  235,008 B (aa64 214,030 B), and the limit is that rounded up to the next
+  2,048 B plus 2,048 B. Before them it was 235,520 B (230 KiB), up from
+  215,040 B: first to 219,136 B for the start-up diagnostics above (217,088
+  B), then, by owner decision 2026-10-21 ("don't worry about the size limit
+  for now"), for `sshd`'s own driver sweep -- netload's engine with its
+  companion-driver loader, which brings in the JSON5 sidecar reader. x64
+  RELEASE measures 232,960 B with it (aa64 211,982 B); the limit is that
+  rounded up to the next 2,048 B step plus 2,048 B of headroom
+  (`test-efi-pack-release-qemu.sh`).
+- **CI runs the QEMU integration suite on dispatch only; a push runs the
+  cheap jobs.** A push to `main` now runs `plan`, `gcc x64`, `gcc aa64` and
+  `clang-tidy`; `QEMU integration (full suite)` runs on `workflow_dispatch`
+  (`gh workflow run ci.yml --ref main`, or `cut-release.sh --ci-gate`). A
+  release is certified by a dispatched run whose suite job went green on the
+  release commit or its release-only parent, or by a complete local run of
+  the new `scripts/release-suite.sh` -- the same steps as CI's integration
+  job, and the only writer of the release stamp; `run-integration.sh` no
+  longer writes it -- together with a green push run of the three cheap jobs
+  on that commit. `cut-release.sh` now REFUSES when nothing certifies the
+  commit (normal flow and `--resume`), deciding before the version bump;
+  `--ci-gate` dispatches and waits, and the new `--tag-untested` overrides
+  loudly and is recorded in the release notes. It also waits for the
+  released commit's push run to finish first. The gate names its jobs,
+  examines every green run at a commit, reports "could not check" (exit 2)
+  and "still running" (exit 3) distinctly, and names a cancelled run. A push
+  no longer cancels a running dispatch, and a `[release-cut]` push cancels
+  nothing. `scripts/check-main-ci.sh` reports a push green on the cheap
+  jobs, walking back from a docs-only or release tip. Design:
+  `docs/AXL-CI-Release-Speed-Design.md` §14.
+
+- **`netload`'s default driver directory is beside `netload.efi`.** It is
+  `<dir of netload.efi>\drivers\<arch>`, then `...\drivers`; only when
+  neither exists does it fall back to the volume root's `\drivers\<arch>`
+  and `\drivers` (a flat stick, where the paths coincide). A release
+  tarball's versioned directory copied to a stick therefore works without
+  `--dir`, which still overrides.
+
+- **The console take-over (`axl_console_device_install()`) receives standard
+  error too.** Its handle now carries `gEfiStandardErrorDeviceGuid` beside
+  `gEfiConsoleOutDeviceGuid`, so ConSplitter fans `gST->StdErr` -- every
+  `axl_printerr()` -- to it as it does to a screen in `ErrOut`, and uninstall
+  removes the tag with the rest. A take-over (not `passthrough_local`) moves
+  the screen off StdErr with ConOut: on firmware whose `ErrOut` lists the
+  display, each screen console it evicts (one carrying a GOP or UGA) loses its
+  StdErr tag too, and gets it back on uninstall, so an error line is drawn
+  once, not a second time over the take-over's picture. Uninstall puts each
+  screen's ConOut tag back first, in its own call, so a StdErr tag that came
+  back meanwhile (a reconnect) cannot keep the screen out of ConOut. Every
+  other StdErr device (the serial terminal) keeps its tag. A tool's error line
+  (`sshd -T -x bogus`) used to reach the serial port and not an `sshd`
+  session; it now reaches both, once each.
+- **`axl_ssh_server_load_authorized_keys()` reads UTF-16LE files.** A
+  file starting with the UTF-16LE byte-order mark -- what the UEFI Shell's
+  `echo ... > file` and `edit` write -- is converted to UTF-8 before its
+  lines are read, and a UTF-8 BOM is dropped; such a file was refused as
+  malformed before. UTF-16 that does not convert is `AXL_INVALID`, the whole
+  file refused as for any malformed line. Running out of memory while
+  reading or decoding the file is `AXL_ERR`; `AXL_NO_RESOURCES` still means
+  only "more than 16 keys".
+- **`lsusb` exits 1 when a `-d`/`-s` filter matches no device** (it exited
+  0), printing nothing -- usbutils' behaviour.
+
+- **`usb-ids.json5` names `0627:0001` `QEMU Tablet`** (was `QEMU USB Mouse`),
+  the usb.ids name Linux lsusb prints. QEMU gives its keyboard, mouse and
+  tablet that one ID, so no name fits all three.
+
+- **The console VT encoder sends `?` for a codepoint a terminal would not
+  draw in exactly one cell, on a one-cell-per-codepoint console** -- a wide
+  (CJK) glyph, a combining mark, a C1 control. This reaches every consumer of
+  `AxlConsoleVtEnc` and of `axl-console-mirror` whose producer is the console
+  device or the tap (both report `AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT`):
+  `sshd` sessions and browser terminals alike now show `?` where they showed
+  the glyph. The console's grid cannot hold such a codepoint -- a UEFI
+  console counts every codepoint as one cell (GraphicsConsole widens a
+  character only after a `WIDE_CHAR`, which the Shell never sends), and the
+  local GOP shows nothing for them either (its font has no CJK) -- so the raw
+  glyph slid the terminal's grid off the console's: after the Shell redrew a
+  line holding one (its scrollback), an `sshd` session gained blank rows and
+  everything below moved. EDK2's TerminalDxe sends its non-UTF-8 terminals
+  `?` for a character they cannot show; this is the same rule. Under
+  `AXL_CONSOLE_CELLS_WIDTH_RESOLVED` (`axl_vterm_new`, re-encoded) the glyph
+  goes out as it is and the encoder follows its width; a C1 control is `?`
+  under either rule. A sequence that is not well-formed UTF-8 (an overlong
+  form, an encoded surrogate, a value past U+10FFFF, one cut short) is one
+  `?` too, where it went out raw and a terminal drew one to four
+  replacement characters for it.
+
+- **`axl_console_screen_snapshot()` writes colours 0-15 in their 16-colour
+  form** (30-37/90-97, 40-47/100-107) rather than as 38;5;N / 48;5;N;
+  16-255 keep the 256-colour form. Any terminal renders the two the same,
+  so a repaint looks as before, but the bytes differ: a consumer that
+  compares snapshot output byte for byte (a golden) sees the change. No API
+  or ABI change.
+
+- **`axl_console_device_uninstall()` returns `int` and never frees the
+  device under a call in flight** (it returned `void`). The device counts
+  the firmware's calls into its SimpleTextOut, SimpleTextIn/InEx and pointer
+  proxy; while one has not returned -- a `TPL_CALLBACK` tick that preempted
+  the Shell part-way through its output, or an uninstall from inside an op
+  callback -- uninstall changes nothing and returns `AXL_BUSY`, to be called
+  again later. `AXL_OK` when the device is gone (and for NULL),
+  `AXL_INVALID` for a handle that is not the installed device, `AXL_ERR`
+  when the firmware would not let go (the instance is leaked, as before,
+  and the console stays taken; it says so in a warning). The result is
+  `AXL_WARN_UNUSED`, so a call that ignores it now draws
+  `-Wunused-result`: anything but `AXL_OK` means the device is still
+  installed and still calls into the ops' target, which must stay alive --
+  and the image holding it loaded -- until a later call returns `AXL_OK`.
+  A caller that can run from a timer or loop callback retries on
+  `AXL_BUSY`. fbcon does, and on `AXL_ERR` it keeps its terminal, logs an
+  error and refuses to unload.
+
+- **The console device's input calls report a full key ring.**
+  `axl_console_device_inject_key()` and `_ex()` return `AXL_BUSY` where they
+  returned `AXL_ERR`, so "try again" is told apart from "this device takes no
+  input". `axl_console_device_inject_text()` returns `AXL_BUSY` where it
+  returned `AXL_OK` while silently dropping every key past the 63rd, and now
+  stops at a whole character or sequence rather than mid-way.
+  `axl_console_tap_inject_text()` shares the decoder: it stops the same way
+  and returns `AXL_ERR` (its documented full-ring code) where it returned
+  `AXL_OK`.
+
+- **A key the full ring refuses still fires the guest's key notifies.** An
+  injected key -- `axl_console_device_inject_key()`/`_ex()`, the tap's
+  `inject_key()`/`_ex()` under `input_capture`, and a physical key the
+  device's read loop forwards -- runs every notify registered for it even
+  when the 63-key ring is full and the key itself is dropped, as a keyboard
+  driver runs them on the key press before it looks for room (EDK2
+  TerminalDxe's `EfiKeyFiFoInsertOneKey`). A Ctrl-C behind type-ahead into a
+  command that never reads the console -- a running script -- now breaks it;
+  before, its notify never fired. The return codes are unchanged
+  (`AXL_BUSY`; the tap's `AXL_ERR`), but offering a refused key again now
+  fires its notifies again, so do not retry a notify chord. A text unit the
+  ring cannot take is still not pressed at all, and fires nothing.
+
+- **A call that reaches the console device after its uninstall reports the
+  device gone.** Such a call -- one the firmware had already dispatched to a
+  method when the uninstall freed the instance -- touched nothing before and
+  still does, but it returned `EFI_SUCCESS` (or `EFI_NOT_READY` for a key
+  read) as if it had worked. Every method of the device's SimpleTextOut,
+  SimpleTextIn/InEx and pointer proxy now fails with a status its spec
+  defines: `EFI_DEVICE_ERROR`, except TestString (`EFI_UNSUPPORTED`) and
+  RegisterKeyNotify/UnregisterKeyNotify (`EFI_INVALID_PARAMETER`).
+
+- **Resident code no longer intercepts Ctrl-C by default.** With no
+  `axl_loop_set_intercept_break()` call, a loop intercepts only in the
+  foreground: an application image's loop that `axl_loop_attach_driver()`
+  does not drive (unchanged). A driver-attached loop does not, and neither
+  does any loop a DRIVER image creates, attached or not -- including the
+  short-lived loop of `axl_wait_ms()` and the other sync waits and sync
+  TCP/UDP/DNS wrappers. `axl_loop_intercept_break()` reports that effective
+  value, and detaching an app's loop restores the foreground default. An
+  explicit call still wins everywhere. The library's internal break poll
+  under long operations is skipped in a driver image too. The trade-off: a
+  driver whose entry point blocks in a sync wait can no longer be aborted
+  with Ctrl-C; bound it with a timeout or an `AxlCancellable`. No in-tree
+  driver relied on a Ctrl-C quitting its loop: fbcon already opted out, and
+  for every other resident loop the quit was the bug above.
+
+- **Load options set through `axl_driver_set_load_options()` (and the
+  `axl_driver_ensure*` `load_options` argument) live only for the image's
+  entry point.** Once `StartImage` returns, the loader clears the image's
+  `LoadOptions` and frees its copy, so a driver reads its options in
+  `DriverEntry` and copies what it needs later; every in-tree reader already
+  did. They used to stay until `axl_driver_unload()`.
+
+- **A KEXINIT in an authenticated SSH session now rekeys instead of ending
+  the connection.** Before authentication it still ends it. The rules follow
+  OpenSSH 9.9p1: connection-layer messages keep being processed during an
+  exchange, and an out-of-place transport message draws UNIMPLEMENTED rather
+  than a disconnect.
+
+- **An idle AxlSsh connection is now ended by default.** Without a call to
+  either setter above, an authenticated connection with no channel in use
+  is closed after 300 s, and a peer that stops answering is closed about
+  four minutes after it was last heard (probes every 60 s, three
+  unanswered). sshd's defaults are both off; these are on so that an
+  embedded server does not hold its few slots for dead peers. A stock
+  `ssh`, `ssh -tt` or `ssh host cmd` user sees no difference: ssh(1)
+  answers every probe and an open session is in use. Call
+  `axl_ssh_server_set_unused_timeout(s, 0)` and
+  `axl_ssh_server_set_client_alive(s, 0, 0)` for sshd's behaviour. **This
+  is not a change to released behaviour**: the AxlSsh server is on `main`
+  and in no release (4.7.3 predates `<axl/axl-ssh-server.h>`), which is
+  why it is here and not under a breaking heading.
+
+- **Large TCP sends are paced and polled, and on a LAN are ~100x faster.** A send is
+  handed to the firmware in pieces (`AxlTcpPacing.chunk_bytes`) with a poll
+  before each Transmit, and a loop with a send pending polls the firmware
+  on every pass through a busy idle source. Before, handing EDK2's TCP a
+  large buffer made it burst segments the firmware TX path dropped (iPXE's
+  SNP loses a Transmit between polls; MnpDxe drains one frame per 10 ms),
+  and a 1 MiB HTTP GET took 7-10 s on QEMU's sub-millisecond link; it now
+  takes about 0.06 s. A single send now moves at most about `chunk_bytes`
+  per round trip, so a distant peer is no faster -- about the same at
+  100 ms of RTT -- and beyond roughly 120 ms the default is SLOWER than
+  before (raise `chunk_bytes` for such a peer). The costs: **while a send is
+  pending the loop does not block**, until the send retires or has made no
+  progress for `idle_backoff_ms` -- one core stays busy for as long as a
+  slow reader keeps a send moving, and a serial Ctrl-C (a 0x03 keystroke)
+  is read only once that polling stops: delayed, not lost, while the
+  Shell's break flag is still checked every pass. Each sending loop takes
+  one source-table slot, and a driver-mode tick runs up to its driver
+  budget (5 ms by default) longer for the same span.
+
+- **AxlSsh coalesces its sends and pauses a peer that stops reading.** A
+  connection keeps at most one TCP send in flight and every packet sealed
+  meanwhile leaves in the next one (RELEASE: x64 61.4 -> 7.8 us per
+  pipelined round trip, aa64 277 -> 53.5), and the padding RNG is pooled,
+  one firmware call per 256 bytes. Past 128 KiB queued to send the server
+  stops parsing and reading that connection -- the peer's TCP window
+  closes, nothing is dropped -- and reads again once the queue is under
+  64 KiB. A paused peer that half-closes is not noticed until it reads
+  again.
+
+- **The firmware never holds a caller's send buffer.** AxlTcp copies each
+  piece of an `axl_tcp_send_async()` into a per-socket buffer (one piece,
+  8 KiB by default) before handing it to the firmware, so a buffer is the
+  caller's again the moment its callback runs, whatever the status.
+- **Cancelling a send stops it at a piece boundary.** A send still queued is
+  dropped whole (`AXL_CANCELLED`, 0 bytes). The ACTIVE send stops arming
+  pieces and reports `AXL_CANCELLED` at once, while the piece the firmware
+  already holds goes out on its own and holds back the next send until it
+  completes; a send whose last piece is already armed reports `AXL_OK`. The
+  connection stays usable either way.
+- **`axl_tcp_close()` is abortive exactly when it would drop accepted
+  bytes**: a queued send, a partly-armed active send, or a stream some
+  earlier send already cut short. A close whose only outstanding send is
+  fully armed now stays graceful (FIN) and retires that send `AXL_OK`; in an
+  abortive close it is retired `AXL_CANCELLED` with its whole size counted.
+- **`axl_memcpy()` and `axl_memmove()` are the toolchain's `memmove`, not
+  byte loops** -- ~12x faster on x64 and ~20x on aa64 for 8 KiB copies as
+  measured (x64 ~4.2 -> ~49 GB/s, aa64 ~0.48 -> ~9.5 GB/s; `memmove` measured
+  no slower than `memcpy`). `axl_memcpy` now copies overlapping regions
+  correctly in BOTH directions: the byte loop happened to handle `dst < src`,
+  and AxlArray's remove paths and AxlLog's table removals (now `axl_memmove`)
+  relied on it, as consumer code may.
+- **Integration runs fail on an unexpected `AXL_DEBUG_ASSERT`.** The asserts
+  log and continue, so a broken invariant never failed a test by itself;
+  `test_count_results` now fails the run on any marker a suite did not
+  declare in `TEST_EXPECTED_ASSERTS` (exact counts, which double as the
+  gate's control).
+
+- **The login-grace audit line now carries a REASON when the connection was
+  still waiting its turn.** `Timeout before authentication for connection
+  from A port P` is unchanged for a peer that simply sent nothing -- to the
+  byte -- but a connection the reaper takes while it is still QUEUED now
+  ends `... after waiting N ms behind another connection's authentication
+  hook`, or `... after waiting N ms in the authentication queue` when no
+  hook was on the stack and it was merely behind someone who had waited
+  longer. That is the one state where the reap is the server's doing rather
+  than the peer's, and the line said nothing about it. **This is observable
+  output**, so a script matching the old line with a trailing anchor needs
+  the new suffix; one matching a prefix does not. Queued timeouts are also
+  a separate kind for the audit log's rate limiter (five kinds to eight,
+  with the hook watchdog's two), so an ordinary timeout can no longer take
+  the window that would have carried the first queued one.
+
+- **`scripts/lint.sh` now lints `test/integration/*.c`.** The 60 guest
+  fixtures were the last C in the repo no clang-tidy pass could see -- 59 of
+  them were not in the compile database at all, because nothing the lint
+  build ran compiled them, and a file the database does not carry is
+  analysed under a sibling's interpolated compile command -- measured, not
+  the clean skip first claimed here. They join the
+  existing `bugprone-*` pass beside `test/unit/` and `tools/`, fixed the way
+  `tools/axl.c` was: with a build target (`integration-fixtures`,
+  objects only, no links) rather than an exclusion. The full config over
+  them is 10 findings, all analyzer noise of the kind already waived for
+  `tools/` -- `AXL_EMBED_SIZE`'s linker-symbol subtraction, and the libc
+  fixtures' deliberate `open(NULL, O_RDONLY)`. Side effect worth knowing:
+  those TUs also joined the `clang -Wall -Wextra` pass, which selects from
+  the database (366 -> 426 TUs, zero findings). Cold, the added cost is
+  inside the run-to-run variance of a lint run; warm it is +1.0 s on 10.6 s.
+  Five real findings came out of it, all
+  `bugprone-assignment-in-if-condition` in `ssh-server-selftest.c`, all
+  fixed rather than waived -- no other C in the tree carries that idiom.
+
+- **`axl_ssh_auth_complete()` refuses a `banner` that is not valid UTF-8,
+  and treats `""` as no banner** rather than sending an empty
+  `USERAUTH_BANNER`. Same RFC 4252 §5.4 field as
+  `axl_ssh_server_set_banner()`, so the same two rules on both paths. Note
+  that a PEER can trigger the new refusal: the `user` a hook receives is the
+  peer's bytes and is not checked for UTF-8, so an application that builds a
+  banner from it can get `AXL_INVALID` for a name the peer chose. The
+  request is still pending in that case -- complete it again without the
+  banner. **This is not a change to released behaviour**: `axl_ssh_auth_complete()`
+  is on `main` and in no release (4.7.3 predates it), which is why it is
+  here and not under a breaking heading.
+
+- **AxlSsh opens `session` channels when channel hooks are installed.**
+  Until `axl_ssh_server_set_channel_ops()` is called nothing changes: every
+  `CHANNEL_OPEN` is still refused with `UNKNOWN_CHANNEL_TYPE`. With hooks
+  installed, a channel open of any other type (`direct-tcpip`, `x11`,
+  `forwarded-tcpip`) is refused the same way and **the connection stays up**,
+  so `ssh -L`, `-W` and `-J` fail on that forward instead of ending the
+  session. The open-failure message now has an empty description, so
+  ssh(1) prints `open failed: unknown channel type: ` (the 44-byte reply
+  frame replaces a 60-byte one).
+
+### Fixed
+
+- **The CMake package's header tracking works on CMake 3.20.x.** It passed
+  gcc `-MP`, whose phony header targets CMake 3.20 rewrites as
+  `header.h::`, so the first rebuild after editing any header failed --
+  Ninja with "depfile mentions ... as an output", make with "has both : and
+  :: entries". The package no longer passes `-MP` (neither generator needs
+  it: CMake writes its own phony entries, and Ninja ignores a depfile input
+  that has gone; a deleted header is tested under both). Found by running
+  the package's own test under CMake 3.20.6, which it now does on every run
+  alongside the pinned CMake, together with `sdk/examples`.
+
+- **A `.efi` no longer carries a COFF string table.** objcopy's
+  ELF-to-PE step stored a section name over eight bytes (aa64's 9-byte
+  `.rela.dyn`; a C++ image's `.eh_frame` and `.gcc_except_table`) in a
+  string table after the last section and pointed the COFF header's
+  `PointerToSymbolTable` at it, with zero symbols. The PE/COFF spec says an
+  executable image has no string table and truncates a long section name to
+  eight bytes; `pe-set-debug`, which every image goes through (the SDK
+  build, `axl-cc`, the pack wrap), now does exactly that. An aa64 C image is
+  14 bytes smaller (a C++ image on either arch loses its table too) and its
+  relocation section is named `.rela.dy`; nothing loads a section by name
+  (the C++ unwinder finds its table by the `__eh_frame_start` symbol).
+  `check-reloc-coverage`, which looked the relocation section up by its ELF
+  name to choose its diagnosis, matches the eight-byte name. Every
+  section's bytes are unchanged except the build id in `.dbgdir`, which
+  covers the shorter file.
+  `check-pe-stripped` now gates aa64 images as well as x64 ones.
+
+- **The JSON writer and `axl_json_escape_string` escape control characters
+  instead of dropping them.** Every byte below 0x20 except `\t`, `\n` and
+  `\r` was silently left out of a string -- an ESC, a U+0000, a form feed
+  -- though `axl_json_escape_string`'s own docstring said it escaped them,
+  and a test pinned the drop. They are `\u00XX` now (RFC 8259 §7), keys and
+  values alike, counted and NUL-terminated. Output that held such a byte
+  changes; `axl_json_escape_string` needs up to six bytes for each.
+- **A connection-per-request client could exhaust a loop's event sources.**
+  AxlTcp held one loop source per deferred graceful close until the
+  firmware completed it (past TIME_WAIT), so a client opening a connection
+  per request at ~1 ms a round trip ran into `AXL_MAX_SOURCES`. One sweeper
+  timer per loop now finalizes completed closes; `axl_loop_free` still
+  reports closes pending on a freed loop.
+
+- **Security: the HTTP response cache served auth-required routes to anyone,
+  and every refused request leaked the middleware's response state.** Both
+  in `dispatch_request`, both reachable remotely without credentials:
+  - With `axl_http_server_use_cache`, the cache was consulted BEFORE
+    authentication. Once an authorised request had filled it, an
+    auth-required route's body went to every caller, 200. Authentication
+    now runs first, and only GET responses of open routes are cached: an
+    authenticated route never is (the key holds no identity), and neither
+    is any other method (the key holds no body, so a repeated POST got the
+    first one's answer without its handler running).
+  - The 404, 401/403 and cache-hit paths returned without freeing what the
+    middleware had set on the response -- a header table per refused
+    request, 14 allocations (920 B) with a four-header security middleware.
+    Anyone who can reach the port could exhaust the heap. Streaming-upload
+    routes, which run the middleware on their own, leaked it the same way
+    on every exit, the refused (401) upload included. Every exit past the
+    middleware now frees it, and the 404/401/403 -- and a completed upload's
+    response -- carry the middleware's headers (security headers belong on
+    errors too), minus any Connection / Content-Length / Transfer-Encoding
+    it set, which would contradict the response's own framing.
+  - An upload handler that answered with `axl_http_response_set_static`
+    had that static body `axl_free`d once the response was sent (or the
+    connection reset).
+  - A response whose headers did not fit the 2 KB header block ran past the
+    stack buffer (the length arithmetic took snprintf's would-be length);
+    with middleware headers on unauthenticated errors that was reachable
+    too. Such a response is now a 500 with no body.
+    `test-http-error-leak-qemu.sh`, both arches.
+
+- **`axl_tls_server_set_cert` leaked a node per HTTPS server after the
+  first.** It re-attached the certificate with `mbedtls_ssl_conf_own_cert`,
+  which appends to the global TLS config's key/cert list and frees nothing:
+  every `axl_http_server_use_tls` after the first grew it by one node (24 B)
+  that was never released, and every handshake walked the list. A consumer
+  that rebuilds its HTTPS server (a configuration re-apply) leaked one per
+  rebuild. The certificate is now attached once: every node pointed at the
+  same certificate and key, which are re-parsed in place, so later calls
+  need no node at all. (Freeing the list instead would pull a node out from
+  under a handshake in flight, which holds a pointer to it.)
+
+- **Replacing the HTTPS certificate on a live server was unsafe.**
+  `axl_tls_server_set_cert` freed the one global certificate and key and
+  re-parsed them in place: a certificate or key that did not parse left the
+  server with neither -- every later handshake failed until a good one was
+  set -- and anything still using the old pair read freed memory. A valid
+  certificate with another certificate's valid key was accepted, with the
+  same result. Each call now builds a complete credential (config,
+  certificate, key, checked to be a pair) and swaps it in only on success; every connection holds a reference to the credential
+  it was accepted under until it is freed. `axl_tls_accept` without a
+  certificate now returns NULL instead of a context whose handshake fails.
+  `test-tls-rekey-qemu.sh`, both arches.
+
+- **`axl_http_server_set_route_ttl(s, path, 0)` was ignored.** The TTL is
+  stored as the hash value itself, so 0 read back as "no override" and the
+  route was cached for the server default. A TTL of 0 now means the route
+  is never cached. `test-http.sh`.
+
+- **A restage or unstage during a staged upgrade's commit grace defeated
+  the trial.** `axl_service_start_staged` waits the grace period with the
+  candidate already serving, and its handlers -- an `/upgrade` endpoint --
+  could stage or unstage meanwhile. The promotion then acted on whatever
+  `P.new` held: a restage made an UNTRIALLED image P (the trialled one
+  lost), and an unstage left `promote:swap` recorded, so the next start
+  reported the good candidate ROLLED_BACK. `axl_service_stage` and
+  `axl_service_unstage` now answer `AXL_BUSY` while an upgrade is in flight,
+  and the promotion re-keys `P.new` before the copy and before the swap: a
+  `P.new` changed past the API is not promoted, and the next start trials
+  it. `axl_service_last_upgrade` answers `AXL_BUSY` in flight (it held the
+  previous attempt's verdict), and the outcome is recorded before the record
+  is cleared, so a reader never sees the stale verdict afterwards.
+  `test-service-stage-grace-qemu.sh`, both arches.
+
+- **File and path operations no longer pile up memory in the UEFI Shell.**
+  Under the modern Shell every AXL open, stat, delete, mkdir, directory
+  listing, `axl_fs_path_canonical`, `axl_volume_enumerate` and
+  `axl_get_current_dir` went through `EFI_SHELL_PROTOCOL` calls whose
+  results the Shell parks on a list it frees only when the CURRENT SHELL
+  COMMAND ends. A short command got it back; an app looping for hours, or a
+  resident driver (an SFTP server, a service) whose calls park onto
+  whatever command is current while the Shell sits at its prompt, grew
+  without bound -- 25 pages per 400 absolute reads, 50 per 400 relative
+  ones, 175 per 400 relative mkdir+rmdir, measured on both arches. AXL now
+  resolves paths itself through the Shell's map (`GetDevicePathFromMap`,
+  which parks nothing), reproducing `OpenFileByName`'s resolution string for
+  string; keeps the current directory in a cache that re-checks itself
+  against the Shell's `cwd` variable on every use; and finds a volume's
+  `fs<n>` name by probing `FS0:`..`FS63:` through the map: 0 pages per 400
+  of every operation. Every answer pinned is unchanged --
+  map names in any case and alias, relative paths, `..`, 8.3 names, missing
+  file vs missing volume error codes, the Shell's own quirks (`fs0:a` names
+  the root) -- and is pinned against what the Shell itself answered by
+  `test-shell-buffer-growth-qemu.sh`. The EFI 1.x shell and no-shell paths
+  are untouched. A few rare cases still ask the Shell (and park), and three
+  narrower ones the checks cannot see are listed in "Under the modern
+  Shell, a path operation costs the Shell nothing" in `src/fs/README.md`.
+- **An image gives the C library's heap back when it exits.** Since 4.2.0
+  newlib's `malloc` (and so `operator new`) has grown into a page region AXL
+  takes from the firmware, and nothing returned it. UEFI does not reclaim
+  an image's page allocations when it unloads, so every launch of an image
+  that had called `malloc` left 1 MiB (256 pages) of boot-services memory
+  behind until the next reset. That was every C++ image, not only ones that
+  allocate -- libsupc++'s emergency-pool constructor mallocs before `main`,
+  and on a `--no-eh-frame` image it is the only thing that does -- plus any
+  C program using `malloc`, `strdup` or stdio, and every load/unload cycle
+  of such a driver. The region is now freed as the very last step of
+  teardown: application exit, `--minimal-runtime` exit,
+  `axl_driver_cleanup` and a service driver's unload, piece by piece as it
+  was allocated. Cost, measured on both arches: 48-64 bytes of `.text` in an
+  image that never mallocs; 288-384 bytes of `.text` and ~550 of `.bss` (no
+  file bytes) in one that does; the file grows by 0 or one 512-byte block.
+  That includes a driver whose entry exits with an EFI error through
+  `axl_exit_status` (EDK2 unloads it without calling its unload), whose
+  destructors now run too -- unless a child image it started is still
+  running, where that exit cannot unload it. **What to know:** `axl_driver_cleanup` must now be the last
+  thing a hand-written driver entry or unload does -- nothing after it may
+  call `malloc`, `free` or `new`, including the destructor of a C++ local
+  still in scope -- and an `AXL_SERVICE_DRIVER` teardown must not call it.
+
+- **`axl_exit` from a callback while a child image runs no longer
+  deadlocks.** While an image this one started (`axl_image_run`,
+  `axl_driver_start`, a Shell command, a driver connect) is running, the
+  firmware refuses `gBS->Exit` for this image, and `axl_exit` -- which must
+  not return -- spun at callback TPL, starving the child: the machine hung.
+  The exit is now deferred: the calling callback is abandoned (its dispatch
+  returns to the firmware), the child runs to completion, and the exit
+  happens when the call that started the child returns, from that caller's
+  context. Applies to apps and drivers alike. A callback of an event made
+  directly through the firmware (`AXL_ALLOW_UEFI`) is not covered.
+
+- **A service whose setup exits with an EFI error no longer leaves its
+  protocol behind.** `AXL_SERVICE_DRIVER` publishes the service GUID before
+  setup runs; an `axl_exit_status` with an error from setup had EDK2 unload
+  the image without removing it, leaving an interface pointer into freed
+  memory for the next lookup. The entry now undoes the publication (and
+  frees the loop and config) on that exit.
+
+- **`install.sh` stages under its build lock, and atomically.** It released
+  the build-tree lock before copying out of that tree, so a concurrent run
+  could stage a half-written archive; and it copied in place, so a test
+  linking from the stage while another run refreshed it could read a
+  partial file. The copies now happen under the lock, and every changed file
+  lands by rename. Unchanged files keep their mtime, as before.
+
+- **A `--no-eh-frame` image no longer carries libsupc++'s emergency
+  exception pool.** It could never be used there (a throw halts), yet its
+  constructor malloc'd before `main` in every C++ image -- in one that
+  otherwise never allocates, that alone committed the C heap and linked
+  newlib's allocator. A minimal `--no-eh-frame` image is ~15 KB smaller
+  (x64 63,488 -> 48,128 bytes; aa64 66,062 -> 51,726) and takes no C heap.
+
+- **A DEBUG (`AXL_MEM_DEBUG`) driver's unload releases AxlMem's free
+  quarantine.** Only the leak report drained it, and a plain driver's
+  unload prints none, so up to 64 KiB of freed pool outlived every unload.
+
+- **`run-integration.sh` restages the SDK before running a test that reads
+  it**, so a `src/`-only edit is measured rather than the previous staged
+  build (its stage check compares only public headers). It runs
+  `install.sh --arch all --cpp` (~14 s when nothing changed) only when a
+  selected test uses `test_sdk_dir`, and never under `--no-build`.
+
+- **`check-libc-overlap` can no longer fail unsatisfiably on a staged
+  archive.** It judged a staged `libaxl.a` against every file under `src/`,
+  so editing `src/cxxrt/` or a README after staging failed it for good. It
+  now uses what builds the archive (`--print-staged-inputs` lists it).
+
+- **`run-qemu.sh` refuses a UNIX socket path it cannot bind, naming the
+  setting to change.** A socket path is capped at 107 bytes (`sun_path` is
+  108 with the NUL). A long `AXL_QEMU_TMPDIR` made QEMU refuse
+  `monitor.sock` with one line in its own log, so `--screenshot` runs
+  produced no PNG and a screenshot suite read as a render regression. The
+  per-run sockets a run will use (`--screenshot`, `--mount`) and the
+  caller's `--monitor-socket`, `--qmp-socket` and `--serial-socket` are now
+  checked before anything is created, and an over-long one exits 1 with
+  the knob, the length and the limit. `--help` gives the bound (an
+  `AXL_QEMU_TMPDIR` of at most 75 bytes). The integration runner checks a
+  caller's `AXL_QEMU_TMPDIR` once, before building, against the deeper
+  per-test path (at most 55 bytes), and `test_setup` checks the same for a
+  single test.
+
+- **An interrupted `axl_tcp_recv` no longer leaves its Receive armed in the
+  firmware.** When the call's own loop returned before the receive finished
+  -- a Ctrl-C, which that loop intercepts, or anything else that quit it --
+  `axl_tcp_recv` returned `AXL_ERR` but left the firmware's Receive token
+  queued, pointing into the caller's buffer (often a stack frame about to
+  be reused): the next segment to arrive was written into it, and the
+  socket's next receive could not get it. The receive is now taken down
+  before the call returns -- its loop sources removed and the token
+  cancelled -- so nothing is written after the call, and a segment that
+  arrives later goes to the socket's next receive. If the receive completed
+  in the instant before the cancel, the call returns `AXL_OK` with those
+  bytes rather than dropping them.
+
+- **An async receive's loop sources are removed from the loop that holds
+  them.** `axl_tcp_close` and a re-arm removed a receive's sources from the
+  socket's single "async loop", which every operation overwrote, and source
+  ids are unique across loops, so removal from any other loop silently did
+  nothing and the source stayed registered (and could fire) after close.
+  Three ways in: a send on another loop than the receive's; a receive
+  callback whose `axl_tcp_recv_async` onto another loop failed (a full
+  source table) and which then returned `true`; and a re-arm without a
+  cancellable, which left the previous receive's cancel source registered
+  (it could cancel the NEW receive). The receive now records its own loop,
+  a failed `axl_tcp_recv_async` leaves the receive's callback, buffer and
+  loop untouched (so a callback returning `true` after one keeps its
+  receive), and a re-arm removes the old cancel source. The transmit
+  linger likewise begins only for a receive on the send's loop, as
+  documented; a receive on another loop used to start one.
+
+- **A service whose teardown fails stays whole, and the next stop retries
+  it.** When an `AXL_SERVICE_DRIVER` teardown returned non-OK, the unload
+  stub refused the unload (`EFI_ABORTED`, so the image stayed resident) but
+  still freed the loop, uninstalled the service protocol and forgot the
+  service. Status then read "stopped" for a resident image, and a second
+  unload found no service, skipped teardown and returned `EFI_SUCCESS`, so
+  the firmware freed the image under whatever the teardown had failed to
+  release -- a console device still installed, for one: a use-after-free.
+  A failed teardown now changes nothing but the loop's tick: the service
+  stays published (status reports it stopping; `axl_service_stop`, the
+  Shell's `unload` and `axl_service_reload` find it), and each later unload
+  runs teardown again until it succeeds. The loop is NOT ticked again in
+  between, because a failed teardown may already have freed what its
+  sources point at. A teardown that can fail must therefore resume rather
+  than repeat (see `AxlServiceTeardown`). `axl_service_reload` over such a
+  service returns `AXL_DENIED` (still published, nothing started) where it
+  returned `AXL_ERR` ("down") for an image that was in fact still resident.
+  The driver's entry path had the same hole: when setup succeeded but the
+  tick could not be attached and the rollback teardown failed, DriverEntry
+  returned an error, and the firmware freed the image without calling its
+  Unload. It now comes up in the same half-stopped state and returns
+  success, and the launcher's `start` now reports it as stopping rather
+  than as a successful start. A failed teardown now logs one warning in the
+  driver image,
+  which says what it leaves behind, beside the launcher's one raw
+  `UnloadImage` status line; it used to log four. Covered by
+  `test-service-teardown-fail-qemu.sh`, which reaches the attach failure
+  through a weak library test point (`_axl_service_test_point`, never true
+  in production).
+
+- **`axl_service_attach_driver` no longer passes setup's return code
+  through.** A setup returning `AXL_BUSY` (say, from `axl_serial_open`) was
+  read by the driver's entry as "the rollback teardown failed": the service
+  came up half-stopped, and the next stop ran a teardown for a setup that
+  never succeeded. Every setup failure is now `AXL_ERR`; the framework
+  learns of held resources through its own channel.
+
+- **sshd's stuck console is the service state.** A take-over the firmware
+  would not give back was published as sshd's own `SSHD_STUCK_GUID`, and a
+  setup that failed that way returned `AXL_OK` with nothing serving. Now a
+  failed stop, or a setup that returns `AXL_SERVICE_SETUP_HELD`, leaves
+  sshd STOPPING (`sshd status` exits 5, and `sshd` refuses to start over
+  it); a Shell that exits while the console cannot be released leaves it
+  DEGRADED. `sshd status` prints the same stuck line for both (and only
+  for sshd's own degraded reason). `test-sshd-stuck-qemu.sh` covers the
+  stopping paths through a test build, `sshd-t.efi`, whose driver links
+  strong test points; the shipped sshd links none. The degraded path,
+  which needs the Shell to exit under a running sshd, is untested.
+
+- **A refused `axl_console_device_uninstall` no longer takes the keyboard
+  with it.** Uninstall stopped the `read_physical` loop first, and when the
+  disconnect of its handle was then refused (`AXL_ERR`) it returned with the
+  loop still stopped and the firmware keyboards still evicted: no key reached
+  the guest, so an operator of a `take_input` + `read_physical` consumer
+  (sshd's console, a remote-console take-over) could not even type the
+  `unload` that retries it. The loop now runs again on that failure. The
+  later failure point, the protocol uninstall, already leaves input working:
+  by then the firmware keyboards are re-admitted. OVMF never refuses the
+  disconnect, so `test-console-device-release-fail-qemu.sh` reaches it
+  through a weak library test point (`_axl_console_device_test_point`, never
+  true in production) and then types at the Shell over serial.
+
+- **A refused uninstall of the console device's ConIn protocols no longer
+  frees the instance under them.** `axl_console_device_uninstall` ignored
+  the status of uninstalling its ConIn protocols, cleared its record of them
+  and closed their WaitForKey events. If the ConOut uninstall then
+  succeeded, it freed the instance while the ConIn protocols, and any ConIn
+  binding still holding them, pointed into it. A refusal now returns
+  `AXL_ERR` with the instance kept and nothing changed, and a later call
+  resumes. The same holds for the install path's rollback, which also
+  still tries to uninstall the ConOut protocols when the ConIn ones are
+  refused (so no later connect binds ConSplitter to the leaked instance),
+  and says so at warning level. The `AXL_ERR`
+  documentation now says what each refusal leaves: after a refused
+  disconnect the console stays taken, but after a refused protocol uninstall
+  the firmware consoles are back and only the instance is kept. Covered by
+  the second scenario of `test-console-device-release-fail-qemu.sh`.
+
+- **`axl_tls_generate_self_signed` always encodes a valid serial number.**
+  The random 8-byte serial had only its top bit cleared, so one certificate
+  in 256 began `00 xx` with `xx` below `0x80` -- a non-minimal DER INTEGER.
+  OpenSSL 3 rejects such a certificate ("BAD INTEGER"), and curl answers the
+  handshake with a `bad_certificate` alert even under `--insecure`, so every
+  HTTPS request to that server failed for as long as it ran. (mbedTLS adds a
+  0x00 before a serial whose top bit is set, but never strips one it is
+  given.) The first byte is now redrawn until it is non-zero. This was the
+  sporadic `test-server-cpu-qemu.sh` "served only 0/20 HTTPS requests"
+  failure; it dates from the generator's first version, and the load on the
+  box at the time was a coincidence.
+
+- **A driver load never loads the calling image.** A driver whose file
+  name equals the running image's made the driver search find the image
+  itself (candidate 1, its own directory), and `axl_driver_ensure` loaded
+  and started it -- the image running again inside itself, about thirty
+  levels deep in a measured case. The search now skips the image's own file
+  (a debug line) and goes on to the real driver, and the driver loaders --
+  `axl_driver_load`, `axl_driver_load_sibling`, `axl_driver_ensure*` and the
+  `axl_shared_driver_locate*` family -- refuse it with an error line. An
+  explicit `axl_driver_load` of the running image's own file now returns
+  AXL_ERR. Identity is the file as the filesystem stores it, read through
+  opened handles as `axl_file_replace` decides it, so another case, an 8.3
+  alias, `.`/`..` segments and a trailing dot are all the same file, and a
+  copy elsewhere -- even under the same name -- is not. `axl_image_load` and
+  `axl_image_run` of one's own path are unaffected.
+
+- **The driver search finds a sibling of an image at a volume root first.**
+  Its first candidate, the running image's own directory, was built by
+  concatenating `<dir>/<name>`; for an image at `fs0:\` that gave
+  `fs0:\\name`, which missed, so a `drivers\<arch>\` copy won over the
+  driver beside the image. It is now joined (`axl_path_companion`). The
+  `axl_driver_get_image_path` documentation also said it returns
+  `fs0:\...`; it returns the path within the volume (`\...`), and now says
+  so.
+
+- **The HTTP client's `Host` names the port when it is not the scheme's
+  default (RFC 9110 7.2).** Both clients sent the bare host, so a request
+  to `http://server:8080/` said `Host: server`; a WebDAV server comparing a
+  MOVE or COPY `Destination` (`http://server:8080/...`) against it took
+  the destination for another host and answered 502 (seen against
+  wsgidav from axl-webfs). `Host` is now `host:port` exactly when the port
+  differs from 80 for http or 443 for https, unchanged otherwise, and it
+  follows the target of each redirect. `axl_url_parse` accepts an IPv6
+  literal in brackets (`http://[::1]:8080/`; `host` is the address
+  without them), and `axl_url_build` and `Host` put the brackets back. A
+  bracketed host must hold a `:` (`[abc]` and `[1.2.3.4]` are refused),
+  and zone IDs are not supported.
+
+- **`axl_url_parse` lowercases the scheme (RFC 3986 3.1).** `HTTPS://`
+  and `Http://` were stored as written, so they got no default port and
+  matched no `"https"`/`"http"` comparison -- an `HTTPS://` URL was not
+  connected over TLS. The scheme is now stored lowercased.
+
+- **`axl_http_parse_status_line` refuses a control character in the
+  line**, HTAB aside, as the request-line parser does: a bare CR inside a
+  status line was passed over (only the code's digits were checked), and
+  the client now fails such a response.
+
+- **The client reads past interim 1xx responses to the final one (RFC
+  9110 15.2).** A `100 Continue` or `103 Early Hints` was returned as the
+  response, with no body, and the real response was left on the
+  keep-alive connection -- where the NEXT request read it, putting every
+  later response on that connection one behind. Both clients now skip
+  interim heads (up to 16, `HTTP_CLIENT_INTERIM_MAX`; one more fails the
+  request) and return the final response. A `101 Switching Protocols`
+  fails the request: the client asks for no upgrade. After any failed
+  `axl_http_request_streaming` the connection is closed rather than
+  reused, as the async client already did.
+
+- **A response with neither Content-Length nor Transfer-Encoding has a
+  body that runs to the close (RFC 9112 6.3 rule 8).** Both clients read
+  it as having no body -- the common `Connection: close` reply of embedded
+  servers and BMCs came back empty. It is now read to the close (cut by a
+  reset, `AXL_INCOMPLETE`), and the connection is not reused after it. A
+  response to HEAD, a 1xx, 204 or 304, and a 2xx to CONNECT have no body
+  whatever their fields say (rule 1): a HEAD answered with a
+  Content-Length no longer waits for that many bytes.
+
+- **`axl_http_request_streaming` reports its idle deadline as
+  `AXL_TIMEOUT`.** When `timeout.ms` passed with nothing received -- while
+  awaiting the response or mid-body -- it returned `AXL_ERR`, or, for a
+  body framed by the close, `AXL_INCOMPLETE` ("cut"), when the server had
+  simply sent no length and not closed. It now returns `AXL_TIMEOUT`, as
+  the async client always did.
+
+- **A response body framed by the close is never returned cut.** Both
+  clients took ANY end of the connection -- a reset, a receive timeout, a
+  TLS stream ended without close_notify -- as the end of such a body, and
+  returned what had arrived as the whole of it. Only an orderly close (the
+  peer's FIN; over TLS, its close_notify) ends it now; anything else fails
+  the request with `AXL_INCOMPLETE`, from `axl_http_request_streaming`
+  too. Internally, a TCP recv records how it ended, so a FIN is told from a
+  reset (`EFI_CONNECTION_FIN` and its siblings are now in the generated
+  UEFI headers).
+
+- **The SDK client reads a response as a user agent (RFC 9112), not as a
+  server reads a request.** Both clients -- the async core behind
+  `axl_http_get` and friends, and `axl_http_request_streaming` -- refused
+  a folded header, a repeated identical Content-Length and bare-LF line
+  ends, which RFC 9112 has a user agent accept; they now read them (see
+  `axl_http_parse_response_headers`). Differing Content-Lengths still fail
+  the response and close the connection. A response with Content-Length
+  and Transfer-Encoding is framed by chunked and its connection is no
+  longer reused (6.3). A response whose Transfer-Encoding does not end in
+  chunked was framed by its Content-Length, or read as having no body; its
+  body now runs until the connection closes (6.3), bounded like a chunked
+  one.
+
+- **The chunked-body decoder can fail, and a failure is 400.** A
+  chunk-size line with no hex digits, more digits than 64 bits hold, a
+  byte other than hex, whitespace or ';' before its CRLF, or more than
+  1 KiB (`HTTP_CHUNK_LINE_MAX`) used to read as the terminating chunk: the
+  body's prefix was committed, 201 -- over a PUT in place, a truncated file
+  reported stored. Now it is 400; an upload is aborted first, so its write
+  is discarded (a PUT in place reports the file partially written). A size
+  line with extensions cut by a segment boundary is reassembled (the old
+  16-byte holding buffer dropped it). Trailers and the final CRLF are
+  read, so the next request on a keep-alive connection starts clean. A
+  chunked whole body past the server's body limit is 413, not dispatched
+  cut at the limit.
+
+- **`axl_http_parse_headers` parses the whole header block or fails.**
+  It stopped silently at a bare CR, so `X: a\rContent-Length: 5` left the
+  Content-Length unread and the body was taken for the next request (a
+  duplicate Content-Length or a Transfer-Encoding hid the same way). Lines
+  now end at CRLF only, and a bare CR or LF, a control character in a
+  value, a non-token name, a line with no colon (obs-fold included), a
+  second Content-Length or Transfer-Encoding line, or a block cut before
+  its empty line fails it -- the server answers 400. A control character
+  in the request line is 400 too. (The client reads a response by a user
+  agent's rules instead: see `axl_http_parse_response_headers`.)
+
+- **The server reads the request line's version instead of guessing it.**
+  It took the line's last 8 bytes for the version, so `GET / HTTP/1.1 junk`
+  and `GET /a b c d` were served, `GET /HTTP/1.0` was read as HTTP/1.0 (no
+  Host needed), and `HTTP/2.0`, lowercase `http/1.1` and a line with no
+  version at all were served as HTTP/1.1. A request line must now be
+  exactly `method SP request-target SP HTTP/DIGIT.DIGIT` (RFC 9112 3), or
+  it is 400; a major version other than 1 is 505 HTTP Version Not
+  Supported (RFC 9110 15.6.6). `axl_http_parse_request_line` refuses the
+  malformed shapes too.
+
+- **Running out of memory while parsing a request head is 500, not 400.**
+  The server answered it as a malformed request. `axl_http_parse_headers`,
+  `axl_http_parse_response_headers` and `axl_http_parse_request_line` now
+  return `AXL_NO_RESOURCES` for a failed allocation (they returned
+  `AXL_ERR`, which now means only "malformed"); a caller that compares
+  `== AXL_ERR` rather than `!= AXL_OK` must handle it -- none in this tree
+  did.
+
+- **The server refuses framing it cannot be sure of (RFC 9112).** A
+  `Transfer-Encoding` other than exactly `chunked` was framed by
+  Content-Length (usually 0), so its body was read as the next request: a
+  final coding other than chunked, chunked twice or an empty value is now
+  400, an unimplemented coding before a final chunked 501. Whitespace
+  between a field name and its colon, an obs-fold line, a line with no
+  colon and a second Content-Length or Transfer-Encoding line are 400.
+  Content-Length together with chunked: chunked frames the body and the
+  connection closes after the response. HTTP/1.0 with Transfer-Encoding
+  is read as chunked and closed after the response too (RFC 9112 6.1). An
+  HTTP/1.1 request without a Host, or any request with two, is 400
+  (3.2); HTTP/1.0 without one is answered.
+
+- **Requests pipelined into one segment are all answered, in order.**
+  Bytes that arrived after a finished request in the same segment were
+  dropped -- the client hung until its timeout -- and after a
+  Content-Length streaming upload they were WRITTEN INTO THE FILE (a PUT
+  followed by a GET stored "pipedGET /..."). They are now carried on the
+  connection and parsed as the next request: after a request with no
+  body, after a Content-Length body (in the header buffer or a later
+  segment), after a chunked body's terminator, and over TLS, where the
+  plaintext past what a phase could take was dropped and a request that
+  was already whole with more data buffered reset the connection. Bytes
+  that cannot be kept (no memory) close the connection after the
+  response, never silently.
+
+- **`axl_http_get_content_length` no longer wraps or reads a prefix.** A
+  value that is not all digits, or does not fit below SIZE_MAX, is now
+  SIZE_MAX ("not a usable length"): 2^64+1 used to read as 1 and "42abc"
+  as 42 -- a client sized a response body by the wrapped figure. The
+  strict reader behind it is public, `axl_http_parse_content_length`
+  (AXL_OK with the length, or AXL_INVALID), and is the one the server's
+  400 uses.
+
+- **Header field values are read without their optional whitespace.**
+  `axl_http_parse_headers` trimmed only leading spaces: a trailing space
+  or a tab stayed in the value, so `Transfer-Encoding: chunked ` did not
+  read as chunked (the framing reached the file), and `Content-Length: 5 `
+  became a 400 once Content-Length was parsed strictly. Leading and
+  trailing spaces and tabs (RFC 9110 §5.5 OWS) are now trimmed.
+
+- **A malformed or overflowing `Content-Length` is 400** before any
+  handler runs. It was read leniently: `abc` as 0 (an empty PUT committed
+  over the file), 2^64+1 as 1, 2^64-1 as the framing's "no body" mark.
+
+- **A chunked upload is decoded however its bytes arrive.** On a
+  streaming upload route (a WebDAV PUT) the body bytes that arrived with
+  the headers were handed to the handler RAW when the body was chunked:
+  the chunk framing reached the file, and a terminator in that first
+  segment was never seen, so a small chunked PUT hung until the client
+  gave up. And the upload path never put back the half of a chunk
+  size-line a segment boundary had cut, so the rest of it was read as the
+  terminating chunk and an empty file was stored, 201. Both go through
+  the one decoder now.
+
+- **The HTTP client sends a long request target whole.** The path and
+  query were joined in a 512-byte buffer and silently CUT, so a request
+  for a 512-byte path asked for its 511-byte prefix -- another resource
+  (a 511-byte path read its 505-byte sibling's content). The request
+  header block is now built in one buffer sized to fit it exactly, by one
+  builder the async core and the streaming path share: no part of a
+  request is ever cut, and the old 2048-byte header cap is gone with it.
+  A block that cannot be allocated fails with `AXL_NO_RESOURCES`.
+
+- **serve-fs COPY runs on the library's tree copy.** Its own copy was
+  recursive (about 88 KB of stack at its depth bound of 64, reachable by
+  any client that can MKCOL), never looked at Ctrl-C, and duplicated the
+  handle-tracked copy `axl_file_replace` already had. COPY now uses that
+  copy: no depth bound, a stack that does not grow with the tree, Ctrl-C
+  checked per entry and per chunk (the COPY ends 500 with nothing of it
+  left), and a copy that fails part-way removes exactly what it created
+  -- an overwritten collection is put back. A live PUT's temp is still
+  never copied.
+
+- **A WebDAV path component starting with a blank, or ending with a
+  blank or a period, is 400.** EDK2 FAT trims those before it looks a name
+  up, so `/dav/~AP1A2B3.TMP.`, `~AP1A2B3.TMP%20` and `%20~AP1A2B3.TMP`
+  reached a live PUT's temp past its exact-name check: a GET served the
+  half-written body, a PUT or MOVE replaced it, a DELETE removed it. FAT
+  cannot store such a name, so every method and `Destination` refuse it.
+
+- **WebDAV percent-decodes the request path and `Destination`, and
+  percent-encodes PROPFIND hrefs.** A client asking for `with%20space.txt`
+  reached a file named `with%20space.txt`; now it reaches `with space.txt`,
+  and the listing names it `/dav/with%20space.txt`. `%2F`, `%5C`, `%00`, a
+  malformed escape and a raw `\` are 400 -- a raw backslash used to reach
+  the filesystem as a separator inside one URL segment. `%2e%2e` is `..`,
+  contained in the mount like any other.
+
+- **A WebDAV PROPFIND no longer puts its listing on the stack, and lists
+  more than 256 children.** `AxlFsEntry kids[256]` was 75 KB of the
+  128 KiB UEFI stack (and would be past it once `AxlFsEntry.name` widens);
+  the listing is on the heap, re-asked with twice the room while it fills
+  the array, with no cap, so a directory is listed whole instead of cut at
+  256. A listing that cannot be held in memory is 507 and one whose
+  `list_dir` fails is 500 -- never a partial 207, which a sync client takes
+  for the whole directory. A child whose path is longer than 512 bytes is
+  listed (it was skipped), and its href is never cut.
+
+- **`axl_http_server_serve_fs(s, prefix, "FS0:", ...)` serves the volume
+  root.** A root given as a bare volume (`FS0:` -- the form the docs show)
+  mapped the mount root to `FS0:`, which opens nothing on FAT, so PROPFIND
+  of the mount listed nothing; `FS0:\` and `FS0:/` already worked.
+
+- **A serve-fs PUT too big for the volume is 507 before a byte is
+  written** when its `Content-Length` says so, instead of filling the
+  volume and answering 500.
+
+- **Responses with status 207, 412, 414, 415, 416, 502 and 507 carry
+  their reason phrases** instead of `Unknown`.
+
+- **A file time a firmware reports with a time zone is no longer off by
+  twice the offset.** UEFI 2.11 section 8.3 defines Localtime = UTC -
+  TimeZone; AXL subtracted the zone where it must add it, in file times
+  and `AXL_CLOCK_REALTIME` alike. Times with the zone unspecified -- every
+  FAT time -- were and are read as UTC.
+- **Paths take '/' under every shell.** The modern shell's
+  `OpenFileByName` failed `fs0:/x` and the EFI 1.x shell's map lookup split
+  on '\' only; the backend now converts at its path entry points, so
+  `axl_file_info("FS0:/x")`, `axl_fopen`, `axl_dir_open`, `axl_dir_mkdir`,
+  `axl_chdir` and the rest work with either separator.
+- **Nothing cuts a name or a path any more.** `axl_path_resolve` cut its
+  input at 512 bytes; `axl_dir_walk` cut every path at 512 and walked the
+  cut one (and is now iterative, its state on the heap -- the recursion
+  cost ~1.4 KB of stack a level); `axl_dir_read` ENDED a listing at an
+  entry larger than its buffer instead of skipping it; `axl_fstat` cut a
+  long name (it now leaves it empty); the provider thunk cut paths at 512
+  bytes; the 9P client cut a Twalk component at 255 bytes and a listed
+  name to fit, and skips a listed name with an embedded NUL rather than
+  ending it there; `axl_net_list_available_drivers` cut a driver name or path to fit
+  its fixed fields and now skips that driver with a warning. A callback's
+  -1 from below the first level of `axl_dir_walk` is now returned, as
+  documented.
+- **A provider volume lists only names FAT could hold, and a too-small
+  `ReadDir` keeps its entry.** A provider entry name over 255 UTF-16
+  units is skipped with a warning (once per directory; the rest at debug),
+  and a path component over 255 units is refused by `Open`; EDK2's FAT
+  driver holds the same limit, so a Shell tool never sees a name it could
+  not open. A `ReadDir` answered `EFI_BUFFER_TOO_SMALL` returned the NEXT
+  entry on the retry -- the first was lost; the entry is now kept until a
+  buffer large enough reads it, or `SetPosition` rewinds.
+- **`tar -x` and `tar -t` read GNU and pax long names, and no longer write
+  links as empty files.** A host archive with a path over 100 bytes (GNU
+  tar's default format carries it in an `L` record, pax in an `x` record)
+  was extracted under the 100-byte CUT name -- overwriting a sibling of
+  that name -- beside a stray `@LongLink` or `PaxHeaders` file, with exit
+  0. AxlTar now applies the record, so the member lands under its full
+  name; a pax `size` is honoured. Symlinks and hardlinks were written as
+  empty regular files: they are now reported "not extracted (link)",
+  other member types "unsupported member type", a pax global header is
+  noted once, and any skipped member makes the exit non-zero. `tar -x`
+  also refuses a member whose name still holds a ':' after the volume is
+  stripped. A malformed pax record set, or a pax `size` over 2^63 - 1,
+  refuses the member and its data is stepped over by the header's size:
+  a size near 2^64 had wrapped size + padding to 0 and made the reader
+  parse the member's DATA as further headers -- members GNU tar never
+  shows.
+- **`tar -x` writes each file safely: a failed member never destroys
+  what was there.** It opened the member's own name for writing first, so
+  an archive that ended inside a member's data left the bytes it had
+  under that name -- replacing any existing file with a short one -- and
+  exited 0; a failed write or flush did the same damage. Each regular
+  file now goes to a temporary `~TARhhhhhhhh.TMP` beside it (a name
+  nothing holds yet), is flushed, and is put in place by
+  `axl_file_replace` -- one rename, after libarchive's
+  `ARCHIVE_EXTRACT_SAFE_WRITES`. A truncated, unreadable, unwritable or
+  unflushable member removes its temporary, leaves any existing file
+  byte for byte, is reported (`tar: <file>: not extracted (member data
+  incomplete or unreadable); any existing file is unchanged`, or the
+  write / flush / put-in-place failure) and makes the exit 1. The
+  temporary is removed on every exit AXL runs its cleanup for -- each
+  failure, the normal end, `axl_exit`, and a Ctrl-C (an `axl_atexit`
+  hook); a temporary that cannot be removed is named. A Ctrl-C stops
+  `tar -x` between members or part-way through one (it is polled per
+  chunk), discards the member in progress, prints `tar: interrupted` and
+  exits 1. A reset, power
+  loss or crash runs no cleanup and can still leave a `~TAR*.TMP` beside
+  the target, which then holds part or all of the member; the target
+  itself is never the one left short. A member that cannot be put in
+  place is reported with the reason in words ("a directory is in the
+  way", "the existing file or the volume is read-only", ...). A member
+  whose name is the FAT 8.3 alias of the temporary just made for it (so
+  that its path would reach the temporary itself) is noticed by asking
+  the volume, and extracted through another temporary; no name is
+  refused for merely looking like tar's own.
+- **Renaming works on virtiofs volumes.** `axl_file_rename`,
+  `axl_file_replace`, `axl_file_move` -- and so SFTP rename and safe
+  `tar -x` -- failed with `AXL_ERR` on a volume served by OVMF's
+  VirtioFsDxe (QEMU `-device vhost-user-fs`). The rename's
+  `EFI_FILE_INFO` was sized `sizeof(EFI_FILE_INFO)` plus the name, 8
+  bytes past the name's NUL (`FileName[1]` and the struct's padding),
+  and VirtioFsDxe requires the last CHAR16 of the buffer to be NUL; FAT
+  does not check, which hid it. The buffer is now sized exactly.
+- **`tar -c` archives past a member it cannot archive, at any depth.** It
+  reports the member, archives the rest and exits non-zero, as GNU tar
+  does. It used to stop the directory holding the member (and the whole
+  walk for a member directly under a named directory).
+- **A provider volume moves an entry between directories in one step, and
+  keeps a time.** With a version-2 provider (the 9P mount is one),
+  `axl_file_rename`, `axl_file_replace` and `axl_file_move` no longer copy
+  to move between directories, and `axl_file_set_mtime` /
+  `axl_file_truncate` work through a 9P mount (`Tsetattr`).
+- **A directory listing no longer hands up names that leave the
+  directory.** Every listing was passed up as the driver gave it, and a 9P
+  mount passes Linux names through as they are -- a directory named
+  `..\..`, `a/b`, an empty name. Joined onto a path such a name is several
+  components, so a walker (a recursive delete or copy, `find`, WebDAV's
+  tree copy) could act outside the directory it walked; on a 9P mount a
+  replace with `AXL_FILE_REPLACE_TREE` could have removed the mount's root.
+  `axl_dir_read` now skips, for every driver, a name that cannot be one
+  path component: empty, or holding `\` or `/`. The provider seam drops
+  the same names (and "." / "..", so provider listings no longer include
+  those), warning once per directory with the provider and the escaped
+  name and logging the rest at debug; AXL's own tree walkers refuse them
+  too. A `:` is kept: inside a joined path it is only a character (a path's
+  FIRST colon names its volume), and it is ordinary in Linux names.
+  `axl_dir_read` also skips a name over 255 bytes of UTF-8, which it used
+  to cut short -- and a cut name can be a sibling's -- and no longer
+  returns an empty name when the AXL heap is exhausted.
+  **Who is affected:** anything walking a directory through
+  `axl_dir_read`, on any driver, and most of all a 9P mount or another
+  provider volume. Such entries -- systemd unit names with `\x2d` escapes
+  are the common case -- are now missing from listings and skipped by tree
+  copies, and a tree moved across volumes with `AXL_FILE_REPLACE_COPY |
+  AXL_FILE_REPLACE_TREE` leaves them, and the directories holding them, in
+  the source, with a warning that the source could not be removed in full.
+  On a driver other than a provider, which hands such a name up as it is,
+  a tree copy or move meeting one fails whole (`AXL_ERR`) instead of
+  skipping it. A tree moved from a 9P mount to FAT whose names hold `:`
+  (legal on Linux, not on FAT) fails whole too, and so does a WebDAV MOVE
+  of it (409 today; 500 once serve-fs moves onto `axl_file_replace`).
+
+- **`axl_file_move` and `axl_file_write_atomic` no longer lose the
+  target.** `axl_file_move` DELETED the destination before its final
+  rename or copy, so a copy whose flush failed, a source that could not be
+  deleted after the copy, or a rename the filesystem refused cost the file
+  that was there; and onto the 8.3 alias of the source itself (also
+  through a directory's alias) it renamed the source to the literal alias.
+  `axl_file_write_atomic` and `axl_piece_tree_save` deleted the target and
+  then renamed the temp over it, ignoring the delete's result, so a rename
+  that then failed lost the target. All three now replace through
+  `axl_file_replace`, which removes the old entry only after the new one is
+  in place. **Who is affected:** anyone who moved or atomically wrote onto
+  an existing file; nothing to change.
+
+- **`axl_rand_new_seeded`, `axl_rand_new` and `axl_rand_copy` return NULL
+  when their allocation fails.** `axl_rand_new_seeded` seeded the state it
+  had not got, writing 32 bytes through a NULL pointer -- silently, on
+  firmware that maps page 0. `axl_rand_new`'s documentation promised it
+  never returns NULL; it can, and now says so. **Who is affected:** a
+  caller of any of the three under memory pressure.
+
+- **A WebDAV PUT over an existing file no longer destroys it when the PUT
+  fails, and one failed PUT no longer wedges the mount.**
+  `axl_http_server_serve_fs` truncated the target at the first chunk, so
+  a PUT that did not complete -- the client hung up, a write failed, the
+  volume filled -- left whatever part of the new body had arrived where
+  the old file was. Its PUT is now atomic: the body goes to a temp
+  sibling (`~APxxxxx.TMP`, an 8.3 name) that replaces the target only once
+  it is complete and flushed, by setting the old file aside first and
+  deleting it last, so the old file is never gone before the new one is
+  whole. Replacing a file needs room for both for a moment. A PUT
+  replaces a FILE only: a collection that appears at the target while the
+  body streams is 409 at the commit and is never removed. While a PUT is
+  in flight its temp is recognised by its name, through any spelling of
+  its directory, and is hidden, not copied and refused -- a PUT to it, or
+  one whose target turns out to be it, is 403 -- and a discarded temp is
+  removed through the PUT's own handle, never by path; a temp-named file
+  no PUT owns (a power loss's leftover) is an ordinary file. A commit
+  that reports failure after its rename happened keeps the body -- it is
+  the resource now -- and logs an error naming it, instead of discarding
+  it. A PUT addressed through an existing file's 8.3 alias replaces the
+  file under its stored long name.
+  Separately, on every WebDAV mount, a PUT whose target could not be
+  opened (a missing parent collection) left the mount's PUT state marked
+  failed, and nothing cleared it: the next PUT opened its target --
+  emptying an existing file -- and was answered 500, and every PUT after
+  it was refused until restart. Each failing call now ends its own PUT.
+  An empty-body PUT no longer bypasses a PUT in flight on another
+  connection (it truncated the very file that one was writing).
+  **Who is affected:** every `axl_http_server_serve_fs` mount that took a
+  PUT over an existing file -- a hung-up or failed one destroyed the
+  file -- and every `axl_http_server_serve_fs` or
+  `axl_http_server_add_webdav` mount that ever answered a PUT with an
+  error. A backend of your own given to `axl_http_server_add_webdav` gets
+  the wedge fix, but its PUT is atomic only if it writes atomically (see
+  Breaking).
+
+- **`axl_file_delete` reads the firmware's "closed but not deleted" warning
+  as a failure on every backend.** With no shell at all it read
+  `EFI_WARN_DELETE_FAILURE` as success; all backends now open the file
+  and delete through one handle routine that does not. A path that
+  cannot be opened for writing (a read-only file), or whose volume does
+  not resolve (an unmapped `fs9:`), is now `AXL_ERR` rather than
+  `AXL_NOT_FOUND`, which stays the answer for a file that is not there.
+  **Who is affected:** a caller that maps `AXL_NOT_FOUND` to HTTP 404 and
+  anything else to 500 now answers 500 for an unmapped volume (it was
+  404), and for a read-only file.
+
+- **C `remove()` and `unlink()` return 0 on success and -1 on failure.**
+  The status was inverted: every successful remove returned -1 and every
+  failed one 0, so a caller checking it saw the opposite of what happened.
+
+- **WebDAV MOVE and COPY with `Overwrite: T` replace any existing
+  destination without risking it, and answer RFC 4918's status codes.**
+  The fs-backed server (`axl_http_server_serve_fs`) now renames an
+  existing destination ASIDE within its own directory, moves or copies,
+  and only then removes the aside (RFC 4918 §9.9.3, §9.8.4); a move or
+  copy that fails puts the destination back. Before, MOVE onto a
+  collection answered 409 (once `axl_file_move` stopped replacing a
+  directory with a file), a collection onto a file and COPY onto a
+  collection failed, and deleting the destination first lost it when the
+  move then could not happen: a MOVE of a missing source deleted the
+  destination tree, and a destination naming the source's own parent
+  through its 8.3 alias (`/dav/LONGDI~1`) deleted the source with it --
+  that is now refused (409) with everything intact. An aside that cannot
+  be removed in full is left and logged as a warning naming it; the
+  request still succeeds. With `AXL_SERVE_FS_NO_DELETE` an overwrite that
+  would remove a collection is refused (403); replacing a file is still
+  allowed. MOVE and COPY now answer, before the op runs: 502 for a
+  `Destination` on another server (its authority is not the request's
+  `Host`), 403 for a destination that is the source itself or the mount
+  root (COPY onto itself truncated the file), and, when the ops provide
+  `stat`, 404 for a missing source (MOVE answered 409), 412 for
+  `Overwrite: F` onto an existing destination (it was 409), and 204 for a
+  success that replaced something (it was 201). An op that returns
+  `AXL_DENIED` is answered 403. **Who is affected:** every
+  `axl_http_server_add_webdav` consumer, including ones with their own
+  ops, sees the new status codes (412, 403, 404, 204 and 502 come from the
+  handler, before the op runs). A deployment behind a proxy that rewrites
+  `Host` now gets 502 for every MOVE or COPY whose `Destination` is an
+  absolute URL naming the original host; a relative `Destination`, or a
+  request with no `Host` header, is unaffected. A client that renames a
+  file by changing only its letter case no longer loses it (before,
+  `Overwrite: T` deleted it); it is renamed, 204, with either Overwrite
+  value (see the MOVE and COPY entry above).
+
+- **`axl_file_move` refuses what POSIX `rename` refuses.** It removed the
+  destination first whatever it was, so moving a directory onto an
+  existing file deleted the file. A directory onto a file (`ENOTDIR`), a
+  file onto any directory (`EISDIR`) and a directory onto a non-empty
+  directory (`ENOTEMPTY`) are now `AXL_ERR` with nothing changed; a
+  directory onto an empty directory still replaces it. **Who is
+  affected:** a caller that moved a file onto an empty directory to
+  replace it now gets `AXL_ERR`.
+
+- **`axl_fseek` writes out a stream's buffered bytes before it moves.**
+  With buffering on, bytes still in the stream's buffer were written at
+  the position the seek moved to, not where they were written: FULL
+  buffering, write `AB`, seek to 10, write `Z` stored ten zeros then
+  `ABZ`. They are now written out first, as stdio's `fseek` does, and
+  `axl_ftell` counts them, so a position saved with `axl_ftell` and
+  restored with `axl_fseek` lands after them. On a transcoding stream
+  (`axl_stream_set_encoding` other than UTF-8) `axl_ftell` counts that
+  pending text in the file's own units (one byte per character for ASCII,
+  two for UCS-2) rather than the UTF-8 bytes the caller wrote, and on the
+  read side reports the start of a character only partly delivered: it
+  added caller bytes to a file position, so a save/restore over buffered
+  UCS-2 text overwrote it.
+
+- **A provably invalid UTF-8 tail no longer swallows the text after it.**
+  Writing to a transcoding stream, a sequence such as `E2 41` at the end of
+  a write was held back as "incomplete" although `41` already proves it
+  invalid; an `axl_fseek` or `axl_stream_set_encoding` then discarded the
+  held bytes, losing the valid `A`. The lead byte is now decided at once
+  (the Latin-1 fallback) and `A` written.
+
+- **A file stream keeps its handle where the stream says it is.** After a
+  failed write, a failed seek or a pread/pwrite whose restore failed, the
+  next read or write went to wherever the firmware had left the handle;
+  it now re-seeks to the stream's position first. **`axl_fopen` with "a"
+  now fails** when the file's length cannot be read, instead of opening
+  with a position that does not match the handle's.
+
+- **`axl_file_move` (and C `rename()`) no longer destroy a file moved onto
+  itself.** It deleted `new_path` before renaming, so a `new_path` naming
+  the source itself -- the same path (`rename(x, x)`), a case-only change,
+  `.\x`, the other separator, an 8.3 alias -- deleted the source; and a
+  missing source cost the destination. The source is now renamed aside
+  under a fresh name first, so it survives the delete, and a missing
+  source fails before anything is removed. On a later failure the source
+  is renamed back.
+
+- **A write past the end of a file no longer exposes deleted data.** A
+  write that started beyond the end -- `axl_pwrite` at a larger offset,
+  `axl_fseek` past the end then `axl_write`, or an `axl_write` after the
+  file was shrunk below the stream's position -- left the gap holding
+  whatever the newly allocated clusters held before: the EDK2-derived FAT
+  driver extends a file on write (`FatGrowEof`) without writing the gap,
+  so a previously deleted file's bytes read back from it. A file stream
+  now writes zeros from the old end to the write position first, as POSIX
+  reads a hole. It sees a shrink made by this stream, by another stream
+  or by `axl_file_truncate` in the same image; a shrink made outside AXL
+  in this image, or by another image, is not visible to it (UEFI has no
+  change notification) until the stream seeks. Measured on OVMF: 16384
+  bytes of a deleted file's `0xA5` came back through a one-byte write at
+  offset 16384, and 8192 stale bytes after a truncate by path.
+
+- **`axl_net_get_driver_info` names a USB NIC's own driver, not the USB
+  host controller's.** It looked for the PCI bus controller on the NIC's
+  device path before the USB one, and a USB NIC's path
+  (`PciRoot/Pci(..)/USB(..)/MAC(..)`) has a PCI node too -- the host
+  controller's -- so `netinfo -v list` and every other caller reported a USB
+  NIC as `driver=Usb Xhci Driver`. It now takes the deepest bus controller
+  on the path (USB, then PCI); a PCI NIC is named as before.
+  `test-nic-driver-name-qemu.sh` pins both.
+
+- **`rsod-decode.py` reads a real vendor x64 crash screen correctly.** On a
+  captured screen it printed the last-branch source as `??? [0xd]` (the
+  `LBRfr0 Dump:` heading that follows the records was read as address 0xd),
+  dropped R10-R15 (printed there as a bare `10=` .. `15=`), reported a
+  register named `nic` (the stack dump's ASCII gutter), gave no Cause for
+  `Page fault (14)` (a decimal vector), skipped module-list rows named
+  `Unknown(xxxxx) <description>`, and showed the `-->RIP` module annotation
+  as the fault description under `--detail`. With no `--syms` it now places
+  each branch end and frame through the dump's own module list, or on the
+  stack as `<stack SP+0x28>`; it states when the firmware's own `name
+  +offset` attribution falls past the end of that image (it named the image
+  with the nearest lower base for a PC that was on the stack); and the Cause
+  line says when RIP is on the stack. `--markdown` with no `--syms` no
+  longer dies with an IndexError. The JSON branch records gain
+  `from_location`/`to_location`/`from_note`/`to_note`, and stack frames
+  `stack_offset`.
+
+- **A line exactly the console's width no longer leaves an empty row after
+  it.** A UEFI text console wraps the moment a character lands in its last
+  column (GraphicsConsole writes CR LF right there; TerminalDxe's and
+  ConSplitter's cursor records move to the next row), so a line's own CR LF
+  after that made a second, empty row: on an 80-column console the pack
+  stub's `axl-pack: ... re-reading from the volume (attempt 1 of 2)` lines,
+  and any tool, log or standard-error line exactly as wide, were each
+  followed by a blank row on the display and in an ssh session, and the
+  serial terminal -- whose real cursor had not wrapped -- drifted a row from
+  TerminalDxe's record until the next prompt. AXL's console writes (stdout,
+  standard error, the AxlLog console sink) and the pack stub now go through
+  one function that watches for that wrap -- the line's last character
+  moved the cursor from a column past 0 to column 0 -- and writes the break
+  after it per device, judging the wrap on each device's own cursor (a
+  narrower one wraps a line a wider one does not): CR LF and an absolute
+  cursor move to an EDK2 TerminalDxe terminal of any type but TtyTerm (its
+  real cursor is still in a pending wrap, so the serial wire keeps its
+  newline and TerminalDxe's record is put back in step), a space and a
+  backspace to everything else (no motion where the wrap has happened, and
+  out of a pending wrap where it has not), the break as written to a device
+  the line did not wrap. It fans out to the console's devices only when the
+  output verifiably IS the console's splitter (or the Shell's logger over
+  it): under AXL's console tap, or any other wrapper, the wrapper alone
+  gets the break. Standard error under `2>`, `2> NUL` and `2>v` reaches the
+  writer through the Shell's wrapper, whose cursor is frozen and never
+  shows a wrap, so files, `NUL` and variables get exactly the bytes they
+  did; standard output under `>` and `|` does not reach it at all.
+  **Raw serial logs:** after a line exactly the console's width, a
+  TerminalDxe terminal's wire now carries `\r\n` followed by TerminalDxe's
+  own cursor move, `ESC [ rrr ; 001 H` (three-digit row and column) --
+  `\r\n\x1b[012;001H` for row 12 -- where it used to carry `\r\n` alone.
+  A tool parsing raw serial captures should strip CSI sequences (as
+  `test_clean_log` does) rather than expect the next line right after the
+  newline. The pack stub links the same object: RELEASE stub
+  18,944 -> 22,016 B (x64) and 18,446 -> 21,518 B (aa64); x64 RELEASE
+  `sshd.efi` 241,664 -> 246,784 B (aa64 224,270 B).
+
+- **`AXL_EMBED_SIZE` no longer subtracts two unrelated pointers.** The blob
+  and its end symbol are separate objects to the compiler, so the pointer
+  difference was undefined behaviour (clang's analyzer flags it); it is now
+  computed on their addresses. Same value, same `size_t` result.
+- **Standard error shares the console's cursor with standard output.** A
+  line AXL wrote to standard error -- a tool's `axl_printerr`, the AxlLog
+  console sink (`[DEBUG]` lines, the teardown's `mem: no leaks detected`),
+  the pack stub's `axl-pack: ...` -- was drawn over by the Shell's next
+  prompt, on the display, the serial terminal and in an ssh session. UEFI's
+  `gST->StdErr` and `gST->ConOut` are two console splitters, each with its
+  own cursor record, and the Shell places its prompt from ConOut's; a StdErr
+  line never moved that record (and where ConOut's first device is not a
+  StdErr device, as OVMF's display is not, never moved that device's cursor
+  either), so the prompt landed on the first error line. When standard error
+  is the console it is now written through the console's ConOut splitter,
+  as on a Unix terminal -- beneath the Shell's console logger, so page break
+  never stops it -- and directly to every StdErr device that is not a ConOut
+  device; with stdout redirected (`> f`, `|`) too. "The console" is decided
+  by identity -- the handle IS the Shell's own console file (or, in a
+  nested Shell, the outer Shell's) -- so `2> NUL` and `2>v name` still take
+  the lines, `2>` captures them and `>` never does. A resident shared
+  driver's standard error is the current launcher's, judged per launcher
+  and lent only to the driver that launcher dispatches into; a service
+  writing on its own clock keeps the verdict it started with (its
+  launcher's), so no other command's `>` or `2>` -- a shared-driver
+  launcher's included -- captures its lines.
+  The old `gST->StdErr` path stays where there is nothing to compare: no
+  Shell parameters on the image or its parent (the EFI 1.x shell, a boot
+  manager launch), no Shell protocol, no console splitter -- and under
+  `2>`. A display that is a ConOut device but not in `ErrOut` (OVMF's) now
+  shows error lines too. A coloured log line puts each output's own
+  attribute back rather than a fixed light-grey. `axl_stdout_raw` and
+  `axl_stderr_raw` no longer hand raw bytes to the Shell's console file,
+  which prints its buffer as a NUL-terminated UCS-2 string and read past
+  them: to the console they take the text path, decoded across writes
+  (UTF-16LE from its mark, also when a later write starts with it, else
+  UTF-8; ill-formed UTF-8 such as `C0 80` is U+FFFD, never a NUL), with a
+  resident driver's decoder starting fresh for each launcher; and the
+  image's Shell handles are read live, so a resident image never writes to
+  a handle the Shell closed (`test-stderr-stale-qemu.sh`). `test-stderr-row-qemu.sh` (the serial stream through a real
+  terminal and, on x64, the display's text grid from a screendump; `>`,
+  `|`, page break, a resident service, a shared driver per launcher, a
+  nested Shell), `test-sshd-stderr-row-qemu.sh` (the ssh session's screen)
+  and `test-io-redirect-qemu.sh` (`>` and `2>` alone, `NUL`, `>v`, raw
+  bytes on the console) match exactly; `test-efi-pack-qemu.sh` and
+  `test-old-shell-qemu.sh` cover the stub under `NUL` and the EFI 1.x
+  shell. Cost: the pack stub +1,024 B on x64 (RELEASE 17,920 -> 18,944) and
+  +512 B on aa64 (17,934 -> 18,446); x64 RELEASE `sshd.efi` 238,080 ->
+  241,664 B.
+
+- **While `sshd` serves, the serial console is the Shell's again.** On a
+  server whose console is redirected to a serial port (watched over a BMC's
+  serial-over-LAN), the Shell's output stopped appearing there once `sshd`
+  started: only sshd's own log lines did, and with `-v` a line per packet.
+  sshd wrote its log raw to the first serial port -- the console's own
+  UART. The firmware's serial terminal draws by absolute cursor position
+  from a cursor model of its own, so each foreign line scrolled the
+  operator's screen under it, and the Shell's typed line and output were
+  painted from then on onto the wrong rows, over the log lines, which
+  scrolled them away. sshd now never writes, unasked, to a port the console
+  draws on (`axl_serial_is_console()`): its log goes to the first port that
+  is not the console's, and with none -- one UART -- it is not written while
+  serving. `sshd -v` says which. `--log-port N` / `AxlLogPort N` still puts
+  it on any port, the console's included, when asked.
+  `test-sshd-console-qemu.sh` feeds the serial stream to a real terminal and
+  matches the operator's rows exactly.
+
+- **A compressed tool re-reads itself, in 64 KB reads, before calling its
+  payload corrupt.** On a server booted through BMC virtual media, large
+  single reads come back intermittently corrupt while 64 KB reads do not:
+  packed `sshd.efi --version`, loaded by the firmware's one large read,
+  failed 7 times in 10 with `axl-pack: packed image is corrupt`, while
+  `sha256sum` of the same file (64 KB reads) was right 5 times in 5. When
+  the payload it was loaded with fails its checks (corrupt, or an invalid
+  header), the stub now reads its own file from the volume it came from, in
+  reads of at most 64 KB, finds the payload by the PE section table, and
+  decodes that -- up to twice, printing `axl-pack: packed image is corrupt
+  -- re-reading from the volume (attempt N of 2)` before each. A file that is
+  corrupt on disk still fails, with the same final line; an image started
+  from a memory buffer has no file to re-read and fails at once. The stub
+  grew by 1,024 bytes (x64 release 16,896 -> 17,920, aa64 16,910 -> 17,934),
+  which every wrapped image pays; `axbench` and `sed` (x64) and `hexdump`
+  (aa64) now ship raw, and x64 RELEASE `sshd.efi` is 236,544 B (with the
+  driver-read changes below; limit 237,568 B).
+- **AXL reads files 64 KB at a time, and loads drivers from its own read.**
+  On a server booted through BMC virtual media, large single reads come
+  back intermittently corrupt while 64 KB reads do not (a packed tool
+  loaded by the firmware's one large read failed its CRC 7 times in 10;
+  `sha256sum`'s 64 KB reads of the same file were right 5 of 5). An
+  unpacked image has no CRC, so the same fault runs the bad bytes -- the
+  likely cause of a page-fault RSOD seen from a tool on the same media.
+  Every AXL file read (`axl_file_get_contents`, `AxlStream` file reads,
+  directory reads) now asks the firmware for at most 64 KB per call and
+  loops. A read that fails part-way keeps what it read: the backend returns
+  those bytes, and the next call retries and reports the error if the fault
+  recurs, so an `AxlStream`
+  read delivers them and sets `axl_ferror()`, and `axl_file_get_contents()`
+  returns `AXL_IO_ERROR` for a file it could not read whole instead of the
+  bytes before the error. `axl_driver_load()`,
+  `axl_driver_load_sibling()`, `axl_driver_load_dir()`, and through them
+  `netload`'s and `sshd`'s driver sweeps, now read a RAW driver themselves
+  the same way and call `LoadImage` with the bytes AND the file's device
+  path, so the image's `FilePath` and `DeviceHandle` are still the file's;
+  the firmware reads the file itself only when AXL cannot open it or learn
+  its size. A driver AXL can size but not read whole, an empty one, or one
+  over 64 MB is refused with a warning (`cannot load <file>: <why>`), and
+  once AXL has read the bytes `LoadImage`'s verdict is final -- there is no
+  retry through the firmware's large read. The file's size comes from
+  `EFI_FILE_INFO` rather than `GetPosition`, which AXL's own `AxlFsProvider`
+  volumes do not implement.
+  Tested by `test-vmedia-reads-qemu.sh`, both arches: a fixture volume that
+  flips a byte in any single read over 64 KB, read through
+  `axl_file_get_contents` (exact sha256), a 318 KB raw driver loaded from
+  it (its pad table intact, its own file path reported), and packed
+  `sshd.efi` launched from it by the Shell (the firmware's read corrupted,
+  one stub re-read line, `sshd <version>` printed).
+- **`axl_driver_load()` keeps a driver's file path on a volume named by a
+  custom shell mapping.** A path such as `MYVOL:\x.efi` -- a name set with
+  `axl_volume_set_map()` or `map`, not an `fsN:` alias -- found no volume,
+  so the driver fell to a buffer load and its `LoadedImage->FilePath` became
+  the synthesized `MemoryMapped` identity (`axl_app_image_path()` returned
+  NULL, and an iPXE-style driver could not find its directory). Any name
+  the shell maps now resolves to the volume it was set for.
+- **A resident service whose options do not fit its LoadOptions says so.**
+  `axl_service_start_embedded()` failed with only a DEBUG line when the
+  URL-encoded options passed 4,096 bytes (a long path, or a long `sshd -P`
+  password), so `sshd` said just "could not start the server". It now logs
+  `service '<name>': its options (URL-encoded) do not fit the 4096-byte
+  LoadOptions -- shorten a long path or string option` at ERROR.
+- **A Ctrl-C during the network bring-up's link wait now ends the bring-up.**
+  `axl_net_auto_init`, `axl_net_init` and `axl_net_bring_up` went on to the
+  full DHCP wait after a cancelled link wait, so an application's Ctrl-C took
+  effect up to 10 s late; they now return `AXL_ERR` at once.
+- **`sshd`'s own log no longer appears in every session and on the
+  screen.** Once the console device joined the StdErr fan-out, the driver's
+  log lines (`ssh: Accepted password for ...`) were drawn at the user's
+  prompt. While it serves, `sshd` now logs to the first serial port in the
+  console's format (the serial transcript is unchanged), and not at all
+  without one; other programs' error lines still reach the sessions.
+- **An `axl-cc --embed` (or `--service`) link no longer warns
+  `missing .note.GNU-stack section implies executable stack`.** The embedded
+  blob carries a `.note.GNU-stack`, the bare-metal toolchain's objects and
+  newlib's assembly `memset` carry none, and ld warned about the mix. Every
+  image link now passes `-z noexecstack`, in `axl-cc` and in the in-tree
+  build; a PE image has no stack-exec flag, so the `.efi` differs only in
+  its per-link build id. The in-tree build also links with
+  `--fatal-warnings`, so a linker warning fails it.
+- **A DHCP bring-up now waits for the NIC it configured.**
+  `axl_net_bring_up()`, `axl_net_auto_init()` and `axl_net_auto_init_opts()`
+  ended their DHCP wait on one NIC as soon as ANY NIC had an address. With
+  a second NIC already up the wait returned at once, the NIC being
+  configured had no lease yet, and the call failed -- `netload` printed
+  "no DHCP lease in 15s" after about no time at all. It passed only when
+  the lease landed within the few milliseconds before the read-back, so a
+  slow guest (an iPXE NIC under host load) failed it;
+  `test-efi-pack-release-qemu.sh` did on aarch64. The wait now watches the
+  configured NIC's own address.
+  - **What you will notice:** a NIC with no DHCP server now costs its full
+    DHCP timeout on every try, as the timeout always claimed, where a
+    second NIC's lease used to cut it to nothing. `netload --retries N`
+    now really costs N x the timeout, and `netload -p` (or `--connect`)
+    over several link-up NICs with no server behind them is slower by a
+    timeout per NIC.
+- **The console device no longer drops local type-ahead.** With
+  `read_physical` set, the device moved every key an evicted firmware
+  keyboard had queued into its 63-key ring, losing the rest of a longer
+  paste. Arrival and delivery are now split: a key ARRIVES when the read
+  timer reads it -- the `key_filter` sees it and the guest's key notifies
+  fire then, also while the guest is not reading -- and waits in a
+  256-key holding queue until the ring has room. Only when that is full
+  does the device stop reading, leaving the rest in the firmware's own
+  queue. So a paste typed at the local console while `sshd` runs arrives
+  whole, a local Ctrl-C behind typed-ahead keys breaks a running script at
+  least as far back as on a plain Shell, and a consumer's escape hotkey (fbcon's Ctrl+backslash) works
+  while the guest is busy. `axl_console_device_queued_keys()` counts the
+  held keys too.
+- **`inject_text` no longer loses the byte that breaks off an escape
+  sequence.** A CSI interrupted by a byte that cannot continue it (a
+  control byte, DEL, a non-ASCII byte) was consumed along with that byte;
+  the sequence is now its literal keys (Esc, `[`, ...) and the byte is
+  decoded as the next key.
+- **`run-qemu.sh` (and every QEMU test) staged a file whose name has a space
+  in it as two missing files.** The disk staging split `find`'s output on
+  whitespace; it now reads the names NUL-separated, so `my banner.txt`
+  reaches the guest's volume. A `dd` or `mkfs.vfat` that fails while it
+  builds the disk now fails the run too (an empty staging directory booted
+  an unformatted disk).
+- **`sshd` sessions saw the boot manager's output after `exit`.** The
+  driver noticed the Shell had gone only after that tick's flush, so the
+  firmware's next lines (`BdsDxe: loading Boot0000 ...`) reached every
+  session before the goodbye. The Shell is now looked for first, and once
+  it has gone no more console output goes out (including what the
+  encoder still holds when it is freed): the goodbye is the last thing a
+  session is sent.
+
+- **`sshd` was unusable from a terminal of another size than the console.**
+  A taller terminal scrolled on past the console's last row, so every row
+  after was offset and the prompt was drawn over old output; a smaller one
+  wrapped and scrolled the view out of step, and `edit` lost its title and
+  status bars. The console is still never reshaped (other sessions and the
+  local screen show it), but each session's size is now taken from its
+  `pty-req` and every `window-change`: a larger terminal is repainted
+  inside a scroll region of the console's rows, so the rest stays blank;
+  a smaller one is shown a notice with both sizes instead of the console
+  and gets no output until it is enlarged, then is repainted. Its input
+  still reaches the console. The login banner now reads `sshd: the console
+  is CxR; a smaller terminal waits until it is enlarged`.
+
+- **`sshd stop` left a larger terminal confined to the console's rows.**
+  The scroll region sshd sets for a terminal larger than the console was
+  reset only in the Shell-exit goodbye; `sshd stop` (and an unload) freed
+  the server under its sessions. Every session now gets `[sshd] stopped`,
+  after the region reset where one is set, and the server is freed once
+  they have left or after a second. Once the Shell has gone, a session's
+  keys are dropped rather than reaching the boot manager.
+
+- **A remote console sent a TAB raw.** A UEFI console draws a TAB as one
+  cell, but a terminal moves to its next tab stop. The encoder now sends
+  it as one space, so the terminal and the console stay in step.
+
+- **A remote console drew EFI_YELLOW as brown, so every Shell prompt over
+  `sshd` was the wrong colour.** EFI_YELLOW is EFI_BROWN | EFI_BRIGHT, but
+  the live stream wrote it as SGR 33 (dark yellow) and a repaint as
+  38;5;3. The live stream and the repaint now go through one pen encoder:
+  UEFI colours are mapped to ANSI indices once, and the 16 ANSI colours go
+  out in their 16-colour form (30-37/90-97, 40-47/100-107), so EFI_YELLOW
+  is 93 on both paths. EDK2 TerminalDxe writes bright colours as `1;3x`,
+  which is bright only on a terminal that draws bold as bright (not VTE's
+  default); 90-97 is bright everywhere. The snapshot's own bytes changed
+  with it; see Changed.
+
+- **A remote console lost a full-screen app's first paint, and showed a
+  stale screen after the app.** The alternate screen (DECSET 1049) only
+  keeps a full-screen app out of the terminal's scrollback, but a bare
+  switch also changes what the terminal shows: entering showed a blank
+  screen, and since a SIMPLE_TEXT_OUTPUT producer recognises the app only
+  after its first paint, that paint was lost (the Shell editor's title bar
+  over `sshd`); leaving brought back the screen from before the app, with
+  the cursor saved there. `AxlConsoleVtEnc` now carries the screen on show
+  across both switches, as a UEFI console has one screen. A repaint (late
+  join included) also ends on the pen the console is writing with; it
+  used to end on the default pen until the next SetAttribute.
+
+- **A remote console (`AxlConsoleVtEnc`: the console mirror, `sshd`)
+  dropped cursor moves, so full-screen and line-edited output landed in
+  the wrong cells.** The encoder suppresses a move to where the cursor
+  already is, but did not follow the cursor through text: "move to r;c,
+  print, move to r;c" lost the second move. The Shell's editor painted
+  its status line one row down and scrolled the screen; the line editor's
+  Escape, history and Tab left the cursor at the end of the erased text,
+  and a session joining afterwards was repainted with that cursor. The
+  encoder now tracks the terminal's cursor through text, CR, LF and BS
+  (a TAB makes it unknown), and at the right margin writes CR LF as a
+  UEFI console does (EDK2 GraphicsConsole and TerminalDxe both wrap at
+  once) instead of leaving the terminal in its deferred wrap -- which is
+  also what makes a terminal wider than the console wrap at the console's
+  edge.
+
+- **Ctrl-C typed on the local serial console did not break a running
+  script under a console take-over with input.** The device's read loop
+  re-injects an evicted keyboard's keys and fires the guest's key notifies
+  with the exact UEFI match, under which a registration's Ctrl state must
+  equal the key's. A serial terminal reports no shift state at all, and its
+  own driver (EDK2 TerminalDxe) matches on the key alone -- which is how
+  its 0x03 reached the Shell's Ctrl-C notify before the take-over. A
+  physical key without `EFI_SHIFT_STATE_VALID` is now matched that way; a
+  keyboard that reports a shift state keeps the exact rule.
+
+- **The firmware faulted after the Shell exited under a console take-over
+  with input.** EDK2's ConSplitter unregisters no key notify from a
+  console-in device it drops, so a keyboard the console device evicted
+  (`take_input`) kept the Shell's Ctrl-C/Ctrl-S notifies; the Shell's exit
+  removed them only from the device. In the next Shell, the keyboard's first
+  `c` or `s` called the freed Shell's code -- a page fault, measured with
+  `sshd` (`exit`, Continue from the boot manager, type). Evicting a
+  keyboard now removes from it the notifies ConSplitter had registered on it
+  (they keep firing through the device's own copies while it is evicted, and
+  ConSplitter re-registers its current list on restore), relying on EDK2's
+  input drivers handing back the existing handle for an identical
+  registration (`TerminalConInRegisterKeyNotify`, the PS/2 and USB
+  keyboards' equivalents).
+
+- **A resident driver's AxlLoop swallowed the Shell's Ctrl-C, and the
+  first one stopped the loop for good.** Each driver-mode tick read the
+  Shell's `ExecutionBreak` event before deciding whether it intercepted
+  Ctrl-C, and reading consumes it. So with fbcon, a 9p server or any
+  `AXL_SERVICE_DRIVER` resident, Ctrl-C never broke a running script, even
+  with `axl_loop_set_intercept_break(loop, false)`. A driver loop left at the
+  default also quit on it, and since the tick never clears a quit request,
+  the service stopped dispatching for the rest of its residency. A
+  driver-attached loop that does not intercept now never reads the event.
+  Covered by `test-console-device-hold-qemu.sh` on both arches: a Ctrl-C
+  injected through the take-over device stops a looping script under a
+  resident service loop, which keeps dispatching afterwards.
+
+- **Library work in a driver image took the Shell's Ctrl-C, and could wedge
+  the machine.** The break poll under file reads, writes, copies and
+  truncates, sorts, digests, the sync HTTP client and IPMI KCS polling read
+  the Shell's break in a driver image too, consuming it, and then called
+  `axl_exit(1)`, which cannot exit an image that is not the current one and
+  spins at whatever priority level the driver was running. A sync wait or
+  sync network call made by a driver (its loop is never driver-attached)
+  also intercepted by default: it took the break from the Shell and returned
+  `AXL_CANCELLED`. In a driver image the poll now does nothing and such
+  loops leave the break alone. Covered by `test-console-device-hold-qemu.sh`:
+  a resident service runs a 300 ms `axl_wait_ms()` and a file read under an
+  injected Ctrl-C; both complete with no interrupt latched, the Shell still
+  breaks its looping script, and the service still answers.
+
+- **A service driver that called `axl_loop_default()` reported the default
+  loop as a leak when stopped.** `axl_driver_cleanup()` now frees the
+  image's default loop after the atexit drain, as an application's exit
+  does, so the unload verdict of an `AXL_SERVICE_DRIVER` (and the memory of
+  any unloaded `AXL_DRIVER`) no longer carries it. Covered by
+  `test-service-leak-verdict-qemu.sh`, whose services now use the default
+  loop in setup.
+
+- **A stopped service driver never reported its own leaks.** An
+  `AXL_SERVICE_DRIVER` image has no `_axl_cleanup`, so its unload ran
+  teardown, destructors and atexit, but printed no memory verdict, and the
+  harness's leak gate accepted the launcher's clean exit in its place. A
+  successful unload now sweeps the registry and prints the same teardown
+  verdict an application does, so a block `setup` allocates and `teardown`
+  forgets fails the gate, named by `file:line`. Every suite that stops a
+  service sees one more verdict line. Covered by
+  `test-service-leak-verdict-qemu.sh`.
+
+- **Every detached service start leaked its launcher's copy of the driver's
+  LoadOptions.** `axl_driver_ensure*` and `axl_driver_start()` hand a driver
+  its options through a copy that was freed only by `axl_driver_unload()` in
+  the same image. A launcher exits with the driver still resident, and `stop`
+  unloads it from another image, so each `start` printed a leak report from
+  `axl-driver.c` at the launcher's exit. The copy is now taken back as soon as
+  the entry point returns, with the image's `LoadOptions` cleared first so
+  nothing is left pointing at it. Covered by
+  `test-service-leak-verdict-qemu.sh`, which also checks that the options
+  were present during the driver's setup and are gone after it.
+
+- **An AxlSsh session could hang for good after a resume.** `resume()`
+  re-armed the receive and then pumped; a hook that pump ran could dispatch
+  the loop, the re-armed receive completed inside it and was parked, and
+  the outer pump consumed the hook's turn, so nothing re-armed it. It now
+  re-arms again after its pump.
+
+- **The x86 monotonic clock could run slow for the whole boot.** The TSC
+  was calibrated from one 10 ms `gBS->Stall`, which overshoots under host
+  contention; every later process adopts the published frequency, so the
+  login grace, the penalties and every hook budget stretched by the same
+  factor (measured 0.77-0.94x, once 0.13x, on a loaded virtualised host).
+  It is now calibrated on pairs of a short and a long Stall, the least of
+  each kept and DIFFERENCED: the least sample discards an overshoot, and
+  the difference cancels what every Stall costs whatever its length --
+  which alone had left the clock 0.6 % slow on an idle virtualised host,
+  enough that a timer firing at a period's end read the clock just short
+  of it and AxlSsh's keepalive lost a whole reaper tick per probe. The
+  difference is then kept between what the long Stall alone gives, which can
+  only overstate the frequency, and 2 % under it: a short Stall disturbed in
+  every pair would otherwise make the clock run fast without bound, and
+  could even yield no frequency at all. Measured on QEMU/KVM, clock time per
+  real time: 0.993-0.995 idle before, 0.999-1.002 after; under 12 burners
+  0.22-0.995 before, 0.989-1.000 after. The calibration still costs 10 ms at
+  the first clock read of a boot.
+
+- **Cancelling a send the firmware was transmitting corrupted TcpDxe.**
+  `EFI_TCP4.Cancel` on a Transmit TcpDxe is still processing frees its token
+  but leaves its data queued; the next segmentation then ASSERTed on a DEBUG
+  firmware and signalled freed memory on a RELEASE one, while the
+  connection went on sending the owner's buffer. Reached from a cancellable
+  on `axl_tcp_send_async()` (the async HTTP client's cancel), a synchronous
+  `axl_tcp_send()` timeout (TLS, the HTTP and 9P clients, `AxlSocket`) or an
+  interrupted one. AxlTcp no longer cancels a Transmit at all.
+- **`axl_http_server_free()` called from inside one of the server's own
+  handlers freed memory its caller still used.** A route, upload or
+  WebSocket handler -- or a DISCONNECT fired by `axl_ws_conn_close`,
+  `axl_ws_send` or the broadcast -- runs beneath server code that keeps
+  using the connection and the server after it returns; the free released
+  both underneath it (a general-protection fault on freed memory). The free
+  is now recorded and completed once that code has returned, and under
+  `axl_http_server_run` it also ends run's private loop. A second call while
+  a free is pending or running (a DISCONNECT hook the teardown fires) does
+  nothing instead of freeing twice.
+- **A WebSocket CONNECT handler that closed its own connection never got
+  DISCONNECT.** Closing from inside CONNECT (`axl_ws_conn_close`) and
+  returning `AXL_OK` accepts the connection, so whatever the handler
+  registered was never torn down. Every CONNECT that is not rejected now
+  gets exactly one DISCONNECT, delivered after CONNECT returns -- a
+  teardown asked for during CONNECT is deferred until then, never nested
+  inside it. `axl_ws_conn_close()`'s documentation no longer promises a
+  close frame it does not send.
+- **An upload handler could be called twice.** A teardown between an
+  upload's clean-EOF call and its response's completion (a server freed
+  just after a 2xx) called the handler again with `aborted = true`, against
+  `AxlUploadHandler`'s promise that the two calls are mutually exclusive --
+  a handler whose abort path deletes a partial file deleted the finished
+  one.
+- **A failed allocation while answering a WebSocket upgrade** could insert
+  a NULL header name and leak the header strings; the upgrade now fails
+  cleanly with 500.
+- **A synchronous TLS handshake ignored a failed flush of its buffered
+  output.** `axl_tls_handshake()` now returns `AXL_TLS_ERR` when sending the
+  handshake records fails or times out: a partial flush leaves the peer
+  holding part of a record, and nothing sent after it can make sense of the
+  stream.
+- **A failed firmware release could still hand TcpDxe freed memory.** When
+  `Configure(NULL)`/`DestroyChild` fail with a Transmit in flight, the
+  socket -- whose embedded transmit token and fragment table the firmware
+  may still use -- and its transmit buffer are now leaked whole, with an
+  error logged, instead of freed.
+- **AxlHttpServer freed a response buffer before the close that retired the
+  send borrowing it**, with the application's DISCONNECT and upload-abort
+  handlers running in between; it now frees both after `axl_tcp_close()`.
+
+- **The pre-push integration gate could skip tests a library change
+  affected.** `run-integration.sh` pre-built `all tests tools axl-busybox`
+  and nothing else, but 81 fixture targets across 79 tests are built by the tests
+  themselves, inside their own run -- after the runner has already decided
+  the cache. The skip cache keys on the digests of the artifacts a test
+  STAGED (`lib/test-cache.sh`), so a fixture that had not been rebuilt
+  hashed as its previous self and the test reported CACHED; `libaxl.a` is in
+  no key at all. It did not self-heal, because a test that is skipped never
+  rebuilds the artifact that would miss the key next time. Each test now
+  declares its targets in a `builds=` field of the `# test-meta:` header it
+  already carries, and the runner builds the union of the selected tests'
+  targets BEFORE the cache decision; `check-test-meta` fails if a
+  declaration and the script's own build line disagree, in either
+  direction. That gate had to be built twice: its first parser matched only
+  `make -C "$PROJECT_DIR"`, so it reported clean over the six scripts that
+  `cd "$PROJECT_DIR"` and call plain `make` -- two of which built fixtures
+  nothing declared. It now reads a bare `make` at a command position
+  (including behind a prefix such as `flock` or `timeout 300`), strips
+  comments first because `make` in prose is not a build, and skips a `-n`
+  dry run, a `print-<var>` query and a `PREFIX=`/`BUILD=RELEASE` build of
+  another output tree -- each with its own test and a control. Demonstrated: a sabotage of `src/net/axl-ssh-server.c` ran
+  green through `--only=test-ssh-auth-qemu.sh` with the cache on, and now
+  fails it by name. CI was never exposed (`--ci` runs uncached).
+
+- **Concurrent makes in one tree could WIPE it mid-build.** The build-state
+  signature was written to `$(BUILDDIR)/.axl-flags` with `$(file >…)` and
+  hashed with `sha256sum` on the next line, both at parse time of every
+  make. Two makes in one tree -- which the integration pool runs constantly
+  -- and one truncates the file while the other reads it: the reader gets
+  `e3b0c44298fc`, the SHA-256 of the empty string, the signature mismatches,
+  and the Makefile deletes every `.o`, both archives and every `.efi`/`.so`
+  under `$(PREFIX)` while the other workers are linking. It surfaced as four
+  of five AArch64 ssh tests failing their first attempt with
+  `ssh-server-selftest.so is empty`, `undefined reference to main` or
+  `libaxl-cxxrt.a: No such file`, and the runner's retry hid it. Eight
+  simultaneous NO-OP makes reproduce it. The flags are now written to a
+  per-invocation temp file, hashed there and `mv`d into place, and the state
+  file is written the same way; after the fix, 160 concurrent makes give 0
+  wipes and 0 failures. `test/integration/test-build-state-race.sh` holds
+  it deterministically -- reproducing by concurrency took six rounds, and a
+  gate that fires one time in six is worse than none.
+
+  **This corrects a diagnosis shipped in the entry above.** The race was
+  first read as five workers colliding on one `ld -o`, and the fixture
+  pre-build was described as closing it. The pre-build narrows it (five
+  workers no longer rebuild the library and the fixture at once), which is
+  why the symptom became hard to reproduce, but a make *parse* alone is
+  enough to wipe and every test parses several. `lib/console-device-lib.sh`'s
+  `flock` is a local mitigation of this same Makefile bug.
+
+- **The unit harness accused a healthy binary of hanging when its own
+  timeout fired.** `test_count_results` decided "stalled" from log shape
+  alone -- a `=== X Tests ===` header with no `=== Results:` footer -- while
+  `test_run_foreground` discarded the one fact that settles it, `timeout`'s
+  exit status. All of `test-axl.sh` runs in one
+  QEMU under one limit, so a truncated log always names whichever binary was
+  in flight, and it said "it hung or faulted (likely an infinite loop or a
+  firmware call that wedged)". It named `AxlTestSsh` four times under box
+  load, against a binary that runs in ~1 s of a 120 s limit. The status is
+  captured now and the message branches three ways: the harness's own limit
+  (124) reports the limit and says the named binary did not necessarily
+  hang; a kill from outside (128+N -- the OOM killer, on the box this is
+  about) says so and states that the limit was NOT reached; a run that
+  ended on its own says it faulted or reset, which is the only thing left
+  once a hang is excluded -- that branch used to blame "an infinite loop",
+  which is exactly what cannot end a guest early. The harness passes no
+  `timeout -k`, so its own kill is always 124; `-k` yields 137 only against
+  a child that ignores SIGTERM, which is neither of the two over-general
+  readings this went through on the way here.
+
+- **A breached wall-clock budget no longer swallows the pass-count ratchet.**
+  The `TEST_MAX_DURATION` check `return`ed before the ratchet block, so a
+  slow run neither checked its count nor recorded it -- which is why four
+  load-failed `verify.sh` runs left the committed baseline four assertions
+  short, and why a genuine count regression on a loaded box would have been
+  reported only as "took too long". It folds into the final exit now, the
+  way the leak verdict beside it already did. The baseline write is not
+  gated on it: unlike a leak, a slow box cannot inflate a pass count.
+
 ## 4.7.5 — 2026-11-09
 
 ### Fixed

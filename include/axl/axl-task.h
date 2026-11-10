@@ -172,6 +172,14 @@ typedef void (*AxlTaskComplete)(
  * shows up as a task that never completes rather than as a smaller
  * worker count.
  *
+ * A slow AP is still counted: the probe waits up to 10 seconds of wall
+ * time, because a virtual AP whose host thread is descheduled makes no
+ * progress until the host runs it again, and on a loaded host that can
+ * take hundreds of milliseconds. The flip side is that an AP that does
+ * not answer holds every creation for those 10 seconds, with a warning
+ * each time -- including on firmware that terminates a dispatched AP,
+ * where that happens on every call.
+ *
  * A machine with no usable APs falls back to running submitted tasks
  * synchronously; that is reported by `axl_task_pool_is_single_core`,
  * not by failure.
@@ -187,6 +195,13 @@ axl_task_pool_new(void);
 
 /**
  * @brief Free the task pool. Signals all workers to exit.
+ *
+ * Waits for each counted worker to acknowledge, which it does once its
+ * current task (if any) returns -- up to 10 seconds of wall time, the
+ * same bound as creation's probe -- and then up to as long again for the
+ * firmware to retire each acknowledged worker. A worker still running
+ * after that is left to finish on its own, and its bookkeeping is never
+ * reused.
  */
 void
 axl_task_pool_free(

@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/lib/axl/@AXL_ARCH@
+includedir=${prefix}/include/axl-sdk
+
+Name: axl
+Description: AximCode Library - GLib-inspired C library for UEFI (@AXL_ARCH@)
+URL: https://axl.aximcode.com
+Version: @AXL_VERSION@
+Libs: -L${libdir} -laxl
+Cflags: -I${includedir}

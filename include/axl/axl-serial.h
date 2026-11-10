@@ -132,6 +132,45 @@ axl_serial_get_control(
     AxlSerialControl *out       ///< [out] populated on success
 );
 
+/**
+ * @brief Is a console output or standard-error device bound on this port?
+ *
+ * True when a child the port's serial I/O is opened for
+ * (`BY_CHILD_CONTROLLER` -- how a terminal driver binds the port) carries
+ * the console-out or the standard-error device tag, i.e. is a member of the
+ * ConOut or StdErr fan-out. Decided by binding, not by device path: a
+ * serial driver rewrites its port's Uart node in place on a line-setting
+ * change, while a terminal may keep the path it copied when it started.
+ *
+ * Ask before writing raw bytes to a port. A terminal driver draws by
+ * absolute cursor position (`ESC[row;colH`) from a cursor model of its own,
+ * so bytes it did not write -- a log line -- scroll the screen under it, and
+ * from then on everything it draws, the Shell's typed line and its output,
+ * lands on the wrong row, over the foreign lines. A terminal that is
+ * console INPUT only does not count: writing to it disturbs nothing the
+ * console draws. With no console at all, every port answers false.
+ *
+ * Cost: one OpenProtocolInformation call and two protocol lookups per
+ * child bound on the port -- cheap, but ask once per decision, not per
+ * write.
+ *
+ * Answers for the console as it is now. A console take-over that removed
+ * the terminal's console-out tag (AxlConsoleDevice without
+ * `passthrough_local`) makes the port answer false until it is restored.
+ *
+ * Looks one level deep: at the children the port's own serial I/O is
+ * opened for. A driver that binds the port and publishes a child serial
+ * I/O of its own (a multiplexer), with the terminal on that, leaves the
+ * console tags on a grandchild, and the port answers false.
+ *
+ * @return true if a console output or standard-error device is bound on
+ *     @p handle; false if none is, or @p handle is NULL or not a serial port.
+ */
+bool
+axl_serial_is_console(
+    AxlHandle handle   ///< handle from axl_serial_next
+);
+
 // ---------------------------------------------------------------------------
 // Byte I/O — open a port and transmit/receive (Serial-Over-LAN, UART bridges)
 // ---------------------------------------------------------------------------

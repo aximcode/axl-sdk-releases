@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=11 local-only=0
+# test-meta: arch=both needs= est=11 local-only=0 builds=gfx-mode-selftest guest=gpu
 # test-gfx-mode-qemu.sh — GOP display-mode enumerate / switch round-trip.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
@@ -43,7 +43,7 @@ run_one() {
     efi="$out/gfx-mode-selftest.efi"
 
     echo "=== GOP mode enumerate/switch ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" gfx-mode-selftest 2>&1 | tail -2
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" gfx-mode-selftest 2>&1 | tail -2
 
     log="$(mktemp)"
     # --gpu wires a virtual GPU so OVMF publishes a GOP with several modes.

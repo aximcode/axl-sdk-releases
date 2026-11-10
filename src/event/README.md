@@ -120,6 +120,14 @@ The `AXL_CANCELLED` return (`-2` in `<axl/axl-macros.h>`) covers both
 explicit cancellation and the shell break event (Ctrl-C) — consumers
 see one return code for "some external source stopped me."
 
+Ctrl-C ends the waits of a foreground application only. Resident code (a
+driver) never reads the Shell's break, which belongs to whatever the Shell
+is running. The exception is resident code acting FOR a foreground command
+that is waiting on it -- a driver's setup while the command that loaded it
+waits in its start: `axl_cancellable_set_cancel_on_break(c, true)` lets a
+Ctrl-C cancel `c` during any synchronous wait that observes it. Turn it off
+once that command has its answer.
+
 ## Sleep and wait helpers
 
 Two families, sharing one underlying primitive (timer event +

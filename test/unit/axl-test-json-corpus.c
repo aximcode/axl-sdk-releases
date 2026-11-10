@@ -344,8 +344,6 @@ run_dir(const char *suite, const char *dir, size_t max_bytes, CorpusTally *t)
             continue;
         }
         if (e.attributes & AXL_FS_ATTR_DIRECTORY) {
-            char sub[512];
-
             /* json5-tests/todo/ is UPSTREAM's own not-implemented bucket, not
                a claim about a conformant parser -- both cases in it need
                Unicode unquoted keys, which AXL documents as ASCII
@@ -357,8 +355,15 @@ run_dir(const char *suite, const char *dir, size_t max_bytes, CorpusTally *t)
                            suite);
                 continue;
             }
-            axl_snprintf(sub, sizeof(sub), "%s\\%s", dir, e.name);
+            /* The path whole, never cut: a cut one would name another
+               directory, or none. */
+            char *sub = axl_asprintf("%s\\%s", dir, e.name);
+            if (sub == NULL) {
+                test_check(false, "json corpus: allocate a subdirectory path");
+                continue;
+            }
             run_dir(suite, sub, max_bytes, t);
+            axl_free(sub);
             continue;
         }
         run_case(suite, dir, e.name, max_bytes, t);

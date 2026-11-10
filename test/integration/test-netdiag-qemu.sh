@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=18 local-only=0
+# test-meta: arch=x64 needs= est=18 local-only=0 guest=plain
 # test-netdiag-qemu.sh — AxlNet diagnostics against a live (DHCP'd) network.
 #
 # Boots AxlTestNet's `net-diag` mode, which brings up networking via DHCP
@@ -32,7 +32,7 @@ fi
 declare -A _NATIVE=([X64]=x64 [AARCH64]=aa64)
 NATIVE="${_NATIVE[$ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" ARCH="$NATIVE" tests 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$NATIVE" tests 2>&1 | tail -1
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/AxlTestNet.efi"
 [[ -f "$EFI" ]] || { echo "FAIL: AxlTestNet.efi not built ($EFI)"; exit 1; }
 

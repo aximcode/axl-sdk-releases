@@ -28,6 +28,7 @@
 #ifndef AXL_TIME_H
 #define AXL_TIME_H
 
+#include <axl/axl-macros.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -189,6 +190,105 @@ uint64_t
 axl_time_get_us(void);
 
 // ===================================================================
+// Firmware timer resolution (the tick under every timer event)
+// ===================================================================
+
+/// A held request for a finer firmware timer tick; see
+/// axl_timer_resolution_begin(). 0 is never a valid id.
+typedef uint32_t AxlTimerResolutionId;
+
+/// Finest period axl_timer_resolution_begin() asks for: 1 ms.
+#define AXL_TIMER_RESOLUTION_MIN_US  1000u
+
+/// Coarsest period axl_timer_resolution_begin() accepts: 100 ms. A request
+/// coarser than the firmware's own tick changes nothing anyway.
+#define AXL_TIMER_RESOLUTION_MAX_US  100000u
+
+/**
+ * @brief Ask the firmware to tick at least every @p period_us microseconds,
+ *        until axl_timer_resolution_end().
+ *
+ * UEFI wakes a halted CPU, and fires every timer event, only on the
+ * firmware's periodic timer interrupt -- 10 ms on EDK2 platforms. Nothing
+ * that waits for an event (a loop timer, a network poll) reacts faster than
+ * that tick, whatever its own interval. This raises it through the PI Timer
+ * Architectural Protocol, the way Windows' `timeBeginPeriod` raises the
+ * system timer resolution:
+ *
+ *   - **Requests are counted across images.** The tick runs at the finest
+ *     period any active request asks for -- this image's, a resident AXL
+ *     driver's, another AXL application's: they share one registry, kept
+ *     in a UEFI configuration table -- and goes back to the period found
+ *     before the first request when the last one ends. It is never made
+ *     coarser than it was found.
+ *   - **The tick is firmware-global**: every image and driver runs on it
+ *     while any request is held, and it costs CPU everywhere (measured on an
+ *     idle QEMU guest: ~0.1 core at 1 ms against ~0.013 at 10 ms). Hold a
+ *     request only while something needs it.
+ *   - **A change is not free**: the firmware re-arms its timer, so the
+ *     partial interval is lost and timer events slip by up to one tick.
+ *   - **Requests are released with their image**: those still held at exit
+ *     (axl_exit, a return from main) or when a driver unloads are ended
+ *     then. A request whose image is gone without ending it (a crash, a raw
+ *     `gBS->Exit`) is dropped -- and the tick restored -- at the NEXT begin
+ *     or end by any AXL image; until one comes, the tick stays fast.
+ *   - **Code outside AXL** changing the tick is not tracked. The last end
+ *     restores the period found only if the tick is still the one AXL set;
+ *     if something else changed it meanwhile, it is left alone.
+ *
+ * **A fast tick can break USB keyboards.** Measured 2026-11-03 on QEMU (OVMF,
+ * usb-kbd on qemu-xhci, ten key presses 0.5 s apart): at a 10 ms or 5 ms
+ * tick 10 of 10 arrived, at 2 ms 8, at 1 ms 1 -- with or without a hub.
+ * Whether OVMF's USB keyboard path, QEMU's device model or both are at fault,
+ * and whether real hardware is affected, is not yet known; until it is, do
+ * not hold a fast tick where someone types on a USB keyboard.
+ *
+ * @p period_us is rounded up to #AXL_TIMER_RESOLUTION_MIN_US. The period
+ * actually granted -- read back from the firmware, which may round it -- is
+ * reported in @p out_granted_us. Call at TPL_CALLBACK or below.
+ *
+ * @return AXL_OK with @p out_id set; AXL_INVALID, with nothing changed, if
+ *     @p out_id is NULL or @p period_us is 0 or over
+ *     #AXL_TIMER_RESOLUTION_MAX_US; AXL_UNSUPPORTED if the firmware publishes
+ *     no Timer Architectural Protocol, or its timer is stopped (a period of
+ *     0, which this never restores); AXL_ERR, with nothing held, if the
+ *     firmware refuses the period, the registry is full (32 requests across
+ *     all images), or the registry cannot be created.
+ */
+AXL_WARN_UNUSED int
+axl_timer_resolution_begin(
+    uint32_t              period_us,        ///< wanted tick, in microseconds
+    AxlTimerResolutionId *out_id,           ///< [out] the request, for axl_timer_resolution_end()
+    uint32_t             *out_granted_us    ///< [out, optional] the tick in force afterwards, in microseconds
+);
+
+/**
+ * @brief End a request made by axl_timer_resolution_begin().
+ *
+ * The tick moves to the finest period still requested by any image, or back
+ * to the period found before the first request if none is left (see
+ * axl_timer_resolution_begin() for when it is left alone). Only the image
+ * that made a request can end it. Call at TPL_CALLBACK or below.
+ *
+ * @return AXL_OK; AXL_INVALID if @p id is not an active request of this
+ *     image (0, already ended, another image's, or never issued).
+ */
+int
+axl_timer_resolution_end(
+    AxlTimerResolutionId id   ///< a request from axl_timer_resolution_begin()
+);
+
+/**
+ * @brief The firmware's current timer tick, in microseconds.
+ *
+ * @return the period (rounded down to whole microseconds), or 0 if the
+ *     firmware publishes no Timer Architectural Protocol or its timer is
+ *     stopped.
+ */
+uint32_t
+axl_timer_period_us(void);
+
+// ===================================================================
 // Wallclock (real time)
 // ===================================================================
 
@@ -208,6 +308,9 @@ axl_time_get_us(void);
  * the SDK. Consumers see UTF-8-friendly snake_case field names and
  * a sentinel-based timezone encoding rather than UEFI's
  * `EFI_UNSPECIFIED_TIMEZONE` magic value.
+ *
+ * `timezone_minutes` keeps UEFI's sign (UEFI 2.11 section 8.3): local
+ * time = UTC - `timezone_minutes`, so UTC+1 is -60.
  */
 typedef struct {
     uint16_t year;              ///< full year (e.g. 2026)

@@ -17,10 +17,18 @@ axl_ipv4_parse(const char *str, uint8_t octets[4])
      * hand-rolled state machine and exercises the same conversion
      * paths the SDK ships for downstream consumers. The trailing
      * %n captures the bytes consumed, so we can reject trailing
-     * garbage ("1.2.3.4junk") without an extra strlen. */
+     * garbage ("1.2.3.4junk") without an extra strlen.
+     *
+     * The field WIDTH of 3 is load-bearing, not cosmetic. %u stores through
+     * an unsigned int, so an octet of 2^32 or more used to WRAP before the
+     * > 255 check below could see it: "4294967306.0.0.0" parsed as
+     * 10.0.0.0 (Task P review M-4, reachable through
+     * axl_ssh_server_set_penalty_exempt). Three digits cannot wrap, and a
+     * fourth stops the match at the '.' it expected. Zero-padded
+     * three-digit octets ("010") still parse, as they always did. */
     unsigned int a = 0, b = 0, c = 0, d = 0;
     int          consumed = 0;
-    int n = axl_sscanf(str, "%u.%u.%u.%u%n", &a, &b, &c, &d, &consumed);
+    int n = axl_sscanf(str, "%3u.%3u.%3u.%3u%n", &a, &b, &c, &d, &consumed);
     if (n != 4 || str[consumed] != '\0') { return AXL_ERR; }
     if (a > 255 || b > 255 || c > 255 || d > 255) { return AXL_ERR; }
     octets[0] = (uint8_t)a;

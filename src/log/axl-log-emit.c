@@ -10,8 +10,8 @@
     — is what lets an image link the emitters without linking the engine.
 
     See axl-log-dispatch.h for why the seam is a weak symbol rather than a
-    vtable, and Makefile's $(LOG_ENGINE_PULL) for how a link asks for the
-    engine.
+    vtable, and AXL_LOG_ENGINE_PULL (cmake/AxlImages.cmake) for how a link
+    asks for the engine.
 
     Part of the AximCode AXL SDK.
 **/

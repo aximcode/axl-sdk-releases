@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=none needs=podman est=60 local-only=0
+# test-meta: arch=none needs=podman est=60 cpu=2 local-only=0
 # test-install-lifecycle.sh — install, upgrade, downgrade, prune, recover.
 #
 # WHY THIS EXISTS. Every other installer test checks ONE operation in
@@ -41,7 +41,10 @@ INSTALLER="$PROJECT_DIR/packaging/install.sh"
 [[ -f "$INSTALLER" ]] || { echo "FAIL: no $INSTALLER"; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=/dev/null
+source "$(dirname "$0")/lib/podman-run.sh"
+podman_owned_init
+trap 'podman_owned_cleanup; rm -rf "$WORK"' EXIT
 
 # shellcheck source=/dev/null
 source "$(dirname "$0")/release-fixture.sh"
@@ -67,6 +70,29 @@ for v in "$V1" "$V2" "$V3"; do
     publish "$r" "axl-sdk-host-tools-$v.tar.gz"     "axl-sdk-host-tools-$v"   "$v" make_manager_tree
     seal    "$r" "$v"
 done
+# THE HOP EVERY EXISTING USER TAKES (step 10): the RELEASED manager -- v4.7.5,
+# dispatcher and installer from the tag -- updating to a release made by THIS
+# tree, the first with SDK receipts and the receipt-based prune rule. The
+# 4.7.5 release is a fixture carrying 4.7.5 code, the new one a fixture
+# carrying this tree; both are published like every release above.
+HOP_OLD="4.7.5"; HOP_NEW="5.0.0"
+HOPDIR="$WORK/hop"; mkdir -p "$HOPDIR"
+git -C "$PROJECT_DIR" show "v$HOP_OLD:scripts/axl" > "$HOPDIR/axl" 2>/dev/null \
+    && git -C "$PROJECT_DIR" show "v$HOP_OLD:packaging/install.sh" > "$HOPDIR/install.sh" 2>/dev/null \
+    || { echo "FAIL: cannot read v$HOP_OLD from git -- the hop step needs the tag"; exit 1; }
+for v in "$HOP_OLD" "$HOP_NEW"; do
+    r="$REL/hop-$v"
+    if [[ "$v" == "$HOP_OLD" ]]; then
+        export FIXTURE_AXL="$HOPDIR/axl" FIXTURE_INSTALLER="$HOPDIR/install.sh"
+    else
+        unset FIXTURE_AXL FIXTURE_INSTALLER
+    fi
+    publish "$r" "axl-sdk-linux-$v-x86_64.tar.gz"   "axl-sdk-$v"              "$v"
+    publish "$r" "axl-sdk-host-tools-$v.tar.gz"     "axl-sdk-host-tools-$v"   "$v" make_manager_tree
+    seal    "$r" "$v"
+done
+unset FIXTURE_AXL FIXTURE_INSTALLER
+
 # An empty release: `axl use <on-disk version>` must not need the network, and
 # pointing at a mirror with nothing in it is how that gets proven rather than
 # assumed.
@@ -115,9 +141,9 @@ set -u
 # ONLY curl: the fixture publishes .tar.gz, so tar needs no xz. Provisioned the way
 # test-consumer-install.sh does, and fail loudly rather than letting every
 # later step report "axl: not found" for a reason that has nothing to do with
-# the lifecycle.
-apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl >/dev/null 2>&1 \
-    || { echo "  FAIL could not provision curl"; exit 1; }
+# the lifecycle. pkg_install is scripts/container-pkg.sh, prepended to this
+# block by the podman call below: bounded, and a mirror failure says so.
+pkg_install curl
 P="$HOME/axlroot"; B="$HOME/bin"; PATH="$B:$PATH"; export PATH
 # The manager now TRACKS the SDK across installs and updates -- they ship
 # together, and a manager frozen at whatever version first created it never
@@ -194,9 +220,14 @@ grep -q "^\* axl-sdk-'"$V3"'" /tmp/list.txt \
 # advises axl prune, and the size is the number that decides whether that is
 # worth running -- it was the one fact a reader had to leave and measure for
 # themselves. Counted rather than spot-checked: one sized row out of three
-# would satisfy a grep and mean the du had failed for the other two.
+# would satisfy a grep and mean the du had failed for the other two. The size
+# is the column after the name (the owner, from the receipt, follows it).
 _rows=$(grep -c "axl-sdk-[0-9]" /tmp/list.txt)
-_sized=$(awk "/axl-sdk-[0-9]/ && \$NF ~ /^[0-9]+([.][0-9]+)?[KMGT]?\$/ { n++ } END { print n+0 }" /tmp/list.txt)
+_sized=$(awk "/axl-sdk-[0-9]/ { i = (\$1 == \"*\" || \$1 == \"+\") ? 3 : 2; if (\$i ~ /^[0-9]+([.][0-9]+)?[KMGT]?\$/) n++ } END { print n+0 }" /tmp/list.txt)
+# THE RECEIPT, per row: every root here was placed by install.sh.
+_owned=$(grep -c "axl-sdk-[0-9].* install\.sh\$" /tmp/list.txt)
+[ "$_owned" = "$_rows" ] && ok "and every row names install.sh as its owner (the receipt)" \
+    || { bad "owners: $_owned of $_rows rows say install.sh"; cat /tmp/list.txt; }
 [ "$_rows" -gt 0 ] && [ "$_sized" = "$_rows" ] \
     && ok "and every one of the $_rows rows carries its size on disk" \
     || { bad "sizes: $_sized of $_rows rows"; cat /tmp/list.txt; }
@@ -1338,6 +1369,73 @@ axl uninstall --yes > /tmp/un.log 2>&1 \
     || bad "uninstall removed $B/axl -- there is now no way back"
 [ -L "$P/axl-sdk-host-tools" ] && ok "the manager marker survives" \
     || bad "the manager marker is gone"
+
+echo "--- 10. the hop: the RELEASED '"$HOP_OLD"' manager updates to '"$HOP_NEW"'"
+# The machine every existing user, a consumer pinning '"$HOP_OLD"' included,
+# has today: a '"$HOP_OLD"' install made by the '"$HOP_OLD"' installer, so its
+# SDK root carries NO receipt. Its own `axl update` must reach the new release:
+# update the manager first, re-exec the NEW axl, and let the NEW install.sh
+# place the SDK -- which is what gives the new root its receipt.
+H="$HOME/hoproot"; HB="$HOME/hopbin"
+sh /tmp/install-old.sh --yes --version '"$HOP_OLD"' --base-url "file:///rel/hop-'"$HOP_OLD"'" \
+   --prefix "$H" --bin-dir "$HB" > /tmp/10a.log 2>&1 \
+    && ok "the released '"$HOP_OLD"' installer installs '"$HOP_OLD"'" \
+    || { bad "the '"$HOP_OLD"' install exited $?"; tail -8 /tmp/10a.log; }
+[ -e "$H/axl-sdk-'"$HOP_OLD"'/share/axl/.axl-receipt" ] \
+    && bad "fixture: the '"$HOP_OLD"' root already has a receipt" \
+    || ok "fixture: the '"$HOP_OLD"' root has no receipt, as on a real machine"
+[ "$("$HB/axl" --version 2>/dev/null)" = "axl '"$HOP_OLD"'" ] \
+    && ok "fixture: the manager is the released '"$HOP_OLD"'" \
+    || bad "fixture: manager is $("$HB/axl" --version 2>/dev/null)"
+if "$HB/axl" update --no-toolchain --base-url "file:///rel/hop-'"$HOP_NEW"'" > /tmp/10b.log 2>&1; then
+    ok "the '"$HOP_OLD"' manager runs axl update to '"$HOP_NEW"'"
+else
+    bad "axl update from '"$HOP_OLD"' exited $?"; tail -10 /tmp/10b.log
+fi
+grep -q "AXL-INSTALLER-MARKER '"$HOP_NEW"'" /tmp/10b.log \
+    && ok "the re-exec into the new axl happened (the new installer ran)" \
+    || { bad "no '"$HOP_NEW"' installer marker -- no re-exec"; grep MARKER /tmp/10b.log | sort -u; }
+[ "$("$HB/axl" --version 2>/dev/null)" = "axl '"$HOP_NEW"'" ] \
+    && ok "the manager is now '"$HOP_NEW"'" || bad "manager is $("$HB/axl" --version 2>/dev/null)"
+[ "$("$HB/axl" --print-prefix 2>/dev/null)" = "$H/axl-sdk-'"$HOP_NEW"'" ] \
+    && ok "and the SDK moved to '"$HOP_NEW"'" || bad "SDK is $("$HB/axl" --print-prefix 2>/dev/null)"
+[ "$(sed -n "s/^AXL_RECEIPT_SOURCE=//p" "$H/axl-sdk-'"$HOP_NEW"'/share/axl/.axl-receipt" 2>/dev/null)" = "install.sh" ] \
+    && ok "the new root carries an install.sh receipt" \
+    || { bad "the new root has no install.sh receipt"; cat "$H/axl-sdk-'"$HOP_NEW"'/share/axl/.axl-receipt" 2>&1 | head -5; }
+# THE MIXED MACHINE: a pre-receipt root beside a receipted one, plus a root a
+# package owns, under the rules '"$HOP_NEW"' brings.
+mkdir -p "$H/axl-sdk-4.9.0/share/axl" "$H/axl-sdk-4.9.0/bin"
+echo 4.9.0 > "$H/axl-sdk-4.9.0/share/axl/version"
+printf "AXL_RECEIPT_KIND=sdk\nAXL_RECEIPT_SOURCE=deb\n" > "$H/axl-sdk-4.9.0/share/axl/.axl-receipt"
+"$HB/axl" list > /tmp/10l.txt 2>&1
+grep -q "^  axl-sdk-'"$HOP_OLD"' .*(no receipt)\$" /tmp/10l.txt \
+    && ok "list labels the '"$HOP_OLD"' root as having no receipt" \
+    || { bad "list did not label the pre-receipt root"; cat /tmp/10l.txt; }
+grep -q "^\* axl-sdk-'"$HOP_NEW"' .* install\.sh\$" /tmp/10l.txt \
+    && ok "and the '"$HOP_NEW"' root as current and install.sh" \
+    || { bad "list did not label the new root"; cat /tmp/10l.txt; }
+grep -q "^  axl-sdk-4.9.0 .* deb\$" /tmp/10l.txt \
+    && ok "and a package root as deb" || { bad "list did not label the deb root"; cat /tmp/10l.txt; }
+"$HB/axl" use '"$HOP_OLD"' --base-url file:///rel/empty > /tmp/10u.log 2>&1 \
+    && [ "$("$HB/axl" --print-prefix)" = "$H/axl-sdk-'"$HOP_OLD"'" ] \
+    && ok "axl use selects the pre-receipt root (it is install.sh-placed)" \
+    || { bad "axl use '"$HOP_OLD"' failed"; tail -5 /tmp/10u.log; }
+"$HB/axl" use 4.9.0 --base-url file:///rel/empty > /tmp/10p.log 2>&1 \
+    && bad "axl use selected a deb root" \
+    || ok "axl use refuses the deb root"
+"$HB/axl" use '"$HOP_NEW"' --base-url file:///rel/empty > /tmp/10v.log 2>&1 \
+    && ok "axl use back to '"$HOP_NEW"'" || { bad "axl use back failed"; tail -5 /tmp/10v.log; }
+"$HB/axl" prune --keep 0 > /tmp/10pr.log 2>&1 || bad "prune exited $?"
+[ -d "$H/axl-sdk-'"$HOP_OLD"'" ] \
+    && { bad "prune kept the superseded pre-receipt root"; cat /tmp/10pr.log; } \
+    || ok "prune removes the superseded pre-receipt root (the transition rule)"
+[ -d "$H/axl-sdk-'"$HOP_NEW"'" ] && ok "and keeps the current receipted one" \
+    || bad "prune removed the current root"
+[ -d "$H/axl-sdk-4.9.0" ] && ok "and never the package root" \
+    || bad "prune removed a package root"
+grep -qF "  skipped axl-sdk-4.9.0: a deb package -- remove it with: sudo apt remove axl-sdk-4.9.0" /tmp/10pr.log \
+    && ok "naming the command that does remove it" \
+    || { bad "prune did not name the package"; cat /tmp/10pr.log; }
 exit $rc
 '
 
@@ -1360,13 +1458,17 @@ else
 fi
 
 LOG="$WORK/lifecycle.log"
-podman run --rm \
+# OWNED (lib/podman-run.sh): named for this run and removed by the EXIT trap
+# if the test is killed, rather than left "Up" after its podman client dies.
+podman_owned_run "$LOG" \
     -v "$REL:/rel:ro" \
     -v "$INSTALLER:/tmp/install.sh:ro" \
+    -v "$HOPDIR/install.sh:/tmp/install-old.sh:ro" \
     "${TC_ARGS[@]}" \
     -e "HAVE_TC=$HAVE_TC" -e "X64_TC=$X64_TC" \
     docker.io/library/debian:stable-slim \
-    sh -c "$LIFECYCLE" > "$LOG" 2>&1
+    sh -c "$(cat "$PROJECT_DIR/scripts/container-pkg.sh")
+$LIFECYCLE"
 RC=$?
 sed 's/^/    /' "$LOG"
 
@@ -1383,7 +1485,7 @@ FAILS="$(grep -c '^  FAIL ' "$LOG" 2>/dev/null || true)"
 # at the END OF STEP 6 -- so deleting steps 7 and 8 left rc=0, zero FAILs and
 # a green "ran the whole lifecycle". A count is the only thing standing
 # between "every assertion passed" and "most of them never ran".
-EXPECTED_ASSERTIONS=163
+EXPECTED_ASSERTIONS=182
 if [[ "$PASSES" -ne "$EXPECTED_ASSERTIONS" ]]; then
     test_host_fail "the container ran every assertion ($PASSES of $EXPECTED_ASSERTIONS)"
 else

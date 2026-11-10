@@ -76,10 +76,10 @@ typedef struct AxlRand AxlRand;
  * Seeds from `axl_rng_bytes()` when the firmware entropy protocol is
  * available, otherwise from a monotonic clock reading. Two calls
  * therefore yield different streams. For a repeatable stream use
- * axl_rand_new_seeded(). Never returns NULL (aborts on OOM, per the
- * library's allocation contract).
+ * axl_rand_new_seeded().
  *
- * @return a new generator; free with axl_rand_free().
+ * @return a new generator, or NULL when its allocation fails; free with
+ *     axl_rand_free().
  */
 AxlRand *
 axl_rand_new(
@@ -93,7 +93,8 @@ axl_rand_new(
  * Every seed value is valid (a zero seed is handled — the SplitMix64
  * expansion guarantees a non-degenerate xoshiro state).
  *
- * @return a new generator; free with axl_rand_free().
+ * @return a new generator, or NULL when its allocation fails; free with
+ *     axl_rand_free().
  */
 AxlRand *
 axl_rand_new_seeded(
@@ -107,7 +108,7 @@ axl_rand_new_seeded(
  * independently of the original. Useful for branching a reproducible
  * sequence. NULL-safe: returns NULL when @p r is NULL.
  *
- * @return a new generator, or NULL if @p r is NULL.
+ * @return a new generator, or NULL if @p r is NULL or the allocation fails.
  */
 AxlRand *
 axl_rand_copy(

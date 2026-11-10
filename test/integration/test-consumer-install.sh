@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=podman est=150 local-only=0
+# test-meta: arch=x64 needs=podman est=150 cpu=2 local-only=0
 # test-consumer-install.sh — the install path, on a machine that has nothing.
 #
 # WHY THIS EXISTS. AXL-Distribution-Design.md §16 counted what every existing
@@ -69,6 +69,22 @@
 # release directory from), so all four arms report zero either way and adding
 # one cannot unbalance the count.
 #
+# A MIRROR OUTAGE IS A FAILURE, FAST AND NAMED (2026-11-09). Every image is
+# bootstrapped from its distribution's mirror, and when archive.ubuntu.com
+# went away this test became a 756 s CTest kill with no line naming the cause,
+# leaving a container "Up" behind each time. So:
+#   - every package install goes through scripts/container-pkg.sh: each fetch
+#     and each call bounded, and a failure prints an `AXL-PKG-FAIL:` line, the
+#     mirrors, and the tail of the package manager's log;
+#   - once one arm has hit AXL-PKG-FAIL, the remaining arms are NOT RUN --
+#     each records a FAIL saying so -- rather than spend the test's time limit
+#     rediscovering the same outage;
+#   - every container is OWNED (lib/podman-run.sh), so a TERM, INT or KILL
+#     from a test timeout cannot leave one running.
+# It stays a FAIL, never a SKIP: the dispatched suite certifies releases, and
+# a skip would certify a consumer install nobody ran.
+# test-container-lib.sh asserts all three against real podman.
+#
 # Usage: ./test/integration/test-consumer-install.sh [--arch X64|AARCH64]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,8 +115,22 @@ if [[ ! -d "$X64_TC" ]]; then
 fi
 
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
-WORK="$(mktemp -d -t axl-consumer.XXXXXXXX)"; trap 'rm -rf "$WORK"' EXIT
+# A healthy arm takes ~10-30 s. The cap only matters for a container whose
+# client was SIGKILLed (CTest's backstop), so it sits above the test's whole
+# CI limit (240 s) rather than near an arm's normal time.
+# shellcheck disable=SC2034  # read by lib/podman-run.sh, sourced below
+AXL_PODMAN_CAP=300
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/podman-run.sh"
+podman_owned_init
+WORK="$(mktemp -d -t axl-consumer.XXXXXXXX)"; trap 'podman_owned_cleanup; rm -rf "$WORK"' EXIT
 REL="$WORK/rel"; mkdir -p "$REL"
+# Prepended to every container's script: defines pkg_install, whose 60 s
+# per-call wall clock (and what it does not bound) is explained in that file.
+# Measured 2026-11-09 with archive.ubuntu.com not answering: debian and fedora
+# passed, ubuntu(host gcc) printed AXL-PKG-FAIL at its 60 s wall, ubuntu(both)
+# was NOT RUN, and the whole test FAILED in 81 s.
+PKG_SH="$(cat "$PROJECT_DIR/scripts/container-pkg.sh")"
 
 echo "=== consumer install ==="
 echo ""
@@ -110,22 +140,22 @@ echo ""
 # the same seam a mirror would use, so this exercises the real fetch path
 # rather than a special "local" mode.
 # ---------------------------------------------------------------------------
-if ! "$PROJECT_DIR/scripts/make-host-tools-tarball.sh" --out "$REL" > "$WORK/ht.log" 2>&1; then
+if ! "$PROJECT_DIR/scripts/make-release-assets.sh" host-tools --out "$REL" > "$WORK/ht.log" 2>&1; then
     test_host_fail "stage a release directory (host-tools)"
     tail -6 "$WORK/ht.log" | sed 's/^/      /'
     test_host_summary "consumer-install"; exit 1
 fi
-if ! "$PROJECT_DIR/scripts/make-sdk-tarball.sh" --arch x64 --out "$REL" > "$WORK/sdk.log" 2>&1; then
+if ! "$PROJECT_DIR/scripts/make-release-assets.sh" sdk --arch x64 --out "$REL" > "$WORK/sdk.log" 2>&1; then
     test_host_fail "stage a release directory (SDK)"
     tail -6 "$WORK/sdk.log" | sed 's/^/      /'
     test_host_summary "consumer-install"; exit 1
 fi
 cp "$PROJECT_DIR/packaging/install.sh" "$REL/install.sh"
 echo "$VERSION" > "$REL/VERSION"
-# `sha256sum -- *`, byte for byte what the release job runs. An earlier
+# scripts/release-sums.sh, the command the release job runs. An earlier
 # `./*.tar.gz` here wrote "./name" entries and install.sh correctly refused
 # them -- a fixture that does not match the producer tests the wrong thing.
-( cd "$REL" && sha256sum -- * > SHA256SUMS )
+"$PROJECT_DIR/scripts/release-sums.sh" "$REL" > /dev/null
 test_host_pass "staged a release directory ($(ls -1 "$REL" | wc -l) assets)"
 
 # ---------------------------------------------------------------------------
@@ -143,14 +173,12 @@ echo "  precondition: no compiler, linker, archiver or axl on this image"
 # Bootstrapping the IMAGE is legitimately distro-specific -- it is the OS
 # package manager, not our install path. Everything below this line is
 # identical on both, and if it ever needs a conditional that is a finding.
+# pkg_install (scripts/container-pkg.sh) exits with AXL-PKG-FAIL on failure.
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl xz-utils >/dev/null 2>&1
-elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q curl xz >/dev/null 2>&1
+    pkg_install curl xz-utils
 else
-    echo "FAIL: no apt-get or dnf on this image"; exit 1
+    pkg_install curl xz
 fi
-[ $? -eq 0 ] || { echo "FAIL: could not install curl/xz"; exit 1; }
 
 cd /tmp
 # Exactly README s first two lines.
@@ -240,9 +268,9 @@ dispatch_check() {  # dispatch_check <label> <expect-python:0|1>
 }
 dispatch_check "no python3" 0
 
-# ...and once the advice IS followed, everything works.
-if command -v apt-get >/dev/null 2>&1; then apt-get install -y -qq python3 >/dev/null 2>&1
-else dnf install -y -q python3 >/dev/null 2>&1; fi
+# ...and once the advice IS followed, everything works. A failed install used
+# to be discarded here and resurface as four "dispatcher" failures.
+pkg_install python3
 dispatch_check "python3 installed" 1
 
 # The maintenance verbs, on the machine they will actually be used on.
@@ -271,17 +299,39 @@ fi
 exit $rc
 '
 
+# PKG_DOWN names the first arm whose package install failed (AXL-PKG-FAIL).
+# Every arm after it is NOT RUN: the verdict is already FAIL, and each further
+# arm would only spend the test's time limit rediscovering the same outage.
+PKG_DOWN=""
+
+# not_run_after_outage <label> -- once an arm has hit AXL-PKG-FAIL, record a
+# FAIL for <label> that says why it did not run, and return 0 (skip the arm).
+not_run_after_outage() {
+    [[ -z "$PKG_DOWN" ]] && return 1
+    test_host_fail "$1: NOT RUN -- a package install already failed in $PKG_DOWN (AXL-PKG-FAIL above)"
+    return 0
+}
+
+# note_outage <label> <log> -- remember the first arm whose log has the marker.
+note_outage() {
+    if [[ -z "$PKG_DOWN" ]] && grep -q '^AXL-PKG-FAIL:' "$2"; then PKG_DOWN="$1"; fi
+    return 0
+}
+
 run_distro() {  # run_distro <label> <image>
     local label="$1" image="$2"
     local log="$WORK/${label}.log"
-    podman run --rm \
+    not_run_after_outage "$label" && return 0
+    podman_owned_run "$log" \
         -v "$REL:/rel:ro" \
         -v "$X64_TC:$X64_TC:ro" \
         -v "$PROJECT_DIR/sdk/examples:/ex:ro" \
         -e "V=$VERSION" \
-        "$image" sh -c "$CONSUMER" > "$log" 2>&1
+        "$image" sh -c "$PKG_SH
+$CONSUMER"
     local rc=$?
     sed 's/^/    /' "$log"
+    note_outage "$label" "$log"
     check "$rc" "$label: the consumer's first hour works end to end"
 }
 
@@ -443,14 +493,17 @@ exit $rc
 run_distro_hostgcc() {  # run_distro_hostgcc <label> <image> <bootstrap-cmd>
     local label="$1" image="$2" bootstrap="$3"
     local log="$WORK/${label}.log"
-    podman run --rm \
+    not_run_after_outage "$label" && return 0
+    podman_owned_run "$log" \
         -v "$REL:/rel:ro" \
         -v "$PROJECT_DIR/sdk/examples:/ex:ro" \
         -e "V=$VERSION" \
-        "$image" sh -c "$bootstrap
-$CONSUMER_HOSTGCC" > "$log" 2>&1
+        "$image" sh -c "$PKG_SH
+$bootstrap
+$CONSUMER_HOSTGCC"
     local rc=$?
     sed 's/^/    /' "$log"
+    note_outage "$label" "$log"
     # A zero exit is not enough on its own: a container that produced no
     # output at all -- a shell that never reached the script, an image whose
     # sh is not there -- would also exit 0, and this arm's whole value is in
@@ -468,8 +521,7 @@ $CONSUMER_HOSTGCC" > "$log" 2>&1
 }
 
 run_distro_hostgcc "ubuntu(host gcc)" docker.io/library/ubuntu:24.04 \
-    '{ apt-get update -qq && apt-get install -y -qq gcc binutils curl; } > /tmp/apt.log 2>&1 \
-        || { echo "FAIL: could not apt-get gcc/binutils/curl"; tail -8 /tmp/apt.log; exit 1; }'
+    'pkg_install gcc binutils curl'
 
 # ---------------------------------------------------------------------------
 # THE BOTH-PRESENT ARM: a machine where the Ubuntu-packaged gcc AND the
@@ -611,16 +663,19 @@ exit $rc
 run_distro_both() {  # run_distro_both <label> <image> <bootstrap-cmd>
     local label="$1" image="$2" bootstrap="$3"
     local log="$WORK/${label}.log"
-    podman run --rm \
+    not_run_after_outage "$label" && return 0
+    podman_owned_run "$log" \
         -v "$REL:/rel:ro" \
         -v "$X64_TC:$X64_TC:ro" \
         -v "$PROJECT_DIR/sdk/examples:/ex:ro" \
         -e "V=$VERSION" \
         -e "X64_TC=$X64_TC" \
-        "$image" sh -c "$bootstrap
-$CONSUMER_BOTH" > "$log" 2>&1
+        "$image" sh -c "$PKG_SH
+$bootstrap
+$CONSUMER_BOTH"
     local rc=$?
     sed 's/^/    /' "$log"
+    note_outage "$label" "$log"
     # Same reasoning as run_distro_hostgcc's own count: a zero exit is not
     # enough on its own, because a container that never reached the script
     # would also exit 0. 12 as of 2026-09-03 (3 control lines, install.sh,
@@ -636,7 +691,6 @@ $CONSUMER_BOTH" > "$log" 2>&1
 }
 
 run_distro_both "ubuntu(both)" docker.io/library/ubuntu:24.04 \
-    '{ apt-get update -qq && apt-get install -y -qq gcc binutils curl; } > /tmp/apt.log 2>&1 \
-        || { echo "FAIL: could not apt-get gcc/binutils/curl"; tail -8 /tmp/apt.log; exit 1; }'
+    'pkg_install gcc binutils curl'
 
 test_host_summary "consumer-install"

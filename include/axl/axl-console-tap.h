@@ -180,7 +180,10 @@ axl_console_tap_inject_key(
  * `EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED` bits).
  *
  * Without @c input_capture the firmware still owns the queue and its own
- * notifies; an injected key is readable but fires nothing.
+ * notifies; an injected key is readable but fires nothing. With it, the
+ * notifies fire even when the ring is full and the key is dropped, as a
+ * keyboard driver fires them on the press -- so a Ctrl+C refused for a full
+ * ring has still broken the Shell, and must not be offered again.
  *
  * @return AXL_OK on success, AXL_ERR on NULL @p t or a full ring.
  */
@@ -196,14 +199,53 @@ axl_console_tap_inject_key_ex(
 /**
  * @brief Inject a run of terminal input bytes (xterm/VT), decoded to keystrokes.
  *
- * Decodes CSI/SS3 escape sequences (arrows, F-keys, Home/End, PgUp/PgDn, Delete)
- * and UTF-8 printables (BMP) into the keystrokes of
- * @ref axl_console_tap_inject_key. Each call is self-contained: feed whole escape
- * / multi-byte sequences in a single call. A sequence left open at end-of-call is
- * treated as a bare Esc plus literal bytes rather than held into the next call, so
- * a dropped final byte can't corrupt the next keystroke.
+ * Decodes CSI/SS3 escape sequences (arrows, F-keys, Home/End, PgUp/PgDn,
+ * Insert/Delete), the C0 control bytes and UTF-8 printables (BMP) into the
+ * keystrokes a real USB keyboard delivers for the same keys on OVMF, modifiers
+ * included -- what a guest reads through `ReadKeyStrokeEx` and what its key
+ * notifies match against. The key shape:
  *
- * @return AXL_OK on success, AXL_ERR on NULL @p t / NULL @p bytes.
+ * - Every key carries @ref AXL_CONSOLE_SHIFT_STATE_VALID in its KeyShiftState
+ *   and exactly @ref AXL_CONSOLE_TOGGLE_KEYBOARD as its KeyToggleState.
+ * - A printable byte is that character with no modifier.
+ * - `0x08` and `0x7f` are Backspace (UnicodeChar `0x08`), `0x09` Tab, `0x0d`
+ *   Enter, a lone `0x1b` Esc: a terminal sends these for those keys, so they
+ *   are never read as Ctrl+H/I/M/[.
+ * - Any other C0 byte is its letter plus @ref AXL_CONSOLE_LEFT_CONTROL_PRESSED --
+ *   `0x00` is Space, `0x01`-`0x1a` are `a`-`z`, `0x1c`-`0x1f` are `\ ] ^ _`.
+ *   The Simple `ReadKeyStroke` folds a Ctrl+letter back to its C0 code, as the
+ *   firmware's console splitter does.
+ * - ESC followed by one byte that is not `[`, `O` or `>= 0x80` is ONE key: that
+ *   byte's key plus @ref AXL_CONSOLE_LEFT_ALT_PRESSED (`ESC ESC` is Alt+Esc).
+ * - The xterm modifier parameter `m` (`CSI 1;m A`, `CSI n;m ~`, `CSI 1;m P`) in
+ *   2..16 adds the bits of `m - 1`: Shift -> @ref AXL_CONSOLE_LEFT_SHIFT_PRESSED,
+ *   Alt -> @ref AXL_CONSOLE_LEFT_ALT_PRESSED, Ctrl ->
+ *   @ref AXL_CONSOLE_LEFT_CONTROL_PRESSED, Meta ->
+ *   @ref AXL_CONSOLE_LEFT_LOGO_PRESSED; `m` 1 means none. A sequence whose `m`
+ *   is 0 or above 16, or with any parameter above 65535, is unrecognized and
+ *   produces no key.
+ * - Shift is dropped from a printable other than Space, where it only changed
+ *   the character, and kept on Space, Tab, Backspace, Enter and every scan key.
+ * - SS3 `ESC O` + `A B C D H F` are the cursor keys and `P Q R S` F1-F4;
+ *   `ESC [ Z` is Tab plus @ref AXL_CONSOLE_LEFT_SHIFT_PRESSED.
+ * - CSI-u `ESC [ code ; m u` and modifyOtherKeys `ESC [ 27 ; m ; code ~` decode
+ *   `code` with modifier `m`: 9 Tab, 13 Enter, 27 Esc, 127 Backspace, any other
+ *   code from 0x20 a BMP character, a letter upper-cased when Shift is held.
+ *   A surrogate or another C0 code is unrecognized.
+ *
+ * Each call is self-contained: feed whole escape / multi-byte sequences in a
+ * single call. A sequence left open at end-of-call, or broken off by a byte
+ * that cannot continue it, is treated as a bare Esc plus literal bytes rather
+ * than held into the next call, so a dropped final byte can't corrupt the next
+ * keystroke.
+ *
+ * Keys wait in a ring of 64 (63 usable) that drains only as the guest reads.
+ * A character or an escape sequence is injected whole or not at all, and the
+ * run stops at the first one whose keys do not all fit; the bytes from there
+ * on are not injected.
+ *
+ * @return AXL_OK when every byte was injected; AXL_ERR on NULL @p t / NULL
+ *     @p bytes, or when the ring filled before the end of the run.
  */
 int
 axl_console_tap_inject_text(

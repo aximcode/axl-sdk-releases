@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=12 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0 builds=ARCH=x64,time-settime-selftest guest=plain
 # arch=both since 2026-08-19: verified passing on AARCH64 unchanged (21/0). It was
 # x64-only with no stated reason -- never ported, not unportable.
 # test-time-qemu.sh — round-trip the RTC-write API
@@ -23,7 +23,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export TEST_SKIP_RATCHET=1
 
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/time-settime-selftest.efi"
-make -C "$PROJECT_DIR" ARCH=x64 time-settime-selftest 2>&1 | tail -2
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 time-settime-selftest 2>&1 | tail -2
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT

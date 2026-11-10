@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=49 local-only=0
+# test-meta: arch=x64 needs= est=49 local-only=0 guest=none
+# guest=none: it measures the host CPU of the QEMU run-qemu.sh itself starts
+#   (time(1) around the call); a leased guest's QEMU is not that process.
 # test-cpu-idle.sh -- CPU-idle regression guard.
 #
 # Runs AxlTestCpuIdle.efi (six x 500ms event-driven waits = ~3s
@@ -13,7 +15,7 @@
 # ~1.0 on any host while idle stays well below on all of them.
 #
 # Usage:
-#   make tests                              # build AxlTestCpuIdle.efi
+#   scripts/axl-build.sh tests              # build AxlTestCpuIdle.efi
 #   ./test/integration/test-cpu-idle.sh     # run + assert
 #
 # Environment:
@@ -39,7 +41,7 @@ TEST_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$ARCH_SUFFIX")/AxlTest
 
 if [ ! -f "$TEST_EFI" ]; then
     echo "error: $TEST_EFI not found"
-    echo "       run: make ARCH=$ARCH_SUFFIX tests"
+    echo "       run: scripts/axl-build.sh ARCH=$ARCH_SUFFIX tests"
     exit 2
 fi
 

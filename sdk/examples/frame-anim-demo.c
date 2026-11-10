@@ -29,7 +29,7 @@
  *   ./scripts/run-qemu.sh --gpu frame-anim-demo.efi
  *   ./scripts/run-qemu.sh --vnc-reverse HOST:PORT frame-anim-demo.efi
  *
- * Build with: make frame-anim-demo
+ * Build with: scripts/axl-build.sh frame-anim-demo
  */
 
 #include <axl.h>

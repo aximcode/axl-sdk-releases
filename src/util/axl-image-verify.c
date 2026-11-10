@@ -26,6 +26,7 @@
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include "../backend/axl-backend.h"
+#include "axl-driver-internal.h"   /* _axl_image_tpl_refused */
 
 AXL_LOG_DOMAIN("image-verify");
 
@@ -583,6 +584,12 @@ axl_image_verify_signature(
 
     if (path == NULL) {
         return AXL_ERR;
+    }
+    /* consult_db is a LoadImage dry run, which UEFI 2.11 Table 7.3 allows only
+       below TPL_CALLBACK. Fail closed: a caller that asked the db must not be
+       handed the presence-only answer because of where it was called from. */
+    if (consult_db && _axl_image_tpl_refused("axl_image_verify_signature")) {
+        return AXL_UNSUPPORTED;
     }
 
     void   *buf = NULL;

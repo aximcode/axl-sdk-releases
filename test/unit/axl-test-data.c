@@ -2399,11 +2399,11 @@ test_json_build(void)
                && axl_strcmp(esc, "\"em\xE2\x80\x94""dash\"") == 0,
                "json utf8: escape_string keeps non-ASCII bytes");
 
-    // Control characters are still dropped — the fix must not widen the skip
-    // set into a pass-everything.
-    test_check(axl_json_escape_string("a\x01\x1F""b", esc, sizeof(esc)) > 0
-               && axl_strcmp(esc, "\"ab\"") == 0,
-               "json utf8: real control chars are still skipped");
+    // Control characters are ESCAPED (the docstring always said so; the code
+    // dropped them) -- never passed raw, never lost.
+    test_check(axl_json_escape_string("a\x01\x1F""b\x1b", esc, sizeof(esc)) > 0
+               && axl_strcmp(esc, "\"a\\u0001\\u001fb\\u001b\"") == 0,
+               "json utf8: control chars are escaped as \\u00XX, not dropped");
 
     // ---- Ill-formed UTF-8 in => valid JSON out -----------------------------
     // Letting non-ASCII bytes through (above) means an ill-formed sequence now
@@ -7164,6 +7164,52 @@ test_json_error_format(void)
                    "errfmt: a buffer too small is REFUSED, not truncated — "
                    "and left empty rather than partial");
     }
+}
+
+// The writer once DROPPED every control character but \t \n \r -- U+0000,
+// ESC, BS, FF vanished from a string with no sign, so an agent relaying a
+// command's output lost bytes. RFC 8259 §7 requires 0x00-0x1F escaped;
+// they are \u00XX now. Every quoting path: counted and NUL-terminated
+// values, and keys.
+static void
+test_json_writer_control_chars(void)
+{
+    AxlJsonWriter w;
+    AxlString    *out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_arr_begin(&w);
+        axl_json_strn(&w, "a\x01" "b\0c\x1b\x08\x0c\x1f", 9);  /* emit_quoted_n, NUL inside */
+        axl_json_str(&w, "t\x1bu");                            /* emit_quoted */
+    axl_json_arr_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w), "json ctl: no error");
+    test_check(axl_strcmp(axl_string_str(out),
+                          "[\"a\\u0001b\\u0000c\\u001b\\u0008\\u000c\\u001f\","
+                          "\"t\\u001bu\"]") == 0,
+               "json ctl: control characters are escaped as \\u00XX, never dropped");
+    axl_string_free(out);
+
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_key(&w, "k\x01");                             /* emit_quoted, key */
+        axl_json_str(&w, "v");
+        axl_json_keyn(&w, "q\x02", 2);                         /* emit_quoted_n, key */
+        axl_json_str(&w, "x\x1by");
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"k\\u0001\":\"v\",\"q\\u0002\":\"x\\u001by\"}") == 0,
+               "json ctl: keys escape control characters too");
+
+    AxlJsonReader r;
+    char          buf[16];
+    test_check(axl_json_parse(axl_string_str(out), axl_string_len(out), AXL_JSON_STRICT, &r)
+               && axl_json_get_string(&r, "q\x02", buf, sizeof(buf))
+               && axl_strcmp(buf, "x\x1by") == 0,
+               "json ctl: an escaped ESC round-trips through the strict reader");
+    axl_json_free(&r);
+    axl_string_free(out);
 }
 
 static void
@@ -15789,6 +15835,7 @@ test_data_main(int argc, char **argv)
     test_json_comment_multiline();
     test_json_ensure_ascii();
     test_json_writer_utf8_mode();
+    test_json_writer_control_chars();
     test_json_error_format();
     test_json_get_double();
     test_json_writer_roundtrip();

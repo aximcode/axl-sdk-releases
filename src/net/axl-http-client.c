@@ -18,6 +18,9 @@
 #include "axl-net-internal.h"
 #include "axl-http-client-tls.h"
 #include "axl-http-client-internal.h"
+#include "axl-http-core-internal.h"
+#include "axl-url-internal.h"       /* the Host authority */
+#include "axl-tcp-internal.h"       /* _axl_tcp_recv_fin */
 
 AXL_LOG_DOMAIN("http");
 
@@ -71,6 +74,11 @@ static const AxlConfigDesc http_client_descs[] = {
       offsetof(struct AxlHttpClient, max_redirects), sizeof(int) },
     { "tls.verify",    AXL_CFG_BOOL, "true", "TLS certificate verification",
       offsetof(struct AxlHttpClient, tls_verify), sizeof(bool) },
+    { "tls.close_notify", AXL_CFG_STRING, "required",
+      "How a TLS body framed by the close must end: \"required\" (close_notify, "
+      "else AXL_INCOMPLETE) or \"lenient\" (a TCP FIN without it ends the body, "
+      "with a warning)",
+      0, 0 },
     { "source.ip",     AXL_CFG_STRING, "", "Pin connect to interface with this station IP (dotted-quad, empty = auto)",
       offsetof(struct AxlHttpClient, source_ip), sizeof(char *) },
     { 0 }
@@ -80,6 +88,19 @@ static int
 http_client_apply(void *target, const char *key, const char *value)
 {
     AxlHttpClient *c = (AxlHttpClient *)target;
+
+    /* tls.close_notify: two values only; a mistyped one is refused rather
+       than read as either. */
+    if (axl_strcmp(key, "tls.close_notify") == 0) {
+        if (axl_strcmp(value, "required") == 0) {
+            c->tls_close_notify_lenient = false;
+        } else if (axl_strcmp(value, "lenient") == 0) {
+            c->tls_close_notify_lenient = true;
+        } else {
+            return -1;
+        }
+        return 0;   /* store it too, so axl_http_client_get reads it back */
+    }
 
     /* "header.*" — dynamic keys, store in hash table */
     if (axl_strlen(key) > 7 && axl_strncmp(key, "header.", 7) == 0) {
@@ -92,32 +113,29 @@ http_client_apply(void *target, const char *key, const char *value)
 }
 
 // ---------------------------------------------------------------------------
-// Shared request-header builder (overflow-safe). axl_snprintf returns the
-// would-have-written count (C99), so the `len += axl_snprintf(buf + len,
-// cap - len, ...)` idiom underflows `cap - len` and writes OOB once `len`
-// passes `cap`. This bounded writer never writes past `cap` and records
-// truncation in `overflow` instead. Shared by the sync streaming path
-// (do_request) and the async core so there is ONE builder.
+// Shared request-header builder. It runs twice over the same inputs: a
+// counting pass (no buffer) that sizes the block, then a writing pass into
+// a buffer allocated to exactly that size -- so there is no cap, and no
+// part of a request (a long path, a long header) is ever cut to fit. Shared
+// by the sync streaming path (do_streaming_request) and the async core so
+// there is ONE builder.
 // ---------------------------------------------------------------------------
 
+/* One pass of the builder: with @p buf NULL it only counts (len is the size
+   the block needs); with a buffer of that size it writes. */
 typedef struct {
     char   *buf;
-    size_t  cap;
-    size_t  len;        /* bytes actually written, always <= cap */
-    bool    overflow;   /* a write was truncated */
+    size_t  len;
 } ReqBuf;
 
 static void
 reqbuf_write(const char *data, size_t n, void *arg)
 {
     ReqBuf *b = (ReqBuf *)arg;
-    for (size_t i = 0; i < n; i++) {
-        if (b->len < b->cap) {
-            b->buf[b->len++] = data[i];
-        } else {
-            b->overflow = true;
-        }
+    if (b->buf != NULL) {
+        axl_memcpy(b->buf + b->len, data, n);
     }
+    b->len += n;
 }
 
 static void
@@ -140,14 +158,12 @@ reqbuf_emit_header(const void *key, void *value, void *data)
                   (const char *)key, (const char *)value);
 }
 
-int
-_axl_http_build_request(
-    char         *buf,
-    size_t        cap,
-    size_t       *out_len,
+/* Write the header block into @p b: one pass of _axl_http_build_request. */
+static void
+reqbuf_emit_request(
+    ReqBuf       *b,
     const char   *method,
-    const char   *full_path,
-    const char   *host,
+    const AxlUrl *url,
     size_t        content_length,
     bool          chunked,
     const char   *content_type,
@@ -155,37 +171,69 @@ _axl_http_build_request(
     AxlHashTable *default_headers,
     AxlHashTable *extra_headers)
 {
-    ReqBuf b = { buf, cap, 0, false };
-
-    reqbuf_append(&b, "%s %s HTTP/1.1\r\n", method, full_path);
-    reqbuf_append(&b, "Host: %s\r\n", host);
+    const char *path      = url->path;
+    const char *query     = url->query;
+    bool        has_query = query != NULL && query[0] != '\0';
+    reqbuf_append(b, "%s %s%s%s HTTP/1.1\r\n", method,
+                  (path != NULL && path[0] != '\0') ? path : "/",
+                  has_query ? "?" : "", has_query ? query : "");
+    /* The target's authority (RFC 9110 7.2): the port when not the
+       scheme's default, an IPv6 literal in brackets. */
+    AxlUrlAuthority a;
+    _axl_url_authority(url->scheme, url->host, url->port, &a);
+    reqbuf_append(b, "Host: %s%s%s%s\r\n", a.open, url->host, a.close, a.port);
 
     bool has_body = chunked || content_length > 0;
     if (chunked) {
-        reqbuf_append(&b, "Transfer-Encoding: chunked\r\n");
+        reqbuf_append(b, "Transfer-Encoding: chunked\r\n");
     } else if (content_length > 0) {
-        reqbuf_append(&b, "Content-Length: %llu\r\n",
+        reqbuf_append(b, "Content-Length: %llu\r\n",
                       (unsigned long long)content_length);
     }
     if (has_body && content_type != NULL) {
-        reqbuf_append(&b, "Content-Type: %s\r\n", content_type);
+        reqbuf_append(b, "Content-Type: %s\r\n", content_type);
     }
 
-    reqbuf_append(&b, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
+    reqbuf_append(b, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
 
     if (default_headers != NULL) {
-        axl_hash_table_foreach(default_headers, reqbuf_emit_header, &b);
+        axl_hash_table_foreach(default_headers, reqbuf_emit_header, b);
     }
     if (extra_headers != NULL) {
-        axl_hash_table_foreach(extra_headers, reqbuf_emit_header, &b);
+        axl_hash_table_foreach(extra_headers, reqbuf_emit_header, b);
     }
 
-    reqbuf_append(&b, "\r\n");
+    reqbuf_append(b, "\r\n");
+}
 
-    if (b.overflow) {
-        axl_error("request headers exceed %zu bytes", cap);
-        return AXL_ERR;
+int
+_axl_http_build_request(
+    char        **out,
+    size_t       *out_len,
+    const char   *method,
+    const AxlUrl *url,
+    size_t        content_length,
+    bool          chunked,
+    const char   *content_type,
+    bool          keep_alive,
+    AxlHashTable *default_headers,
+    AxlHashTable *extra_headers)
+{
+    /* Count, allocate exactly, write: the block has no size limit, so
+       nothing in it is ever cut. The headers cannot change between the
+       passes -- both run here, with nothing in between. */
+    ReqBuf count = { NULL, 0 };
+    reqbuf_emit_request(&count, method, url, content_length,
+                        chunked, content_type, keep_alive, default_headers,
+                        extra_headers);
+    ReqBuf b = { axl_malloc(count.len), 0 };
+    *out = b.buf;
+    if (b.buf == NULL) {
+        return AXL_NO_RESOURCES;
     }
+    reqbuf_emit_request(&b, method, url, content_length,
+                        chunked, content_type, keep_alive, default_headers,
+                        extra_headers);
     *out_len = b.len;
     return AXL_OK;
 }
@@ -429,6 +477,22 @@ tls_drain(
     return got;
 }
 
+/* The status of a failed sync TCP receive, as the client reports it: the
+   receive's only canceller is its own idle deadline (axl_tcp_recv's
+   timeout), so a cancel IS the timeout. */
+static int
+client_recv_status(
+    int rc
+    )
+{
+    return (rc == AXL_CANCELLED) ? AXL_TIMEOUT : rc;
+}
+
+/* Receive up to *len bytes (plaintext over TLS). @return AXL_OK (with *len
+   possibly 0 while a TLS record is incomplete); AXL_TIMEOUT when the idle
+   deadline passed with nothing received; AXL_ERR when the connection ended
+   or failed -- _axl_http_client_close_status tells an orderly end from a
+   cut. */
 static int
 client_recv(AxlHttpClient *c, void *buf, size_t *len)
 {
@@ -458,9 +522,9 @@ client_recv(AxlHttpClient *c, void *buf, size_t *len)
         }
 
         size_t raw_len = sizeof(c->tls_rx_buf);
-        if (axl_tcp_recv(c->sock, c->tls_rx_buf, &raw_len,
-                         c->timeout_ms) != AXL_OK) {
-            return -1;
+        int    rc      = axl_tcp_recv(c->sock, c->tls_rx_buf, &raw_len, c->timeout_ms);
+        if (rc != AXL_OK) {
+            return client_recv_status(rc);
         }
         if (raw_len == 0) {
             *len = 0;
@@ -475,7 +539,7 @@ client_recv(AxlHttpClient *c, void *buf, size_t *len)
         }
         return 0;
     }
-    return axl_tcp_recv(c->sock, buf, len, c->timeout_ms);
+    return client_recv_status(axl_tcp_recv(c->sock, buf, len, c->timeout_ms));
 }
 
 /// Read a Transfer-Encoding: chunked response body.
@@ -486,7 +550,8 @@ client_recv(AxlHttpClient *c, void *buf, size_t *len)
 /// terminating zero-sized chunk + (possibly empty) trailers.
 ///
 /// On success: `*out_body` is malloc'd (axl_free) and `*out_size` is
-/// the decoded byte count. Returns 0 / -1.
+/// the decoded byte count. Returns 0, AXL_TIMEOUT (the idle deadline
+/// passed mid-body), or -1.
 static int
 read_chunked_body(
     AxlHttpClient *c,
@@ -605,9 +670,10 @@ read_chunked_body(
             return -1;
         }
         size_t want = sizeof(work_buf) - work_len;
-        if (client_recv(c, work_buf + work_len, &want) != 0) {
+        int rrc = client_recv(c, work_buf + work_len, &want);
+        if (rrc != AXL_OK) {
             axl_free(body);
-            return -1;
+            return (rrc == AXL_TIMEOUT) ? AXL_TIMEOUT : -1;
         }
         /* `want == 0` with success is the TLS `MBEDTLS_ERR_SSL_WANT_READ`
            case: bytes arrived on the wire but didn't complete a TLS
@@ -619,6 +685,155 @@ read_chunked_body(
 
     *out_body = body;
     *out_size = body_size;
+    return 0;
+}
+
+int
+_axl_http_client_interim(
+    size_t  status,
+    size_t *count
+    )
+{
+    if (status / 100 != 1) {
+        return 0;
+    }
+    if (status == 101) {
+        axl_error("response 101 Switching Protocols: the client asked for no upgrade");
+        return AXL_ERR;
+    }
+    if (++*count > HTTP_CLIENT_INTERIM_MAX) {
+        axl_error("more than %u interim 1xx responses before a final one",
+                  (unsigned)HTTP_CLIENT_INTERIM_MAX);
+        return AXL_ERR;
+    }
+    return 1;
+}
+
+/* Close the client's connection -- TLS context, socket and the host it was
+   for -- so the next request opens a fresh one. */
+static void
+client_drop_connection(
+    AxlHttpClient *c
+    )
+{
+    if (c->tls_ctx != NULL) {
+        client_tls_free(c->tls_ctx);
+        c->tls_ctx = NULL;
+    }
+    if (c->sock != NULL) {
+        axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
+        c->sock = NULL;
+    }
+    axl_free(c->connected_host);
+    c->connected_host = NULL;
+}
+
+AxlStatus
+_axl_http_client_close_status(
+    const AxlHttpClient *c,
+    size_t               got
+    )
+{
+    const char *host = (c->connected_host != NULL) ? c->connected_host : "the server";
+    bool        fin  = _axl_tcp_recv_fin(c->sock);
+    if (c->tls_ctx == NULL) {
+        if (fin) {
+            return AXL_OK;
+        }
+        axl_error("%s: the connection was reset or failed after %llu bytes of a "
+                  "body framed by the close", host, (unsigned long long)got);
+        return AXL_INCOMPLETE;
+    }
+    if (g_http_tls_ops != NULL && g_http_tls_ops->peer_closed(c->tls_ctx)) {
+        return AXL_OK;
+    }
+    if (!fin) {
+        axl_error("%s: the TLS connection was reset or failed after %llu bytes of a "
+                  "body framed by the close", host, (unsigned long long)got);
+        return AXL_INCOMPLETE;
+    }
+    if (c->tls_close_notify_lenient) {
+        axl_warning("%s: TLS ended without close_notify after %llu bytes of a body "
+                    "framed by the close; accepted (tls.close_notify=lenient)",
+                    host, (unsigned long long)got);
+        return AXL_OK;
+    }
+    axl_error("%s: TLS ended without close_notify after %llu bytes of a body framed "
+              "by the close (set tls.close_notify=lenient to accept it)",
+              host, (unsigned long long)got);
+    return AXL_INCOMPLETE;
+}
+
+/// Read a response body that runs until the connection closes (RFC 9112
+/// 6.3: a Transfer-Encoding whose final coding is not chunked).
+///
+/// `initial` / `initial_len` are the bytes already received past the head.
+/// Reads until the peer closes, bounded by HTTP_CLIENT_BODY_MAX. The body
+/// is whole only at an ORDERLY close (_axl_http_client_close_status); a
+/// reset, a timeout or a TLS cut part-way is AXL_INCOMPLETE, never a short
+/// body. On success `*out_body` is malloc'd (axl_free; NULL for an empty
+/// body) and `*out_size` is its length. Returns 0, AXL_INCOMPLETE,
+/// AXL_TIMEOUT (the idle deadline passed with neither data nor a close), or
+/// -1.
+static int
+read_body_to_close(
+    AxlHttpClient *c,
+    const char    *initial,
+    size_t         initial_len,
+    void         **out_body,
+    size_t        *out_size)
+{
+    uint8_t *body = NULL;
+    size_t   cap  = 0;
+    size_t   size = 0;
+    for (;;) {
+        /* Room for the bytes in hand and one more read. */
+        size_t need = size + initial_len + HTTP_CLIENT_RECV_BUF;
+        if (size > HTTP_CLIENT_BODY_MAX) {
+            axl_free(body);
+            return -1;
+        }
+        if (need > cap) {
+            size_t   new_cap = (cap * 2 > need) ? cap * 2 : need;
+            uint8_t *nb      = axl_realloc(body, new_cap);
+            if (nb == NULL) {
+                axl_free(body);
+                return -1;
+            }
+            body = nb;
+            cap  = new_cap;
+        }
+        if (initial_len > 0) {
+            axl_memcpy(body, initial, initial_len);
+            size        = initial_len;
+            initial_len = 0;
+        }
+        size_t got = HTTP_CLIENT_RECV_BUF;
+        int rrc = client_recv(c, body + size, &got);
+        if (rrc == AXL_TIMEOUT) {
+            axl_error("response body framed by the close: no data and no close "
+                      "within %llu ms, after %llu bytes",
+                      (unsigned long long)c->timeout_ms, (unsigned long long)size);
+            axl_free(body);
+            return AXL_TIMEOUT;
+        }
+        if (rrc != AXL_OK) {
+            int cs = _axl_http_client_close_status(c, size);
+            if (cs != AXL_OK) {
+                axl_free(body);
+                return cs;   /* AXL_INCOMPLETE, its cause logged */
+            }
+            break;   /* the orderly close: the body is complete */
+        }
+        size += got;
+        _axl_poll_break();
+    }
+    if (size == 0) {
+        axl_free(body);
+        body = NULL;
+    }
+    *out_body = body;
+    *out_size = size;
     return 0;
 }
 
@@ -643,7 +858,7 @@ do_streaming_request(
     AxlHttpClientResponse **resp)
 {
     AxlUrl                 *parsed;
-    char                    req_buf[2048];
+    AXL_AUTO_FREE char     *req_buf = NULL;
     size_t                  req_len;
     char                    recv_buf[HTTP_CLIENT_RECV_BUF];
     size_t                  recv_len;
@@ -652,6 +867,7 @@ do_streaming_request(
     size_t                  status_code;
     AxlHashTable           *resp_headers;
     size_t                  resp_content_len;
+    AxlHttpFraming          framing;
     void                   *resp_body;
     AxlHttpClientResponse  *r;
 
@@ -685,28 +901,12 @@ do_streaming_request(
         return -1;
     }
 
-    /* Build request */
-    const char *req_path = parsed->path;
-    if (req_path == NULL || req_path[0] == '\0') {
-        req_path = "/";
-    }
-
-    /* Build path with query string if present */
-    char full_path[512];
-    if (parsed->query != NULL && parsed->query[0] != '\0') {
-        axl_snprintf(full_path, sizeof(full_path), "%s?%s",
-                     req_path, parsed->query);
-    } else {
-        axl_snprintf(full_path, sizeof(full_path), "%s", req_path);
-    }
-
     /* Body framing: chunked when the total size is unknown ((size_t)-1), else
        Content-Length: stream_total_size. */
     bool   stream_chunked  = (stream_total_size == (size_t)-1);
     size_t req_content_len = stream_chunked ? 0 : stream_total_size;
 
-    if (_axl_http_build_request(req_buf, sizeof(req_buf), &req_len,
-                                method, full_path, parsed->host,
+    if (_axl_http_build_request(&req_buf, &req_len, method, parsed,
                                 req_content_len, stream_chunked, content_type,
                                 c->keep_alive, c->default_headers,
                                 extra_headers) != AXL_OK) {
@@ -722,14 +922,7 @@ do_streaming_request(
        one-shot pipe). The producer's first pull happens below, so
        retrying the header send is still safe here. */
     if (client_send(c, req_buf, req_len) != AXL_OK) {
-        if (c->tls_ctx != NULL) {
-            client_tls_free(c->tls_ctx);
-            c->tls_ctx = NULL;
-        }
-        axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
-        c->sock = NULL;
-        axl_free(c->connected_host);
-        c->connected_host = NULL;
+        client_drop_connection(c);
 
         if (ensure_connected(c, parsed->host, parsed->port) != 0 ||
             client_send(c, req_buf, req_len) != AXL_OK)
@@ -805,92 +998,92 @@ do_streaming_request(
         }
     }
 
-    /* Receive response headers */
+    /* Receive the response head. Interim 1xx heads come before the final
+       one (RFC 9110 15.2): each is parsed, dropped from the buffer, and the
+       next head read -- the same rule as the async core. */
     total_recv = 0;
-    header_end = 0;
-
-    while (total_recv < sizeof(recv_buf)) {
-        recv_len = sizeof(recv_buf) - total_recv;
-        if (client_recv(c, recv_buf + total_recv, &recv_len) != 0) {
-            /* A streaming body has already drained its one-shot producer, so we
-               can't replay the request on a stale connection — fail. */
+    resp_headers = NULL;
+    size_t interim = 0;
+    for (;;) {
+        header_end = axl_http_find_response_header_end(recv_buf, total_recv);
+        if (header_end == 0) {
+            if (total_recv >= sizeof(recv_buf)) {
+                axl_url_free(parsed);
+                axl_error("response headers too large or incomplete");
+                return -1;
+            }
+            recv_len = sizeof(recv_buf) - total_recv;
+            int rrc = client_recv(c, recv_buf + total_recv, &recv_len);
+            if (rrc != AXL_OK) {
+                /* A streaming body has already drained its one-shot producer,
+                   so we can't replay the request on a stale connection — fail. */
+                axl_url_free(parsed);
+                return (rrc == AXL_TIMEOUT) ? AXL_TIMEOUT : -1;
+            }
+            total_recv += recv_len;
+            continue;
+        }
+        /* The status line and headers, read as a user agent reads them (RFC
+           9112): the same rules as the async core. */
+        if (_axl_http_response_head_parse(recv_buf, header_end, &status_code,
+                                          &resp_headers) != AXL_OK) {
             axl_url_free(parsed);
             return -1;
         }
-
-        total_recv += recv_len;
-
-        header_end = axl_http_find_header_end(recv_buf, total_recv);
-        if (header_end > 0) {
+        int im = _axl_http_client_interim(status_code, &interim);
+        if (im == 0) {
             break;
         }
-    }
-
-    if (header_end == 0) {
-        axl_url_free(parsed);
-        axl_error("response headers too large or incomplete");
-        return -1;
-    }
-
-    /* Parse status line */
-    size_t first_line_end = 0;
-    for (size_t j = 0; j + 1 < header_end; j++) {
-        if (recv_buf[j] == '\r' && recv_buf[j + 1] == '\n') {
-            first_line_end = j;
-            break;
+        axl_hash_table_free(resp_headers);
+        resp_headers = NULL;
+        if (im < 0) {
+            axl_url_free(parsed);
+            return -1;   /* a 101, or past the cap: the caller drops the connection */
         }
-    }
-
-    int status = axl_http_parse_status_line(recv_buf, first_line_end,
-                                            &status_code);
-    if (status != AXL_OK) {
-        axl_url_free(parsed);
-        return -1;
-    }
-
-    /* Parse response headers */
-    size_t hdr_start = first_line_end + 2;
-    status = axl_http_parse_headers(recv_buf + hdr_start,
-                                    header_end - hdr_start,
-                                    &resp_headers);
-    if (status != AXL_OK) {
-        if (resp_headers != NULL) {
-            axl_hash_table_free(resp_headers);
-        }
-        axl_url_free(parsed);
-        return -1;
+        axl_memmove(recv_buf, recv_buf + header_end, total_recv - header_end);
+        total_recv -= header_end;
     }
 
     /* Streaming requests are NOT redirect-followed (the one-shot producer can't
        be replayed): a 3xx is returned as-is for the caller to re-issue with a
        fresh streamer. */
 
-    /* Read body. Two transports: Content-Length (size known up front)
-       or Transfer-Encoding: chunked (size discovered chunk-by-chunk).
-       Per RFC 7230 §3.3.3, if both are present chunked wins. */
-    resp_content_len = axl_http_get_content_length(resp_headers);
+    /* Read body, framed as RFC 9112 6.3 says: none for HEAD, 1xx, 204 or
+       304; else a Transfer-Encoding wins over Content-Length -- chunked when
+       its last coding is, else the body runs until the close; then
+       Content-Length; with neither, the body runs until the close. */
+    if (_axl_http_response_framing(resp_headers, method, status_code, &framing) != AXL_OK
+        || (framing.kind == AXL_HTTP_BODY_LENGTH && framing.length > HTTP_CLIENT_BODY_MAX)) {
+        axl_hash_table_free(resp_headers);
+        axl_url_free(parsed);
+        return -1;
+    }
+    resp_content_len = framing.length;
     resp_body = NULL;
 
     size_t resp_body_read = 0;
 
-    bool chunked = false;
-    {
-        const char *te = (const char *)axl_hash_table_lookup(
-            resp_headers, "transfer-encoding");
-        if (te != NULL && axl_strcasecmp(te, "chunked") == 0) {
-            chunked = true;
-        }
-    }
-
-    if (chunked) {
-        if (read_chunked_body(c,
-                              recv_buf + header_end,
-                              total_recv - header_end,
-                              &resp_body,
-                              &resp_body_read) != 0) {
+    if (framing.kind == AXL_HTTP_BODY_CHUNKED) {
+        int rc = read_chunked_body(c,
+                                   recv_buf + header_end,
+                                   total_recv - header_end,
+                                   &resp_body,
+                                   &resp_body_read);
+        if (rc != 0) {
             axl_hash_table_free(resp_headers);
             axl_url_free(parsed);
-            return -1;
+            return (rc == AXL_TIMEOUT) ? AXL_TIMEOUT : -1;
+        }
+    } else if (framing.kind == AXL_HTTP_BODY_TO_CLOSE) {
+        int rc = read_body_to_close(c,
+                                    recv_buf + header_end,
+                                    total_recv - header_end,
+                                    &resp_body,
+                                    &resp_body_read);
+        if (rc != 0) {
+            axl_hash_table_free(resp_headers);
+            axl_url_free(parsed);
+            return (rc == AXL_INCOMPLETE || rc == AXL_TIMEOUT) ? rc : -1;
         }
     } else if (resp_content_len > 0) {
         resp_body = axl_malloc(resp_content_len);
@@ -914,13 +1107,14 @@ do_streaming_request(
         /* Read remaining body */
         while (resp_body_read < resp_content_len) {
             recv_len = resp_content_len - resp_body_read;
-            if (client_recv(c, (uint8_t *)resp_body + resp_body_read,
-                            &recv_len) != 0) {
-                /* Partial body — network error during download */
+            int rrc = client_recv(c, (uint8_t *)resp_body + resp_body_read,
+                                  &recv_len);
+            if (rrc != AXL_OK) {
+                /* Partial body: the idle deadline, or a network error */
                 axl_free(resp_body);
                 axl_hash_table_free(resp_headers);
                 axl_url_free(parsed);
-                return -1;
+                return (rrc == AXL_TIMEOUT) ? AXL_TIMEOUT : -1;
             }
 
             resp_body_read += recv_len;
@@ -959,7 +1153,9 @@ do_streaming_request(
      * Connection: close
      */
     {
-        bool close_conn = !c->keep_alive;
+        /* Nor when the framing forbids reuse: Content-Length beside
+           Transfer-Encoding, or a body that ran to the close. */
+        bool close_conn = !c->keep_alive || !framing.reusable;
         if (!close_conn) {
             const char *conn_hdr = (const char *)axl_hash_table_lookup(
                 resp_headers, "connection");
@@ -969,10 +1165,7 @@ do_streaming_request(
             }
         }
         if (close_conn) {
-            axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
-            c->sock = NULL;
-            axl_free(c->connected_host);
-            c->connected_host = NULL;
+            client_drop_connection(c);
         }
     }
 
@@ -1107,6 +1300,11 @@ axl_http_request_streaming(AxlHttpClient *c, const char *method,
     }
     int rc = do_streaming_request(c, method, url, streamer, ctx, total_size,
                                   content_type, extra_headers, out_resp);
+    if (rc != AXL_OK) {
+        /* Whatever of the response is still on the connection would be read
+           as the next request's: never reuse it after a failure. */
+        client_drop_connection(c);
+    }
     /* Cleanup fires regardless of success — consumer doesn't need
        to thread free-on-error through every callsite. */
     if (cleanup_fn != NULL) {

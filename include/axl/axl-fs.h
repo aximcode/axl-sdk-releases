@@ -9,10 +9,18 @@
  * this header is the `<sys/stat.h>` + `<dirent.h>` + `<sys/statvfs.h>`
  * analog.
  *
- * All paths are UTF-8; backend converts to UCS-2 internally.
+ * All paths are UTF-8; backend converts to UCS-2 internally. A path is
+ * limited to 511 characters relative to its volume (after `fsN:`), and by
+ * the volume's own driver (FAT: 260 for the whole path); a longer one fails,
+ * it is never cut short. See the module README, "Path length".
  * High-level convenience wrappers (`axl_file_get_contents`) layer on
  * top of axl_fopen — they're path-based shortcuts, not stream
  * primitives.
+ *
+ * Either separator works in every path this header takes, under the
+ * modern shell, the EFI 1.x shell and with no shell: '/' is read as '\'.
+ * No name can hold a '/' (FAT refuses it; axl_dir_read() never returns
+ * one), so nothing that must keep one is lost.
  */
 
 #ifndef AXL_FS_H
@@ -23,6 +31,7 @@
 #include <stdint.h>
 #include <axl/axl-macros.h>
 #include <axl/axl-bytes.h>
+#include <axl/axl-stream.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,36 +97,37 @@ axl_file_set_contents(
  * @brief Crash-safely write an entire buffer to a file.
  *
  * Writes @p buf to a temporary sibling ("<path>.tmp") and flushes it
- * through to the volume, then replaces @p path with it via rename. The
- * promote happens ONLY if that flush succeeded: a temp whose bytes never
- * landed is deleted and @p path is left exactly as it was, rather than
- * replaced by a file that may be empty or short. Unlike
- * axl_file_set_contents — which truncates
- * the target and writes in place, so a power loss mid-write leaves the
- * target half-written — this never modifies the target until the full,
- * flushed contents exist in the temp file.
+ * through to the volume, then puts it in @p path's place with
+ * axl_file_replace() (flags 0). The replace happens ONLY if that flush
+ * succeeded: a temp whose bytes never landed is deleted and @p path is
+ * left exactly as it was, rather than replaced by a file that may be
+ * empty or short. Unlike axl_file_set_contents -- which truncates the
+ * target and writes in place, so a power loss mid-write leaves the target
+ * half-written -- this never modifies the target until the full, flushed
+ * contents exist in the temp file.
  *
- * On UEFI/FAT a rename cannot atomically replace an existing file, so
- * when @p path already exists the replace is delete-then-rename: a power
- * loss in that window leaves the target momentarily absent but the
- * complete data still present in "<path>.tmp" (recoverable) — never a
- * half-written target.
+ * On UEFI/FAT a rename cannot replace an existing file, so when @p path
+ * already exists axl_file_replace() first renames it aside to
+ * `~AXLhhhh.TMP` in the same directory, then renames the temp into place,
+ * then removes the aside. A failure puts the target back; a power loss in
+ * between leaves the previous contents at the aside name and the new ones
+ * complete at @p path or "<path>.tmp" -- never a half-written target, and
+ * never neither.
  *
- * The temp file is removed on failure ONLY when @p path exists at that
- * point, so a failure never leaves the data in neither place. The test is
- * deliberately "does the target exist now", not "did we delete it": when
- * the replace got as far as removing the target and then could not
- * rename, "<path>.tmp" is left holding the complete contents for
- * recovery — and the same is true when @p path never existed and the
- * rename simply failed, which also leaves a "<path>.tmp" behind. Keeping
- * the only copy of the caller's data is worth the occasional stray temp;
- * a caller that wants it gone can delete "<path>.tmp" itself.
+ * On failure the temp file is removed, and @p path is as it was -- except
+ * in the cases axl_file_replace() lists under "What it cannot prevent":
+ * when @p path existed before the call and no longer resolves after it,
+ * "<path>.tmp" is kept, holding the complete new contents for recovery.
  *
  * @p path must be in a writable directory; the temp sibling is created
- * in the same directory (same-directory rename is the FAT atomic case).
+ * in the same directory, so the replace is a same-directory rename.
  *
- * @return AXL_OK on success, AXL_ERR on any failure (the target is left
- *     untouched if the temp write fails).
+ * @return #AXL_OK on success; #AXL_ERR for NULL @p path, NULL @p buf with
+ *     a non-zero @p len, or a temp file that could not be written and
+ *     flushed (the target untouched); otherwise what axl_file_replace()
+ *     returned -- #AXL_IS_DIR for a directory at @p path, #AXL_DENIED for a
+ *     read-only target or volume, #AXL_NO_RESOURCES, #AXL_CANCELLED, and
+ *     the rest. Treat any negative value as failure.
  */
 AXL_WARN_UNUSED int
 axl_file_write_atomic(
@@ -166,9 +176,13 @@ typedef struct AxlFileWriter AxlFileWriter;
  *
  * Not atomic: unlike `axl_file_write_atomic`, the target is written in
  * place (truncated up front), so an aborted stream or a power loss
- * mid-write leaves it partially written. Out-of-core streaming
- * precludes the temp-file-then-rename trick — a caller that needs
- * all-or-nothing must write to a temp path and rename on close itself.
+ * mid-write leaves it partially written. For all-or-nothing, open the
+ * writer on a temp path beside the target and replace the target with
+ * it only once its bytes are known to be on the volume -- which
+ * `axl_file_writer_close` returning AXL_OK says (it flushes) -- streaming
+ * does not stand in the way of that. The WebDAV PUT of
+ * `axl_fs_webdav_ops()` works this way, flushing with the handle still
+ * open (an internal call) so it can still delete the temp through it.
  *
  * @return new writer, or NULL on open failure / OOM / EXCL-and-exists.
  *     Free with `axl_file_writer_close`.
@@ -285,11 +299,20 @@ typedef void (*AxlProgressFunc)(uint64_t done, uint64_t total, void *ctx) AXL_CB
 // AxlFsEntry — file / directory metadata
 // ---------------------------------------------------------------------------
 
-/// Current `AxlFsEntry.version` value emitted by the SDK. Bumped
-/// when the struct gains a new field. Forward-compat: callers test
-/// `entry.struct_size >= offsetof(AxlFsEntry, new_field) +
-/// sizeof(new_field)` before reading anything added in version > 1.
-#define AXL_FS_ENTRY_VERSION  1
+/// Capacity of `AxlFsEntry.name`, NUL included: 765 UTF-8 bytes, which
+/// holds any name FAT creates (255 UTF-16 units, each at most 3 bytes).
+#define AXL_FS_NAME_MAX  766u
+
+/// `AxlFsEntry.version` as this SDK writes it. 2: `name` widened from 256
+/// to #AXL_FS_NAME_MAX bytes, moving every field after it.
+///
+/// `struct_size` and `version` record which layout filled an entry; they
+/// are not a compatibility mechanism. AXL never reads them from a caller's
+/// entry, and could not use them if it did. AXL links statically, so code
+/// built against different versions meets only when objects built against
+/// an older header are linked with a newer libaxl.a -- undefined; rebuild
+/// everything. Whoever fills an entry (AXL, or a provider) sets both.
+#define AXL_FS_ENTRY_VERSION  2
 
 /**
  * @brief Canonical file / directory metadata.
@@ -304,11 +327,15 @@ typedef void (*AxlProgressFunc)(uint64_t done, uint64_t total, void *ctx) AXL_CB
  * Pre-Phase-C this was three different structs (`AxlFileInfo`,
  * `AxlDirEntry`, `AxlFsProviderInfo`) carrying the same data in
  * different shapes; collapsed in Phase C cleanup.
+ *
+ * 808 bytes. UEFI promises only 128 KiB of boot-services stack: keep
+ * arrays of entries, and an entry per level of a recursive walk, on the
+ * heap.
  */
 typedef struct {
     uint32_t struct_size;     ///< sizeof(AxlFsEntry) at write time
     uint32_t version;         ///< AXL_FS_ENTRY_VERSION at write time
-    char     name[256];       ///< basename UTF-8; empty for path-stat / root
+    char     name[AXL_FS_NAME_MAX]; ///< basename UTF-8, never cut; empty for path-stat / root
     uint64_t size;            ///< file size in bytes (0 for directories)
     uint64_t alloc_size;      ///< physical size on disk; 0 if unknown
     uint64_t mtime_unix;      ///< modification time, Unix epoch seconds (0 = unknown)
@@ -332,8 +359,9 @@ axl_fs_entry_is_read_only(const AxlFsEntry *e)
 /**
  * @brief Get file metadata for a path. Wraps UEFI EFI_FILE_INFO.
  *
- * `entry->name` is populated with the basename; the rest of the
- * fields hold the file's stat data.
+ * `entry->name` is left empty -- the caller has the path; axl_fstat()
+ * reports a file's current name. The rest of the fields hold the
+ * file's stat data.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
@@ -343,6 +371,39 @@ axl_file_info(
     AxlFsEntry  *entry  ///< [out] receives file metadata
 );
 
+/**
+ * @brief Get metadata for the file under an open stream -- `fstat(2)`.
+ *
+ * axl_file_info() for a file you hold open. It describes the file @a s was
+ * opened on even after that file was renamed or another file was created
+ * at its old path, and, unlike axl_file_info(), it fills `entry->name`
+ * with the file's CURRENT basename, which is how a caller learns where a
+ * renamed file went. A name too long for `entry->name` (over 765 bytes of
+ * UTF-8, which no FAT-created name is) leaves `entry->name` empty, never
+ * cut: a cut name could be a sibling's.
+ *
+ * Read-only: nothing is written, so bytes still held in @a s's own write
+ * buffer are not yet in the file and are not counted in `entry->size`.
+ * Call axl_fflush() first if they must be.
+ *
+ * Works on any stream axl_fopen() returned, including one opened "r".
+ * Other streams (buffer, console, custom, or a wrapper built over a file
+ * stream) are #AXL_UNSUPPORTED. A file deleted through another handle is
+ * #AXL_ERR: the FAT driver fails every query on a handle whose file is
+ * gone.
+ *
+ * @a entry is zeroed on entry, so it is defined (empty) after any failure.
+ *
+ * @return #AXL_OK with @a entry filled; #AXL_UNSUPPORTED if @a s is not a
+ *     file stream; #AXL_ERR on NULL arguments, a deleted file, or a device
+ *     error. Treat any negative value as failure.
+ */
+AXL_WARN_UNUSED int
+axl_fstat(
+    AxlStream  *s,     ///< stream from axl_fopen()
+    AxlFsEntry *entry  ///< [out] metadata, `name` = current basename
+);
+
 // ---------------------------------------------------------------------------
 // File operations (path-based)
 // ---------------------------------------------------------------------------
@@ -350,9 +411,8 @@ axl_file_info(
 /**
  * @brief Delete a file.
  *
- * Deleting a path that does not exist is #AXL_NOT_FOUND, not success — the
- * same answer axl_file_rename() has always given for the same input, and the
- * two disagreeing is how this was noticed.
+ * Deleting a path that does not exist is #AXL_NOT_FOUND, not success, as
+ * axl_file_rename() answers for a missing source.
  *
  * It also does not CREATE the file on the way to answering. That is worth
  * stating because it used to: EDK2's `EfiShellDeleteFileByName` opens its
@@ -363,10 +423,17 @@ axl_file_info(
  * no-shell path never did this, so the behaviour also depended on whether a
  * modern shell was present; both now open without `CREATE`.
  *
- * @return #AXL_OK on success, #AXL_NOT_FOUND if @a path does not exist,
- *     #AXL_ERR if it exists and could not be removed. As everywhere in AXL,
- *     treat ANY negative value as failure; the split is there for callers that
- *     map a status onto something else (an HTTP 404 versus a 500).
+ * #AXL_NOT_FOUND means the volume was reached and holds no such file, and
+ * nothing else: a file that is there and cannot be removed -- one with the
+ * read-only attribute, a read-only volume -- and a path whose volume does
+ * not resolve (an unmapped `fs9:`) are both #AXL_ERR.
+ *
+ * @return #AXL_OK on success; #AXL_NOT_FOUND if the volume holds no file at
+ *     @a path; #AXL_ERR otherwise, including NULL @a path, a file that
+ *     could not be removed and a volume that does not resolve. As everywhere
+ *     in AXL, treat ANY negative value as failure; the split is there for
+ *     callers that map a status onto something else (an HTTP 404 versus a
+ *     500).
  */
 int
 axl_file_delete(
@@ -374,55 +441,294 @@ axl_file_delete(
 );
 
 /**
- * @brief Rename a file within its current directory.
+ * @brief Rename or move a file or directory within its volume --
+ *     `rename(2)` with `RENAME_NOREPLACE`.
  *
- * @p new_path may be a basename only ("bar.txt") or a full path
- * with the same directory prefix as @p old_path ("fs0:\\dir\\bar.txt"
- * given "fs0:\\dir\\foo.txt"). Cross-directory renames are refused
- * with AXL_ERR — most UEFI FAT drivers can't move a file across
- * directories via SetFileInfo. Use axl_file_move for cross-directory
- * cases (it falls back to copy + delete).
+ * @a new_path is either a bare name ("bar.txt"), which keeps the entry in
+ * @a old_path's directory, or a path on the SAME volume as @a old_path, in
+ * that directory or any other. The entry moves in one
+ * `EFI_FILE_PROTOCOL.SetInfo` and no data is copied, so the cost does not
+ * depend on the file's size; a directory moves with everything below it.
+ * Timestamps and attributes are unchanged.
  *
- * @return AXL_OK on success, AXL_ERR on cross-directory request,
- *     missing source, or backend failure.
+ * Never replaces: an existing @a new_path is #AXL_EXISTS and both entries
+ * are left as they were. (axl_file_replace() and axl_file_move() replace;
+ * this does not.)
+ *
+ * "Same volume" means the same filesystem, decided after both paths are
+ * resolved (current directory, either separator, map-name case and
+ * aliases) -- not by comparing their prefixes. Another volume is
+ * #AXL_UNSUPPORTED with nothing changed: the `EXDEV` case, which
+ * axl_file_move answers by copying. A filesystem that cannot move an entry
+ * between directories -- an `<axl/axl-fs-provider.h>` provider without a
+ * `rename` callback -- is #AXL_UNSUPPORTED too, with nothing changed; a
+ * rename within one directory still works there.
+ *
+ * #AXL_OK means VERIFIED: the entry is re-read through the same handle and
+ * must carry the new name, so a filesystem that accepts the request and
+ * changes nothing is #AXL_ERR. One consequence on FAT: a rename that
+ * changes only letter case ("a.txt" to "A.TXT") is the same name to the
+ * driver, which does nothing, so it is #AXL_ERR. A name FAT stores without
+ * its trailing dots and spaces ("a." is stored as "a") verifies as that
+ * stored form, so long as it differs from the entry's old name.
+ *
+ * Refused with nothing changed (#AXL_ERR): a directory moved into itself
+ * or below itself; a destination directory that does not exist; a path
+ * whose `..` climbs above the volume root; the volume root; a directory
+ * with any file below it open (the EDK2-derived FAT driver refuses that
+ * move, and so does a provider volume); a read-only source or volume.
+ *
+ * "Nothing changed" cannot extend to a failure DURING the move. The
+ * EDK2-derived FAT driver removes the old directory entry before writing
+ * the new one, so a destination directory that must grow on a full volume
+ * (or a full fixed-size FAT12/16 root) can fail after the removal and
+ * leave the entry under neither name. AXL cannot reorder the driver's
+ * writes; it logs an error when it finds the entry gone from both names.
+ *
+ * A handle already open on the moved file stays valid and follows it. An
+ * `AxlFileView` keyed by either name is invalidated, and renaming or
+ * moving a directory invalidates every view, since paths below it changed
+ * too.
+ *
+ * @return #AXL_OK once the entry is verified at @a new_path;
+ *     #AXL_NOT_FOUND if @a old_path does not exist;
+ *     #AXL_UNSUPPORTED if @a new_path is on another volume, or the
+ *     filesystem cannot move between directories -- nothing changed in
+ *     either case, and copying is the alternative (axl_file_move);
+ *     #AXL_EXISTS if @a new_path already exists;
+ *     #AXL_ERR otherwise, including NULL arguments and a missing
+ *     destination directory. Treat any negative value as failure.
  */
-int
+AXL_WARN_UNUSED int
 axl_file_rename(
     const char *old_path,  ///< current path (UTF-8)
-    const char *new_path   ///< new path or basename (UTF-8); same dir as @p old_path
+    const char *new_path   ///< bare name, or a path on the same volume (UTF-8)
+);
+
+/// axl_file_replace(): when the filesystem cannot make the move as one
+/// rename -- another volume, or a provider without a `rename` callback
+/// asked to move between directories -- copy a FILE instead. A directory
+/// is copied only with #AXL_FILE_REPLACE_TREE as well; without both flags
+/// a directory that cannot be renamed is #AXL_UNSUPPORTED.
+#define AXL_FILE_REPLACE_COPY  0x01u
+/// axl_file_replace(): replace whatever is at @a new_path -- a file, or a
+/// directory with everything below it -- lifting rename(2)'s kind and
+/// emptiness rules (WebDAV MOVE with `Overwrite: T`, RFC 4918 section
+/// 9.9.3). It never lifts the rule that a path cannot run through a
+/// non-directory, and never replaces a directory that holds @a old_path.
+/// With #AXL_FILE_REPLACE_COPY it also lets a directory that cannot be
+/// renamed be moved by copying it, with everything below it; the copy keeps
+/// a record of every entry it creates (a path each, on the order of 10 MB
+/// for 100,000 entries) so a copy that fails removes exactly those.
+#define AXL_FILE_REPLACE_TREE  0x02u
+
+/// What a successful axl_file_replace() did -- for a caller that must say
+/// so (WebDAV answers 201, 204 or 403 by it).
+typedef enum {
+    AXL_FILE_REPLACE_RESULT_CREATED  = 0, ///< nothing was at @a new_path; the entry moved there
+    AXL_FILE_REPLACE_RESULT_REPLACED = 1, ///< the entry at @a new_path was replaced
+    AXL_FILE_REPLACE_RESULT_SAME     = 2, ///< both paths named one entry; nothing changed
+    AXL_FILE_REPLACE_RESULT_RECASED  = 3, ///< both paths named one entry; its name's letter case changed
+} AxlFileReplaceResult;
+
+/**
+ * @brief Move an entry onto a path, replacing what is there --
+ *     `rename(2)` -- and put both entries back if it fails.
+ *
+ * Moves the file or directory at @a old_path to @a new_path as
+ * axl_file_rename() does, except that an existing @a new_path is REPLACED.
+ * @a new_path is a bare name, which keeps the entry in @a old_path's
+ * directory, or a path; either separator. With @a flags 0 this is
+ * rename(2): no copying, rename(2)'s rules and refusals. When nothing is
+ * at @a new_path, none of the aside steps below happen.
+ *
+ * FAT cannot rename over an existing name, so a replace is a sequence,
+ * ordered so that a failure AXL can observe puts both entries back:
+ *   1. every refusal below is decided before anything changes;
+ *   2. the entry at @a new_path is renamed ASIDE, in its own directory, to
+ *      a fresh name `~AXLhhhh.TMP` (h an uppercase hex digit), which needs
+ *      no long-name entry and is never a FAT-generated alias;
+ *   3. @a old_path must still resolve and @a new_path must not -- otherwise
+ *      the two were one entry, or @a new_path held @a old_path, under
+ *      spellings the stored names did not reveal: the aside is renamed back
+ *      and the call fails;
+ *   4. the source -- through the handle step 1 identified it by -- is
+ *      renamed to @a new_path, or, with #AXL_FILE_REPLACE_COPY when that
+ *      rename is #AXL_UNSUPPORTED, a file is copied there, flushed through
+ *      to the volume, given the source's modification time where the
+ *      destination can store it, and the source deleted (with
+ *      #AXL_FILE_REPLACE_TREE as well, a directory is copied the same way,
+ *      file by file, and the source tree then removed);
+ *   5. only then is the aside removed (with everything below it, under
+ *      #AXL_FILE_REPLACE_TREE). Removal acts only on the aside name, never
+ *      on @a new_path.
+ * If step 4 fails, the aside is renamed back to the name read through its
+ * own handle in step 2 (the long name, even when @a new_path spelled an
+ * 8.3 alias). A failed rename removes nothing: an entry found at
+ * @a new_path after all means the move happened, and it is #AXL_OK. A
+ * failed copy removes only the partial copy, through the handle that
+ * created it (a partial directory copy, by removing the tree it created).
+ * A copy whose source then cannot be deleted is undone the same way only
+ * while the source still holds every byte copied. A source tree whose
+ * removal fails part-way after a complete directory copy is not undone:
+ * the move happened, what is left of the source is logged as a warning,
+ * and the call returns #AXL_OK.
+ *
+ * A Ctrl-C during the sequence does not end the program inside it: before
+ * step 5 the sequence is undone and the call returns #AXL_CANCELLED; once
+ * step 5 has begun it completes. The interrupt stays pending for the
+ * caller's next yield.
+ *
+ * Identity is decided by the names the filesystem STORES, read through a
+ * handle on every component of both paths and compared exactly, on one
+ * volume -- never by comparing the strings given:
+ *   - @a new_path naming the same entry as @a old_path -- the same path,
+ *     `.\x`, the other separator, an 8.3 alias of the entry or of any
+ *     directory on the way, trailing dots FAT drops -- is #AXL_OK and
+ *     changes nothing, as rename(2) of two links to one file;
+ *   - except when @a new_path's LAST component differs from the entry's
+ *     stored name in letter case only ("a.txt" to "A.TXT"): the entry is
+ *     renamed to that spelling through an aside of itself, and #AXL_OK
+ *     means it now reads back so. Letter case elsewhere in @a new_path
+ *     changes nothing. (axl_file_rename() refuses a case-only change; one
+ *     SetInfo cannot make it.) Only ASCII letters count: a name that
+ *     differs from the stored one only in the case of other letters ("ä"
+ *     to "Ä"), which FAT also finds as the same entry, is SAME and keeps
+ *     its stored spelling.
+ * A filesystem that reports the name it was asked for instead of the one
+ * it stores (some providers) defeats this; step 3 is then what catches two
+ * spellings of one entry.
+ *
+ * rename(2)'s rules, in rename(2)'s order, before anything changes:
+ *   - a path through a non-directory: #AXL_NOT_DIR;
+ *   - without #AXL_FILE_REPLACE_COPY, @a new_path on another volume:
+ *     #AXL_UNSUPPORTED, whatever the kinds -- rename(2)'s `EXDEV`, which it
+ *     answers before every rule below;
+ *   - a directory moved into itself or below itself: #AXL_INVALID;
+ *   - @a new_path a directory that holds @a old_path: #AXL_NOT_EMPTY
+ *     (#AXL_INVALID with #AXL_FILE_REPLACE_TREE: replacing it would remove
+ *     the source);
+ *   - a directory onto a non-directory: #AXL_NOT_DIR; a non-directory onto
+ *     a directory: #AXL_IS_DIR;
+ *   - a directory onto a directory that holds anything: #AXL_NOT_EMPTY. A
+ *     directory that cannot be listed counts as holding something. A
+ *     directory onto an EMPTY directory replaces it.
+ * #AXL_FILE_REPLACE_TREE lifts the last two rules and no other.
+ *
+ * Without #AXL_FILE_REPLACE_COPY a move the filesystem cannot make as one
+ * rename is #AXL_UNSUPPORTED with nothing changed -- the `EXDEV` case.
+ *
+ * Also refused with nothing changed: #AXL_DENIED for an entry with the
+ * read-only attribute at either path, or a write-protected volume (FAT
+ * will neither rename nor remove such an entry); #AXL_NO_RESOURCES when
+ * @a new_path's volume reports less free space than the sequence may
+ * need -- the clusters its directory must grow by for the entries steps 2
+ * and 4 and an undo append there, counted from those names' directory-
+ * entry slots and the volume's cluster size, plus the source rounded up
+ * to whole clusters for a copy (a directory copy: each new directory's
+ * entries rounded up once, and each file's data). The replaced entry's
+ * space is not counted as free: it is held until step 5, so a replace
+ * across volumes needs room for both, where `mv` would remove the target
+ * first. The destination directory's growth is counted as if it had no
+ * free slot left -- AXL cannot see how many it has -- so a directory with
+ * room to spare can be refused by up to one cluster more than it needs; a
+ * fixed-size FAT12/16 root, which never grows, likewise. A volume that
+ * cannot report its free space is not refused.
+ *
+ * What it cannot prevent:
+ *   - The EDK2-derived FAT driver removes an entry's old directory entry
+ *     before writing the new one, and appends the new one, growing the
+ *     directory when it must. A growth that fails loses that entry under
+ *     both names. The free-space check closes this only where the reported
+ *     figure is exact and nothing else writes the volume meanwhile: FAT12
+ *     and FAT16 count their free clusters, but FAT32 reports its FSInfo
+ *     hint, which a volume last written elsewhere can overstate; and a
+ *     full fixed-size FAT12/16 root directory, which cannot grow, is not
+ *     covered. An entry found gone from every name is logged as an error
+ *     naming them.
+ *   - The same driver empties a file before removing its entry, so a
+ *     source delete that fails part-way after a copy can leave the source
+ *     short. The copy is then kept at @a new_path, the replaced entry
+ *     stays at its aside name, an error names both, and the call fails.
+ *   - Power loss or reset: from step 2 to step 5 the replaced entry is at
+ *     the aside name, and nothing removes it or puts it back after a
+ *     restart; a `~AXLhhhh.TMP` found later is such an entry.
+ *   - Other writers: step 1's checks hold only while nothing else changes
+ *     the directories involved during the call.
+ *   - A filesystem that reports the name it was asked for rather than the
+ *     one it stores (some providers): two spellings of one entry are then
+ *     caught only at step 3, and putting the aside back renames the entry
+ *     to the spelling its handle reported -- the destination's -- so the
+ *     call fails with the entry under @a new_path's spelling.
+ *   - An aside that cannot be renamed back is left at its aside name and
+ *     logged as an error naming both. An aside that cannot be removed after
+ *     a replace that succeeded is logged as a warning naming it, and the
+ *     call returns #AXL_OK: the replace happened. A tree removal that fails
+ *     part-way leaves the rest under the aside name, with that warning.
+ *
+ * A handle already open on @a old_path follows a RENAMED entry; after a
+ * copy it refers to a deleted file. A handle open on the replaced entry
+ * refers to a deleted entry once the call succeeds (FAT keeps no
+ * unlinked-but-open files). An `AxlFileView` keyed by either name is
+ * invalidated; moving or replacing a directory invalidates every view.
+ *
+ * @return #AXL_OK once the entry is verified at @a new_path, or when both
+ *     paths named one entry -- @a result says which;
+ *     #AXL_NOT_FOUND if @a old_path, or @a new_path's directory, does not
+ *     exist on a volume that resolved;
+ *     #AXL_INVALID for a directory into itself, an overlap
+ *     #AXL_FILE_REPLACE_TREE would destroy the source by, or an unknown bit
+ *     in @a flags;
+ *     #AXL_NOT_DIR, #AXL_IS_DIR, #AXL_NOT_EMPTY as above;
+ *     #AXL_UNSUPPORTED for a move only a copy could make, without
+ *     #AXL_FILE_REPLACE_COPY, or of a directory without
+ *     #AXL_FILE_REPLACE_TREE as well;
+ *     #AXL_DENIED for a read-only entry at either path, or a write-protected
+ *     volume;
+ *     #AXL_NO_RESOURCES for a volume short of the space above;
+ *     #AXL_CANCELLED for a Ctrl-C during the sequence, undone;
+ *     #AXL_ERR otherwise -- NULL arguments, a volume that does not resolve,
+ *     the volume root at either path, an allocation failure, a directory
+ *     with a file below it open (the FAT driver refuses to move it), a name
+ *     that cannot be read whole, a copy or flush that failed, one entry
+ *     under two spellings found only at step 3. Except as listed under
+ *     "What it cannot prevent", every failure leaves both entries as they
+ *     were. Treat any negative value as failure.
+ */
+AXL_WARN_UNUSED int
+axl_file_replace(
+    const char           *old_path,  ///< entry to move (UTF-8)
+    const char           *new_path,  ///< bare name, or a path (UTF-8)
+    uint32_t              flags,     ///< AXL_FILE_REPLACE_* (0 = rename(2))
+    AxlFileReplaceResult *result     ///< [out] what happened, written only on #AXL_OK; may be NULL
 );
 
 /**
- * @brief Move a file. Same-directory case is an atomic rename;
- *     cross-directory falls back to copy + delete.
+ * @brief Move a file or directory -- `mv`: axl_file_replace() with
+ *     #AXL_FILE_REPLACE_COPY.
  *
- * Tries axl_file_rename first (atomic on FAT for same-directory).
- * On refusal — typically because @p new_path's directory differs
- * from @p old_path's — falls back to chunked stream copy followed
- * by source delete.
+ * Everything axl_file_replace() says applies. Within a volume the entry
+ * moves by one rename, whatever its size; only when that rename is
+ * #AXL_UNSUPPORTED (another volume, or a filesystem that cannot move
+ * between directories) is a FILE copied in chunks, flushed, given the
+ * source's modification time, and the source deleted. A directory moves
+ * only by rename. An existing @a new_path is replaced; a failed copy or
+ * flush, or a source that cannot be deleted but still holds every byte,
+ * removes the copy and puts the replaced entry back. A source that a
+ * failed delete has EMPTIED is not undone: the copy -- then the only
+ * whole one -- stays at @a new_path, the replaced entry stays at its
+ * `~AXLhhhh.TMP` aside, an error names both, and the call fails (see
+ * axl_file_replace(), "What it cannot prevent"). A @a new_path that names
+ * the source itself -- the
+ * same path, another spelling, an 8.3 alias -- changes nothing; one that
+ * differs from the source's stored name in letter case only renames it to
+ * that spelling.
  *
- * Overwrite semantics: an existing file at @p new_path is replaced
- * (matches POSIX `rename(2)`). The implementation removes
- * @p new_path eagerly before attempting the rename / copy — this
- * is NOT atomic. If the subsequent move then fails, the prior
- * destination is gone; the source remains for retry. Callers that
- * want "fail-if-exists" must probe with axl_file_info first.
+ * Use axl_file_rename() for fail-if-exists, and axl_file_replace() to
+ * learn what happened (created, replaced, unchanged) or to replace a
+ * directory tree.
  *
- * Failure modes (the fallback is NOT atomic — no rollback):
- *
- *   - Copy fails mid-stream, or the destination cannot be flushed
- *     through to the volume → partial destination file exists;
- *     source is untouched. The source is deleted only after the copy
- *     is known to have reached the media, so a failed flush never
- *     costs both copies. Caller can retry or clean up @p new_path.
- *   - Copy succeeds but delete fails → both files exist. Caller
- *     can retry the delete.
- *
- * Callers needing atomicity across directories must orchestrate
- * temp-file + rename themselves at a higher layer.
- *
- * @return AXL_OK on success; AXL_ERR if either source missing,
- *     destination unwritable, copy fails, or delete fails.
+ * @return as axl_file_replace().
  */
 int
 axl_file_move(
@@ -440,10 +746,9 @@ axl_file_move(
  * checked — a missing path, a directory, or an unwritable volume fails
  * rather than reporting a hollow success.
  *
- * Path-based only: there is no handle-based `ftruncate` form. Resizing
- * an open `AxlStream` / `AxlFileWriter` in place is not offered — see
- * the invalidation note below for what a resize does to objects already
- * holding the file.
+ * axl_ftruncate() is the form for a file held open in an `AxlStream`;
+ * see the invalidation note below for what a resize by path does to
+ * objects already holding the file.
  *
  * The file must already exist: unlike axl_file_set_contents this never
  * creates one, and a missing @p path is AXL_ERR. Directories are
@@ -508,6 +813,155 @@ axl_file_truncate(
 );
 
 /**
+ * @brief Set the length of the file under an open stream -- `ftruncate(2)`.
+ *
+ * axl_file_truncate() for a file you hold open: it acts on the file @a s
+ * was opened on, wherever that file now is. A rename, or a new file created
+ * at the old path, does not redirect it -- which a path saved at open time
+ * would.
+ *
+ * Everything axl_file_truncate() says about the change itself applies: grow
+ * or shrink to exactly @a size; growth is zero-filled on the EDK2-derived
+ * FAT driver and is a real O(@a size) write; FAT caps a file at 4 GiB - 1;
+ * timestamps are preserved; #AXL_OK means the new length was re-read from
+ * the same handle and flushed.
+ *
+ * Bytes still held in @a s's own write buffer (axl_stream_set_buffering)
+ * are written out FIRST, so none of them can land after the resize. If
+ * writing them out fails, this returns #AXL_ERR before the length is
+ * touched.
+ *
+ * The stream's position is NOT moved, as with POSIX. After a shrink below
+ * it, a write extends the file again from that position, and a READ there
+ * fails rather than reporting end of file (the EDK2-derived FAT driver
+ * treats a read past the end as a device error) -- seek first.
+ *
+ * @a s must be a stream axl_fopen() returned, not one built over it
+ * (axl_text_stream_wrap, a compress filter): those, buffer streams, the
+ * console streams and custom streams are #AXL_UNSUPPORTED, unchanged. A
+ * stream opened "r" is #AXL_DENIED: UEFI refuses a size change through a
+ * read-only handle.
+ *
+ * @return #AXL_OK once the file is verified to be @a size bytes long;
+ *     #AXL_UNSUPPORTED if @a s is not a file stream;
+ *     #AXL_DENIED if @a s was opened for reading only;
+ *     #AXL_ERR on NULL @a s, a directory, a read-only or full volume, a
+ *     length the filesystem cannot represent or ignored, a file deleted
+ *     through another handle, or a failure writing out buffered bytes.
+ *     After #AXL_ERR from the resize itself the length is unspecified, as
+ *     for axl_file_truncate(). Treat any negative value as failure.
+ */
+AXL_WARN_UNUSED int
+axl_ftruncate(
+    AxlStream *s,     ///< stream from axl_fopen()
+    uint64_t   size   ///< new file length in bytes
+);
+
+/// Earliest time axl_file_set_mtime() accepts: 1980-01-01 00:00:00 UTC.
+#define AXL_FS_MTIME_MIN       315532800ULL
+/// Latest: 2107-12-31 23:59:59 UTC (FAT stores it as :58).
+#define AXL_FS_MTIME_MAX       4354819199ULL
+/// Earliest time EVERY volume keeps: 1981-01-01 00:00:00 UTC. The
+/// EDK2-derived FAT driver drops the year of a 1980 time, so a server that
+/// must clamp a time it was sent clamps here, not at #AXL_FS_MTIME_MIN.
+#define AXL_FS_MTIME_KEPT_MIN  347155200ULL
+
+/**
+ * @brief Set a file's or directory's modification time -- `utimensat(2)`
+ *     with the access time omitted.
+ *
+ * @a mtime_unix is Unix seconds, UTC: the clock and encoding axl_file_info()
+ * reports in `AxlFsEntry.mtime_unix`, so a time read from one file can be
+ * applied to another unchanged. It is written as UTC calendar fields with
+ * the time zone unspecified, which is how AXL reads every file time back.
+ *
+ * Only the modification time changes; size, attributes, name and creation
+ * time are untouched. There is no access-time argument: UEFI's FAT driver
+ * ignores a supplied access time and stamps its own.
+ *
+ * Range and precision:
+ *   - @a mtime_unix below #AXL_FS_MTIME_MIN or above #AXL_FS_MTIME_MAX is
+ *     #AXL_INVALID on EVERY volume, refused before the volume is touched:
+ *     FAT's range, applied everywhere so that a time one volume accepts
+ *     another does not refuse (the EDK2-derived driver would silently
+ *     clamp a later year to 2107);
+ *   - precision is the volume's: FAT keeps two-second steps (an odd second
+ *     as the even second below it); a provider may keep the second.
+ * axl_file_info() reads back the value actually stored.
+ *
+ * #AXL_OK means VERIFIED: the time is re-read through the same open handle
+ * and must equal @a mtime_unix or lie one second below it, and the change
+ * is flushed before returning. A filesystem that accepts the request but
+ * keeps another time -- an `<axl/axl-fs-provider.h>` provider whose
+ * `set_info` does not honour `mtime_unix` (a 9P mount does) -- is
+ * #AXL_ERR. After a failed check the previous time is written back, so a
+ * failure leaves the time as it was (best effort: if that write fails too,
+ * the time is unspecified). Known case: the EDK2-derived FAT driver drops
+ * the year of any 1980 time and keeps the old one, so a 1980 time on a
+ * file stamped in another year is #AXL_ERR; #AXL_FS_MTIME_KEPT_MIN is the
+ * first second every volume keeps.
+ *
+ * @a path must exist; nothing is created. The volume root has no directory
+ * entry on FAT and is #AXL_ERR. A file with the read-only attribute is
+ * #AXL_DENIED, as the UEFI Shell's `touch` refuses it: UEFI opens such a
+ * file read-only, and SetInfo then silently ignores the time.
+ *
+ * A later write through ANY handle on the file stamps the current time
+ * again when that handle is flushed or closed, as on POSIX. A caller still
+ * holding unwritten data in an `AxlStream` on the same file must
+ * axl_fflush() it first, or use axl_fset_mtime() on that stream.
+ *
+ * @return #AXL_OK once the stored time is verified;
+ *     #AXL_INVALID if @a mtime_unix is outside the range above;
+ *     #AXL_NOT_FOUND if @a path does not exist;
+ *     #AXL_DENIED if the file is read-only;
+ *     #AXL_ERR otherwise (NULL @a path, the volume root, a read-only
+ *     volume, a time the filesystem did not keep, a device error). Treat
+ *     any negative value as failure.
+ */
+AXL_WARN_UNUSED int
+axl_file_set_mtime(
+    const char *path,       ///< file or directory path (UTF-8)
+    uint64_t    mtime_unix  ///< modification time, Unix seconds, UTC
+);
+
+/**
+ * @brief Set the modification time of the file under an open stream --
+ *     `futimens(2)` with the access time omitted.
+ *
+ * axl_file_set_mtime() for a file you hold open, acting on the file @a s
+ * was opened on wherever it now is. Its encoding, range (#AXL_INVALID
+ * outside #AXL_FS_MTIME_MIN..#AXL_FS_MTIME_MAX), precision, verification
+ * and restore-on-failure rules all apply unchanged.
+ *
+ * Bytes still held in @a s's own write buffer are written out FIRST: they
+ * would otherwise reach the file afterwards and stamp the current time
+ * over the one set here. That makes write, axl_fset_mtime(), axl_fclose()
+ * -- the order `put -p` and `scp -p` use -- keep the time. A write made
+ * after this call, through any handle, stamps the current time again, as
+ * on POSIX.
+ *
+ * @a s must be a stream axl_fopen() returned and opened for writing: a
+ * read-only handle makes the FAT driver drop the time silently, so a
+ * stream opened "r" is #AXL_DENIED rather than a verification failure.
+ * Other streams are #AXL_UNSUPPORTED.
+ *
+ * @return #AXL_OK once the stored time is verified;
+ *     #AXL_INVALID if @a mtime_unix is outside the range above;
+ *     #AXL_UNSUPPORTED if @a s is not a file stream;
+ *     #AXL_DENIED if @a s was opened for reading only, or the file has the
+ *     read-only attribute;
+ *     #AXL_ERR otherwise (NULL @a s, a time the filesystem did not keep, a
+ *     deleted file, a failure writing out buffered bytes). Treat any
+ *     negative value as failure.
+ */
+AXL_WARN_UNUSED int
+axl_fset_mtime(
+    AxlStream *s,          ///< stream from axl_fopen(), opened for writing
+    uint64_t   mtime_unix  ///< modification time, Unix seconds, UTC
+);
+
+/**
  * @brief Create a directory (idempotent).
  *
  * Succeeds if @p path already exists AS A DIRECTORY (so mkdir-p and
@@ -554,6 +1008,19 @@ axl_dir_open(
  * `entry->name` is populated with the entry's basename;
  * `entry->attributes` carries the kind bits
  * (`AXL_FS_ATTR_DIRECTORY` for sub-dirs, etc.).
+ *
+ * On every driver, an entry whose name cannot be joined onto a path as ONE
+ * component -- empty, or holding `\` or `/` -- is skipped, as is one too
+ * long for `entry->name` (over 765 bytes of UTF-8), which cut short could
+ * be a sibling's name. A FAT name always fits (FAT creates at most 255
+ * UTF-16 units); a longer one comes only from a non-FAT driver, a
+ * provider, or a FAT volume written by a non-conforming tool (the
+ * EDK2-derived driver reads long names of up to 260 units). The first
+ * skipped in a directory is logged at
+ * warning with the name escaped, the rest at debug. "." and ".." are
+ * returned only from drivers that list them: FAT lists them in a
+ * subdirectory but not in a volume's root, and a provider-published volume
+ * lists them nowhere.
  *
  * @return true if an entry was read, false at end of directory.
  */
@@ -606,9 +1073,14 @@ typedef int (*AxlDirWalkFn)(
  *   - `max_depth = N` lists at most N levels of nesting below root.
  *   - `max_depth <= 0` is rejected (returns -1).
  *
- * @return 0 on a clean traversal, the callback's non-zero return
- *     value if it stopped the walk, or -1 if @p root could not be
- *     opened or arguments are invalid.
+ * The walk is iterative and keeps its state on the heap -- one open
+ * directory and one path per level -- so a deep tree costs no stack, and
+ * every path reaches @p fn whole, however long. A subdirectory that cannot
+ * be opened is skipped, not an error.
+ *
+ * @return 0 on a clean traversal; the callback's non-zero return value,
+ *     from whatever level it came, if it stopped the walk; or -1 if @p root
+ *     could not be opened, arguments are invalid, or memory ran out.
  */
 int
 axl_dir_walk(

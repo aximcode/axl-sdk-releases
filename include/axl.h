@@ -138,6 +138,10 @@
 #include <axl/axl-net.h>
 #include <axl/axl-net-opts.h>
 #include <axl/axl-9p.h>
+#include <axl/axl-ssh-core.h>
+#include <axl/axl-ssh-server.h>
+#include <axl/axl-ssh-host-key.h>
+#include <axl/axl-ssh-channel.h>
 #include <axl/axl-gfx.h>
 #include <axl/axl-edid.h>
 #include <axl/axl-input.h>
@@ -339,7 +343,9 @@ void _axl_cleanup(void);
   DriverEntry(AxlHandle _ImageHandle, AxlSystemTable *_SystemTable) {    \
     axl_driver_init(_ImageHandle, _SystemTable);                         \
     axl_driver_set_unload((void *)_axl_driver_unload_stub);              \
+    _axl_driver_entry_begin();                                           \
     int _rc = entry_func(_ImageHandle, _SystemTable);                    \
+    _axl_driver_entry_end();                                             \
     /* ENTRY FAILURE IS THE OTHER TEARDOWN PATH, and the firmware gives  */\
     /* no second chance: EDK2's CoreStartImage unloads a failed image    */\
     /* through CoreUnloadAndCloseImage, which -- unlike CoreUnloadImage  */\

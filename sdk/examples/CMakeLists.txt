@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 # C and CXX. The C++ examples were unreachable from this build for as long as
 # it said `C` alone -- check-examples compiled them, so they were not DEAD, but
 # the build system a consumer copies had no C++ path at all.

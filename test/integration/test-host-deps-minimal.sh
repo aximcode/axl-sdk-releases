@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=podman est=8 local-only=0
+# test-meta: arch=x64 needs=podman est=8 cpu=2 local-only=0
 # test-host-deps-minimal.sh — are the SDK's host prerequisites enough?
 #
 # WHY THIS EXISTS. release.yml's smoke test extracts the SDK tarball and drives
@@ -114,15 +114,22 @@ if [[ -n "$_missing" ]]; then
     exit 0
 fi
 
-OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
+# The container is OWNED (test/integration/lib/podman-run.sh): named for this
+# run and removed by the EXIT trap if the test is killed mid-run, instead of
+# staying "Up" after its podman client dies. Its package install goes through
+# scripts/container-pkg.sh: bounded, and a mirror failure is named as one.
+# shellcheck source=/dev/null
+source "$DIR/test/integration/lib/podman-run.sh"
+podman_owned_init
+OUT=$(mktemp -d); trap 'podman_owned_cleanup; rm -rf "$OUT"' EXIT
 
-podman run --rm \
+podman_owned_run "$OUT/run.log" \
     -v "$STAGE:/opt/axl-sdk:ro" \
     -v "$X64_TC:$X64_TC:ro" \
     -v "$AA64_TC:$AA64_TC:ro" \
     -v "$DIR/sdk/examples:/ex:ro" \
     -e "AXL_DEPS=$DEPS" \
-    debian:stable-slim bash -c '
+    debian:stable-slim bash -c "$(cat "$DIR/scripts/container-pkg.sh")"'
 set -u
 export DEBIAN_FRONTEND=noninteractive
 # The image must genuinely lack a toolchain, or the run proves nothing.
@@ -136,9 +143,8 @@ echo "precondition: image has no gcc/g++/ld/ar/objcopy"
 # whether the empty list was really empty. Not running it at all means the four
 # builds below execute on the image exactly as the precondition found it.
 if [ -n "$AXL_DEPS" ]; then
-    apt-get update -qq >/dev/null 2>&1
     # shellcheck disable=SC2086
-    apt-get install -y -qq $AXL_DEPS >/dev/null 2>&1 || { echo "FAIL: apt could not install: $AXL_DEPS"; exit 1; }
+    pkg_install $AXL_DEPS
 else
     echo "no declared dependencies -- installing nothing"
 fi
@@ -184,12 +190,16 @@ check "x64 C++"  axl-c++ ""             /ex/hello.cpp 8664
 check "aa64 C"   axl-cc  "--arch aa64"  /ex/hello.c   aa64
 check "aa64 C++" axl-c++ "--arch aa64"  /ex/hello.cpp aa64
 exit $rc
-' 2>&1 | tee "$OUT/run.log"
-rc=${PIPESTATUS[0]}
+'
+rc=$?
+cat "$OUT/run.log"
 
 echo ""
 if [[ $rc -eq 0 ]]; then
     echo "host-deps-minimal: PASS — the declared set is sufficient"
+elif grep -q '^AXL-PKG-FAIL:' "$OUT/run.log"; then
+    echo "host-deps-minimal: FAIL — the package install did not complete (see"
+    echo "  AXL-PKG-FAIL above): the mirror or the network, not the declared set."
 else
     echo "host-deps-minimal: FAIL — install.sh's need_cmd set is missing something,"
     echo "  or a shipped build path reaches for a tool the SDK never asked for."

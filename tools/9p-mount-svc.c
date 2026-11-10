@@ -157,23 +157,16 @@ mount_teardown(
     m_volume = NULL;
     axl_9p_disconnect(m_client);
     m_client = NULL;
-    /* Deliberately return AXL_OK regardless of rc above, NOT a bare "ignore
-       the error" - _axl_service_driver_unload_stub ORs a non-OK teardown rc
-       into the EFI_STATUS it hands back to gBS->UnloadImage precisely so a
-       failed teardown does not get absorbed into a "successful" unload
-       (axl-service.c's own comment on that OR). Propagating rc here would
-       trip that, but the unload stub uninstalls this driver's marker
-       protocol (what axl_service_is_running/`9p status` key off) BEFORE
-       returning to the firmware - by the time gBS->UnloadImage sees a
-       non-EFI_SUCCESS return and (per the UEFI spec) leaves the image
-       resident, the marker is already gone. `9p status` would then report
-       "stopped" for an image that is still occupying memory: a worse lie
-       than the one this discards. axl_9p_unmount's only non-OK returns are
-       "token already dead" / "not an SFS handle" (axl-9p-mount.c), neither
-       reachable from this single, non-reentrant teardown call - so today
-       this trade costs nothing in practice, but it is not accidental, and a
-       future non-degenerate failure mode should be weighed against the
-       same "resident-but-reports-stopped" outcome before changing this. */
+    /* AXL_OK whatever rc said, because a non-OK return means "I still hold
+       something; call me again" -- the framework then keeps this image
+       resident and re-runs this teardown on the next stop (see
+       AxlServiceTeardown) -- and there is nothing left to retry.
+       axl_9p_unmount frees its context whether or not the unpublish
+       succeeded, and its only non-OK returns are "token already dead" /
+       "not an SFS handle" (axl-9p-mount.c), neither of which leaves a
+       volume published. Both pointers are cleared above and both calls are
+       NULL-safe, so a second run would be harmless, but a failing return
+       would only pin an image that has nothing left to release. */
     return AXL_OK;
 }
 

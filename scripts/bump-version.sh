@@ -4,8 +4,8 @@
 # Usage: scripts/bump-version.sh X.Y.Z
 #
 # After running, review the diff and commit both files together.
-# The Makefile's check-version target will refuse to build if the
-# two files disagree, so using this script is the safe way to bump.
+# The build refuses to configure (CMakeLists.txt) if the two files
+# disagree, so using this script is the safe way to bump.
 
 set -euo pipefail
 

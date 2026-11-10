@@ -17,6 +17,7 @@
 #include "axl-test.h"
 #include "../data/pk-ecdsa-p256-vector.h"
 #include "axl-pk-provider.h"
+#include "../../deps/ed25519-ref10/crypto_api.h"
 
 // ---------------------------------------------------------------------------
 // axl_pk_sig_params_ok() -- the one enforcement point for spec §5's
@@ -132,6 +133,17 @@ test_verify_outcomes(void)
 {
     test_check(axl_pk_available() == true,
                "pk_available: true");
+
+    /* The other half of AxlTestEd25519's missing-provider set: this
+       binary calls axl_pk_enable_mbedtls() (in test_crypto_main), so the
+       queries that answer "no" there answer "yes" here. If both binaries
+       ever agree, the weak seam has stopped discriminating. */
+    test_check(axl_pk_alg_available(AXL_PK_ECDSA_P256)
+               && axl_pk_alg_available(AXL_PK_ECDSA_P384)
+               && axl_pk_alg_available(AXL_PK_RSA),
+               "pk_alg_available: ECDSA P-256 / P-384 / RSA with the mbedTLS pull");
+    test_check(_axl_pk_provider_for(AXL_PK_RSA) != NULL,
+               "pk_alg_available: the mbedTLS provider resolves");
 
     /* The known-good vector verifies. */
     test_check(axl_pk_verify(AXL_PK_ECDSA_P256,
@@ -337,6 +349,31 @@ test_key_handle(void)
     axl_pk_key_free(rk);
 }
 
+/* Captures AxlPk's missing-provider error line (domain "pk"). */
+static size_t pk_ed_absent_errors;
+static char   pk_ed_absent_msg[256];
+
+static void
+pk_ed_absent_capture(int level, const char *domain, const char *message,
+                     const AxlRealtime *stamp, void *data)
+{
+    (void)stamp;
+    (void)data;
+    if (level == AXL_LOG_ERROR && domain != NULL
+        && axl_strcmp(domain, "pk") == 0) {
+        pk_ed_absent_errors++;
+        axl_snprintf(pk_ed_absent_msg, sizeof(pk_ed_absent_msg), "%s",
+                     message);
+    }
+}
+
+static void
+pk_ed_absent_reset(void)
+{
+    pk_ed_absent_errors = 0;
+    pk_ed_absent_msg[0] = '\0';
+}
+
 static void
 test_pk_reserved_alg_fails_closed(void)
 {
@@ -344,9 +381,43 @@ test_pk_reserved_alg_fails_closed(void)
        must fail closed at every entry point rather than being quietly
        treated as P-256 -- md_for_alg and ec_order_bytes are ternaries,
        so no -Wswitch names them when an algorithm is added. */
+    pk_ed_absent_reset();
+    test_check(axl_log_add_handler(pk_ed_absent_capture, NULL) == AXL_OK,
+               "pk reserved: capture handler installed");
     AxlPkKey *k = axl_pk_key_new(AXL_PK_ED25519);
     test_check(k == NULL, "pk reserved: key_new(ED25519) returns NULL");
+    axl_log_remove_handler(pk_ed_absent_capture);
     axl_pk_key_free(k);
+    /* ...and says which function would have made it work: this binary
+       never calls axl_pk_enable_ed25519(). Exactly one line, verbatim. */
+    test_check(pk_ed_absent_errors == 1
+               && axl_strcmp(pk_ed_absent_msg,
+                             "Ed25519 unavailable: call axl_pk_enable_ed25519()"
+                             " before using Ed25519 keys") == 0,
+               "pk reserved: key_new(ED25519) logs the exact enable line once");
+
+    /* The DER-import half of the same diagnostic: an Ed25519
+       SubjectPublicKeyInfo (RFC 8032 TEST 1's key) names id-Ed25519, so
+       the refusal is blamed on the missing provider -- once, verbatim. */
+    static const uint8_t ed_spki[44] = {
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21,
+        0x00, 0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b,
+        0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda,
+        0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+    };
+    pk_ed_absent_reset();
+    test_check(axl_log_add_handler(pk_ed_absent_capture, NULL) == AXL_OK,
+               "pk reserved: capture handler installed (DER)");
+    AxlPkKey *ek = axl_pk_key_load_public(ed_spki, sizeof(ed_spki));
+    axl_log_remove_handler(pk_ed_absent_capture);
+    test_check(ek == NULL,
+               "pk reserved: load_public(Ed25519 SPKI) returns NULL");
+    axl_pk_key_free(ek);
+    test_check(pk_ed_absent_errors == 1
+               && axl_strcmp(pk_ed_absent_msg,
+                             "Ed25519 unavailable: call axl_pk_enable_ed25519()"
+                             " before using Ed25519 keys") == 0,
+               "pk reserved: load_public(Ed25519 SPKI) logs the exact enable line once");
 
     /* A real P-256 key asked to behave as a reserved algorithm cannot
        be constructed through the public API, so drive the reserved
@@ -361,14 +432,60 @@ test_pk_reserved_alg_fails_closed(void)
                "pk reserved: verify(ED25519) refuses");
 
     /* axl_pk_alg_available reports per-algorithm availability, which
-       is what distinguishes 'not linked' from 'failed'. ECDSA and RSA
-       are always in; Ed25519 is not implemented until E2b. */
+       is what distinguishes 'not linked' from 'failed'. This binary
+       enables ECDSA/RSA and not Ed25519. */
     test_check(axl_pk_alg_available(AXL_PK_ECDSA_P256),
                "pk reserved: P-256 is available");
     test_check(axl_pk_alg_available(AXL_PK_RSA),
                "pk reserved: RSA is available");
     test_check(!axl_pk_alg_available(AXL_PK_ED25519),
-               "pk reserved: Ed25519 is not available yet");
+               "pk reserved: Ed25519 is not enabled in this image");
+}
+
+static void
+test_ed25519_vendored_links(void)
+{
+    /* E2b Task 1 vendors ref10 and wires its three externals, but
+       registers NO provider -- so the algorithm must STILL fail closed
+       through the public API. This test pins both halves at once,
+       which is the only claim Task 1 is entitled to make:
+
+         - the vendored code, its externals and the build rule are all
+           correct, evidenced by it reproducing a vector it did not
+           choose;
+         - and nothing about AXL_PK_ED25519's reachability has moved.
+
+       test_pk_reserved_alg_fails_closed() above owns the full
+       fail-closed set; the one assertion repeated here is what ties
+       the two halves together in a single test. */
+    static const uint8_t seed1[32] = {
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
+        0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+        0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19,
+        0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60
+    };
+    /* RFC 8032 §7.1 TEST 1. Bytes specified by someone else, so
+       passing is evidence about the standard rather than about us. */
+    static const char *PUB1 =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    uint8_t pk[crypto_sign_ed25519_PUBLICKEYBYTES];
+    uint8_t sk[crypto_sign_ed25519_SECRETKEYBYTES];
+
+    test_check(crypto_sign_ed25519_keypair_from_seed(pk, sk, seed1) == 0,
+               "ed25519 vendored: keypair_from_seed succeeds");
+    test_check(test_hex_equals(pk, sizeof(pk), PUB1),
+               "ed25519 vendored: RFC 8032 TEST 1 public key");
+    /* ref10's secret key is seed || public key, not a clamped scalar.
+       Pinning that layout here is what the provider's union arm relies
+       on, and it is the half of the contract a resync could silently
+       change. */
+    test_check(test_hex_equals(sk + 32, 32, PUB1),
+               "ed25519 vendored: sk's second half is the public key");
+
+    /* Still fails closed -- no provider is registered until Task 3. */
+    test_check(!axl_pk_alg_available(AXL_PK_ED25519),
+               "ed25519 vendored: still unavailable without a provider");
 }
 
 static void
@@ -421,9 +538,10 @@ test_pk_raw_public_rejects(void)
                    == NULL,
                "pk raw: RSA has no raw form");
 
-    /* Ed25519 is declared but not implemented until E2b. */
+    /* Ed25519 is opt-in (axl_pk_enable_ed25519), and this binary never
+       enables it, so no provider takes the raw key. */
     test_check(axl_pk_key_from_raw_public(AXL_PK_ED25519, junk, 32) == NULL,
-               "pk raw: Ed25519 not available yet");
+               "pk raw: Ed25519 not enabled in this image");
 
     /* Wrong length for the curve. */
     test_check(axl_pk_key_from_raw_public(AXL_PK_ECDSA_P256, junk, 64)
@@ -759,6 +877,51 @@ test_ecdh(void)
     axl_ecdh_free(NULL);  /* NULL-safe */
 }
 
+// ---------------------------------------------------------------------------
+// Entropy policy -- axl_crypto_set_weak_entropy_allowed() /
+// axl_crypto_is_weak_entropy_allowed().
+//
+// The DRBG behind every key this SDK produces has one entropy source,
+// EFI_RNG_PROTOCOL. What happens when that source is missing is a
+// security decision, so it is pinned here rather than left to whatever
+// the platform shim happens to do. The fallback path itself is only
+// reachable on firmware that publishes no RNG -- see the sabotage run
+// recorded in the commit message.
+// ---------------------------------------------------------------------------
+
+static void
+test_weak_entropy_policy(void)
+{
+    /* The default is the whole point: a platform with no hardware RNG
+       fails to produce a key rather than deriving one from a clock. */
+    test_check(!axl_crypto_is_weak_entropy_allowed(),
+               "entropy: weak fallback is DISALLOWED by default");
+
+    axl_crypto_set_weak_entropy_allowed(true);
+    test_check(axl_crypto_is_weak_entropy_allowed(),
+               "entropy: opt-in reads back true");
+
+    axl_crypto_set_weak_entropy_allowed(false);
+    test_check(!axl_crypto_is_weak_entropy_allowed(),
+               "entropy: opt-in is revocable");
+
+    /* Failing closed costs nothing where the firmware publishes
+       EFI_RNG_PROTOCOL -- the DRBG still seeds and keys are still
+       produced. axl_rng_bytes() is the honest probe for that: it is
+       the one entry point that never falls back. */
+    uint8_t probe[8];
+    if (axl_rng_bytes(probe, sizeof probe) != AXL_OK) {
+        /* One balancer for the one populated assertion below. */
+        test_skip_n(1, "entropy: no EFI_RNG_PROTOCOL -- fail-closed keygen "
+                       "SKIPPED");
+        return;
+    }
+    AxlPkKey *k = axl_pk_key_new(AXL_PK_ECDSA_P256);
+    test_check(k != NULL,
+               "entropy: hardware RNG present -- keygen succeeds fail-closed");
+    axl_pk_key_free(k);
+}
+
 static int
 test_crypto_main(int argc, char **argv)
 {
@@ -767,11 +930,19 @@ test_crypto_main(int argc, char **argv)
 
     test_print_header("AxlCrypto");
 
+    /* ECDSA/RSA through the key-handle API are opt-in. (axl_pk_verify()
+       below would link the provider by itself; the call is still the
+       documented way, and what a direct user writes.) Deliberately NOT
+       axl_pk_enable_ed25519() -- its fail-closed half is asserted here. */
+    axl_pk_enable_mbedtls();
+
+    test_weak_entropy_policy();
     test_pk_sig_params_ok();
     test_arg_validation();
     test_verify_outcomes();
     test_key_handle();
     test_pk_reserved_alg_fails_closed();
+    test_ed25519_vendored_links();
     test_pk_raw_public_roundtrip();
     test_pk_raw_public_rejects();
     test_aead();

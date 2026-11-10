@@ -1,5 +1,9 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=21 local-only=0
+# test-meta: arch=x64 needs= est=21 local-only=0 guest=none
+# guest=none: the agent cannot run on its machine -- on the replayed CPU
+#   model (qemu64,vendor=GenuineIntel,family=6,model=42,stepping=7) the
+#   agent prints "agent: network bring-up failed" (measured 2026-11-08,
+#   booted and in the pool's boot), so no class of it ever comes up.
 # test-cpu-replay-qemu.sh — HF4: end-to-end CPU identity replay.
 #
 # A fixture cpu.json carrying a distinctive CPU identity, through
@@ -11,9 +15,9 @@
 #
 # x86 runs under the integration job's KVM (CPUID overrides honoured by
 # KVM via the chosen model). The aarch64 leg needs aa64 tools + an
-# aarch64 TCG boot; it runs locally (where `make ARCH=aa64 tools` has
-# been done) and SKIPs in the x64-only CI job. Auxiliary; opts out of
-# the test-axl.sh ratchet.
+# aarch64 TCG boot; it runs locally (where
+# `scripts/axl-build.sh ARCH=aa64 tools` has been done) and SKIPs in the
+# x64-only CI job. Auxiliary; opts out of the test-axl.sh ratchet.
 
 set -euo pipefail
 
@@ -32,7 +36,7 @@ fail() { echo "FAIL: $1"; [[ -n "${2:-}" ]] && echo "  $2"; FAIL=$((FAIL + 1)); 
 
 if [[ ! -x "$SYSINFO_X64" ]]; then
     echo "Building x64 tools..."
-    make -C "$PROJECT_DIR" ARCH=x64 tools 2>&1 | tail -3
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tools 2>&1 | tail -3
 fi
 [[ -x "$SYSINFO_X64" ]] || { echo "FAIL: sysinfo.efi (x64) not found"; exit 1; }
 
@@ -72,8 +76,8 @@ fi
 # aarch64: MIDR replay (local only — needs aa64 tools + TCG boot)
 # ----------------------------------------------------------------------
 # Gate on the aa64 sysinfo binary (run-qemu.sh does its own QEMU
-# discovery). Built locally via `make ARCH=aa64 tools`; absent in the
-# x64-only CI job, so this leg skips there.
+# discovery). Built locally via `scripts/axl-build.sh ARCH=aa64 tools`;
+# absent in the x64-only CI job, so this leg skips there.
 if [[ -x "$SYSINFO_AA64" ]]; then
     FIX_A="$(mktemp -d)"
     cat > "$FIX_A/cpu.json" <<'EOF'
@@ -94,7 +98,7 @@ EOF
     fi
 else
     echo "SKIP: aarch64 CPU replay (no qemu-system-aarch64 or aa64 sysinfo.efi" \
-         "— build with 'make ARCH=aa64 tools'; runs locally, skipped in x64 CI)"
+         "— build with: scripts/axl-build.sh ARCH=aa64 tools; runs locally, skipped in x64 CI)"
 fi
 
 echo

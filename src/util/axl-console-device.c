@@ -19,6 +19,7 @@
 #include <uefi/axl-uefi.h>
 #include "../backend/axl-backend.h"   /* axl_backend_console_text_set_mode */
 
+#include "axl-console-device-internal.h"   /* _axl_console_device_test_point */
 #include "axl-console-emit.h"
 #include "axl-console-input.h"
 
@@ -31,6 +32,7 @@ AXL_LOG_DOMAIN("condev");
 #define DEVICE_DEFAULT_COLS   80   /* when cfg geometry is 0 and no physical size */
 #define DEVICE_DEFAULT_ROWS   25
 #define DEVICE_MAX_EVICTED    16   /* console-out handles we can re-tag on uninstall */
+#define DEVICE_HOLD_KEYS      256  /* physical keys read but not yet in the 63-key ring */
 #define DEVICE_MAX_MODES      32   /* physical text modes we mirror under passthrough */
 #define DEVICE_DEFAULT_POLL_MS 15  /* read_physical timer period when cfg is 0 */
 
@@ -88,6 +90,9 @@ struct AxlConsoleDevice {
        them and let ConSplitter restore GraphicsConsole. */
     EFI_HANDLE                       evicted[DEVICE_MAX_EVICTED];
     uint32_t                         evicted_count;
+    /* evicted[i] was a SCREEN in the StdErr fan-out too, and its StdErr tag
+       went with its ConOut one (see evict_other_conout_devices). */
+    bool                             evicted_err[DEVICE_MAX_EVICTED];
 
     /* --- Input relay (take_input) -------------------------------------------
        Our own ConIn/ConInEx published on my_handle (so gST->ConsoleInHandle's
@@ -111,6 +116,16 @@ struct AxlConsoleDevice {
     uint32_t                           input_poll_ms;
     EFI_HANDLE                         evicted_in[DEVICE_MAX_EVICTED];
     uint32_t                           evicted_in_count;
+
+    /* Physical keys that have ARRIVED (read from a firmware keyboard, filtered,
+       gated, their notifies fired) but are not yet DELIVERED to the ring, which
+       the guest drains. A FIFO of head + count, touched only at TPL_CALLBACK
+       (the read timer) or with TPL raised (Reset, queued_keys). */
+    EFI_KEY_DATA                       hold[DEVICE_HOLD_KEYS];
+    uint32_t                           hold_head;
+    uint32_t                           hold_count;
+    void                             (*discard_hook)(void);   /* test seam: runs as
+                                                                     Reset's raised section ends */
 
     /* --- Pointer take-over (take_pointer) -----------------------------------
        Every EFI_SIMPLE_POINTER_PROTOCOL is uninstalled from the handle database
@@ -149,6 +164,35 @@ struct AxlConsoleDevice {
 
 static AxlConsoleDevice *g_dev;   /* the one active instance */
 
+/* Calls into the device that have not returned yet: every published protocol
+   method counts itself from its first statement to its return, and uninstall
+   refuses (AXL_BUSY) while any is live -- a TPL_CALLBACK tick that preempted the
+   Shell mid-OutputString must not free the instance the call resumes into.
+   STATIC, not a field: a call the firmware had already dispatched when an
+   uninstall preempted it reaches the method AFTER the free, so the counter and
+   the g_dev check must live outside the freed instance. Each method bumps the
+   counter BEFORE it reads g_dev, so that late call either is counted in time
+   (and the uninstall refuses) or reads g_dev == NULL and touches nothing. A
+   preemption between the load and the store of the increment is harmless: the
+   preempting code's own calls are balanced before it returns. */
+static volatile uint32_t g_in_call;
+
+/* Enter a counted call. true when a device is installed to serve it. */
+static inline bool
+dev_call_enter(void)
+{
+    g_in_call++;
+    __asm__ volatile("" ::: "memory");   /* read g_dev only after the count */
+    return g_dev != NULL;
+}
+
+static inline void
+dev_call_leave(void)
+{
+    __asm__ volatile("" ::: "memory");
+    g_in_call--;
+}
+
 /* The console-out marker tag ConSplitter binds on lives in the UEFI headers
    (gEfiConsoleOutDeviceGuid, hand-written in axl-uefi-extra.h — it is an
    MdeModulePkg impl GUID, not a spec GUID). Our own vendor GUID naming this
@@ -156,14 +200,30 @@ static AxlConsoleDevice *g_dev;   /* the one active instance */
 static EFI_GUID DEVICE_VENDOR_GUID =
     { 0xA713D0A5, 0xC0DE, 0x4A11, { 0xB0, 0x0B, 0x10, 0xCA, 0x1C, 0x0F, 0xFE, 0xED } };
 
+/* The one spelling of our device path: the install publishes it and
+   axl_console_device_present() searches for it, so they cannot drift apart. */
+static void
+device_path_init(DeviceDevicePath *dp)
+{
+    dp->vendor.Header.Type      = HARDWARE_DEVICE_PATH;
+    dp->vendor.Header.SubType   = HW_VENDOR_DP;
+    dp->vendor.Header.Length[0] = (uint8_t)sizeof(VENDOR_DEVICE_PATH);
+    dp->vendor.Header.Length[1] = 0;
+    dp->vendor.Guid             = DEVICE_VENDOR_GUID;
+    dp->end.Type      = END_DEVICE_PATH_TYPE;
+    dp->end.SubType   = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+    dp->end.Length[0] = (uint8_t)sizeof(EFI_DEVICE_PATH_PROTOCOL);
+    dp->end.Length[1] = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Our SimpleTextOut methods — feed the shared engine, own my_mode. No foreign
 // vtable, no passthrough (the device is the SOLE console writer after eviction).
 // Geometry is fixed (dev->cols/rows), so resolved == configured for the engine.
 // ---------------------------------------------------------------------------
 
-static EFI_STATUS EFIAPI
-dev_reset(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ext)
+static EFI_STATUS
+dev_reset_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ext)
 {
     (void)This;
     (void)ext;
@@ -172,7 +232,18 @@ dev_reset(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ext)
 }
 
 static EFI_STATUS EFIAPI
-dev_output_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+dev_reset(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ext)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_reset_body(This, ext);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_output_string_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
 {
     (void)This;
     AxlConsoleDevice *d = g_dev;
@@ -183,7 +254,18 @@ dev_output_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
 }
 
 static EFI_STATUS EFIAPI
-dev_test_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+dev_output_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_output_string_body(This, String);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_test_string_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
 {
     (void)This;
     (void)String;
@@ -193,7 +275,20 @@ dev_test_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
 }
 
 static EFI_STATUS EFIAPI
-dev_query_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
+dev_test_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+{
+    /* TestString defines only SUCCESS and UNSUPPORTED: a device that has gone
+       renders nothing. */
+    EFI_STATUS st = EFI_UNSUPPORTED;
+    if (dev_call_enter()) {
+        st = dev_test_string_body(This, String);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_query_mode_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
                UINTN *Columns, UINTN *Rows)
 {
     (void)This;
@@ -230,7 +325,19 @@ dev_query_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
 }
 
 static EFI_STATUS EFIAPI
-dev_set_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
+dev_query_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
+               UINTN *Columns, UINTN *Rows)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_query_mode_body(This, ModeNumber, Columns, Rows);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_set_mode_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
 {
     (void)This;
     if (g_dev == NULL) {
@@ -276,7 +383,18 @@ dev_set_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
 }
 
 static EFI_STATUS EFIAPI
-dev_set_attribute(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute)
+dev_set_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_set_mode_body(This, ModeNumber);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_set_attribute_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute)
 {
     (void)This;
     axl_console_emit_set_attribute(&g_dev->emit, (uint32_t)Attribute);
@@ -284,7 +402,18 @@ dev_set_attribute(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute)
 }
 
 static EFI_STATUS EFIAPI
-dev_clear_screen(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This)
+dev_set_attribute(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_set_attribute_body(This, Attribute);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_clear_screen_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This)
 {
     (void)This;
     axl_console_emit_clear_screen(&g_dev->emit);
@@ -292,7 +421,18 @@ dev_clear_screen(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This)
 }
 
 static EFI_STATUS EFIAPI
-dev_set_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
+dev_clear_screen(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_clear_screen_body(This);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_set_cursor_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
 {
     (void)This;
     axl_console_emit_set_cursor(&g_dev->emit, (uint32_t)Column, (uint32_t)Row);
@@ -300,11 +440,33 @@ dev_set_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
 }
 
 static EFI_STATUS EFIAPI
-dev_enable_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN Visible)
+dev_set_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_set_cursor_body(This, Column, Row);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_enable_cursor_body(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN Visible)
 {
     (void)This;
     axl_console_emit_enable_cursor(&g_dev->emit, Visible ? true : false);
     return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+dev_enable_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN Visible)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_enable_cursor_body(This, Visible);
+    }
+    dev_call_leave();
+    return st;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,17 +476,45 @@ dev_enable_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN Visible)
 // which falls back to the firmware ConIn when it is not capturing).
 // ---------------------------------------------------------------------------
 
-static EFI_STATUS EFIAPI
-dev_in_reset(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ext)
+/* Discard every key the guest has not read: the ring and the held keys behind
+   it, as a firmware Reset empties the keyboard's own queue. Both are emptied
+   before TPL comes down: a read tick pending meanwhile runs at the restore and
+   moves keys typed since into the ring, and a drain after it would drop them. */
+static void
+dev_input_discard(AxlConsoleDevice *d)
+{
+    EFI_TPL old = axl_efi_call(gBS->RaiseTPL, 1, TPL_NOTIFY);   /* above the read timer */
+    d->hold_head  = 0;
+    d->hold_count = 0;
+    axl_console_input_drain(&d->in);
+    if (d->discard_hook != NULL) {
+        d->discard_hook();
+    }
+    axl_efi_call(gBS->RestoreTPL, 1, old);
+}
+
+static EFI_STATUS
+dev_in_reset_body(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ext)
 {
     (void)This;
     (void)ext;
-    axl_console_input_drain(&g_dev->in);
+    dev_input_discard(g_dev);
     return EFI_SUCCESS;
 }
 
 static EFI_STATUS EFIAPI
-dev_in_read_key(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key)
+dev_in_reset(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ext)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_in_reset_body(This, ext);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_in_read_key_body(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key)
 {
     (void)This;
     /* Simple protocol: pop + Ctrl+letter fold (the engine applies it). */
@@ -332,16 +522,38 @@ dev_in_read_key(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key)
 }
 
 static EFI_STATUS EFIAPI
-dev_inex_reset(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, BOOLEAN ext)
+dev_in_read_key(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_in_read_key_body(This, Key);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_inex_reset_body(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, BOOLEAN ext)
 {
     (void)This;
     (void)ext;
-    axl_console_input_drain(&g_dev->in);
+    dev_input_discard(g_dev);
     return EFI_SUCCESS;
 }
 
 static EFI_STATUS EFIAPI
-dev_inex_read_key(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData)
+dev_inex_reset(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, BOOLEAN ext)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_inex_reset_body(This, ext);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_inex_read_key_body(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData)
 {
     (void)This;
     /* Ex protocol: the guest reads back the full EFI_KEY_DATA (KeyState included). */
@@ -349,7 +561,18 @@ dev_inex_read_key(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData
 }
 
 static EFI_STATUS EFIAPI
-dev_inex_set_state(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *toggle_state)
+dev_inex_read_key(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_inex_read_key_body(This, KeyData);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_inex_set_state_body(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *toggle_state)
 {
     (void)This;
     (void)toggle_state;
@@ -357,7 +580,18 @@ dev_inex_set_state(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *toggle_state)
 }
 
 static EFI_STATUS EFIAPI
-dev_inex_register_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData,
+dev_inex_set_state(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *toggle_state)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_inex_set_state_body(This, toggle_state);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_inex_register_notify_body(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData,
                          EFI_KEY_NOTIFY_FUNCTION fn, void **NotifyHandle)
 {
     (void)This;
@@ -365,10 +599,35 @@ dev_inex_register_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *
 }
 
 static EFI_STATUS EFIAPI
-dev_inex_unregister_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *handle)
+dev_inex_register_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData,
+                         EFI_KEY_NOTIFY_FUNCTION fn, void **NotifyHandle)
+{
+    /* The notify pair defines no device error: a request a gone device cannot
+       serve is an invalid one. */
+    EFI_STATUS st = EFI_INVALID_PARAMETER;
+    if (dev_call_enter()) {
+        st = dev_inex_register_notify_body(This, KeyData, fn, NotifyHandle);
+    }
+    dev_call_leave();
+    return st;
+}
+
+static EFI_STATUS
+dev_inex_unregister_notify_body(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *handle)
 {
     (void)This;
     return axl_console_input_unregister_notify(&g_dev->in, handle);
+}
+
+static EFI_STATUS EFIAPI
+dev_inex_unregister_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *handle)
+{
+    EFI_STATUS st = EFI_INVALID_PARAMETER;   /* as RegisterKeyNotify */
+    if (dev_call_enter()) {
+        st = dev_inex_unregister_notify_body(This, handle);
+    }
+    dev_call_leave();
+    return st;
 }
 
 /* WaitForKey / WaitForKeyEx NOTIFY_WAIT callback. The device is the sole input
@@ -411,24 +670,53 @@ input_gate_admits(AxlConsoleDevice *d, const EFI_KEY_DATA *kd)
     return true;
 }
 
-/* read_physical timer: drain each evicted firmware keyboard's ConInEx and
-   re-inject its keys into our ring. Runs at TPL_CALLBACK. The evicted keyboards'
-   protocols stay installed (only their ConsoleInDevice tag was removed), so their
-   own driver keeps queuing keys we read here. */
-/* Deliver one physical key to the shell: let the consumer's key_filter peek it first
-   (a true return consumes it), then the optional repeat gate, then inject to our ring.
-   Shared by the read loop and the headless test seam. */
+/* DELIVER held keys to the ring, oldest first, while it has room. */
+static void
+hold_flush(AxlConsoleDevice *d)
+{
+    while (d->hold_count > 0 && axl_console_input_room(&d->in) > 0) {
+        axl_console_input_push(&d->in, d->hold[d->hold_head]);
+        d->hold_head = (d->hold_head + 1) % DEVICE_HOLD_KEYS;
+        d->hold_count--;
+    }
+}
+
+/* One physical key ARRIVES: the consumer's key_filter peeks it first (a true
+   return consumes it), then the optional repeat gate; a key that passes both
+   fires its notifies NOW -- as the keyboard's driver fires them when the key
+   is typed, not when it is read -- and joins the held keys for the ring.
+   Shared by the read loop and the headless test seam. The caller guarantees
+   room in hold[] (the read loop reads only while there is). */
 static void
 dev_deliver_physical_key(AxlConsoleDevice *d, const EFI_KEY_DATA *kd)
 {
     if (d->key_filter != NULL && d->key_filter(d->key_filter_user, kd)) {
         return;   /* consumed by the consumer (e.g. a terminal hotkey) */
     }
-    if (input_gate_admits(d, kd)) {
-        axl_console_input_push_notify(&d->in, *kd);
+    if (!input_gate_admits(d, kd) || d->hold_count == DEVICE_HOLD_KEYS) {
+        return;
     }
+    axl_console_input_notify_physical(&d->in, kd);
+    d->hold[(d->hold_head + d->hold_count) % DEVICE_HOLD_KEYS] = *kd;
+    d->hold_count++;
+    hold_flush(d);
 }
 
+/* read_physical timer: read each evicted firmware keyboard's keys and pass them
+   on to the guest. Runs at TPL_CALLBACK. The evicted keyboards' protocols stay
+   installed (only their ConsoleInDevice tag was removed), so their own driver
+   keeps queuing keys we read here.
+
+   ARRIVAL and DELIVERY are split. A key arrives when it is read: the
+   consumer's key_filter sees it and its notifies fire then (a terminal's
+   escape hotkey, the Shell's Ctrl-C), even when the guest is not reading. It
+   is delivered to the 63-key ring as the guest makes room. Up to
+   DEVICE_HOLD_KEYS arrived keys wait in between -- more than TerminalDxe's own
+   queue, so a Ctrl-C behind type-ahead breaks a script at least as far back
+   as on a plain Shell. Only when that is full does reading stop, and the rest
+   waits in the keyboard's own queue: a key read with nowhere to go would be
+   lost, one left unread is not (TerminalDxe back-pressures the serial line),
+   so a paste typed at the local console arrives whole however long it is. */
 static void EFIAPI
 dev_read_timer_cb(EFI_EVENT Event, void *Context)
 {
@@ -438,6 +726,7 @@ dev_read_timer_cb(EFI_EVENT Event, void *Context)
     if (d == NULL) {
         return;
     }
+    hold_flush(d);   /* what the guest made room for since the last tick */
     for (uint32_t i = 0; i < d->evicted_in_count; i++) {
         /* Re-resolve the keyboard's SimpleTextInputEx from its STABLE handle every
            tick. A firmware keyboard can reallocate or remove its interface at any
@@ -460,7 +749,8 @@ dev_read_timer_cb(EFI_EVENT Event, void *Context)
             continue;
         }
         EFI_KEY_DATA kd;
-        while (!EFI_ERROR(ex->ReadKeyStrokeEx(ex, &kd))) {
+        while (d->hold_count < DEVICE_HOLD_KEYS
+               && !EFI_ERROR(ex->ReadKeyStrokeEx(ex, &kd))) {
             dev_deliver_physical_key(d, &kd);
         }
     }
@@ -559,9 +849,28 @@ snapshot_physical_modes(AxlConsoleDevice *d)
     d->mode_count = (usable > 0) ? count : 0;
 }
 
+/* Point our SimpleTextOut at its methods and the Mode we own. Shared by the
+   publish and the output test seam, so a test drives the same vtable. */
+static void
+dev_wire_conout(AxlConsoleDevice *d)
+{
+    d->my_conout.Reset             = dev_reset;
+    d->my_conout.OutputString      = dev_output_string;
+    d->my_conout.TestString        = dev_test_string;
+    d->my_conout.QueryMode         = dev_query_mode;
+    d->my_conout.SetMode           = dev_set_mode;
+    d->my_conout.SetAttribute      = dev_set_attribute;
+    d->my_conout.ClearScreen       = dev_clear_screen;
+    d->my_conout.SetCursorPosition = dev_set_cursor;
+    d->my_conout.EnableCursor      = dev_enable_cursor;
+    d->my_conout.Mode              = &d->my_mode;
+}
+
 /* Build our SimpleTextOut + Mode + device path and install them on a fresh handle
-   TOGETHER WITH gEfiConsoleOutDeviceGuid — we tag ourselves directly, so
-   ConSplitter binds us with no ConOut-variable read. */
+   TOGETHER WITH gEfiConsoleOutDeviceGuid and gEfiStandardErrorDeviceGuid — we tag
+   ourselves directly, so ConSplitter binds us into both the ConOut and the StdErr
+   fan-out with no ConOut/ErrOut-variable read. StdErr is joined, never taken
+   over: the other StdErr devices (the serial terminal) keep their tags. */
 static bool
 publish_console_device(AxlConsoleDevice *d)
 {
@@ -586,26 +895,9 @@ publish_console_device(AxlConsoleDevice *d)
     d->my_mode.CursorRow     = 0;
     d->my_mode.CursorVisible = TRUE;
 
-    d->my_conout.Reset             = dev_reset;
-    d->my_conout.OutputString      = dev_output_string;
-    d->my_conout.TestString        = dev_test_string;
-    d->my_conout.QueryMode         = dev_query_mode;
-    d->my_conout.SetMode           = dev_set_mode;
-    d->my_conout.SetAttribute      = dev_set_attribute;
-    d->my_conout.ClearScreen       = dev_clear_screen;
-    d->my_conout.SetCursorPosition = dev_set_cursor;
-    d->my_conout.EnableCursor      = dev_enable_cursor;
-    d->my_conout.Mode              = &d->my_mode;
+    dev_wire_conout(d);
 
-    d->my_devpath.vendor.Header.Type      = HARDWARE_DEVICE_PATH;
-    d->my_devpath.vendor.Header.SubType   = HW_VENDOR_DP;
-    d->my_devpath.vendor.Header.Length[0] = (uint8_t)sizeof(VENDOR_DEVICE_PATH);
-    d->my_devpath.vendor.Header.Length[1] = 0;
-    d->my_devpath.vendor.Guid             = DEVICE_VENDOR_GUID;
-    d->my_devpath.end.Type      = END_DEVICE_PATH_TYPE;
-    d->my_devpath.end.SubType   = END_ENTIRE_DEVICE_PATH_SUBTYPE;
-    d->my_devpath.end.Length[0] = (uint8_t)sizeof(EFI_DEVICE_PATH_PROTOCOL);
-    d->my_devpath.end.Length[1] = 0;
+    device_path_init(&d->my_devpath);
 
     d->my_handle = NULL;
     EFI_STATUS st = gBS->InstallMultipleProtocolInterfaces(
@@ -613,6 +905,7 @@ publish_console_device(AxlConsoleDevice *d)
         &gEfiDevicePathProtocolGuid,          &d->my_devpath,
         &gEfiSimpleTextOutputProtocolGuid,       &d->my_conout,
         &gEfiConsoleOutDeviceGuid,             NULL,
+        &gEfiStandardErrorDeviceGuid,          NULL,
         NULL);
     if (EFI_ERROR(st)) {
         return false;
@@ -621,11 +914,44 @@ publish_console_device(AxlConsoleDevice *d)
     return true;
 }
 
+/* Undo publish_console_device's install: the device path, our SimpleTextOut
+   and both console tags. The caller has disconnected ConSplitter first (or
+   nothing bound us). */
+static EFI_STATUS
+unpublish_console_device(AxlConsoleDevice *d)
+{
+    return gBS->UninstallMultipleProtocolInterfaces(
+        d->my_handle,
+        &gEfiDevicePathProtocolGuid,       &d->my_devpath,
+        &gEfiSimpleTextOutputProtocolGuid, &d->my_conout,
+        &gEfiConsoleOutDeviceGuid,         NULL,
+        &gEfiStandardErrorDeviceGuid,      NULL,
+        NULL);
+}
+
+/* A screen console (GraphicsConsole): its handle carries the display it
+   draws on. The serial terminal's does not. */
+static bool
+is_screen_console(EFI_HANDLE h)
+{
+    void *iface = NULL;
+    return !EFI_ERROR(axl_efi_call(gBS->HandleProtocol, 3, h,
+                                   &gEfiGraphicsOutputProtocolGuid, &iface))
+        || !EFI_ERROR(axl_efi_call(gBS->HandleProtocol, 3, h,
+                                   &gEfiUgaDrawProtocolGuid, &iface));
+}
+
 /* Evict every OTHER gEfiConsoleOutDeviceGuid-tagged handle from the fan-out by
    uninstalling the tag — the core DisconnectControllers ConSplitter from it, so
    ConSplitter Stop deletes it from the fan-out. The evicted handles are recorded
    so uninstall can re-tag them. GraphicsConsole's SimpleTextOut and the GOP
-   producer are untouched. */
+   producer are untouched.
+
+   A SCREEN that is also a StdErr device (firmware whose ErrOut lists the
+   display) loses that tag too: the device joined the StdErr fan-out, so a
+   screen left in it would draw every error line a second time, over the
+   take-over's picture. Every other StdErr device -- the serial terminal --
+   keeps its tag: the take-over owns the screen, not the serial line. */
 static void
 evict_other_conout_devices(AxlConsoleDevice *d)
 {
@@ -642,32 +968,54 @@ evict_other_conout_devices(AxlConsoleDevice *d)
         }
         st = gBS->UninstallProtocolInterface(handles[i],
                                              &gEfiConsoleOutDeviceGuid, NULL);
-        if (!EFI_ERROR(st)) {
-            if (d->evicted_count < DEVICE_MAX_EVICTED) {
-                d->evicted[d->evicted_count++] = handles[i];
-            } else {
-                /* Evicted but not recorded: uninstall cannot re-tag it, so this
-                   firmware console stays gone. n is 2-4 on real platforms, so the
-                   cap is generous, but a surplus must not vanish silently. */
-                axl_warning("console device: >%d console-out handles evicted; "
-                            "the surplus will not be restored on uninstall",
-                            DEVICE_MAX_EVICTED);
-            }
+        if (EFI_ERROR(st)) {
+            continue;
         }
+        if (d->evicted_count >= DEVICE_MAX_EVICTED) {
+            /* Evicted but not recorded: uninstall cannot re-tag it, so this
+               firmware console stays gone -- and its StdErr tag is left
+               alone, since that could not be restored either. n is 2-4 on
+               real platforms, so the cap is generous, but a surplus must not
+               vanish silently. */
+            axl_warning("console device: >%d console-out handles evicted; "
+                        "the surplus will not be restored on uninstall",
+                        DEVICE_MAX_EVICTED);
+            continue;
+        }
+        void *tag = NULL;
+        bool  err = !EFI_ERROR(axl_efi_call(gBS->HandleProtocol, 3, handles[i],
+                                            &gEfiStandardErrorDeviceGuid, &tag))
+                    && is_screen_console(handles[i])
+                    && axl_backend_uninstall_protocol(handles[i],
+                                                      &gEfiStandardErrorDeviceGuid,
+                                                      NULL) == AXL_OK;
+        d->evicted_err[d->evicted_count] = err;
+        d->evicted[d->evicted_count++]   = handles[i];
     }
     gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
 }
 
-/* Re-tag the handles we evicted and reconnect them, so ConSplitter re-adds the
-   firmware console (GraphicsConsole) to the fan-out — the inverse of eviction. */
+/* Re-tag the handles we evicted -- a screen's StdErr tag with its ConOut one --
+   and reconnect them, so ConSplitter re-adds the firmware console
+   (GraphicsConsole) to both fan-outs: the inverse of eviction.
+
+   Each tag in its OWN call, ConOut first. One combined install fails whole
+   when either tag is already there, and a StdErr tag can come back while the
+   take-over holds the console (a reconnect, ConPlatform); that must not cost
+   the screen its ConOut tag, which nothing else would put back. A tag that is
+   already there is left as it is; the handle is reconnected when either tag
+   went on. */
 static void
 restore_evicted_conout_devices(AxlConsoleDevice *d)
 {
     for (uint32_t i = 0; i < d->evicted_count; i++) {
-        EFI_HANDLE h = d->evicted[i];
-        EFI_STATUS st = gBS->InstallMultipleProtocolInterfaces(
-            &h, &gEfiConsoleOutDeviceGuid, NULL, NULL);
-        if (!EFI_ERROR(st)) {
+        void *h      = d->evicted[i];
+        bool  conout = axl_backend_install_protocol(&h, &gEfiConsoleOutDeviceGuid,
+                                                    NULL) == AXL_OK;
+        bool  err    = d->evicted_err[i]
+                       && axl_backend_install_protocol(&h, &gEfiStandardErrorDeviceGuid,
+                                                       NULL) == AXL_OK;
+        if (conout || err) {
             axl_driver_connect_handle(h);   /* == ConnectController(h,NULL,NULL,TRUE) */
         }
     }
@@ -743,6 +1091,51 @@ publish_console_in(AxlConsoleDevice *d)
    keyboard's stable HANDLE (its ConInEx protocol stays installed; only the tag is
    removed) so the read_physical timer can re-resolve its ConInEx each tick and poll
    it, and so it can be re-admitted on uninstall. */
+/* Undo, on a console-in device ConSplitter has just dropped, the key notifies
+   ConSplitter registered on it -- which ConSplitterTextInExDeleteDevice does
+   not do: it only compacts its member list.
+
+   Left there, the dropped keyboard keeps every notify registered before the
+   take-over (the Shell's Ctrl-C/Ctrl-S among them) for as long as it lives,
+   while the registrants' own UnregisterKeyNotify, routed through ConSplitter,
+   reaches only the members left. Once the Shell's image is freed (`exit`), the
+   keyboard's next matching key calls freed code; TerminalDxe's IsKeyRegistered
+   ignores the shift state, so a plain 'c' is enough. Nothing is lost by
+   removing them: while evicted, the keyboard's keys reach the guest through
+   our ring, whose push fires our own copies of the same notifies, and on
+   restore ConSplitter re-registers its current list on it.
+
+   Our registry holds exactly what ConSplitter registered on its members when we
+   joined (we joined before evicting). We cannot hold the keyboard's handles for
+   those, but EDK2's input drivers hand back the EXISTING handle when the same
+   (key, function) pair is registered again (TerminalConInRegisterKeyNotify,
+   KeyboardRegisterKeyNotify in Ps2KbdTextIn.c, USBKeyboardRegisterKeyNotify),
+   so register-then-unregister removes the entry -- and where there was none,
+   removes only the one it just added. */
+static void
+forget_split_notifies(AxlConsoleDevice *d, EFI_HANDLE h)
+{
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = NULL;
+
+    if (EFI_ERROR(axl_efi_call(gBS->HandleProtocol, 3, h,
+                               &gEfiSimpleTextInputExProtocolGuid, (void **)&ex))
+        || ex == NULL || ex->RegisterKeyNotify == NULL || ex->UnregisterKeyNotify == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < AXL_CONSOLE_KEY_NOTIFY_MAX; i++) {
+        const AxlConsoleKeyNotify *n = &d->in.notify[i];
+        if (!n->in_use) {
+            continue;
+        }
+        EFI_KEY_DATA key = n->key;
+        void        *nh  = NULL;
+        if (axl_efi_call(ex->RegisterKeyNotify, 4, ex, &key, n->fn, &nh) == EFI_SUCCESS
+            && nh != NULL) {
+            axl_efi_call(ex->UnregisterKeyNotify, 2, ex, nh);
+        }
+    }
+}
+
 static void
 evict_other_conin_devices(AxlConsoleDevice *d)
 {
@@ -761,6 +1154,7 @@ evict_other_conin_devices(AxlConsoleDevice *d)
            SimpleTextInputEx from it each tick (a cached interface can dangle). */
         if (!EFI_ERROR(gBS->UninstallProtocolInterface(handles[i],
                            &gEfiConsoleInDeviceGuid, NULL))) {
+            forget_split_notifies(d, handles[i]);
             if (d->evicted_in_count < DEVICE_MAX_EVICTED) {
                 d->evicted_in[d->evicted_in_count] = handles[i];
                 d->evicted_in_count++;
@@ -890,8 +1284,8 @@ restore_pointer_devices(AxlConsoleDevice *d)
     d->evicted_ptr_count = 0;
 }
 
-static EFI_STATUS EFIAPI
-dev_proxy_reset(EFI_SIMPLE_POINTER_PROTOCOL *This, BOOLEAN ext)
+static EFI_STATUS
+dev_proxy_reset_body(EFI_SIMPLE_POINTER_PROTOCOL *This, BOOLEAN ext)
 {
     AxlConsoleDevice *d = g_dev;
     (void)This;
@@ -902,6 +1296,17 @@ dev_proxy_reset(EFI_SIMPLE_POINTER_PROTOCOL *This, BOOLEAN ext)
         }
     }
     return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+dev_proxy_reset(EFI_SIMPLE_POINTER_PROTOCOL *This, BOOLEAN ext)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_proxy_reset_body(This, ext);
+    }
+    dev_call_leave();
+    return st;
 }
 
 /* Are we running at TPL_APPLICATION? WaitForEvent is only legal there; a caller at a
@@ -945,8 +1350,8 @@ proxy_forward_real(AxlConsoleDevice *d, EFI_SIMPLE_POINTER_STATE *State)
 /* The proxy GetState: yield the CPU until a real pointer has input or a short timer
    elapses, then forward the first real pointer that has data. A guest polling this in
    a tight loop (edit) idles instead of spinning; a real mouse move still reaches it. */
-static EFI_STATUS EFIAPI
-dev_proxy_getstate(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *State)
+static EFI_STATUS
+dev_proxy_getstate_body(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *State)
 {
     AxlConsoleDevice *d = g_dev;
     (void)This;
@@ -967,6 +1372,33 @@ dev_proxy_getstate(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *
     return proxy_forward_real(d, State);
 }
 
+static EFI_STATUS EFIAPI
+dev_proxy_getstate(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *State)
+{
+    EFI_STATUS st = EFI_DEVICE_ERROR;
+    if (dev_call_enter()) {
+        st = dev_proxy_getstate_body(This, State);
+    }
+    dev_call_leave();
+    return st;
+}
+
+/* The proxy's published shape: its methods and a mode that reports one unit of
+   movement per count and both buttons. */
+static void
+proxy_wire(AxlConsoleDevice *d)
+{
+    d->proxy_sp.Reset        = dev_proxy_reset;
+    d->proxy_sp.GetState     = dev_proxy_getstate;
+    d->proxy_sp.WaitForInput = NULL;   /* guests poll GetState; we do the waiting inside it */
+    d->proxy_sp.Mode         = &d->proxy_mode;
+    d->proxy_mode.ResolutionX = 1;
+    d->proxy_mode.ResolutionY = 1;
+    d->proxy_mode.ResolutionZ = 1;
+    d->proxy_mode.LeftButton  = TRUE;
+    d->proxy_mode.RightButton = TRUE;
+}
+
 /* Install the yielding proxy on a fresh handle so a guest locates it in place of the
    real pointers we evicted. No-op (and harmless) when nothing was evicted. */
 static void
@@ -979,15 +1411,7 @@ install_pointer_proxy(AxlConsoleDevice *d)
                                    &d->proxy_timer))) {
         d->proxy_timer = NULL;   /* proxy still works, just non-yielding (no idle) */
     }
-    d->proxy_sp.Reset        = dev_proxy_reset;
-    d->proxy_sp.GetState     = dev_proxy_getstate;
-    d->proxy_sp.WaitForInput = NULL;   /* guests poll GetState; we do the waiting inside it */
-    d->proxy_sp.Mode         = &d->proxy_mode;
-    d->proxy_mode.ResolutionX = 1;
-    d->proxy_mode.ResolutionY = 1;
-    d->proxy_mode.ResolutionZ = 1;
-    d->proxy_mode.LeftButton  = TRUE;
-    d->proxy_mode.RightButton = TRUE;
+    proxy_wire(d);
     d->proxy_handle = NULL;
     if (EFI_ERROR(gBS->InstallProtocolInterface(&d->proxy_handle,
                       &gEfiSimplePointerProtocolGuid, EFI_NATIVE_INTERFACE,
@@ -1057,17 +1481,30 @@ stop_input_read_loop(AxlConsoleDevice *d)
 
 /* Uninstall our ConIn protocols + close the wait events. Assumes the read loop is
    stopped and (on the success path) our handle has already been
-   DisconnectController'd, so ConSplitter no longer references our ConIn structs. */
-static void
+   DisconnectController'd, so ConSplitter no longer references our ConIn structs.
+
+   False when the firmware refused the uninstall: the protocols are still
+   installed and point into @p d (their WaitForKey events included), so NOTHING
+   is changed -- the caller must keep @p d alive, and a later call retries.
+   EDK2's DisconnectController returns EFI_SUCCESS when any binding stopped and
+   EFI_NOT_FOUND when none did, both of which the disconnect reads as success,
+   so a ConIn binding that refused can still hold our ConInEx here; this
+   uninstall's refusal is the first place the core says so. */
+static bool
 teardown_console_in(AxlConsoleDevice *d)
 {
     if (d->input_published) {
-        gBS->UninstallMultipleProtocolInterfaces(
-            d->my_handle,
-            &gEfiSimpleTextInputProtocolGuid,   &d->my_conin,
-            &gEfiSimpleTextInputExProtocolGuid, &d->my_coninex,
-            &gEfiConsoleInDeviceGuid,           NULL,
-            NULL);
+        EFI_STATUS st = _axl_console_device_test_point("conin-uninstall")
+                      ? EFI_ACCESS_DENIED
+                      : gBS->UninstallMultipleProtocolInterfaces(
+                            d->my_handle,
+                            &gEfiSimpleTextInputProtocolGuid,   &d->my_conin,
+                            &gEfiSimpleTextInputExProtocolGuid, &d->my_coninex,
+                            &gEfiConsoleInDeviceGuid,           NULL,
+                            NULL);
+        if (EFI_ERROR(st)) {
+            return false;
+        }
         d->input_published = false;
     }
     if (d->wait_key != NULL) {
@@ -1078,6 +1515,7 @@ teardown_console_in(AxlConsoleDevice *d)
         gBS->CloseEvent(d->wait_key_ex);
         d->wait_key_ex = NULL;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,12 +1596,7 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
         if (!publish_console_in(d)) {
             axl_debug("console device: could not publish the input relay");
             g_dev = NULL;
-            gBS->UninstallMultipleProtocolInterfaces(
-                d->my_handle,
-                &gEfiDevicePathProtocolGuid,       &d->my_devpath,
-                &gEfiSimpleTextOutputProtocolGuid, &d->my_conout,
-                &gEfiConsoleOutDeviceGuid,         NULL,
-                NULL);
+            unpublish_console_device(d);
             axl_free(d);
             return AXL_ERR;
         }
@@ -1178,15 +1611,22 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
            uninstall clears g_dev AFTER, where a live disconnect could still call
            us -- the asymmetry is deliberate. */
         g_dev = NULL;
-        if (cfg->take_input) {
-            teardown_console_in(d);   /* uninstall ConIn + close wait events */
+        /* Uninstall ConIn + close wait events, then ConOut -- each attempted
+           whatever the other did, so a refused ConIn does not also leave our
+           ConOut tags installed for a later connect to bind ConSplitter to.
+           Either refusal leaves protocols pointing into d, so d is leaked
+           rather than freed under them. */
+        bool in_ok  = !cfg->take_input || teardown_console_in(d);
+        bool out_ok = !EFI_ERROR(unpublish_console_device(d));
+        if (!in_ok || !out_ok) {
+            /* log-level: AXL_ERR is the status, but not what it leaves behind
+               -- an instance leaked on purpose, which no later call can reach
+               (g_dev is cleared) */
+            axl_warning("console device install: could not undo the %s "
+                        "protocols after a failed connect; leaking the instance "
+                        "to avoid a UAF", !in_ok ? "console input" : "console");
+            return AXL_ERR;
         }
-        gBS->UninstallMultipleProtocolInterfaces(
-            d->my_handle,
-            &gEfiDevicePathProtocolGuid,    &d->my_devpath,
-            &gEfiSimpleTextOutputProtocolGuid, &d->my_conout,
-            &gEfiConsoleOutDeviceGuid,       NULL,
-            NULL);
         axl_free(d);
         return AXL_ERR;
     }
@@ -1269,15 +1709,36 @@ axl_console_device_install(const AxlConsoleOps *ops, void *user,
     return AXL_OK;
 }
 
-void
+/* Production's answer at every test point: never. A fixture links a strong
+   definition (see axl-console-device-internal.h). */
+__attribute__((weak)) bool
+_axl_console_device_test_point(const char *point)
+{
+    (void)point;
+    return false;
+}
+
+int
 axl_console_device_uninstall(AxlConsoleDevice *d)
 {
-    if (d == NULL || g_dev != d) {
-        return;
+    if (d == NULL) {
+        return AXL_OK;
+    }
+    if (g_dev != d) {
+        return AXL_INVALID;
+    }
+    /* A call into the device is suspended part-way (we preempted it, or we are
+       inside one of its op callbacks): freeing now would resume it in freed
+       memory. Change nothing; the caller retries once it has returned. */
+    if (g_in_call != 0) {
+        return AXL_BUSY;
     }
     /* Stop the read loop FIRST so its TPL_CALLBACK timer can't preempt teardown and
        poll a keyboard we are about to re-admit / free. NULL-safe when read_physical
-       was off. */
+       was off. The disconnect below is the only step that can refuse BEFORE the
+       evicted keyboards are re-admitted, and its refusal must leave input as it
+       found it, so remember whether the loop ran. */
+    bool was_reading = d->read_timer != NULL;
     stop_input_read_loop(d);
 
     /* Disconnect ConSplitter from OUR handle BEFORE re-adding the firmware console.
@@ -1308,10 +1769,22 @@ axl_console_device_uninstall(AxlConsoleDevice *d)
        leave d->installed so a retry can resume. */
     bool self_dropped = false;
     if (d->installed) {
-        if (axl_driver_disconnect_handle(d->my_handle) != AXL_OK) {
+        if (_axl_console_device_test_point("disconnect")
+            || axl_driver_disconnect_handle(d->my_handle) != AXL_OK) {
+            /* log-level: AXL_ERR is the status, but not what it leaves behind -- an
+               instance leaked on purpose with the console still taken. That state
+               outlives the call, and a caller that drops the status (or that
+               handles it by retrying) leaves no other trace of why. */
             axl_warning("console device uninstall: could not disconnect our "
                         "console handle; leaking the instance to avoid a UAF");
-            return;
+            /* Restart the read loop: the firmware keyboards are still evicted,
+               so it is the only path from a key to the guest -- without it the
+               operator could not even type the command that retries this. */
+            if (was_reading && !start_input_read_loop(d)) {
+                axl_warning("console device: read loop unavailable after the "
+                            "refused uninstall; input is inject-only");
+            }
+            return AXL_ERR;
         }
         self_dropped = true;
     }
@@ -1325,23 +1798,33 @@ axl_console_device_uninstall(AxlConsoleDevice *d)
     restore_pointer_devices(d);   /* reinstall the SimplePointer(s) we hid from guests */
     if (self_dropped) {
         /* Both aggregates have dropped us: uninstall our ConIn protocols + close the
-           wait events, then the ConOut protocols. */
-        teardown_console_in(d);
-        if (EFI_ERROR(gBS->UninstallMultipleProtocolInterfaces(
-                d->my_handle,
-                &gEfiDevicePathProtocolGuid,       &d->my_devpath,
-                &gEfiSimpleTextOutputProtocolGuid, &d->my_conout,
-                &gEfiConsoleOutDeviceGuid,         NULL,
-                NULL))) {
+           wait events, then the ConOut protocols. Either refusal leaves protocols
+           pointing into d, so d is kept (leaked) and a later call resumes here:
+           the steps above are idempotent on a retry. The firmware consoles are
+           already restored by now, so the console is NOT taken any more. */
+        if (!teardown_console_in(d)) {
+            /* log-level: AXL_ERR is the status, but not what it leaves behind -- an
+               instance leaked on purpose. That state outlives the call, and a
+               caller that drops the status (or that handles it by retrying)
+               leaves no other trace of why. */
             axl_warning("console device uninstall: could not uninstall our "
-                        "console protocols; leaking the instance to avoid a UAF");
-            return;
+                        "console input protocols; leaking the instance to avoid "
+                        "a UAF (the firmware consoles are restored)");
+            return AXL_ERR;
+        }
+        if (EFI_ERROR(unpublish_console_device(d))) {
+            /* log-level: as above */
+            axl_warning("console device uninstall: could not uninstall our "
+                        "console protocols; leaking the instance to avoid a UAF "
+                        "(the firmware consoles are restored)");
+            return AXL_ERR;
         }
         d->installed = false;
     }
     g_dev = NULL;
     axl_free(d);
     axl_debug("console device uninstalled");
+    return AXL_OK;
 }
 
 // --- Input relay injection (functional only when take_input=true) ------------
@@ -1374,6 +1857,31 @@ axl_console_device_inject_text(AxlConsoleDevice *d, const char *bytes, size_t le
         return AXL_ERR;
     }
     return axl_console_input_inject_text(&d->in, bytes, len);
+}
+
+int
+axl_console_device_inject_text_partial(AxlConsoleDevice *d, const char *bytes,
+                                       size_t len, size_t *consumed)
+{
+    if (d == NULL || !d->take_input) {
+        if (consumed != NULL) {
+            *consumed = 0;
+        }
+        return AXL_ERR;
+    }
+    return axl_console_input_inject_text_partial(&d->in, bytes, len, consumed);
+}
+
+size_t
+axl_console_device_queued_keys(const AxlConsoleDevice *d)
+{
+    if (d == NULL || !d->take_input) {
+        return 0;
+    }
+    EFI_TPL old  = axl_efi_call(gBS->RaiseTPL, 1, TPL_NOTIFY);   /* vs the read timer */
+    size_t  held = d->hold_count;
+    axl_efi_call(gBS->RestoreTPL, 1, old);
+    return axl_console_input_queued(&d->in) + held;
 }
 
 // --- Runtime geometry + session ----------------------------------------------
@@ -1466,6 +1974,27 @@ axl_console_device_in_alt_screen(const AxlConsoleDevice *d)
     return d != NULL && axl_console_emit_in_alt_screen(&d->emit);
 }
 
+/* Cross-image probe. g_dev is this image's alone, so ask the firmware for the
+   handle every image's install publishes: SimpleTextOut on a device path that is
+   EXACTLY our Vendor node. LocateDevicePath is a longest-PREFIX match -- a handle
+   whose path is a bare End node matches any query with length 0 -- so the hit
+   only counts when it consumed the whole Vendor node, leaving the cursor on End. */
+bool
+axl_console_device_present(void)
+{
+    if (gBS == NULL) {
+        return false;
+    }
+    DeviceDevicePath probe;
+    device_path_init(&probe);
+
+    EFI_DEVICE_PATH_PROTOCOL *cursor = &probe.vendor.Header;
+    EFI_HANDLE                handle = NULL;
+    EFI_STATUS st = axl_efi_call(gBS->LocateDevicePath, 3,
+                                 &gEfiSimpleTextOutputProtocolGuid, &cursor, &handle);
+    return !EFI_ERROR(st) && handle != NULL && cursor == &probe.end;
+}
+
 // ---------------------------------------------------------------------------
 // Test seams for the input relay (no public header). A full install wedges the
 // combined unit boot (it wraps the live console), so these drive the REAL ConIn/
@@ -1542,6 +2071,17 @@ _axl_console_device_test_uninstall_proxy(AxlConsoleDevice *d)
     }
 }
 
+/* The proxy's vtable as install would publish it, without installing it. */
+EFI_SIMPLE_POINTER_PROTOCOL *
+_axl_console_device_test_proxy(AxlConsoleDevice *d)
+{
+    if (d == NULL) {
+        return NULL;
+    }
+    proxy_wire(d);
+    return &d->proxy_sp;
+}
+
 /* Drive the proxy's forward path (no yield) so a unit test can assert it relays a
    cached real pointer's state without blocking on WaitForEvent. */
 int
@@ -1563,7 +2103,7 @@ _axl_console_device_test_feed_physical(AxlConsoleDevice *d,
 {
     d->key_filter      = filter;
     d->key_filter_user = fuser;
-    axl_console_input_drain(&d->in);
+    dev_input_discard(d);
     EFI_KEY_DATA kd = {0};
     kd.Key.ScanCode           = scan;
     kd.Key.UnicodeChar        = uni;
@@ -1571,6 +2111,17 @@ _axl_console_device_test_feed_physical(AxlConsoleDevice *d,
     dev_deliver_physical_key(d, &kd);
     EFI_KEY_DATA out;
     return axl_console_input_pop(&d->in, &out);
+}
+
+/* Set the consumer key_filter the read loop runs on each physical key's arrival. */
+void
+_axl_console_device_test_set_key_filter(AxlConsoleDevice *d,
+        bool (*filter)(void *, const void *), void *user)
+{
+    if (d != NULL) {
+        d->key_filter      = filter;
+        d->key_filter_user = user;
+    }
 }
 
 /* Seed the read loop's evicted-keyboard list with a synthetic handle, mirroring
@@ -1581,6 +2132,7 @@ _axl_console_device_test_add_evicted_conin(AxlConsoleDevice *d, void *handle)
     if (d == NULL || d->evicted_in_count >= DEVICE_MAX_EVICTED) {
         return false;
     }
+    forget_split_notifies(d, (EFI_HANDLE)handle);
     d->evicted_in[d->evicted_in_count] = (EFI_HANDLE)handle;
     d->evicted_in_count++;
     return true;
@@ -1596,4 +2148,45 @@ _axl_console_device_test_read_tick(AxlConsoleDevice *d)
     }
     g_dev = d;
     dev_read_timer_cb(NULL, NULL);
+}
+
+/* Run @a hook at the end of a Reset's raised-TPL section, where a timer tick
+   can become pending, so a test can make one pending there deterministically. */
+void
+_axl_console_device_test_set_discard_hook(AxlConsoleDevice *d, void (*hook)(void))
+{
+    if (d != NULL) {
+        d->discard_hook = hook;
+    }
+}
+
+/* Wire the output side of a bare instance (the real SimpleTextOut vtable + emit
+   engine, no protocol install) to caller ops and publish it as g_dev, so a test
+   calls into the device exactly as ConSplitter does. Fixed 80x25. */
+void
+_axl_console_device_test_begin_output(AxlConsoleDevice *d, const AxlConsoleOps *ops,
+                                      void *user)
+{
+    if (d == NULL) {
+        return;
+    }
+    d->cols = 80;
+    d->rows = 25;
+    d->my_mode.MaxMode = 1;
+    d->my_mode.Attribute = 0x07;
+    dev_wire_conout(d);
+    axl_console_emit_init(&d->emit, ops, user, &d->my_mode, false);
+    g_dev = d;
+}
+
+EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *
+_axl_console_device_test_conout(AxlConsoleDevice *d)
+{
+    return (d == NULL) ? NULL : &d->my_conout;
+}
+
+AxlConsoleDevice *
+_axl_console_device_test_current(void)
+{
+    return g_dev;
 }

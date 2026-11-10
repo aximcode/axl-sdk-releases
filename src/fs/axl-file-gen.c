@@ -77,3 +77,11 @@ axl_file_gen_bump(const char *path)
     }
     axl_file_gen_bump_key(axl_file_gen_key(path));
 }
+
+void
+axl_file_gen_bump_all(void)
+{
+    for (size_t i = 0; i < AXL_FILE_GEN_SLOTS; i++) {
+        mGen[i]++;
+    }
+}

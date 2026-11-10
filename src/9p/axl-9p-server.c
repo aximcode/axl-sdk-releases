@@ -124,10 +124,12 @@ s9p_reap(S9pConn *conn)
    this callback. axl_tcp_close used to remove the send's loop source without
    invoking it; it now retires every pending send with AXL_CANCELLED so an
    accepted send is not left without a callback
-   (docs/AXL-Tcp-Queue-Design.md §3.5). Safe: send callbacks are deferred, and
-   a close from inside one re-enters an already-torn-down socket, which
-   returns without freeing it (§6b defect 2). The !active guard below still
-   earns its keep for the ordinary "already reaped" case. */
+   (docs/AXL-Tcp-Queue-Design.md §3.5) -- and delivers a send that had
+   already FINISHED, callback owed, with its ORIGINAL status, AXL_OK
+   included. So the status cannot say "being reaped"; the !active guard
+   below does, for every status, because s9p_reap_impl clears `active`
+   BEFORE it closes. A close from inside one re-enters an already-torn-down
+   socket, which returns without freeing it (§6b defect 2). */
 static bool
 s9p_on_send(AxlTcp *sock, AxlStatus status, void *data)
 {
@@ -616,22 +618,19 @@ axl_9p_server_new(
         axl_free(s);
         return AXL_ERR;   /* root path too long to store safely */
     }
-    /* Strip a single trailing separator ("fs0:\" -> "fs0:", "/export/" ->
-       "/export"), unless root IS just that one separator (the bare
-       filesystem/volume root, e.g. "/"). Every path this server ever
-       builds goes through axl_path_join (Twalk, s9p_path_append), which
-       never emits a bare trailing separator, and axl_path_get_dirname
-       (s9p_path_up) never returns one either -- so without this
-       normalization, a root configured with a trailing separator (the
-       conventional way to write a whole-volume root) would never
-       textually match a path walked back up to it, defeating the ".."
-       root-escape guard entirely (every ".." at the top level would look
-       like an escape attempt, or worse, silently succeed one level too
-       far, depending on how the comparison skewed). */
-    size_t root_len = axl_strlen(s->root);
-    if (root_len > 1
-        && (s->root[root_len - 1] == '/' || s->root[root_len - 1] == '\\')) {
-        s->root[root_len - 1] = '\0';
+    /* Normalize the root to the spelling a path walked back up to it
+       carries: "/export/" -> "/export", while "/" stays "/" and a volume
+       root is always "fs0:\" (a bare "fs0:" gains the separator). Every
+       path this server builds goes through axl_path_join (Twalk,
+       s9p_path_append) and axl_path_get_dirname (s9p_path_up); dirname
+       ends in a separator only at a filesystem root ("/" or "fs0:\"). So
+       without this normalization the root would never textually match a
+       path walked back up to it, defeating the ".." root-escape guard
+       entirely (every ".." at the top level would look like an escape
+       attempt, or worse, silently succeed one level too far). */
+    if (!s9p_root_normalize(s->root, sizeof(s->root))) {
+        axl_free(s);
+        return AXL_ERR;   /* no room for the volume root's separator */
     }
 
     s->loop      = loop;

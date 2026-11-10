@@ -60,11 +60,9 @@
 
 #define AXL_9P_MAX_FIDS  128u   ///< per-connection fid table cap
 
-/* Capacity of every export-path buffer in the server -- S9pFid.path and the
-   scratch buffers handlers build a child path in. ONE constant, so a
-   handler cannot build a name into a buffer larger than the fid it is
-   destined for and discover the mismatch as a silent truncation. */
-#define AXL_9P_PATH_MAX  512u
+/* Every export-path buffer in the server -- S9pFid.path and the scratch
+   buffers handlers build a child path in -- is AXL_9P_PATH_MAX
+   (axl-9p-internal.h), shared with the client and the mount. */
 
 /* msize negotiation ceiling (Tversion): generous but bounded, per the
    phase-4 plan's "cap generous e.g. 64-128 KiB". rbuf/txbuf grow to the
@@ -123,16 +121,17 @@
    whichever .c first needed one. The phase-4 plan fixes the vocabulary and
    the whole of it is spelled out, including the codes no handler currently
    reaches for -- the point of a fixed vocabulary is that the next handler
-   picks from it instead of inventing a number. The two values NOT on the
+   picks from it instead of inventing a number. The three values NOT on the
    plan's list are marked, per its "add one deliberately and say so" rule. */
 #define P9_EPERM     1u
 #define P9_ENOENT    2u
+#define P9_EINTR     4u    ///< NOT on the plan's list -- a Ctrl-C undid a Trename
 #define P9_EIO       5u
 #define P9_EBADF     9u
 #define P9_ENOMEM    12u
 #define P9_EACCES    13u
 #define P9_EEXIST    17u
-#define P9_EXDEV     AXL_9P_EXDEV   ///< NOT on the plan's list -- see s9p_handle_trename.
+#define P9_EXDEV     AXL_9P_EXDEV   ///< NOT on the plan's list -- a Trename to another volume.
                                     ///< Aliases the shared definition in
                                     ///< axl-9p-internal.h: the client's
                                     ///< copy-then-unlink fallback keys off the
@@ -570,8 +569,10 @@ s9p_readdir_resume(
    emit. A truncated record must never reach the wire.
 
    PRECONDITION: strlen(@a name) < 0xFFFF, so the name is encodable as a 9P
-   string[s]. Every caller sources @a name from AxlFsEntry.name (char[256])
-   or from a "." / ".." literal, so this holds by construction. It is a
+   string[s]. Every caller sources @a name from AxlFsEntry.name (at most
+   AXL_9P_NAME_MAX - 1 bytes) or from a "." / ".." literal, so this holds by
+   construction; AXL_9P_MIN_MSIZE is large enough that such a record always
+   fits an empty reply. It is a
    precondition rather than a checked case deliberately: the ONLY thing this
    function can say with a false return is "didn't fit", which the fill loop
    answers by stopping for good -- so an unencodable name reported that way
@@ -783,6 +784,21 @@ s9p_path_up(
     const char *root,   ///< export root, normalized by axl_9p_server_new
     char       *path,   ///< [in,out] path to move up
     size_t      cap     ///< capacity of @a path
+);
+
+/* Normalize an export root IN PLACE to the exact spelling every path the
+   server builds carries at the top of the tree, so s9p_path_up's textual
+   comparison matches. A trailing separator is dropped ("/export/" ->
+   "/export"), EXCEPT where it is the root of a whole filesystem: "/" stays
+   "/", and a volume root keeps -- or gains -- its separator ("fs0:" and
+   "fs0:\" both become "fs0:\"), because that is what axl_path_get_dirname
+   returns at a volume root and the only spelling UEFI opens as a directory.
+   Returns false (root untouched) if gaining the separator would not fit
+   @a cap. */
+AXL_WARN_UNUSED bool
+s9p_root_normalize(
+    char   *root,   ///< [in,out] NUL-terminated root
+    size_t  cap     ///< capacity of @a root
 );
 
 #endif /* AXL_9P_SERVER_INTERNAL_H */

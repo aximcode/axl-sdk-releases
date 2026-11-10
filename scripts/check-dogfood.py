@@ -93,7 +93,16 @@ def scan_paths() -> list[Path]:
 
 
 # Direct EFI is the *purpose* of these trees, so they are exempt wholesale.
-EXEMPT_DIRS = ("src/backend/", "src/crt0/")
+# Matched by prefix, so a single FILE can be listed too:
+#   src/pack/axl-pack-stub.c  the compressed-image stub runs before and
+#                             without the AXL runtime (it links no libaxl, so
+#                             there is no backend to route through)
+#   src/net/axl-net-legacy-ip4cfg-drv.c
+#                             the resident pre-UEFI-2.4 IPv4-config driver is
+#                             EMBEDDED in libaxl, so it cannot link it either
+LEGACY_IP4CFG_DRV = "src/net/axl-net-legacy-ip4cfg-drv.c"
+EXEMPT_DIRS = ("src/backend/", "src/crt0/", "src/pack/axl-pack-stub.c",
+               LEGACY_IP4CFG_DRV)
 
 # Inline marker on the offending line for a genuine one-off with no backend route.
 ALLOW_MARKER = "axl-uefi-direct"
@@ -124,8 +133,11 @@ CALL_RE = re.compile(r"->\s*[A-Z][A-Za-z0-9_]*\s*\(")
 POOL_RE = re.compile(r"->\s*(?:AllocatePool|FreePool|AllocatePages|FreePages)\b")
 POOL_MARKER = "axl-pool-direct"
 # src/mem implements axl_malloc on top of AllocatePages; backend/crt0 bootstrap
-# it — all three call the firmware allocator by necessity.
-POOL_EXEMPT_DIRS = ("src/backend/", "src/crt0/", "src/mem/")
+# it — all three call the firmware allocator by necessity. The axl-pack stub
+# has no axl_malloc to call: it runs before and without the AXL runtime; nor
+# does the legacy IPv4-config driver, whose pool must outlive its loader.
+POOL_EXEMPT_DIRS = ("src/backend/", "src/crt0/", "src/mem/",
+                    "src/pack/axl-pack-stub.c", LEGACY_IP4CFG_DRV)
 
 # Per-file baseline of KNOWN raw-UEFI-call sites (existing debt). A file absent
 # here must have ZERO; a file present must not EXCEED its number. Burn down by
@@ -156,13 +168,13 @@ BASELINE: dict[str, int] = {
     "src/smbus/axl-smbus-i2c.c": 2,
     "src/smbus/axl-smbus.c": 4,
     "src/util/axl-boot.c": 5,
-    "src/util/axl-console-device.c": 46,
+    "src/util/axl-console-device.c": 43,
     "src/util/axl-console-input.c": 12,
     "src/util/axl-console-tap.c": 23,
     "src/util/axl-cpu.c": 8,
     "src/util/axl-diag.c": 3,
     "src/util/axl-driver-info.c": 45,
-    "src/util/axl-driver.c": 51,
+    "src/util/axl-driver.c": 46,
     "src/util/axl-image-verify.c": 2,
     "src/util/axl-image.c": 10,
     "src/util/axl-mem-region.c": 8,

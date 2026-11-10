@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 builds=image-path-test guest=none
+# guest=none: it asserts image paths rooted at the boot volume
+#   (<vol>:\app\...), which on a leased guest is not the test's disk.
 # test-image-path-qemu.sh — axl_app_image_path() honours its documented NULL
 # for synthetic load contexts, and sidecar discovery still works there.
 #
@@ -39,7 +41,7 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 NATIVE_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" \
     image-path-test 2>&1 | tail -2
 
 test_add_efi "$NATIVE_DIR/image-path-test.efi"   "app/image-path-test.efi"
@@ -63,8 +65,8 @@ echo "=== axl_app_image_path synthetic-load contract ($TEST_ARCH) ==="
 test_build_qemu_cmd
 test_run_background
 
-if ! test_wait_for "IMGPATH_DONE" 90; then
-    echo "FAIL: fixture did not finish within 90s"
+if ! test_wait_boot "IMGPATH_DONE" 90; then
+    echo "FAIL: fixture did not finish within ${TEST_WAITED_S}s"
     test_clean_log; echo "--- Serial ---"; tail -50 "$TEST_CLEAN_LOG"
     exit 1
 fi
@@ -112,10 +114,47 @@ case "${SIDECARS[1]:-}" in
         fail "path-loaded sidecar ('${SIDECARS[1]:-<none>}')" ;;
 esac
 
+# axl_app_image_dir_path from \app\: exact strings. The volume is the one the
+# launcher's own path names, and that path is checked whole first, so a wrong
+# split cannot make every line below agree with a wrong volume.
+self=$(grep -aoE '^IMGPATH: launcher self=.*$' "$TEST_CLEAN_LOG" | sed 's/[[:space:]]*$//' | head -1 || true)
+self=${self#IMGPATH: launcher self=}
+vol=${self%%:*}:
+[[ "$self" == "${vol}\\app\\image-path-test.efi" ]] \
+    && pass "launcher self is <vol>:\\app\\image-path-test.efi ($self)" \
+    || fail "launcher self ('$self')"
+want=(
+    "IMGPATH: dir[sshd.conf]=${vol}\\app\\sshd.conf"
+    "IMGPATH: dir[keys\\ak]=${vol}\\app\\keys\\ak"
+    "IMGPATH: dir[]=${vol}\\app"
+    "IMGPATH: dir[\\keys\\ak]=${vol}\\keys\\ak"
+    "IMGPATH: dir[fs1:\\x.conf]=fs1:\\x.conf"
+)
+mapfile -t DIRS < <(grep -aoE '^IMGPATH: dir\[.*$' "$TEST_CLEAN_LOG" | sed 's/[[:space:]]*$//' || true)
+if [[ "${DIRS[*]}" == "${want[*]}" && ${#DIRS[@]} -eq ${#want[@]} ]]; then
+    pass "axl_app_image_dir_path: beside an image in \\app\\, exactly (name, subpath, \"\", rooted, volume)"
+else
+    fail "axl_app_image_dir_path: want '${want[*]}', saw '${DIRS[*]}'"
+fi
+mapfile -t DRVDIRS < <(grep -aoE '^IMGPATH: drvdir=.*$' "$TEST_CLEAN_LOG" | sed 's/[[:space:]]*$//' || true)
+[[ "${DRVDIRS[0]:-}" == "IMGPATH: drvdir=(err)" ]] \
+    && pass "axl_app_image_dir_path: a buffer-loaded driver has nothing to be beside (AXL_ERR)" \
+    || fail "buffer-loaded drvdir ('${DRVDIRS[0]:-<none>}')"
+[[ "${DRVDIRS[1]:-}" == "IMGPATH: drvdir=${vol}\\app\\x.conf" ]] \
+    && pass "axl_app_image_dir_path: a path-loaded driver is beside its own file" \
+    || fail "path-loaded drvdir ('${DRVDIRS[1]:-<none>}')"
+loc=$(grep -aoE '^IMGPATH: locate=.*$' "$TEST_CLEAN_LOG" | sed 's/[[:space:]]*$//' | head -1 || true)
+# Spelled as the image's own path spells its volume (vol, from the launcher's
+# self above): axl_driver_locate names the image's volume the way
+# axl_app_image_path and axl_app_boot_path do -- the shell's alias, verbatim.
+[[ "$loc" == "IMGPATH: locate=${vol}\\app\\image-path-driver.efi" ]] \
+    && pass "axl_driver_locate: an image in \\app\\ finds its sibling as <vol>:\\app\\name, spelled as its own path" \
+    || fail "axl_driver_locate from \\app\\ ('$loc')"
+
 echo ""
 printf "axl_app_image_path: %d passed, %d failed (%s)\n" "$PASS" "$FAIL" "$TEST_ARCH"
 if [[ $FAIL -gt 0 ]]; then
     echo ""; echo "--- Serial ---"; tail -60 "$TEST_CLEAN_LOG"
 fi
 
-[[ $FAIL -eq 0 && $PASS -eq 4 ]] && exit 0 || exit 1
+[[ $FAIL -eq 0 && $PASS -eq 9 ]] && exit 0 || exit 1

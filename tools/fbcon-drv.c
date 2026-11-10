@@ -87,13 +87,23 @@ static AxlSourceId       g_touch_source;    /* absolute pointer feeding the curs
 static uint32_t          g_scr_w, g_scr_h;  /* GOP pixel extent (touch coords map onto it) */
 static bool              g_shell_seen;      /* the hosted shell was present at least once */
 static volatile bool     g_leave_pending;   /* Ctrl+\ asked us to drop the take-over */
+static bool              g_stuck_said;      /* the stuck-release error was logged */
 
 /* Restore the firmware console and drop the take-over. Idempotent. Safe from the
    render-timer callback now that axl_console_device_uninstall no longer wedges when
    our non-80x25 device is re-added-around (the ConSplitter mode-assert fix). Does NOT
    touch the loop driver -- we may be running inside its tick; fbcon_unload detaches
-   and frees the loop. */
-static void
+   and frees the loop.
+
+   Returns false while the device is still installed, and the terminal is then
+   KEPT, because the device still calls into it:
+   - AXL_BUSY: a console call is in flight -- the render tick preempted the Shell
+     part-way through its output, which is running inside our terminal's ops.
+     Nothing past the input detach has happened; try again on the next tick.
+   - anything else (AXL_ERR: the firmware would not let go): the take-over is
+     stuck in place. Said once, as an error; a later call resumes the release,
+     and until one succeeds the image refuses to unload. */
+static bool
 fbcon_teardown(void)
 {
     if (g_touch_source != 0) {
@@ -105,8 +115,18 @@ fbcon_teardown(void)
         g_mouse_attached = false;
     }
     if (g_device != NULL) {
-        axl_console_device_uninstall(g_device);   /* restores the firmware console + input */
+        /* restores the firmware console + input */
+        int rc = axl_console_device_uninstall(g_device);
+        if (rc != AXL_OK) {
+            if (rc != AXL_BUSY && !g_stuck_said) {
+                axl_error("fbcon: the console take-over could not be undone (%d); "
+                          "it stays in place and fbcon stays resident", rc);
+                g_stuck_said = true;
+            }
+            return false;
+        }
         g_device = NULL;
+        g_stuck_said = false;
         /* Wipe our full-screen frame so the restored firmware console doesn't paint
            over a ghost of the old grid (it only redraws the cells it touches). */
         if (gST != NULL && gST->ConOut != NULL && gST->ConOut->ClearScreen != NULL) {
@@ -117,6 +137,7 @@ fbcon_teardown(void)
         axl_console_term_free(g_term);
         g_term = NULL;
     }
+    return true;
 }
 
 /* key_filter: peek fbcon's own Ctrl+\ (drop the take-over) FIRST, then hand the rest
@@ -188,8 +209,12 @@ fbcon_render(void *data)
 {
     (void)data;
     if (g_leave_pending) {
+        if (!fbcon_teardown()) {
+            /* busy or stuck: still ours to paint; the next tick retries */
+            axl_console_term_render(g_term);
+            return AXL_SOURCE_CONTINUE;
+        }
         axl_info("Ctrl+\\ -- restoring the firmware console");
-        fbcon_teardown();
         /* We stay in the same shell, so tell the user how to come back. This resident
            instance lingers (a driver can't self-unload from inside its own image), but
            the `fbcon.efi` launcher reaps it on the next run -- so `fbcon.efi` just works. */
@@ -202,12 +227,30 @@ fbcon_render(void *data)
     if (axl_shell_kind() == AXL_SHELL_KIND_UEFI) {
         g_shell_seen = true;
     } else if (g_shell_seen) {
+        if (!fbcon_teardown()) {
+            /* busy or stuck: still ours to paint; the next tick retries */
+            axl_console_term_render(g_term);
+            return AXL_SOURCE_CONTINUE;
+        }
         axl_info("hosted shell exited -- restoring the firmware console");
-        fbcon_teardown();
         return AXL_SOURCE_REMOVE;
     }
     axl_console_term_render(g_term);
     return AXL_SOURCE_CONTINUE;
+}
+
+/* Setup failed after the take-over was installed. An error return unloads this
+   image, which is safe only once the firmware has its console back: a device
+   still installed calls into our terminal and code. So when the release does
+   not complete, stay resident (fbcon_teardown said why) and report success
+   with nothing rendering; unloading the image retries the release. */
+static int
+fbcon_setup_failed(void)
+{
+    if (fbcon_teardown()) {
+        return 1;
+    }
+    return 0;
 }
 
 static int
@@ -275,11 +318,7 @@ fbcon_entry(AxlHandle image, AxlSystemTable *st)
 
     g_loop = axl_loop_new();
     if (g_loop == NULL) {
-        axl_console_device_uninstall(g_device);
-        g_device = NULL;
-        axl_console_term_free(g_term);
-        g_term = NULL;
-        return 1;
+        return fbcon_setup_failed();
     }
     /* fbcon is a background console renderer, not the foreground app: Ctrl+C belongs
        to the hosted shell (and to whatever full-screen app it runs), NOT to fbcon's
@@ -291,11 +330,7 @@ fbcon_entry(AxlHandle image, AxlSystemTable *st)
         || axl_loop_attach_driver(g_loop, FBCON_RENDER_MS) != AXL_OK) {
         axl_loop_free(g_loop);
         g_loop = NULL;
-        axl_console_device_uninstall(g_device);
-        g_device = NULL;
-        axl_console_term_free(g_term);
-        g_term = NULL;
-        return 1;
+        return fbcon_setup_failed();
     }
 
     /* Pointer handling. When take_pointer evicted the real SimplePointer(s), the
@@ -348,7 +383,13 @@ fbcon_unload(AxlHandle image)
     if (g_loop != NULL) {
         axl_loop_detach_driver(g_loop);   /* detach BEFORE uninstall/free (no notify in flight) */
     }
-    fbcon_teardown();   /* restore console + drop the take-over (no-op if self-restored) */
+    /* restore console + drop the take-over (no-op if self-restored). At the Shell's
+       TPL_APPLICATION, outside every console call, the device cannot be busy; a
+       release the firmware refuses keeps the image (the device calls into it). */
+    if (!fbcon_teardown()) {
+        axl_error("fbcon: the console take-over is still in place; unload refused");
+        return 1;
+    }
     if (g_loop != NULL) {
         axl_loop_free(g_loop);
         g_loop = NULL;

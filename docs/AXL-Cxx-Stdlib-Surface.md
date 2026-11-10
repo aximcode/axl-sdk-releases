@@ -76,7 +76,7 @@ virtual calls working and only `type_info` access broken.
 That was a linker-script defect latent in every aa64 image, not an RTTI bug;
 RTTI was simply the first workload to split the table. Fixed by naming the
 output section `.rela.dyn` so ld absorbs its own internal section.
-`make check-reloc-coverage` now asserts, on both arches, that
+`gate.check-reloc-coverage` now asserts, on both arches, that
 `[DT_RELA, DT_RELA+DT_RELASZ)` lies inside ONE section and that the section
 survives `objcopy` — whose `-j` takes exact names, which is the other half of
 the same trap.
@@ -156,7 +156,7 @@ only by `-fexceptions`. Asserted, not assumed.
 must never cross the C boundary (`AXL-Cxx-Design.md` §6b — AXL invokes
 consumer callbacks from C frames that carry no landing pads, so an exception
 unwinding through them runs no cleanup at all). Every public callback typedef
-is `noexcept` and `make check-cb-noexcept` holds the line.
+is `noexcept` and `gate.check-cb-noexcept` holds the line.
 
 The original entry, as it stood:
 

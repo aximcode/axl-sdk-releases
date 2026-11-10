@@ -37,10 +37,10 @@
  *
  * Example (host side):
  *   ./scripts/run-qemu.sh --cpu-report --timeout 30 \
- *       out/native-x64/cpu-spin-fixture.efi port 6000
+ *       build/x64-debug/cpu-spin-fixture.efi port 6000
  *   -> expect CPU-REPORT mean ~1.0 cores and exit code 8 (spike).
  *   ./scripts/run-qemu.sh --cpu-report --timeout 30 \
- *       out/native-x64/cpu-spin-fixture.efi idle 6000
+ *       build/x64-debug/cpu-spin-fixture.efi idle 6000
  *   -> expect CPU-REPORT mean ~0.0 cores and exit code 0 (no spike).
  */
 

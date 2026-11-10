@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=0 local-only=0
+# test-meta: arch=x64 needs= est=0 local-only=0 builds=http-plain-selftest,hello
 # test-tls-strippable.sh — mbedTLS must be strippable for HTTP consumers that
 # never reference TLS.
 #
@@ -30,13 +30,15 @@ echo "=== TLS strippability test ==="
 
 # Build: the full lib + the plain-HTTP
 # fixture + an https-capable consumer (fetch calls axl_tls_init for https).
-if ! make ARCH="$ARCH" all http-plain-selftest \
-        "$("$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/fetch.efi" > /tmp/tls-strip-build.log 2>&1; then
+# fetch is read RAW (tools/raw/): the shipped tools/fetch.efi is the
+# compressed axl-pack stub, whose bytes carry no mbedTLS literal to count.
+if ! "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$ARCH" all http-plain-selftest \
+        "$("$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/raw/fetch.efi" > /tmp/tls-strip-build.log 2>&1; then
     echo "FAIL: build failed"; tail -20 /tmp/tls-strip-build.log; exit 1
 fi
 
 PLAIN="$("$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/http-plain-selftest.efi"
-FETCH="$("$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/fetch.efi"
+FETCH="$("$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")/tools/raw/fetch.efi"
 
 # NOTE ON THE MARGIN, since the numbers moved a lot and look alarming.
 # Images are objcopy'd with --strip-all, so the COFF symbol table is gone and
@@ -79,7 +81,7 @@ ps=$(stat -c%s "$PLAIN"); fs=$(stat -c%s "$FETCH")
 # found no mbedTLS" and "nm never ran". Assertion 5 is the control: the same
 # method, on an image that MUST contain mbedTLS. Without it, a broken nm
 # invocation reports assertion 4 as a pass forever.
-if ! make ARCH="$ARCH" hello >> /tmp/tls-strip-build.log 2>&1; then
+if ! "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$ARCH" hello >> /tmp/tls-strip-build.log 2>&1; then
     echo "FAIL: hello build failed"; tail -20 /tmp/tls-strip-build.log; exit 1
 fi
 PREFIX_DIR="$("$PROJECT_DIR/scripts/build-prefix.sh" "$ARCH")"

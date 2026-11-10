@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=20 local-only=0
+# test-meta: arch=x64 needs= est=20 local-only=0 builds=axlk-reqlog-server guest=standard
 # axl-kernel third SoftBMC-port test — runs axlk-reqlog-server inside
 # QEMU and drives it with curl from the host. Validates two things:
 #
@@ -27,29 +27,15 @@ MAX_CLIENTS=24
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     all axlk-reqlog-server 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/axlk-reqlog-server.efi"
 
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting axlk-reqlog-server...
-axlk-reqlog-server.efi
-NSHEOF
+# The startup commands live in test-axlk-reqlog.nsh
+test_use_nsh
 
 test_build_image
 
@@ -62,8 +48,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for server..."
 
-if ! test_wait_for "listening on port" 60; then
-    echo "FAIL: axlk-reqlog-server did not start within 60s"
+if ! test_wait_boot "listening on port" 60; then
+    echo "FAIL: axlk-reqlog-server did not start within ${TEST_WAITED_S}s"
     test_clean_log
     tail -40 "$TEST_CLEAN_LOG"
     exit 1
@@ -216,9 +202,7 @@ fi
 # = MAX_CLIENTS. Server's accept loop exits, then reaps children.
 
 sleep 3
-kill "$TEST_QEMU_PID" 2>/dev/null || true
-wait "$TEST_QEMU_PID" 2>/dev/null || true
-TEST_QEMU_PID=0
+test_guest_stop
 
 test_clean_log
 

@@ -22,14 +22,20 @@
  * Driver.efi's own DriverEntry is NOT invoked (no axl_driver_start), so
  * driver-side allocations don't muddy the comparison. Only the AXL-side
  * load-options leak is what this test checks.
+ *
+ * driver.efi is named beside this image (axl_app_image_dir_path), not at a
+ * volume's root, so the pair works wherever its files were copied -- a
+ * disk's fs0:\, or a directory on a shared volume (a leased pool guest).
  */
 
 #include <axl.h>
 
 #define LOAD_OPTIONS_TABLE_SIZE  16  /* must mirror src/util/axl-driver.c */
+#define DRIVER_PATH_CAP          512
 
-static int g_passes = 0;
-static int g_fails  = 0;
+static int  g_passes = 0;
+static int  g_fails  = 0;
+static char g_driver_path[DRIVER_PATH_CAP];
 
 static void
 pass(const char *msg)
@@ -52,7 +58,7 @@ phase_basic(AxlMemStats *baseline)
     AxlDriverHandle drv = NULL;
     AxlMemStats     after;
 
-    if (axl_driver_load("fs0:\\driver.efi", &drv) != AXL_OK || drv == NULL) {
+    if (axl_driver_load(g_driver_path, &drv) != AXL_OK || drv == NULL) {
         fail("phase_basic: axl_driver_load");
         return;
     }
@@ -91,7 +97,7 @@ phase_reset(AxlMemStats *baseline)
     char            big[128];
     axl_memset(big, 'A', sizeof(big));
 
-    if (axl_driver_load("fs0:\\driver.efi", &drv) != AXL_OK || drv == NULL) {
+    if (axl_driver_load(g_driver_path, &drv) != AXL_OK || drv == NULL) {
         fail("phase_reset: axl_driver_load");
         return;
     }
@@ -144,7 +150,7 @@ phase_table_full(AxlMemStats *baseline)
     /* Load + set_options on the first LOAD_OPTIONS_TABLE_SIZE — all
        must succeed. */
     for (i = 0; i < LOAD_OPTIONS_TABLE_SIZE; i++) {
-        if (axl_driver_load("fs0:\\driver.efi", &drvs[i]) != AXL_OK
+        if (axl_driver_load(g_driver_path, &drvs[i]) != AXL_OK
             || drvs[i] == NULL) {
             axl_printf("FAIL: phase_table_full: load #%d\n", i);
             g_fails++;
@@ -160,7 +166,7 @@ phase_table_full(AxlMemStats *baseline)
     pass("phase_table_full: filled table to capacity");
 
     /* Load #17: set_options must fail with AXL_ERR. */
-    if (axl_driver_load("fs0:\\driver.efi", &drvs[LOAD_OPTIONS_TABLE_SIZE]) != AXL_OK
+    if (axl_driver_load(g_driver_path, &drvs[LOAD_OPTIONS_TABLE_SIZE]) != AXL_OK
         || drvs[LOAD_OPTIONS_TABLE_SIZE] == NULL) {
         fail("phase_table_full: load #17");
         goto cleanup;
@@ -205,6 +211,14 @@ main(int argc, char **argv)
     AxlMemStats baseline;
 
     axl_printf("driver-leak-test: start\n");
+
+    /* Named before the baseline, so whatever naming it costs is not
+       counted against the phases. */
+    if (axl_app_image_dir_path("driver.efi", g_driver_path, sizeof(g_driver_path))
+        != AXL_OK) {
+        axl_printf("FAIL: cannot name driver.efi beside this image\n");
+        return 1;
+    }
 
     axl_mem_get_stats(&baseline);
 

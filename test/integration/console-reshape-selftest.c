@@ -307,7 +307,7 @@ main(
           "set_size is ignored under passthrough");
 
     /* ---- 6. uninstall restores the bare-console view ---------------- */
-    axl_console_device_uninstall(dev);
+    check(axl_console_device_uninstall(dev) == AXL_OK, "uninstall succeeds");
     check_u32(axl_console_text_mode_count(), pre_count,
               "uninstall leaves the physical mode list intact");
     check(axl_console_text_current_mode(&cur) == AXL_OK && cur == pre_current,

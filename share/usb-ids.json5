@@ -21,6 +21,13 @@
 {
     schema: 1,
     vendors: [
+        // 0x0409 — NEC (QEMU's usb-hub reports 0409:55aa)
+        { id: 0x0409, name: 'NEC Corp.',
+          devices: [
+            { pid: 0x55AA, name: 'Hub' },
+          ],
+        },
+
         // 0x0421 — Nokia
         { id: 0x0421, name: 'Nokia Mobile Phones' },
 
@@ -41,11 +48,13 @@
         // 0x05E3 — Genesys Logic (USB hubs, card readers)
         { id: 0x05E3, name: 'Genesys Logic, Inc.' },
 
-        // 0x0627 — Adomax Technology (QEMU's USB-mouse vendor;
-        // pin point for the AxlUsb test runner)
+        // 0x0627 — Adomax Technology (QEMU's HID vendor; pin point for
+        // the AxlUsb test runner). QEMU gives usb-kbd, usb-mouse and
+        // usb-tablet this one ID, so no name fits all three: this is
+        // the usb.ids name, which Linux lsusb prints too.
         { id: 0x0627, name: 'Adomax Technology Co., Ltd',
           devices: [
-            { pid: 0x0001, name: 'QEMU USB Mouse' },
+            { pid: 0x0001, name: 'QEMU Tablet' },
           ],
         },
 
@@ -110,6 +119,14 @@
 
         // 0x2109 — VIA Labs (USB hubs, USB-3 controllers)
         { id: 0x2109, name: 'VIA Labs, Inc.' },
+
+        // 0x46F4 — QEMU (usb-storage). usb.ids lists the vendor only;
+        // the device name is the device's own iProduct.
+        { id: 0x46F4, name: 'QEMU',
+          devices: [
+            { pid: 0x0001, name: 'QEMU USB HARDDRIVE' },
+          ],
+        },
 
         // 0x8087 — Intel (integrated Bluetooth + USB controllers)
         { id: 0x8087, name: 'Intel Corp.' },

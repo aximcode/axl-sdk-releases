@@ -1,0 +1,128 @@
+diff -ruN a/Help/cpack_gen/archive.rst b/Help/cpack_gen/archive.rst
+--- a/Help/cpack_gen/archive.rst	2026-11-10 03:32:26.419341011 -0600
++++ b/Help/cpack_gen/archive.rst	2026-11-10 04:02:39.355692594 -0600
+@@ -174,6 +174,32 @@
+ 
+   :Default: ``0`` (see policy :policy:`CMP0206`)
+ 
++.. variable:: CPACK_ARCHIVE_SORT_ENTRIES
++
++  .. versionadded:: 4.6
++
++  Write the archive's entries in name order. By default they follow the
++  order in which the staging directory was read, which on a filesystem with
++  hashed directories (such as ext4) differs from one filesystem to another,
++  so the same build on two machines produces two archives.
++
++  :Default: ``OFF``
++
++.. variable:: CPACK_ARCHIVE_UNAME
++              CPACK_ARCHIVE_GNAME
++
++  .. versionadded:: 4.6
++
++  Set the user and group NAME of entries contained in the archive. Set both
++  or neither. When unset, each entry records the name of the file's owner on
++  the machine that runs CPack, whatever :variable:`CPACK_ARCHIVE_UID` and
++  :variable:`CPACK_ARCHIVE_GID` say -- so two builders produce different
++  archives, and ``tar`` run as root, which restores ownership by name when a
++  name is present, gives the files to that user if the extracting machine has
++  one. ``root`` / ``root`` pairs with the default UID and GID of ``0``.
++
++  :Default: unset (the builder's names)
++
+ Variables used by CPack Archive generator
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+diff -ruN a/Help/release/dev/cpack-archive-uname.rst b/Help/release/dev/cpack-archive-uname.rst
+--- a/Help/release/dev/cpack-archive-uname.rst	1969-12-31 18:00:00.000000000 -0600
++++ b/Help/release/dev/cpack-archive-uname.rst	2026-11-10 04:02:39.355786238 -0600
+@@ -0,0 +1,8 @@
++cpack-archive-uname
++-------------------
++
++* The :cpack_gen:`CPack Archive Generator` gained
++  :variable:`CPACK_ARCHIVE_UNAME` and :variable:`CPACK_ARCHIVE_GNAME` to set the
++  user and group names of archive entries, which until now always named the
++  user running CPack, and :variable:`CPACK_ARCHIVE_SORT_ENTRIES` to write
++  entries in name order rather than the filesystem's readdir order.
+diff -ruN a/Source/CPack/cmCPackArchiveGenerator.cxx b/Source/CPack/cmCPackArchiveGenerator.cxx
+--- a/Source/CPack/cmCPackArchiveGenerator.cxx	2026-11-10 03:32:25.719863345 -0600
++++ b/Source/CPack/cmCPackArchiveGenerator.cxx	2026-11-10 04:02:39.355402476 -0600
+@@ -2,6 +2,7 @@
+    file LICENSE.rst or https://cmake.org/licensing for details.  */
+ #include "cmCPackArchiveGenerator.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <ostream>
+ #include <unordered_map>
+@@ -347,7 +348,14 @@
+     filePrefix += installPrefix->substr(1);
+     filePrefix += "/";
+   }
+-  for (std::string const& file : component->Files) {
++  // Entries in NAME order when asked, not the order the staging directory
++  // was read in -- which on a filesystem with hashed directories (ext4) is a
++  // per-filesystem order, so two builders produce two archives.
++  std::vector<std::string> files = component->Files;
++  if (this->IsOn("CPACK_ARCHIVE_SORT_ENTRIES")) {
++    std::sort(files.begin(), files.end());
++  }
++  for (std::string const& file : files) {
+     std::string rp = filePrefix + file;
+ 
+     DeduplicateStatus status = DeduplicateStatus::Add;
+@@ -398,6 +406,9 @@
+   if (this->UID >= 0 && this->GID >= 0) {                                     \
+     archive.SetUIDAndGID(this->UID, this->GID);                               \
+   }                                                                           \
++  if (!this->UName.empty() && !this->GName.empty()) {                         \
++    archive.SetUNAMEAndGNAME(this->UName, this->GName);                       \
++  }                                                                           \
+   do {                                                                        \
+     if (!archive.Open()) {                                                    \
+       cmCPackLogger(cmCPackLog::LOG_ERROR,                                    \
+@@ -528,6 +539,22 @@
+       this->GID = static_cast<int>(g);
+     }
+   }
++  // The owner NAMES, which libarchive otherwise looks up for the files' own
++  // owner -- the builder -- whatever CPACK_ARCHIVE_UID/GID say. Both or
++  // neither: cmArchiveWrite applies them only as a pair.
++  cmValue UNameOption = this->GetOptionIfSet("CPACK_ARCHIVE_UNAME");
++  cmValue GNameOption = this->GetOptionIfSet("CPACK_ARCHIVE_GNAME");
++  if (UNameOption.IsSet() != GNameOption.IsSet()) {
++    cmCPackLogger(cmCPackLog::LOG_ERROR,
++                  "CPACK_ARCHIVE_UNAME and CPACK_ARCHIVE_GNAME must be set "
++                  "together."
++                    << std::endl);
++    return 0;
++  }
++  if (UNameOption) {
++    this->UName = *UNameOption;
++    this->GName = *GNameOption;
++  }
+ 
+   if (this->WantsComponentInstallation()) {
+     // CASE 1 : COMPONENT ALL-IN-ONE package
+@@ -554,6 +581,9 @@
+     cmCPackLogger(cmCPackLog::LOG_ERROR, workdir.GetError() << std::endl);
+     return 0;
+   }
++  if (this->IsOn("CPACK_ARCHIVE_SORT_ENTRIES")) {
++    std::sort(this->files.begin(), this->files.end());
++  }
+   for (std::string const& file : this->files) {
+     // Get the relative path to the file
+     std::string rp = cmSystemTools::RelativePath(this->toplevel, file);
+diff -ruN a/Source/CPack/cmCPackArchiveGenerator.h b/Source/CPack/cmCPackArchiveGenerator.h
+--- a/Source/CPack/cmCPackArchiveGenerator.h	2026-11-10 03:32:25.868174972 -0600
++++ b/Source/CPack/cmCPackArchiveGenerator.h	2026-11-10 04:02:39.344552809 -0600
+@@ -113,4 +113,6 @@
+   std::string OutputExtension;
+   int UID = 0;
+   int GID = 0;
++  std::string UName;
++  std::string GName;
+ };

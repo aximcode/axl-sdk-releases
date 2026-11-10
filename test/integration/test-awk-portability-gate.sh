@@ -53,7 +53,7 @@ else
                                     || fail "$want is NOT covered"
     done
     # ...and the globbed files did not get lost while adding them.
-    for want in Makefile scripts/run-qemu.sh test/integration/common-test.sh; do
+    for want in scripts/run-qemu.sh test/integration/common-test.sh; do
         grep -qx -- "$want" "$LIST" && pass "$want is still covered" \
                                     || fail "$want was DROPPED"
     done

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=18 local-only=0
+# test-meta: arch=x64 needs= est=18 local-only=0 builds=echo-server-sync guest=standard
 # echo-server-sync integration test — runs the single-client sync
 # echo server inside UEFI, connects from the host via hostfwd, and
 # verifies one echo round-trip (guest-side serial log + host-side
@@ -20,30 +20,16 @@ ECHO_MESSAGE="hello-from-host"
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     all echo-server-sync 2>&1 | tail -3
 
 TEST_BUILD_DIR="$(test_build_dir)"
 test_add_efi "$TEST_BUILD_DIR/echo-server-sync.efi"
 
 # Startup: init network, launch server
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting echo-server-sync...
-echo-server-sync.efi ${GUEST_PORT}
-NSHEOF
+# The startup commands live in test-echo-server-sync.nsh
+test_use_nsh "$GUEST_PORT"
 
 test_build_image
 
@@ -57,8 +43,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for server to start..."
 
-if ! test_wait_for "single-client" 60; then
-    echo "FAIL: echo-server-sync did not start within 60 seconds"
+if ! test_wait_boot "single-client" 60; then
+    echo "FAIL: echo-server-sync did not start within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"
     tail -30 "$TEST_CLEAN_LOG"
@@ -77,9 +63,7 @@ PROBE_OUTPUT=$(python3 "$(dirname "$0")/tcp-probe.py" \
 
 # Give the guest a moment to log the "disconnected" line, then stop.
 sleep 2
-kill "$TEST_QEMU_PID" 2>/dev/null || true
-wait "$TEST_QEMU_PID" 2>/dev/null || true
-TEST_QEMU_PID=0
+test_guest_stop
 
 test_clean_log
 

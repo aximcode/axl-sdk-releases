@@ -952,6 +952,135 @@ test_utf8_decode(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_utf8_validate — bounded, refusing validator (GLib's g_utf8_validate_len)
+// ---------------------------------------------------------------------------
+
+/* One range through axl_utf8_validate: the verdict AND the exact endptr
+   offset, never the verdict alone.
+ *
+ * The offset is half the contract -- it is what a caller reports to whoever
+ * supplied the text -- and without it every negative case here is satisfied
+ * by a validator that refuses everything. @a expect_off is the offset of the
+ * first byte of the first ill-formed sequence, or @a len when the range is
+ * valid. */
+static bool
+utf8_val_is(const char *s, size_t len, bool expect, size_t expect_off)
+{
+    const char *end = NULL;
+    bool        got = axl_utf8_validate(s, len, &end);
+
+    return got == expect && end == s + expect_off;
+}
+
+static void
+test_utf8_validate(void)
+{
+    /* --- Valid ---------------------------------------------------------- */
+    test_check(utf8_val_is("", 0, true, 0),
+               "utf8_validate: the empty range is valid");
+    test_check(utf8_val_is("hello", 5, true, 5),
+               "utf8_validate: ASCII is valid, endptr at s + len");
+    test_check(utf8_val_is("\xC2\x80", 2, true, 2),
+               "utf8_validate: U+0080 (C2 80), the 2-byte minimum");
+    test_check(utf8_val_is("\xE0\xA0\x80", 3, true, 3),
+               "utf8_validate: U+0800 (E0 A0 80), the 3-byte minimum");
+    test_check(utf8_val_is("\xEF\xBF\xBF", 3, true, 3),
+               "utf8_validate: U+FFFF (EF BF BF) -- a noncharacter is still"
+               " well-formed");
+    test_check(utf8_val_is("\xF0\x90\x80\x80", 4, true, 4),
+               "utf8_validate: U+10000 (F0 90 80 80), the 4-byte minimum");
+    test_check(utf8_val_is("\xF4\x8F\xBF\xBF", 4, true, 4),
+               "utf8_validate: U+10FFFF (F4 8F BF BF), the largest codepoint");
+    test_check(utf8_val_is("\xED\x9F\xBF", 3, true, 3),
+               "utf8_validate: U+D7FF (ED 9F BF), just under the surrogate gap");
+    test_check(utf8_val_is("\xEE\x80\x80", 3, true, 3),
+               "utf8_validate: U+E000 (EE 80 80), just over the surrogate gap");
+
+    /* --- Overlong: the smallest AND the largest of each class ------------ */
+    test_check(utf8_val_is("\xC0\x80", 2, false, 0),
+               "utf8_validate: overlong C0 80 is refused at offset 0");
+    test_check(utf8_val_is("\xC1\xBF", 2, false, 0),
+               "utf8_validate: overlong C1 BF, the largest 2-byte overlong");
+    test_check(utf8_val_is("\xE0\x80\x80", 3, false, 0),
+               "utf8_validate: overlong E0 80 80");
+    test_check(utf8_val_is("\xE0\x9F\xBF", 3, false, 0),
+               "utf8_validate: overlong E0 9F BF, the largest 3-byte overlong");
+    test_check(utf8_val_is("\xF0\x80\x80\x80", 4, false, 0),
+               "utf8_validate: overlong F0 80 80 80");
+    test_check(utf8_val_is("\xF0\x8F\xBF\xBF", 4, false, 0),
+               "utf8_validate: overlong F0 8F BF BF, the largest 4-byte overlong");
+
+    /* --- Surrogates, and above U+10FFFF ---------------------------------- */
+    test_check(utf8_val_is("\xED\xA0\x80", 3, false, 0),
+               "utf8_validate: surrogate U+D800 (ED A0 80) is refused");
+    test_check(utf8_val_is("\xED\xBF\xBF", 3, false, 0),
+               "utf8_validate: surrogate U+DFFF (ED BF BF) is refused");
+    test_check(utf8_val_is("\xF4\x90\x80\x80", 4, false, 0),
+               "utf8_validate: U+110000 (F4 90 80 80) is above the range");
+
+    /* --- Invalid leads. F5-F7 enter the 4-byte ladder and fail on range,
+           which is a different path from F8+ failing as a lead at all. ---- */
+    test_check(utf8_val_is("\xF5\x80\x80\x80", 4, false, 0),
+               "utf8_validate: an F5 lead is refused");
+    test_check(utf8_val_is("\xF8", 1, false, 0),
+               "utf8_validate: F8 is never a lead byte");
+    test_check(utf8_val_is("\xFF", 1, false, 0),
+               "utf8_validate: FF is never a lead byte");
+    test_check(utf8_val_is("\x80", 1, false, 0),
+               "utf8_validate: a lone continuation byte is refused");
+
+    /* --- Bounded by len, not by the buffer -------------------------------
+           THE DISCRIMINATING CASE is the first, and the ENDPTR half of it is
+           the whole discriminator -- do not weaken utf8_val_is() to a
+           verdict-only check. The euro sign's continuation bytes are present
+           and valid in the buffer, just outside the range. Delete the
+           `need > len - i` guard and trace it: axl_utf8_decode returns 3, i
+           becomes 3, the loop exits, and `i == len` is `3 == 2`, so the
+           VERDICT is still false. What actually breaks is that two bytes
+           past the range were read, and endptr is handed back at offset 3 --
+           OUTSIDE the range the caller gave. Nothing but the offset
+           assertion can see either. */
+    test_check(utf8_val_is("\xE2\x82\xAC", 2, false, 0),
+               "utf8_validate: E2 82 AC with len 2 is cut short by the range");
+    test_check(utf8_val_is("\xE2\x82\x41", 3, false, 0),
+               "utf8_validate: E2 82 41 -- truncated, then ASCII inside the range");
+    test_check(utf8_val_is("\xC3", 1, false, 0),
+               "utf8_validate: a 2-byte sequence truncated at the end of the range");
+    test_check(utf8_val_is("\xF0\x9F\x98", 3, false, 0),
+               "utf8_validate: a 4-byte sequence truncated at the end of the range");
+
+    /* --- An endptr offset past zero -------------------------------------- */
+    test_check(utf8_val_is("\xC3\xA9\xA9", 3, false, 2),
+               "utf8_validate: C3 A9 A9 reports the stray continuation at offset 2");
+
+    /* --- NUL, which RFC 3629 allows and this refuses --------------------- */
+    {
+        static const char nul_mid[]  = { 'a', '\0', 'b' };
+        static const char nul_last[] = { 'a', 'b', '\0' };
+
+        test_check(utf8_val_is(nul_mid, sizeof nul_mid, false, 1),
+                   "utf8_validate: a NUL in the middle is refused at its offset");
+        test_check(utf8_val_is(nul_last, sizeof nul_last, false, 2),
+                   "utf8_validate: a NUL as the last byte inside len (the"
+                   " strlen + 1 mistake)");
+    }
+
+    /* --- NULL endptr, and a NULL s --------------------------------------- */
+    test_check(!axl_utf8_validate("\xFF", 1, NULL),
+               "utf8_validate: a NULL endptr with invalid input still refuses");
+    {
+        char        sentinel = 0;
+        const char *end      = &sentinel;
+
+        test_check(axl_utf8_validate(NULL, 0, &end) && end == NULL,
+                   "utf8_validate: s NULL with len 0 is valid and endptr NULL");
+        end = &sentinel;
+        test_check(!axl_utf8_validate(NULL, 1, &end) && end == NULL,
+                   "utf8_validate: s NULL with len above 0 is refused, endptr NULL");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // axl_utf8_encode — per-codepoint encoder (reverse of axl_utf8_decode)
 // ---------------------------------------------------------------------------
 
@@ -1457,6 +1586,168 @@ test_memcpy(void)
     axl_memcpy(dst, src, 6);
     test_check(axl_strcmp(dst, "hello") == 0, "memcpy: basic");
     test_check(axl_memcpy(NULL, src, 5) == NULL, "memcpy: NULL dst");
+}
+
+// ---------------------------------------------------------------------------
+// axl_memcpy over every small size and every alignment pairing.
+//
+// axl_memcpy used to be a byte loop and is now a word-at-a-time copy (the
+// toolchain's memcpy), which is exactly the code shape whose bugs live at the
+// edges: the head bytes before the first aligned word, the tail after the last,
+// and src/dst misaligned against each other. Sizes 0..67 cover zero, every
+// sub-word size, and several whole words plus every tail length on both
+// arches; offsets 0..7 cover every src/dst alignment pairing modulo 8.
+//
+// Each case copies into a region whose surrounding guard bytes are set to a
+// value the source never contains, so an over-write by one byte in either
+// direction is seen, as is a wrong byte inside the copy and a wrong return.
+// ---------------------------------------------------------------------------
+
+#define TEST_MEMCPY_MAX_N    67u
+#define TEST_MEMCPY_MAX_OFF  7u
+#define TEST_MEMCPY_GUARD    16u
+#define TEST_MEMCPY_BUF      (TEST_MEMCPY_GUARD + TEST_MEMCPY_MAX_OFF \
+                              + TEST_MEMCPY_MAX_N + TEST_MEMCPY_GUARD)
+#define TEST_MEMCPY_FILL     0xEEu
+
+static void
+test_memcpy_sizes_and_alignments(void)
+{
+    /* Aligned storage, so offset k really means "k bytes past a boundary". */
+    static uint64_t src_words[(TEST_MEMCPY_BUF + 7u) / 8u];
+    static uint64_t dst_words[(TEST_MEMCPY_BUF + 7u) / 8u];
+    uint8_t *src = (uint8_t *)src_words;
+    uint8_t *dst = (uint8_t *)dst_words;
+    size_t   cases = 0;
+    size_t   bad_ret = 0;
+    size_t   bad_body = 0;
+    size_t   bad_guard = 0;
+    size_t   first_n = 0, first_so = 0, first_do = 0;
+    bool     first_set = false;
+
+    for (size_t i = 0; i < TEST_MEMCPY_BUF; i++) {
+        /* 1..254: never the guard value, and distinct from its neighbours. */
+        src[i] = (uint8_t)(1u + (i * 37u) % 254u);
+    }
+
+    for (size_t n = 0; n <= TEST_MEMCPY_MAX_N; n++) {
+        for (size_t so = 0; so <= TEST_MEMCPY_MAX_OFF; so++) {
+            for (size_t dof = 0; dof <= TEST_MEMCPY_MAX_OFF; dof++) {
+                uint8_t *d = dst + TEST_MEMCPY_GUARD + dof;
+                uint8_t *s = src + TEST_MEMCPY_GUARD + so;
+                bool     ok = true;
+
+                axl_memset(dst, TEST_MEMCPY_FILL, TEST_MEMCPY_BUF);
+                if (axl_memcpy(d, s, n) != d) {
+                    bad_ret++;
+                    ok = false;
+                }
+                for (size_t k = 0; k < n; k++) {
+                    if (d[k] != s[k]) {
+                        bad_body++;
+                        ok = false;
+                        break;
+                    }
+                }
+                for (size_t k = 0; k < TEST_MEMCPY_BUF; k++) {
+                    bool inside = (dst + k >= d) && (dst + k < d + n);
+                    if (!inside && dst[k] != TEST_MEMCPY_FILL) {
+                        bad_guard++;
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok && !first_set) {
+                    first_set = true;
+                    first_n   = n;
+                    first_so  = so;
+                    first_do  = dof;
+                }
+                cases++;
+            }
+        }
+    }
+
+    if (first_set) {
+        axl_printf("  memcpy: first failure n=%zu src_off=%zu dst_off=%zu\n",
+                   first_n, first_so, first_do);
+    }
+    test_check(cases == (TEST_MEMCPY_MAX_N + 1u) * 64u,
+               "memcpy: all 4352 size/alignment cases ran");
+    test_check(bad_ret == 0, "memcpy: returns dst for sizes 0..67, offsets 0..7");
+    test_check(bad_body == 0,
+               "memcpy: copies every byte for sizes 0..67, offsets 0..7");
+    test_check(bad_guard == 0,
+               "memcpy: writes no byte outside [dst, dst+n) for sizes 0..67, offsets 0..7");
+}
+
+// ---------------------------------------------------------------------------
+// axl_memcpy and axl_memmove are both overlap-safe.
+//
+// The byte loop axl_memcpy once was copied an overlapping region correctly
+// whenever dst < src, and in-tree code came to rely on it: AxlArray's
+// remove_index / remove_range and AxlLog's table removals shift their tails
+// down with it. A library memcpy makes no such promise, so axl_memcpy keeps
+// memmove semantics -- in BOTH directions, which the byte loop never had.
+// Every case is checked against a reference copy made through a separate
+// buffer, and none may fire a debug assertion.
+// ---------------------------------------------------------------------------
+
+#define TEST_OVERLAP_BUF    64u
+#define TEST_OVERLAP_MAX_N  40u
+#define TEST_OVERLAP_MAX_SH 9u
+
+typedef void *(*TestCopyFn)(void *dst, const void *src, size_t n);
+
+static size_t
+test_overlap_mismatches(
+    TestCopyFn copy  ///< axl_memcpy or axl_memmove
+)
+{
+    uint8_t buf[TEST_OVERLAP_BUF];
+    uint8_t want[TEST_OVERLAP_BUF];
+    uint8_t tmp[TEST_OVERLAP_BUF];
+    size_t  bad = 0;
+
+    for (size_t n = 1; n <= TEST_OVERLAP_MAX_N; n++) {
+        for (size_t sh = 1; sh <= TEST_OVERLAP_MAX_SH; sh++) {
+            for (int dir = 0; dir < 2; dir++) {
+                /* dir 0: dst below src (a tail shifted down); dir 1: above. */
+                size_t so = (dir == 0) ? sh : 0;
+                size_t dof = (dir == 0) ? 0 : sh;
+
+                for (size_t i = 0; i < TEST_OVERLAP_BUF; i++) {
+                    buf[i]  = (uint8_t)(1u + (i * 37u) % 254u);
+                    want[i] = buf[i];
+                }
+                for (size_t i = 0; i < n; i++) {
+                    tmp[i] = want[so + i];
+                }
+                for (size_t i = 0; i < n; i++) {
+                    want[dof + i] = tmp[i];
+                }
+                if (copy(buf + dof, buf + so, n) != buf + dof
+                    || axl_memcmp(buf, want, TEST_OVERLAP_BUF) != 0) {
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+static void
+test_memcpy_overlap_is_safe(void)
+{
+    size_t before = _axl_debug_assert_count();
+
+    test_check(test_overlap_mismatches(axl_memcpy) == 0,
+               "memcpy: 720 overlapping copies (n 1..40, shift 1..9, both "
+               "directions) match a copy made through a separate buffer");
+    test_check(test_overlap_mismatches(axl_memmove) == 0,
+               "memmove: the same 720 overlapping copies match");
+    test_check(_axl_debug_assert_count() == before,
+               "memcpy/memmove: overlapping copies fire no debug assertion");
 }
 
 static void
@@ -3436,6 +3727,140 @@ test_format(void)
     test_check(axl_strcmp(cap.buf, "100%") == 0, "format: literal percent");
 }
 
+/* A precision-bounded %s over a buffer that is NOT NUL-terminated within
+   the precision -- the case C99 7.21.6.1p8 explicitly permits ("the array
+   shall contain a null character ... if the precision is not specified or
+   is greater than the size of the array").
+
+   What these CAN see: the emitted bytes, the padding arithmetic that
+   derives from the emitted length, and the "precision absent" / "precision
+   zero" arms. A botched bound -- off by one, an unsigned compare that
+   wraps, a zero precision falling through to the unbounded scan -- changes
+   the OUTPUT and is caught here.
+
+   What they CANNOT see: the over-read itself. min(first_nul, prec) is the
+   same number whether the NUL scan is bounded by the precision or
+   truncated after the fact, so the bytes written are identical either way
+   and no assertion over them can distinguish the two. The read bound is
+   proven by test/fuzz/format_fuzz.c, where the payload is an exactly-sized
+   heap block under AddressSanitizer. */
+
+/* Some format tests feed axl_format exactly what gcc's format checker
+   objects to -- an unterminated string, or NULL, under a precision -- because
+   that input IS the behaviour under test. The warning is gcc-only, so clang
+   must not see the pragma (it would warn about an unknown option). */
+#if defined(__clang__)
+#define TEST_ALLOW_FORMAT_OVERFLOW_BEGIN
+#define TEST_ALLOW_FORMAT_OVERFLOW_END
+#else
+#define TEST_ALLOW_FORMAT_OVERFLOW_BEGIN \
+    _Pragma("GCC diagnostic push")        \
+    _Pragma("GCC diagnostic ignored \"-Wformat-overflow\"")
+#define TEST_ALLOW_FORMAT_OVERFLOW_END _Pragma("GCC diagnostic pop")
+#endif
+
+static void
+test_format_string_precision(void)
+{
+    FormatCapture cap;
+
+    /* payload has NO terminator; tail is a sentinel that must never be
+       emitted, and carries the only NUL in the object so that the
+       PRE-FIX engine stays within this object (defined behaviour) and
+       the comparison below is a fair one. */
+    static const struct {
+        char payload[4];
+        char tail[8];
+    } probe = { { 'a', 'b', 'c', 'd' },
+                { 'S', 'E', 'N', 'T', 'I', 'N', 'L', '\0' } };
+
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%.*s]", 4, probe.payload);
+    test_check(axl_strcmp(cap.buf, "[abcd]") == 0,
+               "format: %.*s emits exactly the precision from an unterminated buffer");
+
+    /* A shorter precision than the payload. */
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%.*s]", 2, probe.payload);
+    test_check(axl_strcmp(cap.buf, "[ab]") == 0,
+               "format: %.*s truncates below the payload length");
+
+    /* Zero precision emits nothing -- including when the pointer addresses
+       the very end of the payload, where there is nothing to emit. */
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%.*s]", 0, probe.payload);
+    test_check(axl_strcmp(cap.buf, "[]") == 0,
+               "format: %.0s emits nothing");
+
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%.*s]", 0, probe.payload + 4);
+    test_check(axl_strcmp(cap.buf, "[]") == 0,
+               "format: %.0s at the end of a buffer emits nothing");
+
+    /* A literal-digit precision takes the same path as `.*`. */
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%.3s]", probe.payload);
+    test_check(axl_strcmp(cap.buf, "[abc]") == 0,
+               "format: %.3s bounds the scan the same way");
+
+    /* Width pads to the TRUNCATED length, both alignments. */
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%8.*s]", 4, probe.payload);
+    test_check(axl_strcmp(cap.buf, "[    abcd]") == 0,
+               "format: %8.*s right-aligns the truncated string");
+
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%-8.*s]", 4, probe.payload);
+    test_check(axl_strcmp(cap.buf, "[abcd    ]") == 0,
+               "format: %-8.*s left-aligns the truncated string");
+
+    /* A NEGATIVE precision is "as if omitted" (C99 7.21.6.1p6), so the
+       scan is unbounded again and runs to the object's own NUL. This is
+       the one assertion here that reads the sentinel on purpose. */
+    cap.len = 0; cap.buf[0] = '\0';
+TEST_ALLOW_FORMAT_OVERFLOW_BEGIN
+    axl_format(capture_write, &cap, "[%.*s]", -1, probe.payload);
+TEST_ALLOW_FORMAT_OVERFLOW_END
+    test_check(axl_strcmp(cap.buf, "[abcdSENTINL]") == 0,
+               "format: a negative precision is treated as absent");
+
+    /* No precision at all: unchanged behaviour, terminator-driven. */
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%s]", "abcd");
+    test_check(axl_strcmp(cap.buf, "[abcd]") == 0,
+               "format: %s without a precision still scans to the NUL");
+
+    /* A precision larger than a TERMINATED string stops at the NUL. */
+    cap.len = 0; cap.buf[0] = '\0';
+    axl_format(capture_write, &cap, "[%.*s]", 99, "ab");
+    test_check(axl_strcmp(cap.buf, "[ab]") == 0,
+               "format: a precision past the NUL stops at the NUL");
+
+    /* The NULL substitution is a normal string once substituted, so a
+       precision truncates it rather than being ignored. */
+    cap.len = 0; cap.buf[0] = '\0';
+TEST_ALLOW_FORMAT_OVERFLOW_BEGIN
+    axl_format(capture_write, &cap, "[%.*s]", 2, (const char *)NULL);
+TEST_ALLOW_FORMAT_OVERFLOW_END
+    test_check(axl_strcmp(cap.buf, "[(n]") == 0,
+               "format: a precision truncates the NULL substitution");
+
+    cap.len = 0; cap.buf[0] = '\0';
+TEST_ALLOW_FORMAT_OVERFLOW_BEGIN
+    axl_format(capture_write, &cap, "[%.*s]", 0, (const char *)NULL);
+TEST_ALLOW_FORMAT_OVERFLOW_END
+    test_check(axl_strcmp(cap.buf, "[]") == 0,
+               "format: %.0s of NULL emits nothing");
+
+    /* Same contract through the snprintf front end, including the
+       returned length. */
+    char buf[32];
+    int n = axl_snprintf(buf, sizeof(buf), "%.*s", 4, probe.payload);
+    test_check(n == 4, "snprintf: %.*s returns the truncated length");
+    test_check(axl_strcmp(buf, "abcd") == 0,
+               "snprintf: %.*s stores exactly the precision");
+}
+
 static void
 test_utf16(void)
 {
@@ -3477,6 +3902,123 @@ test_utf16(void)
     char tiny[2];
     n = axl_utf16_to_utf8(u16, 5, tiny, sizeof(tiny));   /* only 'A' fits (é needs 2) */
     test_check(n == 1 && tiny[0] == 'A', "utf16->utf8: clean truncation at boundary");
+}
+
+/* axl_text_to_utf8: a text file as the Shell writes it (UTF-16LE + BOM) or
+   as a host editor does (UTF-8, with or without a BOM). */
+static void
+test_text_to_utf8(void)
+{
+    char  *t = NULL;
+    size_t n = 0, bad = 0;
+
+    static const char plain[] = "a\r\nb";
+    test_check(axl_text_to_utf8(plain, 4, &t, &n, &bad) == AXL_OK
+                   && t != NULL && axl_strcmp(t, "a\r\nb") == 0 && n == 4 && bad == 4,
+               "text->utf8: plain UTF-8 is copied as it stands");
+    axl_free(t);
+
+    static const char bom8[] = "\xEF\xBB\xBFhi\r\n";
+    test_check(axl_text_to_utf8(bom8, 7, &t, &n, NULL) == AXL_OK
+                   && t != NULL && axl_strcmp(t, "hi\r\n") == 0 && n == 4,
+               "text->utf8: a UTF-8 BOM is dropped");
+    axl_free(t);
+
+    /* What `echo Hi > f` writes: FF FE, then "Hi\r\n" as UTF-16LE -- and an
+       e-acute and a U+1F600 surrogate pair for the conversion proper. */
+    static const unsigned char u16[] = {
+        0xFF, 0xFE, 'H', 0, 'i', 0, 0xE9, 0, 0x3D, 0xD8, 0x00, 0xDE, '\r', 0, '\n', 0
+    };
+    test_check(axl_text_to_utf8(u16, sizeof(u16), &t, &n, &bad) == AXL_OK
+                   && t != NULL
+                   && axl_strcmp(t, "Hi\xC3\xA9\xF0\x9F\x98\x80\r\n") == 0
+                   && n == 10 && bad == 10,
+               "text->utf8: UTF-16LE + BOM converts, surrogate pair included");
+    axl_free(t);
+
+    static const unsigned char bom_only[] = { 0xFF, 0xFE };
+    test_check(axl_text_to_utf8(bom_only, 2, &t, &n, NULL) == AXL_OK
+                   && t != NULL && t[0] == '\0' && n == 0,
+               "text->utf8: a BOM alone is empty text");
+    axl_free(t);
+
+    test_check(axl_text_to_utf8(NULL, 0, &t, &n, NULL) == AXL_OK
+                   && t != NULL && t[0] == '\0' && n == 0,
+               "text->utf8: no bytes is empty text");
+    axl_free(t);
+
+    /* A lone high surrogate on line 2: invalid, the text still produced
+       with U+FFFD there, and bad_at pointing at it. */
+    static const unsigned char lone[] = {
+        0xFF, 0xFE, 'a', 0, '\n', 0, 'b', 0, 0x3D, 0xD8, 'c', 0
+    };
+    t = NULL;
+    test_check(axl_text_to_utf8(lone, sizeof(lone), &t, &n, &bad) == AXL_INVALID
+                   && t != NULL && axl_strcmp(t, "a\nb\xEF\xBF\xBD" "c") == 0
+                   && n == 7 && bad == 3,
+               "text->utf8: an unpaired surrogate is invalid, bad_at at its U+FFFD");
+    axl_free(t);
+
+    static const unsigned char odd[] = { 0xFF, 0xFE, 'a', 0, 'b' };
+    t = NULL;
+    test_check(axl_text_to_utf8(odd, sizeof(odd), &t, &n, &bad) == AXL_INVALID
+                   && t != NULL && axl_strcmp(t, "a") == 0 && n == 1 && bad == 1,
+               "text->utf8: an odd trailing byte is invalid, bad_at at the end");
+    axl_free(t);
+
+    /* An encoded U+0000 converts to a NUL byte, which validation refuses. */
+    static const unsigned char nul16[] = { 0xFF, 0xFE, 'a', 0, 0, 0, 'b', 0 };
+    test_check(axl_text_to_utf8(nul16, sizeof(nul16), &t, &n, NULL) == AXL_OK
+                   && t != NULL && n == 3 && t[0] == 'a' && t[1] == '\0' && t[2] == 'b'
+                   && !axl_utf8_validate(t, n, NULL),
+               "text->utf8: an encoded U+0000 becomes a NUL that validate refuses");
+    axl_free(t);
+
+    t = (char *)1;
+    test_check(axl_text_to_utf8(NULL, 3, &t, &n, NULL) == AXL_INVALID && t == NULL,
+               "text->utf8: NULL data with a length is invalid, out NULL");
+    test_check(axl_text_to_utf8(plain, 4, NULL, &n, NULL) == AXL_INVALID,
+               "text->utf8: a NULL out is invalid");
+
+    /* Every failure leaves *out_len and *bad_at defined (0), so a caller that
+       reads them on the error path reads no stack garbage. */
+    n   = 77;
+    bad = 77;
+    test_check(axl_text_to_utf8(NULL, 3, &t, &n, &bad) == AXL_INVALID
+                   && n == 0 && bad == 0,
+               "text->utf8: NULL data with a length sets out_len and bad_at to 0");
+    n   = 77;
+    bad = 77;
+    test_check(axl_text_to_utf8(plain, 4, NULL, &n, &bad) == AXL_INVALID
+                   && n == 0 && bad == 0,
+               "text->utf8: a NULL out sets out_len and bad_at to 0");
+    n   = 77;
+    bad = 77;
+    t   = (char *)1;
+    axl_mem_fail_next_alloc(1);
+    int oom8 = axl_text_to_utf8(plain, 4, &t, &n, &bad);
+    axl_mem_fail_next_alloc(0);
+    test_check(oom8 == AXL_NO_RESOURCES && t == NULL && n == 0 && bad == 0,
+               "text->utf8: UTF-8 copy out of memory: NO_RESOURCES, out NULL, lengths 0");
+    n   = 77;
+    bad = 77;
+    t   = (char *)1;
+    axl_mem_fail_next_alloc(1);
+    int oom16 = axl_text_to_utf8(u16, sizeof(u16), &t, &n, &bad);
+    axl_mem_fail_next_alloc(0);
+    test_check(oom16 == AXL_NO_RESOURCES && t == NULL && n == 0 && bad == 0,
+               "text->utf8: UTF-16 decode out of memory: NO_RESOURCES, out NULL, lengths 0");
+
+    /* UTF-16 is decoded straight from the bytes: the text is the ONE
+       allocation, so failing the second one changes nothing. */
+    t = NULL;
+    axl_mem_fail_next_alloc(2);
+    int one = axl_text_to_utf8(u16, sizeof(u16), &t, &n, &bad);
+    axl_mem_fail_next_alloc(0);
+    test_check(one == AXL_OK && t != NULL
+                   && axl_strcmp(t, "Hi\xC3\xA9\xF0\x9F\x98\x80\r\n") == 0,
+               "text->utf8: UTF-16 decode makes one allocation (no unit copy)");
+    axl_free(t);
 }
 
 static void
@@ -4131,6 +4673,7 @@ test_strbuf_main(
     test_asprintf();
     test_utf8_ucs2();
     test_utf8_decode();
+    test_utf8_validate();
     test_utf8_encode();
     test_base64();
     test_base64url();
@@ -4140,6 +4683,8 @@ test_strbuf_main(
     test_strcmp();
     test_strncmp();
     test_memcpy();
+    test_memcpy_sizes_and_alignments();
+    test_memcpy_overlap_is_safe();
     test_memset();
     test_memchr();
     test_snprintf();
@@ -4166,7 +4711,9 @@ test_strbuf_main(
     test_fnmatch();
     test_wcs();
     test_format();
+    test_format_string_precision();
     test_utf16();
+    test_text_to_utf8();
     test_math_special_values();
     test_str_to_double_basic();
     test_str_to_double_exact();

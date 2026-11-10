@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=25 local-only=0
+# test-meta: arch=both needs= est=25 local-only=0 builds=minimal-log-off,minimal-log-on guest=standard
 # test-minimal-log-qemu.sh — a --minimal-runtime image with no log engine
 # no-ops axl_error and keeps running; the same image with `=log` logs normally.
 #
@@ -31,24 +31,15 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 NATIVE_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" \
     minimal-log-off minimal-log-on 2>&1 | tail -2
 
 test_add_efi "$NATIVE_DIR/minimal-log-off.efi" "app/mlog-off.efi"
 test_add_efi "$NATIVE_DIR/minimal-log-on.efi"  "app/mlog-on.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "echo MLOG_OFF_BEGIN"
-    echo "app\\mlog-off.efi"
-    echo "echo MLOG_OFF_RC=%lasterror%"
-    echo "echo MLOG_ON_BEGIN"
-    echo "app\\mlog-on.efi"
-    echo "echo MLOG_DONE"
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-minimal-log-qemu.nsh.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh
 
 test_build_image
 
@@ -57,8 +48,8 @@ echo "=== the log engine is opt-in, and opting out is silent not broken ($TEST_A
 test_build_qemu_cmd
 test_run_background
 
-if ! test_wait_for "MLOG_DONE" 120; then
-    echo "FAIL: fixture did not finish within 120s"
+if ! test_wait_boot "MLOG_DONE" 120; then
+    echo "FAIL: fixture did not finish within ${TEST_WAITED_S}s"
     test_clean_log; echo "--- Serial ---"; tail -60 "$TEST_CLEAN_LOG"
     exit 1
 fi

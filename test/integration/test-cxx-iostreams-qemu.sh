@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=12 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0 guest=plain
 # test-cxx-iostreams-qemu.sh — the REAL <iostream> under UEFI, end to end.
 #
 # This suite exists because of P4 (docs/AXL-Libc-Substrate-Design.md §4d).
@@ -71,7 +71,13 @@ trap 'rm -rf "$WORK"' EXIT
 # coming back is ~112 KB (15%), and a second copy of the formatter is ~19 KB
 # on top of a stdio that arrives with it. A ceiling loose enough to miss those
 # would be decoration. Ordinary drift is nowhere near 50 KB.
-declare -A TEXT_CEILING=([X64]=785000 [AARCH64]=755000)
+#
+# x64 RAISED 785,000 -> 800,000 (2026-11-02): ordinary drift since P4 had in
+# fact used the headroom up -- 783,248 measured on ca17b9f5 -- and the
+# modern-Shell path resolution (src/backend/native/axl-backend-native-shell.c,
+# which every image that opens a file links) adds 1,792 B: 785,040. 800,000
+# is ~15 KB over that, still under the smaller structural candidate (~19 KB).
+declare -A TEXT_CEILING=([X64]=800000 [AARCH64]=755000)
 
 EXPECTED=(
     "ctor: init_array ran"

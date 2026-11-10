@@ -86,3 +86,6 @@ AxlHexdump
 ~~~~~~~~~~
 
 .. doxygenfile:: axl-hexdump.h
+
+.. include:: ../../../src/pack/README.md
+   :parser: myst_parser.sphinx_

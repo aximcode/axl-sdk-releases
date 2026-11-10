@@ -1335,7 +1335,7 @@ comments and declarations a decision record should never be quoting. The rule he
 **So the finding is not a violation, it is the absence of a gate.** This tree
 wrote decision 40 and enforced it nowhere; SoftBMC, a CONSUMER, built a source
 lint for it after a mutation build showed a JSON5 `PUT /api/users/admin`
-demoting the administrator account. `make check-json-dialect` closes that:
+demoting the administrator account. `gate.check-json-dialect` closes that:
 every `axl_json_parse` / `load_file` / `parse_source` / `scanner_init` under
 `src/` and `tools/` must pass `AXL_JSON_STRICT` unless the line above carries
 `/* json-dialect: local-file -- <why> */`. There is exactly one exception in

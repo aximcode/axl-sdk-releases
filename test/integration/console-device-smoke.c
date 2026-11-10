@@ -28,7 +28,7 @@
  *   OVMF_VARS=$HOME/uefi/Build/OvmfX64/DEBUG_GCC5/FV/OVMF_VARS.fd \
  *   SHOT_WAIT=18 timeout 120 scripts/run-qemu.sh --arch X64 \
  *     --screenshot /tmp/condev.png --debugcon /tmp/condev.dbg \
- *     out/native-x64/drivers/console-device-smoke.efi
+ *     build/x64-debug/drivers/console-device-smoke.efi
  *
  * Restore variant: compiling this SAME file with -DSELF_UNINSTALL_MS=N builds a
  * driver that takes over (wiping the frame pure black and rendering NOTHING),
@@ -370,8 +370,16 @@ blit_cb(void *data)
        a re-add). After the last cycle the firmware console is left restored and we
        paint the RESTORED banner so --restored proves the final state is live. */
     if (g_device != NULL && axl_time_get_ms() - s_takeover_ms >= SELF_UNINSTALL_MS) {
-        axl_console_device_uninstall(g_device);
+        /* A call into the device in flight (this tick preempted the Shell
+           part-way through one) refuses the uninstall: try the next tick. */
+        int un_rc = axl_console_device_uninstall(g_device);
+        if (un_rc == AXL_BUSY) {
+            return AXL_SOURCE_CONTINUE;
+        }
         g_device = NULL;
+        if (un_rc != AXL_OK) {
+            return AXL_SOURCE_REMOVE;   /* not restored: the RESTORED banner never comes */
+        }
         s_cycle++;
         if (s_cycle >= CYCLE_COUNT) {
             if (gST != NULL && gST->ConOut != NULL) {
@@ -403,8 +411,16 @@ blit_cb(void *data)
        uninstall AFTER the `ver` keystroke, so nothing repainted. The restored
        console painting `ver` is the whole signal. */
     if (g_device != NULL && axl_time_get_ms() - s_takeover_ms >= SELF_UNINSTALL_MS) {
-        axl_console_device_uninstall(g_device);   /* re-tag + reconnect + disconnect self */
+        /* re-tag + reconnect + disconnect self; AXL_BUSY (a call in flight)
+           changed nothing, so it is retried on the next tick */
+        int un_rc = axl_console_device_uninstall(g_device);
+        if (un_rc == AXL_BUSY) {
+            return AXL_SOURCE_CONTINUE;
+        }
         g_device = NULL;
+        if (un_rc != AXL_OK) {
+            return AXL_SOURCE_REMOVE;   /* not restored: the RESTORED banner never comes */
+        }
         /* Prove the restore deterministically: drive the restored gST->ConOut
            DIRECTLY (bypass the shell + streams). If uninstall reconnected the
            firmware console into the fan-out, these lines paint onto the frame we
@@ -543,7 +559,12 @@ smoke_unload(AxlHandle image)
 {
     (void)image;
     if (g_device != NULL) {
-        axl_console_device_uninstall(g_device);   /* re-tags + reconnects the firmware console */
+        /* re-tags + reconnects the firmware console; a device that is still
+           installed calls into this image, so refuse the unload (the library
+           has logged why) */
+        if (axl_console_device_uninstall(g_device) != AXL_OK) {
+            return 1;
+        }
         g_device = NULL;
     }
     if (g_loop != NULL) {

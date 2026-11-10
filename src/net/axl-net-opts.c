@@ -14,6 +14,8 @@
 #include <axl/axl-net.h>
 #include <axl/axl-net-opts.h>
 
+#include "axl-net-internal.h"
+
 AXL_LOG_DOMAIN("net");
 
 int
@@ -36,7 +38,6 @@ axl_net_init_from_opts(
     }
     return axl_net_init(opts->nic_index, timeout_sec);
 }
-
 
 // ---------------------------------------------------------------------------
 // AxlConfig group injection — axl_config_descs_net

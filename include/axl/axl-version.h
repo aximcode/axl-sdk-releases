@@ -5,8 +5,8 @@
     Compile-time AXL SDK version.
 
     Keep the macros below in sync with the VERSION file at the repo
-    root — the Makefile runs a `check-version` target before every
-    build that hard-errors on drift. Use `scripts/bump-version.sh`
+    root — the CMake configure (CMakeLists.txt) hard-errors on
+    drift. Use `scripts/bump-version.sh`
     to update both files atomically at release time.
 
     Consumers can gate features on a specific AXL version at
@@ -26,10 +26,10 @@
 
 #include <stdbool.h>
 
-#define AXL_VERSION_MAJOR   4
-#define AXL_VERSION_MINOR   7
-#define AXL_VERSION_PATCH   5
-#define AXL_VERSION_STRING  "4.7.5"
+#define AXL_VERSION_MAJOR   5
+#define AXL_VERSION_MINOR   0
+#define AXL_VERSION_PATCH   0
+#define AXL_VERSION_STRING  "5.0.0"
 
 /* Encoded as 0xMMmmpp (major, minor, patch) for simple comparisons. */
 #define AXL_VERSION_NUMBER \

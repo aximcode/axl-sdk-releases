@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/* Regression fixture for `make check-cxx-entry`.
+/* Regression fixture for `gate.check-cxx-entry`.
  *
  * A C++ translation unit that emits the firmware entry points AXL provides.
  * The check compiles this once per DriverEntry-emitting macro and asserts (via

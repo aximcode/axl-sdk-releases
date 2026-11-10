@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=15 local-only=0
+# test-meta: arch=both needs= est=15 local-only=0 guest=plain
 # test-cut-tr-qemu.sh — cut(1) and tr(1) match GNU behavior for the common
 # option set, driven over UEFI-Shell stdin pipes (the real use: `... | cut | tr`).
 #
@@ -74,7 +74,7 @@ run_one() {
     trefi="$out/tools/tr.efi"
 
     echo "=== cut/tr ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" \
         "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/cut.efi" \
         "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/tr.efi" 2>&1 | tail -1
 

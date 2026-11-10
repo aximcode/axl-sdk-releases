@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=16 local-only=0
+# test-meta: arch=x64 needs= est=16 local-only=0 guest=standard
 # tools/{fetch,netinfo} integration test — boots QEMU with user-mode
 # networking, runs each tool against a host-side Python HTTP server
 # (reused from test-http.sh), and validates the serial log output.
@@ -22,8 +22,8 @@ HOST_PORT=$(test_port 0)
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tools 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tools 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 TOOLS_DIR="$NATIVE_DIR/tools"
@@ -39,50 +39,9 @@ trap 'test_cleanup; [[ $HOST_SERVER_PID -gt 0 ]] && kill $HOST_SERVER_PID 2>/dev
 sleep 1
 echo "  Host HTTP server PID: $HOST_SERVER_PID, port: $HOST_PORT"
 
-cat << NSHEOF | test_set_startup
-@echo -off
-fs0:
-cd \\
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo === TEST-NETINFO-LIST ===
-netinfo.efi list
-
-echo === TEST-NETINFO-NO-LOAD ===
-netinfo.efi -v --no-load list
-
-echo === TEST-NETINFO-VERBOSE ===
-netinfo.efi -v list
-
-echo === TEST-NETINFO-LIST-BUNDLE ===
-netinfo.efi list-bundle
-
-echo === TEST-NETINFO-DIAG ===
-netinfo.efi diag
-
-echo === TEST-FETCH-GET ===
-fetch.efi http://10.0.2.2:${HOST_PORT}/hello
-
-echo === TEST-FETCH-404 ===
-fetch.efi http://10.0.2.2:${HOST_PORT}/no-such-thing
-
-echo === TEST-FETCH-REDIRECT ===
-fetch.efi http://10.0.2.2:${HOST_PORT}/redirect
-
-echo === TEST-FETCH-SAVE ===
-fetch.efi http://10.0.2.2:${HOST_PORT}/hello -o fetched.txt
-type fetched.txt
-
-echo === TEST-END ===
-reset -s
-NSHEOF
+# The startup commands live in test-net-tools.nsh; the host server port is %1.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh "$HOST_PORT"
 
 test_build_image
 
@@ -91,10 +50,7 @@ echo "=== AXL Network Tool Tests ($TEST_ARCH) ==="
 # OVMF's built-in NIC drivers (e1000) are sufficient for the tools'
 # axl_net_ensure_drivers() to find a NIC. Same setup as test-http.sh.
 test_build_qemu_cmd
-TEST_QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev "user,id=net0"
-)
+test_add_network
 test_run_foreground 60
 
 test_clean_log

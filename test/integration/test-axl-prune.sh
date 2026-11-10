@@ -98,7 +98,7 @@ EOF
            "$WORK/opt/axl-sdk-host-tools-$hv/libexec/axl/axl-prune.sh"
         chmod +x "$WORK/opt/axl-sdk-host-tools-$hv/bin/axl" \
                  "$WORK/opt/axl-sdk-host-tools-$hv/libexec/axl/axl-prune.sh"
-        # DELIBERATELY NO axl-toolchains.conf: make-host-tools-tarball.sh
+        # DELIBERATELY NO axl-toolchains.conf: the host-tools archive (packaging/host-tools)
         # writes share/axl/version and nothing else. Staging one here would
         # hide the half of the regression where prune, running from the
         # manager, can no longer find the manifest at all.
@@ -440,6 +440,103 @@ if grep -q "arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf" "$DRYOWN" \
     sed 's/^/      /' "$DRYOWN" | head -10
 else
     test_host_pass "the toolchain in use is never reported as not ours"
+fi
+
+# ── SDK roots: owned by a receipt since the packages returned (§17.5) ────
+#
+# `axl-sdk-<semver>` stopped being our namespace by construction the day the
+# .deb/.rpm came back: a package installs /opt/axl-sdk-<ver> too, and dpkg/rpm
+# would go on listing files `rm -rf` had taken. So an SDK root is prunable only
+# with an install.sh receipt (share/axl/.axl-receipt, SOURCE=install.sh); a
+# package's (SOURCE=deb|rpm) is skipped and named with its package manager's
+# command; any other receipt is not ours to judge; and a root with NO receipt
+# -- every install before receipts existed -- keeps the old pattern rule, or
+# existing machines would never prune again.
+receipt() {   # receipt <version> <source>
+    printf 'AXL_RECEIPT_KIND=sdk\nAXL_RECEIPT_SOURCE=%s\n' "$2" \
+        > "$WORK/opt/axl-sdk-$1/share/axl/.axl-receipt"
+}
+setup
+receipt 4.3.0 deb          # oldest: would be the first to go by pattern
+receipt 4.3.2 rpm
+receipt 4.3.5 install.sh   # the running prefix
+mkdir -p "$WORK/opt/axl-sdk-4.2.0/share/axl" "$WORK/opt/axl-sdk-4.2.9/share/axl"
+receipt 4.2.0 install.sh   # ours, superseded
+printf 'AXL_RECEIPT_KIND=sdk\nAXL_RECEIPT_SOURCE=brew\n' \
+    > "$WORK/opt/axl-sdk-4.2.9/share/axl/.axl-receipt"   # an owner we do not know
+PKG="$WORK/pkg.txt"
+"$AXL_NEW" prune --keep 0 > "$PKG" 2>&1
+check_dir() {   # check_dir <present|absent> <dir> <message>
+    if { [[ "$1" == present ]] && [[ -d "$2" ]]; } || { [[ "$1" == absent ]] && [[ ! -d "$2" ]]; }; then
+        test_host_pass "$3"
+    else
+        test_host_fail "$3"
+        sed 's/^/      /' "$PKG" | head -14
+    fi
+}
+check_dir present "$WORK/opt/axl-sdk-4.3.0" "a .deb-owned SDK root is never pruned"
+check_dir present "$WORK/opt/axl-sdk-4.3.2" "an .rpm-owned SDK root is never pruned"
+check_dir present "$WORK/opt/axl-sdk-4.2.9" "an SDK root with an unknown owner's receipt is never pruned"
+check_dir absent  "$WORK/opt/axl-sdk-4.2.0" "an install.sh-receipted superseded root IS pruned (control)"
+# The transition: 4.3.4 is `current` and survives; nothing else unreceipted is
+# left in this setup but the PRE-RECEIPT case is the next block's.
+if grep -qxF "  skipped axl-sdk-4.3.0: a deb package -- remove it with: sudo apt remove axl-sdk-4.3.0" "$PKG" \
+   && grep -qxF "  skipped axl-sdk-4.3.2: an rpm package -- remove it with: sudo dnf remove axl-sdk-4.3.2" "$PKG" \
+   && grep -qxF "  skipped axl-sdk-4.2.9: its receipt names an owner prune does not know (brew)" "$PKG"; then
+    test_host_pass "each skipped SDK root is named, with the command that removes it"
+else
+    test_host_fail "each skipped SDK root is named, with the command that removes it"
+    sed 's/^/      /' "$PKG" | head -14
+fi
+
+# THE PRE-RECEIPT TRANSITION, both ways in one tree: roots with no receipt (a
+# machine upgraded from 4.7.x) are still pruned by the pattern, beside a
+# receipted one that is.
+setup
+receipt 4.3.5 install.sh
+PRE="$WORK/pre.txt"
+"$AXL_NEW" prune > "$PRE" 2>&1
+if [[ ! -d "$WORK/opt/axl-sdk-4.3.0" && -d "$WORK/opt/axl-sdk-4.3.2" ]]; then
+    test_host_pass "pre-receipt SDK roots keep the pattern rule (4.3.0 pruned, 4.3.2 kept)"
+else
+    test_host_fail "pre-receipt SDK roots keep the pattern rule"
+    sed 's/^/      /' "$PRE" | head -10
+fi
+
+# AN UNREADABLE RECEIPT is an owner this user cannot see -- never "no
+# receipt", which is the pattern rule and so `rm -rf`. Root reads anything,
+# so as root this cannot be set up: said, not faked.
+if [[ "$(id -u)" -ne 0 ]]; then
+setup
+receipt 4.3.5 install.sh
+receipt 4.3.0 install.sh
+chmod 000 "$WORK/opt/axl-sdk-4.3.0/share/axl/.axl-receipt"
+UNR="$WORK/unreadable.txt"
+"$AXL_NEW" prune --keep 0 > "$UNR" 2>&1
+chmod 644 "$WORK/opt/axl-sdk-4.3.0/share/axl/.axl-receipt"
+if [[ -d "$WORK/opt/axl-sdk-4.3.0" ]] \
+   && grep -qxF "  skipped axl-sdk-4.3.0: its receipt cannot be read by this user" "$UNR"; then
+    test_host_pass "a root whose receipt cannot be read is skipped, and named"
+else
+    test_host_fail "a root whose receipt cannot be read is skipped, and named"
+    sed 's/^/      /' "$UNR" | head -8
+fi
+# ...and from a running prefix whose OWN receipt cannot be read, prune
+# refuses rather than prune on behalf of an owner it cannot see.
+setup
+receipt 4.3.5 install.sh
+chmod 000 "$WORK/opt/axl-sdk-4.3.5/share/axl/.axl-receipt"
+out="$("$AXL_NEW" prune 2>&1)"; rc=$?
+chmod 644 "$WORK/opt/axl-sdk-4.3.5/share/axl/.axl-receipt"
+if [[ "$rc" -eq 1 && "$out" == "axl prune: this SDK's receipt cannot be read by this user -- not pruning on behalf of an owner it cannot see." ]] \
+   && [[ -d "$WORK/opt/axl-sdk-4.3.0" ]]; then
+    test_host_pass "prune refuses when its own root's receipt cannot be read"
+else
+    test_host_fail "prune refuses when its own root's receipt cannot be read (rc=$rc)"
+    echo "      $out"
+fi
+else
+echo "  SKIP: an unreadable receipt (running as root, which reads anything)"
 fi
 
 test_host_summary "axl-prune"

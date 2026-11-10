@@ -9,13 +9,13 @@
 # Honours $AXL_SDK_PREFIX, which is the same value `install.sh --prefix` takes.
 #
 # WHY THIS EXISTS, and why it is NOT build-prefix.sh with a flag. Two different
-# things live under out/ and both were called "the prefix":
+# things once both lived under out/ and were both called "the prefix":
 #
-#   out/native-<arch>[-release][-tls]   the BUILD directory. Intermediate
+#   build/<arch>-<debug|release>        the BUILD directory. Intermediate
 #                                       objects and images; a function of
 #                                       ARCH x BUILD. Ask
 #                                       scripts/build-prefix.sh.
-#   out/{bin,lib,include,share}         the STAGED SDK. What
+#   stage/{bin,lib,include,share}       the STAGED SDK. What
 #                                       `install.sh --prefix` produces, what a
 #                                       consumer consumes, and what the .deb
 #                                       and .rpm are built from. Ask here.
@@ -58,7 +58,7 @@ done
 
 # Default matches install.sh's own default. It was `out` when this accessor
 # landed, deliberately, so the separation could be mechanical; O1 then decided
-# the move (2026-08-16). `out/` keeps the build trees and Sphinx output,
+# the move (2026-08-16). `build/` keeps the build trees, `out/` Sphinx output,
 # `stage/` holds the staged SDK -- the overloading AXL-Distribution-Design.md
 # §4 is named after is what made a build directory read as an install prefix.
 PREFIX="${AXL_SDK_PREFIX:-stage}"

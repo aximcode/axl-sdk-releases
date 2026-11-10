@@ -496,6 +496,63 @@ is representable there — refusing it would turn a round-trippable code
 unit into a dropped one, and that round-trip is a documented promise.
 See `src/stream/README.md`.
 
+### Validation
+
+`axl_utf8_validate` answers the other question: not "what does this
+say" but "is it well-formed at all". It takes a length rather than a
+terminator, walks the range once, and refuses anything RFC 3629 does —
+overlongs, surrogates, codepoints above U+10FFFF, lone continuation
+bytes, and a sequence the range cuts short. Its shape is GLib's
+`g_utf8_validate_len`, down to refusing **an embedded NUL**, which RFC
+3629 allows and `axl_utf8_encode(0, ...)` will happily write: text
+carrying one is almost always truncated or binary, and every C consumer
+downstream stops at it.
+
+```c
+const char *bad;
+if (!axl_utf8_validate(text, len, &bad)) {
+    axl_warn("not UTF-8 at byte %zu", (size_t)(bad - text));
+}
+```
+
+`endptr` is optional and receives the first byte of the first
+ill-formed sequence, or `s + len` when the range is valid — so a
+refusal can say *where*. That is the difference from `axl_utf8_decode`,
+which applies the same well-formedness rules but substitutes U+FFFD and
+carries on: **decode to display, validate to accept.** The bound on
+`len` is what makes it usable on a wire field: the continuation bytes of
+a sequence the field cuts may still be present in the buffer, and decode
+would read them.
+
+Its first consumers are `axl_ssh_server_set_banner()` and
+`axl_ssh_auth_complete()`, on the RFC 4252 §5.4 banner — a field that RFC
+specifies as UTF-8, checked at configuration time rather than left to the
+client.
+
+### Text files: `axl_text_to_utf8`
+
+The UEFI Shell writes text as UTF-16LE with a byte-order mark -- `echo
+... > file` and `edit` both do -- where a host editor writes UTF-8. A
+file a user may have made either way is read through
+`axl_text_to_utf8`: bytes starting `FF FE` are converted from UTF-16LE,
+a UTF-8 BOM is dropped, and anything else is copied as UTF-8. It is the
+encoding layer only -- check the result with `axl_utf8_validate` when
+it must be valid UTF-8 -- and UTF-16 that does not convert (an unpaired
+surrogate, an odd trailing byte) is `AXL_INVALID` with the text still
+produced and `bad_at` saying where, so a caller can name the line.
+`AxlConfigFile` and `axl_ssh_server_load_authorized_keys` read their
+files through it.
+
+```c
+char  *text = NULL;
+size_t len  = 0;
+if (axl_text_to_utf8(bytes, n, &text, &len, NULL) == AXL_OK
+    && axl_utf8_validate(text, len, NULL)) {
+    /* text is UTF-8 */
+}
+axl_free(text);   /* whatever the result */
+```
+
 ### Case-Insensitive Operations
 
 `axl_strcasecmp`, `axl_strcasestr`, and `axl_strncasecmp` fold

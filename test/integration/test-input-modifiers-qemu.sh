@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=socat est=18 local-only=1
+# test-meta: arch=x64 needs=socat,qemu.qmp est=18 local-only=1 guest=none
+# guest=none: it injects held modifiers and pointer events over QMP into a
+#   --background guest with its own input devices: a machine no class gives.
 # test-input-modifiers-qemu.sh — prove that a HELD keyboard modifier is
 # stamped onto POINTER events through the real OVMF firmware path:
 # Ctrl+click and Shift+wheel.
@@ -235,18 +237,14 @@ fi
 [[ -S "$QMP" ]] || { echo "ERROR: QEMU QMP socket never appeared"; exit 1; }
 echo "PTR-READY seen; injecting events"
 
-# One QMP command per connection: send qmp_capabilities to leave
-# negotiation, then the event, then close. Held key state persists across
-# connection close (it lives in QEMU's device model, not the session).
-qmp() {
-    {
-        printf '%s\n' '{"execute":"qmp_capabilities"}'
-        printf '%s\n' "$1"
-        sleep 0.2
-    } | socat -t 2 - "UNIX-CONNECT:$QMP" >/dev/null 2>&1
-}
-key()   { qmp "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":$2,\"key\":{\"type\":\"qcode\",\"data\":\"$1\"}}}]}}"; }
-btn()   { qmp "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"btn\",\"data\":{\"down\":$2,\"button\":\"$1\"}}]}}"; }
+# One input event per QMP session (axl_qmp, lib/qmp-lib.sh). Held key state
+# persists across sessions (it lives in QEMU's device model, not the session).
+# shellcheck source=lib/qmp-lib.sh
+source "$(dirname "$0")/lib/qmp-lib.sh"
+axl_qmp_available || { echo "ERROR: python3 >= 3.11 with qemu.qmp is required (axl_qmp)" >&2; exit 1; }
+qmp() { axl_qmp --timeout 2 "$QMP" input-send-event "$1" >/dev/null 2>&1; }
+key()   { qmp "{\"events\":[{\"type\":\"key\",\"data\":{\"down\":$2,\"key\":{\"type\":\"qcode\",\"data\":\"$1\"}}}]}"; }
+btn()   { qmp "{\"events\":[{\"type\":\"btn\",\"data\":{\"down\":$2,\"button\":\"$1\"}}]}"; }
 click() { btn left true; btn left false; }
 wheel() { btn wheel-up true; btn wheel-up false; }
 

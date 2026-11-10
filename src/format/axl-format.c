@@ -461,10 +461,24 @@ axl_vformat(AxlWriteFunc write_fn, void *ctx, const char *fmt, va_list args)
             if (s == NULL) {
                 s = "(null)";
             }
+            /* The terminator scan is BOUNDED BY the precision, and the
+               order matters: C99 7.21.6.1p8 says the argument array need
+               only contain a null character "if the precision is not
+               specified or is greater than the size of the array", so a
+               caller writing %.*s over a bounded, non-terminated buffer
+               is entitled to have s[prec] and beyond never read.
+               Scanning to a NUL first and truncating afterwards reads
+               past the end of exactly the arrays this conversion exists
+               to serve. A negative precision was normalised to "absent"
+               where it was parsed, so prec is >= 0 here; prec == 0 makes
+               this loop run zero times, which is the required
+               "write nothing". */
             size_t slen = 0;
-            while (s[slen] != '\0') { slen++; }
-            if (has_prec && (size_t)prec < slen) {
-                slen = (size_t)prec;
+            if (has_prec) {
+                size_t max_len = (size_t)prec;
+                while (slen < max_len && s[slen] != '\0') { slen++; }
+            } else {
+                while (s[slen] != '\0') { slen++; }
             }
             int pad = (width > (int)slen) ? width - (int)slen : 0;
             if (!flag_left) { write_chars(write_fn, ctx, ' ', pad); }

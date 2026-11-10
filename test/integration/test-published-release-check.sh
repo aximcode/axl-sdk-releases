@@ -43,9 +43,12 @@ check() {
     return 0
 }
 
-# mk_release <dir> — a well-formed release: the six assets of §14.1a.
+# mk_release <dir> — a well-formed release: the six assets of §14.1a and the
+# two system packages of §17.5.
 mk_release() {
     local d="$1"; mkdir -p "$d"
+    printf 'deb payload\n'         > "$d/axl-sdk-${V}_${V}-1_amd64.deb"
+    printf 'rpm payload\n'         > "$d/axl-sdk-$V-$V-1.x86_64.rpm"
     printf 'sdk payload\n'         > "$d/axl-sdk-linux-$V-x86_64.tar.gz"
     printf 'host tools payload\n'  > "$d/axl-sdk-host-tools-$V.tar.gz"
     printf 'uefi x64 payload\n'    > "$d/axl-sdk-uefi-tools-$V-x64.tar.gz"
@@ -121,5 +124,21 @@ D="$WORK/nosums"; mk_release "$D"; rm -f "$D/SHA256SUMS"
 run_check "$D"
 [[ "$RC" -ne 0 ]] && grep -q "SHA256SUMS is not downloadable" <<<"$OUT"
 check $? "a release with no SHA256SUMS is caught (rc=$RC)"
+
+# ---- 8. the system packages: both, named for this version ---------------
+grep -qx "  PASS: the .deb and .rpm are both published, named for $V" <<<"$(run_check "$GOOD"; echo "$OUT")"
+check $? "the package pair is recognised in a well-formed release"
+D="$WORK/onlydeb"; mk_release "$D"
+rm -f "$D/axl-sdk-$V-$V-1.x86_64.rpm"
+( cd "$D" && sha256sum -- * > SHA256SUMS ) && grep -v '\.rpm$' "$D/.attached" > "$D/.a" && mv "$D/.a" "$D/.attached"
+run_check "$D"
+[[ "$RC" -ne 0 ]] && grep -q "the system packages are not the pair this version needs" <<<"$OUT"
+check $? "a .deb without its .rpm is caught (rc=$RC)"
+D="$WORK/wrongver"; mk_release "$D"
+mv "$D/axl-sdk-${V}_${V}-1_amd64.deb" "$D/axl-sdk-1.2.3_1.2.3-1_amd64.deb"
+( cd "$D" && sha256sum -- * > SHA256SUMS ) && ( cd "$D" && ls -1 | grep -v '^SHA256SUMS$' > .attached; echo SHA256SUMS >> .attached )
+run_check "$D"
+[[ "$RC" -ne 0 ]] && grep -q "the system packages are not the pair this version needs" <<<"$OUT"
+check $? "a package named for another version is caught (rc=$RC)"
 
 test_host_summary "published-release-check"

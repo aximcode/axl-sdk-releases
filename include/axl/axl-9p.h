@@ -170,15 +170,14 @@ axl_9p_remove(
  * moves @p from to @p to's final component within it. Both endpoints are on
  * the same server session.
  *
- * A SAME-DIRECTORY rename is a single server-side `Trename`.
- *
- * A CROSS-DIRECTORY rename is not, on every server that answers it
- * `Rlerror(EXDEV)` — which includes AXL's own Axl9pServer, deliberately, since
- * a server-side move would be an unbounded synchronous whole-file copy on its
- * event loop. Against such a server this call degrades to copy-then-unlink on
- * the CLIENT (read @p from, write @p to, remove @p from), the same fallback
- * mv(1) and every other rename(2) caller performs. Four consequences the
- * caller must plan for, because a copy is not a rename:
+ * A rename is a server-side `Trename`, which has rename(2)'s semantics: an
+ * existing @p to is REPLACED atomically. That includes Axl9pServer, which
+ * moves across directories of its export. A server that cannot answers
+ * `Rlerror(EXDEV)` (a move between two of its filesystems), and against it
+ * this call degrades to copy-then-unlink on the CLIENT (read @p from, write
+ * @p to, remove @p from), the same fallback mv(1) and every other rename(2)
+ * caller performs. Four consequences the caller must plan for, because a
+ * copy is not a rename:
  *
  *   - A DIRECTORY is refused with AXL_ERR, not copied. A recursive tree copy
  *     has partial-failure semantics rename() does not have.
@@ -203,9 +202,11 @@ axl_9p_remove(
  * replacement is atomic, and this fallback is not — a session drop between
  * the truncating open and the last write would leave a real destination
  * corrupted rather than either whole file. A caller that wants replace
- * semantics removes the destination first. This also matches the
- * same-directory path against Axl9pServer, whose `Trename` refuses a taken
- * destination outright.
+ * semantics removes the destination first.
+ *
+ * The volume axl_9p_mount() publishes never uses this fallback: its `rename`
+ * sends `Trename` only, maps EXDEV to AXL_FS_ERR_UNSUPPORTED, and refuses an
+ * existing destination.
  *
  * @return AXL_OK on success (for a cross-directory move, only if the copy AND
  *     the source removal both succeeded); AXL_ERR if @p from is missing,
@@ -307,7 +308,8 @@ axl_9p_server_listen(
  * of the boot). The trade is the documented one: the RST discards any un-ACKed
  * tail of an in-flight reply and clients see a reset rather than a clean FIN.
  * Connections dropped while the server is RUNNING are unaffected — those still
- * get a graceful FIN.
+ * get a graceful FIN, unless the close would drop part of a reply not yet
+ * handed to the firmware, which makes it abortive (see @ref axl_tcp_close).
  */
 void
 axl_9p_server_free(

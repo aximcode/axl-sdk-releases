@@ -14,7 +14,9 @@
  * synthesizes a MemoryMapped(...)/FilePath device path after the load.
  *
  * Test:
- *   1. read fs0:\driver.efi into a buffer,
+ *   1. read driver.efi -- beside this image, in the Shell's current
+ *      directory (fs0:\ booted; a pooled guest's lease directory) -- into
+ *      a buffer,
  *   2. axl_driver_load_buffer() it (do NOT start — the device path is set
  *      at load time, independent of StartImage),
  *   3. install a private MARKER protocol on the loaded *image* handle so
@@ -31,6 +33,9 @@
 
 #include <axl.h>
 #include <uefi/axl-uefi.h>
+
+/* Relative: the Shell's current directory holds it (see the header). */
+#define DRIVER_IMAGE "driver.efi"
 
 /* Private marker protocol — installed on the loaded image handle purely so
  * the shell can target that one handle by GUID. Printed below for the
@@ -62,9 +67,9 @@ main(int argc, char **argv)
     /* 1. Read the test driver image into a buffer. */
     void   *buf = NULL;
     size_t  len = 0;
-    if (axl_file_get_contents("fs0:\\driver.efi", &buf, &len) != AXL_OK
+    if (axl_file_get_contents(DRIVER_IMAGE, &buf, &len) != AXL_OK
         || buf == NULL || len == 0) {
-        check(false, "read fs0:\\driver.efi");
+        check(false, "read " DRIVER_IMAGE);
         axl_printf("Results: %d passed, %d failed\n", g_pass, g_fail);
         return 1;
     }
@@ -88,7 +93,7 @@ main(int argc, char **argv)
     {
         void   *b2 = NULL;
         size_t  l2 = 0;
-        if (axl_file_get_contents("fs0:\\driver.efi", &b2, &l2) == AXL_OK
+        if (axl_file_get_contents(DRIVER_IMAGE, &b2, &l2) == AXL_OK
             && b2 != NULL) {
             AxlDriverHandle d2 = NULL;
             int r2 = axl_driver_load_buffer((const unsigned char *)b2, l2, &d2);

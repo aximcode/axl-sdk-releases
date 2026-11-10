@@ -9,7 +9,7 @@
     `VTermStateCallbacks` (without Layer 3's `screen.c`) yields the positioned
     op stream `AxlConsoleOps` will be widened to carry.
 
-    Linking is not the interesting part; the Makefile already proves that. What
+    Linking is not the interesting part; the build already proves that. What
     these assertions pin is *runtime* behaviour that a link check cannot see.
 
     See deps/libvterm/README.md for the eight local patches. `test_decscusr_query`
@@ -1202,9 +1202,22 @@ test_screen_snapshot_exact_vt(void)
     test_check(axl_console_screen_snapshot(s, screen_cap_sink, &cap) == AXL_OK,
                "screen: snapshot returns AXL_OK");
     test_check(axl_strcmp(cap.buf,
-            "\x1b[2J\x1b[m\x1b[1;1H\x1b[0;38;5;1;49mAB\x1b[?25h\x1b[1;3H") == 0,
+            "\x1b[2J\x1b[m\x1b[1;1H\x1b[0;31;49mAB\x1b[?25h\x1b[1;3H") == 0,
             "screen: exact self-contained VT repaint of a 2x4 red-AB screen");
+    axl_console_screen_free(s);
 
+    /* The 16 ANSI colours go out in their 16-colour form (fg 30-37/90-97, bg
+       40-47/100-107), the form the live encoder writes; a 256-colour index past
+       them keeps 38;5;N / 48;5;N. */
+    s = axl_console_screen_new(2, 4);
+    screen_feed_str(s, "\x1b[38;5;200;103mZ\x1b[0;96;48;5;17mW");
+    cap = (ScreenCap){0};
+    test_check(axl_console_screen_snapshot(s, screen_cap_sink, &cap) == AXL_OK,
+               "screen: snapshot (colour forms) returns AXL_OK");
+    test_check(axl_strcmp(cap.buf,
+            "\x1b[2J\x1b[m\x1b[1;1H\x1b[0;38;5;200;103mZ\x1b[0;96;48;5;17mW"
+            "\x1b[?25h\x1b[1;3H") == 0,
+            "screen: 16 colours in their 16-colour form, 256 in 38;5/48;5");
     axl_console_screen_free(s);
 }
 
@@ -1641,6 +1654,114 @@ test_vt_enc_no_coalesce_emits_per_op(void)
     axl_console_vt_enc_free(e);
 }
 
+/* The alternate screen keeps a full-screen app out of the terminal's scrollback;
+   it must not change what the terminal SHOWS, because a UEFI console has one
+   screen. The producer only knows an app is full-screen after its first paint (a
+   backward cursor jump after a clear), so a bare ESC[?1049h switched to a BLANK
+   alternate screen and lost that paint -- the editor's title bar over sshd. And a
+   bare ESC[?1049l brought back the screen as it was BEFORE the app, with the
+   cursor saved there, while the console shows the app's last frame. The encoder
+   carries the visible screen across both switches. The far terminal here is a
+   screen model fed the encoder's bytes. */
+static void
+term_feed_sink(const char *bytes, size_t len, void *user)
+{
+    axl_console_screen_feed((AxlConsoleScreen *)user, (const uint8_t *)bytes, len);
+}
+
+static bool
+term_cell_is(const AxlConsoleScreen *t, uint32_t row, uint32_t col, const char *want)
+{
+    char g[8] = {0};
+    if (!_axl_console_screen_test_cell(t, row, col, g, NULL)) {
+        return false;
+    }
+    if (want[0] == ' ' && want[1] == '\0') {
+        return g[0] == '\0' || axl_strcmp(g, " ") == 0;   /* a blank cell */
+    }
+    return axl_strcmp(g, want) == 0;
+}
+
+static void
+test_vt_enc_alt_screen_carries_the_console(void)
+{
+    AxlConsoleScreen     *t   = axl_console_screen_new(3, 10);
+    AxlConsoleVtEncConfig cfg = { .sink = term_feed_sink, .user = t, .cols = 10, .rows = 3 };
+    AxlConsoleVtEnc      *e   = axl_console_vt_enc_new(&cfg);
+    void                 *u   = NULL;
+    const AxlConsoleOps  *ops = axl_console_vt_enc_ops(e, &u);
+    test_check(t != NULL && e != NULL && ops != NULL, "vt-enc alt: set up");
+    if (t == NULL || e == NULL || ops == NULL) {
+        axl_console_vt_enc_free(e);
+        axl_console_screen_free(t);
+        return;
+    }
+    AxlConsoleValue on  = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = true };
+    AxlConsoleValue off = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = false };
+
+    /* An app paints, THEN is recognised as full-screen. */
+    ops->clear_screen(u);
+    ops->output_text(u, "TITLE", 5);
+    ops->set_cursor(u, 2, 0);
+    ops->output_text(u, "status", 6);
+    ops->set_cursor(u, 1, 3);
+    test_check(ops->set_term_prop(u, AXL_CONSOLE_PROP_ALT_SCREEN, &on) == 1,
+               "vt-enc alt: enter accepted");
+    test_check(_axl_console_screen_test_alt(t), "vt-enc alt: the terminal is on the alt screen");
+    test_check(term_cell_is(t, 0, 0, "T") && term_cell_is(t, 0, 4, "E"),
+               "vt-enc alt: the paint before the switch is on the alt screen (title)");
+    test_check(term_cell_is(t, 2, 0, "s") && term_cell_is(t, 2, 5, "s"),
+               "vt-enc alt: the paint before the switch is on the alt screen (status)");
+    uint32_t row = 0, col = 0;
+    _axl_console_screen_test_cursor(t, &row, &col, NULL);
+    test_check(row == 1 && col == 3, "vt-enc alt: the cursor is where it was");
+
+    /* The app redraws, then exits: what the terminal shows is its last frame. */
+    ops->clear_screen(u);
+    ops->output_text(u, "NEW", 3);
+    /* A pen set with nothing drawn in it yet: the repaint must end on it. */
+    AxlConsolePen red = { .fg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = 4 },
+                          .bg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = 0 } };
+    ops->set_pen(u, &red);
+    test_check(ops->set_term_prop(u, AXL_CONSOLE_PROP_ALT_SCREEN, &off) == 1,
+               "vt-enc alt: leave accepted");
+    test_check(!_axl_console_screen_test_alt(t), "vt-enc alt: the terminal is on the main screen");
+    test_check(term_cell_is(t, 0, 0, "N") && term_cell_is(t, 0, 3, " "),
+               "vt-enc alt: after leaving, the main screen shows the console (not the old title)");
+    test_check(term_cell_is(t, 2, 0, " "),
+               "vt-enc alt: after leaving, the stale status line is gone");
+    _axl_console_screen_test_cursor(t, &row, &col, NULL);
+    test_check(row == 0 && col == 3, "vt-enc alt: the cursor is the console's, not the saved one");
+
+    /* Typing continues where the console's cursor is. */
+    ops->output_text(u, "x", 1);
+    test_check(term_cell_is(t, 0, 3, "x"), "vt-enc alt: the next text lands after NEW");
+    AxlConsolePen got = {0};
+    char          g[8] = {0};
+    test_check(_axl_console_screen_test_cell(t, 0, 3, g, &got)
+               && got.fg.kind == AXL_CONSOLE_COLOR_INDEXED && got.fg.idx == 1,
+               "vt-enc alt: ...in the console's pen (UEFI red = ANSI 1), not the repaint's");
+
+    /* The same for a late joiner: its repaint ends on the console's pen, so the
+       joiner's next text (here fed straight in) is drawn in it. */
+    AxlConsolePen green = { .fg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = 2 },
+                            .bg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = 0 } };
+    ops->set_pen(u, &green);   /* nothing drawn in it yet */
+    AxlConsoleScreen *j = axl_console_screen_new(3, 10);
+    test_check(axl_console_vt_enc_snapshot(e, term_feed_sink, j) == AXL_OK,
+               "vt-enc alt: late-join snapshot");
+    axl_console_screen_feed(j, (const uint8_t *)"y", 1);
+    _axl_console_screen_test_cursor(j, &row, &col, NULL);
+    test_check(col > 0 && _axl_console_screen_test_cell(j, row, col - 1, g, &got)
+               && axl_strcmp(g, "y") == 0
+               && got.fg.kind == AXL_CONSOLE_COLOR_INDEXED && got.fg.idx == 2,
+               "vt-enc alt: a late joiner's next text is in the console's pen (green)");
+    axl_console_screen_free(j);
+
+    axl_console_vt_enc_free(e);
+    axl_console_screen_free(t);
+}
+
 // ---------------------------------------------------------------------------
 
 static void
@@ -1740,6 +1861,7 @@ test_vterm_main(
     test_screen_snapshot_frame_count_coalesced();
     test_vt_enc_coalesce_buffers_until_flush();
     test_vt_enc_no_coalesce_emits_per_op();
+    test_vt_enc_alt_screen_carries_the_console();
     test_screen_resize();
 
     return test_print_results();

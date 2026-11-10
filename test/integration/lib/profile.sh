@@ -35,6 +35,18 @@
 # Usage:
 #   AXL_TEST_PROFILE=/tmp/prof.txt ./test/integration/run-integration.sh --arch X64
 #   python3 test/integration/lib/profile-report.py /tmp/prof.txt
+#
+# THIS IS THE OPT-IN CENSUS; THE ALWAYS-ON SPLIT IS ELSEWHERE. Every run, CI
+# included, writes TIMING lines into each test's own log -- per guest run
+# (booted or pooled, with its boot reading), per run-qemu.sh guest, the
+# test's setup/guest/post summary, the runner's wall and the pool's lease and
+# release -- and lib/timing-report.py tabulates a run's log directory. The
+# formats are defined in the "Wall-time accounting" block of
+# scripts/axl-common.sh. What stays here is what the always-on path must not
+# pay for: the launch argv (the guest-class census) and the staged-file
+# digests (the association question). The `boot|` records below remain for
+# profile-report.py; for a guest's duration, prefer the TIMING lines, which
+# also cover pooled runs and the direct launchers named under KNOWN GAP.
 
 _prof_active() { [[ -n "${AXL_TEST_PROFILE:-}" ]]; }
 
@@ -49,21 +61,24 @@ _prof_emit() {
 }
 
 # Name a record by the TEST SCRIPT, not by $0's path, so the report keys match
-# what run-integration.sh prints and what discover_tests emits.
-_prof_test_name() { basename "${BASH_SOURCE[-1]:-$0}"; }
+# what run-integration.sh prints and what discover_tests emits. The runner's
+# own name for the test wins when it set one: scripts/run-qemu.sh can only key
+# its records that way, and a test reaching guests by both paths must not be
+# counted as two.
+_prof_test_name() { printf '%s\n' "${AXL_TEST_PROFILE_NAME:-$(basename "${BASH_SOURCE[-1]:-$0}")}"; }
 
 _prof_elapsed() {   # $1 = start stamp
     _prof_active || return 0
     awk -v a="$1" -v b="$(_prof_now)" 'BEGIN { printf "%.3f", b - a }'
 }
 
-# KNOWN GAP, recorded rather than left for someone to rediscover as a "fast"
-# test: test-crashhandler.sh assembles its own QEMU command
-# (build_crash_qemu_cmd, which strips KVM because the crash handler needs a real
-# #GP) and launches it directly, reaching neither launcher below nor
-# run-qemu.sh. Its ~42 s and 3 boots are therefore absent from the boot columns.
-# One bespoke test; hooking it would mean instrumenting a private command
-# assembly, which is a worse trade than saying so here.
+# KNOWN GAP in the BOOT columns: test-crashhandler.sh and
+# test-efi-pack-release-qemu.sh assemble their own TCG crash guests (a real #GP
+# needs no KVM) and launch them directly, reaching neither launcher below nor
+# run-qemu.sh, so their boots carry no duration HERE. Both DO call
+# _prof_launch, so the census sees them -- and both bracket the launch with
+# test_timing_begin/test_timing_end, so their TIMING lines carry it. test-run-background-pdeathsig.sh's `-M none` child is
+# not a guest -- no firmware, nothing to pool -- and is deliberately unrecorded.
 
 # --- hooks, called from common-test.sh --------------------------------------
 
@@ -79,6 +94,28 @@ _prof_boot_end() {
     [[ -n "${_PROF_BOOT_AT:-}" ]] || return 0
     _prof_emit "boot|$(_prof_test_name)|$(_prof_elapsed "$_PROF_BOOT_AT")|${1:-unlabelled}"
     unset _PROF_BOOT_AT
+}
+
+# One record per guest LAUNCH, with the QEMU command line: the input to the
+# guest-pool census (docs/AXL-Test-Guest-Pool-Design.md §8, phase 0), which
+# groups launches into the guest classes a pool would need.
+#
+# AT THE LAUNCH, not at the first wait: _prof_boot_end fires only when a test
+# goes on to call test_wait_for, and the sshd suites wait with their own
+# helper, so 82 tests recorded no boot at all. A launch record cannot be
+# missed that way.
+#
+# $1 = how it launched, $2.. = the QEMU argv. Record:
+#   launch|<test>|<via>|<vars template>|<argv, axl_census_argv>
+# The vars TEMPLATE is recorded because the argv only names the per-run copy,
+# and a different template (enrolled keys, a fixture's variables) is a
+# different guest. '|' can appear inside an argument; the argv is last, so it
+# is only ever the separator before it.
+_prof_launch() {
+    _prof_active || return 0
+    local via="$1"
+    shift
+    _prof_emit "launch|$(_prof_test_name)|$via|${FW_VARS:-}|$(axl_census_argv "$@")"
 }
 
 # $1 = source path, $2 = destination inside the guest image.

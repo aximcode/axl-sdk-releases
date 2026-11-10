@@ -86,7 +86,9 @@ usage: sh install.sh [options]
   --toolchain ARCH    also install the cross toolchain: x64 | aa64 | all
   --uninstall         remove an installed version and its links
   --use VERSION       make an already-installed version current; download it
-                      first only if it is not present
+                      first only if it is not present. (`axl use` with no
+                      version names the one a project pins in a
+                      .axl-sdk-version file here or in a parent.)
   --force             reinstall even if that version is already present
   --prune             after installing, offer to remove superseded versions
   --base-url URL      fetch from here instead of GitHub (mirror, or a local dir)
@@ -109,6 +111,11 @@ Environment:
 Everything installs under one versioned directory and is removed by deleting
 it. Nothing is written outside the prefix except the toolchain, which lives in
 /opt because a compiler is shared between SDK versions.
+
+The .deb/.rpm (axl-sdk-<version>, in /opt/axl-sdk-<version>) are the other
+way to install: system-wide, managed by apt/dnf. This script never extracts
+over, selects or removes a version a package installed, and a version it
+installs takes precedence on PATH over the package's.
 EOF
 }
 
@@ -152,8 +159,52 @@ parse_args() {
     esac
 }
 
+# root_owner DIR -- who placed this SDK root, from its receipt
+# (share/axl/.axl-receipt, AXL-Distribution-Design.md §21): install.sh, deb,
+# rpm, something else, or nothing (a root from before receipts existed).
+root_owner() {
+    [ -e "$1/share/axl/.axl-receipt" ] || return 0
+    # Present but unreadable is an owner we cannot see, not "no receipt".
+    [ -r "$1/share/axl/.axl-receipt" ] || { echo "unreadable"; return 0; }
+    sed -n 's/^AXL_RECEIPT_SOURCE=//p' "$1/share/axl/.axl-receipt" | head -1
+}
+
+# refuse_package_root DIR WHAT -- a .deb/.rpm owns this root (§17.5): its
+# package manager does, not this script, or dpkg/rpm would go on listing
+# files we replaced or removed.
+refuse_package_root() {
+    case "$(root_owner "$1")" in
+        deb) die "$1 belongs to the ${1##*/} .deb, which apt manages -- install.sh will not $2 it (remove it with: sudo apt remove ${1##*/})" ;;
+        rpm) die "$1 belongs to the ${1##*/} .rpm, which dnf manages -- install.sh will not $2 it (remove it with: sudo dnf remove ${1##*/})" ;;
+        unreadable) die "$1 has a receipt this user cannot read -- install.sh will not $2 a root whose owner it cannot see" ;;
+    esac
+    return 0
+}
+
+# write_receipt DIR -- the SDK half of §21's receipt: what the tree cannot
+# tell you about itself. Who placed it (and so may remove it: `axl prune`
+# prunes only install.sh's), the digest it was verified against, and whether
+# TLS was skipped fetching it. Not the version: share/axl/version says that.
+# Written LAST, into the staged tree before it is renamed into place, so a
+# half-extracted tree never carries one; inside the prefix, so `rm -rf`
+# stays a complete uninstall (§12.3).
+write_receipt() {
+    _sha="$(cut -d' ' -f1 "$WORK/want.sha256" 2>/dev/null)"
+    ensure mkdir -p "$1/share/axl"
+    {
+        echo "AXL_RECEIPT_KIND=sdk"
+        echo "AXL_RECEIPT_SOURCE=install.sh"
+        echo "AXL_RECEIPT_SHA256=$_sha"
+        echo "AXL_RECEIPT_INSECURE_FETCH=${AXL_INSECURE_FETCH:-0}"
+        echo "AXL_RECEIPT_INSTALLED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$1/share/axl/.axl-receipt" || die "could not write $1/share/axl/.axl-receipt"
+}
+
 # A package install and a prefix install both put `axl` on PATH, and the
-# package wins (/usr/bin before ~/.local/bin on most distros). §17.3.
+# 4.4.0 package won (/usr/bin before ~/.local/bin on most distros). §17.3.
+# The packages that returned in 5.0.0 are named axl-sdk-<version>, live in
+# /opt and put nothing in /usr/bin (§17.5), so they do not collide: said, not
+# refused.
 check_package_install() {
     _pkg=""
     if command -v dpkg >/dev/null 2>&1 && dpkg -s axl-sdk >/dev/null 2>&1; then
@@ -161,7 +212,13 @@ check_package_install() {
     elif command -v rpm >/dev/null 2>&1 && rpm -q axl-sdk >/dev/null 2>&1; then
         _pkg="dnf remove axl-sdk"
     fi
-    [ -n "$_pkg" ] || return 0
+    if [ -z "$_pkg" ]; then
+        if [ -L /opt/axl-sdk-package ]; then
+            info "a system axl-sdk package is installed too ($(readlink -f /opt/axl-sdk-package 2>/dev/null))."
+            info "  The install here takes precedence on PATH; the two do not share files."
+        fi
+        return 0
+    fi
     warn "axl-sdk is also installed as a system package."
     warn "  /usr/bin/axl will win on PATH over anything installed here."
     warn "  Remove it first:  sudo $_pkg"
@@ -205,6 +262,7 @@ do_uninstall() {
     fi
     [ -n "$_target" ] && [ -d "$_target" ] \
         || die "nothing to uninstall under $PREFIX_ROOT (try --version X.Y.Z)"
+    refuse_package_root "$_target" "remove"
 
     for _l in "$BIN_DIR"/axl "$BIN_DIR"/axl-cc "$BIN_DIR"/axl-c++ \
               "$BIN_DIR"/axl-install-toolchain; do
@@ -350,6 +408,8 @@ extract_tree() {
         _src="$STAGE"
     fi
 
+    refuse_package_root "$PREFIX_ROOT/$DIR" "replace"
+    [ "$COMPONENT" = "sdk" ] && write_receipt "$_src"
     rm -rf "$PREFIX_ROOT/$DIR"
     ensure mv "$_src" "$PREFIX_ROOT/$DIR"
     rm -rf "$STAGE"
@@ -381,7 +441,7 @@ link_tree() {
     _n=0
     for _b in "$PREFIX_ROOT/$DIR"/bin/*; do
         [ -f "$_b" ] && [ -x "$_b" ] || continue
-        case "${_b##*/}" in pe-set-debug) continue ;; esac  # internal, resolved by path
+        case "${_b##*/}" in pe-set-debug|axl-efi-pack) continue ;; esac  # internal, resolved by path
         ensure ln -sfn "$_b" "$BIN_DIR/${_b##*/}"
         _n=$((_n + 1))
     done
@@ -467,6 +527,7 @@ do_use() {
     validate_version "$VERSION"
     set_dir_for_version
     if [ -d "$PREFIX_ROOT/$DIR" ]; then
+        refuse_package_root "$PREFIX_ROOT/$DIR" "select"
         info "$LABEL $VERSION is already installed -- switching to it"
         link_tree
     else
@@ -685,9 +746,45 @@ cleanup() {
     return 0
 }
 
+# A signal must END the script after cleanup runs, not resume it.
+# `trap cleanup EXIT INT TERM` (what this replaces) does not: a trap handler
+# that does not itself exit RESUMES the script where the signal interrupted
+# it, at the interrupted command's own failure status. Measured here: an
+# interrupt during the checksum check resumed straight into die()'s "SHA256
+# mismatch -- refusing to install", over a download the interrupt -- not a
+# bad download -- had actually caused; the same shape gave a false "could not
+# download" and "could not extract". With --prune --toolchain, an interrupt
+# during the toolchain step was absorbed as a failure and the REAL prune ran
+# anyway -- including a Ctrl-C during the prune's own --dry-run preview,
+# which resumed straight into the real deletion. See scripts/axl-common.sh's
+# axl_die_by_signal for the bash-side history of this bug class; this is
+# POSIX /bin/sh -- the one AXL script that must run before anything of ours
+# is installed, on a machine we know nothing about -- so it cannot source
+# that bash-only helper (`local`, `BASHPID`, `[[ ]]`). This is the portable
+# equivalent, and simpler than the bash one: cleanup is a fixed, known
+# function rather than a captured EXIT trap read back at signal time, so
+# there is nothing to eval and no ordering hazard to worry about. Ignore
+# INT/TERM for the cleanup's own duration so a second signal cannot cut it
+# short, run cleanup once, then re-raise with the signal's default action so
+# the shell dies BY the signal -- what a caller waiting on Ctrl-C needs to
+# see -- rather than resuming or exiting 0.
+die_by_signal() {
+    trap - EXIT
+    trap '' INT TERM
+    cleanup
+    trap - INT TERM
+    kill -s "$1" "$$"
+    # Reached only if the signal was ignored on entry (e.g. run under
+    # `nohup`) -- exit with the conventional 128+n instead of falling
+    # through into main() at the point the signal landed.
+    exit "$2"
+}
+
 main() {
     WORK=""; STAGE=""
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'die_by_signal INT 130'  INT
+    trap 'die_by_signal TERM 143' TERM
     parse_args "$@"
 
     if [ "${AXL_INSECURE_FETCH:-0}" = "1" ]; then
@@ -730,6 +827,10 @@ main() {
         info "already at $VERSION -- nothing to do (--force to reinstall)"
         return 0
     fi
+    # Before the download, not after it: a package's root is refused either
+    # way (extract_tree checks again), but not after a 13 MB fetch.
+    set_dir_for_version
+    refuse_package_root "$PREFIX_ROOT/$DIR" "replace"
     fetch_and_verify
     extract_tree
     link_tree

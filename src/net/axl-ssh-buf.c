@@ -129,3 +129,17 @@ axl_ssh_get_string(const uint8_t *p, size_t len, size_t *off,
     *off = probe + n;
     return AXL_OK;
 }
+
+int
+axl_ssh_userauth_signed_blob(AxlString *out, const uint8_t *session_id,
+                             size_t sid_len, const uint8_t *req,
+                             size_t req_len)
+{
+    if (out == NULL || session_id == NULL || req == NULL) {
+        return AXL_ERR;
+    }
+    if (axl_ssh_put_string(out, session_id, sid_len) != AXL_OK) {
+        return AXL_ERR;
+    }
+    return axl_string_append_len(out, (const char *)req, req_len);
+}

@@ -11,14 +11,18 @@
 **/
 
 #include "axl-backend.h"
+#include "../../fs/axl-fs-read-chunk.h"  /* AXL_FS_READ_CHUNK */
 #include "axl-backend-native-efi1x.h"  /* old EFI 1.x shell path resolution */
 #include "axl-backend-native-nosh.h"   /* no shell at all (BDS boot option) */
+#include "axl-backend-native-shell.h"  /* modern-shell paths that park nothing */
+#include "axl-backend-native-lines.h"  /* axl_text_out_lines */
 #include "axl-stdio-bridge.h"  /* AxlStdioBridge, bridge install/uninstall */
 #include <axl/axl-driver.h>    /* axl_protocol_install, axl_protocol_uninstall */
 #include <axl/axl-sys.h>       /* axl_protocol_find_guid */
 #include <axl/axl-atexit.h>    /* axl_atexit */
 #include <axl/axl-input.h>     /* AXL_INPUT_MOD_* — read_key_ex normalizes to these */
 #include <axl/axl-log.h>
+#include <axl/axl-str.h>       /* axl_snprintf */
 #include <stdarg.h>
 
 AXL_LOG_DOMAIN("backend");
@@ -26,6 +30,15 @@ AXL_LOG_DOMAIN("backend");
 /* Runaway guard for axl_backend_shell_unmap_device: more names than any one
    device carries. */
 #define AXL_UNMAP_MAX_NAMES  32u
+
+/* Longest `name:` volume prefix shell_path_volume_resolves looks up, with
+   its NUL. Shell map names are short (`fs0:`, `blk12:`, a consistent name
+   such as `HD0a1b:`); a longer prefix is not a mapping. */
+#define AXL_SHELL_MAP_NAME_MAX  64u
+
+/* EFI_TIME.TimeZone meaning "local time, zone unknown" (UEFI 2.11 §8.3).
+   AXL reads it as UTC, so a time written with it reads back unchanged. */
+#define AXL_EFI_TIME_ZONE_UNSPECIFIED  0x07FF
 
 // ===================================================================
 // Global firmware table pointers (set by CRT0)
@@ -126,30 +139,8 @@ axl_backend_console_write(
     )
 {
     if (gST != NULL && gST->ConOut != NULL && str != NULL) {
-        gST->ConOut->OutputString(gST->ConOut, (CHAR16 *)str);
-    }
-}
-
-/**
- * @brief Write a UCS-2 string to the error console. NULL-safe.
- *
- * Targets gST->StdErr so the UEFI shell's `2>` redirect (which swaps
- * gST->StdErr, symmetric to `>` swapping gST->ConOut) captures it and a
- * plain `>` does not. Falls back to gST->ConOut when StdErr is absent
- * (minimal firmware / BDS).
- */
-void
-axl_backend_console_write_err(
-    const unsigned short  *str
-    )
-{
-    if (gST == NULL || str == NULL) {
-        return;
-    }
-    if (gST->StdErr != NULL) {
-        gST->StdErr->OutputString(gST->StdErr, (CHAR16 *)str);
-    } else if (gST->ConOut != NULL) {
-        gST->ConOut->OutputString(gST->ConOut, (CHAR16 *)str);
+        axl_text_out_lines(gST, gST->ConOut, &gEfiConsoleOutDeviceGuid, NULL,
+                           (const CHAR16 *)str);
     }
 }
 
@@ -162,29 +153,6 @@ axl_backend_console_set_attr(
     )
 {
     if (gST != NULL && gST->ConOut != NULL) {
-        gST->ConOut->SetAttribute(gST->ConOut, attr);
-    }
-}
-
-/**
- * @brief Set the error console's text attribute (color/style).
- *
- * Targets gST->StdErr, symmetric to axl_backend_console_write_err(), so
- * the escape bytes an ANSI/serial console (TerminalDxe) emits for
- * SetAttribute land on the same sink as the text they color. Falls
- * back to gST->ConOut when StdErr is absent (minimal firmware / BDS).
- */
-void
-axl_backend_console_set_attr_err(
-    uint32_t  attr
-    )
-{
-    if (gST == NULL) {
-        return;
-    }
-    if (gST->StdErr != NULL) {
-        gST->StdErr->SetAttribute(gST->StdErr, attr);
-    } else if (gST->ConOut != NULL) {
         gST->ConOut->SetAttribute(gST->ConOut, attr);
     }
 }
@@ -612,7 +580,8 @@ read_counter_freq(void)
 
    - aarch64: read CNTFRQ_EL0 (architectural register). Every UEFI
      process reads the same value; no calibration needed.
-   - x86_64: calibrate against a 10 ms gBS->Stall on first call, then
+   - x86_64: calibrate against short gBS->Stall samples on first call
+     (short and long Stalls, differenced; see get_counter_freq_hz), then
      publish the result on a fresh UEFI handle carrying our private
      AXL_TSC_FREQ_PROTOCOL_GUID. Subsequent processes within the same
      boot LocateProtocol → read the cached freq, no re-calibration.
@@ -644,7 +613,81 @@ static const EFI_GUID AXL_TSC_FREQ_PROTOCOL_GUID = {
 typedef struct {
     uint64_t freq_hz;
 } AxlTscFreqInterface;
+
+/* TSC calibration: this many pairs of a short and a long Stall, the
+   least of each kept and differenced (get_counter_freq_hz says why). Five
+   pairs of 100 + 1900 us cost the 10 ms five 2 ms Stalls did. */
+#define AXL_TSC_CAL_PAIRS     5u
+#define AXL_TSC_CAL_SHORT_US  100u
+#define AXL_TSC_CAL_LONG_US   1900u
 #endif
+
+/* The MINIMUM non-zero sample, not the mean: every error a sample carries
+   is an overshoot (see get_counter_freq_hz), so the smallest is the least
+   disturbed, and one bad sample among several costs nothing. */
+static uint64_t
+least_sample(const uint64_t *ticks, size_t count)
+{
+    uint64_t least = 0;
+
+    for (size_t i = 0; ticks != NULL && i < count; i++) {
+        if (ticks[i] != 0 && (least == 0 || ticks[i] < least)) {
+            least = ticks[i];
+        }
+    }
+    return least;
+}
+
+/* How far under the long Stall alone the differenced frequency may fall,
+   as a divisor: 1/50, 2 %. The long Stall alone overstates by the fixed
+   cost every Stall carries -- measured at 0.6 % on an idle virtualised
+   host -- and a floor closer than that would put the truth below it and
+   undo the differencing. 2 % is over three times that cost, room for it to
+   grow under load, and the differenced value read at worst 1.0 % fast on
+   a loaded host before the floor existed; a disturbed SHORT Stall can now
+   make the clock run at most 2 % fast instead of without bound. */
+#define AXL_COUNTER_FREQ_FAST_SLACK_DIV  50u
+
+/* Ticks per @a us microseconds scaled to a second, in two parts so the
+   scaling cannot overflow: the remainder is below @a us, and @a us is
+   microseconds. */
+static uint64_t
+ticks_per_second(uint64_t ticks, uint64_t us)
+{
+    return ticks / us * 1000000u + ticks % us * 1000000u / us;
+}
+
+uint64_t
+axl_backend_counter_freq_from_samples(const uint64_t *short_ticks,
+                                      const uint64_t *long_ticks,
+                                      size_t count, uint64_t short_us,
+                                      uint64_t long_us)
+{
+    uint64_t least_short = least_sample(short_ticks, count);
+    uint64_t least_long  = least_sample(long_ticks, count);
+
+    if (least_long == 0 || short_us >= long_us) {
+        return 0;
+    }
+    /* The long Stall alone can only OVERSTATE the frequency: its fixed cost
+       and any overshoot both add ticks. An overshoot on the short Stall
+       errs the other way -- the difference shrinks and the clock runs fast,
+       without bound if every short sample was disturbed -- so the
+       difference is kept between that ceiling and a floor just under it
+       (AXL_COUNTER_FREQ_FAST_SLACK_DIV). No short sample leaves the
+       ceiling, and a short sample no smaller than the long the floor --
+       never 0. */
+    uint64_t ceiling = ticks_per_second(least_long, long_us);
+    uint64_t lowest  = ceiling - ceiling / AXL_COUNTER_FREQ_FAST_SLACK_DIV;
+    uint64_t diff    = 0;
+    if (least_long > least_short) {
+        diff = ticks_per_second(least_long - least_short, long_us - short_us);
+    }
+    if (diff > ceiling) {
+        return ceiling;
+    }
+    return diff < lowest ? lowest : diff;
+}
 
 static uint64_t
 get_counter_freq_hz(void)
@@ -676,15 +719,48 @@ get_counter_freq_hz(void)
         return memo;
     }
 
-    /* First publisher: calibrate via 10ms Stall. */
-    uint64_t before = read_cycle_counter();
-    gBS->Stall(10000);
-    uint64_t after  = read_cycle_counter();
-    uint64_t diff   = after - before;
-    if (diff == 0) {
+    /* First publisher: calibrate against gBS->Stall, AXL_TSC_CAL_PAIRS
+       pairs of a short and a long Stall, keeping the least of each. A Stall
+       never returns early -- it polls a reference timer until at least the
+       time asked for has passed -- so every error a sample carries is an
+       OVERSHOOT: the vCPU descheduled in or around it, an SMI, a long
+       interrupt. An overshoot counts extra ticks, overestimates the
+       frequency, and makes this clock run SLOW for the rest of the boot,
+       since the value is published below and every later process adopts
+       it. One 10 ms sample was measured at 0.77x, and once 0.13x, real time
+       on a loaded virtualised host, which stretched every bound timed on
+       this clock (login grace, penalties, hook budgets) by the same factor.
+       Linux calibrates the TSC the same way for the same reason: several
+       passes against the PIT and the HPET/PM timer, keeping the minimum
+       (pit_hpet_ptimer_calibrate_cpu, arch/x86/kernel/tsc.c).
+
+       Even the least sample carries what EVERY Stall costs, whatever its
+       length: the call and the reference timer's reads, each a VM exit
+       when virtualised. Read off one length, that cost alone left the
+       clock 0.6 % slow on an idle virtualised host -- enough that a timer
+       firing at a period's end read the clock just short of it, every
+       time. The frequency is therefore the DIFFERENCE of the least long
+       and the least short sample over the difference of their lengths,
+       which cancels it (axl_backend_counter_freq_from_samples). The short
+       Stall is short so that it is rarely disturbed itself: an overshoot
+       there makes the clock run fast, which the long Stall alone bounds to
+       2 % (AXL_COUNTER_FREQ_FAST_SLACK_DIV). */
+    uint64_t short_ticks[AXL_TSC_CAL_PAIRS];
+    uint64_t long_ticks[AXL_TSC_CAL_PAIRS];
+    for (size_t i = 0; i < AXL_TSC_CAL_PAIRS; i++) {
+        uint64_t before = read_cycle_counter();
+        gBS->Stall(AXL_TSC_CAL_SHORT_US);
+        uint64_t mid = read_cycle_counter();
+        gBS->Stall(AXL_TSC_CAL_LONG_US);
+        long_ticks[i]  = read_cycle_counter() - mid;
+        short_ticks[i] = mid - before;
+    }
+    uint64_t freq = axl_backend_counter_freq_from_samples(
+        short_ticks, long_ticks, AXL_TSC_CAL_PAIRS, AXL_TSC_CAL_SHORT_US,
+        AXL_TSC_CAL_LONG_US);
+    if (freq == 0) {
         return 0;   /* no usable counter */
     }
-    uint64_t freq = diff * 100;   /* 10ms → *100 = ticks/sec */
 
     /* Publish for future processes. Allocate from boot-services
        pool so the interface survives image unload (the AXL leak
@@ -726,11 +802,12 @@ days_from_civil(uint32_t y, uint32_t m, uint32_t d);
    pre-1970 date) preserve them. File-timestamp consumers clamp at
    the call site.
 
-   The @p tz_minutes argument uses the AXL convention: real signed
-   minutes east of UTC, or INT16_MIN to mean "unspecified — treat
-   as already-UTC." EFI's 0x07FF sentinel must be translated to
-   INT16_MIN by the caller (axl_backend_get_time does this for
-   AxlTime; axl_backend_efi_time_to_unix does it inline). */
+   @p tz_minutes is EFI_TIME.TimeZone's value -- UEFI 2.11 section 8.3:
+   Localtime = UTC - TimeZone, so UTC = local + TimeZone (EDK2's CryptoPkg
+   TimerWrapper adds it the same way) -- or INT16_MIN to mean "unspecified,
+   treat as already-UTC". EFI's 0x07FF sentinel must be translated to
+   INT16_MIN by the caller (axl_backend_get_time does this for AxlTime;
+   axl_backend_efi_time_to_unix does it inline). */
 static int64_t
 civil_to_unix_seconds(uint32_t year,
                       uint32_t month,
@@ -746,9 +823,29 @@ civil_to_unix_seconds(uint32_t year,
                  + (int64_t)minute * 60
                  + (int64_t)second;
     if (tz_minutes != INT16_MIN) {
-        secs -= (int64_t)tz_minutes * 60;
+        secs += (int64_t)tz_minutes * 60;
     }
     return secs;
+}
+
+uint64_t
+axl_backend_counter_ticks(void)
+{
+#if defined(__x86_64__) || defined(__aarch64__)
+    return read_cycle_counter();
+#else
+    return 0;
+#endif
+}
+
+uint64_t
+axl_backend_counter_hz(void)
+{
+#if defined(__x86_64__) || defined(__aarch64__)
+    return get_counter_freq_hz();
+#else
+    return 0;
+#endif
 }
 
 int
@@ -866,7 +963,8 @@ no_shell_at_all(
    stays shell-agnostic. Shared by the open / delete / mkdir entry points,
    which differ only in the mode and attributes they ask for.
 
-   @return AXL_OK with @p out set, or AXL_ERR. */
+   @return AXL_OK with @p out set; AXL_NOT_FOUND when the volume resolved
+       and the file is absent; AXL_ERR otherwise. */
 static int
 no_shell_file_open(
     const unsigned short  *path,
@@ -881,28 +979,142 @@ no_shell_file_open(
     return axl_nosh_file_open(path, mode, attributes, out);
 }
 
-/**
- * @brief Open a file by UCS-2 path.
- *
- * @return 0 on success, -1 on error.
- */
-int
-axl_backend_file_open(
-    const unsigned short  *path,        ///< UCS-2 file path
-    uint64_t               mode,        ///< EFI file mode flags
-    uint64_t               attributes,  ///< EFI file attributes
-    AxlFileHandle         *handle       ///< (out) receives file handle
+/* Does the volume @p path names resolve under the modern shell? A `name:`
+   prefix (before any separator) must be a live mapping; a path without one
+   resolves against the current directory, which must exist. The shell's
+   OpenFileByName answers EFI_NOT_FOUND for an unmapped volume exactly as
+   for an absent file, and only this tells the two apart. */
+static bool
+shell_path_volume_resolves(
+    EFI_SHELL_PROTOCOL    *shell,
+    const unsigned short  *path
+    )
+{
+    size_t colon = 0;
+    bool   found = false;
+    for (size_t i = 0; path[i] != 0; i++) {
+        if (path[i] == (unsigned short)'\\' || path[i] == (unsigned short)'/') {
+            break;
+        }
+        if (path[i] == (unsigned short)':') {
+            colon = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return axl_shell_cwd(shell) != NULL;
+    }
+    if (colon == 0 || colon + 2 > AXL_SHELL_MAP_NAME_MAX) {
+        return false;
+    }
+    unsigned short name[AXL_SHELL_MAP_NAME_MAX];
+    for (size_t i = 0; i <= colon; i++) {
+        name[i] = path[i];
+    }
+    name[colon + 1] = 0;
+    return axl_backend_shell_map_exists(name);
+}
+
+/* @p path, or -- when it holds a '/' -- a copy with every '/' turned into
+   '\'. A UEFI path separates with '\' only: the modern shell's
+   OpenFileByName fails "fs0:/x" outright and the EFI 1.x shell's map
+   lookup splits on '\' alone, so every entry point that takes a path
+   converts here, before the shell-mode dispatch, and no name can hold a
+   '/' to lose (FAT refuses it). *@p copy receives the allocation, NULL when
+   none was needed; the caller frees it on every exit.
+
+   @return the path to use, or NULL when the copy could not be allocated. */
+static const unsigned short *
+path_backslashed(
+    const unsigned short  *path,
+    unsigned short       **copy
+    )
+{
+    size_t n     = 0;
+    bool   slash = false;
+
+    *copy = NULL;
+    for (; path[n] != 0; n++) {
+        if (path[n] == (unsigned short)'/') {
+            slash = true;
+        }
+    }
+    if (!slash) {
+        return path;
+    }
+    unsigned short *c = axl_backend_alloc((n + 1) * sizeof(*c));
+    if (c == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i <= n; i++) {
+        c[i] = (path[i] == (unsigned short)'/') ? (unsigned short)'\\' : path[i];
+    }
+    *copy = c;
+    return c;
+}
+
+/* Is @p path a name EFI_SHELL_PROTOCOL.OpenFileByName answers itself
+   rather than resolving to a file (ShellProtocol.c EfiShellOpenFileByName):
+   the standard streams `>i` `>o` `>e`, the null file `NUL`/`NULL` (any
+   case), and a shell variable `>v<name>`. None of them parks a buffer, so
+   they stay on the Shell. */
+static bool
+shell_special_name(
+    const unsigned short  *path
+    )
+{
+    static const char *const nul[] = { "NUL", "NULL" };
+
+    if (path[0] == (unsigned short)'>') {
+        unsigned short c = path[1];
+        return (c == 'v')
+               || ((c == 'i' || c == 'o' || c == 'e') && path[2] == 0);
+    }
+    for (size_t k = 0; k < sizeof(nul) / sizeof(nul[0]); k++) {
+        size_t i = 0;
+        while (nul[k][i] != '\0'
+               && (path[i] & ~(unsigned short)0x20) == (unsigned short)nul[k][i]) {
+            i++;
+        }
+        if (nul[k][i] == '\0' && path[i] == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* EFI_SHELL_PROTOCOL.OpenFileByName, minus the buffer it parks on every
+   call: a regular file is resolved and opened AXL-side exactly as the Shell
+   would (axl-backend-native-shell.h); the names the Shell answers itself
+   still go to it. */
+static EFI_STATUS
+shell_open_by_name(
+    EFI_SHELL_PROTOCOL    *shell,
+    const unsigned short  *path,
+    uint64_t               mode,
+    SHELL_FILE_HANDLE     *fh
+    )
+{
+    if (shell_special_name(path)) {
+        return shell->OpenFileByName((CHAR16 *)path, fh, mode);
+    }
+    return axl_shell_path_open(shell, (const CHAR16 *)path, mode, 0,
+                               (EFI_FILE_PROTOCOL **)fh);
+}
+
+/* axl_backend_file_open on a path whose separators are all '\'. */
+static int
+file_open_backslashed(
+    const unsigned short  *path,
+    uint64_t               mode,
+    uint64_t               attributes,
+    AxlFileHandle         *handle
     )
 {
     EFI_SHELL_PROTOCOL  *shell;
     SHELL_FILE_HANDLE    fh;
     EFI_STATUS           status;
-
-    (void)attributes;
-
-    if (path == NULL || handle == NULL) {
-        return AXL_ERR;
-    }
 
     shell = get_shell();
     if (shell == NULL) {
@@ -912,14 +1124,15 @@ axl_backend_file_open(
            SHELL_FILE_HANDLE has on the modern shell, so the handle-based
            ops below stay shell-agnostic. */
         EFI_FILE_PROTOCOL *file = NULL;
-        if (no_shell_file_open(path, mode, attributes, &file) != AXL_OK) {
-            return AXL_ERR;
+        int rc = no_shell_file_open(path, mode, attributes, &file);
+        if (rc != AXL_OK) {
+            return rc;   /* AXL_NOT_FOUND passes through */
         }
         *handle = (AxlFileHandle)file;
         return AXL_OK;
     }
 
-    status = shell->OpenFileByName((CHAR16 *)path, &fh, mode);
+    status = shell_open_by_name(shell, path, mode, &fh);
     if (EFI_ERROR(status)) {
         /* EFI_NOT_FOUND is the normal "file doesn't exist" case and
          * floods the log when callers probe many candidate paths
@@ -928,11 +1141,41 @@ axl_backend_file_open(
         if (status != EFI_NOT_FOUND) {
             axl_debug("file open failed: status=0x%llx",
                       (unsigned long long)status);
+            return AXL_ERR;
         }
-        return AXL_ERR;
+        return shell_path_volume_resolves(shell, path) ? AXL_NOT_FOUND
+                                                       : AXL_ERR;
     }
     *handle = (AxlFileHandle)fh;
     return AXL_OK;
+}
+
+/**
+ * @brief Open a file by UCS-2 path; either separator.
+ *
+ * @return AXL_OK on success; AXL_NOT_FOUND when the volume resolved and the
+ *     file system reported no such file; AXL_ERR on any other failure.
+ */
+int
+axl_backend_file_open(
+    const unsigned short  *path,        ///< UCS-2 file path
+    uint64_t               mode,        ///< EFI file mode flags
+    uint64_t               attributes,  ///< EFI file attributes
+    AxlFileHandle         *handle       ///< (out) receives file handle
+    )
+{
+    unsigned short *copy = NULL;
+
+    if (path == NULL || handle == NULL) {
+        return AXL_ERR;
+    }
+    const unsigned short *p = path_backslashed(path, &copy);
+    if (p == NULL) {
+        return AXL_ERR;
+    }
+    int rc = file_open_backslashed(p, mode, attributes, handle);
+    axl_backend_free(copy);
+    return rc;
 }
 
 /**
@@ -963,10 +1206,46 @@ axl_backend_file_close(
     return AXL_OK;
 }
 
+int
+axl_backend_dir_read_entry(
+    AxlFileHandle  handle,
+    size_t        *size,
+    void          *buf
+    )
+{
+    if (handle == NULL || size == NULL || buf == NULL) {
+        return AXL_ERR;
+    }
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    UINTN               usize = *size;
+    EFI_STATUS          status;
+    if (shell != NULL) {
+        status = shell->ReadFile((SHELL_FILE_HANDLE)handle, &usize, buf);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+        status = file->Read(file, &usize, buf);
+    }
+    if (status == EFI_BUFFER_TOO_SMALL) {
+        *size = usize;
+        return AXL_NO_RESOURCES;
+    }
+    if (EFI_ERROR(status)) {
+        *size = 0;
+        return AXL_ERR;
+    }
+    *size = usize;
+    return AXL_OK;
+}
+
 /**
- * @brief Read from a file.
+ * @brief Read from a file, at most AXL_FS_READ_CHUNK per firmware call.
  *
- * @return 0 on success, -1 on error.
+ * The contract (the short-read stop, partial success before an error,
+ * *size on error) is in axl-backend.h; the chunk size and why are in
+ * axl-fs-read-chunk.h.
+ *
+ * @return AXL_OK on success, including a partial read cut short by an
+ *     error; AXL_ERR when the first call fails.
  */
 int
 axl_backend_file_read(
@@ -976,23 +1255,42 @@ axl_backend_file_read(
     )
 {
     EFI_SHELL_PROTOCOL  *shell;
-    EFI_STATUS           status;
-    UINTN                usize;
+    EFI_STATUS           status = EFI_SUCCESS;
+    size_t               want;
+    size_t               got = 0;
 
     if (handle == NULL || size == NULL || buf == NULL) {
         return AXL_ERR;
     }
 
-    usize = *size;
+    want  = *size;
     shell = get_shell();
-    if (shell != NULL) {
-        status = shell->ReadFile((SHELL_FILE_HANDLE)handle, &usize, buf);
-    } else {
-        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
-        status = file->Read(file, &usize, buf);
+    while (got < want) {
+        UINTN ask   = (want - got < AXL_FS_READ_CHUNK) ? want - got
+                                                       : AXL_FS_READ_CHUNK;
+        UINTN usize = ask;
+        if (shell != NULL) {
+            status = shell->ReadFile((SHELL_FILE_HANDLE)handle, &usize,
+                                     (uint8_t *)buf + got);
+        } else {
+            EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+            status = file->Read(file, &usize, (uint8_t *)buf + got);
+        }
+        if (EFI_ERROR(status)) {
+            break;
+        }
+        got += usize;
+        if (usize < ask) {
+            break;
+        }
     }
-    *size = usize;
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    /* Bytes already read are the caller's even when a later chunk fails:
+       the file position has moved past them, so dropping them here would
+       lose them for good. The next call retries from the failing chunk and
+       reports the error if the fault recurs (the POSIX read() contract;
+       nothing here is sticky). */
+    *size = got;
+    return (EFI_ERROR(status) && got == 0) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -1125,74 +1423,31 @@ axl_backend_file_delete(
     const unsigned short  *path  ///< UCS-2 file path
     )
 {
-    EFI_SHELL_PROTOCOL  *shell;
-    EFI_STATUS           status;
+    AxlFileHandle h = NULL;
+    int           rc;
 
     if (path == NULL) {
         return AXL_ERR;
-    }
-
-    shell = get_shell();
-    if (shell == NULL) {
-        /* No modern shell: open with write access, then Delete (which
-           closes the handle whether it succeeds or fails). Works for both
-           files and empty directories. */
-        EFI_FILE_PROTOCOL *file = NULL;
-        if (no_shell_file_open(path,
-                               AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
-                               0, &file) != AXL_OK) {
-            return AXL_NOT_FOUND;
-        }
-        status = file->Delete(file);
-        return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
 
     /* Open-then-delete, NOT shell->DeleteFileByName().
      *
      * EDK2's EfiShellDeleteFileByName opens its target with
      * EfiShellCreateFile (ShellPkg/Application/Shell/ShellProtocol.c), so
-     * deleting a name that does not exist CREATED a zero-length file, deleted
-     * it, and honestly reported EFI_SUCCESS. Three things wrong with that, in
-     * increasing order of how much they matter:
-     *
-     *   - the caller cannot tell "I removed it" from "there was nothing
-     *     there", and axl_file_rename() on the same input already answered
-     *     correctly, so the two disagreed;
-     *   - a pure-CLEANUP call performed a WRITE. On a read-only or nearly
-     *     full volume, or one whose media just went away, that can fail --
-     *     and when it succeeds it is I/O nobody asked for;
-     *   - the no-shell branch above opens WITHOUT create and refused, so the
-     *     behaviour depended on whether a modern shell was present.
-     *
-     * This uses the shell's OWN OpenFileByName and DeleteFile rather than
-     * casting a SHELL_FILE_HANDLE to EFI_FILE_PROTOCOL*, so it assumes
-     * nothing about how the shell represents a handle -- EfiShellOpenFileByName
-     * forwards its OpenMode to InternalOpenFileDevicePath unchanged, so
-     * omitting EFI_FILE_MODE_CREATE really does mean "do not create".
-     *
-     * Probing with a stat first would also have worked and was the reported
-     * suggestion, but it costs a second open and leaves a window where the
-     * file appears between the probe and the delete -- in which
-     * DeleteFileByName would create it again. Removing the create at the
-     * source has neither problem.
-     */
-    {
-        SHELL_FILE_HANDLE handle = NULL;
-
-        status = shell->OpenFileByName((CHAR16 *)path, &handle,
-                                       AXL_FILE_MODE_READ
-                                       | AXL_FILE_MODE_WRITE);
-        if (EFI_ERROR(status) || handle == NULL) {
-            return AXL_NOT_FOUND;
-        }
-        /* DeleteFile closes the handle in EVERY case, so there is no
-           CloseFile() here and `handle` must not be touched again. It
-           returns EFI_WARN_DELETE_FAILURE -- a WARNING, which EFI_ERROR()
-           reads as SUCCESS -- when the handle was closed but the file
-           survived, so success is tested for explicitly. */
-        status = shell->DeleteFile(handle);
-        return (status == EFI_SUCCESS) ? AXL_OK : AXL_ERR;
+     * deleting a name that does not exist CREATED a zero-length file,
+     * deleted it, and honestly reported EFI_SUCCESS: the caller could not
+     * tell "removed" from "never there", and a pure cleanup call performed
+     * a WRITE. axl_backend_file_open never creates without CREATE, on the
+     * modern shell, the old shell and with no shell at all, and the delete
+     * goes through the one handle routine that reads the firmware's
+     * "closed but not deleted" warning as the failure it is -- which the
+     * no-shell branch here used to read as success. */
+    rc = axl_backend_file_open(path, AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
+                               0, &h);
+    if (rc != AXL_OK) {
+        return (rc == AXL_NOT_FOUND) ? AXL_NOT_FOUND : AXL_ERR;
     }
+    return axl_backend_file_handle_delete(&h);
 }
 
 /* GetFileInfo for an already-open handle, shell-agnostic. On the modern shell
@@ -1286,6 +1541,24 @@ axl_backend_file_get_size(
     return result;
 }
 
+int
+axl_backend_file_handle_is_dir(
+    AxlFileHandle   handle,
+    bool           *is_dir
+    )
+{
+    if (handle == NULL || is_dir == NULL) {
+        return AXL_ERR;
+    }
+    EFI_FILE_INFO *info = native_file_info(handle);
+    if (info == NULL) {
+        return AXL_ERR;
+    }
+    *is_dir = (info->Attribute & EFI_FILE_DIRECTORY) != 0;
+    axl_backend_free(info);
+    return AXL_OK;
+}
+
 /**
  * @brief Check if a path is a directory.
  *
@@ -1312,61 +1585,191 @@ axl_backend_file_is_dir(
     return is_dir;
 }
 
-int
-axl_backend_file_rename(
-    const unsigned short  *old_path,
-    const unsigned short  *new_path
+/* Append @p n characters of @p src to the volume-relative path in @p rel,
+   normalizing as it goes: either separator becomes '\', a run of them one,
+   and none leads. A trailing one is the caller's to strip.
+
+   @return false when the result would not fit in @p cap characters. */
+static bool
+vol_path_append(
+    unsigned short       *rel,
+    size_t                cap,
+    size_t               *len,
+    const unsigned short *src,
+    size_t                n
     )
 {
-    AxlFileHandle        handle = NULL;
-    EFI_FILE_INFO       *info;
-    EFI_STATUS           status;
-    size_t               new_len;
-    size_t               info_size;
-    EFI_FILE_INFO       *new_info;
-    size_t               i;
+    for (size_t i = 0; i < n; i++) {
+        unsigned short c = src[i];
+        if (c == (unsigned short)'/' || c == (unsigned short)'\\') {
+            if (*len == 0 || rel[*len - 1] == (unsigned short)'\\') {
+                continue;
+            }
+            c = (unsigned short)'\\';
+        }
+        if (*len + 1 >= cap) {
+            return false;
+        }
+        rel[(*len)++] = c;
+    }
+    rel[*len] = 0;
+    return true;
+}
 
-    if (old_path == NULL || new_path == NULL) {
+/* The modern shell: the volume and remainder GetDevicePathFromFilePath
+   would resolve the path to (the map name in any case and any alias, or
+   the current directory), without opening anything -- and without the
+   buffers that call parks (axl-backend-native-shell.h). The remainder is
+   the one file-path node the Shell would build, normalized here. */
+static int
+shell_path_locate(
+    EFI_SHELL_PROTOCOL    *shell,
+    const unsigned short  *path,
+    void                 **volume,
+    unsigned short        *rel,
+    size_t                 rel_cap
+    )
+{
+    AxlShellPath sp;
+    if (axl_shell_path_resolve(shell, (const CHAR16 *)path, &sp) != AXL_OK) {
         return AXL_ERR;
     }
 
-    /* Open the existing file (shell-agnostic — resolves fsN:/relative). */
-    if (axl_backend_file_open(old_path,
-                              AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
-                              0, &handle) != AXL_OK) {
+    static const unsigned short sep = (unsigned short)'\\';
+    size_t len = 0;
+    int    rc  = AXL_OK;
+    rel[0] = 0;
+    if (!vol_path_append(rel, rel_cap, &len, &sep, 1)
+        || !vol_path_append(rel, rel_cap, &len, sp.rest,
+                            axl_backend_wcslen(sp.rest))) {
+        rc = AXL_ERR;
+    }
+    while (rc == AXL_OK && len > 0 && rel[len - 1] == (unsigned short)'\\') {
+        rel[--len] = 0;
+    }
+    if (rc == AXL_OK) {
+        *volume = sp.volume;
+    }
+    axl_shell_path_done(&sp);
+    return rc;
+}
+
+int
+axl_backend_path_locate(
+    const unsigned short  *path,
+    void                 **volume,
+    unsigned short        *rel,
+    size_t                 rel_cap
+    )
+{
+    EFI_SHELL_PROTOCOL *shell;
+    unsigned short     *copy = NULL;
+    int                 rc;
+
+    if (path == NULL || volume == NULL || rel == NULL || rel_cap == 0) {
+        return AXL_ERR;
+    }
+    *volume = NULL;
+    rel[0]  = 0;
+
+    const unsigned short *p = path_backslashed(path, &copy);
+    if (p == NULL) {
+        return AXL_ERR;
+    }
+    shell = get_shell();
+    if (shell != NULL) {
+        rc = shell_path_locate(shell, p, volume, rel, rel_cap);
+    } else if (!no_shell_at_all()) {
+        rc = axl_efi1x_path_locate(p, volume, rel, rel_cap);
+    } else {
+        rc = axl_nosh_path_locate(p, volume, rel, rel_cap);
+    }
+    axl_backend_free(copy);
+    return rc;
+}
+
+int
+axl_backend_file_handle_delete(
+    AxlFileHandle  *handle
+    )
+{
+    EFI_SHELL_PROTOCOL *shell;
+    EFI_STATUS          status;
+
+    if (handle == NULL || *handle == NULL) {
+        return AXL_ERR;
+    }
+    shell = get_shell();
+    if (shell != NULL) {
+        /* DeleteFile closes the handle whatever it answers. */
+        status = shell->DeleteFile((SHELL_FILE_HANDLE)*handle);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)*handle;
+        status = file->Delete(file);
+    }
+    *handle = NULL;
+    /* EFI_WARN_DELETE_FAILURE is a warning EFI_ERROR() reads as success:
+       the handle closed, the file survived. Test for success outright. */
+    return (status == EFI_SUCCESS) ? AXL_OK : AXL_ERR;
+}
+
+int
+axl_backend_file_handle_rename(
+    AxlFileHandle          handle,
+    const unsigned short  *file_name
+    )
+{
+    EFI_FILE_INFO *info;
+    EFI_FILE_INFO *new_info;
+    EFI_STATUS     status;
+    size_t         new_len;
+    size_t         info_size;
+
+    if (handle == NULL || file_name == NULL) {
         return AXL_ERR;
     }
 
-    /* Get current file info */
     info = native_file_info(handle);
     if (info == NULL) {
-        axl_backend_file_close(&handle);
         return AXL_ERR;
     }
 
-    /* Build new info with the new filename */
-    for (new_len = 0; new_path[new_len] != 0; new_len++) {}
-    info_size = sizeof(EFI_FILE_INFO) + (new_len + 1) * sizeof(CHAR16);
+    /* The current metadata, times included, with the name replaced. The
+       times are the entry's own, so the driver writes back what it has.
 
-    new_info = (EFI_FILE_INFO *)axl_backend_alloc(info_size);
+       Sized EXACTLY: the fixed fields up to FileName, then the name and its
+       NUL, nothing after. sizeof(EFI_FILE_INFO) is not that -- it counts
+       FileName[1] and the struct's tail padding, 8 bytes past offset 80 --
+       and OVMF's VirtioFsDxe (SimpleFsSetInfo.c ValidateInfoStructure)
+       takes everything after FileName's offset as the name field and
+       requires its LAST CHAR16 to be NUL. The old sizing left 8 bytes of
+       uninitialised pool there, so every rename on a virtiofs volume was
+       EFI_INVALID_PARAMETER. EnhancedFatDxe does not check, which hid it. */
+    for (new_len = 0; file_name[new_len] != 0; new_len++) {}
+    size_t fixed = SIZE_OF_EFI_FILE_INFO;
+    info_size = fixed + (new_len + 1) * sizeof(CHAR16);
+    new_info  = (EFI_FILE_INFO *)axl_backend_alloc(info_size);
     if (new_info == NULL) {
         axl_backend_free(info);
-        axl_backend_file_close(&handle);
         return AXL_ERR;
     }
-
-    /* Copy metadata, replace filename */
-    *new_info = *info;
+    /* The fixed fields only: the buffer may be shorter than
+       sizeof(EFI_FILE_INFO) for a one-character name. */
+    for (size_t i = 0; i < fixed; i++) {
+        ((UINT8 *)new_info)[i] = ((const UINT8 *)info)[i];
+    }
     new_info->Size = info_size;
-    for (i = 0; i <= new_len; i++) {
-        new_info->FileName[i] = (CHAR16)new_path[i];
+    for (size_t i = 0; i <= new_len; i++) {
+        new_info->FileName[i] = (CHAR16)file_name[i];
     }
 
     status = native_set_file_info(handle, new_info);
     axl_backend_free(new_info);
     axl_backend_free(info);
-    axl_backend_file_close(&handle);
 
+    if (status == EFI_UNSUPPORTED) {
+        return AXL_UNSUPPORTED;
+    }
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
@@ -1397,18 +1800,15 @@ axl_backend_file_set_size(
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
-int
-axl_backend_file_mkdir(
+/* axl_backend_file_mkdir on a path whose separators are all '\'. */
+static int
+file_mkdir_backslashed(
     const unsigned short  *path
     )
 {
     EFI_SHELL_PROTOCOL  *shell;
     SHELL_FILE_HANDLE    fh;
     EFI_STATUS           status;
-
-    if (path == NULL) {
-        return AXL_ERR;
-    }
 
     shell = get_shell();
     if (shell == NULL) {
@@ -1425,12 +1825,42 @@ axl_backend_file_mkdir(
         return AXL_OK;
     }
 
-    status = shell->CreateFile((CHAR16 *)path, EFI_FILE_DIRECTORY, &fh);
+    /* EFI_SHELL_PROTOCOL.CreateFile, minus the buffer it parks: only a
+       `>v` shell-variable name is the Shell's own; a file is opened
+       READ|WRITE|CREATE with the attributes, as CreateFile opens it. */
+    if (path[0] == (unsigned short)'>' && path[1] == (unsigned short)'v') {
+        status = shell->CreateFile((CHAR16 *)path, EFI_FILE_DIRECTORY, &fh);
+    } else {
+        status = axl_shell_path_open(shell, (const CHAR16 *)path,
+                                     EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE
+                                         | EFI_FILE_MODE_CREATE,
+                                     EFI_FILE_DIRECTORY,
+                                     (EFI_FILE_PROTOCOL **)&fh);
+    }
     if (EFI_ERROR(status)) {
         return AXL_ERR;
     }
     shell->CloseFile(fh);
     return AXL_OK;
+}
+
+int
+axl_backend_file_mkdir(
+    const unsigned short  *path
+    )
+{
+    unsigned short *copy = NULL;
+
+    if (path == NULL) {
+        return AXL_ERR;
+    }
+    const unsigned short *p = path_backslashed(path, &copy);
+    if (p == NULL) {
+        return AXL_ERR;
+    }
+    int rc = file_mkdir_backslashed(p);
+    axl_backend_free(copy);
+    return rc;
 }
 
 int
@@ -1457,6 +1887,24 @@ days_from_civil(uint32_t y, uint32_t m, uint32_t d)
     uint32_t doy = (153 * mp + 2) / 5 + d - 1;
     uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097 + (int64_t)doe - 719468;
+}
+
+/* Inverse of days_from_civil (Howard Hinnant's civil_from_days, public
+   domain): days since 1970-01-01 to a Gregorian year/month/day, for the
+   full proleptic Gregorian range. The one copy: axl_time_set_unix and the
+   file-time writer below both convert through it. */
+void
+axl_backend_civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
+{
+    z += 719468;
+    int64_t era  = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);                  // [0, 146096]
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);       // [0, 365]
+    unsigned mp  = (5 * doy + 2) / 153;                           // [0, 11]
+    *d = doy - (153 * mp + 2) / 5 + 1;                            // [1, 31]
+    *m = mp < 10 ? mp + 3 : mp - 9;                               // [1, 12]
+    *y = (int)((int64_t)yoe + era * 400 + (*m <= 2));
 }
 
 uint64_t
@@ -1499,33 +1947,50 @@ axl_backend_efi_time_to_unix(const void *efi_time_16)
     return secs < 0 ? 0 : (uint64_t)secs;
 }
 
+void
+axl_backend_unix_to_efi_time(uint64_t secs, void *efi_time_16)
+{
+    int       y;
+    unsigned  mo, d;
+    uint64_t  rem = secs % 86400u;
+    EFI_TIME *out = efi_time_16;
+
+    axl_backend_civil_from_days((int64_t)(secs / 86400u), &y, &mo, &d);
+    *out = (EFI_TIME){
+        .Year       = (UINT16)y,
+        .Month      = (UINT8)mo,
+        .Day        = (UINT8)d,
+        .Hour       = (UINT8)(rem / 3600u),
+        .Minute     = (UINT8)((rem % 3600u) / 60u),
+        .Second     = (UINT8)(rem % 60u),
+        .Nanosecond = 0,
+        .TimeZone   = AXL_EFI_TIME_ZONE_UNSPECIFIED,
+        .Daylight   = 0,
+    };
+}
+
 int
-axl_backend_file_stat(
-    const unsigned short  *path,
-    uint64_t              *size,
-    uint64_t              *alloc_size,
-    uint64_t              *mtime_unix,
-    bool                  *is_dir,
-    bool                  *read_only
+axl_backend_file_handle_stat(
+    AxlFileHandle   handle,
+    uint64_t       *size,
+    uint64_t       *alloc_size,
+    uint64_t       *mtime_unix,
+    bool           *is_dir,
+    bool           *read_only,
+    unsigned short *name,
+    size_t          name_cap,
+    bool           *name_cut
     )
 {
-    AxlFileHandle        handle = NULL;
-    EFI_FILE_INFO       *info;
+    EFI_FILE_INFO *info = native_file_info(handle);
 
-    if (path == NULL) {
-        return AXL_ERR;
+    if (name_cut != NULL) {
+        *name_cut = false;
     }
 
-    if (axl_backend_file_open(path, AXL_FILE_MODE_READ, 0, &handle) != AXL_OK) {
-        return AXL_ERR;
-    }
-
-    info = native_file_info(handle);
     if (info == NULL) {
-        axl_backend_file_close(&handle);
         return AXL_ERR;
     }
-
     if (size != NULL) {
         *size = info->FileSize;
     }
@@ -1541,10 +2006,81 @@ axl_backend_file_stat(
     if (read_only != NULL) {
         *read_only = (info->Attribute & EFI_FILE_READ_ONLY) != 0;
     }
-
+    /* A name longer than @p name is CUT, at a character boundary -- never
+       between the halves of a surrogate pair -- rather than failing the
+       whole stat. A caller that must compare the full name passes a buffer
+       for the longest name it accepts. */
+    if (name != NULL && name_cap > 0) {
+        const unsigned short *src = (const unsigned short *)info->FileName;
+        size_t n = 0;
+        while (n + 1 < name_cap && src[n] != 0) {
+            name[n] = src[n];
+            n++;
+        }
+        if (src[n] != 0 && n > 0 && name[n - 1] >= 0xD800u
+            && name[n - 1] <= 0xDBFFu) {
+            n--;   /* a high surrogate whose low half did not fit */
+        }
+        if (name_cut != NULL) {
+            *name_cut = (src[n] != 0);
+        }
+        name[n] = 0;
+    }
     axl_backend_free(info);
-    axl_backend_file_close(&handle);
     return AXL_OK;
+}
+
+int
+axl_backend_file_stat(
+    const unsigned short  *path,
+    uint64_t              *size,
+    uint64_t              *alloc_size,
+    uint64_t              *mtime_unix,
+    bool                  *is_dir,
+    bool                  *read_only
+    )
+{
+    AxlFileHandle handle = NULL;
+    int           rc;
+
+    if (path == NULL) {
+        return AXL_ERR;
+    }
+    if (axl_backend_file_open(path, AXL_FILE_MODE_READ, 0, &handle) != AXL_OK) {
+        return AXL_ERR;
+    }
+    rc = axl_backend_file_handle_stat(handle, size, alloc_size, mtime_unix,
+                                      is_dir, read_only, NULL, 0, NULL);
+    axl_backend_file_close(&handle);
+    return rc;
+}
+
+int
+axl_backend_file_set_mtime(
+    AxlFileHandle  handle,
+    uint64_t       mtime_unix
+    )
+{
+    EFI_FILE_INFO *info;
+    EFI_STATUS     status;
+
+    if (handle == NULL) {
+        return AXL_ERR;
+    }
+    info = native_file_info(handle);
+    if (info == NULL) {
+        return AXL_ERR;
+    }
+    /* A zero time means "keep it" to the EDK2-derived FAT driver (Info.c),
+       so only the modification time is changed. Size, attributes and the
+       name go back exactly as read, which makes this neither a resize nor
+       a rename. */
+    info->CreateTime     = (EFI_TIME){ 0 };
+    info->LastAccessTime = (EFI_TIME){ 0 };
+    axl_backend_unix_to_efi_time(mtime_unix, &info->ModificationTime);
+    status = native_set_file_info(handle, info);
+    axl_backend_free(info);
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 // ===================================================================
@@ -1605,8 +2141,10 @@ axl_backend_shell_setenv(
  *
  * Looks up EFI_SHELL_PARAMETERS_PROTOCOL on the image handle. The
  * StdIn field there is what the shell wired up — for `tool1 | tool2`
- * this is the captured LHS output stream. Cached after the first
- * probe so repeat callers don't pay HandleProtocol overhead.
+ * this is the captured LHS output stream. Read LIVE on every call, never
+ * cached: the Shell uninstalls the protocol and closes a redirect's file
+ * when the launch command ends, and an image that writes after that (a
+ * resident one) must not use a handle the Shell has freed.
  *
  * @return SHELL_FILE_HANDLE cast as AxlFileHandle, or NULL when the
  *     shell-params protocol isn't published on this image (cross-
@@ -1615,18 +2153,16 @@ axl_backend_shell_setenv(
 static SHELL_FILE_HANDLE  mShellStdIn        = NULL;
 static SHELL_FILE_HANDLE  mShellStdOut       = NULL;
 static SHELL_FILE_HANDLE  mShellStdErr       = NULL;
-static bool               mShellStdProbed    = false;
 
-/* Shared probe — looks up EFI_SHELL_PARAMETERS_PROTOCOL once and
-   caches StdIn, StdOut, and StdErr handles. All three helpers below
-   trigger the same probe on first call. */
+/* Shared probe -- looks up EFI_SHELL_PARAMETERS_PROTOCOL on this image and
+   sets StdIn, StdOut and StdErr from it, or all three NULL when it is not
+   (or no longer) there. One HandleProtocol per call. */
 static void
 probe_shell_std_handles(void)
 {
-    if (mShellStdProbed) {
-        return;
-    }
-    mShellStdProbed = true;
+    mShellStdIn  = NULL;
+    mShellStdOut = NULL;
+    mShellStdErr = NULL;
     EFI_SHELL_PARAMETERS_PROTOCOL *sp = NULL;
     EFI_GUID guid = gEfiShellParametersProtocolGuid;
     EFI_STATUS status = gBS->HandleProtocol(
@@ -1648,6 +2184,10 @@ const AxlGuid AXL_STDIO_BRIDGE_GUID =
     AXL_GUID(0xc8f517d7, 0x36cc, 0x458d,
              0x98, 0xd6, 0xb1, 0x16, 0x82, 0x5e, 0x30, 0xbf);
 
+const AxlGuid AXL_STDIO_BRIDGE2_GUID =
+    AXL_GUID(0xce4cacac, 0xe9c8, 0x4efc,
+             0x92, 0x6b, 0x66, 0xbe, 0x58, 0x76, 0xdb, 0x55);
+
 const AxlGuid AXL_DISPATCH_TOKEN_GUID =
     AXL_GUID(0x02dd6813, 0xd275, 0x4734,
              0x98, 0xf8, 0xc7, 0xf6, 0x03, 0x31, 0x95, 0x8d);
@@ -1660,8 +2200,15 @@ const AxlGuid AXL_DISPATCH_TOKEN_GUID =
    safe EOF-fallback rather than a stale deref). */
 static AxlHandle         mDispatchHandle = NULL;
 
-static AxlStdioBridge  mBridge;
+/* This launcher's bridge: installed as itself under AXL_STDIO_BRIDGE2_GUID
+   and, for drivers built before it, its `base` under AXL_STDIO_BRIDGE_GUID,
+   both on mBridgeHandle. */
+static AxlStdioBridge2 mBridge;
 static AxlHandle       mBridgeHandle  = NULL;   /* install handle; NULL = not installed */
+
+/* Driver side: the interfaces THIS image published for launchers to dispatch
+   through (axl_shared_driver_publish). A bridge aimed elsewhere is not ours. */
+static const void     *mBridgeTargets[AXL_BRIDGE_TARGETS_MAX];
 static uint32_t        mBridgeAtexit  = 0;      /* atexit cookie; 0 = not yet registered */
 
 static void
@@ -1714,6 +2261,24 @@ dispatch_cell(void)
    the reaper below and the read-path lookup. Definition follows. */
 static bool bridge_launcher_alive(const AxlStdioBridge *b);
 
+/* The bridge under @p guid on @p handle as the AxlStdioBridge every layout
+   starts its liveness fields with: the interface itself under the original
+   GUID, its `base` under BRIDGE2. NULL when there is none. */
+static AxlStdioBridge *
+bridge_base_on(
+    EFI_HANDLE   handle,
+    EFI_GUID    *guid,
+    bool         v2,
+    void       **iface
+    )
+{
+    *iface = NULL;
+    if (EFI_ERROR(gBS->HandleProtocol(handle, guid, iface)) || *iface == NULL) {
+        return NULL;
+    }
+    return v2 ? &((AxlStdioBridge2 *)*iface)->base : (AxlStdioBridge *)*iface;
+}
+
 /* Uninstall every installed bridge instance whose launcher image has exited.
    Cross-image and best-effort: it enumerates the whole DB, so a live image can
    reap bridges leaked by launchers that skipped their atexit uninstall
@@ -1721,9 +2286,12 @@ static bool bridge_launcher_alive(const AxlStdioBridge *b);
    (guid, iface) pointer and never dereferences the freed interface, so a stale
    instance is safe to drop. */
 static void
-bridge_reap_dead(void)
+bridge_reap_dead_of(
+    const AxlGuid  *which,
+    bool            v2
+    )
 {
-    EFI_GUID    guid    = *(EFI_GUID *)&AXL_STDIO_BRIDGE_GUID;
+    EFI_GUID    guid    = *(EFI_GUID *)which;
     UINTN       count   = 0;
     EFI_HANDLE *handles = NULL;
     if (EFI_ERROR(gBS->LocateHandleBuffer(
@@ -1732,17 +2300,22 @@ bridge_reap_dead(void)
         return;
     }
     for (UINTN i = 0; i < count; i++) {
-        void *iface = NULL;
-        if (EFI_ERROR(gBS->HandleProtocol(handles[i], &guid, &iface))
-            || iface == NULL) {
-            continue;
-        }
-        AxlStdioBridge *b = (AxlStdioBridge *)iface;
-        if (!bridge_launcher_alive(b)) {
+        void           *iface = NULL;
+        AxlStdioBridge *b     = bridge_base_on(handles[i], &guid, v2, &iface);
+        if (b != NULL && !bridge_launcher_alive(b)) {
             gBS->UninstallProtocolInterface(handles[i], &guid, iface);
         }
     }
     gBS->FreePool(handles);
+}
+
+/* Both layouts: an older launcher installs the original only, a newer one
+   both, and either can leak. */
+static void
+bridge_reap_dead(void)
+{
+    bridge_reap_dead_of(&AXL_STDIO_BRIDGE2_GUID, true);
+    bridge_reap_dead_of(&AXL_STDIO_BRIDGE_GUID, false);
 }
 
 void
@@ -1759,8 +2332,42 @@ axl_backend_stdio_bridge_reap(void)
     bridge_reap_dead();
 }
 
+bool
+axl_backend_stdio_bridge_target(
+    const void  *iface,
+    bool         published
+    )
+{
+    if (iface == NULL) {
+        return true;
+    }
+    for (size_t i = 0; i < AXL_BRIDGE_TARGETS_MAX; i++) {
+        if (published ? mBridgeTargets[i] == NULL : mBridgeTargets[i] == iface) {
+            mBridgeTargets[i] = published ? iface : NULL;
+            return true;
+        }
+    }
+    return !published;
+}
+
+/* Whether @p target is an interface this image published. */
+static bool
+bridge_target_is_mine(
+    const void  *target
+    )
+{
+    for (size_t i = 0; target != NULL && i < AXL_BRIDGE_TARGETS_MAX; i++) {
+        if (mBridgeTargets[i] == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int
-axl_backend_stdio_bridge_install(void)
+axl_backend_stdio_bridge_install(
+    const void  *target
+    )
 {
     /* Capture THIS image's shell handles.  If we have none, nothing to
        bridge — a successful no-op (e.g. not launched from a shell). */
@@ -1798,24 +2405,30 @@ axl_backend_stdio_bridge_install(void)
        (the accumulating leak) are cleared here. */
     bridge_reap_dead();
     /* Refresh: uninstall a stale one first (handles change per invocation). */
-    if (mBridgeHandle != NULL) {
-        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE_GUID, &mBridge);
-        mBridgeHandle = NULL;
-    }
-    mBridge.stdin_h        = in;
-    mBridge.stdout_h       = out;
-    mBridge.stderr_h       = err;
-    mBridge.launcher_image = (void *)gImageHandle;
-    mBridge.token          = t;
-    mBridge.pending_status = 0;
-    mBridge.has_pending    = false;
-    /* The published interface is &mBridge — a static in THIS (launcher)
-       image. It MUST be uninstalled before the image unloads, or the
-       firmware protocol DB keeps a dangling pointer into freed image
-       memory. The bridge_atexit handler below guarantees that: CRT0 runs
-       atexit (-> uninstall) before returning the launcher image to firmware. */
-    if (axl_protocol_install(&AXL_STDIO_BRIDGE_GUID, &mBridge, &mBridgeHandle)
+    axl_backend_stdio_bridge_uninstall();
+    mBridge.size                = (uint32_t)sizeof(mBridge);
+    mBridge.base.stdin_h        = in;
+    mBridge.base.stdout_h       = out;
+    mBridge.base.stderr_h       = err;
+    mBridge.base.launcher_image = (void *)gImageHandle;
+    mBridge.base.token          = t;
+    mBridge.base.pending_status = 0;
+    mBridge.base.has_pending    = false;
+    mBridge.target              = target;
+    /* The published interfaces are &mBridge and &mBridge.base — a static in
+       THIS (launcher) image. They MUST be uninstalled before the image
+       unloads, or the firmware protocol DB keeps a dangling pointer into
+       freed image memory. The bridge_atexit handler below guarantees that:
+       CRT0 runs atexit (-> uninstall) before returning the launcher image to
+       firmware. BRIDGE2 first: it is the one a driver of this age reads. */
+    if (axl_protocol_install(&AXL_STDIO_BRIDGE2_GUID, &mBridge, &mBridgeHandle)
         != AXL_OK) {
+        mBridgeHandle = NULL;
+        return AXL_ERR;
+    }
+    if (axl_protocol_install(&AXL_STDIO_BRIDGE_GUID, &mBridge.base, &mBridgeHandle)
+        != AXL_OK) {
+        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE2_GUID, &mBridge);
         mBridgeHandle = NULL;
         return AXL_ERR;
     }
@@ -1829,7 +2442,8 @@ void
 axl_backend_stdio_bridge_uninstall(void)
 {
     if (mBridgeHandle != NULL) {
-        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE_GUID, &mBridge);
+        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE_GUID, &mBridge.base);
+        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE2_GUID, &mBridge);
         mBridgeHandle = NULL;
     }
 }
@@ -1857,19 +2471,41 @@ bridge_launcher_alive(
 }
 
 /* Live (uncached) bridge lookup — only used on the no-local-shell-params
-   (driver) path. Reaps stale instances first (self-heal: a naive find-first
-   would dereference whatever LocateProtocol returned first — a prior
-   launcher's leaked stale bridge is older, so returned first, and its
-   handles are freed), then returns the newest LIVE survivor's bridge
-   instance (or NULL when none are live). Shared by every per-stream lookup
-   below (stdin, stderr) so each just picks the field it needs off the same
-   live instance. */
-static AxlStdioBridge *
-bridge_find_live(void)
+   (driver) path. Returns the newest LIVE bridge AIMED AT THIS IMAGE (its
+   target is an interface this image published), or NULL: a launcher lends
+   its handles to the driver it dispatches into, never to another resident
+   image writing on its own clock. @p reap first drops dead instances
+   (self-heal for leaked bridges; the stdin path); without it the lookup only
+   reads -- no firmware call at all in an image that published nothing, one
+   LocateProtocol and out when no dispatch is current -- which is what the
+   per-line stdout/stderr path uses. Liveness is the token
+   compare on mapped memory either way, so a dead instance never matches.
+   Only AXL_STDIO_BRIDGE2_GUID is read, and `target` only when the
+   launcher's `size` covers it: an older launcher's original-layout bridge
+   ends where `target` would begin. */
+static AxlStdioBridge2 *
+bridge_find_live(
+    bool  reap
+    )
 {
-    bridge_reap_dead();
+    /* First, with no firmware call: an image that published nothing to
+       dispatch into -- an application, a service -- reads no bridge. */
+    bool aimed = false;
+    for (size_t i = 0; i < AXL_BRIDGE_TARGETS_MAX && !aimed; i++) {
+        aimed = mBridgeTargets[i] != NULL;
+    }
+    if (!aimed) {
+        return NULL;
+    }
+    AxlDispatchToken *cell = dispatch_cell();
+    if (cell == NULL || cell->current == 0) {
+        return NULL;
+    }
+    if (reap) {
+        bridge_reap_dead();
+    }
 
-    EFI_GUID    guid    = *(EFI_GUID *)&AXL_STDIO_BRIDGE_GUID;
+    EFI_GUID    guid    = *(EFI_GUID *)&AXL_STDIO_BRIDGE2_GUID;
     UINTN       count   = 0;
     EFI_HANDLE *handles = NULL;
     if (EFI_ERROR(gBS->LocateHandleBuffer(
@@ -1877,15 +2513,14 @@ bridge_find_live(void)
         || count == 0 || handles == NULL) {
         return NULL;
     }
-    AxlStdioBridge *live = NULL;
+    AxlStdioBridge2 *live = NULL;
     for (UINTN i = 0; i < count; i++) {
-        void *iface = NULL;
-        if (EFI_ERROR(gBS->HandleProtocol(handles[i], &guid, &iface))
-            || iface == NULL) {
-            continue;
-        }
-        AxlStdioBridge *b = (AxlStdioBridge *)iface;
-        if (bridge_launcher_alive(b)) {
+        void           *iface = NULL;
+        AxlStdioBridge *base  = bridge_base_on(handles[i], &guid, true, &iface);
+        AxlStdioBridge2 *b    = iface;
+        if (base != NULL && bridge_launcher_alive(base)
+            && b->size >= sizeof(AxlStdioBridge2)
+            && bridge_target_is_mine(b->target)) {
             live = b;   /* DB order is oldest-first; newest live wins */
         }
     }
@@ -1896,22 +2531,24 @@ bridge_find_live(void)
 static AxlFileHandle
 bridge_lookup_stdin(void)
 {
-    AxlStdioBridge *b = bridge_find_live();
-    return (b != NULL) ? b->stdin_h : NULL;
+    AxlStdioBridge2 *b = bridge_find_live(true);
+    return (b != NULL) ? b->base.stdin_h : NULL;
 }
 
+/* The live bridge's stdout (@p err false) or stderr handle, and in
+   @p *owner the token of the dispatch that lent it (0 with no bridge). */
 static AxlFileHandle
-bridge_lookup_stdout(void)
+bridge_lookup_out(
+    bool       err,
+    uint64_t  *owner
+    )
 {
-    AxlStdioBridge *b = bridge_find_live();
-    return (b != NULL) ? b->stdout_h : NULL;
-}
-
-static AxlFileHandle
-bridge_lookup_stderr(void)
-{
-    AxlStdioBridge *b = bridge_find_live();
-    return (b != NULL) ? b->stderr_h : NULL;
+    AxlStdioBridge2 *b = bridge_find_live(false);
+    *owner = (b != NULL) ? b->base.token : 0;
+    if (b == NULL) {
+        return NULL;
+    }
+    return err ? b->base.stderr_h : b->base.stdout_h;
 }
 
 AxlFileHandle
@@ -1976,24 +2613,424 @@ axl_backend_stdout_is_interactive(void)
     return handle_is_interactive_console(axl_backend_shell_stdout());
 }
 
+// ===================================================================
+// Error console
+// ===================================================================
+
+/* Standard error on a console is the SAME stream as standard output, as on a
+   Unix terminal: written through the console's ConOut splitter, whatever
+   stdout is redirected to.
+
+   Why not gST->StdErr: the firmware's StdErr and ConOut are two console
+   splitters, each keeping its own cursor record (ConSplitter's TextOutMode).
+   A StdErr line moves the devices' cursors and not ConOut's record, and the
+   Shell draws its prompt from that record -- SetCursorPosition(0,
+   ConOut->Mode->CursorRow) -- so the prompt landed on the first error line
+   and wrote over it. ConOut's record is its FIRST device's cursor, and where
+   that device is not in StdErr (OVMF's display: ErrOut is the serial terminal
+   only) it never moves for an error line at all.
+
+   Why the splitter and not gST->ConOut: under the Shell gST->ConOut is the
+   Shell's console logger, which keeps the scroll-back, stops at each
+   screenful under page break and waits for a key (and on Ctrl-S), and is
+   not written to be entered from a timer callback -- where a resident
+   image's log line comes from. The logger shares the splitter's Mode
+   (ConsoleLogger.c, OurConOut.Mode = gST->ConOut->Mode), so a line written
+   to the splitter moves the very record the prompt is placed from. Under
+   `>` gST->ConOut is the file, but the logger -- installed as a
+   SimpleTextOut on the Shell's own image handle, the one carrying
+   EFI_SHELL_PROTOCOL -- still names the splitter by that Mode. Error lines
+   are therefore not in the Shell's scroll-back, as they never were.
+
+   A device in StdErr but not ConOut -- the serial terminal while a take-over
+   holds the screen, a port only ErrOut names -- still gets every error line,
+   written to it directly (stderr_only_devices_write).
+
+   "The console" is decided by IDENTITY: standard error is the console only
+   when its Shell handle IS the Shell's console file -- the handle
+   EFI_SHELL_PROTOCOL's OpenFileByName returns for ">e". "Has no file size"
+   is not enough: `NUL` and an environment variable (`2>v name`) have none
+   either. The handle judged is the live one (stderr_is_console_now): a
+   resident driver's comes from whichever launcher dispatches into it now.
+   With no live handle, the verdict taken at image start applies
+   (axl_backend_console_err_init: the image's own handle, or its parent
+   launcher's). With nothing to compare -- no EFI_SHELL_PARAMETERS_PROTOCOL
+   (the EFI 1.x shell, a BDS launch), no EFI_SHELL_PROTOCOL to ask, no
+   splitter found -- the line goes to gST->StdErr as it always did. So does
+   it under `2>`. */
+static bool                             mErrInitDone      = false;
+static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *mErrSplitter      = NULL;  ///< found once; NULL = none
+static bool                             mErrStartConsole  = false; ///< verdict with no live handle
+
+/* The loaded image whose memory holds @p p: its base, and its size in
+   @p size. NULL when no image does. */
+static const unsigned char *
+image_holding(
+    const void  *p,
+    UINT64      *size
+    )
+{
+    EFI_HANDLE          *handles = NULL;
+    UINTN                count   = 0;
+    const unsigned char *found   = NULL;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &gEfiLoadedImageProtocolGuid, NULL,
+                                          &count, &handles))) {
+        return NULL;
+    }
+    for (UINTN i = 0; i < count && found == NULL; i++) {
+        EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+        if (!EFI_ERROR(gBS->HandleProtocol(handles[i], &gEfiLoadedImageProtocolGuid,
+                                           (VOID **)&li))
+            && li != NULL && li->ImageBase != NULL
+            && (const unsigned char *)p >= (const unsigned char *)li->ImageBase
+            && (const unsigned char *)p < (const unsigned char *)li->ImageBase
+                                          + li->ImageSize) {
+            found = li->ImageBase;
+            *size = li->ImageSize;
+        }
+    }
+    gBS->FreePool(handles);
+    return found;
+}
+
+/* Whether the Shell handle @p h is the Shell's console file named @p name
+   (">o" or ">e"). False whenever that cannot be asked.
+
+   Nested Shells: a command run in a Shell started from the Shell inherits
+   the OUTER Shell's console file (the inner Shell hands on the StdErr it was
+   given, ShellParametersProtocol.c), while OpenFileByName answers with the
+   inner Shell's own. The console files are statics of the Shell binary, so
+   the outer one is the same code and the same static in another image of
+   the same binary: at the same offset in an image of the same size, with
+   the same Revision, and with Write and Close at the same offsets from
+   their own image's base. That counts as the console too.
+
+   The equality test is a StrCmp in the Shell and allocates nothing, so it
+   is made on every call. Only the image walk is cached -- keyed on the
+   handle, the Shell and the answer it was compared with, as a Shell's
+   static can be freed with the Shell and its pages reused -- and the key
+   is stored LAST, so a writer at a raised TPL never sees a key with the
+   previous verdict. */
+static bool
+shell_handle_is_outer_console(
+    EFI_SHELL_PROTOCOL  *shell,
+    AxlFileHandle        h,
+    SHELL_FILE_HANDLE    console
+    )
+{
+    static EFI_SHELL_PROTOCOL *key_shell[2];
+    static SHELL_FILE_HANDLE   key_console[2];
+    static AxlFileHandle       key_h[2];
+    static bool                verdict[2];
+    for (int i = 0; i < 2; i++) {
+        if (key_h[i] == h && key_shell[i] == shell && key_console[i] == console) {
+            return verdict[i];
+        }
+    }
+    UINT64                   size_c = 0;
+    UINT64                   size_h = 0;
+    const unsigned char     *base_c = image_holding(console, &size_c);
+    const unsigned char     *base_h = image_holding(h, &size_h);
+    const EFI_FILE_PROTOCOL *fc     = (const EFI_FILE_PROTOCOL *)console;
+    const EFI_FILE_PROTOCOL *fh     = (const EFI_FILE_PROTOCOL *)h;
+    bool same = base_c != NULL && base_h != NULL && base_c != base_h && size_c == size_h
+                && (const unsigned char *)console - base_c == (const unsigned char *)h - base_h
+                && fh->Revision == fc->Revision
+                && (const unsigned char *)(UINTN)fh->Write - base_h
+                   == (const unsigned char *)(UINTN)fc->Write - base_c
+                && (const unsigned char *)(UINTN)fh->Close - base_h
+                   == (const unsigned char *)(UINTN)fc->Close - base_c;
+    /* One slot per answer (">o", ">e" have different statics): the slot
+       already holding this answer, else the first while it is empty, else
+       the second. */
+    int slot = (key_console[0] == console || key_console[0] == NULL) ? 0 : 1;
+    key_h[slot]       = NULL;
+    verdict[slot]     = same;
+    key_shell[slot]   = shell;
+    key_console[slot] = console;
+    key_h[slot]       = h;
+    return same;
+}
+
+static bool
+shell_handle_is_console_file(
+    EFI_SHELL_PROTOCOL  *shell,
+    AxlFileHandle        h,
+    const CHAR16        *name
+    )
+{
+    SHELL_FILE_HANDLE console = NULL;
+    if (h == NULL || shell == NULL || shell->OpenFileByName == NULL) {
+        return false;
+    }
+    if (EFI_ERROR(shell->OpenFileByName((CHAR16 *)name, &console, EFI_FILE_MODE_WRITE))) {
+        return false;
+    }
+    if ((AxlFileHandle)console == h) {
+        return true;
+    }
+    return shell_handle_is_outer_console(shell, h, console);
+}
+
+/* The first SimpleTextOut, other than @p skip, whose Mode is @p mode (any
+   Mode when NULL), among the handles carrying @p on. NULL when none. */
+static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *
+text_out_find(
+    EFI_GUID                         *on,
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL  *skip,
+    SIMPLE_TEXT_OUTPUT_MODE          *mode
+    )
+{
+    EFI_HANDLE                      *handles = NULL;
+    UINTN                            count   = 0;
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *found   = NULL;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, on, NULL, &count, &handles))) {
+        return NULL;
+    }
+    for (UINTN i = 0; i < count && found == NULL; i++) {
+        EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *t = NULL;
+        if (!EFI_ERROR(gBS->HandleProtocol(handles[i], &gEfiSimpleTextOutputProtocolGuid,
+                                           (VOID **)&t))
+            && t != NULL && t != skip && (mode == NULL || t->Mode == mode)) {
+            found = t;
+        }
+    }
+    gBS->FreePool(handles);
+    return found;
+}
+
+/* The StdErr the Shell gave this image's PARENT -- the launcher an AXL
+   service driver or a shared driver was loaded from, running while the
+   driver starts. NULL when the parent has no Shell parameters. */
+static AxlFileHandle
+parent_image_stderr(
+    void
+    )
+{
+    EFI_LOADED_IMAGE_PROTOCOL     *li = NULL;
+    EFI_SHELL_PARAMETERS_PROTOCOL *sp = NULL;
+    if (gImageHandle == NULL
+        || EFI_ERROR(gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid,
+                                         (VOID **)&li))
+        || li == NULL || li->ParentHandle == NULL
+        || EFI_ERROR(gBS->HandleProtocol(li->ParentHandle, &gEfiShellParametersProtocolGuid,
+                                         (VOID **)&sp))
+        || sp == NULL) {
+        return NULL;
+    }
+    return (AxlFileHandle)sp->StdErr;
+}
+
+void
+axl_backend_console_err_init(
+    void
+    )
+{
+    if (gST == NULL) {
+        return;
+    }
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    AxlFileHandle       err   = axl_backend_shell_stderr();
+    mErrInitDone     = true;
+    mErrSplitter     = NULL;
+    /* With no Shell handle of its own and no live bridge -- a driver
+       starting inside its launcher -- standard error is the launcher's. */
+    mErrStartConsole = shell_handle_is_console_file(
+        shell, (err != NULL) ? err : parent_image_stderr(), L">e");
+    if (shell == NULL) {
+        return;
+    }
+    /* The Shell's console logger, then the splitter that shares its Mode. */
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *logger =
+        text_out_find(&gEfiShellProtocolGuid, NULL, NULL);
+    if (logger != NULL && logger->Mode != NULL) {
+        mErrSplitter = text_out_find(&gEfiSimpleTextOutputProtocolGuid, logger,
+                                     logger->Mode);
+    }
+}
+
+/* Whether standard error is the console NOW. The live handle is the image's
+   own Shell StdErr, or -- for a resident driver -- the StdErr the CURRENT
+   launcher lends it through the stdio bridge, which changes from one
+   launcher to the next: judged on every write (shell_handle_is_console_file). With
+   no live handle (a driver writing on its own clock, between launchers),
+   the verdict taken at image start. */
+static bool
+stderr_is_console_now(
+    void
+    )
+{
+    AxlFileHandle h = axl_backend_shell_stderr();
+    if (h == NULL) {
+        return mErrStartConsole;
+    }
+    return shell_handle_is_console_file(get_shell(), h, L">e");
+}
+
+bool
+axl_backend_shell_handle_is_console(
+    AxlFileHandle  h,
+    bool           err
+    )
+{
+    return shell_handle_is_console_file(get_shell(), h, err ? L">e" : L">o");
+}
+
+/* Write @p str, in @p attr when @p colour, to one text output, putting its
+   attribute back afterwards. @p fanout and @p device say which devices it
+   reaches (axl_text_out_lines). */
+static void
+text_out_write(
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out,
+    EFI_GUID                        *fanout,
+    EFI_HANDLE                       device,
+    const unsigned short            *str,
+    bool                             colour,
+    uint32_t                         attr
+    )
+{
+    INT32 prev = (out->Mode != NULL) ? out->Mode->Attribute : 0;
+    if (colour) {
+        out->SetAttribute(out, attr);
+    }
+    axl_text_out_lines(gST, out, fanout, device, (const CHAR16 *)str);
+    if (colour) {
+        out->SetAttribute(out, (UINTN)prev);
+    }
+}
+
+/* The error line to every StdErr device that is not also a ConOut device:
+   ConSplitter fans a splitter out to exactly the handles carrying its tag,
+   so these are the devices a ConOut write misses. */
+static void
+stderr_only_devices_write(
+    const unsigned short *str,
+    bool                  colour,
+    uint32_t              attr
+    )
+{
+    EFI_HANDLE  stack[8];
+    EFI_HANDLE *handles = stack;
+    UINTN       size    = sizeof(stack);
+
+    EFI_STATUS st = gBS->LocateHandle(ByProtocol, &gEfiStandardErrorDeviceGuid, NULL,
+                                      &size, handles);
+    if (st == EFI_BUFFER_TOO_SMALL) {
+        handles = axl_backend_alloc(size);
+        if (handles == NULL) {
+            return;
+        }
+        st = gBS->LocateHandle(ByProtocol, &gEfiStandardErrorDeviceGuid, NULL,
+                               &size, handles);
+    }
+    if (!EFI_ERROR(st)) {
+        for (UINTN i = 0; i < size / sizeof(EFI_HANDLE); i++) {
+            VOID                            *tag = NULL;
+            EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = NULL;
+            if (EFI_ERROR(gBS->HandleProtocol(handles[i], &gEfiConsoleOutDeviceGuid, &tag))
+                && !EFI_ERROR(gBS->HandleProtocol(handles[i],
+                                                  &gEfiSimpleTextOutputProtocolGuid,
+                                                  (VOID **)&out))
+                && out != NULL) {
+                text_out_write(out, NULL, handles[i], str, colour, attr);
+            }
+        }
+    }
+    if (handles != stack) {
+        axl_backend_free(handles);
+    }
+}
+
+/* One error line to wherever standard error is (above). */
+static void
+console_write_err_impl(
+    const unsigned short *str,
+    bool                  colour,
+    uint32_t              attr
+    )
+{
+    if (gST == NULL || str == NULL) {
+        return;
+    }
+    if (gST->StdErr == NULL || gST->StdErr == gST->ConOut) {
+        /* No separate error console, or a console tap aliased the two. */
+        if (gST->ConOut != NULL) {
+            text_out_write(gST->ConOut, &gEfiConsoleOutDeviceGuid, NULL, str, colour, attr);
+        }
+        return;
+    }
+    if (!mErrInitDone) {
+        axl_backend_console_err_init();   /* no stream init ran: first use */
+    }
+    if (mErrSplitter != NULL && stderr_is_console_now()) {
+        text_out_write(mErrSplitter, &gEfiConsoleOutDeviceGuid, NULL, str, colour, attr);
+        stderr_only_devices_write(str, colour, attr);
+    } else {
+        text_out_write(gST->StdErr, &gEfiStandardErrorDeviceGuid, NULL, str, colour, attr);
+    }
+}
+
+/**
+ * @brief Write a UCS-2 string to standard error. NULL-safe.
+ */
+void
+axl_backend_console_write_err(
+    const unsigned short  *str
+    )
+{
+    console_write_err_impl(str, false, 0);
+}
+
+/**
+ * @brief Write a UCS-2 string to standard error in a text attribute.
+ */
+void
+axl_backend_console_write_err_attr(
+    const unsigned short  *str,
+    uint32_t               attr
+    )
+{
+    console_write_err_impl(str, true, attr);
+}
+
 AxlFileHandle
-axl_backend_shell_stdout(void)
+axl_backend_shell_stdout_owned(
+    uint64_t  *owner
+    )
 {
     probe_shell_std_handles();
     if (mShellStdOut != NULL) {
+        *owner = 0;
         return (AxlFileHandle)mShellStdOut;  /* app/launcher: own params */
     }
-    return bridge_lookup_stdout();           /* driver: live bridge consult */
+    return bridge_lookup_out(false, owner);  /* driver: live bridge consult */
+}
+
+AxlFileHandle
+axl_backend_shell_stderr_owned(
+    uint64_t  *owner
+    )
+{
+    probe_shell_std_handles();
+    if (mShellStdErr != NULL) {
+        *owner = 0;
+        return (AxlFileHandle)mShellStdErr;  /* app/launcher: own params */
+    }
+    return bridge_lookup_out(true, owner);   /* driver: live bridge consult */
+}
+
+AxlFileHandle
+axl_backend_shell_stdout(void)
+{
+    uint64_t owner;
+    return axl_backend_shell_stdout_owned(&owner);
 }
 
 AxlFileHandle
 axl_backend_shell_stderr(void)
 {
-    probe_shell_std_handles();
-    if (mShellStdErr != NULL) {
-        return (AxlFileHandle)mShellStdErr;  /* app/launcher: own params */
-    }
-    return bridge_lookup_stderr();           /* driver: live bridge consult */
+    uint64_t owner;
+    return axl_backend_shell_stderr_owned(&owner);
 }
 
 const unsigned short *
@@ -2008,7 +3045,9 @@ axl_backend_shell_getcwd(
         /* Old EFI 1.x shell: SHELL_ENVIRONMENT.CurDir. */
         return axl_efi1x_getcwd();
     }
-    return (const unsigned short *)shell->GetCurDir(NULL);
+    /* Cached across calls; GetCurDir parks a buffer every time it is asked
+       (axl-backend-native-shell.h). */
+    return (const unsigned short *)axl_shell_cwd(shell);
 }
 
 int
@@ -2018,13 +3057,19 @@ axl_backend_shell_chdir(
 {
     EFI_SHELL_PROTOCOL  *shell;
     EFI_STATUS           status;
+    unsigned short      *copy = NULL;
 
     shell = get_shell();
     if (shell == NULL || path == NULL) {
         return AXL_ERR;
     }
 
-    status = shell->SetCurDir(NULL, (CONST CHAR16 *)path);
+    const unsigned short *p = path_backslashed(path, &copy);
+    if (p == NULL) {
+        return AXL_ERR;
+    }
+    status = shell->SetCurDir(NULL, (CONST CHAR16 *)p);
+    axl_backend_free(copy);
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
@@ -2046,8 +3091,11 @@ axl_backend_shell_execute(
            EFI_INVALID_PARAMETER before the command ever runs, on real
            OVMF/EDK2 shells. Pass this image's own handle by address, the
            same convention the old EFI 1.x branch below uses. */
+        axl_backend_child_image_enter();
         EFI_STATUS status = shell->Execute(&gImageHandle, (CHAR16 *)command,
                                            NULL, NULL);
+        axl_backend_child_image_leave();
+        axl_backend_exit_if_deferred();
         return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
 
@@ -2062,11 +3110,59 @@ axl_backend_shell_execute(
            resident driver's own handle has no SHELL_INTERFACE and Execute
            would reject it (EFI_INVALID_PARAMETER), so borrow a shell-launched
            one. */
+        axl_backend_child_image_enter();
         EFI_STATUS status = se->Execute(axl_efi1x_shell_parent(),
                                         (CHAR16 *)command, FALSE);
+        axl_backend_child_image_leave();
+        axl_backend_exit_if_deferred();
         return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
     return AXL_ERR;
+}
+
+/* An app can return any 64-bit value, this one included; the result's
+   status_written is then wrong only for a command that ran and returned
+   exactly this. */
+#define AXL_SHELL_STATUS_UNSET 0xA5A5A5A5A5A5A5A5ULL
+
+int
+axl_backend_shell_execute_status(
+    const unsigned short  *command,
+    uint64_t              *status,
+    bool                  *written,
+    uint64_t              *execute_status
+    )
+{
+    if (command == NULL || status == NULL || written == NULL
+        || execute_status == NULL) {
+        return AXL_ERR;
+    }
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL) {
+        return AXL_ERR;
+    }
+    /* &gImageHandle, not NULL: see axl_backend_shell_execute. */
+    EFI_STATUS code = (EFI_STATUS)AXL_SHELL_STATUS_UNSET;
+    axl_backend_child_image_enter();
+    EFI_STATUS rc = shell->Execute(&gImageHandle, (CHAR16 *)command, NULL, &code);
+    axl_backend_child_image_leave();
+    axl_backend_exit_if_deferred();
+    *written        = ((uint64_t)code != AXL_SHELL_STATUS_UNSET);
+    *status         = *written ? (uint64_t)code : 0;
+    *execute_status = (uint64_t)rc;
+    return AXL_OK;
+}
+
+const unsigned short *
+axl_backend_shell_get_alias(
+    const unsigned short  *name
+    )
+{
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || name == NULL || shell->GetAlias == NULL) {
+        return NULL;
+    }
+    return (const unsigned short *)shell->GetAlias((CONST CHAR16 *)name, NULL);
 }
 
 /* No-op stand-in for ConOut->OutputString, installed while a "quiet" shell
@@ -2117,10 +3213,8 @@ axl_backend_shell_execute_quiet(
 // so those iterate fs0..fsN and byte-compare).
 // ===================================================================
 
-/* Total device-path size in bytes, including the trailing END node. Bounded
-   walk; returns 0 on a malformed chain (Length < 4). */
-static size_t
-dp_total_bytes(
+size_t
+axl_backend_dp_size(
     const void  *dp
     )
 {
@@ -2149,8 +3243,8 @@ axl_backend_dp_equal(
     if (a == NULL || b == NULL) {
         return false;
     }
-    size_t sa = dp_total_bytes(a);
-    if (sa == 0 || sa != dp_total_bytes(b)) {
+    size_t sa = axl_backend_dp_size(a);
+    if (sa == 0 || sa != axl_backend_dp_size(b)) {
         return false;
     }
     const uint8_t *pa = (const uint8_t *)a;
@@ -2236,6 +3330,17 @@ axl_backend_shell_map_name(
         return shell_map_name_no_modern_shell(device_path, out, out_size);
     }
 
+    /* Probe FS0..FS63 first: GetMapFromDevicePath parks its result on the
+       Shell's per-command free list, and axl_volume_enumerate asks this for
+       every volume on every call. When exactly one probed name maps to the
+       volume it is the answer whatever the list order
+       (axl-backend-native-shell.h); otherwise ask the Shell. */
+    unsigned only = 0;
+    if (axl_shell_fs_probe(shell, device_path, &only) == 1) {
+        int n = axl_snprintf(out, out_size, "fs%u", only);
+        return (n > 0 && (size_t)n < out_size) ? AXL_OK : AXL_ERR;
+    }
+
     /* GetMapFromDevicePath advances the pointer past the matched volume
        portion; pass a local copy so the caller's device path is untouched.
        The list it returns is NOT freed, here or in map_alias and
@@ -2314,7 +3419,10 @@ axl_backend_shell_map_alias(
         return shell_map_name_no_modern_shell(device_path, out, out_size);
     }
 
-    /* GetMapFromDevicePath advances the pointer; pass a local copy. */
+    /* Asked of the Shell every time, parking its answer on the Shell's
+       per-command free list: the FIRST name cannot be found without it,
+       because a re-set of any name the device has reorders the list unseen
+       (axl-backend-native-shell.h). Not a per-file-operation path. */
     EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)device_path;
     const unsigned short *map = (const unsigned short *)
         shell->GetMapFromDevicePath(&dp);
@@ -2525,6 +3633,23 @@ axl_backend_wcslen(
         n++;
     }
     return n;
+}
+
+bool
+axl_backend_wcs_copy(
+    unsigned short        *dst,
+    size_t                 cap,
+    const unsigned short  *src
+    )
+{
+    size_t n = axl_backend_wcslen(src);
+    if (n + 1 > cap) {
+        return false;
+    }
+    for (size_t i = 0; i <= n; i++) {
+        dst[i] = src[i];
+    }
+    return true;
 }
 
 /**
@@ -2892,11 +4017,11 @@ axl_backend_set_exit_status(uint64_t status)
     if (mShellStdIn == NULL) {
         /* Assumes SYNCHRONOUS dispatch (the shared-driver pattern has no
            event loop): only one launcher is ever mid-dispatch at a time, so
-           bridge_find_live() unambiguously returns THAT launcher's bridge. */
-        AxlStdioBridge *b = bridge_find_live();
+           bridge_find_live(true) unambiguously returns THAT launcher's bridge. */
+        AxlStdioBridge2 *b = bridge_find_live(true);
         if (b != NULL) {
-            b->pending_status = status;
-            b->has_pending    = true;
+            b->base.pending_status = status;
+            b->base.has_pending    = true;
         }
     }
 }
@@ -2905,14 +4030,15 @@ bool
 axl_backend_bridge_take_exit_status(uint64_t *out)
 {
     /* Read THIS (launcher) image's own bridge cell — the driver wrote it
-       through the installed protocol interface (== &mBridge here). */
-    if (mBridgeHandle == NULL || !mBridge.has_pending) {
+       through the installed protocol interface: &mBridge.base under either
+       GUID, whichever age of driver it was. */
+    if (mBridgeHandle == NULL || !mBridge.base.has_pending) {
         return false;
     }
     if (out != NULL) {
-        *out = mBridge.pending_status;
+        *out = mBridge.base.pending_status;
     }
-    mBridge.has_pending = false;
+    mBridge.base.has_pending = false;
     return true;
 }
 
@@ -2946,6 +4072,100 @@ axl_backend_resolve_exit_status(int rc)
         code = 1u;
     }
     return (uint64_t)code;
+}
+
+/* How many images this one has started and not yet regained control from,
+   and the notify depth at each start (innermost last), so a deferred exit
+   unwinds only to a callback entered after the innermost child started. */
+#define AXL_CHILD_NEST_MAX 16
+static unsigned mChildImages;
+static unsigned mChildNotifyDepth[AXL_CHILD_NEST_MAX];
+
+/* An exit requested while a child ran (axl_backend_exit_defer), performed by
+   axl_backend_exit_if_deferred once no child remains. The status is resolved
+   at the FIRST request and pinned: a later axl_exit_status overwrites the
+   armed status, and must not change what the first request decided. */
+static bool     mExitDeferred;
+static int      mDeferredRc;
+static uint64_t mDeferredStatus;
+static void   (*mDeferredExit)(int rc);
+
+void
+axl_backend_child_image_enter(void)
+{
+    if (mChildImages < AXL_CHILD_NEST_MAX) {
+        mChildNotifyDepth[mChildImages] = axl_backend_notify_depth();
+    }
+    mChildImages++;
+}
+
+void
+axl_backend_child_image_leave(void)
+{
+    if (mChildImages > 0) {
+        mChildImages--;
+    }
+}
+
+bool
+axl_backend_child_images_running(void)
+{
+    return mChildImages > 0;
+}
+
+bool
+axl_backend_exit_defer(
+    int    rc,
+    void (*exit_fn)(int rc)
+    )
+{
+    if (mChildImages == 0) {
+        return false;
+    }
+    unsigned innermost = (mChildImages <= AXL_CHILD_NEST_MAX)
+                         ? mChildNotifyDepth[mChildImages - 1]
+                         : mChildNotifyDepth[AXL_CHILD_NEST_MAX - 1];
+    if (!axl_backend_notify_unwind_ok(innermost)) {
+        return false;
+    }
+    /* The first request decides, as an exit does. A callback that runs again
+       while the child still runs (the tick fires on) asks again; it is
+       unwound again, without re-deciding. */
+    if (!mExitDeferred) {
+        mExitDeferred   = true;
+        mDeferredRc     = rc;
+        mDeferredStatus = axl_backend_resolve_exit_status(rc);
+        mDeferredExit   = exit_fn;
+    }
+    axl_backend_notify_unwind();
+    return false;   /* unreachable: the unwind does not return */
+}
+
+void
+axl_backend_exit_if_deferred(void)
+{
+    if (mChildImages != 0 || !mExitDeferred) {
+        return;
+    }
+    void (*fn)(int rc) = mDeferredExit;
+
+    mExitDeferred = false;
+    axl_backend_set_exit_status(mDeferredStatus);
+    fn(mDeferredRc);
+}
+
+uint64_t
+axl_backend_start_image(
+    void *handle
+    )
+{
+    UINTN      exit_data_size = 0;
+    EFI_STATUS status;
+
+    axl_backend_child_image_enter();
+    status = gBS->StartImage((EFI_HANDLE)handle, &exit_data_size, NULL);
+    axl_backend_child_image_leave();
+    return (uint64_t)status;
 }
 
 void

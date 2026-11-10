@@ -406,10 +406,10 @@ axl_var_enumerate(
 // ---------------------------------------------------------------------------
 
 int
-axl_var_read(
+axl_var_read_raw(
     const char     *name,
     const AxlGuid  *vendor,
-    uint32_t       *attrs,
+    uint32_t       *efi_attrs_out,
     void          **data,
     size_t         *size
     )
@@ -466,8 +466,8 @@ axl_var_read(
        a populated *size -- a pairing a caller could act on, and the
        opposite of the clearing discipline axl_var_enumerate documents. */
     if (data == NULL) {
-        if (attrs != NULL) {
-            *attrs = axl_var_attrs_from_efi(efi_attrs);
+        if (efi_attrs_out != NULL) {
+            *efi_attrs_out = efi_attrs;
         }
         if (size != NULL) {
             *size = (size_t)data_size;
@@ -497,6 +497,12 @@ axl_var_read(
             &read_size,
             buf);
         if (EFI_ERROR(status)) {
+            /* Zeroed before it is freed: a failed read may still have
+               written part of a secret's payload (an SSH host key). */
+            volatile uint8_t *v = buf;
+            for (size_t k = 0; k < (size_t)data_size; k++) {
+                v[k] = 0;
+            }
             axl_free(buf);
             axl_free(wname);
             return AXL_ERR;
@@ -508,10 +514,72 @@ axl_var_read(
 
     /* Every failure exit above is behind us, so the out params commit
        together with the payload. */
-    if (attrs != NULL) {
-        *attrs = axl_var_attrs_from_efi(efi_attrs);
+    if (efi_attrs_out != NULL) {
+        *efi_attrs_out = efi_attrs;
     }
     *size = final_size;
     *data = buf;
     return AXL_OK;
+}
+
+int
+axl_var_read(
+    const char     *name,
+    const AxlGuid  *vendor,
+    uint32_t       *attrs,
+    void          **data,
+    size_t         *size
+    )
+{
+    uint32_t efi_attrs = 0;
+    int      rc        = axl_var_read_raw(name, vendor, &efi_attrs, data, size);
+
+    if (rc == AXL_OK && attrs != NULL) {
+        *attrs = axl_var_attrs_from_efi(efi_attrs);
+    }
+    return rc;
+}
+
+int
+axl_var_write_raw(
+    const char     *name,
+    const AxlGuid  *vendor,
+    uint32_t        efi_attrs,
+    const void     *data,
+    size_t          size
+    )
+{
+    if (name == NULL || name[0] == '\0' || vendor == NULL
+        || (data == NULL && size > 0)) {
+        return AXL_INVALID;
+    }
+    size_t          wcap  = axl_strlen(name) + 1;
+    unsigned short *wname = axl_malloc(wcap * sizeof(unsigned short));
+    if (wname == NULL) {
+        return AXL_NO_RESOURCES;
+    }
+    axl_utf8_to_ucs2_buf(name, wname, wcap);
+
+    EFI_GUID efi_vendor;
+    axl_memcpy(&efi_vendor, vendor, sizeof(efi_vendor));
+
+    EFI_STATUS status = axl_rt()->SetVariable(   /* axl-uefi-direct: runtime variable services */
+        (CHAR16 *)wname,
+        &efi_vendor,
+        efi_attrs,
+        (UINTN)size,
+        (void *)data);
+    axl_free(wname);
+
+    if (!EFI_ERROR(status)) {
+        return AXL_OK;
+    }
+    if (status == EFI_NOT_FOUND) {
+        return AXL_NOT_FOUND;
+    }
+    if (status == EFI_WRITE_PROTECTED || status == EFI_SECURITY_VIOLATION) {
+        return AXL_DENIED;
+    }
+    axl_debug("SetVariable(%s) failed: 0x%llx", name, (unsigned long long)status);
+    return AXL_ERR;
 }

@@ -25,8 +25,10 @@ THE TARBALL'S OWN README is the other prose list, and it drifted further --
 ARE ~40-character labels, so `devkit.conf` fits it exactly and
 `scripts/make-uefi-tools-readme.py` derives it. Nothing here can check that
 file, because it exists only inside a release artifact; what IS checkable is
-that `release.yml` still delegates to the generator rather than growing the
-hand-written heredoc back.
+that the tarball's staging -- the uefi_tools install rules in
+`packaging/uefi-tools/CMakeLists.txt`, which `release.yml` packs through
+`scripts/make-release-assets.sh` -- still runs the generator rather than
+growing a hand-written list back.
 """
 
 from __future__ import annotations
@@ -38,7 +40,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
-WORKFLOW = ROOT / ".github/workflows/release.yml"
+STAGER = ROOT / "packaging/uefi-tools/CMakeLists.txt"
+# The generator RUN as a command on a code line: an execute_process COMMAND
+# naming it. A substring test over the whole file was satisfied by the
+# staging's own comments naming the generator, so removing the call left this
+# gate green (test-tool-docs-gate.sh).
+GENERATOR_CALL = re.compile(r"^\s*COMMAND\s.*/scripts/make-uefi-tools-readme\.py",
+                            re.MULTILINE)
 GENERATOR = "make-uefi-tools-readme.py"
 
 # Built and shipped, but deliberately absent from a table of user tools.
@@ -51,15 +59,16 @@ NOT_USER_TOOLS = {
 
 
 def main() -> int:
-    def make_var(name: str) -> list[str]:
-        r = subprocess.run(["make", "-s", f"print-{name}"], cwd=ROOT,
-                           capture_output=True, text=True, check=False)
+    def build_list(name: str) -> list[str]:
+        r = subprocess.run(["bash", str(ROOT / "scripts" / "axl-list.sh"), name],
+                           cwd=ROOT, capture_output=True, text=True, check=False)
         if r.returncode != 0:
-            print(f"check-tool-docs: could not read {name} from the Makefile")
+            print(f"check-tool-docs: could not read {name} (scripts/axl-list.sh): "
+                  f"{r.stderr.strip()}")
             sys.exit(1)
         return r.stdout.split()
 
-    shipped = set(make_var("TOOL_NAMES")) | set(make_var("TOOL_EXTRA_APPS"))
+    shipped = set(build_list("TOOL_NAMES")) | set(build_list("TOOL_EXTRA_APPS"))
     if not shipped:
         print("check-tool-docs: the tool list came back EMPTY -- this gate "
               "would pass vacuously")
@@ -82,7 +91,7 @@ def main() -> int:
 
     for tool in sorted(documented - shipped):
         print(f"check-tool-docs: README.md documents `{tool}`, which the "
-              f"Makefile no longer builds")
+              f"build no longer ships (TOOL_NAMES, TOOL_EXTRA_APPS)")
         errors += 1
 
     for tool in sorted(set(NOT_USER_TOOLS) & documented):
@@ -90,8 +99,11 @@ def main() -> int:
               f"({NOT_USER_TOOLS[tool]}) but README.md documents it -- pick one")
         errors += 1
 
-    if GENERATOR not in WORKFLOW.read_text(encoding="utf-8"):
-        print(f"check-tool-docs: release.yml no longer calls {GENERATOR} -- the "
+    stager_code = "\n".join(
+        ln for ln in STAGER.read_text(encoding="utf-8").splitlines()
+        if not ln.lstrip().startswith("#"))
+    if not GENERATOR_CALL.search(stager_code):
+        print(f"check-tool-docs: {STAGER.relative_to(ROOT)} no longer calls {GENERATOR} -- the "
               f"tarball's README is back to a hand-written list, which is how "
               f"it came to name 13 of {len(shipped)} tools")
         errors += 1

@@ -93,7 +93,10 @@ axl_tls_cleanup(void);
  * @brief Generate a self-signed ECDSA P-256 certificate.
  *
  * The certificate includes SubjectAltName entries for localhost
- * and any provided IP addresses. Valid for 10 years.
+ * and any provided IP addresses. Valid for 10 years. The serial
+ * number is a random positive integer of 8 bytes, encoded as minimal
+ * DER (RFC 5280 section 4.1.2.2), so a strict parser such as
+ * OpenSSL 3 accepts every certificate this returns.
  * Caller frees @a cert_der and @a key_der with axl_free().
  *
  * @return AXL_OK on success, AXL_ERR on failure.
@@ -112,9 +115,25 @@ axl_tls_generate_self_signed(
 /**
  * @brief Load a server certificate and private key for TLS.
  *
- * After this call, TLS accept operations use this certificate.
+ * Connections accepted after this call are served this certificate. There
+ * is ONE server certificate per image: every AxlHttpServer with TLS uses
+ * the last one set (each axl_http_server_use_tls sets it).
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * Safe on a live server. The certificate and key are parsed, the key is
+ * checked to be the certificate's, and the server configuration is built,
+ * all BEFORE the current one is replaced: on AXL_ERR (a certificate or key
+ * that does not parse, a key that is not the certificate's, no memory)
+ * nothing changes and the previous certificate keeps serving.
+ * Connections already accepted -- a handshake in flight included -- keep
+ * the certificate they were accepted under until they are freed.
+ *
+ * (Until 2026-11-02 a certificate or key that did not parse left the
+ * server with none, so every later handshake failed; and the old pair was
+ * freed under connections still using it.)
+ *
+ * @return AXL_OK on success; AXL_ERR before axl_tls_init(), for NULL
+ *     input, when the certificate or key does not parse, or when the key
+ *     is not the certificate's.
  */
 int
 axl_tls_server_set_cert(
@@ -127,10 +146,12 @@ axl_tls_server_set_cert(
 /**
  * @brief Create a TLS server context for an accepted TCP connection.
  *
- * Wraps the socket for TLS. Call axl_tls_handshake() after to
+ * Wraps the socket for TLS, under the server certificate current at this
+ * call (see axl_tls_server_set_cert()). Call axl_tls_handshake() after to
  * complete the TLS handshake.
  *
- * @return context, or NULL on failure.
+ * @return context, or NULL on failure -- including when no server
+ *     certificate has been set.
  */
 AxlTlsContext *
 axl_tls_accept(

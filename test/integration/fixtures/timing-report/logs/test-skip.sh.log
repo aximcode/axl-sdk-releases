@@ -1,0 +1,2 @@
+SKIP: no corpus
+TIMING: runner test=test-skip.sh attempt=1 via=boot wall=0.300 cpu=0.100 rc=77

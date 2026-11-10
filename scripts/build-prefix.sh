@@ -7,8 +7,8 @@
 #   ARCH   x64 | aa64 | X64 | AARCH64   (default: $TEST_ARCH, else x64)
 #   --abs  absolute path instead of the repo-relative prefix
 #
-# Honours ARCH and BUILD together, because it asks the Makefile
-# rather than restating its rule.
+# Honours ARCH and BUILD together, because it asks the build
+# (scripts/axl-build.sh --print-prefix) rather than restating its rule.
 #
 # WHY THIS EXISTS. PREFIX is a function of ARCH and BUILD, and once also of
 # AXL_TLS -- a TLS build got its own tree because toggling the flag wiped the
@@ -43,7 +43,7 @@ case "${ARCH_IN:-${TEST_ARCH:-x64}}" in
     *)                    ARCH=x64  ;;
 esac
 
-PREFIX="$(make -s -C "$REPO_ROOT" ARCH="$ARCH" print-prefix)"
+PREFIX="$("$REPO_ROOT/scripts/axl-build.sh" --print-prefix ARCH="$ARCH")"
 
 if $ABS; then
     printf '%s/%s\n' "$REPO_ROOT" "$PREFIX"

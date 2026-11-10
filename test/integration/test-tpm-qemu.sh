@@ -1,5 +1,9 @@
 #!/bin/bash
-# test-meta: arch=x64 needs=swtpm est=21 local-only=0
+# test-meta: arch=x64 needs=swtpm est=21 local-only=0 guest=none
+# guest=none: its TPM is a swtpm process this test starts per run (a
+#   -chardev socket at a per-run path): a pooled guest's TPM would need a
+#   swtpm the pool starts with the class and restores with the snapshot --
+#   the TPM's state lives in swtpm, outside the guest's -- which it has not.
 # test-tpm-qemu.sh — axl_tpm_* against a swtpm-backed TPM 2.0.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
@@ -26,7 +30,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export TEST_SKIP_RATCHET=1
 
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs x64)/AxlTestPlatform.efi"
-make -C "$PROJECT_DIR" ARCH=x64 tests 2>&1 | tail -1
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH=x64 tests 2>&1 | tail -1
 
 SWTPM="${SWTPM:-$(command -v swtpm || true)}"
 if [[ -z "$SWTPM" ]]; then

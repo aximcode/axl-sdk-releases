@@ -7,9 +7,23 @@
 **/
 
 #include "axl-http-server-internal.h"
+#include "axl-http-core-internal.h"
 #include <axl/axl-json.h>
 
 AXL_LOG_DOMAIN("http");
+
+/* The last AxlHttpRequest.request_id handed out. ONE sequence for the
+   process, not one per server: an id names a request among every request
+   any server has parsed, so state keyed on it can never meet another
+   server's request under the same id. */
+static uint64_t http_request_seq;
+
+/* A fresh request_id: nonzero, never reused while the process runs. */
+static uint64_t
+http_next_request_id(void)
+{
+    return ++http_request_seq;
+}
 
 // ---------------------------------------------------------------------------
 // Body buffer growth
@@ -40,7 +54,121 @@ grow_buffer(
 // Chunked transfer encoding
 // ---------------------------------------------------------------------------
 
+/* Decoder states. Each byte moves the decoder on by itself, so a size
+   line, a chunk's CRLF or the final CRLF may be cut by a segment boundary
+   anywhere and nothing is lost: a partial line waits in chunk_line. */
+enum {
+    HTTP_CHUNK_SIZE = 0,   /* reading a chunk-size line */
+    HTTP_CHUNK_DATA,       /* chunk_remaining bytes of data owed */
+    HTTP_CHUNK_DATA_END,   /* the CR (or a bare LF) after a chunk's data */
+    HTTP_CHUNK_DATA_LF,    /* the LF after that CR */
+    HTTP_CHUNK_TRAILER,    /* trailer lines after the last chunk, to an empty one */
+    HTTP_CHUNK_DONE
+};
+
 void
+chunked_reset(
+    HttpConn *conn
+    )
+{
+    conn->chunk_state       = HTTP_CHUNK_SIZE;
+    conn->chunk_line_len    = 0;
+    conn->chunk_trailer_len = 0;
+    conn->chunk_remaining   = 0;
+}
+
+/* Parse a chunk-size line (CRLF stripped): hex digits, then optional
+   whitespace, then nothing or ';' and extensions (ignored). @return true
+   with @p out; false for no digits, an overflow, or any other byte. */
+static bool
+chunk_size_parse(
+    const char *line,
+    size_t      len,
+    size_t     *out
+    )
+{
+    size_t i      = 0;
+    size_t size   = 0;
+    while (i < len && axl_hex_nibble((unsigned char)line[i]) >= 0) {
+        if (size > (SIZE_MAX >> 4)) {
+            return false;   /* more than size_t holds */
+        }
+        size = (size << 4) | (size_t)axl_hex_nibble((unsigned char)line[i]);
+        i++;
+    }
+    if (i == 0) {
+        return false;
+    }
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i < len && line[i] != ';') {
+        return false;
+    }
+    *out = size;
+    return true;
+}
+
+/* Hand @p n bytes of chunk data to the body: the upload handler, or the
+   whole-body buffer. @return 0 or the status to fail with. */
+static size_t
+chunk_data(
+    AxlHttpServer *s,
+    HttpConn      *conn,
+    const char    *data,
+    size_t         n
+    )
+{
+    if (conn->is_upload_stream) {
+        stream_upload_data(s, conn, data, n, false);
+        conn->body_bytes_read += n;
+        return 0;
+    }
+    if (conn->body_bytes_read + n > s->body_limit) {
+        return 413;   /* never dispatch a cut body */
+    }
+    size_t needed = conn->body_bytes_read + n;
+    if (needed > conn->body_alloc) {
+        size_t new_alloc = conn->body_alloc ? conn->body_alloc : 4096;
+        while (new_alloc < needed) {
+            new_alloc *= 2;
+        }
+        void *grown = grow_buffer(conn->body, conn->body_bytes_read, new_alloc);
+        if (grown == NULL) {
+            return 500;
+        }
+        conn->body       = grown;
+        conn->body_alloc = new_alloc;
+    }
+    axl_memcpy((uint8_t *)conn->body + conn->body_bytes_read, data, n);
+    conn->body_bytes_read += n;
+    return 0;
+}
+
+/* Take one byte of a size or trailer line. @return 0 while the line goes
+   on, 1 when it is complete (in chunk_line, CR stripped), or 400 when it
+   is longer than HTTP_CHUNK_LINE_MAX. A bare LF ends a line too (RFC 9112
+   2.2 lets a recipient accept it). */
+static size_t
+chunk_line_byte(
+    HttpConn *conn,
+    char      c
+    )
+{
+    if (c == '\n') {
+        if (conn->chunk_line_len > 0 && conn->chunk_line[conn->chunk_line_len - 1] == '\r') {
+            conn->chunk_line_len--;
+        }
+        return 1;
+    }
+    if (conn->chunk_line_len >= sizeof(conn->chunk_line)) {
+        return 400;
+    }
+    conn->chunk_line[conn->chunk_line_len++] = c;
+    return 0;
+}
+
+size_t
 process_chunked_data(
     AxlHttpServer *s,
     HttpConn      *conn,
@@ -50,127 +178,174 @@ process_chunked_data(
 {
     size_t pos = 0;
 
-    while (pos < buf_len) {
-        //
-        // Skip the trailing CRLF that follows a chunk's data. It can span
-        // recvs (the \r at the end of one buffer, the \n at the start of
-        // the next), so it is tracked as a 0..2 byte countdown.
-        //
-        while (conn->chunk_crlf_pending > 0 && pos < buf_len) {
-            pos++;
-            conn->chunk_crlf_pending--;
+    while (pos < buf_len && conn->chunk_state != HTTP_CHUNK_DONE) {
+        if (conn->is_upload_stream && conn->upload_ended) {
+            return 0;   /* the handler ended the upload and answered */
         }
-        if (conn->chunk_crlf_pending > 0) {
-            return;  /* need the rest of the CRLF from the next recv */
-        }
-
-        //
-        // Consume the in-progress chunk's data. A single chunk can be far
-        // larger than one recv buffer, so chunk_remaining carries the count
-        // still owed across recvs — without it, a continuation buffer would
-        // be misparsed as a new chunk size-line.
-        //
-        if (conn->chunk_remaining > 0) {
+        switch (conn->chunk_state) {
+        case HTTP_CHUNK_DATA: {
             size_t avail = buf_len - pos;
-            size_t take  = (avail < conn->chunk_remaining)
-                           ? avail : conn->chunk_remaining;
-
-            if (conn->is_upload_stream) {
-                stream_upload_data(s, conn, buf + pos, take, false);
-                if (!conn->active) {
-                    return;  /* handler aborted */
-                }
-                conn->body_bytes_read += take;
-            } else {
-                if (conn->body_bytes_read + take > s->body_limit) {
-                    conn->chunked_done = true;
-                    conn->content_length = conn->body_bytes_read;
-                    return;
-                }
-                size_t needed = conn->body_bytes_read + take;
-                if (needed > conn->body_alloc) {
-                    size_t new_alloc = conn->body_alloc ? conn->body_alloc : 4096;
-                    while (new_alloc < needed) {
-                        new_alloc *= 2;
-                    }
-                    conn->body = grow_buffer(conn->body, conn->body_bytes_read,
-                                             new_alloc);
-                    if (conn->body == NULL) {
-                        conn->chunked_done = true;
-                        return;
-                    }
-                    conn->body_alloc = new_alloc;
-                }
-                axl_memcpy((uint8_t *)conn->body + conn->body_bytes_read,
-                           buf + pos, take);
-                conn->body_bytes_read += take;
+            size_t take  = (avail < conn->chunk_remaining) ? avail : conn->chunk_remaining;
+            size_t st    = chunk_data(s, conn, buf + pos, take);
+            if (st != 0) {
+                return st;
             }
-
-            pos += take;
+            pos                   += take;
             conn->chunk_remaining -= take;
-            if (conn->chunk_remaining > 0) {
-                return;  /* more data owed; resume on the next recv */
-            }
-            conn->chunk_crlf_pending = 2;  /* skip the trailing \r\n */
-            continue;
-        }
-
-        //
-        // Parse the next chunk size-line (hex digits up to \r\n).
-        //
-        size_t line_end   = pos;
-        bool   found_crlf = false;
-        while (line_end + 1 < buf_len) {
-            if (buf[line_end] == '\r' && buf[line_end + 1] == '\n') {
-                found_crlf = true;
-                break;
-            }
-            line_end++;
-        }
-
-        if (!found_crlf) {
-            //
-            // Incomplete size-line — save it so it's prepended to the next
-            // recv's data (see process_request_data's chunk_leftover path).
-            //
-            size_t left = buf_len - pos;
-            if (left > 0 && left < sizeof(conn->chunk_leftover)) {
-                axl_memcpy(conn->chunk_leftover, buf + pos, left);
-                conn->chunk_leftover_len = left;
+            if (conn->chunk_remaining == 0) {
+                conn->chunk_state = HTTP_CHUNK_DATA_END;
             }
             break;
         }
-
-        //
-        // axl_hex_parse_u64 stops at the first non-hex byte, covering
-        // chunk-extensions (`;...`) and an empty line.
-        //
-        uint64_t parsed_size = 0;
-        size_t   chunk_size  = 0;
-        if (axl_hex_parse_u64(buf + pos, line_end - pos, &parsed_size) >= 0) {
-            chunk_size = (size_t)parsed_size;
-        }
-        pos = line_end + 2;  /* skip \r\n after the size-line */
-
-        if (chunk_size == 0) {
-            //
-            // Terminal chunk — done.
-            //
-            conn->chunked_done = true;
-            conn->content_length = conn->body_bytes_read;
-            if (conn->is_upload_stream) {
-                stream_upload_data(s, conn, NULL, 0, true);
+        case HTTP_CHUNK_DATA_END:
+            if (buf[pos] == '\r') {
+                conn->chunk_state = HTTP_CHUNK_DATA_LF;
+            } else if (buf[pos] == '\n') {
+                conn->chunk_state = HTTP_CHUNK_SIZE;
+            } else {
+                return 400;   /* the data was longer than its size said */
             }
-            return;
+            pos++;
+            break;
+        case HTTP_CHUNK_DATA_LF:
+            if (buf[pos] != '\n') {
+                return 400;
+            }
+            conn->chunk_state = HTTP_CHUNK_SIZE;
+            pos++;
+            break;
+        case HTTP_CHUNK_SIZE: {
+            size_t got = chunk_line_byte(conn, buf[pos++]);
+            if (got == 400) {
+                return 400;
+            }
+            if (got == 0) {
+                break;
+            }
+            size_t size = 0;
+            if (!chunk_size_parse(conn->chunk_line, conn->chunk_line_len, &size)) {
+                return 400;
+            }
+            conn->chunk_line_len = 0;
+            if (size == 0) {
+                conn->chunk_state = HTTP_CHUNK_TRAILER;
+            } else {
+                conn->chunk_remaining = size;
+                conn->chunk_state     = HTTP_CHUNK_DATA;
+            }
+            break;
         }
-
-        //
-        // Arm the data-consumption state and loop back to consume it (the
-        // chunk_remaining branch above handles however much fits here, and
-        // carries the rest to the next recv).
-        //
-        conn->chunk_remaining = chunk_size;
+        case HTTP_CHUNK_TRAILER: {
+            conn->chunk_trailer_len++;
+            if (conn->chunk_trailer_len > HTTP_CHUNK_TRAILER_MAX) {
+                return 400;
+            }
+            size_t got = chunk_line_byte(conn, buf[pos++]);
+            if (got == 400) {
+                return 400;
+            }
+            if (got == 1) {
+                bool empty = conn->chunk_line_len == 0;
+                conn->chunk_line_len = 0;
+                if (empty) {
+                    /* The final CRLF: the body is whole. What follows it
+                       (a pipelined request) is not read here. */
+                    conn->chunk_state    = HTTP_CHUNK_DONE;
+                    conn->chunked_done   = true;
+                    conn->content_length = conn->body_bytes_read;
+                    if (conn->is_upload_stream) {
+                        stream_upload_data(s, conn, NULL, 0, true);
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            return 0;
+        }
     }
+    if (conn->chunk_state == HTTP_CHUNK_DONE && pos < buf_len) {
+        /* The body ended inside this buffer: the rest is the next request. */
+        conn_carry_keep(conn, buf + pos, buf_len - pos);
+    }
+    return 0;
+}
+
+/* A Transfer-Encoding value, read per RFC 9112 6.1/6.3: a comma list whose
+   FINAL coding must be chunked, applied once. @return 0 for exactly
+   chunked; 400 when the final coding is not chunked, chunked appears more
+   than once, or the list is empty -- the body's length cannot be told;
+   501 when a coding before it is one the server does not implement. */
+static size_t
+transfer_coding_check(
+    const char *te
+    )
+{
+    AxlHttpCodings cod;
+    _axl_http_codings_scan(te, &cod);
+    if (cod.empty || !cod.last_chunked || cod.chunked > 1) {
+        return 400;
+    }
+    return (cod.other > 0) ? 501 : 0;
+}
+
+/* The request as the server has it before the body: what a gate that runs
+   ahead of the body (an upload route's middleware and auth, the
+   100-continue decision) judges. body is NULL by design. */
+static void
+prebody_request(
+    const HttpConn  *conn,
+    AxlHttpRequest  *req,
+    AxlHttpResponse *resp
+    )
+{
+    axl_memset(req, 0, sizeof(*req));
+    req->method     = conn->method;
+    req->path       = conn->path;
+    req->query      = conn->query;
+    req->headers    = conn->headers;
+    req->request_id = conn->request_id;
+    axl_memcpy(req->client_addr, conn->client_addr, sizeof(req->client_addr));
+
+    axl_memset(resp, 0, sizeof(*resp));
+    resp->status_code = 200;
+}
+
+/* May a request that asked for 100-continue have its body? Decided from
+   what dispatch_request would refuse without it: no route (404), or a
+   route's auth callback failing on the headers (401/403). A refusal is
+   answered here, as dispatch_request would answer it -- the middleware
+   first, its headers on the error -- and the connection closes, so the
+   body the client then never sends is never waited for. A request that
+   passes is judged again, with its body, by dispatch_request.
+   @return true when the body may be read. */
+static bool
+continue_gate(
+    AxlHttpServer *s,
+    HttpConn      *conn,
+    HttpRoute     *route
+    )
+{
+    AxlHttpRequest  req;
+    AxlHttpResponse resp;
+    size_t          status = 404;
+
+    prebody_request(conn, &req, &resp);
+    if (route != NULL) {
+        status = http_check_route_auth(s, route->auth_flags, &req);
+        if (status == 0) {
+            return true;
+        }
+    }
+    if (run_middleware(s, &req, &resp) != AXL_OK) {
+        axl_warning("middleware rejected %s %s (status %zu)",
+                    conn->method, conn->path, resp.status_code);
+        send_middleware_refusal(conn, &resp);
+    } else {
+        send_error_response_headers(conn, status, &resp);
+        http_response_release(&resp);
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,61 +382,56 @@ process_request_data(
         }
 
         //
-        // Parse request line
+        // Parse the request line and headers, and judge them: 400 for a
+        // malformed line or block or a missing Host, 505 for HTTP/2+.
         //
-        size_t first_line_end = 0;
-        for (size_t j = 0; j + 1 < header_end; j++) {
-            if (conn->header_buf[j] == '\r' && conn->header_buf[j + 1] == '\n') {
-                first_line_end = j;
-                break;
-            }
-        }
-
-        int parse_status;
-        parse_status = axl_http_parse_request_line(
-                        conn->header_buf,
-                        first_line_end,
-                        &conn->method,
-                        &conn->path,
-                        &conn->query
-                        );
-        if (parse_status != 0) {
-            send_error_response(conn, 400);
+        AxlHttpReqHead head;
+        size_t         head_status = _axl_http_request_head_parse(conn->header_buf,
+                                                                  header_end, &head);
+        conn->method  = head.method;
+        conn->path    = head.path;
+        conn->query   = head.query;
+        conn->headers = head.headers;
+        bool http10   = head.http10;
+        if (head_status != 0) {
+            send_error_response(conn, head_status);
             /* reset_connection runs from on_response_sent now */
             return;
         }
 
-        //
-        // Parse headers
-        //
-        size_t header_start = first_line_end + 2;
-        parse_status = axl_http_parse_headers(
-                        conn->header_buf + header_start,
-                        header_end - header_start,
-                        &conn->headers
-                        );
-        if (parse_status != 0) {
+        if (axl_http_parse_content_length(conn->headers, &conn->content_length) != AXL_OK) {
+            /* Not a number, or past what the framing can represent: read
+               leniently it was 0 (an empty body) or wrapped. */
             send_error_response(conn, 400);
-            /* reset_connection runs from on_response_sent now */
             return;
         }
-
-        conn->content_length = axl_http_get_content_length(conn->headers);
         conn->body_bytes_read = 0;
         conn->body = NULL;
         conn->body_alloc = 0;
         conn->chunked = false;
         conn->chunked_done = false;
-        conn->chunk_remaining = 0;
-        conn->chunk_crlf_pending = 0;
-        conn->chunk_leftover_len = 0;
+        chunked_reset(conn);
 
         //
         // Check for chunked transfer encoding
         //
         const char *te_header = (const char *)axl_hash_table_lookup(conn->headers, "transfer-encoding");
-        if (te_header != NULL && axl_strcasecmp(te_header, "chunked") == 0) {
+        bool        close_after = false;
+        if (te_header != NULL) {
+            /* Exactly chunked, or refused: a body whose length cannot be
+               told is never read as having none (its bytes would be taken
+               for the next request). */
+            size_t st = transfer_coding_check(te_header);
+            if (st != 0) {
+                send_error_response(conn, st);
+                return;
+            }
             conn->chunked = true;
+            /* With Content-Length too, chunked frames the body and the
+               connection closes after the response (RFC 9112 6.3): the
+               sender's framing is in doubt. */
+            close_after = axl_hash_table_lookup(conn->headers, "content-length") != NULL
+                          || http10;   /* HTTP/1.0 has no chunked: faulty framing (6.1) */
             conn->content_length = 0;
         }
 
@@ -275,14 +445,51 @@ process_request_data(
                 conn->keep_alive = false;
             }
         }
+        if (close_after) {
+            conn->keep_alive = false;
+        }
 
         conn->headers_done = true;
+        conn->request_id   = http_next_request_id();
+
+        //
+        // Expect (RFC 9110 10.1.1): 100-continue is answered once the
+        // server knows it will read the body; any other expectation is one
+        // it cannot meet.
+        //
+        AxlHttpExpect expect = _axl_http_expect_check(
+            (const char *)axl_hash_table_lookup(conn->headers, "expect"), http10);
+        if (expect == AXL_HTTP_EXPECT_FAILED) {
+            send_error_response(conn, 417);
+            return;
+        }
 
         //
         // Early route lookup — detect upload routes before body buffering
         //
         size_t body_in_header = conn->header_len - header_end;
+        /* Bytes past this request's body are the next request, pipelined
+           into the same segment: carry them. A chunked body's decoder
+           finds its own end and carries what follows it. */
+        if (!conn->chunked && body_in_header > conn->content_length) {
+            conn_carry_keep(conn, conn->header_buf + header_end + conn->content_length,
+                            body_in_header - conn->content_length);
+            body_in_header = conn->content_length;
+        }
         HttpRoute *early_route = find_route(s, conn->method, conn->path);
+        /* A 100 is owed only while the client is still holding its body
+           back: a body that has started arriving needs none. A WebSocket
+           upgrade is left as it was: dispatch_request takes it before any
+           route lookup, which the gate below would answer 404. */
+        const char *upgrade = (const char *)axl_hash_table_lookup(conn->headers, "upgrade");
+        bool want_continue = expect == AXL_HTTP_EXPECT_CONTINUE
+                             && body_in_header == 0
+                             && (conn->chunked
+                                 || (conn->content_length > 0
+                                     && conn->content_length != SIZE_MAX))
+                             && !(upgrade != NULL && axl_strcasecmp(upgrade, "websocket") == 0);
+        bool body_too_large = !conn->chunked && conn->content_length != SIZE_MAX
+                              && conn->content_length > s->body_limit;
 
         if (early_route != NULL && early_route->is_upload &&
             early_route->upload_handler != NULL) {
@@ -301,42 +508,16 @@ process_request_data(
             //
             AxlHttpRequest  mw_req;
             AxlHttpResponse mw_resp;
-            axl_memset(&mw_req, 0, sizeof(mw_req));
-            mw_req.method  = conn->method;
-            mw_req.path    = conn->path;
-            mw_req.query   = conn->query;
-            mw_req.headers = conn->headers;
-            axl_memcpy(mw_req.client_addr, conn->client_addr,
-                       sizeof(mw_req.client_addr));
-
-            axl_memset(&mw_resp, 0, sizeof(mw_resp));
-            mw_resp.status_code = 200;
+            prebody_request(conn, &mw_req, &mw_resp);
 
             if (run_middleware(s, &mw_req, &mw_resp) != AXL_OK) {
                 axl_warning("middleware rejected upload %s %s (status %zu)",
                             conn->method, conn->path, mw_resp.status_code);
-                if (mw_resp.status_code == 200) {
-                    mw_resp.status_code = 500;
-                }
-                /* Force-close: the client almost certainly already
-                   pushed body bytes into the kernel TCP buffer (curl
-                   et al. send headers + body in one write). If we
-                   stayed in keep-alive, on_response_sent's rearm would
-                   read those leftover body bytes into header_buf and
-                   parse them as the next request line. Same reason
-                   send_error_response forces close. */
-                conn->keep_alive = false;
-                send_response(conn, &mw_resp);
-                /* send_response memcpy'd headers + body into tx_buf;
-                   the originals (set by middleware via
-                   axl_http_response_set_text / _json / etc.) are
-                   ours to free. */
-                if (mw_resp.body != NULL && !mw_resp.body_static) {
-                    axl_free(mw_resp.body);
-                }
-                if (mw_resp.headers != NULL) {
-                    axl_hash_table_free(mw_resp.headers);
-                }
+                /* Closes: the client almost certainly already pushed body
+                   bytes (curl et al. send headers + body in one write),
+                   which a kept-alive connection would parse as the next
+                   request line. */
+                send_middleware_refusal(conn, &mw_resp);
                 return;
             }
 
@@ -355,7 +536,11 @@ process_request_data(
             if (auth_status != 0) {
                 axl_warning("upload %s %s rejected: auth (%zu)",
                             conn->method, conn->path, auth_status);
-                send_error_response(conn, auth_status);
+                /* With the middleware's headers, and freeing what it set:
+                   this exit leaked it on every unauthenticated upload, as
+                   dispatch_request's 401 did. */
+                send_error_response_headers(conn, auth_status, &mw_resp);
+                http_response_release(&mw_resp);
                 return;
             }
 
@@ -364,13 +549,15 @@ process_request_data(
             // to the handler as they arrive.
             //
             conn->is_upload_stream = true;
+            conn->upload_ended     = false;
             conn->upload_route     = early_route;
             axl_debug("upload stream started for %s %s",
                       conn->method, conn->path);
 
             conn->upload_buf = axl_malloc(s->upload_chunk_size);
             if (conn->upload_buf == NULL) {
-                send_error_response(conn, 500);
+                send_error_response_headers(conn, 500, &mw_resp);
+                http_response_release(&mw_resp);
                 /* reset_connection runs from on_response_sent now */
                 return;
             }
@@ -384,14 +571,40 @@ process_request_data(
             conn->upload_req.headers   = conn->headers;
             conn->upload_req.body      = NULL;
             conn->upload_req.body_size = 0;
+            conn->upload_req.request_id = conn->request_id;
             axl_memcpy(conn->upload_req.client_addr, conn->client_addr,
                        sizeof(conn->upload_req.client_addr));
 
             axl_memset(&conn->upload_resp, 0, sizeof(conn->upload_resp));
             conn->upload_resp.status_code = 200;
+            /* The middleware's headers go out with the upload's response,
+               which owns and frees them when it is sent (or the connection
+               resets) -- less any framing they carry, which that response
+               writes itself. Anything else it set -- a body, a streamer --
+               is released here. Both used to be dropped on the floor: a
+               leak on every upload. */
+            http_response_strip_framing(&mw_resp);
+            conn->upload_resp.headers = mw_resp.headers;
+            mw_resp.headers = NULL;
+            http_response_drop_streamer(&mw_resp);
+            http_response_release(&mw_resp);
 
-            /* Seed with any body data already in the header buffer */
-            if (body_in_header > 0) {
+            /* Seed with any body data already in the header buffer. A
+               chunked body is DECODED first, as every later recv's is: fed
+               raw, the chunk framing reached the handler as body bytes and
+               a terminator that arrived with the headers was never seen, so
+               the upload hung (and, with a later recv, stored the framing). */
+            if (body_in_header > 0 && conn->chunked) {
+                size_t st = process_chunked_data(s, conn, conn->header_buf + header_end,
+                                                  body_in_header);
+                if (st != 0) {
+                    stream_upload_fail(conn, st);
+                    return;
+                }
+                if (conn->chunked_done || !conn->active || conn->upload_ended) {
+                    return;
+                }
+            } else if (body_in_header > 0) {
                 bool no_body = (conn->content_length == 0 ||
                                 conn->content_length == SIZE_MAX) &&
                                !conn->chunked;
@@ -413,7 +626,20 @@ process_request_data(
                 return;
             }
 
+            /* Middleware and auth passed: the body is wanted. */
+            if (want_continue && !send_continue(conn)) {
+                return;
+            }
             start_conn_recv(s, conn);
+            return;
+        }
+
+        //
+        // A client waiting on a 100 is answered before anything is spent on
+        // its body: a refusal now, or (below, once the body can be held)
+        // the 100. A too-large Content-Length is left to the 413 below.
+        //
+        if (want_continue && !body_too_large && !continue_gate(s, conn, early_route)) {
             return;
         }
 
@@ -425,7 +651,12 @@ process_request_data(
             // For chunked: seed body with leftover header data and process it
             //
             if (body_in_header > 0) {
-                process_chunked_data(s, conn, conn->header_buf + header_end, body_in_header);
+                size_t st = process_chunked_data(s, conn, conn->header_buf + header_end,
+                                                 body_in_header);
+                if (st != 0) {
+                    send_error_response(conn, st);
+                    return;
+                }
                 if (conn->chunked_done) {
                     dispatch_and_respond(s, conn);
                     return;
@@ -435,7 +666,7 @@ process_request_data(
             //
             // Content-Length body
             //
-            if (conn->content_length > s->body_limit) {
+            if (body_too_large) {
                 send_error_response(conn, 413);
                 /* reset_connection runs from on_response_sent now */
                 return;
@@ -460,31 +691,22 @@ process_request_data(
         }
 
         //
-        // Continue to body read or dispatch
+        // Continue to body read or dispatch -- after the 100 the gate above
+        // allowed, now that the body has somewhere to go.
         //
+        if (want_continue && !send_continue(conn)) {
+            return;
+        }
         start_conn_recv(s, conn);
     } else if (conn->chunked && !conn->chunked_done) {
         //
-        // Process chunked data that arrived in chunk_read_buf.
-        // If there's leftover from a previous partial chunk header,
-        // prepend it.
+        // Process chunked data that arrived in chunk_read_buf; the decoder
+        // keeps whatever a recv boundary cut.
         //
-        if (conn->chunk_leftover_len > 0) {
-            char   tmp_buf[HTTP_CHUNK_READ_BUF_SIZE + 16];
-            size_t tmp_len = conn->chunk_leftover_len + bytes;
-            if (tmp_len <= sizeof(tmp_buf)) {
-                axl_memcpy(tmp_buf, conn->chunk_leftover, conn->chunk_leftover_len);
-                axl_memcpy(tmp_buf + conn->chunk_leftover_len, conn->chunk_read_buf, bytes);
-                conn->chunk_leftover_len = 0;
-                process_chunked_data(s, conn, tmp_buf, tmp_len);
-            } else {
-                conn->chunk_leftover_len = 0;
-                process_chunked_data(s, conn, conn->chunk_read_buf, bytes);
-            }
-        } else {
-            process_chunked_data(s, conn, conn->chunk_read_buf, bytes);
-        }
-        if (!conn->chunked_done) {
+        size_t st = process_chunked_data(s, conn, conn->chunk_read_buf, bytes);
+        if (st != 0) {
+            send_error_response(conn, st);
+        } else if (!conn->chunked_done) {
             start_conn_recv(s, conn);
         } else {
             dispatch_and_respond(s, conn);

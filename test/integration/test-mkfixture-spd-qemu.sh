@@ -1,5 +1,9 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=11 local-only=1
+# test-meta: arch=x64 needs= est=11 local-only=1 builds=smbus-hc-shim guest=none
+# guest=none: not converted yet (pool design §6.7 step 8 item 9): its SMBus
+#   EEPROM is backed by test/data/spd-ddr4-micron-8gb.bin, named by absolute
+#   path (memory-backend-file mem-path=$PROJECT_DIR/...); classes.toml has no
+#   tree-relative path form, and the pool keys no class on a mem-path file.
 # test-mkfixture-spd-qemu.sh — HF4: mkfixture SPD capture.
 #
 # Boots mkfixture.efi --spd against a canned DDR4 SPD blob attached at
@@ -29,7 +33,7 @@ TEST_ARCH="X64"
 test_setup
 
 _native_arch="x64"
-make -C "$PROJECT_DIR" ARCH="$_native_arch" tools smbus-hc-shim 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" tools smbus-hc-shim 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 SPD_BLOB="$PROJECT_DIR/test/data/spd-ddr4-micron-8gb.bin"

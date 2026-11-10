@@ -34,9 +34,12 @@
 
 #include <axl.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "../fs/axl-fs-internal.h"
 
 // ---------------------------------------------------------------------------
 // Both spellings, because the two toolchains disagree
@@ -277,15 +280,28 @@ stat(
 /* _stat is what newlib's reentrant layer calls; same body. */
 int _stat(const char *path, struct stat *st) AXL_CXXRT_ALIAS(stat);
 
+/* Is the volume @p path is on write-protected? */
+static bool
+volume_read_only(
+    const char *path
+    )
+{
+    AxlFsVolumeFacts f;
+    return axl_fs_volume_facts(path, &f) == AXL_OK && f.read_only;
+}
+
 /**
- * @brief Rename or move a path.
+ * @brief Rename or move a path -- POSIX `rename()`, over axl_file_replace()
+ *     with no flags.
  *
- * Backed by axl_file_move rather than axl_file_rename, and that is the
- * difference between POSIX semantics and FAT's: `axl_file_rename` refuses a
- * cross-directory request (FAT renames within one directory), while POSIX
- * `rename()` is defined across directories on the same filesystem.
- * axl_file_move tries the atomic same-directory rename first and falls back
- * to copy + delete, which is the closest a FAT volume gets to the contract.
+ * axl_file_replace() is rename(2) on a filesystem that cannot rename onto a
+ * taken name: it REPLACES an existing target (which axl_file_rename never
+ * does), keeps rename(x, x) and every other spelling of one entry the
+ * no-op POSIX makes it, and puts the target back if the move fails. It
+ * never copies, so another volume is `EXDEV`, as POSIX has it -- the caller
+ * (mv(1), every portable program) copies itself.
+ *
+ * Each AXL code maps to the errno rename(2) documents for the same case.
  */
 int
 rename(
@@ -294,9 +310,33 @@ rename(
     )
 {
     if (old_path == NULL || new_path == NULL) {
+        errno = EFAULT;
         return -1;
     }
-    return axl_file_move(old_path, new_path) == AXL_OK ? 0 : -1;
+    if (old_path[0] == '\0' || new_path[0] == '\0') {
+        errno = ENOENT;   /* rename(2): an empty path names nothing */
+        return -1;
+    }
+    switch (axl_file_replace(old_path, new_path, 0, NULL)) {
+    case AXL_OK:           return 0;
+    case AXL_NOT_FOUND:    errno = ENOENT;    break;
+    case AXL_NOT_DIR:      errno = ENOTDIR;   break;
+    case AXL_IS_DIR:       errno = EISDIR;    break;
+    case AXL_NOT_EMPTY:    errno = ENOTEMPTY; break;
+    case AXL_INVALID:      errno = EINVAL;    break;
+    case AXL_UNSUPPORTED:  errno = EXDEV;     break;
+    case AXL_DENIED:
+        /* rename(2) tells a read-only filesystem (EROFS) from an entry it
+           may not change (EACCES); AXL_DENIED is both. */
+        errno = (volume_read_only(old_path) || volume_read_only(new_path))
+                ? EROFS : EACCES;
+        break;
+    case AXL_NO_RESOURCES: errno = ENOSPC;    break;
+    case AXL_CANCELLED:    errno = EINTR;     break;
+    case AXL_EXISTS:       errno = EEXIST;    break;
+    default:               errno = EIO;       break;
+    }
+    return -1;
 }
 
 int _rename(const char *o, const char *n) AXL_CXXRT_ALIAS(rename);
@@ -442,7 +482,7 @@ unlink(
     if (path == NULL) {
         return -1;
     }
-    return axl_file_delete(path) ? 0 : -1;
+    return (axl_file_delete(path) == AXL_OK) ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------

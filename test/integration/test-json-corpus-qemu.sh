@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=both needs=virtiofsd,jq est=5 local-only=1
+# test-meta: arch=both needs=virtiofsd,jq est=5 local-only=1 guest=none
+# guest=none: --mount: a host directory (the corpora) as a guest volume,
+#   fixed when QEMU starts.
 # test-json-corpus-qemu.sh -- AXL's JSON reader vs. EXTERNAL public corpora.
 #
 # The corpora are NOT vendored. They are cloned into deps/ (gitignored) by
@@ -76,7 +78,7 @@ TEST_EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$ARCH_SUFFIX")/AxlTest
 # at all reported the same green as one that tested every document in it.
 # run-integration.sh scores 77 as SKIP and names it in the totals.
 if [[ ! -f "$TEST_EFI" ]]; then
-    echo "SKIP: $TEST_EFI not built (run: make tests${ARCH:+ ARCH=$ARCH_SUFFIX})" >&2
+    echo "SKIP: $TEST_EFI not built (run: scripts/axl-build.sh${ARCH:+ ARCH=$ARCH_SUFFIX} tests)" >&2
     exit 77
 fi
 if [[ ! -f "$CORPORA_DIR/AXLCORPUS.TAG" ]]; then
@@ -124,6 +126,12 @@ run_one() {
 
     t0=$(date +%s.%N)
     set +e
+    # test-input: not-keyed -- the skip cache does NOT key on the corpora (a
+    # --mount records nothing, and a directory is never keyed): deliberately.
+    # They change only on a deliberate fetch of new corpora, and hashing
+    # thousands of files into every cache key costs more than the rare miss
+    # it would catch. After updating deps/json-corpora, run this test
+    # directly (or with --no-cache).
     "$PROJECT_DIR/scripts/run-qemu.sh" \
         --arch "$ARCH" \
         --mount "$CORPORA_DIR" \

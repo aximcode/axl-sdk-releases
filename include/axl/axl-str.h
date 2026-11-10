@@ -213,9 +213,12 @@ axl_hex_parse_u64(
     uint64_t   *out);
 
 /**
- * @brief Copy @n bytes from @a src to @a dst.
+ * @brief Copy @a n bytes from @a src to @a dst.
  *
- * Regions must not overlap. NULL-safe: returns @a dst if either is NULL.
+ * Overlapping regions are copied correctly, in either direction -- the same
+ * guarantee as axl_memmove(), which this shares an implementation with, so
+ * code that shifts a buffer's tail with it stays correct. NULL-safe: returns
+ * @a dst if either is NULL.
  *
  * @return @a dst.
  */
@@ -821,6 +824,42 @@ axl_utf8_decode(
     uint32_t    *out_codepoint   ///< [out] decoded codepoint, or 0xFFFD on invalid
 );
 
+/**
+ * @brief Check that @a len bytes at @a s are well-formed UTF-8.
+ *
+ * Well-formed as RFC 3629 defines it: every sequence is the shortest form of
+ * its codepoint (no overlong forms such as C0 80), no codepoint is a UTF-16
+ * surrogate (U+D800-U+DFFF) or above U+10FFFF, no continuation byte stands
+ * alone, and no sequence is cut short by the end of the range. The bytes
+ * C0, C1 and F5-FF can therefore never appear.
+ *
+ * **A NUL byte inside the range is refused,** although RFC 3629 allows
+ * U+0000 and axl_utf8_encode(0, ...) writes exactly that byte: text that
+ * carries one is almost always truncated or binary, and every C consumer
+ * downstream would silently stop at it. GLib's `g_utf8_validate_len` makes
+ * the same choice. An empty range (@a len 0) is valid, and @a s may then be
+ * NULL.
+ *
+ * The same well-formedness rules axl_utf8_decode applies; where decode
+ * substitutes U+FFFD for an ill-formed sequence and carries on, this refuses
+ * -- decode to display, validate to accept. Unlike decode it is bounded by
+ * @a len rather than by a terminator, and a NUL inside that length is
+ * refused rather than read as the end.
+ *
+ * @return true if all @a len bytes are well-formed; false otherwise,
+ *     including for @a s NULL with @a len above 0. When @a endptr is
+ *     non-NULL it receives the address of the first byte of the first
+ *     ill-formed sequence (a NUL included), or `s + len` when the range is
+ *     valid -- so a caller can report where input went wrong; with @a s
+ *     NULL it receives NULL.
+ */
+bool
+axl_utf8_validate(
+    const char  *s,       ///< bytes to check; need not be NUL-terminated
+    size_t       len,     ///< how many bytes of @a s to check
+    const char **endptr   ///< [out, optional] first invalid byte, or s + len
+);
+
 /** Longest UTF-8 sequence axl_utf8_encode can produce, in bytes. A
     destination of this size can never be too small for one codepoint. */
 #define AXL_UTF8_MAX_LEN 4
@@ -995,6 +1034,56 @@ axl_utf8_to_utf16(
     size_t      len,        ///< number of bytes
     uint16_t   *dst,        ///< destination, or NULL to measure
     size_t      dst_count   ///< capacity of @p dst in 16-bit units
+);
+
+/**
+ * @brief Read a text file's bytes as UTF-8, whichever way it was written.
+ *
+ * The UEFI Shell writes text as UTF-16LE with a byte-order mark -- both
+ * `echo ... > file` and `edit` do -- where a host editor writes UTF-8, so a
+ * file a user may have made either way is read through this:
+ *  - bytes starting FF FE are UTF-16LE: converted to UTF-8 (a surrogate pair
+ *    to one 4-byte sequence), the mark dropped;
+ *  - bytes starting EF BB BF are UTF-8, the mark dropped;
+ *  - anything else is taken as UTF-8 as it stands. UTF-16BE and UTF-16
+ *    without a mark are not recognised.
+ *
+ * This is the ENCODING layer only. UTF-8 input is copied, not validated --
+ * a caller that needs valid UTF-8 checks the result with
+ * axl_utf8_validate(), which also refuses a NUL -- and an encoded U+0000 in
+ * UTF-16 becomes a NUL byte, as the same check sees.
+ *
+ * UTF-16 that does not convert -- an unpaired surrogate, or an odd byte
+ * left at the end -- is #AXL_INVALID. The text is still produced, each bad
+ * unit as U+FFFD (an odd trailing byte as nothing), and @a bad_at says
+ * where the first one landed, so a caller can name the line it is on and
+ * use what came before it.
+ *
+ * UTF-16 is decoded straight from @a data, which need not be 2-byte
+ * aligned; the text is the one allocation.
+ *
+ * @a out_len and @a bad_at, when not NULL, are set on EVERY return: on a
+ * failure that produces no text they are 0.
+ *
+ * @return #AXL_OK; #AXL_INVALID for UTF-16 that does not convert (@a out is
+ *     set, see above) or for a NULL @a out, or @a data NULL with @a len
+ *     above 0 (@a out is then NULL, the lengths 0); #AXL_NO_RESOURCES when
+ *     the text cannot be allocated (@a out NULL, the lengths 0). The caller
+ *     frees @a *out with axl_free() whatever the result -- it is NULL when
+ *     nothing was produced.
+ */
+AXL_WARN_UNUSED int
+axl_text_to_utf8(
+    const void *data,     ///< the file's bytes; may be NULL when @a len is 0
+    size_t      len,      ///< their count
+    char      **out,      ///< receives the text, NUL-terminated (axl_free() it)
+    size_t     *out_len,  ///< receives its length in bytes (0 when no text
+                          ///< was produced), or NULL
+    size_t     *bad_at    ///< on UTF-16 that does not convert, receives the
+                          ///< byte offset in @a *out where the first bad unit
+                          ///< landed (the text's length for an odd trailing
+                          ///< byte); otherwise the text's length (0 when no
+                          ///< text was produced). May be NULL
 );
 
 // ---------------------------------------------------------------------------

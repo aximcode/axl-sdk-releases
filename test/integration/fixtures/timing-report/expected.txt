@@ -1,0 +1,30 @@
+timing report: logs
+tests: 13 -- 12 logs (11 with a wall time, 1 with no TIMING line at all), 1 cached (not run)
+
+    TOTAL      CPU    SETUP     BOOT  GUEST-B  GUEST-P     POOL     POST     HOST  RUNS  STATUS  TEST
+   15.000    9.250        -   2.000~   13.000        -        -        -    2.000  2b    PASS    test-rq.sh
+   12.400    6.000    1.000    2.500   10.000        -        -    0.500    2.400  2b    PASS    test-boot-fg.sh
+    9.100   4.100~    1.000   0.000~    7.000        -        -    1.000    2.100  1b    PASS    test-miss.sh
+    5.200    2.500        -    1.000    3.000        -        -        -    2.200  1b    FAIL    test-nested.sh
+    4.500    5.000        -    1.000    3.000        -        -        -    1.500  1b    PASS    test-retry.sh
+    4.000    1.200        -        -        -    2.500    0.405        -    1.095  2p    PASS    test-rqpool.sh
+    3.300    0.400    0.300        -        -    2.000    0.550    0.300    0.750  1p    PASS    test-pooled.sh
+    3.000    1.500        ?        ?        ?        ?        ?        ?        ?  ?     TIMEOUT test-direct.sh
+    2.000        -        -        -        -        -        -        -    2.000  -     PASS    test-vialib.sh
+    0.800    0.700        -        -        -        -        -        -    0.800  -     PASS    test-host.sh
+    0.300    0.100        -        -        -        -        -        -    0.300  -     SKIP    test-skip.sh
+   56.600  29.250~    2.300   6.500~   36.000    4.500    0.955    1.800   15.145  7b3p          SUM over 10 split tests
+
+share of the split wall (56.600 s): boot 11.5%, booted run 52.1%, pooled run 8.0%, pool lease+release 1.7%, host 26.8%
+~ BOOT is a floor: 2 booted runs printed no boot-ready reading
+unsplit: 3.000 s of wall in 1 tests (marked ?)
+CPU (user + system of each test's reaped processes; a pooled guest's QEMU is the pool's, not in it): 30.750 s over all 11 tests, earlier attempts (a retry's first, a pool miss's pooled run) included; 1 of them with no reading (-); ~ a floor: an earlier attempt had none
+
+unmeasured (2):
+  test-direct.sh: no guest timing, and its script launches QEMU itself (not through run-qemu.sh, common-test.sh or test_timing_begin)
+  test-nolines.sh: no TIMING line at all (not even the runner's)
+started no guest (1): test-vialib.sh -- it names an instrumented launcher, which reports every guest it starts
+host-only (1): test-host.sh
+skipped (1): test-skip.sh
+cached, not run (1): test-cached.sh
+earlier attempts (retry, pool miss): 2, 5.000 s of wall not in the table (their CPU is in it)

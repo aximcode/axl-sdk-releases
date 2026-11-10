@@ -1154,4 +1154,143 @@ refute_match "$OUTSM" 'DOES NOT MATCH' \
 assert_match "$OUTMC" "app.map \(map, linked 0x6a8f3db9\)" \
     "S9 the map's link stamp is surfaced in Symbol sources"
 
+# ═══════════════════════════════════════════════════════════════
+# A REAL vendor x64 capture, decoded with no symbols at all.
+#
+# Every check above reads a dump this file synthesized, and the synthesis was
+# faithful in every way but the ones that mattered. The real screen
+# (test/integration/data/rsod-vendor-x64-page-fault.txt, scrubbed of vendor,
+# platform and module names, PCI table dropped; addresses, columns and
+# structure are the capture's own)
+# carries what the synthetic one does not:
+#
+#   * an `LBRfr0 Dump:` heading. The branch regex read its `D` as a hex
+#     address, so the real `LBRfr0 231293B3 ...` record was overwritten with
+#     0xd and the one fact that named the culprit printed as `??? [0xd]`.
+#   * an ASCII gutter on the stack dump spelling `nic=1844`, which the
+#     REG=VALUE sweep took for a register called `nic`.
+#   * R10-R15 printed as bare `10=` .. `15=`, dropped because a register name
+#     had to start with a letter. The synthetic dump had them too; nothing
+#     asserted them.
+#   * `Page fault (14)` -- a DECIMAL vector in parentheses, which the cause
+#     table never read, so the summary said nothing about the exception.
+#   * module-list rows named `Unknown(xxxxx) <description>`, which the
+#     `.efi`-only image regex skipped.
+#   * a firmware attribution that is WRONG: the faulting PC is on the stack
+#     (SP+0x28), and the firmware named the image with the nearest lower base
+#     without checking its size. The module list proves it, so the decode says
+#     so instead of repeating it.
+#
+# No toolchain and no image: the dump and its own module list are the input.
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "-- real vendor x64 capture, no symbols --"
+VENDOR="$PROJECT_DIR/test/integration/data/rsod-vendor-x64-page-fault.txt"
+OUTV="$WORK/out-vendor.txt"
+run_decode "$OUTV" "vendor x64 capture decodes" --rsod "$VENDOR"
+
+assert_line "$OUTV" \
+    "Cause: Page fault — RIP is on the stack (SP+0x28): execution jumped into stack memory" \
+    "vendor: the decimal vector is read and the fault PC placed on the stack"
+assert_line "$OUTV" "#0 0x2645d8f0 (faulting PC — on the stack at SP+0x28)" \
+    "vendor: frame 0 is placed on the stack, not called invalid"
+assert_line "$OUTV" \
+    "from axl-webfs-serve-dxe.efi.efi+0x363b3 [0x231293b3] (no debug image)" \
+    "vendor: LBR source parsed and attributed through the module list"
+assert_line "$OUTV" \
+    "to <stack SP+0x28> [0x2645d8f0] (firmware said VendorVideoDxe.efi+0x448f0, past the end of that 0x26500-byte image)" \
+    "vendor: LBR target placed on the stack; the firmware's attribution is refuted"
+refute_match "$OUTV" '\[0xd\]' "vendor: the 'LBRfr0 Dump:' heading is not a branch record"
+
+# Whole register rows: a dropped R10 or a stray `nic` shifts every row after it.
+assert_line "$OUTV" \
+    "AX 0x0000000000000001 BX 0x000000002ea3caa8 SI 0x0000000000000001 DI 0x0000000023172720" \
+    "vendor: register row 1"
+assert_line "$OUTV" \
+    "CX 0x0000000000000000 DX 0x0000000023172700 R8 0x0000000000000000 R9 0x0000000000000000" \
+    "vendor: register row 2"
+assert_line "$OUTV" \
+    "R10 0x0000000000000000 R11 0x000000002f4284b8 R12 0x0000000023123fb0 R13 0x000000002ea3caa0" \
+    "vendor: bare 10= .. 13= are R10 .. R13"
+assert_line "$OUTV" \
+    "R14 0x00000000230fa143 R15 0x000000000000002a BP 0x000000002f2225ca SP 0x000000002645d8c8" \
+    "vendor: bare 14= 15= are R14 R15"
+assert_line "$OUTV" "IP 0x000000002645d8f0 Flags 0x0000000000010216" \
+    "vendor: last register row ends at Flags (no gutter text as a register)"
+refute_match "$OUTV" '(^| )nic 0x' "vendor: the stack dump's ASCII gutter is not a register"
+
+OUTVJ="$WORK/out-vendor.json"
+timeout 60 python3 "$DECODE" --rsod "$VENDOR" --json > "$OUTVJ.raw" 2>"$OUTVJ.err"
+norm < "$OUTVJ.raw" > "$OUTVJ"
+assert_line "$OUTVJ" '"from_location": "axl-webfs-serve-dxe.efi.efi+0x363b3",' \
+    "vendor: JSON carries the branch source's module"
+assert_line "$OUTVJ" '"to_location": "<stack SP+0x28>",' \
+    "vendor: JSON carries the branch target's location"
+
+# --detail prints the firmware's fault description in red under the
+# exception. The `-->RIP <addr> <name> +<off>` tail is not one -- it is the
+# refuted attribution again, and printing it there presented it as the fault.
+OUTVD="$WORK/out-vendor-detail.txt"
+run_decode "$OUTVD" "vendor capture with --detail completes" --rsod "$VENDOR" --detail
+assert_line "$OUTVD" "Exception: Page fault (14) Source: Software (UEFI0012) on BSP" \
+    "vendor: --detail keeps the firmware's exception line verbatim"
+refute_line "$OUTVD" "VendorVideoDxe.efi +0448F0" \
+    "vendor: --detail does not present the -->RIP attribution as the fault description"
+
+# The firmware may name a module without the `.efi` the module list carries
+# (or with it doubled, as this capture's list does). That is the same image,
+# so its claim is not "unsupported by the module list".
+VENDOR_BARE="$WORK/vendor-bare-name.txt"
+sed 's/^LBRfr0 231293B3 axl-webfs-serve-dxe\.efi\.efi +0363B3$/LBRfr0 231293B3 axl-webfs-serve-dxe +0363B3/' \
+    "$VENDOR" > "$VENDOR_BARE"
+OUTVB="$WORK/out-vendor-bare.txt"
+run_decode "$OUTVB" "vendor capture with a suffix-less LBR name decodes" --rsod "$VENDOR_BARE"
+assert_line "$OUTVB" \
+    "from axl-webfs-serve-dxe.efi.efi+0x363b3 [0x231293b3] (no debug image)" \
+    "vendor: a claim naming the image without .efi agrees with the module list"
+
+# The bare `10=` .. `15=` register spelling is x64's. On AARCH64 a stray `10=`
+# must not become R10 (or anything): the registers there are X0..X30 by name.
+AA_BARE="$WORK/vendor-aa64-bare.txt"
+printf '%s\n' \
+    'Type: Synchronous Exception, Syndrome:Data Abort' \
+    'X0=0000000000000001 X1=0000000000000002 10=0000000000000003' \
+    'FP=0000000000000000 LR=0000000000001000 SP=0000000040000000' \
+    'ELR=0000000000001234 ESR=0000000096000004 FAR=0000000000000000' \
+    '--> PC 0000000000001234 Foo.efi +1234' > "$AA_BARE"
+OUTAB="$WORK/out-vendor-aa64-bare.txt"
+run_decode "$OUTAB" "vendor AARCH64 sample with a stray 10= decodes" --rsod "$AA_BARE"
+assert_line "$OUTAB" \
+    "X0 0x0000000000000001 X1 0x0000000000000002 FP 0x0000000000000000 LR 0x0000000000001000" \
+    "vendor AARCH64: a stray bare 10= is not a register"
+refute_match "$OUTAB" '(^| )R10 ' "vendor AARCH64: no R10 on an AARCH64 dump"
+
+# --markdown with no --syms indexed images[0] for its title and died with an
+# IndexError -- the same symbol-less decode the human report handles.
+OUTVM="$WORK/out-vendor.md"
+timeout 60 python3 "$DECODE" --rsod "$VENDOR" --markdown > "$OUTVM.raw" 2>"$OUTVM.err"
+VM_RC=$?
+norm < "$OUTVM.raw" > "$OUTVM"
+if [[ $VM_RC -eq 0 ]]; then
+    test_host_pass "vendor: --markdown with no symbol source completes"
+else
+    test_host_fail "vendor: --markdown with no symbol source completes (exit $VM_RC)"
+    sed 's/^/      /' "$OUTVM.err" | tail -2
+fi
+assert_line "$OUTVM" \
+    '| 0 | from | `axl-webfs-serve-dxe.efi.efi+0x363b3` *(no debug image)* | `0x231293b3` |' \
+    "vendor: --markdown branch source row"
+
+# The module list is 316 rows, three of them `Unknown(xxxxx) <description>`
+# with no `.efi`. An address inside one must be attributed to it, and an
+# address inside none must still say so (the control: without it, a decoder
+# that attributes EVERYTHING to something would pass).
+OUTVA="$WORK/out-vendor-addr.txt"
+run_decode "$OUTVA" "vendor capture with --addr completes" \
+    --rsod "$VENDOR" --addr 23207010 10
+assert_line "$OUTVA" "#0 Unknown(frffb)+0x10 [0x23207010] (no debug image)" \
+    "vendor: an Unknown(...) module-list row is parsed"
+assert_line "$OUTVA" "#1 0x10 (outside all known images)" \
+    "vendor: an address in no listed image is still reported as such"
+
 test_host_summary "rsod-decode-pe-map"

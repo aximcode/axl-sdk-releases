@@ -15,7 +15,9 @@
 #include <axl/axl-console.h>   /* axl_console_readline (interactive stdin fallback) */
 #include <axl/axl-fs.h>
 #include <axl/axl-debug.h>   /* AXL_DEBUG_ASSERT (axl_setvbuf buf==NULL guard) */
+#include "axl-console-decode.h"   /* raw bytes bound for the console */
 #include "axl-stream-internal.h"
+#include "axl-stream-eof.h"
 #include <axl/axl-format.h>
 #include <axl/axl-log.h>
 
@@ -588,24 +590,18 @@ static AxlStream mStdin = {
     .name   = "stdin",
 };
 
-/* Shared raw-bytes write for the binary console sinks. axl_stdout_raw and
-   axl_stderr_raw differ only in which shell handle backs them, so @p get
-   carries that difference in (mirrors how console_write_via DRYs the text
-   sinks above). Returns -1 if @p get() reports no shell handle published —
-   there's no sensible fallback for binary bytes (the firmware console
-   would mangle them via CHAR16 conversion, which is exactly what this
-   path exists to avoid). */
+/* Raw bytes straight to Shell handle @p h, as they are. -1 when there is
+   no handle -- there's no sensible fallback for binary bytes. */
 static axl_ssize_t
-console_write_raw_via(
-    const void  *data,
-    size_t       count,
-    AxlFileHandle (*get)(void)
+console_write_raw_to(
+    AxlFileHandle  h,
+    const void    *data,
+    size_t         count
     )
 {
     if (data == NULL || count == 0) {
         return 0;
     }
-    AxlFileHandle h = get();
     if (h == NULL) {
         return -1;
     }
@@ -616,11 +612,73 @@ console_write_raw_via(
     return (axl_ssize_t)n;
 }
 
+/* One raw sink's console decoder, and whose stream it decodes: the handle
+   and the launcher dispatch lending it (0 for this image's own). Either
+   changing starts a fresh decoder -- a resident driver's launchers all hand
+   it the same Shell console file, so the handle alone would let one
+   launcher's mode and held bytes reach the next. */
+typedef struct {
+    AxlFileHandle      h;
+    uint64_t           owner;
+    AxlConsoleDecoder  d;
+} RawConsoleSink;
+
+static RawConsoleSink mRawOutConsole;
+static RawConsoleSink mRawErrConsole;
+
+/* Raw bytes whose Shell handle IS the console file: shown as text. That
+   file prints its buffer as a NUL-terminated UCS-2 string whatever size it
+   is given (FileInterfaceStdOutWrite / FileInterfaceStdErrWrite), so handed
+   the bytes it reads on past their end. The writer may hand them over in
+   any pieces, so the sink's decoder carries the encoding (from the first
+   bytes: UTF-16LE with its mark, as the Shell's pipes and files are, else
+   UTF-8) and any partial character from one write to the next
+   (axl-console-decode.h); the text goes through the text path, which ends
+   it with a NUL. */
+static axl_ssize_t
+console_write_raw_as_text(
+    RawConsoleSink  *sink,
+    AxlFileHandle    h,
+    uint64_t         owner,
+    const void      *data,
+    size_t           count,
+    void           (*emit)(const unsigned short *)
+    )
+{
+    char   stack_text[256];
+    char  *text = stack_text;
+    if (data == NULL || count == 0) {
+        return 0;
+    }
+    if (sink->h != h || sink->owner != owner) {
+        sink->h     = h;
+        sink->owner = owner;
+        axl_console_decoder_reset(&sink->d);
+    }
+    if (count > SIZE_MAX / 3u - 3u) {
+        return -1;
+    }
+    size_t cap = AXL_CONSOLE_DECODE_BOUND(count);
+    if (cap > sizeof(stack_text)) {
+        text = axl_malloc(cap);
+        if (text == NULL) {
+            return -1;
+        }
+    }
+    size_t      len = axl_console_decode(&sink->d, data, count, text);
+    axl_ssize_t n   = (len == 0) ? 0 : console_write_via(text, len, emit);
+    if (text != stack_text) {
+        axl_free(text);
+    }
+    return (n < 0) ? -1 : (axl_ssize_t)count;
+}
+
 /**
  * Raw-bytes write to the shell's StdOut handle, bypassing the
  * UTF-8→UCS-2 console_write conversion. For binary output (a tool
  * dumping a RAM-disk image, captured SPD blob, etc.) where the
- * caller wants bytes to traverse a pipe intact.
+ * caller wants bytes to traverse a pipe intact. The handle is fetched
+ * ONCE per write: it decides the route and is the one written to.
  *
  * Returns -1 if the shell-params protocol isn't published — there's
  * no sensible fallback for binary bytes (the firmware console
@@ -631,7 +689,13 @@ static axl_ssize_t
 console_write_raw(void *ctx, const void *data, size_t count)
 {
     (void)ctx;
-    return console_write_raw_via(data, count, axl_backend_shell_stdout);
+    uint64_t      owner;
+    AxlFileHandle h = axl_backend_shell_stdout_owned(&owner);
+    if (axl_backend_shell_handle_is_console(h, false)) {
+        return console_write_raw_as_text(&mRawOutConsole, h, owner, data, count,
+                                         axl_backend_console_write);
+    }
+    return console_write_raw_to(h, data, count);
 }
 
 static AxlStream mStdoutRaw = {
@@ -652,7 +716,15 @@ static axl_ssize_t
 console_write_err_raw(void *ctx, const void *data, size_t count)
 {
     (void)ctx;
-    return console_write_raw_via(data, count, axl_backend_shell_stderr);
+    /* As console_write_raw: to the console, the stderr text path (the
+       console splitter, as axl_stderr writes). */
+    uint64_t      owner;
+    AxlFileHandle h = axl_backend_shell_stderr_owned(&owner);
+    if (axl_backend_shell_handle_is_console(h, true)) {
+        return console_write_raw_as_text(&mRawErrConsole, h, owner, data, count,
+                                         axl_backend_console_write_err);
+    }
+    return console_write_raw_to(h, data, count);
 }
 
 static AxlStream mStderrRaw = {
@@ -700,6 +772,9 @@ axl_stream_init(void)
     stream_reset_to_ground(&mStdin);
     stream_reset_to_ground(&mStdoutRaw);
     stream_reset_to_ground(&mStderrRaw);
+
+    /* The console standard error belongs to, as this image starts. */
+    axl_backend_console_err_init();
 
     axl_stdout     = &mStdout;
     axl_stderr     = &mStderr;
@@ -937,6 +1012,94 @@ utf8_lead_len(uint8_t lead)
     return 1;   /* invalid lead → Latin-1 fallback */
 }
 
+/* Decode one code point from the UTF-8 at @p seq (@p avail bytes) exactly
+   as the write transcoder does: an invalid lead, or a multi-byte sequence
+   with a bad continuation, is its lead byte alone, read as Latin-1.
+
+   @return the bytes it takes (1..4), or 0 when the sequence is valid so
+       far but not yet complete -- more bytes are needed to decide. */
+static size_t
+utf8_next_code(const uint8_t *seq, size_t avail, uint32_t *code)
+{
+    if (avail == 0) {
+        return 0;
+    }
+    uint8_t lead   = seq[0];
+    size_t  needed = utf8_lead_len(lead);
+    if (needed == 1) {
+        *code = lead;   /* ASCII, or an invalid lead read as Latin-1 */
+        return 1;
+    }
+    /* A byte already here that cannot continue the sequence decides it
+       now -- the lead is Latin-1 -- however many bytes are still to come.
+       Only a sequence valid so far is "incomplete". */
+    size_t have = (avail < needed) ? avail : needed;
+    for (size_t k = 1; k < have; k++) {
+        if ((seq[k] & 0xC0) != 0x80) {
+            *code = lead;
+            return 1;
+        }
+    }
+    if (avail < needed) {
+        return 0;
+    }
+    if (needed == 2) {
+        *code = ((uint32_t)(seq[0] & 0x1F) << 6)
+              |  (uint32_t)(seq[1] & 0x3F);
+    } else if (needed == 3) {
+        *code = ((uint32_t)(seq[0] & 0x0F) << 12)
+              | ((uint32_t)(seq[1] & 0x3F) << 6)
+              |  (uint32_t)(seq[2] & 0x3F);
+    } else {
+        *code = ((uint32_t)(seq[0] & 0x07) << 18)
+              | ((uint32_t)(seq[1] & 0x3F) << 12)
+              | ((uint32_t)(seq[2] & 0x3F) << 6)
+              |  (uint32_t)(seq[3] & 0x3F);
+    }
+    return needed;
+}
+
+/* Wire bytes one code point takes in @p s's encoding. Everything above
+   U+FFFF is a single '?' in UCS-2, so it is always one unit. */
+static size_t
+wire_unit(const AxlStream *s)
+{
+    return (s->encoding == AXL_ENC_ASCII) ? 1u : 2u;
+}
+
+/* How many WIRE bytes the caller has written that have not reached the
+   sink: the transcode carry plus the stream's own buffer, as the code
+   points they will become. A trailing incomplete sequence is not yet a
+   code point and counts nothing. No I/O. */
+static size_t
+stream_wire_pending(const AxlStream *s)
+{
+    size_t buffered = (s->buf_mode != AXL_STREAM_BUF_NONE) ? s->wbuf_len : 0;
+
+    if (s->encoding == AXL_ENC_UTF8) {
+        return buffered;   /* passthrough: a byte is a byte */
+    }
+    size_t total = s->out_pending_n + buffered;
+    size_t wire  = 0;
+    for (size_t i = 0; i < total; ) {
+        uint8_t  seq[4];
+        size_t   n = 0;
+        uint32_t code;
+        while (n < 4 && i + n < total) {
+            size_t at = i + n;
+            seq[n++] = (at < s->out_pending_n) ? s->out_pending[at]
+                                               : s->wbuf[at - s->out_pending_n];
+        }
+        size_t used = utf8_next_code(seq, n, &code);
+        if (used == 0) {
+            break;
+        }
+        wire += wire_unit(s);
+        i    += used;
+    }
+    return wire;
+}
+
 /* Push exactly @p n wire bytes, looping on short writes.
    A wire code unit is INDIVISIBLE: half a UCS-2 pair on the wire
    desynchronises every later unit, so "the sink took 1 of 2 bytes" cannot be
@@ -1018,7 +1181,9 @@ write_transcode(AxlStream *s, const void *buf, size_t count, bool inject)
             seq[seq_n++] = in[i + from_input++];
         }
 
-        if (seq_n < needed) {
+        uint32_t code      = 0;
+        size_t   consume_n = utf8_next_code(seq, seq_n, &code);
+        if (consume_n == 0) {
             /* Not enough bytes yet — buffer everything we have and
                wait for the next call. The from_pending bytes were
                already in out_pending (no shift needed since they
@@ -1029,43 +1194,6 @@ write_transcode(AxlStream *s, const void *buf, size_t count, bool inject)
             }
             i += from_input;
             return (axl_ssize_t)i;
-        }
-
-        /* Validate continuation bytes for multi-byte sequences. If
-           any continuation is bad, fall back to Latin-1 on the lead
-           byte alone and rescan from the next byte. */
-        bool latin1 = (needed == 1 && lead >= 0x80);
-        if (!latin1 && needed > 1) {
-            for (size_t k = 1; k < needed; k++) {
-                if ((seq[k] & 0xC0) != 0x80) {
-                    latin1 = true;
-                    break;
-                }
-            }
-        }
-
-        size_t consume_n;       /* bytes of seq we'll account for */
-        uint32_t code;
-        if (latin1) {
-            consume_n = 1;
-            code      = lead;
-        } else {
-            consume_n = needed;
-            if (needed == 1) {
-                code = seq[0];
-            } else if (needed == 2) {
-                code = ((uint32_t)(seq[0] & 0x1F) << 6)
-                     |  (uint32_t)(seq[1] & 0x3F);
-            } else if (needed == 3) {
-                code = ((uint32_t)(seq[0] & 0x0F) << 12)
-                     | ((uint32_t)(seq[1] & 0x3F) << 6)
-                     |  (uint32_t)(seq[2] & 0x3F);
-            } else {
-                code = ((uint32_t)(seq[0] & 0x07) << 18)
-                     | ((uint32_t)(seq[1] & 0x3F) << 12)
-                     | ((uint32_t)(seq[2] & 0x3F) << 6)
-                     |  (uint32_t)(seq[3] & 0x3F);
-            }
         }
 
         if (emit_wire(s, code, inject) < 0) {
@@ -1724,6 +1852,14 @@ axl_ferror(AxlStream *s)
 }
 
 void
+_axl_stream_clear_eof(AxlStream *s)
+{
+    if (s != NULL) {
+        s->eof = false;
+    }
+}
+
+void
 axl_clearerr(AxlStream *s)
 {
     if (s == NULL) {
@@ -1743,6 +1879,12 @@ axl_fseek(AxlStream *s, int64_t offset, int whence)
     if (s == NULL || s->seek == NULL) {
         return AXL_ERR;
     }
+    /* Write out what the stream's own buffer holds FIRST, as stdio's fseek
+       does: those bytes belong at the position they were written at, and
+       left buffered they would land wherever the seek goes. */
+    if (stream_drain(s) != AXL_OK) {
+        return AXL_ERR;
+    }
     /* Discard buffered transcode state — those bytes describe a
        partial sequence at the OLD position; splicing them onto the
        post-seek byte stream would corrupt the next read/write. */
@@ -1758,7 +1900,20 @@ axl_ftell(AxlStream *s)
     if (s == NULL || s->tell == NULL) {
         return -1;
     }
-    return s->tell(s->ctx);
+    int64_t pos = s->tell(s->ctx);
+    if (pos < 0) {
+        return pos;
+    }
+    /* The position the CALLER is at, in the sink's (wire) bytes, as stdio
+       reports it -- with no I/O. Written but not yet sent: the stream's own
+       buffer and transcode carry, as the code points they will become.
+       Read but not yet delivered: the tail of a character whose wire bytes
+       were pulled whole, so the caller is at that character's start. */
+    pos += (int64_t)stream_wire_pending(s);
+    if (s->encoding != AXL_ENC_UTF8 && s->in_pending_n > 0) {
+        pos -= (int64_t)wire_unit(s);
+    }
+    return pos;
 }
 
 bool

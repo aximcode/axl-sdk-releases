@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=6 local-only=0
+# test-meta: arch=both needs=jq est=6 local-only=0 builds=BUILD=RELEASE,all
 # test-log-link-granularity.sh — an image that never asks for logging must not
 # link the log engine, and one that does must link it identically.
 #
@@ -16,7 +16,8 @@
 # trampolines in axl-log-emit.o that forward to _axl_log_vdispatch, declared
 # WEAK there and defined in axl-log.o. Nothing pulls the engine implicitly;
 # every non-minimal link asks for it with `-u _axl_log_vdispatch`
-# ($(LOG_ENGINE_PULL) in the Makefile, `--minimal-runtime=log` in axl-cc).
+# (AXL_LOG_ENGINE_PULL in cmake/AxlImages.cmake, `--minimal-runtime=log` in
+# axl-cc).
 #
 # So the property under test is a LINKAGE property, and behaviour tests cannot
 # see it -- a full-runtime image behaves identically whether the seam exists or
@@ -62,7 +63,7 @@ PASS=0; FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
-# The seam symbol. Named once: a rename that reaches the Makefile and axl-cc
+# The seam symbol. Named once: a rename that reaches the build and axl-cc
 # but not this test would leave every assertion below passing vacuously,
 # because `nm | grep <old name>` finds nothing in an image that HAS an engine
 # just as surely as in one that does not -- which is why the positive controls
@@ -72,35 +73,74 @@ SEAM=_axl_log_vdispatch
 for arch in "${ARCHES[@]}"; do
     echo "=== log engine is opt-in at link time ($arch, RELEASE) ==="
 
-    if ! make ARCH="$arch" BUILD=RELEASE all >"$WORK/build-$arch.log" 2>&1; then
+    # The CMake RELEASE tree, and ITS link pieces: axl-link-pieces.sh is
+    # generated from the variables and objects every image's link is made of
+    # (cmake/AxlImages.cmake), and compile_commands.json holds every TU's
+    # compile -- so the probe is linked and compiled as a shipped image is,
+    # never with flags restated here.
+    if ! "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$arch" BUILD=RELEASE all >"$WORK/build-$arch.log" 2>&1; then
         fail "$arch: library build failed"
         tail -20 "$WORK/build-$arch.log" | sed 's/^/      /'
         continue
     fi
+    TREE="$("$PROJECT_DIR/scripts/axl-build.sh" --print-prefix --abs ARCH="$arch" BUILD=RELEASE)"
+    PIECES="$TREE/axl-link-pieces.sh"
+    if [[ ! -f "$PIECES" ]]; then
+        fail "$arch: no $PIECES -- this test reads the CMake tree's link pieces"
+        continue
+    fi
+    unset AXL_LP_LD AXL_LP_LDFLAGS AXL_LP_LDS AXL_LP_CRT0_APP AXL_LP_CRT0_MINIMAL \
+          AXL_LP_LIBS AXL_LP_LOG_PULL AXL_LP_NM AXL_LP_OBJCOPY \
+          AXL_LP_OBJCOPY_SECTIONS AXL_LP_OBJCOPY_STRIP AXL_LP_PE_TARGET
+    # shellcheck source=/dev/null
+    source "$PIECES"
+    LD=$AXL_LP_LD; LDFLAGS=$AXL_LP_LDFLAGS; LDS=$AXL_LP_LDS
+    MINCRT0=$AXL_LP_CRT0_MINIMAL; FULLCRT0=$AXL_LP_CRT0_APP; LIBS=$AXL_LP_LIBS
+    PULL=$AXL_LP_LOG_PULL; NM=$AXL_LP_NM; OBJCOPY=$AXL_LP_OBJCOPY
+    OCSECS=$AXL_LP_OBJCOPY_SECTIONS; OCSTRIP=$AXL_LP_OBJCOPY_STRIP; PETGT=$AXL_LP_PE_TARGET
+    missing=""
+    for v in LD LDFLAGS LDS MINCRT0 FULLCRT0 LIBS PULL NM OBJCOPY OCSECS OCSTRIP PETGT; do
+        [[ -n "${!v}" ]] || missing+=" $v"
+    done
+    if [[ -n "$missing" ]]; then
+        fail "$arch: $PIECES left empty:$missing"
+        continue
+    fi
+    # hello.c's compile (an application TU of this tree), with the probe as
+    # its source and output. Read as a whole command: the tree escaped it for
+    # a shell, and it runs from the tree's directory as ninja runs it.
+    CC_CMD="$(jq -r '.[] | select(.file | endswith("/sdk/examples/hello.c")) | .command' \
+              "$TREE/compile_commands.json")"
+    if [[ -z "$CC_CMD" || "$CC_CMD" != *" -c "* || "$CC_CMD" != *" -o "* ]]; then
+        fail "$arch: no compile of sdk/examples/hello.c in $TREE/compile_commands.json"
+        continue
+    fi
+    CC_CMD="$(sed -E "s# -o [^ ]+# -o $WORK/nop-$arch.o#; s# -c [^ ]+# -c $WORK/nop.c#" <<< "$CC_CMD")"
 
-    # Read the real build variables rather than restating them: a probe that
-    # hardcodes its own flags stops measuring the shipped link the first time
-    # one changes.
-    mapfile -t V < <(make -s ARCH="$arch" BUILD=RELEASE \
-        print-CC print-CFLAGS print-INCLUDES print-LD_ELF print-LDFLAGS_EFI \
-        print-EFI_LDS print-GCC_CRT0 print-RELOC_OBJ print-DEBUG_INFO_OBJ \
-        print-CRT0_MINIMAL_OBJ print-LINK_CRT0_CMD print-LINK_LIBS \
-        print-LOG_ENGINE_PULL print-CROSS print-OBJCOPY print-OBJCOPY_SECTIONS \
-        print-OBJCOPY_STRIP print-PE_TARGET)
-    CC=${V[0]}; CFLAGS=${V[1]}; INCLUDES=${V[2]}; LD=${V[3]}; LDFLAGS=${V[4]}
-    LDS=${V[5]}; ACRT0=${V[6]}; RELOC=${V[7]}; DBGI=${V[8]}; MINCRT0=${V[9]}
-    FULLCRT0=${V[10]}; LIBS=${V[11]}; PULL=${V[12]}; CROSS=${V[13]}
-    OBJCOPY=${V[14]}; OCSECS=${V[15]}; OCSTRIP=${V[16]}; PETGT=${V[17]}
-    NM="${CROSS}nm"
-
-    if [[ -z "$PULL" ]]; then
-        fail "$arch: \$(LOG_ENGINE_PULL) is empty — the Makefile has no pull to omit"
+    # CONTROL: the pieces ARE the shipped link. hello.c's own object, linked
+    # from them exactly as the build links hello.efi's .so, must reproduce the
+    # tree's hello.so byte for byte -- otherwise every reading below would be
+    # of some other link than the one images get.
+    # The database's `output` is relative to the build directory under CMake
+    # 3.31 and ABSOLUTE under 4.2 (CI's pin) -- the spec allows either, so
+    # take it as given when absolute. Prefixing it unconditionally linked
+    # "$TREE//$TREE/..." on CI and failed only there.
+    HELLO_O="$(jq -r '.[] | select(.file | endswith("/sdk/examples/hello.c")) | .output' \
+              "$TREE/compile_commands.json")"
+    [[ "$HELLO_O" == /* ]] || HELLO_O="$TREE/$HELLO_O"
+    # shellcheck disable=SC2086
+    if $LD $LDFLAGS -T "$LDS" $PULL -o "$WORK/hello-$arch.so" $FULLCRT0 "$HELLO_O" $LIBS \
+            >"$WORK/hello-$arch.ldlog" 2>&1 \
+       && cmp -s "$WORK/hello-$arch.so" "$TREE/hello.so"; then
+        pass "$arch: the link pieces reproduce the tree's hello.so byte for byte"
+    else
+        fail "$arch: the link pieces do NOT reproduce $TREE/hello.so -- they are not the shipped link"
+        sed 's/^/      /' "$WORK/hello-$arch.ldlog"
         continue
     fi
 
     echo 'int main(void) { return 0; }' > "$WORK/nop.c"
-    if ! $CC $CFLAGS $INCLUDES -c "$WORK/nop.c" -o "$WORK/nop-$arch.o" \
-            >"$WORK/cc-$arch.log" 2>&1; then
+    if ! (cd "$TREE" && bash -c "$CC_CMD") >"$WORK/cc-$arch.log" 2>&1; then
         fail "$arch: probe compile failed"
         sed 's/^/      /' "$WORK/cc-$arch.log"
         continue
@@ -120,20 +160,34 @@ for arch in "${ARCHES[@]}"; do
             "$WORK/$tag.so" "$WORK/$tag.efi" >>"$WORK/$tag.ldlog" 2>&1
     }
 
-    link "min-nolog-$arch" "$ACRT0 $RELOC $DBGI $MINCRT0" ""       || \
+    link "min-nolog-$arch" "$MINCRT0"                    ""       || \
         { fail "$arch: minimal link (no pull) failed"; sed 's/^/      /' "$WORK/min-nolog-$arch.ldlog"; continue; }
-    link "min-log-$arch"   "$ACRT0 $RELOC $DBGI $MINCRT0" "$PULL"  || \
+    link "min-log-$arch"   "$MINCRT0"                    "$PULL"  || \
         { fail "$arch: minimal link (with pull) failed"; sed 's/^/      /' "$WORK/min-log-$arch.ldlog"; continue; }
     link "full-$arch"      "$FULLCRT0"                    "$PULL"  || \
         { fail "$arch: full-runtime link failed"; sed 's/^/      /' "$WORK/full-$arch.ldlog"; continue; }
 
     # Defined (T/t/W/w with an address) vs undefined (U/w with none). Localized
     # by efi-localize.ver, so a definition reads as lowercase `t`.
-    engine_defined() {
-        $NM "$1" 2>/dev/null | grep -qE "^[0-9a-f]+ [TtWV] $SEAM\$"
+    # 0 defined, 1 not defined, 2 nm could not read the image (sym_present).
+    engine_defined() { sym_present "$1" "$SEAM"; }
+    # CAPTURE, then grep -- never `$NM | grep -q` under pipefail: grep -q
+    # exits at the first match, and an nm still writing then dies of
+    # SIGPIPE, failing the pipeline exactly when the symbol IS there (nm
+    # does exit 141 on an early-closed pipe). An aa64 "axl_log_full is not
+    # defined" failed once and passed on every rerun (2026-11-04); this
+    # trap is the plausible cause, not a reproduced one. Capturing also
+    # turns an nm that could not RUN into a failure of its own instead of
+    # "symbol absent".
+    syms_of() {
+        local out
+        out=$($NM "$1" 2>&1) || { echo "nm failed on $1: $out" >&2; return 2; }
+        printf '%s\n' "$out"
     }
     sym_present() {
-        $NM "$1" 2>/dev/null | grep -qE "^[0-9a-f]+ [TtWV] $2\$"
+        local syms
+        syms=$(syms_of "$1") || return 2
+        grep -qE "^[0-9a-f]+ [TtWV] $2\$" <<< "$syms"
     }
 
     if engine_defined "$WORK/min-log-$arch.so"; then
@@ -149,9 +203,14 @@ for arch in "${ARCHES[@]}"; do
         fail "$arch: a full-runtime image lost $SEAM — ordinary images stopped logging"
     fi
 
-    if engine_defined "$WORK/min-nolog-$arch.so"; then
+    # The ABSENCE check, so "nm could not read it" (2) must not read as
+    # "not linked" (1): the two are the same silence and opposite facts.
+    engine_defined "$WORK/min-nolog-$arch.so"; rc=$?
+    if [[ $rc -eq 0 ]]; then
         fail "$arch: --minimal-runtime still links $SEAM — the seam is not weak,
       or something in libaxl references the engine strongly"
+    elif [[ $rc -eq 2 ]]; then
+        fail "$arch: nm could not read the minimal image — the absence of $SEAM is unjudged"
     else
         pass "$arch: --minimal-runtime does not link the engine"
     fi
@@ -166,22 +225,22 @@ for arch in "${ARCHES[@]}"; do
         fi
     done
 
-    # ld pulls axl-log.o only for the engine, so its presence in the map is an
-    # independent reading of the same fact -- one that a `nm` filter typo
-    # cannot fake.
+    # ld pulls axl-log's member only for the engine, so its presence in the
+    # map is an independent reading of the same fact -- one that a `nm`
+    # filter typo cannot fake. CMake's archive names it axl-log.c.obj.
     members() {
         sed -n '/^Archive member included/,/^Discarded input sections/p' "$1" \
             | grep -o 'libaxl\.a([^)]*)' | sed 's/.*(//;s/)//' | sort -u
     }
-    if members "$WORK/min-nolog-$arch.map" | grep -qx 'axl-log.o'; then
-        fail "$arch: axl-log.o is still an archive member of the minimal image"
+    if members "$WORK/min-nolog-$arch.map" | grep -qx 'axl-log.c.obj'; then
+        fail "$arch: axl-log.c.obj is still an archive member of the minimal image"
     else
-        pass "$arch: axl-log.o is not pulled into the minimal image"
+        pass "$arch: axl-log.c.obj is not pulled into the minimal image"
     fi
-    if members "$WORK/min-log-$arch.map" | grep -qx 'axl-log.o'; then
-        pass "$arch: axl-log.o IS pulled by --minimal-runtime=log"
+    if members "$WORK/min-log-$arch.map" | grep -qx 'axl-log.c.obj'; then
+        pass "$arch: axl-log.c.obj IS pulled by --minimal-runtime=log"
     else
-        fail "$arch: --minimal-runtime=log did not pull axl-log.o"
+        fail "$arch: --minimal-runtime=log did not pull axl-log.c.obj"
     fi
 
     # The bytes are the whole point of the exercise, so assert them. 4096 is a

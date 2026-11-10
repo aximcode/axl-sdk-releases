@@ -11,8 +11,14 @@
 #include "../backend/axl-backend.h"
 #include "../runtime/axl-atexit-internal.h"  /* _axl_atexit_init / _run_all */
 #include "../runtime/axl-cxxabi-internal.h"  /* _axl_cxxabi_run_init_array */
+#include "../runtime/axl-libc-heap-internal.h" /* _axl_libc_heap_release */
+#include "../mem/axl-mem-internal.h"     /* _axl_mem_quarantine_drain */
+#include "../runtime/axl-runtime-internal.h" /* _axl_default_loop_free */
 #include "axl-image-internal.h"   /* _axl_init_image_path */
 #include "axl-driver-internal.h"  /* _axl_driver_ensure_with_embedded_info */
+#include "../pack/axl-pack-format.h" /* packed images: find + unpack */
+#include "../fs/axl-fs-read-chunk.h"  /* AXL_FS_READ_CHUNK */
+#include "../fs/axl-fs-internal.h"    /* axl_fs_path_canonical: file identity */
 #include <axl/axl-driver.h>
 #include <axl/axl-app.h>          /* axl_app_image_path (sibling resolution) */
 #include <axl/axl-env.h>          /* axl_getenv (path-searched-launch fallback) */
@@ -27,6 +33,9 @@
 #include <axl/axl-sys.h>
 
 AXL_LOG_DOMAIN("driver");
+
+/* Defined with the load-options table below; axl_driver_start needs it first. */
+static void load_options_retire(AxlDriverHandle handle);
 
 /* AxlEfiStatus is declared in <axl/axl-efi-status.h> as a 64-bit
    alias for EFI_STATUS so consumers writing UEFI-spec-protocol
@@ -64,6 +73,11 @@ _Static_assert((AxlEfiStatus)AXL_EFI_END_OF_FILE == (AxlEfiStatus)EFI_END_OF_FIL
 #define DRIVER_PATH_BUF          256
 #define DRIVER_SUB_BUF           192
 
+#define DRIVER_DP_END_TYPE       0x7Fu
+#define DRIVER_DP_MEDIA_TYPE     0x04u
+#define DRIVER_DP_FILEPATH_SUB   0x04u
+#define DRIVER_DP_NODE_HDR       4u
+
 #if defined(__x86_64__)
 static const char driver_arch[] = "x64";
 #elif defined(__aarch64__)
@@ -77,6 +91,21 @@ typedef struct {
     const AxlAttempt *guard;   /* NULL = unprotected (the legacy contract) */
     size_t            loaded;
 } DriverLoadCtx;
+
+/* Outcome of loading an image named by a device path. REFUSED is final: AXL
+   sized the file and then could not read it, or read it and the image was
+   refused -- a packed one that could not be unpacked, or bytes LoadImage
+   rejected. A caller must not retry by another route: for a packed file that
+   could load the stub, and for a raw one the routes left are a buffer load
+   of the same bytes (the same verdict) or the firmware's own large read of
+   the file, the very read the loader avoids. FAILED means AXL could not
+   open or size the file and the firmware's load from the path failed too;
+   fallbacks stay open. */
+typedef enum {
+    DRIVER_DP_LOADED,
+    DRIVER_DP_FAILED,
+    DRIVER_DP_REFUSED,
+} DriverDpResult;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -161,6 +190,13 @@ driver_append_file_to_vol_dp(
  * Failure here is non-fatal — axl_driver_load falls back to the
  * memory-buffer load path, which works for drivers that don't
  * require FilePath. */
+/* Free a device path built for LoadImage (driver_build_file_dp and kin). */
+static void
+driver_free_dp(EFI_DEVICE_PATH_PROTOCOL *dp)
+{
+    axl_bs()->FreePool(dp);  /* axl-pool-direct: device path for LoadImage */
+}
+
 static EFI_DEVICE_PATH_PROTOCOL *
 driver_build_file_dp(const char *path)
 {
@@ -198,6 +234,23 @@ driver_build_file_dp(const char *path)
         if (axl_strcasecmp(volumes[i].name, vol_name) == 0) {
             vol_handle = (EFI_HANDLE)volumes[i].handle;
             break;
+        }
+    }
+    if (vol_handle == NULL) {
+        /* Not an fsN alias: any other name the shell maps (one set by
+           axl_volume_set_map or `map`) names the volume whose device path
+           it was set for. Without this, such a path fell to the buffer load
+           and its image lost its FilePath. */
+        char map[DRIVER_VOL_NAME_MAX + 1];
+        axl_memcpy(map, vol_name, name_len);
+        map[name_len]     = ':';
+        map[name_len + 1] = '\0';
+        AXL_AUTO_FREE unsigned short *mapw = axl_utf8_to_ucs2(map);
+        for (size_t i = 0; mapw != NULL && i < n_vols; i++) {
+            if (axl_backend_shell_map_is(mapw, volumes[i].device_path)) {
+                vol_handle = (EFI_HANDLE)volumes[i].handle;
+                break;
+            }
         }
     }
     if (vol_handle == NULL) return NULL;
@@ -409,11 +462,13 @@ driver_build_image_dp(
  * A buffer/embedded load has no firmware device path, so
  * driver_apply_image_identity synthesizes one, installs it as the handle's
  * EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL, and points LoadedImage->FilePath at a
- * standalone copy. axl_driver_unload must uninstall + free both BEFORE
- * UnloadImage — otherwise the firmware's own unload matches its (stale/NULL)
- * internal device-path pointer, not our interface, so ours is never removed
- * and the handle survives carrying only the synth device path (it accumulates
- * in `dh` on every load/unload cycle).
+ * standalone copy. The firmware's own unload matches its (NULL) internal
+ * device-path pointer, not our interface, so it never removes ours: left
+ * there, the handle would survive carrying only the synth device path (it
+ * accumulates in `dh` on every load/unload cycle). axl_driver_unload removes
+ * it AFTER a successful UnloadImage (the firmware has then freed FilePath, our
+ * copy), and leaves it in place when the unload is refused, so a resident
+ * image keeps its identity.
  *
  * The record lives ON the driver's image handle as a private protocol, NOT in
  * a process-local table, because the shared-driver launcher pattern loads the
@@ -436,10 +491,12 @@ typedef struct {
 } AxlImageDpRecord;
 
 /* Uninstall the synthesized LoadedImageDevicePath from @p handle and free the
- * device path + the standalone FilePath copy, returning the handle to its
- * pre-synthesis state. Shared by image_dp_release (normal unload) and
- * image_dp_track's failure rollback. Clears li->FilePath first so the firmware
- * can't read/free a dangling pointer during UnloadImage. */
+ * device path + the standalone FilePath copy (@p file_path NULL: the firmware
+ * already freed it), returning the handle to its pre-synthesis state. Shared by
+ * image_dp_release (after an unload, or for an image the firmware unloaded
+ * itself) and image_dp_track's failure rollback (a live image). For a live
+ * image li->FilePath is cleared before the copy is freed, so nothing is left
+ * pointing at it. */
 static void
 image_dp_teardown(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
                   EFI_DEVICE_PATH_PROTOCOL *file_path)
@@ -449,9 +506,12 @@ image_dp_teardown(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
                                  (void **)&li) == EFI_SUCCESS && li != NULL) {
         li->FilePath = NULL;
     }
-    axl_bs()->UninstallProtocolInterface(
-        handle, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID, dp);
-    axl_bs()->FreePool(dp);  /* axl-pool-direct: installed loaded-image device path */
+    /* Freed only once it is no longer installed: an interface the uninstall
+       refused (one still open) would otherwise point at freed pool. */
+    if (axl_bs()->UninstallProtocolInterface(
+            handle, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID, dp) == EFI_SUCCESS) {
+        axl_bs()->FreePool(dp);  /* axl-pool-direct: installed loaded-image device path */
+    }
     if (file_path != NULL) {
         axl_bs()->FreePool(file_path);  /* axl-pool-direct: LoadedImage FilePath copy */
     }
@@ -491,10 +551,12 @@ image_dp_track(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
 
 /* Uninstall + free the synthesized device path for @p handle, if any, and
  * report whether the image is still loaded. Called from axl_driver_unload
- * BEFORE UnloadImage so our protocol entries are removed cleanly (the
- * firmware's own uninstall of its stale internal pointer then no-ops instead
- * of mismatching). Works from any image — the record is read off the handle,
- * not a process-local table.
+ * AFTER a successful UnloadImage (the firmware never removes our interface:
+ * its own record of the device path is NULL for a buffer load), and for an
+ * image the firmware already unloaded -- never before an UnloadImage that
+ * could be refused, which would strand a resident image without its identity.
+ * Works from any image — the record is read off the handle, not a
+ * process-local table.
  *
  * Liveness matters because the firmware auto-unloads some images out from
  * under us: EDK2's CoreStartImage unloads an image whose DriverEntry returned
@@ -578,13 +640,12 @@ image_dp_release(AxlDriverHandle handle)
 }
 
 /* Give a freshly buffer-loaded image a real identity so the shell never
- * renders a NULL device path. @p info may be NULL; @p default_name is the
- * fallback leaf when the caller named nothing (the driver/app filename). */
+ * renders a NULL device path. @p info may be NULL; with no file_name in it
+ * the leaf is the nearest file-loaded ancestor's basename. */
 static void
 driver_apply_image_identity(
     EFI_HANDLE                  drv_handle,
-    const AxlEmbeddedImageInfo *info,
-    const char                 *default_name
+    const AxlEmbeddedImageInfo *info
     )
 {
     EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
@@ -595,8 +656,7 @@ driver_apply_image_identity(
         return;
     }
 
-    const char *file_name = (info != NULL && info->file_name != NULL)
-                                ? info->file_name : default_name;
+    const char *file_name = (info != NULL) ? info->file_name : NULL;
     if (file_name == NULL || file_name[0] == '\0') {
         /* Anchor, not axl_app_image_path: the loader may itself be a
            buffer-loaded image with no file of its own, and any ancestor
@@ -670,44 +730,430 @@ driver_apply_image_identity(
     image_dp_track(drv_handle, full, file_path);
 }
 
-/* Shared core: LoadImage from a buffer, then synthesize image identity. */
-static int
-driver_load_buffer_apply(
-    const unsigned char        *buf,
-    size_t                      len,
-    const AxlEmbeddedImageInfo *info,
-    const char                 *default_name,
-    AxlDriverHandle            *out_handle
+static void *
+driver_pack_alloc(
+    void   *ctx,
+    size_t  n
     )
 {
-    if (buf == NULL || len == 0 || out_handle == NULL) {
-        if (out_handle != NULL) {
-            *out_handle = NULL;
-        }
+    (void)ctx;
+    return axl_malloc(n);
+}
+
+static void
+driver_pack_free(
+    void *ctx,
+    void *p
+    )
+{
+    (void)ctx;
+    axl_free(p);
+}
+
+/* A failed LoadImage normally creates no handle, but EFI_SECURITY_VIOLATION
+ * (UEFI 2.11: the image failed authentication under the platform policy)
+ * returns one the caller must UnloadImage. Both LoadImage sites refuse the
+ * image on any failure, so that handle is released here. */
+static void
+driver_unload_refused(
+    EFI_STATUS st,
+    EFI_HANDLE image
+    )
+{
+    if (st == EFI_SECURITY_VIOLATION && image != NULL) {
+        axl_efi_call(axl_bs()->UnloadImage, 1, image);
+    }
+}
+
+bool
+_axl_image_tpl_refused(
+    const char *api
+    )
+{
+    uintptr_t tpl = axl_backend_tpl_current();
+    if (tpl < TPL_CALLBACK) {
+        return false;
+    }
+    /* log-level: the caller gets AXL_UNSUPPORTED, which says "not here" but
+       not why; the why -- the TPL and the rule -- is said only here */
+    axl_error("%s: refused at TPL %u -- UEFI allows LoadImage and StartImage "
+              "only below TPL_CALLBACK (UEFI 2.11 Table 7.3); call it from an "
+              "application, such as a Shell command", api, (unsigned)tpl);
+    return true;
+}
+
+/* THE buffer choke point: every image AXL loads from bytes in memory comes
+ * through here. A wrapped image (its section table names .axlpack) is
+ * unpacked first and the ORIGINAL is handed to LoadImage, so the handle
+ * returned is the original's and no stub is ever resident. A buffer that is
+ * wrapped but cannot be unpacked is a load error, logged with the pack
+ * status -- never loaded as the stub it is.
+ *
+ * @p file_dp, when non-NULL, is the device path of the file the bytes came
+ * from: LoadImage gets it, so the image's FilePath/DeviceHandle are the
+ * file's own. NULL means a true memory load, which gets the synthesized
+ * MemoryMapped identity (@p info). */
+static int
+driver_load_from_buffer(
+    const void                 *buf,
+    size_t                      len,
+    const void                 *file_dp,
+    const AxlEmbeddedImageInfo *info,
+    AxlDriverHandle            *out
+    )
+{
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (buf == NULL || len == 0 || out == NULL) {
+        return AXL_ERR;
+    }
+    const char *what = (info != NULL && info->file_name != NULL)
+                           ? info->file_name : "<buffer>";
+
+    size_t        off     = 0;
+    size_t        pk_len  = 0;
+    void         *raw     = NULL;
+    size_t        raw_len = 0;
+    AxlPackStatus ps      = axl_pack_find_payload(buf, len, &off, &pk_len,
+                                                  NULL);
+    if (ps == AXL_PACK_OK) {
+        AxlPackAlloc a = { driver_pack_alloc, driver_pack_free, NULL };
+        ps = axl_pack_unpack((const uint8_t *)buf + off, pk_len,
+                             AXL_PACK_MACHINE_NATIVE, &a, &raw, &raw_len);
+    }
+    if (ps != AXL_PACK_OK && ps != AXL_PACK_E_NOT_PACKED) {
+        /* log-level: the return is a bare AXL_ERR; that the file is a packed
+           image, and which check it failed, is said only here */
+        axl_warning("cannot load %s: %s", what, axl_pack_status_str(ps));
         return AXL_ERR;
     }
 
-    EFI_HANDLE drv_handle = NULL;
-    EFI_STATUS st = axl_bs()->LoadImage(
-        FALSE,                          /* BootPolicy */
-        gImageHandle,                   /* ParentImageHandle */
-        NULL,                           /* DevicePath (none — pure mem load) */
-        (void *)(uintptr_t)buf,         /* SourceBuffer */
-        len,                            /* SourceSize */
-        &drv_handle);
-
-    if (EFI_ERROR(st) || drv_handle == NULL) {
-        axl_debug("driver load_buffer: LoadImage(%zu bytes) failed: 0x%llx",
-                  len, (unsigned long long)st);
-        *out_handle = NULL;
+    bool        unpacked = raw != NULL;
+    const void *img      = unpacked ? raw : buf;
+    size_t      img_len  = unpacked ? raw_len : len;
+    EFI_HANDLE  image   = NULL;
+    EFI_STATUS  st      = axl_efi_call(axl_bs()->LoadImage, 6,
+        FALSE,                                         /* BootPolicy */
+        gImageHandle,                                  /* ParentImageHandle */
+        (EFI_DEVICE_PATH_PROTOCOL *)(uintptr_t)file_dp, /* NULL: memory load */
+        (void *)(uintptr_t)img, img_len, &image);
+    axl_free(raw);   /* LoadImage copied it */
+    if (EFI_ERROR(st) || image == NULL) {
+        driver_unload_refused(st, image);
+        axl_debug("driver load: LoadImage of %s (%zu bytes%s) failed: 0x%llx",
+                  what, img_len, unpacked ? ", unpacked" : "",
+                  (unsigned long long)st);
         return AXL_ERR;
     }
 
-    driver_apply_image_identity(drv_handle, info, default_name);
-
-    *out_handle = (AxlDriverHandle)drv_handle;
+    if (file_dp == NULL) {
+        driver_apply_image_identity(image, info);
+    }
+    *out = (AxlDriverHandle)image;
     return AXL_OK;
 }
+
+/* Open the file a file-on-volume device path names: the volume by
+ * LocateDevicePath(SimpleFileSystem), then each MEDIA_FILEPATH node in turn,
+ * as the firmware's own file loader does. NULL on any failure (the caller
+ * then lets the firmware try, and report). */
+static EFI_FILE_PROTOCOL *
+driver_dp_open_file(
+    EFI_DEVICE_PATH_PROTOCOL *dp
+    )
+{
+    EFI_DEVICE_PATH_PROTOCOL *walk = dp;   /* LocateDevicePath advances it */
+    EFI_HANDLE                vol  = NULL;
+    if (EFI_ERROR(axl_efi_call(axl_bs()->LocateDevicePath, 3,
+                               &EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
+                               &walk, &vol))) {
+        return NULL;
+    }
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
+    EFI_FILE_PROTOCOL               *f  = NULL;
+    if (EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3, vol,
+                               &EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
+                               (void **)&fs))
+        || fs == NULL
+        || EFI_ERROR(axl_efi_call(fs->OpenVolume, 2, fs, &f))) {
+        return NULL;
+    }
+
+    const uint8_t *node  = (const uint8_t *)walk;
+    size_t         opens = 0;
+    while (node[0] != DRIVER_DP_END_TYPE) {
+        size_t nlen = (size_t)node[2] | ((size_t)node[3] << 8);
+        if (node[0] != DRIVER_DP_MEDIA_TYPE || node[1] != DRIVER_DP_FILEPATH_SUB
+            || nlen <= DRIVER_DP_NODE_HDR) {
+            axl_efi_call(f->Close, 1, f);
+            return NULL;
+        }
+        /* A node's string need not be CHAR16-aligned: copy it out, and
+           NUL-terminate it whatever the node held. */
+        size_t  chars = (nlen - DRIVER_DP_NODE_HDR) / sizeof(CHAR16);
+        CHAR16 *name  = axl_malloc((chars + 1) * sizeof(CHAR16));
+        if (name == NULL) {
+            axl_efi_call(f->Close, 1, f);
+            return NULL;
+        }
+        axl_memcpy(name, node + DRIVER_DP_NODE_HDR, chars * sizeof(CHAR16));
+        name[chars] = 0;
+        EFI_FILE_PROTOCOL *next = NULL;
+        EFI_STATUS st = axl_efi_call(f->Open, 5, f, &next, name,
+                                     EFI_FILE_MODE_READ, 0);
+        axl_free(name);
+        axl_efi_call(f->Close, 1, f);
+        if (EFI_ERROR(st) || next == NULL) {
+            return NULL;
+        }
+        f = next;
+        opens++;
+        node += nlen;
+    }
+    if (opens == 0) {   /* the path named a volume, not a file */
+        axl_efi_call(f->Close, 1, f);
+        return NULL;
+    }
+    return f;
+}
+
+/* Read @p want bytes (or to EOF) from @p f's current position into @p buf,
+   at most AXL_FS_READ_CHUNK per Read: BMC virtual media has been measured
+   corrupting larger single reads and not 64 KB ones (axl-fs-read-chunk.h).
+   Returns the count read, or SIZE_MAX on an I/O error. */
+static size_t
+driver_file_read(
+    EFI_FILE_PROTOCOL *f,
+    void              *buf,
+    size_t             want
+    )
+{
+    size_t got = 0;
+    while (got < want) {
+        UINTN n = (want - got < AXL_FS_READ_CHUNK) ? want - got
+                                                   : AXL_FS_READ_CHUNK;
+        if (EFI_ERROR(axl_efi_call(f->Read, 3, f, &n, (uint8_t *)buf + got))) {
+            return SIZE_MAX;
+        }
+        if (n == 0) {
+            break;
+        }
+        got += n;
+    }
+    return got;
+}
+
+/* Outcome of driver_file_read_all. NO_INFO (GetInfo failed, so AXL cannot
+   size the file) is the one case where the firmware is asked to read the
+   file itself; REFUSED is final and already logged. */
+typedef enum {
+    DRIVER_READ_OK,
+    DRIVER_READ_NO_INFO,
+    DRIVER_READ_REFUSED,
+} DriverReadResult;
+
+/* Read all of @p f (closing it) into an axl_malloc'd *@p buf, in
+   AXL_FS_READ_CHUNK reads. The size comes from EFI_FILE_INFO, as the
+   firmware's own file loader gets it: every file system implements GetInfo,
+   where GetPosition is one it may leave unsupported (AXL's own AxlFsProvider
+   volumes do).
+
+   Once the size is known every failure is REFUSED, with one warning naming
+   @p what, never a fallback to the firmware's own read of the path: an
+   error in AXL's own read is the strongest sign the media is bad, and a raw
+   image the firmware reads in one large call runs whatever bytes come back.
+   A file over AXL_PACK_MAX_RAW (64 MB) is refused before anything is
+   allocated: no driver, packed or raw, is that large, and the size comes
+   from the media. An empty file is refused too -- LoadImage could only
+   reject it. */
+static DriverReadResult
+driver_file_read_all(
+    EFI_FILE_PROTOCOL *f,
+    const char        *what,
+    void             **buf,
+    size_t            *len
+    )
+{
+    EFI_GUID       guid = gEfiFileInfoGuid;
+    EFI_FILE_INFO *info = NULL;
+    UINTN          isz  = 0;
+    UINT64         size = 0;
+    bool           have = false;
+    const char    *why  = NULL;
+
+    *buf = NULL;
+    *len = 0;
+    if (axl_efi_call(f->GetInfo, 4, f, &guid, &isz, NULL) == EFI_BUFFER_TOO_SMALL) {
+        info = axl_malloc(isz);
+    }
+    if (info != NULL
+        && !EFI_ERROR(axl_efi_call(f->GetInfo, 4, f, &guid, &isz, info))) {
+        size = info->FileSize;
+        have = true;
+    }
+    axl_free(info);
+    if (!have) {
+        axl_efi_call(f->Close, 1, f);
+        return DRIVER_READ_NO_INFO;
+    }
+
+    if (size == 0) {
+        why = "the file is empty";
+    } else if (size > AXL_PACK_MAX_RAW) {
+        why = "the file is larger than 64 MB";
+    } else {
+        *buf = axl_malloc((size_t)size);
+        if (*buf == NULL) {
+            why = "not enough memory to read it";
+        } else if (driver_file_read(f, *buf, (size_t)size) != (size_t)size) {
+            why = "the file could not be read whole";
+            axl_free(*buf);
+            *buf = NULL;
+        }
+    }
+    axl_efi_call(f->Close, 1, f);
+    if (why != NULL) {
+        /* log-level: the caller gets a bare AXL_ERR; why the driver was not
+           loaded, and that the firmware was not asked instead, is only here */
+        axl_warning("cannot load %s: %s", what, why);
+        return DRIVER_READ_REFUSED;
+    }
+    *len = (size_t)size;
+    return DRIVER_READ_OK;
+}
+
+/* Is @p path the file the RUNNING image was loaded from? Decided by the
+ * identity axl_file_replace() uses: both paths resolved component by
+ * component through opened handles to the names the filesystem STORES
+ * (axl_fs_path_canonical), on the same volume handle. So an 8.3 alias,
+ * another letter case, "." and ".." segments and FAT's trailing-dot trim
+ * all name the same file, and on a case-sensitive filesystem two names
+ * that differ in case stay two files -- no folding by hand.
+ *
+ * Best effort: the image is located by the volume its LoadedImage
+ * DeviceHandle names now. The same media reached through another volume
+ * instance (re-enumerated, or mapped twice) is not recognised, which only
+ * means the old behaviour, never a wrong refusal. An image not loaded from
+ * a file (a buffer load) has no file, so nothing is it. */
+/* The running image's identity, resolved once per image (on BMC virtual
+   media every component open is a USB round trip). Static, so it lives
+   exactly as long as this image -- a reloaded image starts with a zeroed
+   .bss -- and keeps its 1.5 KB off the shared DXE stack. A failed
+   resolution is not cached: it is retried, and answers "not self". */
+static struct {
+    bool  ok;
+    void *volume;
+    char  canon[AXL_FS_REL_MAX];
+} m_self_id;
+
+static bool
+driver_self_identity(void)
+{
+    if (m_self_id.ok) {
+        return true;
+    }
+    const char *self_path = axl_app_image_path();
+    if (self_path == NULL) {
+        return false;   /* not loaded from a file: nothing is it */
+    }
+    /* Through the volume name it answers to NOW (a `map -r` may have
+       renamed it since the image path was recorded). */
+    AXL_AUTO_FREE char *self_name = axl_path_get_basename(self_path);
+    AXL_AUTO_FREE char *self      = axl_malloc(AXL_FS_REL_MAX);
+    if (self_name == NULL || self == NULL
+        || axl_app_image_dir_path(self_name, self, AXL_FS_REL_MAX) != AXL_OK
+        || axl_fs_path_canonical(self, &m_self_id.volume, m_self_id.canon,
+                                 sizeof(m_self_id.canon)) != AXL_OK
+        || m_self_id.canon[0] == '\0') {
+        return false;
+    }
+    m_self_id.ok = true;
+    axl_debug("driver: the running image resolved as '%s'", m_self_id.canon);
+    return true;
+}
+
+static bool
+driver_path_is_self(const char *path)
+{
+    if (path == NULL || !driver_self_identity()) {
+        return false;
+    }
+    void               *vol   = NULL;
+    AXL_AUTO_FREE char *canon = axl_malloc(AXL_FS_REL_MAX);
+    return canon != NULL
+           && axl_fs_path_canonical(path, &vol, canon, AXL_FS_REL_MAX) == AXL_OK
+           && vol == m_self_id.volume
+           && axl_strcmp(canon, m_self_id.canon) == 0;
+}
+
+/* Load the image file @p dp names. AXL reads the file itself, in
+ * AXL_FS_READ_CHUNK reads, and hands LoadImage the bytes TOGETHER with @p dp
+ * (driver_load_from_buffer), so the image's FilePath and DeviceHandle are
+ * the file's own -- as iPXE-style drivers, which find their install
+ * directory from them, need -- and the firmware never makes one large read
+ * of the file: on BMC virtual media such reads come back corrupt
+ * (axl-fs-read-chunk.h). A packed file is unpacked on the way; the decision
+ * is the full buffer's section table. The firmware loads from the path,
+ * reading the file itself, only when AXL cannot open the file or learn its
+ * size; a file AXL opened and could not read is refused
+ * (driver_file_read_all). @p what names the file in a log line. */
+static DriverDpResult
+driver_load_dp(
+    EFI_DEVICE_PATH_PROTOCOL *dp,
+    const char               *what,
+    AxlDriverHandle          *out
+    )
+{
+    *out = NULL;
+    EFI_FILE_PROTOCOL *f   = driver_dp_open_file(dp);
+    void              *buf = NULL;
+    size_t             len = 0;
+    DriverReadResult   rr  = (f != NULL)
+                                 ? driver_file_read_all(f, what, &buf, &len)
+                                 : DRIVER_READ_NO_INFO;
+    if (rr == DRIVER_READ_REFUSED) {
+        return DRIVER_DP_REFUSED;
+    }
+    if (rr == DRIVER_READ_OK) {
+        AxlEmbeddedImageInfo info = { .file_name = what };
+        int rc = driver_load_from_buffer(buf, len, dp, &info, out);
+        axl_free(buf);
+        return (rc == AXL_OK) ? DRIVER_DP_LOADED : DRIVER_DP_REFUSED;
+    }
+
+    axl_debug("driver load: cannot open or size '%s' here; the firmware "
+              "loads it from its path", what);
+    EFI_HANDLE image = NULL;
+    EFI_STATUS st    = axl_efi_call(axl_bs()->LoadImage, 6, FALSE, gImageHandle,
+                                    dp, NULL, 0, &image);
+    if (EFI_ERROR(st) || image == NULL) {
+        driver_unload_refused(st, image);
+        axl_debug("driver load: DevicePath LoadImage of '%s' failed: 0x%llx",
+                  what, (unsigned long long)st);
+        return DRIVER_DP_FAILED;
+    }
+    *out = (AxlDriverHandle)image;
+    return DRIVER_DP_LOADED;
+}
+
+/* The running image's own file, refused to a DRIVER loader: "load myself
+   as a driver" has no meaning, and a search that picked it would start the
+   image again inside itself. AXL_ERR, said why. */
+static int
+driver_refuse_self(const char *path)
+{
+    /* log-level: the caller gets AXL_ERR; why is said only here */
+    axl_error("driver load: '%s' is the running image itself; not loading it", path);
+    return AXL_ERR;
+}
+
+static int
+driver_load_path(
+    const char       *path,
+    AxlDriverHandle  *handle,
+    bool              allow_self
+    );
 
 int
 axl_driver_load(
@@ -715,73 +1161,74 @@ axl_driver_load(
     AxlDriverHandle  *handle
     )
 {
-    EFI_STATUS status;
-    EFI_HANDLE image = NULL;
+    return driver_load_path(path, handle, false);
+}
 
+int
+_axl_driver_load_self_ok(
+    const char       *path,
+    AxlDriverHandle  *handle
+    )
+{
+    return driver_load_path(path, handle, true);
+}
+
+static int
+driver_load_path(
+    const char       *path,
+    AxlDriverHandle  *handle,
+    bool              allow_self
+    )
+{
+    if (_axl_image_tpl_refused("axl_driver_load")) {
+        if (handle != NULL) {
+            *handle = NULL;
+        }
+        return AXL_UNSUPPORTED;
+    }
     if (path == NULL || handle == NULL) {
         return AXL_ERR;
     }
 
     *handle = NULL;
-
-
-    /* Prefer DevicePath load. The firmware reads the file from the
-     * volume's filesystem itself, sets LoadedImage->FilePath to the
-     * full DP we just built, and StartImage sees the FilePath that
-     * driver-binding-style drivers (notably iPXE) need to locate
-     * their own install directory. */
-    EFI_DEVICE_PATH_PROTOCOL *file_dp = driver_build_file_dp(path);
-    if (file_dp != NULL) {
-        status = axl_bs()->LoadImage(
-            FALSE,           /* BootPolicy */
-            gImageHandle,    /* ParentImageHandle */
-            file_dp,         /* DevicePath */
-            NULL, 0,         /* No source buffer; firmware reads via DP */
-            &image);
-        axl_bs()->FreePool(file_dp);  /* axl-pool-direct: device path for LoadImage */
-
-        if (!EFI_ERROR(status)) {
-            *handle = (AxlDriverHandle)image;
-            return AXL_OK;
-        }
-        axl_debug("driver load: DevicePath LoadImage failed for '%s': 0x%llx; "
-                  "falling back to buffer load",
-                  path, (unsigned long long)status);
+    if (!allow_self && driver_path_is_self(path)) {
+        return driver_refuse_self(path);
     }
 
-    /* Fallback: read the file ourselves and load from buffer. Works
-     * for drivers that don't read LoadedImage->FilePath at startup
-     * (e.g. RamDiskDxe). Drivers that DO need it (iPXE) will fail
-     * StartImage with EFI_INVALID_PARAMETER on this path; the caller
-     * already logs that case. */
-    void *buf = NULL;
+    /* Prefer the file's device path: the image's LoadedImage->FilePath is
+     * then the full DP, which driver-binding-style drivers (notably iPXE)
+     * read at StartImage to locate their own install directory. AXL reads
+     * the file (in 64 KB reads) and loads the bytes with that DP; a packed
+     * one is unpacked first (driver_load_dp). */
+    EFI_DEVICE_PATH_PROTOCOL *file_dp = driver_build_file_dp(path);
+    if (file_dp != NULL) {
+        DriverDpResult r = driver_load_dp(file_dp, path, handle);
+        driver_free_dp(file_dp);
+        if (r == DRIVER_DP_LOADED) {
+            return AXL_OK;
+        }
+        if (r == DRIVER_DP_REFUSED) {
+            return AXL_ERR;
+        }
+        axl_debug("driver load: falling back to a buffer load of '%s'", path);
+    }
+
+    /* Fallback: read the file ourselves and load it from memory. Works for
+     * drivers that don't read LoadedImage->FilePath at startup (e.g.
+     * RamDiskDxe). Drivers that DO need it (iPXE) will fail StartImage with
+     * EFI_INVALID_PARAMETER on this path; the caller already logs that case.
+     * The image gets the synthesized identity, keyed off the file's basename,
+     * so a path load that lands here never shows the shell a NULL path. */
+    void  *buf      = NULL;
     size_t buf_size = 0;
     if (axl_file_get_contents(path, &buf, &buf_size) != AXL_OK || buf == NULL) {
         axl_debug("driver load: cannot read '%s'", path);
         return AXL_ERR;
     }
-
-    status = axl_bs()->LoadImage(
-        FALSE, gImageHandle, NULL,
-        buf, (size_t)buf_size,
-        &image);
-
+    AxlEmbeddedImageInfo info = { .file_name = driver_basename(path) };
+    int rc = driver_load_from_buffer(buf, buf_size, NULL, &info, handle);
     axl_free(buf);
-
-    if (EFI_ERROR(status)) {
-        axl_debug("driver load: LoadImage failed for '%s': 0x%llx",
-                 path, (unsigned long long)status);
-        return AXL_ERR;
-    }
-
-    /* This fallback also loaded with DevicePath=NULL, so synthesize a
-     * non-NULL device path the same way the buffer path does — keyed off
-     * the file's basename. Otherwise a path load that falls back to buffer
-     * mode would re-introduce the NULL-device-path shell fault. */
-    driver_apply_image_identity(image, NULL, driver_basename(path));
-
-    *handle = (AxlDriverHandle)image;
-    return AXL_OK;
+    return rc;
 }
 
 int
@@ -790,16 +1237,24 @@ axl_driver_start(
     )
 {
     EFI_STATUS status;
-    size_t exit_data_size = 0;
 
+    if (_axl_image_tpl_refused("axl_driver_start")) {
+        return AXL_UNSUPPORTED;
+    }
     if (handle == NULL) {
         return AXL_ERR;
     }
 
-    status = axl_bs()->StartImage(
-        (EFI_HANDLE)handle,
-        &exit_data_size,
-        NULL);
+    status = (EFI_STATUS)axl_backend_start_image((void *)handle);
+
+    /* The image's entry point has run, so it has read its LoadOptions. Our
+       copy goes now rather than at axl_driver_unload: a launcher that starts a
+       resident driver usually exits long before anyone unloads it, and the
+       unload then runs in another image, whose table never held this copy. */
+    load_options_retire(handle);
+    /* After the retire: the child must not keep LoadOptions pointing into
+       this image's heap if a deferred exit takes it now. */
+    axl_backend_exit_if_deferred();
 
     if (EFI_ERROR(status)) {
         axl_debug("driver start failed: 0x%llx",
@@ -844,10 +1299,15 @@ axl_driver_connect(
      * firmware-first probe and dependency co-load both assume `connect -r`
      * resolves arbitrary nesting depth. Do NOT drop it to FALSE (regression-
      * guarded by test-netload-qemu.sh's --net firmware-first lease check). */
+    /* Counted as a child: a connect can start images (option ROMs, bound
+       drivers' Start) -- see axl_backend_start_image. */
+    axl_backend_child_image_enter();
     for (UINTN i = 0; i < count; i++) {
         axl_bs()->ConnectController(handles[i], NULL, NULL, TRUE);
     }
+    axl_backend_child_image_leave();
     axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
+    axl_backend_exit_if_deferred();     /* after the FreePool: firmware pool */
     return AXL_OK;
 }
 
@@ -923,6 +1383,29 @@ load_options_release(AxlDriverHandle handle)
     mLoadOptionsTable[slot].opts   = NULL;
 }
 
+/* Release `handle`'s tracked copy AND take it back from the firmware: while the
+   image is still loaded, its LoadedImage->LoadOptions is pointed away first, so
+   no reader is ever left holding the freed copy. The pointer is cleared only if
+   it is still ours -- the image may have installed options of its own. An image
+   the firmware already unloaded (an application, a failed DriverEntry) has no
+   LoadedImage left to clear; the copy is released all the same. */
+static void
+load_options_retire(AxlDriverHandle handle)
+{
+    size_t slot = load_options_find(handle);
+    if (slot == LOAD_OPTIONS_TABLE_SIZE) {
+        return;
+    }
+    EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
+    if (!EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3, (EFI_HANDLE)handle,
+                                &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&img))
+        && img != NULL && img->LoadOptions == mLoadOptionsTable[slot].opts) {
+        img->LoadOptions     = NULL;
+        img->LoadOptionsSize = 0;
+    }
+    load_options_release(handle);
+}
+
 int
 axl_driver_unload(
     AxlDriverHandle handle
@@ -934,30 +1417,37 @@ axl_driver_unload(
         return AXL_ERR;
     }
 
-    /* Free any tracked load-options copy BEFORE UnloadImage runs the
-       driver's Unload handler — once the image is unloaded the
-       firmware-side LoadedImage pointer is gone, but the heap copy is
-       ours regardless of UnloadImage's outcome. Releasing first means
-       a UnloadImage failure still doesn't leak the copy. The synthesized
-       loaded-image device path (if any) is released the same way: uninstall
-       our protocol interface and free the pool while the handle is still
-       valid. */
-    load_options_release(handle);
-
-    /* Release our tracked synthesized device path and learn whether the image
-       is still loaded. The firmware auto-unloads an image whose DriverEntry
-       returned an error (and any application) — driver_start_and_verify and
-       axl-net-driver-select both call us on exactly that error path. When the
-       image is already gone there is nothing left of ours to free (handled
-       above) and UnloadImage on the dead handle would only fail and mislead;
-       skip it. On firmware that does NOT auto-unload, image_dp_release reports
-       the image alive and we fall through to UnloadImage as before, so nothing
-       leaks either way. */
-    if (!image_dp_release(handle)) {
-        return AXL_OK;
+    /* The firmware auto-unloads an image whose DriverEntry returned an error
+       (and any application) -- driver_start_and_verify and axl-net-driver-
+       select both call us on exactly that error path. Such an image is gone:
+       release what of our synthesized device path is left and do not
+       UnloadImage the dead handle, which would only fail and mislead. */
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    bool alive = axl_efi_call(axl_bs()->HandleProtocol, 3, (EFI_HANDLE)handle,
+                              &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&li) == EFI_SUCCESS
+                 && li != NULL;
+    if (!alive) {
+        load_options_retire(handle);   /* the copy is ours; no LoadedImage left */
+        if (!image_dp_release(handle)) {
+            return AXL_OK;
+        }
     }
 
+    /* UnloadImage FIRST; nothing of ours is released before a call that can
+       refuse. An unload the driver refuses leaves the image resident, and it
+       keeps all of it: its load options (a tracked copy still in place), and
+       its identity -- the installed LoadedImageDevicePath and
+       LoadedImage->FilePath, which `dh` reads. Once the image is gone the
+       firmware has freed Info.FilePath (our copy) and uninstalled
+       LoadedImage, but not our LoadedImageDevicePath, which
+       image_dp_release's "image gone" branch then uninstalls and frees,
+       letting the handle go; the load-options copy is freed with no
+       LoadedImage left to point at it. */
     status = axl_bs()->UnloadImage((EFI_HANDLE)handle);
+    if (!EFI_ERROR(status)) {
+        load_options_retire(handle);
+        image_dp_release(handle);
+    }
     if (EFI_ERROR(status)) {
         /* Surface the raw status so callers can triage. EFI_ACCESS_DENIED
            is the most-misdiagnosed shape — the firmware's post-callback
@@ -1164,8 +1654,11 @@ axl_driver_connect_handle(
         return AXL_ERR;
     }
 
+    axl_backend_child_image_enter();    /* see axl_backend_start_image */
     status = axl_bs()->ConnectController(
         (EFI_HANDLE)handle, NULL, NULL, TRUE);
+    axl_backend_child_image_leave();
+    axl_backend_exit_if_deferred();
 
     /* NOT_FOUND is OK — means no new bindings, not an error */
     if (EFI_ERROR(status) && status != EFI_NOT_FOUND) {
@@ -1283,7 +1776,7 @@ axl_driver_init(
 }
 
 void
-axl_driver_cleanup(void)
+_axl_driver_cleanup_keep_heap(void)
 {
     /* The unload-side counterpart to axl_driver_init's two calls above.
        Drains in LIFO order and frees the table, so a driver that is
@@ -1299,8 +1792,34 @@ axl_driver_cleanup(void)
        path _axl_args_free does this; a driver has no argv, and these frees
        used to sit behind that function's mArgv guard where a driver could
        never reach them -- so every driver load leaked the capture, and a
-       self-reloading service leaked it per cycle. */
+       reloaded service leaked it per cycle. */
     _axl_image_path_free();
+
+    /* And the default loop, as _axl_cleanup frees an app's: a driver (or a
+       service's setup) that called axl_loop_default() would otherwise leak
+       it on every unload and show it in the unload's leak verdict. After the
+       atexit drain, which may still use it -- the same order as an app. */
+    _axl_default_loop_free();
+
+#ifdef AXL_MEM_DEBUG
+    /* And the free quarantine, which only the leak report drained -- and a
+       plain driver's unload prints none, so up to 64 KiB of freed pool
+       outlived every unload (~2.9 pages per cycle, test-heap-release-qemu).
+       Last of the AxlMem work: nothing above frees after it. */
+    _axl_mem_quarantine_drain();
+#endif
+}
+
+void
+axl_driver_cleanup(void)
+{
+    _axl_driver_cleanup_keep_heap();
+
+    /* LAST, as on the app path: newlib's arena back to the firmware, which
+       does not reclaim it at unload -- every load/unload cycle of a driver
+       that ever malloc'd (any C++ driver) used to leave 1 MiB behind. See
+       axl-libc-heap-internal.h. Idempotent like the rest of this. */
+    _axl_libc_heap_release();
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1857,15 @@ driver_append_candidate(
             return AXL_OK;
         }
     }
+    /* Never the calling image: a driver named as the image would otherwise
+       find the image itself (as candidate 1, its own directory) and load and
+       start it -- the image running again inside itself. Skipped, so the
+       search goes on to the real driver. Debug: an app and its driver may
+       share a name legitimately (fs0:\foo.efi, fs0:\drivers\x64\foo.efi). */
+    if (driver_path_is_self(path)) {
+        axl_debug("driver search: skipping '%s', the running image itself", path);
+        return AXL_OK;
+    }
     char *copy = axl_strdup(path);
     if (copy == NULL) {
         return AXL_ERR;
@@ -1371,14 +1899,17 @@ driver_build_candidates(
     size_t    n_vols = 0;
     axl_volume_enumerate(volumes, DRIVER_MAX_VOLUMES, &n_vols);
 
+    /* The image's volume is named as axl_app_boot_path names it -- the
+       shell's own alias, verbatim (axl_backend_volume_name_for_handle) --
+       so a path found here is spelled exactly as that one is. Enumeration's
+       .name is lowercased by its contract ("fs0" for the shell's "FS0"),
+       and a path built from it named the same file a second way. */
+    char        image_vol[AXL_BACKEND_VOLUME_NAME_MAX];
     const char *image_fs = NULL;
-    if (!EFI_ERROR(li_st) && img != NULL) {
-        for (size_t i = 0; i < n_vols; i++) {
-            if (volumes[i].handle == img->DeviceHandle) {
-                image_fs = volumes[i].name;
-                break;
-            }
-        }
+    if (!EFI_ERROR(li_st) && img != NULL
+        && axl_backend_volume_name_for_handle(img->DeviceHandle, image_vol,
+                                              sizeof(image_vol)) == AXL_OK) {
+        image_fs = image_vol;
     }
 
     char path_buf[DRIVER_PATH_BUF];
@@ -1389,20 +1920,17 @@ driver_build_candidates(
            (the sibling). Tried first — a co-located driver is the most
            specific intent and should win over a stale /drivers/<arch>/
            copy from an older install. */
+        /* axl_driver_get_image_path is VOLUME-RELATIVE ("\app\x.efi"): the
+           companion is joined in its directory, so an image at the root
+           gives "\name" (not "\/name"), and the volume is prefixed once. */
         AXL_AUTO_FREE char *image_path = axl_driver_get_image_path();
-        if (image_path != NULL) {
-            AXL_AUTO_FREE char *image_dir = axl_path_get_dirname(image_path);
-            if (image_dir != NULL
-                && image_dir[0] != '\0'
-                && !(image_dir[0] == '.' && image_dir[1] == '\0'))
+        if (image_path != NULL && (image_path[0] == '\\' || image_path[0] == '/')) {
+            AXL_AUTO_FREE char *sibling = axl_path_companion(image_path, driver_name);
+            if (sibling != NULL
+                && axl_path_build_uefi(image_fs, sibling,
+                                       path_buf, sizeof(path_buf)) == AXL_OK)
             {
-                if (axl_snprintf(sub_buf, sizeof(sub_buf),
-                                 "%s/%s", image_dir, driver_name) > 0
-                    && axl_path_build_uefi(image_fs, sub_buf,
-                                           path_buf, sizeof(path_buf)) == AXL_OK)
-                {
-                    driver_append_candidate(candidates, n_cand, path_buf);
-                }
+                driver_append_candidate(candidates, n_cand, path_buf);
             }
         }
 
@@ -1424,11 +1952,9 @@ driver_build_candidates(
             driver_append_candidate(candidates, n_cand, path_buf);
         }
 
-        /* 3.5: <name> at the volume root. Covers the common case where
-           the user drops the app and its driver side-by-side at fs0:\.
-           Candidate #1 (<image_dir>/<name>) misses this when the
-           image's own directory is just "\" or "/" — the join produces
-           a doubled separator that some path normalizers reject. */
+        /* 3.5: <name> at the volume root, for an image in a subdirectory
+           whose driver sits at fs0:\ (an image AT the root already found
+           it as candidate 1). */
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
                          "/%s", driver_name) > 0
             && axl_path_build_uefi(image_fs, sub_buf,
@@ -1438,9 +1964,11 @@ driver_build_candidates(
         }
     }
 
-    /* 4: drivers/<arch>/<name> on every other mounted volume. */
+    /* 4: drivers/<arch>/<name> on every other mounted volume -- "other" by
+       HANDLE: the image's volume is named by the shell's alias above and by
+       enumeration's lowercased .name here, so the names need not match. */
     for (size_t i = 0; i < n_vols && *n_cand < DRIVER_MAX_CANDIDATES; i++) {
-        if (image_fs != NULL && axl_strcmp(volumes[i].name, image_fs) == 0) {
+        if (image_fs != NULL && volumes[i].handle == img->DeviceHandle) {
             continue;
         }
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
@@ -1521,9 +2049,9 @@ driver_start_and_verify(
         }
     }
 
-    size_t exit_data_size = 0;
-    EFI_STATUS st = axl_bs()->StartImage(
-        (EFI_HANDLE)drv, &exit_data_size, NULL);
+    EFI_STATUS st = (EFI_STATUS)axl_backend_start_image((void *)drv);
+    load_options_retire(drv);   /* read by now; see axl_driver_start */
+    axl_backend_exit_if_deferred();     /* after the retire; see axl_driver_start */
 
     if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
         axl_debug("driver ensure: StartImage failed for '%s': 0x%llx",
@@ -1585,8 +2113,10 @@ driver_try_candidates(
         }
         axl_debug("  hit:  %s - attempting load", candidates[i]);
 
+        /* Already checked not to be the running image when it was listed
+           (driver_append_candidate): not walked a second time. */
         AxlDriverHandle drv = NULL;
-        if (axl_driver_load(candidates[i], &drv) != 0 || drv == NULL) {
+        if (driver_load_path(candidates[i], &drv, true) != 0 || drv == NULL) {
             continue;
         }
 
@@ -1605,8 +2135,37 @@ axl_driver_load_buffer(
     AxlDriverHandle     *out_handle
     )
 {
-    return driver_load_buffer_apply(buf, len, /* info */ NULL,
-                                    /* default_name */ NULL, out_handle);
+    if (_axl_image_tpl_refused("axl_driver_load_buffer")) {
+        if (out_handle != NULL) {
+            *out_handle = NULL;
+        }
+        return AXL_UNSUPPORTED;
+    }
+    return driver_load_from_buffer(buf, len, /* file_dp */ NULL,
+                                   /* info */ NULL, out_handle);
+}
+
+int
+_axl_driver_load_buffer_at(
+    const char      *path,
+    const void      *buf,
+    size_t           len,
+    AxlDriverHandle *out
+    )
+{
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (path == NULL) {
+        return AXL_ERR;
+    }
+    EFI_DEVICE_PATH_PROTOCOL *dp   = driver_build_file_dp(path);
+    AxlEmbeddedImageInfo      info = { .file_name = driver_basename(path) };
+    int rc = driver_load_from_buffer(buf, len, dp, &info, out);
+    if (dp != NULL) {
+        driver_free_dp(dp);
+    }
+    return rc;
 }
 
 int
@@ -1617,8 +2176,14 @@ axl_driver_load_buffer_with_image_info(
     AxlDriverHandle            *out_handle
     )
 {
-    return driver_load_buffer_apply(buf, len, info, /* default_name */ NULL,
-                                    out_handle);
+    if (_axl_image_tpl_refused("axl_driver_load_buffer_with_image_info")) {
+        if (out_handle != NULL) {
+            *out_handle = NULL;
+        }
+        return AXL_UNSUPPORTED;
+    }
+    return driver_load_from_buffer(buf, len, /* file_dp */ NULL, info,
+                                   out_handle);
 }
 
 /* Fallback for a path-searched launch. Some UEFI shells set
@@ -1693,6 +2258,12 @@ axl_driver_load_sibling(
     AxlDriverHandle  *out_handle
     )
 {
+    if (_axl_image_tpl_refused("axl_driver_load_sibling")) {
+        if (out_handle != NULL) {
+            *out_handle = NULL;
+        }
+        return AXL_UNSUPPORTED;
+    }
     if (file_name == NULL || out_handle == NULL) {
         if (out_handle != NULL) {
             *out_handle = NULL;
@@ -1712,6 +2283,15 @@ axl_driver_load_sibling(
         }
     }
 
+    /* The image's own name -- in any spelling the filesystem accepts -- is
+       the running image, not a sibling. */
+    AXL_AUTO_FREE char *self_sib = axl_malloc(AXL_FS_REL_MAX);
+    if (self_sib != NULL
+        && axl_app_image_dir_path(file_name, self_sib, AXL_FS_REL_MAX) == AXL_OK
+        && driver_path_is_self(self_sib)) {
+        return driver_refuse_self(self_sib);
+    }
+
     /* Primary: shell-independent LoadedImage device-path load. The sibling's
        directory and volume both come from THIS image's LoadedImage, so it
        needs no EFI_SHELL_PROTOCOL — it works on the old EFI 1.x shell, BDS,
@@ -1721,17 +2301,16 @@ axl_driver_load_sibling(
        the fallback (preserving the sibling-only hard-fail contract). */
     EFI_DEVICE_PATH_PROTOCOL *sib_dp = driver_build_sibling_dp(file_name);
     if (sib_dp != NULL) {
-        EFI_HANDLE image = NULL;
-        EFI_STATUS st = axl_bs()->LoadImage(FALSE, gImageHandle, sib_dp,
-                                            NULL, 0, &image);
-        axl_bs()->FreePool(sib_dp);  /* axl-pool-direct: device path for LoadImage */
-        if (!EFI_ERROR(st)) {
-            *out_handle = (AxlDriverHandle)image;
+        DriverDpResult r = driver_load_dp(sib_dp, file_name, out_handle);
+        driver_free_dp(sib_dp);
+        if (r == DRIVER_DP_LOADED) {
             return AXL_OK;
         }
-        axl_debug("sibling load: LoadedImage-DP load of '%s' failed: 0x%llx; "
-                  "falling back to shell path resolution", file_name,
-                  (unsigned long long)st);
+        if (r == DRIVER_DP_REFUSED) {
+            return AXL_ERR;   /* a packed sibling that cannot load: final */
+        }
+        axl_debug("sibling load: LoadedImage-DP load of '%s' failed; "
+                  "falling back to shell path resolution", file_name);
     }
 
     /* Fallback: shell-based path resolution. Retained until the DP-primary
@@ -1790,8 +2369,17 @@ driver_load_embedded(
     const char                 *default_name
     )
 {
+    /* default_name stands in for a file_name the caller's info left unset. */
+    AxlEmbeddedImageInfo named = { 0 };
+    if (info != NULL) {
+        named = *info;
+    }
+    if (named.file_name == NULL) {
+        named.file_name = default_name;
+    }
     AxlDriverHandle drv = NULL;
-    if (driver_load_buffer_apply(buf, len, info, default_name, &drv) != AXL_OK) {
+    if (driver_load_from_buffer(buf, len, /* file_dp */ NULL, &named, &drv)
+        != AXL_OK) {
         return AXL_ERR;
     }
 
@@ -1801,6 +2389,7 @@ driver_load_embedded(
 
 int
 _axl_driver_ensure_with_embedded_info(
+    const char                 *api,
     const AxlGuid              *protocol_guid,
     const char                 *driver_name,
     const unsigned char        *embedded_buf,
@@ -1824,6 +2413,10 @@ _axl_driver_ensure_with_embedded_info(
     if (driver_protocol_registered(protocol_guid) == 0) {
         axl_debug("driver ensure: protocol already registered, skipping search");
         return AXL_OK;
+    }
+    /* Published already is an answer at any TPL; loading it is not. */
+    if (_axl_image_tpl_refused(api)) {
+        return AXL_UNSUPPORTED;
     }
 
     /* Step 2/3: disk search. If override_name was passed, search for
@@ -1886,6 +2479,7 @@ axl_driver_ensure_with_embedded(
     )
 {
     return _axl_driver_ensure_with_embedded_info(
+        "axl_driver_ensure_with_embedded",
         protocol_guid, driver_name, embedded_buf, embedded_len,
         override_name, load_options, load_options_size,
         /* info */ NULL);
@@ -1910,6 +2504,9 @@ axl_driver_ensure_from_path(
         axl_debug("driver ensure_from_path: protocol already registered, "
                   "skipping load of '%s'", driver_path);
         return AXL_OK;
+    }
+    if (_axl_image_tpl_refused("axl_driver_ensure_from_path")) {
+        return AXL_UNSUPPORTED;
     }
 
     AxlDriverHandle drv = NULL;
@@ -1951,6 +2548,9 @@ axl_driver_ensure_embedded_only(
                   "skipping embedded load");
         return AXL_OK;
     }
+    if (_axl_image_tpl_refused("axl_driver_ensure_embedded_only")) {
+        return AXL_UNSUPPORTED;
+    }
 
     /* Load the blob directly — NO disk search, so a stale loose copy of
      * driver_name beside the launcher cannot shadow it. driver_load_embedded
@@ -1972,11 +2572,13 @@ axl_driver_ensure(
     const char    *driver_name
     )
 {
-    return axl_driver_ensure_with_embedded(
+    return _axl_driver_ensure_with_embedded_info(
+        "axl_driver_ensure",
         protocol_guid, driver_name,
         NULL, 0,        /* no embedded blob */
         NULL,           /* no override */
-        NULL, 0);       /* no LoadOptions */
+        NULL, 0,        /* no LoadOptions */
+        NULL);          /* no image info */
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,22 +2620,20 @@ driver_load_cb(const char *full_path, const AxlFsEntry *entry, void *user)
     return AXL_OK;
 }
 
-int
-axl_driver_load_dir(
-    const char *dir_path,
-    const char *pattern,
-    size_t     *loaded_count)
-{
-    return axl_driver_load_dir_guarded(dir_path, pattern, NULL, loaded_count);
-}
-
-int
-axl_driver_load_dir_guarded(
+static int
+driver_load_dir_impl(
+    const char       *api,
     const char       *dir_path,
     const char       *pattern,
     const AxlAttempt *guard,
     size_t           *loaded_count)
 {
+    if (_axl_image_tpl_refused(api)) {
+        if (loaded_count != NULL) {
+            *loaded_count = 0;
+        }
+        return AXL_UNSUPPORTED;
+    }
     if (dir_path == NULL) {
         return AXL_ERR;
     }
@@ -2072,6 +2672,27 @@ axl_driver_load_dir_guarded(
         *loaded_count = ctx.loaded;
     }
     return AXL_OK;
+}
+
+int
+axl_driver_load_dir(
+    const char *dir_path,
+    const char *pattern,
+    size_t     *loaded_count)
+{
+    return driver_load_dir_impl("axl_driver_load_dir", dir_path, pattern, NULL,
+                                loaded_count);
+}
+
+int
+axl_driver_load_dir_guarded(
+    const char       *dir_path,
+    const char       *pattern,
+    const AxlAttempt *guard,
+    size_t           *loaded_count)
+{
+    return driver_load_dir_impl("axl_driver_load_dir_guarded", dir_path, pattern,
+                                guard, loaded_count);
 }
 
 // ===================================================================

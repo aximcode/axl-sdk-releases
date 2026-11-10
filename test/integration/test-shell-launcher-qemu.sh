@@ -1,5 +1,7 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=10 local-only=0
+# test-meta: arch=x64 needs= est=10 local-only=0 builds=hello,shell-launcher guest=none
+# guest=none: the boot is the subject: the AXL Shell launcher's -delay 0
+#   boot.
 # test-shell-launcher-qemu.sh — regression guard for the AXL shell launcher
 # that boots the EDK2 Shell with "-delay 0", skipping its 5-second
 # "Press ESC in N seconds to skip startup.nsh" countdown.
@@ -9,7 +11,12 @@
 # (scripts/axl-common.sh); it sibling-loads Shell.efi and starts it with
 # LoadOptions "-delay 0". This test asserts the observable contract:
 #   1. the startup countdown prompt never prints (the perf win), and
-#   2. startup.nsh still runs (the launcher → Shell → startup.nsh chain works).
+#   2. startup.nsh still runs (the launcher → Shell → startup.nsh chain works),
+#   3. AXL_SHELL_OPTIONS reaches the Shell: stage_boot_shell writes it to
+#      axl-shell.opt beside the launcher, which appends it to "-delay 0". A
+#      boot with "-nonest" must see `nonesting` read True; the first boot, with
+#      no options, is the control that must see False -- so the True is the
+#      option's doing, not the Shell's default.
 # A silent regression here (launcher fails to skip the delay, or falls back and
 # the Shell boots with the countdown) leaves the suite passing but slow — which
 # is exactly what this guard catches.
@@ -45,17 +52,19 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 # The staging (stage_boot_shell) builds the launcher on demand, but build the
 # app + launcher up front so a missing-binary failure is loud here, not a
 # confusing boot-time fallback.
-make -C "$PROJECT_DIR" ARCH="$_native_arch" hello shell-launcher 2>&1 | tail -2
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" hello shell-launcher 2>&1 | tail -2
 
 EFI="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$_native_arch")/hello.efi"
 
 nsh="$(mktemp)"
 stdout="$(mktemp)"   # non-raw filtered output (what integration tests grep)
 raw="$(mktemp)"      # full ANSI-stripped transcript (--serial-log)
-trap 'rm -f "$nsh" "$stdout" "$raw"' EXIT
+stdout2="$(mktemp)"  # the AXL_SHELL_OPTIONS boot's output
+trap 'rm -f "$nsh" "$stdout" "$raw" "$stdout2"' EXIT
 
-# A marker proving startup.nsh ran (run-qemu appends `reset -s`).
-printf 'echo AXL_LAUNCHER_STARTUP_OK\n' > "$nsh"
+# A marker proving startup.nsh ran (run-qemu appends `reset -s`), and the
+# Shell's nesting mode, which AXL_SHELL_OPTIONS=-nonest must change.
+printf 'echo AXL_LAUNCHER_STARTUP_OK\necho NONEST=%%nonesting%%\n' > "$nsh"
 
 # Run in NON-raw mode on purpose: that path anchors app-output extraction on the
 # startup sentinel, which the launcher's countdown removal would otherwise break.
@@ -88,10 +97,38 @@ if grep -q "axl-shell-launcher:" "$raw"; then
     grep "axl-shell-launcher:" "$raw" | sed 's/^/    /'
     fail=1
 fi
+# 5. Control: with no options the Shell nests (the EDK2 default).
+if ! grep -qx "NONEST=False" <(tr -d '\r' < "$stdout"); then
+    echo "  MISS: control boot did not print NONEST=False"
+    grep -a "NONEST" "$stdout" | sed 's/^/    /'
+    fail=1
+fi
+
+# 6. AXL_SHELL_OPTIONS=-nonest reaches the Shell.
+AXL_SHELL_OPTIONS="-nonest" timeout 90s "$PROJECT_DIR/scripts/run-qemu.sh" \
+    --arch "$TEST_ARCH" --timeout 40 --nsh "$nsh" "$EFI" > "$stdout2" 2>&1 || true
+if ! grep -qx "NONEST=True" <(tr -d '\r' < "$stdout2"); then
+    echo "  MISS: AXL_SHELL_OPTIONS=-nonest boot did not print NONEST=True"
+    grep -aE "NONEST|axl-shell-launcher:|AXL_SHELL_OPTIONS" "$stdout2" | sed 's/^/    /'
+    fail=1
+fi
+
+# 7. Options with the launcher switched off cannot apply: an error, never a
+#    silent boot of a Shell without them.
+rc7=0
+out7=$(AXL_SHELL_LAUNCHER=0 AXL_SHELL_OPTIONS="-nonest" timeout 90s \
+    "$PROJECT_DIR/scripts/run-qemu.sh" --arch "$TEST_ARCH" --timeout 40 \
+    --nsh "$nsh" "$EFI" 2>&1) || rc7=$?
+if (( rc7 == 0 )) || ! grep -q "needs the Shell launcher" <<< "$out7" \
+   || grep -q "NONEST=" <<< "$out7"; then
+    echo "  MISS: AXL_SHELL_OPTIONS with AXL_SHELL_LAUNCHER=0 did not refuse (rc=$rc7)"
+    tail -3 <<< "$out7" | sed 's/^/    /'
+    fail=1
+fi
 
 if (( fail )); then
     echo "FAIL: shell launcher -delay 0 ($TEST_ARCH)"
     exit 1
 fi
-echo "shell launcher -delay 0: countdown skipped, startup.nsh ran ($TEST_ARCH)"
+echo "shell launcher -delay 0: countdown skipped, startup.nsh ran, options reach the Shell ($TEST_ARCH)"
 exit 0

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=9 local-only=0
+# test-meta: arch=x64 needs= est=9 local-only=0 builds=smbus-hc-shim guest=ipmi_ssif
 # test-ipmi-ssif-qemu.sh — exercise AxlIpmi's SSIF transport against
 # QEMU's BMC simulator via the SMBus IPMI device.
 #
@@ -38,20 +38,17 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_DIR="$(dirname "$PROJECT_DIR")"
 
 _native_arch="x64"
-make -C "$PROJECT_DIR" ARCH="$_native_arch" all tests smbus-hc-shim 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" all tests smbus-hc-shim 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
 test_add_efi "$NATIVE_DIR/AxlTestIpmi.efi"
 test_add_efi "$NATIVE_DIR/SmbusHcShim.efi"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "load SmbusHcShim.efi"
-    echo "AxlTestIpmi.efi hw"
-    echo "reset -s"
-} | test_set_startup
+# Its commands are in test-ipmi-ssif-qemu.nsh; booted, test_use_nsh appends
+# the reset -s that powers the guest off. Pooled, the ipmi_ssif class is the
+# standard guest plus the BMC simulator test_add_ipmi_bmc_sim_ssif adds
+# (test/pool/classes.toml).
+test_use_nsh
 
 test_build_image
 

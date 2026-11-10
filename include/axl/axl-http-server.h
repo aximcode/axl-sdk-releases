@@ -40,6 +40,16 @@ typedef struct {
     size_t      body_size;
     char        client_addr[46];
     void        *middleware_data;
+    /// Identifies this request among every request ANY server in the
+    /// process has parsed: nonzero, and never reused while the process
+    /// runs (one sequence for all servers). The middleware and the
+    /// handler of one request see the same value, as does every call an
+    /// AxlUploadHandler gets for one upload -- so a handler that keeps
+    /// state across those calls keys it on this, not on the request's
+    /// address, which a later request on a reused connection can share.
+    /// It is the server's own number, unrelated to any `X-Request-ID`
+    /// header the client sends, and is not sent on the wire.
+    uint64_t     request_id;
 } AxlHttpRequest;
 
 typedef struct {
@@ -137,6 +147,18 @@ typedef struct AxlHttpServer AxlHttpServer;
 /**
  * @brief Create a new HTTP server bound to the given port.
  *
+ * **Expect: 100-continue (RFC 9110 10.1.1).** A request that asks for a
+ * 100 and has a body still to come gets `HTTP/1.1 100 Continue` once the
+ * server knows it will read that body, and not before: a request it would
+ * refuse without the body -- no route (404), a route's auth callback
+ * failing (401/403), a Content-Length over the body limit (413), or, for an
+ * upload route, the middleware -- gets its final status instead, and the
+ * connection closes without waiting for the body. A request whose body
+ * started arriving with its headers, or an HTTP/1.0 request, gets no 100.
+ * An Expect value other than `100-continue` is answered 417. Rejections a
+ * handler (or an upload handler's first chunk) makes still come after the
+ * body, as they would without the field.
+ *
  * @return server instance, or NULL on failure.
  */
 AxlHttpServer *
@@ -147,7 +169,9 @@ axl_http_server_new(
 /**
  * @brief Free an HTTP server and all resources.
  *
- * Graceful teardown: in-flight connections are closed with a FIN and,
+ * Graceful teardown: idle connections are closed with a FIN -- one whose
+ * close would drop part of a response or WebSocket frame not yet handed to
+ * the firmware is reset instead (@ref axl_tcp_close) -- and,
  * when a loop is still running, their firmware finalization is deferred
  * to it. With `AXL_TEARDOWN_GRACEFUL` the listen port may therefore remain
  * bound until those closes finalize on a later loop tick — fine for normal
@@ -157,7 +181,8 @@ axl_http_server_new(
  *
  * @p mode (see @ref AxlTeardown):
  * - `AXL_TEARDOWN_GRACEFUL` — orderly FIN close of the listener and every
- *   in-flight connection; deferred finalize; the polite default.
+ *   idle connection (one whose close would drop unsent bytes gets an RST
+ *   instead); deferred finalize; the polite default.
  * - `AXL_TEARDOWN_RESET` — the port-releasing teardown: the listener and every
  *   in-flight connection are closed abortively (TCP RST) and finalized
  *   **synchronously and loop-free** (including draining the accept backlog and
@@ -167,6 +192,35 @@ axl_http_server_new(
  *   flight. For an in-place self-upgrade / port hand-off. The RST discards
  *   un-ACKed in-flight response bytes — the intended trade — and leaves no
  *   deferred close source behind. RAII cleanup uses `AXL_TEARDOWN_GRACEFUL`.
+ *
+ * **Safe to call from the server's own handlers** -- a route, upload or
+ * WebSocket handler (DISCONNECT included), middleware, the auth callback --
+ * whether the server's own event handling called it or one of your calls did
+ * (`axl_ws_conn_close`, `axl_ws_send` and the broadcast can fire DISCONNECT).
+ * The code that called the handler still uses the connection and the server
+ * after it returns, so the free is recorded and completed once that code has
+ * returned; with a nested loop running inside a handler, once the OUTERMOST
+ * such call has, and the server keeps serving until then. @p server must not
+ * be used after this call either way, and with `AXL_TEARDOWN_RESET` the port
+ * is free from that point (a timeout, or the code after `axl_loop_run`), not
+ * yet inside the handler. Under @ref axl_http_server_run the free also ends
+ * run's loop, and completes as a RESET: no loop is left to finish a graceful
+ * close on.
+ *
+ * A handler that frees the server is not guaranteed its own response: the
+ * connection is closed as soon as the handler's caller returns. A response
+ * the firmware already holds whole (one transmit piece,
+ * #AXL_TCP_PACING_CHUNK_DEFAULT_BYTES by default) goes out ahead of the FIN;
+ * a larger one is still being handed over, which makes the close a reset --
+ * and under @ref axl_http_server_run the free is a reset anyway. A STREAMED
+ * response is cut off after its headers: they go out whole, and the body,
+ * produced later from their send callback, never does. To answer first
+ * ("POST /shutdown"), free from a timeout instead.
+ *
+ * Once a free is pending or running, calling this again only upgrades a
+ * pending GRACEFUL free to RESET; it never frees twice (a DISCONNECT or
+ * upload-abort hook the teardown fires may call it). A handler that never
+ * returns -- one that calls `axl_exit`, say -- leaves the free pending.
  */
 void
 axl_http_server_free(
@@ -806,6 +860,15 @@ typedef struct {
 /**
  * @brief Authentication callback.
  *
+ * For a gated route it runs before the handler, with the request's body.
+ * It may ALSO run before the body exists, with `body` NULL: always for an
+ * upload route (see @ref axl_http_server_add_upload_route_auth), and for
+ * any route when the request asks for 100-continue, so a refusal can be
+ * sent before the client sends its body. A request that passes that early
+ * check is checked again with its body, so a callback is called twice for
+ * it -- authenticate from the headers (cookie / Authorization / client
+ * address), and a callback that needs the body must accept a NULL one.
+ *
  * @return AXL_OK on success (authenticated), AXL_ERR on failure.
  */
 typedef int (*AxlAuthCallback)(
@@ -910,6 +973,17 @@ typedef struct AxlWsConn AxlWsConn;
  * AXL_ERR from AXL_WS_CONNECT rejects the connection — it is closed with no
  * further events (no DISCONNECT). For AXL_WS_TEXT / _BINARY the return is
  * currently ignored; call axl_ws_conn_close to drop a connection mid-stream.
+ *
+ * CONNECT and DISCONNECT are paired: every CONNECT the handler does not
+ * reject (returns AXL_OK from) is followed by exactly one DISCONNECT -- even
+ * when the handler closed the connection itself from inside CONNECT
+ * (axl_ws_conn_close), since whatever it registered there still needs
+ * tearing down. That DISCONNECT, and any teardown asked for while CONNECT is
+ * running, happen only after CONNECT has returned, never nested inside it. A
+ * rejected CONNECT gets no DISCONNECT, and a connection closed before its
+ * upgrade completed -- the 101 failed to send, or the connection was torn
+ * down (axl_http_server_free, say) before the 101's completion was processed
+ * -- gets neither.
  *
  * @return AXL_OK to keep the connection; AXL_ERR from CONNECT to reject it.
  */
@@ -1035,9 +1109,14 @@ axl_ws_conn_user_data(
 /**
  * @brief Close a specific WebSocket connection (server-initiated).
  *
- * Sends a WebSocket close frame and tears the connection down; the
- * handler's AXL_WS_DISCONNECT fires as usual. Use for a logout / idle
- * timeout. @p conn is invalid after the disconnect handler returns.
+ * Tears the connection down; the handler's AXL_WS_DISCONNECT fires before
+ * this returns -- or, when called from the handler's own AXL_WS_CONNECT,
+ * once that CONNECT has returned (see AxlWsConnHandler). No WebSocket close
+ * frame is sent: a synchronous send from inside the loop's dispatch could
+ * wedge a resident driver-tick loop, so the TCP teardown conveys the close
+ * instead (a FIN, or a reset if a frame is still in flight). Use for a
+ * logout / idle timeout. @p conn is invalid after the disconnect handler
+ * returns.
  *
  * @return AXL_OK on success; AXL_ERR on a NULL / closed connection.
  */
@@ -1055,6 +1134,18 @@ axl_ws_conn_close(
 /**
  * @brief Enable response caching on the server.
  *
+ * Caches the 2xx responses, with a body, of **GET requests to open routes**
+ * (AXL_ROUTE_NO_AUTH) only, keyed on method, path and query. Authentication
+ * runs before the cache is consulted. A route that requires authentication
+ * is never cached -- the key holds no caller identity, so a cached answer
+ * would reach the next caller -- and no other method is, because the key
+ * holds no request body and a cached answer skips the handler.
+ *
+ * Until 2026-11-02 the cache was consulted BEFORE authentication and stored
+ * any method's response: once an authorised request had filled it, an
+ * auth-required route's body was served to anyone, and a repeated POST to
+ * the same path got the first one's answer without its handler running.
+ *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
@@ -1071,7 +1162,12 @@ axl_http_server_use_cache(
  * server-wide default from `axl_http_server_use_cache`. Prefix
  * routes (e.g. `/css/` followed by a wildcard) are not matched —
  * set the TTL on the exact sub-paths you expect, or rely on the
- * server default.
+ * server default. A TTL of 0 means the route is never cached: its
+ * responses are neither stored nor served from the cache. Setting a
+ * path again replaces its TTL.
+ *
+ * (Until 2026-11-02 a TTL of 0 was read back as "no override" and the
+ * route was cached for the server default.)
  *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
@@ -1079,7 +1175,7 @@ int
 axl_http_server_set_route_ttl(
     AxlHttpServer *s,       ///< server
     const char    *path,    ///< exact request path
-    size_t        ttl_ms    ///< time-to-live in milliseconds, or AXL_CACHE_FOREVER
+    size_t        ttl_ms    ///< time-to-live in milliseconds, AXL_CACHE_FOREVER, or 0 (never cached)
 );
 
 /**
@@ -1109,11 +1205,14 @@ axl_http_server_cache_invalidate(
  *     it and return AXL_OK to continue, AXL_ERR to abort and send 500.
  *   - chunk == NULL, chunk_size == 0, aborted == false: clean EOF.
  *     Set @p resp fields here; the response is sent after return.
- *   - chunk == NULL, chunk_size == 0, aborted == true: the connection
- *     was torn down mid-upload (TCP disconnect, recv error, server
- *     shutdown). @p resp is NOT transmitted. The handler MUST NOT
- *     touch the connection, send a response, or call any response
- *     setter (`axl_http_response_set_*`) — the call exists only to
+ *   - chunk == NULL, chunk_size == 0, aborted == true: the upload ended
+ *     without its body -- the connection was torn down mid-upload (TCP
+ *     disconnect, recv error, server shutdown), or the server refused
+ *     the body itself (malformed chunked framing: 400). On a teardown @p resp is NOT transmitted; on the
+ *     server's own refusal @p resp, its status already set, IS sent after
+ *     the call, and the handler may set a body on it (any body set on a
+ *     teardown is released unsent). The handler MUST NOT touch the
+ *     connection or send a response itself — the call exists to
  *     release per-request state (open file handles, accumulators,
  *     allocations) the handler accumulated across earlier chunk
  *     calls. Without this signal, that state leaks into the next
@@ -1123,7 +1222,10 @@ axl_http_server_cache_invalidate(
  * Fires exactly once per upload: clean-EOF and abort calls are
  * mutually exclusive — a handler that already received the clean-EOF
  * call will NOT also receive an abort, even if the response send
- * subsequently fails. Return value is ignored on the abort call.
+ * subsequently fails or the connection is torn down before it
+ * completes. A chunk call that returns AXL_ERR ends the upload too: no
+ * further call follows it, abort included. Return value is ignored on
+ * the abort call.
  *
  * @return AXL_OK on success, AXL_ERR to abort the upload and send 500.
  */
@@ -1214,33 +1316,133 @@ axl_http_server_add_upload_route_auth(
  * `/dav/foo/bar.txt`, the consumer sees `/foo/bar.txt`). Root path
  * is `/` and refers to the WebDAV mount itself — list_dir("/")
  * returns the top-level entries (one virtual entry per UEFI volume,
- * say).
+ * say). The path is percent-DECODED (RFC 3986 §2.1) -- request URL
+ * `/dav/with%20space.txt` arrives as `/with space.txt`, and a
+ * `Destination` likewise -- and the SDK answers 400 for an escape that
+ * decodes to '/', '\\' or NUL, a malformed escape, or a raw '\\', so no
+ * callback sees a separator a segment hid -- and for a component that
+ * starts with a blank or ends with a blank or a period, which EDK2 FAT
+ * trims before its lookup (so it would open a differently spelled entry)
+ * and cannot store. PROPFIND hrefs are
+ * percent-encoded back from the names the callbacks return.
  *
  * Callbacks return @c AXL_OK on success, @c AXL_ERR on failure. The
- * SDK maps the failure to an HTTP status: stat / list_dir / read
- * failures → 404; mkdir / write_open / move failures → 409 (parent
- * missing) or 500 (other); remove failure → 404 or 423 if locked
- * (latter not fully wired in v1).
+ * SDK maps the failure to an HTTP status: stat / read failures → 404;
+ * list_dir failure → 500 (507 when the listing does not fit in memory);
+ * mkdir failure → 409; remove failure → 404, or 423
+ * Locked for @c AXL_BUSY (a resource being written in place). A move /
+ * copy failure maps by its code: 403 for @c AXL_DENIED (a refusal by
+ * policy, such as a mount that may not remove what an overwrite would)
+ * or @c AXL_INVALID (onto the source itself, into its own subtree); 412
+ * for @c AXL_EXISTS (a destination that may not be overwritten); 409 for
+ * @c AXL_NOT_FOUND, @c AXL_NOT_DIR, @c AXL_IS_DIR or @c AXL_NOT_EMPTY (a
+ * destination that cannot be reached, or of the wrong kind); 502 for
+ * @c AXL_UNSUPPORTED (a move only a copy could make); 507 for
+ * @c AXL_NO_RESOURCES (a volume without the room); 423 for @c AXL_BUSY (a
+ * resource being written in place, see #AXL_SERVE_FS_PUT_IN_PLACE); 500
+ * for @c AXL_ERR and anything else.
+ *
+ * MOVE and COPY answer RFC 4918's statuses (§9.8.5, §9.9.4) before the
+ * op is called: 400 for a missing or unparsable `Destination`, 502 for
+ * one naming another server (its authority is not the request's `Host`),
+ * 403 for a destination that is the source itself or the mount root.
+ * With `stat` wired they also answer 404 for a missing source and 412 for
+ * an existing destination with `Overwrite: F` -- also one whose path
+ * differs from the source's in letter case only, which a case-sensitive
+ * backend holds as another entry; a backend that sets
+ * #AXL_WEBDAV_CAP_IDENTITY in `caps` gets that case-variant transfer
+ * forwarded instead, with `overwrite` false. A success is 204 when the
+ * destination existed, 201 when it did not. Without `stat`, every success
+ * is 201 and those cases reach the op.
  *
  * Streaming callbacks (read/write):
  *   - `read_open` returns an opaque ctx the SDK threads into
  *     `read_chunk` (drives the response-body streamer) and
  *     `read_close` (idempotent finalize).
- *   - `write_open` likewise; `write_chunk` receives one chunk per
- *     dispatcher buffer; `write_close(aborted)` runs on EOF
- *     (aborted=false) OR mid-upload TCP teardown (aborted=true).
- *     Same shape as AxlUploadHandler's clean-EOF/abort
- *     contract.
+ *   - `write_open` likewise, and is told the body's length: the
+ *     request's `Content-Length` (0 for a PUT with no body), or
+ *     #AXL_WEBDAV_LENGTH_UNKNOWN for a chunked body, whose length nothing
+ *     states up front. It is the client's claim, checked by the framing
+ *     and not by the backend: a body that ends short is an abort. And
+ *     `write_open` DECLARES, through `*in_place` (false when it says
+ *     nothing), whether the write goes into the target itself -- so that
+ *     a PUT that does not complete leaves the resource partial -- rather
+ *     than somewhere it replaces the target from at the commit.
+ *     `*in_place` is read only when `write_open` returns @c AXL_OK. An
+ *     in-place write can end four ways short of its commit: the client
+ *     hangs up, a `write_chunk` fails, the body does not match its
+ *     `Content-Digest`, or the body's chunked framing is malformed (the
+ *     server refuses it, 400). The SDK says what the last three left in
+ *     its response and its log; on a HANG-UP there is no response and the
+ *     SDK logs nothing, so a backend that writes in place must log its own
+ *     partial-write error on `aborted=true`, as `axl_fs_webdav_ops()` does.
+ *     `write_chunk` receives one chunk per
+ *     dispatcher buffer; `write_close` ends every write `write_open`
+ *     opened, exactly once: `aborted=false` to COMMIT the body (the
+ *     clean end of the PUT), `aborted=true` to DISCARD it -- the client
+ *     hung up mid-body, a `write_chunk` failed, or the body did not match
+ *     its `Content-Digest`. A commit is never followed by a discard, nor
+ *     a discard by a commit: after either call the ctx is dead and the
+ *     SDK does not touch it again, whatever the call returned. With a
+ *     NULL `write_close` a discard is impossible -- whatever
+ *     `write_chunk` wrote stays.
  *
- * `write_close` returns a status because the final flush is where a
- * streaming write actually becomes durable, and nothing earlier can
- * report that: every chunk may have been accepted and the last flush
- * still fail on a full volume or write-protected media. On the clean-EOF
- * call an `AXL_ERR` return makes PUT answer **500**, not 201 — a backend
- * that cannot guarantee the bytes landed must say so here or the client
- * records a stored file that does not exist. The return is IGNORED on
- * the abort call (`aborted=true`), where the partial file is expected
- * and no response is transmitted.
+ * **A PUT should be atomic.** A discarded write must leave the resource
+ * as it was before the PUT, which a backend that truncates the target
+ * at `write_open` cannot do: write the body somewhere else (a temp
+ * sibling) and replace the target in the commit, as
+ * `axl_fs_webdav_ops()` does. A backend that writes in place should at
+ * least delete what it wrote on `aborted=true`, so a broken body is not
+ * left standing as the resource -- and one that cannot (a write in place
+ * a mount opted into, see #AXL_SERVE_FS_PUT_IN_PLACE) sets `*in_place`
+ * at `write_open` and returns a failure from the discard: the SDK then
+ * reports that the resource holds what was written instead of saying
+ * nothing was stored.
+ *
+ * `write_close` returns a status because the commit -- the final flush,
+ * and the replace -- is where a streaming write actually becomes
+ * durable, and nothing earlier can report that: every chunk may have
+ * been accepted and the last flush still fail on a full volume or
+ * write-protected media. On the commit a failure makes PUT answer
+ * **500** (or **409** for @c AXL_IS_DIR / @c AXL_EXISTS, **403** for
+ * @c AXL_DENIED, **507** for @c AXL_NO_RESOURCES),
+ * not 201 — a backend that cannot guarantee the bytes landed must say so
+ * here or the client records a stored file that does not exist. A
+ * commit that fails must leave the resource as it was before the PUT:
+ * the client is told nothing was stored -- unless the write was declared
+ * in place, whose failed commit answers 500 with the body `PUT failed
+ * part-way: the resource is partially written` and an error log.
+ *
+ * On the DISCARD call the return is IGNORED for a write not declared in
+ * place, as it always was. For a write declared in place it says whether
+ * the resource is as it was: @c AXL_OK when the discard restored it
+ * (nothing stored), anything else when it could not -- the resource holds
+ * what was written before the PUT ended. The status is unchanged by it;
+ * what changes is what the SDK says: a PUT whose `write_chunk` failed
+ * answers 500 with the body `PUT failed part-way: the resource is
+ * partially written` and a `Content-Digest` mismatch 400 with
+ * `Content-Digest mismatch: the resource now holds the body that did not
+ * match`, each with a trailing newline, and an error is logged.
+ *
+ * PUT answers: **201** once committed; **405** when the mount has no
+ * `write_open` (or, for an empty body, no `write_close`); **403** when
+ * `write_open` or the commit returns @c AXL_DENIED (a refusal by policy,
+ * such as a read-only file); **409** when either returns @c AXL_IS_DIR
+ * (a collection at the target -- also one that appeared while the body
+ * streamed) or @c AXL_EXISTS (an existing file the mount may not
+ * replace), and for any other `write_open` failure (a missing parent
+ * collection); **507** for @c AXL_NO_RESOURCES; **500** when a
+ * `write_chunk` fails or the commit does;
+ * **400** when the body does not match its `Content-Digest` (RFC 9530:
+ * `sha-256=:<base64>:`, or bare hex) -- every entry of the header is
+ * read and the strongest the SDK hashes (sha-512, else sha-256) is
+ * checked over the body as it streams, BEFORE the commit, so the write
+ * is discarded, not stored and then removed; a header naming only other
+ * algorithms checks nothing; and **503** with `Retry-After: 1` when
+ * another PUT to the same mount is in flight (or `write_open` or the
+ * commit returns @c AXL_BUSY -- serve-fs does for a file another PUT is
+ * writing in place, through any mount) -- a mount takes one PUT at a
+ * time, and the refused one touches nothing, the one in flight included.
  *
  * **Wire `write_open` and `write_close` as a PAIR.** A vtable with a
  * `write_open` but a NULL `write_close` still accepts uploads, and
@@ -1252,7 +1454,14 @@ axl_http_server_add_upload_route_auth(
  * hand-written vtable is where the halves drift apart.
  */
 typedef struct {
-    /// PROPFIND backing — list children of a directory.
+    /// PROPFIND backing — list children of a directory: fill at most
+    /// @p max entries of @p out and set @p count. A directory with more
+    /// than @p max children must fill all @p max (count == max): the SDK
+    /// then calls again, from the start, with twice the room, until a
+    /// listing comes back short of it -- a PROPFIND of n children costs
+    /// about log2(n / 64) + 1 calls. A failure (non-OK) is answered 500,
+    /// and a listing whose room cannot be allocated 507: a PROPFIND is
+    /// the whole directory or nothing, never part of it.
     int  (*list_dir)(void *user, const char *path,
                      AxlFsEntry *out, size_t max,
                      size_t *count) AXL_CB_NOEXCEPT;
@@ -1269,22 +1478,36 @@ typedef struct {
     void (*read_close)(void *ctx) AXL_CB_NOEXCEPT;
 
     /// Streaming write — drives the upload-route chunk handler for PUT.
-    int  (*write_open)(void *user, const char *path, void **out_ctx) AXL_CB_NOEXCEPT;
+    /// @p length is the body's stated length, or
+    /// #AXL_WEBDAV_LENGTH_UNKNOWN for a chunked body; set @p in_place
+    /// (false on entry) when the write goes into the target itself. (Both
+    /// parameters are new: a backend written before them must add them,
+    /// and an atomic one may ignore both.)
+    int  (*write_open)(void *user, const char *path, uint64_t length,
+                       void **out_ctx, bool *in_place) AXL_CB_NOEXCEPT;
     int  (*write_chunk)(void *ctx, const void *data, size_t len) AXL_CB_NOEXCEPT;
     int  (*write_close)(void *ctx, bool aborted) AXL_CB_NOEXCEPT;
 
     /// Lifecycle — MKCOL / DELETE / MOVE / COPY.
     int  (*mkdir)(void *user, const char *path) AXL_CB_NOEXCEPT;
     int  (*remove)(void *user, const char *path) AXL_CB_NOEXCEPT;
+    /// MOVE: relocate @p src to @p dst. With @p overwrite an existing
+    /// @p dst is replaced -- RFC 4918 §9.9.3's DELETE with Depth:
+    /// infinity, which an op should not perform until the move is
+    /// certain to happen (see axl_fs_webdav_ops()). Without it the op is
+    /// reached only for a @p dst the SDK found absent -- or, with
+    /// #AXL_WEBDAV_CAP_IDENTITY, one differing from @p src in letter case
+    /// only, which the op must then refuse (@c AXL_EXISTS, 412) unless it
+    /// IS @p src. A failure maps by its code, as listed above.
     int  (*move)(void *user, const char *src, const char *dst,
                  bool overwrite) AXL_CB_NOEXCEPT;
     /// COPY: replicate @p src to @p dst, leaving @p src in place.
     /// @p depth is 0 (collection itself only, no contents) or -1
     /// (infinity / deep). The SDK rejects Depth: 1 before reaching
-    /// here per RFC 4918 §9.8.3. Returning AXL_ERR maps to 409. To
-    /// get RFC-correct 404 (rather than 409) for missing-source,
-    /// also set stat — the SDK pre-stats @p src when stat is
-    /// wired.
+    /// here per RFC 4918 §9.8.3. A failure maps by its code, as listed
+    /// above. To get RFC-correct 404 (rather than the op's status)
+    /// for a missing source, 412 and 204, also set stat — the SDK
+    /// pre-stats @p src and @p dst when stat is wired.
     int  (*copy)(void *user, const char *src, const char *dst,
                  bool overwrite, int depth) AXL_CB_NOEXCEPT;
 
@@ -1317,6 +1540,11 @@ typedef struct {
     /// Per RFC 3230 §4.3.2, the digest covers the FULL file even
     /// for 206 Partial Content responses — mount clients accumulate
     /// the value across their first Range read.
+    ///
+    /// Response side only. A PUT's `Content-Digest` is checked by the
+    /// SDK over the body as it arrives, before the write is committed;
+    /// this callback, which can only read what is already stored, is
+    /// not consulted for it.
     int  (*digest)(void *user, const char *path,
                    const char *algo,
                    char *out_hex, size_t hex_size) AXL_CB_NOEXCEPT;
@@ -1341,7 +1569,31 @@ typedef struct {
     /// the Want-Digest parsing.
     void (*before_response)(void *user, AxlHttpRequest *req,
                             AxlHttpResponse *resp) AXL_CB_NOEXCEPT;
+
+    /// What the backend takes on itself: AXL_WEBDAV_CAP_* bits, 0 (the
+    /// default a designated initializer leaves) for none.
+    uint32_t caps;
 } AxlWebDavOps;
+
+/// AxlWebDavOps.caps: the backend decides whether two paths name ONE entry
+/// itself -- by what its filesystem stores, not by spelling. A MOVE or COPY
+/// with `Overwrite: F` whose destination differs from the source in letter
+/// case only (a trailing '/' aside) is then forwarded to the op with
+/// `overwrite` false instead of being refused 412: on a case-insensitive
+/// volume it is a rename of the source itself ("a.txt" to "A.TXT").
+/// OBLIGATION: with `overwrite` false the op must refuse a destination that
+/// exists and is a DIFFERENT entry -- on a case-sensitive volume "A.txt" is
+/// one -- with @c AXL_EXISTS (412), changing nothing. axl_fs_webdav_ops()
+/// sets it, and keeps it.
+/// The "letter case only" test folds ASCII letters only: a destination
+/// differing from the source in the case of a non-ASCII letter ("é" to
+/// "É") is not a case variant, so with `Overwrite: F` it is refused 412
+/// like any existing destination -- the safe side.
+#define AXL_WEBDAV_CAP_IDENTITY  0x01u
+
+/// AxlWebDavOps.write_open: the body's length is not known up front -- a
+/// chunked PUT (`Transfer-Encoding: chunked`).
+#define AXL_WEBDAV_LENGTH_UNKNOWN  UINT64_MAX
 
 /**
  * @brief Mount a WebDAV handler at @p prefix.
@@ -1398,17 +1650,58 @@ axl_http_server_add_webdav_auth(
 /// Serve read-only: PUT / DELETE / MKCOL / MOVE / COPY are rejected
 /// with 405 Method Not Allowed; GET / HEAD / PROPFIND / OPTIONS work.
 #define AXL_SERVE_FS_READONLY     0x01u
-/// Reject the DELETE verb (405). Scope is literal: DELETE only. MOVE is
-/// still allowed (and a MOVE relocates, removing the source from its
-/// original path) — use AXL_SERVE_FS_READONLY for "nothing changes".
+/// Reject the DELETE verb (405), and any MOVE or COPY overwrite that would
+/// remove an existing COLLECTION (403, nothing changed): an overwrite must
+/// not wipe a tree DELETE may not. Replacing an existing FILE by MOVE or
+/// COPY is still allowed, and MOVE itself still is (it relocates, removing
+/// the source from its original path) — use AXL_SERVE_FS_READONLY for
+/// "nothing changes".
 #define AXL_SERVE_FS_NO_DELETE    0x02u
 /// PUT / MOVE / COPY must not replace an existing resource: an
 /// overwrite is refused. Enforced by a destination existence-check in
-/// the ops (PUT opens with exclusive-create; MOVE/COPY pre-stat the
-/// destination — `axl_file_move` itself replaces unconditionally, so it
-/// is never delegated the check). A refusal surfaces as 409 Conflict —
-/// the ops layer has no channel to return the RFC-ideal 412 in v1.
+/// the ops (PUT checks before it writes a byte, and again when it would
+/// replace; MOVE/COPY check the destination before anything changes). A
+/// refused PUT is 409 Conflict and a refused MOVE or COPY 412
+/// Precondition Failed -- as for a client's own `Overwrite: F` -- with
+/// the existing resource intact.
 #define AXL_SERVE_FS_NO_OVERWRITE 0x04u
+/// A PUT over an existing FILE writes it IN PLACE when the volume cannot
+/// hold a second copy -- and only then. The decision is made when the PUT
+/// opens, from its `Content-Length`: the body's allocation units plus the
+/// directory room the temp's entry and the commit's replace take (the new
+/// name, the old file's aside, the name an undo writes back -- counted as
+/// axl_file_replace() counts them, so a long name costs more than an 8.3
+/// one) against the volume's free space. On FAT32 that free space is the
+/// FSInfo hint, which a volume another OS left inconsistent can misstate. Short of that, the file is truncated and the
+/// body streamed into it; otherwise -- room enough, a chunked body (no
+/// length to decide by), a volume that cannot report its free space, or a
+/// NEW file -- the PUT is the atomic one. Not atomic: see
+/// #AXL_SERVE_FS_PUT_IN_PLACE for what a failed in-place PUT leaves.
+#define AXL_SERVE_FS_PUT_IN_PLACE_IF_SHORT 0x08u
+/// Every PUT over an existing FILE writes it IN PLACE: truncated, then the
+/// body streamed into it, with no temp and no room needed for a second
+/// copy. A NEW file still goes through the temp (it costs no extra room,
+/// and a failed PUT then leaves nothing). Wins over
+/// #AXL_SERVE_FS_PUT_IN_PLACE_IF_SHORT. NOT ATOMIC: a PUT that does not
+/// complete -- the client hangs up, a write or the final flush fails, the
+/// body does not match its `Content-Digest`, or its chunked framing is
+/// malformed -- leaves the file PARTIALLY written, its old content gone.
+/// That is answered 500 with a body saying so (a hang-up cannot be
+/// answered), 400 for a digest mismatch or malformed framing (with the
+/// same "partially written" body for the framing), and always logged as
+/// an error naming the file. Every refusal is still made before the file
+/// is touched: a read-only file (403), a collection (409), an existing
+/// file on a no-overwrite mount (409), a live temp (403), and a body that
+/// would not fit even in place (507). While the write runs the file is
+/// busy for every WebDAV mount (serve-fs) in the process -- two mounts
+/// may serve one directory; SFTP and 9P exports do NOT consult this set,
+/// so they can still rename or delete the file -- known by the names the filesystem STORES -- an 8.3 alias
+/// or another letter case of the file or of any directory on the way is
+/// the same file: another PUT to it is 503 with `Retry-After: 1`; a DELETE
+/// of it (or of a directory holding it), and a MOVE or COPY that would
+/// replace or remove it, is 423 Locked. A request whose path on that
+/// volume cannot be resolved while a write in place runs there is 500.
+#define AXL_SERVE_FS_PUT_IN_PLACE 0x10u
 
 /**
  * @brief A filesystem subtree bound to a WebDAV path-space.
@@ -1461,12 +1754,80 @@ axl_fs_root_free(
  *
  * Each callback maps to an `<axl/axl-fs.h>` primitive (list_dir →
  * `axl_dir_*`, stat → `axl_file_info`, read → `axl_file_view`, write →
- * `AxlFileWriter`, mkdir → `axl_dir_mkdir`, remove →
- * `axl_file_delete`/`axl_dir_rmdir`, move → `axl_file_move`, copy →
- * stream read+write / recursive). Pass it to
+ * `AxlFileWriter` on a temp sibling, then `axl_file_replace`, mkdir →
+ * `axl_dir_mkdir`, remove → `axl_file_delete`/`axl_dir_rmdir`, move →
+ * `axl_file_replace` with COPY and TREE, copy → that replace's
+ * transaction around the library's tree copy -- iterative, so no
+ * depth bound and no stack growth; Ctrl-C ends it as 500 with nothing
+ * of the copy left). Pass it to
  * `axl_http_server_add_webdav` with an `AxlFsRoot*` as `user_data`. A
  * consumer that wants to wrap or extend the behavior can copy this
- * table and override individual callbacks.
+ * table and override individual callbacks -- but the table carries
+ * #AXL_WEBDAV_CAP_IDENTITY, so a copy that overrides `move` or `copy`
+ * must either meet that cap's obligation (with `overwrite` false, refuse
+ * a destination that exists and is a different entry, with
+ * @c AXL_EXISTS) or clear `caps`. A wrapper that keeps the cap and
+ * ignores `overwrite` lets a case-variant `Overwrite: F` transfer replace
+ * another entry on a case-sensitive volume.
+ *
+ * MOVE is axl_file_replace() with #AXL_FILE_REPLACE_COPY and
+ * #AXL_FILE_REPLACE_TREE, and COPY its transaction with the source kept:
+ * every refusal is decided before anything changes, by the names the
+ * filesystem STORES. A MOVE or COPY onto the source itself under another
+ * spelling (its 8.3 alias) is 403 with `Overwrite: T`, and 412 with
+ * `Overwrite: F` -- the handler finds the destination existing and answers
+ * first. A MOVE onto a collection holding the source or a collection into
+ * its own subtree, and a COPY into its own subtree, are 403. Nothing
+ * changes in any of these. A MOVE that changes only the name's letter
+ * case ("a.txt" to "A.TXT", as clients that rename by MOVE send it) on a
+ * case-insensitive volume renames it: 204, with either Overwrite value --
+ * the destination is found only because it IS the source (the table sets
+ * #AXL_WEBDAV_CAP_IDENTITY). On a case-sensitive volume the two names are
+ * two entries, and the transfer is an overwrite like any other: 412 with
+ * `Overwrite: F` or on a no-overwrite mount, 403 onto a collection on a
+ * no-delete mount. An existing destination with `Overwrite: T` is renamed
+ * aside
+ * (`~AXLhhhh.TMP`), the source moved or copied into its place, and only
+ * then is the aside removed; a move or copy that fails puts it back, so it
+ * costs nothing. An aside that cannot be removed in full is left in place
+ * and logged as a warning naming it; the request still succeeds, as the
+ * resource is where the client asked. A volume without the room the
+ * sequence may need is 507, nothing changed.
+ *
+ * A PUT is atomic. The body is written to a temp sibling of the target
+ * (`~APxxxxx.TMP`, five hex digits -- an 8.3 name, so it has no other
+ * spelling), and only once it is complete and flushed does it replace
+ * the target: the old file is renamed aside, the temp renamed into
+ * place, the aside deleted. A PUT that does not complete (the client
+ * hangs up, a write fails, the body does not match its `Content-Digest`)
+ * removes its temp and leaves the target exactly as it was. Replacing a
+ * file therefore needs room for both for a moment: a PUT whose
+ * `Content-Length` is more than the volume's free space is 507 before a
+ * byte is written (a chunked one learns it when a write fails: 500). A
+ * mount that must take files too large for that opts into writing them in
+ * place, #AXL_SERVE_FS_PUT_IN_PLACE_IF_SHORT or #AXL_SERVE_FS_PUT_IN_PLACE,
+ * at the price of atomicity. An existing file keeps
+ * the name it is stored under, however the PUT spelled it (an 8.3 alias,
+ * another letter case). A PUT replaces a
+ * FILE only: a collection at the target, an existing file on a
+ * no-overwrite mount (409) or a read-only file (403) is refused before a
+ * byte is written -- and checked again at the commit, so a collection
+ * made or moved there while the body streamed is 409 and is never
+ * removed. While a PUT is in flight its temp is not a resource. It is
+ * recognised by its NAME, which is unique among live temps and has no
+ * alias, so no spelling of the directory it sits in (an 8.3 alias
+ * included) reaches it: PROPFIND does not list it, a Depth-infinity COPY
+ * does not copy it, and a request naming it, in any letter case, finds
+ * nothing (a PUT to it, or a PUT whose target turns out to be it at the
+ * commit, is 403). A discarded temp is removed through the PUT's own
+ * handle, never by path.
+ * A temp-named file no PUT owns -- left by a power loss mid-PUT -- is an
+ * ordinary file, listed, readable and deletable, as Apache's mod_dav_fs
+ * leaves its own.
+ *
+ * On FAT a GET still streaming the old file when a PUT replaces it can be
+ * cut short: the EDK2 FAT driver truncates a deleted file's shared state
+ * under any handle still open on it, so that response ends early.
  *
  * The returned table is the full read-write set regardless of any
  * AxlFsRoot flags — the flags are applied by `axl_http_server_serve_fs`,

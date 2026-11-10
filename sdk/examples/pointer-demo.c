@@ -43,7 +43,7 @@
  * An absolute pointer is immune (its coordinates are framebuffer
  * fractions) where the firmware delivers EFI_ABSOLUTE_POINTER events.
  *
- * Build with: make pointer-demo
+ * Build with: scripts/axl-build.sh pointer-demo
  */
 
 #include <axl.h>

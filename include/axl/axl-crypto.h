@@ -18,6 +18,23 @@
  * no — whether THIS IMAGE linked a given algorithm. Use it to
  * distinguish "algorithm not linked" from "signature invalid".
  *
+ * **Every key-handle algorithm is opt-in, in code.** An image carries
+ * an algorithm only if it calls that algorithm's enable function —
+ * calling it is what links the provider, exactly as calling
+ * axl_tls_init() is what links TLS:
+ *
+ * - axl_pk_enable_mbedtls() — ECDSA P-256 / P-384 and RSA;
+ * - axl_pk_enable_ed25519() — Ed25519.
+ *
+ * Some callers make the call for you. AxlJose enables mbedTLS itself,
+ * and so does every ECDSA/RSA-specific function in this header —
+ * axl_pk_verify() and the example below included — because they live
+ * in the provider's own object. AxlSsh enables Ed25519 itself. Only an
+ * image that reaches an algorithm through the generic axl_pk_key_new() /
+ * axl_pk_key_load_private() / axl_pk_key_load_public() /
+ * axl_pk_key_from_raw_public() alone must call the function; without it
+ * those calls return NULL and log one error line naming the function.
+ *
  * @code
  * // pubkey: DER SubjectPublicKeyInfo baked into the image at build time.
  * // sig:    detached DER ECDSA signature over msg (ECDSA-with-SHA-256).
@@ -75,6 +92,78 @@ axl_consttime_equal(
     size_t      len   ///< number of bytes to compare
 );
 
+// ---------------------------------------------------------------------------
+// Entropy policy
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Permit key material to be derived from a clock when the
+ *     firmware publishes no hardware RNG.
+ *
+ * Every private key this SDK produces -- SSH host keys, X25519 and
+ * P-256 ephemerals, RSA and ECDSA key pairs, TLS session secrets --
+ * comes out of one process-global CTR-DRBG, and that DRBG is seeded
+ * from a single entropy source: `EFI_RNG_PROTOCOL` (UEFI 2.11 §37.5).
+ *
+ * When the protocol is absent or its `GetRNG` fails, the default is to
+ * FAIL: the entropy source reports failure, seeding fails, and every
+ * call that needs randomness returns its error or NULL sentinel. No
+ * key is produced. That is deliberate -- a key nobody can generate is
+ * strictly better than a key an attacker can guess.
+ *
+ * Passing true opts a platform out of that. The seed then comes from a
+ * xorshift generator started from the real-time clock and the
+ * firmware's monotonic counter. **In plain terms: keys become
+ * predictable to anyone who can bound when the machine booted.** An
+ * attacker who knows the boot happened inside a one-second window
+ * searches a space small enough to enumerate on a laptop -- which for
+ * an SSH host key means impersonating the host, and for an ephemeral
+ * means decrypting the session. Enable it only on a platform that
+ * genuinely publishes no RNG, only when the operator has accepted that
+ * exposure, and never for a key that outlives the boot.
+ *
+ * Every draw that actually falls back logs at warning level, so the
+ * choice is visible in a production image rather than only under `-v`.
+ *
+ * ORDERING. Seeding is LAZY and the seed is cached for the lifetime of
+ * the process: the DRBG is seeded by the first call that needs
+ * randomness -- axl_pk_key_new(), axl_ecdh_new(), axl_aead_seal(),
+ * axl_tls_init(), axl_ssh_server_new(), or any TLS handshake -- and
+ * the result is reused from then on. Call this BEFORE any of them.
+ * Enabling it afterwards does not retroactively rescue a seed that
+ * already failed on this call, though a later seeding attempt (each
+ * failed attempt is retried on the next call) will honor the new
+ * setting. Disabling it afterwards does not un-taint a DRBG already
+ * seeded from a clock.
+ *
+ * Not thread-safe against a concurrent seeding attempt; set it once
+ * during startup, from the same context that will use the crypto.
+ */
+void
+axl_crypto_set_weak_entropy_allowed(
+    bool allowed   ///< true to permit the clock-seeded fallback; false
+                   ///< (the default) to fail when no hardware RNG is
+                   ///< available
+);
+
+/**
+ * @brief Report whether the clock-seeded entropy fallback is permitted.
+ *
+ * Answers what axl_crypto_set_weak_entropy_allowed() was last set to,
+ * NOT whether the fallback has been used or whether a hardware RNG
+ * exists. A false here means seeding will fail on a platform with no
+ * `EFI_RNG_PROTOCOL`; it does not promise that this platform has one.
+ * To ask whether the firmware publishes an RNG, call axl_rng_bytes()
+ * (@ref axl-rng.h) -- it never falls back.
+ *
+ * @return true if the fallback is permitted, false (the default) if
+ *     the absence of a hardware RNG is a hard failure.
+ */
+bool
+axl_crypto_is_weak_entropy_allowed(
+    void
+);
+
 /**
  * @brief Public-key signature algorithm selector.
  *
@@ -83,16 +172,20 @@ axl_consttime_equal(
  * range.
  */
 typedef enum {
-    AXL_PK_ED25519    = 0,  /**< Ed25519 — reserved; NOT supported by the
-                                 current mbedTLS build (mbedTLS has no
-                                 twisted-Edwards curve; see
-                                 axl_pk_alg_available()). axl_pk_verify()
-                                 returns AXL_ERR for this algorithm. Because
-                                 this is value 0, a zero-initialized selector
-                                 fails closed (nothing verifies) — always set
-                                 #AXL_PK_ECDSA_P256 explicitly. */
+    AXL_PK_ED25519    = 0,  /**< Ed25519 (RFC 8032). Supported by the
+                                 key-handle API, but **opt-in** — call
+                                 axl_pk_enable_ed25519(); see also
+                                 axl_pk_alg_available().
+                                 NOT supported by the raw-bytes
+                                 axl_pk_verify() below, which returns
+                                 AXL_ERR for it. Because this is value 0,
+                                 a zero-initialized selector names this
+                                 algorithm rather than nothing — always
+                                 set the algorithm explicitly. */
     AXL_PK_ECDSA_P256 = 1,  /**< ECDSA over NIST P-256 (prime256v1) with
-                                 SHA-256. */
+                                 SHA-256. Opt-in for the key-handle API,
+                                 as are P-384 and RSA — call
+                                 axl_pk_enable_mbedtls(). */
     AXL_PK_RSA        = 2,   /**< RSA with PKCS#1 v1.5 over SHA-256
                                  (rsa-sha2-256). Keygen produces a 3072-bit
                                  key. Supported by the key-handle API
@@ -125,14 +218,13 @@ typedef enum {
  * @brief Whether public-key signature verification is present in this build.
  *
  * Always true, guaranteed. mbedTLS is an unconditional dependency, so
- * this cannot answer no — do not branch on it. It stays public API
+ * this cannot answer no — do not branch on it. (Linking this function
+ * links no algorithm.) It stays public API
  * only so existing consumer source keeps compiling.
  *
- * The question that CAN still answer no is whether this image linked a
- * particular algorithm: use axl_pk_alg_available(). When THAT is
- * false, axl_pk_verify() returns AXL_ERR regardless of input, so a
- * caller that must fail closed on a missing algorithm branches on
- * axl_pk_alg_available() — never on this.
+ * The question that CAN still answer no is whether this image enabled a
+ * particular algorithm for the key-handle API: use
+ * axl_pk_alg_available() — never this.
  *
  * @return always true.
  */
@@ -155,21 +247,24 @@ axl_pk_available(void);
  *     SHA-256(@p msg) internally (ECDSA-with-SHA-256). @p msg may be
  *     NULL only when @p msg_len is 0.
  *
- * #AXL_PK_ED25519 is reserved and unsupported by this build; it
- * returns AXL_ERR.
+ * Needs no enable call: this function lives in the mbedTLS provider's
+ * object, so calling it enables ECDSA/RSA in the image by itself (see
+ * axl_pk_enable_mbedtls()). #AXL_PK_ED25519 is not supported by *this*
+ * entry point and returns AXL_ERR, even in an image that enabled the
+ * Ed25519 provider — use the key-handle API (axl_pk_key_load_public() +
+ * axl_pk_key_verify()) for it.
  *
  * Operates only on public inputs; there is no secret to leak. Any
  * parse or verify failure is reported uniformly as AXL_ERR — a caller
  * must treat every non-AXL_OK result as "not verified, untrusted" and
  * fail closed. Do NOT branch security decisions on the *reason* for
- * failure; the only distinction the API offers is
- * axl_pk_alg_available(), which separates "this image did not link that
- * algorithm" from "invalid".
+ * failure.
  *
  * @return AXL_OK if the signature is valid for @p msg under @p pubkey;
  *     AXL_ERR otherwise — invalid signature, malformed key/signature,
- *     NULL/zero-length key or signature, unsupported algorithm, or an
- *     algorithm this image did not link (see axl_pk_alg_available()).
+ *     NULL/zero-length key or signature, or an algorithm this entry
+ *     point does not support (anything but #AXL_PK_ECDSA_P256, which
+ *     includes the reserved #AXL_PK_ED25519).
  */
 AXL_WARN_UNUSED int
 axl_pk_verify(
@@ -211,10 +306,13 @@ typedef struct AxlPkKey AxlPkKey;
  * @c AXL_PK_ECDSA_P256 generates a NIST P-256 key; @c AXL_PK_ECDSA_P384
  * a NIST P-384 key; @c AXL_PK_RSA generates a 3072-bit RSA key (slower —
  * seconds on some firmware, but a one-time cost for a persisted host key).
- * @c AXL_PK_ED25519 is unsupported and returns NULL.
+ * Every algorithm is available only in an image that enabled it (see
+ * the file overview); otherwise this returns NULL and logs one error
+ * line naming the enable function to call. Check
+ * axl_pk_alg_available() first if the algorithm is chosen at runtime.
  *
  * @return a new private key handle (caller frees with axl_pk_key_free),
- *     or NULL on failure / unsupported algorithm / TLS not compiled in.
+ *     or NULL on failure / unsupported algorithm / algorithm not linked.
  */
 AxlPkKey *
 axl_pk_key_new(
@@ -228,8 +326,12 @@ axl_pk_key_new(
  * `openssl pkcs8 -topk8 -nocrypt -outform DER`, and of
  * axl_pk_key_get_private_der()).
  *
+ * Only the providers this image enabled are tried (see the file
+ * overview). DER naming an algorithm whose provider is not enabled
+ * returns NULL and logs one error line naming the function to call.
+ *
  * @return a new key handle, or NULL on malformed input / unsupported
- *     key type / TLS not compiled in.
+ *     key type / key type not linked.
  */
 AxlPkKey *
 axl_pk_key_load_private(
@@ -243,8 +345,10 @@ axl_pk_key_load_private(
  * Same encoding the raw-bytes axl_pk_verify() accepts. The resulting
  * handle can verify but not sign.
  *
+ * Same provider rule as axl_pk_key_load_private().
+ *
  * @return a new key handle, or NULL on malformed input / unsupported
- *     key type / TLS not compiled in.
+ *     key type / key type not linked.
  */
 AxlPkKey *
 axl_pk_key_load_public(
@@ -261,7 +365,7 @@ axl_pk_key_load_public(
  * - #AXL_PK_ECDSA_P256 / #AXL_PK_ECDSA_P384 — an uncompressed SEC1
  *   point, `0x04 || X || Y`: 65 bytes for P-256, 97 for P-384.
  * - #AXL_PK_ED25519 — the 32-byte compressed point (RFC 8032 §5.1.2).
- *   **Not supported yet**; see axl_pk_alg_available().
+ *   Available only in an image that calls axl_pk_enable_ed25519().
  * - #AXL_PK_RSA has no meaningful raw form and is always rejected —
  *   use axl_pk_key_load_public() with DER.
  *
@@ -307,9 +411,18 @@ axl_pk_key_get_raw_public(
  *
  * Distinct from axl_pk_available(), which reports whether the
  * public-key layer is present at all. An algorithm can be absent from
- * an image that has the layer: #AXL_PK_ED25519 is opt-in at link time,
- * because its precomputed table is ~30 KB of resident `.rodata` that a
- * firmware driver should not carry unasked.
+ * an image that has the layer, because every algorithm is opt-in (see
+ * axl_pk_enable_mbedtls() and axl_pk_enable_ed25519()):
+ *
+ * - #AXL_PK_ED25519 — its precomputed base-point table is ~109 KB of
+ *   resident `.rodata`, ~125 KB all told, measured.
+ * - #AXL_PK_ECDSA_P256, #AXL_PK_ECDSA_P384 and #AXL_PK_RSA share one
+ *   provider over mbedTLS's PK layer, ~18 KB of a compressed driver
+ *   (RSA alone cannot be dropped: that layer reaches RSA by itself).
+ *
+ * This query is silent. The constructors are not: when one is asked for
+ * an algorithm whose provider the image did not enable it logs, once
+ * per call, an error line naming the function to call.
  *
  * Check this before axl_pk_key_new() when the algorithm is chosen at
  * runtime — it distinguishes "not linked" from "key generation
@@ -321,6 +434,36 @@ bool
 axl_pk_alg_available(
     AxlPkAlg alg  ///< algorithm to query
 );
+
+/**
+ * @brief Enable ECDSA P-256 / P-384 and RSA for the key-handle API.
+ *
+ * The opt-in is the CALL, not anything it does at run time: this
+ * function lives in the mbedTLS provider's object, so referencing it
+ * links that provider — and mbedTLS's PK layer with it — into the
+ * image. An image that never calls it (and uses neither AxlJose nor an
+ * ECDSA/RSA-specific function, which call it for you) carries none of
+ * that code, and axl_pk_alg_available() answers false for those
+ * algorithms.
+ *
+ * Idempotent and safe at any point: before or after any other AxlPk
+ * call, any number of times. Keys created before the call are
+ * unaffected — there can be none of these algorithms, since the
+ * provider was linked or it was not.
+ */
+void
+axl_pk_enable_mbedtls(void);
+
+/**
+ * @brief Enable Ed25519 for the key-handle API.
+ *
+ * Same shape as axl_pk_enable_mbedtls(): calling it links the Ed25519
+ * provider, whose precomputed base-point table is ~109 KB of
+ * `.rodata`. AxlSsh calls it for you (its only host-key algorithm is
+ * `ssh-ed25519`). Idempotent and safe at any point.
+ */
+void
+axl_pk_enable_ed25519(void);
 
 /**
  * @brief Serialize a key's private half as PKCS#8 DER.
@@ -366,8 +509,17 @@ axl_pk_key_get_public_der(
 /**
  * @brief Report a key handle's algorithm.
  *
- * @return the AxlPkAlg of @p key (AXL_PK_ECDSA_P256, AXL_PK_ECDSA_P384, or
- *     AXL_PK_RSA). Returns AXL_PK_ED25519 (the reserved zero value) for a
+ * @warning A NULL @p key returns #AXL_PK_ED25519, because that is the
+ *     enum's zero value — and it now names a REAL, usable algorithm
+ *     rather than a reserved one. So this function cannot distinguish
+ *     "an Ed25519 key" from "no key at all". Check the handle for NULL
+ *     yourself; do not infer it from the return. The value is kept as
+ *     it is deliberately: the alternatives are returning something
+ *     outside AxlPkAlg's range from a function typed to return one, or
+ *     adding an enumerator no caller has asked for.
+ *
+ * @return the AxlPkAlg of @p key — #AXL_PK_ED25519, #AXL_PK_ECDSA_P256,
+ *     #AXL_PK_ECDSA_P384 or #AXL_PK_RSA. See the warning above for a
  *     NULL handle.
  */
 AxlPkAlg
@@ -413,8 +565,36 @@ axl_pk_key_sign(
  * (64 bytes for P-256). For RSA, @p fmt is ignored.
  *
  * Any non-AXL_OK result means "not verified, untrusted" — fail closed.
+ * Test `!= AXL_OK`, never `== AXL_ERR`: there is more than one refusal.
  *
- * @return AXL_OK if the signature is valid; AXL_ERR otherwise.
+ * One of them also says WHY, for a caller that reports refusals: an
+ * #AXL_PK_ED25519 check that could not be made because memory ran out
+ * returns #AXL_NO_RESOURCES before the signature is examined at all, which
+ * is a statement about this machine and not about the signer -- a server
+ * that treats a bad signature as an attack must not treat this as one.
+ * That allocation is 2 x (64 + @p msg_len) bytes, so it is size-driven as
+ * well as pressure-driven: a caller that classifies on this code must bound
+ * the message length itself, or a signer that controls it chooses the
+ * answer. (A failure inside Ed25519's own hash is AXL_ERR too, although it
+ * is not the signer's doing either. It is reported as a verdict because it
+ * cannot happen in a supported configuration -- the build refuses the
+ * mbedTLS options that would allow it -- and "not verified" is the safe
+ * reading of a check that went wrong. The cost, if a future configuration
+ * ever made it reachable: a caller that treats AXL_ERR as forgery, as
+ * AxlSsh does, would blame the peer for the verifier's fault.)
+ *
+ * **The mbedTLS-backed algorithms (ECDSA, RSA) do not separate that case,
+ * deliberately: every failure of theirs is AXL_ERR.** mbedTLS reports an
+ * oversize integer as `MBEDTLS_ERR_MPI_ALLOC_FAILED` too (`mbedtls_mpi_grow`
+ * refuses more than `MBEDTLS_MPI_MAX_LIMBS` with that code, before any
+ * allocation), and the SIGNER chooses the integers' size. Mapping it to
+ * #AXL_NO_RESOURCES would let a peer turn a forgery into "could not check"
+ * at will, which is exactly the charge a caller distinguishing the two is
+ * trying not to drop. Do not "complete" the mapping.
+ *
+ * @return AXL_OK if the signature is valid; #AXL_NO_RESOURCES when an
+ *     Ed25519 check could not be made for lack of memory (NOT verified);
+ *     AXL_ERR otherwise.
  */
 AXL_WARN_UNUSED int
 axl_pk_key_verify(

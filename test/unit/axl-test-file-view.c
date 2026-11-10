@@ -298,6 +298,33 @@ coh_is(AxlFileView *v, const char *want)
     return axl_strcmp(buf, want) == 0;
 }
 
+/* axl_ftruncate reaches an open view too, through a stream opened BEFORE
+   the view, so the open's own bump is not what does it.
+
+   A directory move cannot be pinned the same way on FAT: the view holds its
+   file open, and the driver refuses to move a directory with an open file
+   below it. axl_file_rename still invalidates every view on a directory
+   move, for filesystems that allow it. */
+static void
+test_file_view_coherence_ftruncate(void)
+{
+    AxlStream *s = (axl_file_set_contents(COH_PATH, "abcdef", 6) == AXL_OK)
+                   ? axl_fopen(COH_PATH, "w") : NULL;
+    if (s == NULL) {
+        test_fail("fv coherence: ftruncate setup");
+        return;
+    }
+    AxlFileView *v = axl_file_view_open(COH_PATH, PAGE, FRAMES);
+    test_check(v != NULL && coh_is(v, "abcdef"),
+               "fv coherence: view open on abcdef");
+    test_check(axl_ftruncate(s, 2) == AXL_OK && v != NULL && coh_is(v, "ab"),
+               "fv coherence: axl_ftruncate reaches an open view");
+    axl_fclose(s);
+    axl_file_view_close(v);
+    axl_file_delete(COH_PATH);
+
+}
+
 static void
 test_file_view_coherence(void)
 {
@@ -443,6 +470,7 @@ test_file_view_main(int argc, char **argv)
     test_file_view();
     test_file_view_shared_cache();
     test_file_view_coherence();
+    test_file_view_coherence_ftruncate();
 
     return test_print_results();
 }

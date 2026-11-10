@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=29 local-only=0
+# test-meta: arch=x64 needs= est=29 local-only=0 guest=plain
 # test-jose-cc-qemu.sh — dogfood axl-jose through the SDK consumer path.
 #
 # Proves a real consumer can use <axl/axl-jose.h>: stages an SDK,

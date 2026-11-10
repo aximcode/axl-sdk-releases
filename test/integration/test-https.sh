@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=18 local-only=0
+# test-meta: arch=x64 needs= est=18 local-only=0 guest=standard
 # AxlTls HTTPS integration test — boots QEMU with TLS-enabled HTTP server,
 # validates with curl --insecure from the host.
 #
@@ -18,28 +18,14 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 TEST_BUILD_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" all tests 2>&1 | tail -3
 
 test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
 # Startup: init network, start HTTPS server
-cat << 'NSHEOF' | test_set_startup
-@echo -off
-fs0:
-cd \
-
-echo Connecting drivers...
-connect -r
-stall 1000000
-
-echo Configuring network via DHCP...
-ifconfig -s eth0 dhcp
-stall 3000000
-
-echo Starting HTTPS server...
-AxlTestNet.efi serve-tls
-NSHEOF
+# The startup commands live in test-https.nsh
+test_use_nsh
 
 test_build_image
 
@@ -52,8 +38,8 @@ test_run_background
 echo "  QEMU PID: $TEST_QEMU_PID, port: $HOST_PORT -> $GUEST_PORT"
 echo "  Waiting for HTTPS server..."
 
-if ! test_wait_for "READY" 60; then
-    echo "FAIL: HTTPS server did not start within 60 seconds"
+if ! test_wait_boot "READY" 60; then
+    echo "FAIL: HTTPS server did not start within ${TEST_WAITED_S} seconds"
     test_clean_log
     echo "--- Serial log ---"
     tail -30 "$TEST_CLEAN_LOG"
@@ -76,14 +62,14 @@ pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 # GET /api/version over HTTPS
-RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" 2>/dev/null || true)
+RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/api/version" || true)
 CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 [[ "$CODE" == "200" ]] && pass "HTTPS GET /api/version returns 200" || fail "HTTPS GET (got $CODE)"
 echo "$BODY" | grep -q '"version"' && pass "HTTPS response has version" || fail "HTTPS missing version"
 
 # GET /plain over HTTPS
-RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/plain" 2>/dev/null || true)
+RESP=$(test_curl "${CURL_OPTS[@]}" -w "\n%{http_code}" "${BASE_URL}/plain" || true)
 CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 [[ "$CODE" == "200" ]] && pass "HTTPS GET /plain returns 200" || fail "HTTPS /plain (got $CODE)"
@@ -120,7 +106,7 @@ RECONNECT_N=${AXL_TLS_RECONNECT_N:-40}
 rc_fail=0
 declare -A rc_seen=()
 for _i in $(seq 1 $RECONNECT_N); do
-    curl -s --insecure -H "Connection: close" --max-time 5 \
+    test_curl -s --insecure -H "Connection: close" --max-time 5 \
          -o /dev/null "${BASE_URL}/plain"
     rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -225,8 +211,8 @@ for _round in $(seq 1 $CONC_ROUNDS); do
         # -w always emits exactly one line (000 on connect/handshake
         # failure), so no `|| echo` fallback -- that double-counts a
         # failing request and inflates the total.
-        ( curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}\n' \
-              "${BASE_URL}/plain" 2>/dev/null || true ) &
+        ( test_curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}\n' \
+              "${BASE_URL}/plain" || true ) &
     done; wait)
     while IFS= read -r _code; do
         conc_total=$((conc_total + 1))

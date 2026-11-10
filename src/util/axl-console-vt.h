@@ -16,13 +16,15 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <axl/axl-console-ops.h>
+#include <axl/axl-console-screen.h>
 
 typedef struct AxlString AxlString;   /* fwd; <axl/axl-string.h> in the .c */
 
 /**
  * @brief Encode a pen snapshot as a full SGR escape "ESC[0;<fg>;<bg>;<styles>m".
  *
- * Standard SGR vocabulary only: 39/49 default, 38;5;N/48;5;N indexed,
+ * Standard SGR vocabulary only: 39/49 default, 30-37/90-97 and 40-47/100-107 for
+ * the 16 ANSI colours (indexed 0..15), 38;5;N/48;5;N for the rest of the 256,
  * 38;2;R;G;B / 48;2;R;G;B truecolour, plus 1/3/4/5/7/8/9 for the style bits. The
  * leading 0 resets, so the escape is absolute — it fully replaces any prior pen.
  *
@@ -34,6 +36,19 @@ typedef struct AxlString AxlString;   /* fwd; <axl/axl-string.h> in the .c */
  */
 size_t
 axl_console_pen_to_sgr(char *buf, size_t cap, const AxlConsolePen *pen);
+
+/**
+ * @brief Repaint only the grid on show: clear, its cells, pen, cursor -- no 1049.
+ *
+ * The full snapshot repaints the primary and, when the alternate screen is active,
+ * switches to it and repaints that too: right for a terminal that has seen nothing.
+ * An encoder that has just written its own 1049 switch needs only the screen the
+ * console shows, written onto the screen the terminal now shows. Same sink
+ * contract and return as @ref axl_console_screen_snapshot.
+ */
+int
+_axl_console_screen_snapshot_active(const AxlConsoleScreen *s, AxlConsoleScreenSink sink,
+                                    void *user);
 
 // ---------------------------------------------------------------------------
 // AxlConsoleVtBuf — a buffering VT sink shared by the two serializers.

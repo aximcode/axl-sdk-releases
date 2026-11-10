@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=20 local-only=0
+# test-meta: arch=both needs= est=20 local-only=0 builds=hello-minimal guest=standard
 # test-hello-minimal-qemu.sh — sdk/examples/hello-minimal.{c,cpp} boot and echo
 # their argument, in both languages.
 #
@@ -25,9 +25,10 @@
 # image and reading back the argument is the only check that covers it, and it
 # must run on BOTH arches for reason 2.
 #
-# `check-examples` still carries the compile half, and the Makefile rule
-# asserts .cpp registers no .init_array entry -- there is no runtime here to
-# walk it, so a global constructor would be silently unconstructed.
+# `check-examples` still carries the compile half, and
+# gate.hello-minimal-no-ctors (sdk/CMakeLists.txt) asserts .cpp registers no
+# .init_array entry -- there is no runtime here to walk it, so a global
+# constructor would be silently unconstructed.
 #
 # Ratchet-exempt (end-to-end scenario, not a unit binary's assertion count).
 #
@@ -43,7 +44,7 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 NATIVE_DIR="$(test_build_dir)"
 
-make -C "$PROJECT_DIR" ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$_native_arch" \
     hello-minimal 2>&1 | tail -2
 
 test_add_efi "$NATIVE_DIR/hello-minimal-c.efi"   "app/hmin-c.efi"
@@ -51,15 +52,9 @@ test_add_efi "$NATIVE_DIR/hello-minimal-cxx.efi" "app/hmin-cxx.efi"
 
 # Distinct arguments per language, so a test that somehow ran one image twice
 # cannot look like both passing.
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "app\\hmin-c.efi ARG-FROM-C"
-    echo "app\\hmin-cxx.efi ARG-FROM-CXX"
-    echo "echo HMIN_DONE"
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-hello-minimal-qemu.nsh.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh
 
 test_build_image
 
@@ -68,8 +63,8 @@ echo "=== hello-minimal: no-libaxl images boot and read argv ($TEST_ARCH) ==="
 test_build_qemu_cmd
 test_run_background
 
-if ! test_wait_for "HMIN_DONE" 120; then
-    echo "FAIL: fixture did not finish within 120s"
+if ! test_wait_boot "HMIN_DONE" 120; then
+    echo "FAIL: fixture did not finish within ${TEST_WAITED_S}s"
     test_clean_log; echo "--- Serial ---"; tail -60 "$TEST_CLEAN_LOG"
     exit 1
 fi

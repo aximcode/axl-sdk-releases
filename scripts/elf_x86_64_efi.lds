@@ -89,7 +89,7 @@ SECTIONS
      zero byte as literal file content (an N-byte static array added N bytes to
      the .efi). The crt0 _start ZEROES [_bss, _bss_end) before any C code runs
      (src/crt0/axl-crt0-gcc-*.S) — the loader's zero-fill is NOT relied upon
-     (fresh AllocatePages memory can be dirty; `make check-bss-clear` guards the
+     (fresh AllocatePages memory can be dirty; `gate.check-bss-clear` guards the
      crt0 clear). _bss/_bss_end are the bounds the crt0 reads. Page-aligned so
      it lands on its own PE section boundary. */
   .bss (NOLOAD) :
@@ -123,6 +123,12 @@ SECTIONS
   .rela.plt : { *(.rela.plt) }
   . = ALIGN(4096);
   .rodata : { *(.rodata*) }
+  . = ALIGN(4096);
+  /* A wrapped image's packed payload (src/pack/README.md). Its own section
+     so a loader recognises a wrapped FILE by name in the section table;
+     only the stub's link carries input for it, so in every other image it
+     is empty and objcopy (whose -j list for them omits it) drops it. */
+  .axlpack : { KEEP (*(.axlpack)) }
   . = ALIGN(4096);
   .dynsym   : { *(.dynsym) }
   . = ALIGN(4096);

@@ -43,4 +43,18 @@ axl_log_format_line(
     const char  *eol       ///< line ending, e.g. "\n" or "\r\n"
     );
 
+/* The console redirect behind axl_log_set_console_serial (axl-log-serial.c):
+   while a sink is set, the engine (axl-log.c) hands it each finished console
+   line -- CRLF-ended, @len bytes, NUL after -- instead of writing standard
+   error. An indirection so that the engine, linked into every image that
+   logs, references no serial code: only an image that redirects pulls it.
+   NULL restores standard error. Runs from the dispatcher (not re-entrant,
+   may be at raised TPL): no allocation, no logging, no waiting. */
+typedef void (*AxlLogConsoleSink)(const char *line, size_t len);
+
+void
+_axl_log_set_console_sink(
+    AxlLogConsoleSink sink   ///< the sink, or NULL for standard error
+    );
+
 #endif /* AXL_LOG_LINE_H */

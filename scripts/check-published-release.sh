@@ -145,6 +145,28 @@ else
     echo "  SKIP: no VERSION asset (releases before D2 published none)"
 fi
 
+# ---- the system packages come as a pair, named for this version ---------
+# The .deb and .rpm returned in 5.0.0 (AXL-Distribution-Design.md §17.5):
+# package axl-sdk-<v>, version <v>, release 1, in each distribution's file
+# naming. A release carrying one without the other, or one named for another
+# version, is a broken publish. Releases before 5.0.0 carried neither (and
+# 4.4.0 and earlier the unversioned axl-sdk.deb/.rpm), so "neither" passes.
+_debs=$(grep -c '\.deb$' "$WORK/summed.txt" || true)
+_rpms=$(grep -c '\.rpm$' "$WORK/summed.txt" || true)
+if [[ "$_debs" -eq 0 && "$_rpms" -eq 0 ]]; then
+    echo "  SKIP: this release publishes no .deb/.rpm"
+elif grep -qx 'axl-sdk\.deb' "$WORK/summed.txt"; then
+    echo "  SKIP: this release publishes the retired unversioned axl-sdk.deb/.rpm (4.4.0 and earlier)"
+elif grep -qx "axl-sdk-${VER}_${VER}-1_amd64\.deb" "$WORK/summed.txt" \
+     && grep -qx "axl-sdk-${VER}-${VER}-1\.x86_64\.rpm" "$WORK/summed.txt" \
+     && [[ "$_debs" -eq 1 && "$_rpms" -eq 1 ]]; then
+    pass "the .deb and .rpm are both published, named for $VER"
+else
+    fail "the system packages are not the pair this version needs:"
+    echo "        want axl-sdk-${VER}_${VER}-1_amd64.deb and axl-sdk-${VER}-${VER}-1.x86_64.rpm, got:"
+    grep -E '\.(deb|rpm)$' "$WORK/summed.txt" | sed 's/^/          /'
+fi
+
 # ---- the two stable URLs a first-time user hits -------------------------
 # These are the ONLY names that must never change (§14.1a). A release that
 # publishes them under a versioned name breaks `curl .../latest/download/...`

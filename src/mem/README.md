@@ -43,7 +43,7 @@ old size.
 
 ### Debug vs. Release
 
-In debug builds (`-DAXL_MEM_DEBUG`, the default for `make`):
+In debug builds (`-DAXL_MEM_DEBUG`, the default `BUILD=DEBUG`):
 
 - **Fill patterns**: newly allocated memory is filled with `0xDA`;
   freed memory is filled with `0xDF`. Use-after-free often manifests
@@ -96,8 +96,8 @@ In debug builds (`-DAXL_MEM_DEBUG`, the default for `make`):
   never inflates the leak report, and the teardown path drains the
   ring before printing its verdict.
 
-In release builds (`make BUILD=RELEASE`), these features are disabled
-and the allocator has minimal overhead.
+In release builds (`scripts/axl-build.sh BUILD=RELEASE`), these features are
+disabled and the allocator has minimal overhead.
 
 ### OOM Fault Injection
 

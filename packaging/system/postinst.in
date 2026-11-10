@@ -1,0 +1,22 @@
+#!/bin/sh
+# axl-sdk-@AXL_VERSION@ -- after install (.deb postinst, .rpm %post).
+#
+# The packages' `current` is /opt/axl-sdk-package, an alternatives link --
+# never install.sh's /opt/axl-sdk: two managers must not share one link
+# (AXL-Distribution-Design.md §17.5). The priority is the version, so the
+# newest installed package is current; `update-alternatives --config
+# axl-sdk-package` selects another. /etc/profile.d/axl-sdk.sh rides along as a
+# slave and APPENDS /opt/axl-sdk-package/bin to PATH.
+set -e
+root=/opt/axl-sdk-@AXL_VERSION@
+if command -v update-alternatives >/dev/null 2>&1; then
+    alt=update-alternatives
+else
+    alt=alternatives
+fi
+"$alt" --install /opt/axl-sdk-package axl-sdk-package "$root" @AXL_ALT_PRIORITY@ \
+    --slave /etc/profile.d/axl-sdk.sh axl-sdk-profile "$root/share/axl/profile.sh"
+echo "axl-sdk @AXL_VERSION@ is installed in $root."
+echo "  Log in again (or: . /etc/profile.d/axl-sdk.sh) to put axl and axl-cc on PATH."
+echo "  The bare-metal cross toolchain is separate:  axl-install-toolchain x64|aa64"
+exit 0

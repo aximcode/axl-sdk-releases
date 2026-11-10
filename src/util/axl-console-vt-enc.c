@@ -13,7 +13,10 @@
 
     Encoder-only state lives here: the sink, the late-join screen model, and the
     redundant-cursor dedup (a full-screen app re-positions to the same cell to blink
-    its cursor, which would otherwise flood the wire with escapes).
+    its cursor, which would otherwise flood the wire with escapes). The dedup is
+    only as good as the tracked cursor, so the encoder follows the TERMINAL's
+    cursor through every op, text included, and keeps the terminal in step with a
+    UEFI console at the right margin (see vt_output_text).
 
     The op bodies are the mirror's, moved verbatim — the emitted byte stream is
     load-bearing (goldens, and every already-deployed consumer), so the refactor is
@@ -25,6 +28,8 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-log.h>
 #include <axl/axl-str.h>
+#include <axl/axl-string.h>
+#include <axl/axl-vterm.h>        /* axl_vterm_char_width: the terminal's cell width */
 #include "axl-console-vt.h"   /* shared pen->SGR encoder (DRY with axl-console-screen) */
 
 AXL_LOG_DOMAIN("console");
@@ -55,12 +60,26 @@ struct AxlConsoleVtEnc {
     bool               coalesce;
     AxlConsoleVtBuf    outbuf;
 
-    /* Cursor-dedup state: the last position EMITTED as an escape (or 0,0 after a
-       clear). Encoder-only — the producer separately maintains the true console
-       cursor in the Mode it owns. Not advanced from text output (that heuristic
-       drifts on line-wrap and would falsely suppress a needed reposition). */
-    int32_t            cur_row;   /* -1 = unknown */
+    /* The far terminal's cursor after everything emitted so far: set by a CUP or
+       a clear, advanced by text (vt_output_text). A move to it is suppressed.
+       -1 = unknown, after which the next move is always emitted. */
+    int32_t            cur_row;
     int32_t            cur_col;
+
+    /* The console's geometry: where text wraps and where a line feed scrolls. */
+    uint32_t           cols;
+    uint32_t           rows;
+
+    /* The producer's cell rule (set_cell_rule): false until told otherwise,
+       which is AxlConsoleOps's default, ONE_PER_CODEPOINT. */
+    bool               width_resolved;
+
+    /* The last SGR emitted: the pen the console is writing with. A repaint from
+       the screen model does not always end on it (an SGR with no text after it
+       yet ends the repaint on the default pen), so a repaint -- late join, a 1049
+       switch -- re-emits it last. */
+    char               sgr[64];
+    size_t             sgr_len;
 };
 
 // ---------------------------------------------------------------------------
@@ -104,7 +123,7 @@ vt_clear_screen(void *user)
 {
     AxlConsoleVtEnc *e = (AxlConsoleVtEnc *)user;
     emit_cstr(e, "\x1b[2J\x1b[H");
-    e->cur_row = 0;   /* the terminal cursor is home; dedup tracks from here */
+    e->cur_row = 0;   /* the terminal cursor is home; tracking starts from here */
     e->cur_col = 0;
 }
 
@@ -128,32 +147,205 @@ vt_set_cursor(void *user, int32_t row, int32_t col)
 }
 
 static void
-vt_output_text(void *user, const char *utf8, size_t len)
+vt_cursor_unknown(AxlConsoleVtEnc *e)
 {
-    emit((AxlConsoleVtEnc *)user, utf8, len);
+    e->cur_row = -1;
+    e->cur_col = -1;
 }
 
-/* UEFI-indexed pen -> ANSI SGR "ESC[0;fg;bgm". fg 0..15, bg 0..7. This is the old
-   vt_set_attr body, unchanged, so the golden VT stream stays byte-identical. */
+/* One UTF-8 sequence at @p s (at most @p avail bytes; @p s[0] >= 0xC0).
+   Well-formed: its length, with the codepoint in *cp. Not well-formed -- a
+   lead byte no codepoint has (0xC0, 0xC1, 0xF5..0xFF), an overlong form, an
+   encoded surrogate, a value past U+10FFFF, or cut short: 0. Either way
+   *span is how many bytes it occupies, the lead and the continuation bytes
+   that follow it (up to the length the lead announces), which is what a
+   malformed one is replaced as. Bounded by @p avail -- output_text's text is
+   a counted run, not a NUL-terminated string. */
+static size_t
+utf8_seq(const char *s, size_t avail, uint32_t *cp, size_t *span)
+{
+    static const uint32_t min[5] = { 0, 0, 0x80u, 0x800u, 0x10000u };
+    uint8_t  b  = (uint8_t)s[0];
+    size_t   n  = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : 2;
+    uint32_t v  = b & (n == 4 ? 0x07u : n == 3 ? 0x0Fu : 0x1Fu);
+    size_t   k  = 1;
+
+    for (; k < n && k < avail; k++) {
+        uint8_t t = (uint8_t)s[k];
+        if ((t & 0xC0) != 0x80) {
+            break;
+        }
+        v = (v << 6) | (t & 0x3Fu);
+    }
+    *span = k;
+    /* 0xF5..0xF7 decode past U+10FFFF on their own; 0xF8..0xFF would decode as
+       0xF0..0xF7 under the 4-byte mask, so they are refused by name. */
+    if (b >= 0xF8 || k < n || v < min[n] || v > 0x10FFFFu
+        || (v >= 0xD800u && v <= 0xDFFFu)) {
+        return 0;
+    }
+    *cp = v;
+    return n;
+}
+
+/* Text, with the far terminal's cursor followed through it.
+
+   One cell per codepoint (the SIMPLE_TEXT_OUTPUT producers report
+   CELLS_ONE_PER_CODEPOINT); CR homes the column, LF moves down and scrolls on the
+   last row, BS steps left and stops at column 0 -- the rules the producer's own
+   Mode cursor follows (axl-console-emit.c track_cursor), which is what the Shell
+   positions against.
+
+   The right margin is a UEFI console's: the cell in the last column wraps AT
+   ONCE (EDK2 GraphicsConsole outputs CR LF right there, and TerminalDxe's TtyTerm
+   does the same to a serial terminal). A VT terminal instead defers the wrap until
+   the next printable, and a move clears the deferral -- so a console that has
+   already scrolled and a terminal that has not would disagree on every row after.
+   Writing CR LF here keeps the two in step, and it is also what makes a terminal
+   WIDER than the console wrap at the console's edge rather than its own.
+
+   A TAB is one cell on a UEFI console (GraphicsConsole draws it as a glyph; no
+   tab stops), so it goes out as one space. Any other control byte moves a
+   terminal by rules the console does not model, so it makes the position
+   unknown rather than wrong.
+
+   How many cells a codepoint takes is the producer's cell rule. Under
+   ONE_PER_CODEPOINT (the device and the tap: a UEFI console) every codepoint
+   is ONE cell: GraphicsConsole advances a column per character unless the
+   string switches to wide (WIDE_CHAR), which the Shell never does. A codepoint
+   a terminal draws in two cells (CJK) or in none (a combining mark) would
+   slide the terminal's grid off the console's, so it goes out as one '?' --
+   what TerminalDxe's own non-UTF-8 terminals are sent for a character they
+   cannot show. Under WIDTH_RESOLVED (axl-vterm) the producer has laid its
+   glyphs out by axl_vterm_char_width already: the glyph goes out as it is and
+   the tracked cursor moves by that width. A C1 control is a control, not a
+   glyph, under either rule: it goes out as one '?', never raw (U+009B is an
+   8-bit CSI to a terminal that honours C1). */
+static void
+vt_output_text(void *user, const char *utf8, size_t len)
+{
+    AxlConsoleVtEnc *e    = (AxlConsoleVtEnc *)user;
+    size_t           from = 0;   /* start of the run not yet emitted */
+    size_t           seq_end = 0;   /* end of the well-formed sequence in progress */
+    for (size_t i = 0; i < len; i++) {
+        uint8_t  c     = (uint8_t)utf8[i];
+        uint32_t cells = 1;   /* what this codepoint moves the terminal by */
+        if (i < seq_end) {
+            continue;   /* a continuation byte of a codepoint already counted */
+        }
+        if (c >= 0x80 && c < 0xC0) {
+            /* A continuation byte with no lead: one '?', one cell. */
+            emit(e, utf8 + from, i - from);
+            emit_cstr(e, "?");
+            from = i + 1;
+            c    = '?';
+        } else if (c == '\t') {   /* tracked or not, the terminal gets a space */
+            emit(e, utf8 + from, i - from);
+            emit_cstr(e, " ");
+            from = i + 1;
+        } else if (c >= 0xC0) {
+            uint32_t cp   = 0;
+            size_t   span = 1;
+            size_t   n    = utf8_seq(utf8 + i, len - i, &cp, &span);
+            int      w    = n > 0 ? axl_vterm_char_width(cp) : 1;
+            bool     c1   = cp >= 0x80 && cp <= 0x9F;
+            if (n == 0 || c1 || (!e->width_resolved && w != 1)) {
+                /* Not well-formed, a C1 control, or not one cell on this
+                   producer's console: one '?' for the whole sequence. */
+                emit(e, utf8 + from, i - from);
+                emit_cstr(e, "?");
+                from = i + span;
+                i += span - 1;   /* tracked below as the one cell it is */
+            } else {
+                seq_end = i + n;
+                if (e->width_resolved) {
+                    cells = (uint32_t)w;
+                }
+            }
+        }
+        if (e->cur_row < 0) {
+            continue;   /* unknown stays unknown until a CUP or a clear */
+        }
+        if (c == '\r') {
+            e->cur_col = 0;
+        } else if (c == '\n') {
+            if ((uint32_t)e->cur_row + 1 < e->rows) {
+                e->cur_row++;
+            }
+        } else if (c == '\b') {
+            if (e->cur_col > 0) {
+                e->cur_col--;
+            }
+        } else if (c == 0) {
+            /* NUL: a terminal ignores it; nothing moves */
+        } else if (c != '\t' && (c < 0x20 || c == 0x7F)) {
+            vt_cursor_unknown(e);
+        } else if ((c & 0xC0) != 0x80) {   /* a codepoint's first byte (or the TAB) */
+            if (cells == 2 && e->cur_col > 0 && (uint32_t)e->cur_col + 2 > e->cols
+                && (uint32_t)e->cur_col < e->cols) {
+                /* A wide glyph that does not fit wraps before it (xterm,
+                   libvterm); the cell it could not use stays blank. */
+                emit(e, utf8 + from, i - from);
+                emit_cstr(e, "\r\n");
+                from       = i;
+                e->cur_col = 0;
+                if ((uint32_t)e->cur_row + 1 < e->rows) {
+                    e->cur_row++;
+                }
+            }
+            e->cur_col += (int32_t)cells;
+            if ((uint32_t)e->cur_col >= e->cols) {
+                /* Emit through the end of this codepoint, then the wrap. */
+                size_t end = seq_end > i ? seq_end : i + 1;
+                emit(e, utf8 + from, end - from);
+                emit_cstr(e, "\r\n");
+                from       = end;
+                i          = end - 1;
+                e->cur_col = 0;
+                if ((uint32_t)e->cur_row + 1 < e->rows) {
+                    e->cur_row++;
+                }
+            }
+        }
+    }
+    emit(e, utf8 + from, len - from);
+}
+
+/* Emit an SGR and remember it as the console's pen (see AxlConsoleVtEnc.sgr). */
+static void
+vt_emit_sgr(AxlConsoleVtEnc *e, const char *sgr, size_t len)
+{
+    if (len < sizeof(e->sgr)) {
+        axl_memcpy(e->sgr, sgr, len);
+        e->sgr_len = len;
+    }
+    emit(e, sgr, len);   /* emit() feeds the model even when sink is NULL */
+}
+
+/* A UEFI colour index (EFI_BLACK..EFI_WHITE) -> the ANSI colour index that means
+   the same colour. UEFI orders blue before red and is BGR-ish; ANSI orders red
+   first. 8..15 are the bright set in both: EFI_YELLOW (14) = EFI_BROWN |
+   EFI_BRIGHT is ANSI 11, bright yellow. */
+static const uint8_t uefi_to_ansi[16] = {
+    0, 4, 2, 6, 1, 5, 3, 7, 8, 12, 10, 14, 9, 13, 11, 15
+};
+
+/* UEFI-indexed pen -> SGR, through the ONE pen encoder the repaint also uses
+   (axl_console_pen_to_sgr): the 16 colours go out as 30-37/90-97 and 40-47, so
+   a cell reaches a late joiner in the SGR the live stream used. EDK2's
+   TerminalDxe writes bright colours as "1;3x" instead; that is bright only on a
+   terminal that draws bold as bright, which VTE-based terminals, for one, do not
+   by default -- so EFI_YELLOW read as brown. 90-97 is bright everywhere. */
 static void
 vt_emit_indexed_sgr(AxlConsoleVtEnc *e, uint8_t fg, uint8_t bg)
 {
-    /* UEFI fg 0-15 -> ANSI SGR. 0-7 standard (30-37), 8-15 bright (90-97),
-       EXCEPT index 14: ANSI bright-yellow (93) renders as lime/green on many
-       terminals, so map UEFI "yellow" to plain 33 (matches the EDK2 original
-       - deliberate, do not "fix" to 93). */
-    static const uint8_t fg_map[16] = {
-        30, 34, 32, 36, 31, 35, 33, 37,
-        90, 94, 92, 96, 91, 95, 33, 97
+    AxlConsolePen pen = {
+        .fg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = uefi_to_ansi[fg & 0x0F] },
+        .bg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = uefi_to_ansi[bg & 0x07] },
     };
-    static const uint8_t bg_map[8] = { 40, 44, 42, 46, 41, 45, 43, 47 };
-
-    char buf[20];
-    int  n = axl_snprintf(buf, sizeof(buf), "\x1b[0;%u;%um",
-                          fg_map[fg & 0x0F], bg_map[bg & 0x07]);
-    if (n > 0) {
-        emit(e, buf, (size_t)n);   /* emit() feeds the model even when sink is NULL */
-    }
+    char   buf[64];
+    size_t n = axl_console_pen_to_sgr(buf, sizeof(buf), &pen);
+    vt_emit_sgr(e, buf, n);
 }
 
 /* Full SGR for a general pen (default / indexed / truecolour + style bits), via the
@@ -164,13 +356,12 @@ vt_emit_full_sgr(AxlConsoleVtEnc *e, const AxlConsolePen *pen)
 {
     char   buf[64];
     size_t n = axl_console_pen_to_sgr(buf, sizeof(buf), pen);
-    emit(e, buf, n);
+    vt_emit_sgr(e, buf, n);
 }
 
-/* The pen snapshot -> SGR. The tap only ever produces DEFAULT or INDEXED colours;
-   emit exactly the bytes the previous vt_set_attr(fg, bg) emitted for the indexed
-   case, so the golden stream does not move. The general path is reachable only from
-   axl-vterm. */
+/* The pen snapshot -> SGR. A both-indexed pen is a SIMPLE_TEXT_OUTPUT producer's
+   UEFI attribute (the tap and the device produce nothing else), so its indices are
+   UEFI's and are mapped; any other pen comes from axl-vterm and is already ANSI. */
 static void
 vt_set_pen(void *user, const AxlConsolePen *pen)
 {
@@ -190,12 +381,13 @@ vt_emit_dectcem(AxlConsoleVtEnc *e, bool visible)
 }
 
 /* SetMode has no VT representation in this encoder (the remote terminal's size
-   is driven by the consumer's resize, not the guest's mode change). */
+   is driven by the consumer's resize, not the guest's mode change). It does home
+   the console's cursor behind the terminal's back, so the position is unknown. */
 static void
 vt_set_mode(void *user, uint32_t mode)
 {
-    (void)user;
     (void)mode;
+    vt_cursor_unknown((AxlConsoleVtEnc *)user);
 }
 
 /* The producer reshaped. Keep the late-join screen model at the producer's
@@ -208,10 +400,49 @@ vt_resize(void *user, uint32_t cols, uint32_t rows)
     axl_console_vt_enc_set_size((AxlConsoleVtEnc *)user, cols, rows);
 }
 
+typedef struct {
+    AxlString *buf;
+    bool       failed;
+} VtCapture;
+
+static void
+vt_capture_sink(const char *bytes, size_t len, void *user)
+{
+    VtCapture *c = (VtCapture *)user;
+    if (axl_string_append_len(c->buf, bytes, len) != AXL_OK) {
+        c->failed = true;
+    }
+}
+
+/* DECSET/DECRST 1049, carrying the visible screen across the switch.
+
+   The alternate screen exists to keep a full-screen app out of the terminal's
+   scrollback. It must not change what the terminal SHOWS: a UEFI console has one
+   screen, and the GOP goes on showing whatever was drawn last. A bare switch does
+   change it. Entering shows a blank screen -- and a SIMPLE_TEXT_OUTPUT producer
+   only recognises a full-screen app after its first paint (a backward cursor jump
+   after a clear), so that paint is lost: the editor's title bar. Leaving brings
+   back the screen as it was before the app, cursor included, while the console
+   shows the app's last frame. So the screen on show is serialized from the model
+   BEFORE the switch (the model follows our own bytes) and written after it.
+
+   Out of memory, the switch goes out bare: a wrong screen, not a lost switch. */
 static void
 vt_emit_alt_screen(AxlConsoleVtEnc *e, bool enter)
 {
+    VtCapture shown = { .buf = axl_string_new(NULL), .failed = false };
+    if (shown.buf != NULL
+        && (_axl_console_screen_snapshot_active(e->screen, vt_capture_sink, &shown) != AXL_OK
+            || shown.failed)) {
+        axl_string_free(shown.buf);
+        shown.buf = NULL;
+    }
     emit_cstr(e, enter ? "\x1b[?1049h" : "\x1b[?1049l");
+    if (shown.buf != NULL) {
+        emit(e, axl_string_str(shown.buf), axl_string_len(shown.buf));
+        axl_string_free(shown.buf);
+        emit(e, e->sgr, e->sgr_len);   /* back to the console's pen */
+    }
 }
 
 /* One dispatcher for every terminal property the VT wire can carry. Accept-and-
@@ -232,7 +463,17 @@ vt_set_term_prop(void *user, AxlConsoleProp prop, const AxlConsoleValue *val)
     }
 }
 
+/* The producer's cell rule decides what vt_output_text does with a codepoint
+   that is not one terminal cell. */
+static void
+vt_set_cell_rule(void *user, AxlConsoleCellRule rule)
+{
+    AxlConsoleVtEnc *e = (AxlConsoleVtEnc *)user;
+    e->width_resolved = rule == AXL_CONSOLE_CELLS_WIDTH_RESOLVED;
+}
+
 static const AxlConsoleOps vt_ops = {
+    .set_cell_rule = vt_set_cell_rule,
     .clear_screen  = vt_clear_screen,
     .set_cursor    = vt_set_cursor,
     .output_text   = vt_output_text,
@@ -240,8 +481,6 @@ static const AxlConsoleOps vt_ops = {
     .set_mode      = vt_set_mode,
     .resize        = vt_resize,
     .set_term_prop = vt_set_term_prop,
-    /* set_cell_rule: this encoder re-encodes to a VT wire and never rasterizes, so
-       cell width is the far-end terminal's problem. Deliberately unbound. */
 };
 
 // ---------------------------------------------------------------------------
@@ -262,8 +501,9 @@ axl_console_vt_enc_new(const AxlConsoleVtEncConfig *cfg)
     e->user    = cfg->user;
     e->cur_row = -1;
     e->cur_col = -1;
-    e->screen  = axl_console_screen_new(cfg->rows != 0 ? cfg->rows : VT_ENC_DEFAULT_ROWS,
-                                        cfg->cols != 0 ? cfg->cols : VT_ENC_DEFAULT_COLS);
+    e->cols    = cfg->cols != 0 ? cfg->cols : VT_ENC_DEFAULT_COLS;
+    e->rows    = cfg->rows != 0 ? cfg->rows : VT_ENC_DEFAULT_ROWS;
+    e->screen  = axl_console_screen_new(e->rows, e->cols);
     if (e->screen == NULL) {
         axl_free(e);
         return NULL;
@@ -310,7 +550,13 @@ axl_console_vt_enc_snapshot(AxlConsoleVtEnc *e, AxlConsoleScreenSink sink, void 
     if (e == NULL || sink == NULL) {
         return AXL_ERR;
     }
-    return axl_console_screen_snapshot(e->screen, sink, user);
+    if (axl_console_screen_snapshot(e->screen, sink, user) != AXL_OK) {
+        return AXL_ERR;
+    }
+    if (e->sgr_len > 0) {
+        sink(e->sgr, e->sgr_len, user);   /* the console's pen, not the last cell's */
+    }
+    return AXL_OK;
 }
 
 void
@@ -330,6 +576,8 @@ axl_console_vt_enc_set_size(AxlConsoleVtEnc *e, uint32_t cols, uint32_t rows)
        partial resize would silently pin the other axis to a stale value. Producers
        resolve a configured 0 to the physical size before calling here. */
     if (e != NULL && cols != 0 && rows != 0) {
+        e->cols = cols;   /* where text wraps from now on */
+        e->rows = rows;
         /* On failure (OOM) the model keeps its OLD extent while the producer moves
            to the new one, so a late-join snapshot repaints at the wrong size. The
            call cannot report that upward (this is void by contract), so say it
@@ -346,8 +594,7 @@ void
 axl_console_vt_enc_reset(AxlConsoleVtEnc *e)
 {
     if (e != NULL) {
-        e->cur_row = -1;   /* forget the emitted-cursor dedup baseline */
-        e->cur_col = -1;
+        vt_cursor_unknown(e);   /* forget the dedup baseline */
     }
 }
 

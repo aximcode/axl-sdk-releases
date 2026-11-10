@@ -93,22 +93,36 @@ open_volume_root(
         return NULL;
     }
 
-    EFI_GUID                         guid = gEfiSimpleFileSystemProtocolGuid;
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs   = NULL;
-    EFI_STATUS st = gBS->HandleProtocol(handles[index], &guid, (VOID **)&fs);
-    axl_backend_free(handles);
-    if (EFI_ERROR(st) || fs == NULL) {
-        return NULL;
-    }
-
     EFI_FILE_PROTOCOL *root = NULL;
-    st = fs->OpenVolume(fs, &root);
-    if (EFI_ERROR(st) || root == NULL) {
+    EFI_STATUS         st   = axl_nosh_open_root(handles[index], &root);
+    axl_backend_free(handles);
+    if (EFI_ERROR(st)) {
         axl_debug("nosh: OpenVolume failed (status=0x%llx)",
                   (unsigned long long)st);
         return NULL;
     }
     return root;
+}
+
+EFI_STATUS
+axl_nosh_open_root(
+    EFI_HANDLE           volume,
+    EFI_FILE_PROTOCOL  **root
+    )
+{
+    EFI_GUID                         guid = gEfiSimpleFileSystemProtocolGuid;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs   = NULL;
+
+    *root = NULL;
+    if (EFI_ERROR(gBS->HandleProtocol(volume, &guid, (VOID **)&fs))
+        || fs == NULL) {
+        return EFI_NOT_FOUND;   /* what the Shell's OpenRootByHandle answers */
+    }
+    EFI_STATUS st = fs->OpenVolume(fs, root);
+    if (!EFI_ERROR(st) && *root == NULL) {
+        st = EFI_DEVICE_ERROR;
+    }
+    return st;
 }
 
 // ===================================================================
@@ -241,10 +255,45 @@ axl_nosh_file_open(
         if (st != EFI_NOT_FOUND) {
             axl_debug("nosh: open failed (status=0x%llx)",
                       (unsigned long long)st);
+            return AXL_ERR;
         }
-        return AXL_ERR;
+        return AXL_NOT_FOUND;   /* the volume resolved; the file is absent */
     }
     *out = file;
+    return AXL_OK;
+}
+
+int
+axl_nosh_path_locate(
+    const unsigned short  *path,
+    void                 **volume,
+    unsigned short        *rel,
+    size_t                 rel_cap
+    )
+{
+    if (path == NULL || volume == NULL || rel == NULL) {
+        return AXL_ERR;
+    }
+
+    size_t        index = 0;
+    const CHAR16 *rest  = NULL;
+    CHAR16        out[AXL_NOSH_PATH_MAX];
+    if (!split_fs_index((const CHAR16 *)path, &index, &rest)
+        || normalize_remainder(rest, out) != AXL_OK) {
+        return AXL_ERR;
+    }
+
+    EFI_HANDLE *handles = NULL;
+    size_t      count   = 0;
+    if (volume_handles(&handles, &count) != AXL_OK) {
+        return AXL_ERR;
+    }
+    EFI_HANDLE handle = (index < count) ? handles[index] : NULL;
+    axl_backend_free(handles);
+    if (handle == NULL || !axl_backend_wcs_copy(rel, rel_cap, out)) {
+        return AXL_ERR;
+    }
+    *volume = handle;
     return AXL_OK;
 }
 

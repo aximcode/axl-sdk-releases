@@ -39,7 +39,9 @@ source "$SCRIPT_DIR/common-test.sh"
 set +e
 set -uo pipefail
 
-MAKER="$PROJECT_DIR/scripts/make-sdk-tarball.sh"
+# The release's own command: CPack over the install() rules
+# (Build-System-Design §10.16).
+MAKER="$PROJECT_DIR/scripts/make-release-assets.sh"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
 WORK="$(mktemp -d -t axl-sdktar.XXXXXXXX)"; trap 'rm -rf "$WORK"' EXIT
@@ -48,20 +50,20 @@ echo "=== SDK tarball ==="
 echo ""
 
 if [[ ! -x "$MAKER" ]]; then
-    test_host_fail "scripts/make-sdk-tarball.sh is executable"
+    test_host_fail "scripts/make-release-assets.sh is executable"
     test_host_summary "sdk-tarball"
     exit 1
 fi
-test_host_pass "scripts/make-sdk-tarball.sh is executable"
+test_host_pass "scripts/make-release-assets.sh is executable"
 
 OUT="$WORK/dist"
-if ! "$MAKER" --out "$OUT" > "$WORK/build.log" 2>&1; then
-    test_host_fail "make-sdk-tarball.sh succeeds"
+if ! "$MAKER" sdk --out "$OUT" > "$WORK/build.log" 2>&1; then
+    test_host_fail "make-release-assets.sh sdk succeeds"
     tail -12 "$WORK/build.log" | sed 's/^/      /'
     test_host_summary "sdk-tarball"
     exit 1
 fi
-test_host_pass "make-sdk-tarball.sh succeeds"
+test_host_pass "make-release-assets.sh sdk succeeds"
 
 # The name carries the HOST platform, not the target: one archive holds both
 # target arches, per §5.3's lean that a per-target split is not worth its
@@ -110,6 +112,11 @@ fi
 # cannot see is the one that needs its own assertion, per arch. That is the
 # shape of the defect this release fixes: install.sh staged all three uefi-tools
 # sidecars, release.yml staged one, and nothing compared them.
+#
+# The axl-pack stub objects are the same case: only `axl-cc --compress` links
+# them, and the compile below does not pass it, so all five are named per arch
+# (the stub links each one by path; a missing one is a link failure in the
+# consumer, not here).
 for want in \
     "axl-sdk-${VERSION}/bin/axl" \
     "axl-sdk-${VERSION}/bin/axl-cc" \
@@ -118,6 +125,17 @@ for want in \
     "axl-sdk-${VERSION}/lib/axl/aa64/libaxl.a" \
     "axl-sdk-${VERSION}/lib/axl/x64/libaxl-standin.a" \
     "axl-sdk-${VERSION}/lib/axl/aa64/libaxl-standin.a" \
+    "axl-sdk-${VERSION}/bin/axl-efi-pack" \
+    "axl-sdk-${VERSION}/lib/axl/x64/pack/axl-pack-stub.o" \
+    "axl-sdk-${VERSION}/lib/axl/x64/pack/axl-pack-format.o" \
+    "axl-sdk-${VERSION}/lib/axl/x64/pack/LzmaDec.o" \
+    "axl-sdk-${VERSION}/lib/axl/x64/pack/Bra.o" \
+    "axl-sdk-${VERSION}/lib/axl/x64/pack/Bra86.o" \
+    "axl-sdk-${VERSION}/lib/axl/aa64/pack/axl-pack-stub.o" \
+    "axl-sdk-${VERSION}/lib/axl/aa64/pack/axl-pack-format.o" \
+    "axl-sdk-${VERSION}/lib/axl/aa64/pack/LzmaDec.o" \
+    "axl-sdk-${VERSION}/lib/axl/aa64/pack/Bra.o" \
+    "axl-sdk-${VERSION}/lib/axl/aa64/pack/Bra86.o" \
     "axl-sdk-${VERSION}/lib/cmake/axl/axl-config.cmake" \
     "axl-sdk-${VERSION}/lib/pkgconfig/axl.pc" \
     "axl-sdk-${VERSION}/libexec/axl/rsod-decode.py" \
@@ -134,12 +152,18 @@ done
 # ── the licence payload the .deb/.rpm used to carry ───────────
 #
 # The packages staged 75 doc files, including five third-party licence sets,
-# and D2 retires the packages. These are OBLIGATIONS, not documentation:
-# mbedTLS, DejaVu and edk2 are Apache-2.0 / Bitstream / BSD-2-Clause-Patent
-# §4(a)-style "carry the licence with any binary redistribution"; libvterm is
-# MIT and offers no public-domain election; FreeType's FTL carries a CREDIT
-# clause for products shipping the path-filling APIs. All five are compiled
-# INTO libaxl.a, so the archive that ships libaxl.a is the one that owes them.
+# and D2 retires the packages. Five of the six below are OBLIGATIONS, not
+# documentation: mbedTLS, DejaVu and edk2 are Apache-2.0 / Bitstream /
+# BSD-2-Clause-Patent §4(a)-style "carry the licence with any binary
+# redistribution"; libvterm is MIT and offers no public-domain election;
+# FreeType's FTL carries a CREDIT clause for products shipping the
+# path-filling APIs. All are compiled INTO libaxl.a, so the archive that
+# ships libaxl.a is the one that owes them.
+#
+# ed25519 is the sixth and is public domain, so it owes nothing -- it is
+# asserted here because it is the ONLY staged entry whose "licence" is a
+# README rather than a LICENSE file (upstream ships none for those files),
+# which makes it the easiest one for a future edit to drop silently.
 #
 # NOTICE is Apache-2.0 4(d) and was itself once omitted from the package.
 for want in \
@@ -157,7 +181,8 @@ for want in \
     "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/libvterm/LICENSE" \
     "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/freetype/FTL.TXT" \
     "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/freetype/LICENSE.TXT" \
-    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/edk2/LICENSE" ; do
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/edk2/LICENSE" \
+    "axl-sdk-${VERSION}/share/doc/axl-sdk/third_party/ed25519/README.md" ; do
     if grep -qxF -- "$want" "$LISTING"; then
         test_host_pass "carries ${want#axl-sdk-${VERSION}/share/doc/axl-sdk/}"
     else
@@ -227,11 +252,12 @@ fi
 # The archive must not carry an absolute path from the build machine into a
 # consumer's prefix -- the failure that makes a "relocatable" archive not be.
 #
-# Search for the STAGING prefix, not $OUT: make-sdk-tarball.sh stages into its
-# own mktemp dir, so $OUT (where the .tar.gz lands) is not a path that could
-# ever appear inside the archive. Grepping for it would have been a second
-# assertion that cannot fail.
-STAGE_HINT="axl-sdktar."
+# Search for the STAGING prefix, not $OUT: CPack installs into
+# _CPack_Packages/ under make-release-assets.sh's own mktemp dir (axl-cpack.*),
+# so $OUT (where the .tar.gz lands) is not a path that could ever appear inside
+# the archive. Grepping for it would have been a second assertion that cannot
+# fail.
+STAGE_HINT="_CPack_Packages"
 # NO PIPELINE HERE, deliberately. The first draft was
 #   grep -rIl ... | head -3 | grep -q .
 # which has the same pipefail defect as the listing above and inverts THIS

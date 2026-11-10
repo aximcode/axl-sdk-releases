@@ -24,6 +24,19 @@ void my_function(void) {
 }
 ```
 
+The console sink writes each line to standard error, in its level's colour
+-- and on the console that is the same stream, and the same cursor, as
+standard output: a log line starts where the tool's output left the cursor,
+and the Shell's next prompt starts on the row below it, on the display, the
+serial terminal and an ssh session alike, whether or not stdout is
+redirected. Under `2>` the lines go to the file, and under `>` they stay out
+of the stdout file. They are written beneath the Shell's console logger, so
+page break never stops them and they are not in its scroll-back
+(`src/stream/README.md`, *Standard error on the console*). After a coloured line each output gets its
+own attribute back, not a fixed light-grey. A line exactly the console's
+width is followed by the next on the very next row, as on a Unix terminal
+(`src/stream/README.md`, *A line exactly the console's width*).
+
 ## Log Levels
 
 From most to least severe:
@@ -173,6 +186,31 @@ Read-modify-write, not a fresh struct: `axl_serial_set_mode` takes the whole
 `AxlSerialMode` and treats a zero field as "device default", so a partly
 filled one silently re-rates the port. For scale, a full 640-byte line takes
 about 55 ms at 115200 8N1.
+
+### Moving the console output to a UART
+
+`axl_log_serial_attach` ADDS a sink. `axl_log_set_console_serial` instead
+MOVES this image's console output -- the same lines the console shows, time
+of day, `[INFO]  ` tag and all, CRLF-ended, without colour -- from standard
+error to a port, so a serial transcript reads the same before and after:
+
+```c
+axl_log_set_console_serial(port);    /* standard error no longer written */
+// ...
+axl_log_set_console_serial(NULL);    /* back to standard error, BEFORE closing the port */
+```
+
+It is for an image whose standard error reaches someone it should not. A
+resident driver serving a remote console joins the firmware's standard
+error fan-out, so its own log would be drawn in every session it serves;
+`sshd` moves its log to the serial port while it serves, as OpenSSH's sshd
+logs to syslog. Per image: other images' console output, and this image's
+`axl_printerr`, still go to standard error. `axl_log_set_console_enabled(false)`
+silences it as it silences the console, and an image must restore standard
+error before it unloads -- its leak verdict is console output too. Code that
+turns console logging off for a while should put back what it found
+(`axl_log_get_console_enabled()`), not assume it was on: `sshd` does, so a
+driver whose console log was off stays off after `sshd stop`.
 
 ## The engine is opt-in at link time
 

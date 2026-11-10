@@ -1,0 +1,771 @@
+# The integration tests, registered at CTEST time (slice 5a,
+# docs/AXL-Build-System-Design.md §10.8). configure_file()d into each debug
+# build tree and named in its TEST_INCLUDE_FILES, so ctest runs this every
+# time it reads the tree -- the way gtest_discover_tests registers tests --
+# and a new test-*.sh, or a changed header, needs no reconfigure.
+#
+# test/integration/lib/discover.sh --emit-ctest is the ONE reader of the
+# test-meta headers: the runner, check-test-meta and this registration all
+# go through it. Its output is CACHED (it forks per header field, ~5-8 s for
+# ~300 scripts, on every ctest invocation including -N) and regenerated when
+# a test script, discover.sh, or the set of scripts changes.
+#
+# Read from the environment at ctest time:
+#   AXL_IT_TIMEOUT     a test's own limit, seconds (default 900; CI 240).
+#                      ctest's TIMEOUT is only a backstop above all that
+#                      run-one.sh may take (3 x it + 36: see where it is
+#                      computed), so the test's own limit fires first:
+#                      run-one.sh records the TIMEOUT verdict and run-qemu.sh's
+#                      cleanup runs, which a kill from ctest would preempt.
+#   AXL_IT_CACHE       0 turns the skip cache off (default on, as the runner's)
+#   AXL_IT_CACHE_DIR   a private skip cache (absolute)
+#   AXL_IT_LOGDIR      this run's test logs, tallies and prep manifest
+#                      (absolute; default the tree's integration-logs)
+#   AXL_IT_QEMU_TMPDIR a caller's temp base, used as-is and never removed
+#                      (absolute)
+#   AXL_PREP_TESTS     (read by the prep) the selected scripts, one per line
+#   -- the four above are a front end's (run-integration.sh, verify.sh);
+#   tests that start a nested ctest clear them (lib/preset-env.sh).
+#   AXL_IT_DIR         a directory of test-*.sh to register INSTEAD of the
+#                      real one (the runner's RUN_INTEGRATION_DIR seam; the
+#                      registration's own test runs stubs through it). Such
+#                      a run gets its own log directory, so it can never
+#                      empty a real run's manifest or tallies.
+#   AXL_SHELL_LAUNCHER as for the runner: unset means 1 (on, no fallback);
+#                      0 bisects a suspected launcher fault.
+#   AXL_IT_POOL        1 (the user service's socket) or a socket path: run the
+#                      guest= tests on pooled guests (see the end of this file)
+#   AXL_IT_COST_DATA   the cost data to read in place of the tree's own
+#                      CTestCostData.txt (AXL_IT_COSTED, below; a test seam)
+#
+# integration.prep (lib/suite-prep.sh) builds every registered test's
+# fixtures, not only the selected ones': ctest cannot pass its selection to a
+# fixture, and the build has to happen up front (concurrent ninja runs on one
+# tree are unsafe). On a warm tree that is a no-op build plus, when a test
+# reads the staged SDK, a restage. To run one test on a warm tree without
+# it: ctest -R <name> -FS integration.prep.
+
+# ctest evaluates this with OLD policies unless told: a list keeps empty
+# elements, and more. The project's own minimum.
+cmake_policy(VERSION 3.29)
+
+set(_src [==[@AXL_IT_SOURCE_DIR@]==])
+set(_bin [==[@AXL_IT_BINARY_DIR@]==])
+set(_lib "${_src}/test/integration/lib")
+# Tests run from the source root, as under run-integration.sh.
+set(AXL_IT_WORKDIR "${_src}")
+
+# ---------------------------------------------------------------------------
+# FIRST, before anything below can return(): the pool's guests as a CTest
+# resource (design §10.7). The tree binds CTEST_RESOURCE_SPEC_FILE to this
+# file (the root CMakeLists.txt), so a PLAIN ctest bounds the guests too; it
+# is rewritten here, at ctest time, from the pool's classes, so a slot change
+# needs no reconfigure. If it is MISSING ctest runs no test in the tree at
+# all -- the unit tests, the gates, and the very test registered to explain
+# a refusal below -- so it is always written, EMPTY but valid when the pool's
+# classes cannot be read, and ATOMICALLY (a temporary name, renamed): a
+# concurrent ctest reading it mid-write would fail the same way.
+# ---------------------------------------------------------------------------
+set(_spec "${_bin}/axl-resource-spec.json")
+execute_process(
+    COMMAND [==[@Python3_EXECUTABLE@]==] -m axlpool resource-spec --tree "${_src}"
+    WORKING_DIRECTORY "${_src}/test/pool"
+    OUTPUT_VARIABLE _spec_json
+    ERROR_VARIABLE _spec_err
+    RESULT_VARIABLE _spec_rc)
+if(NOT _spec_rc EQUAL 0)
+    set(_spec_json [==[{"version": {"major": 1, "minor": 0}, "local": [{}]}]==])
+endif()
+string(RANDOM LENGTH 12 _spec_rnd)
+file(WRITE "${_spec}.${_spec_rnd}.tmp" "${_spec_json}")
+file(RENAME "${_spec}.${_spec_rnd}.tmp" "${_spec}")
+
+
+if(DEFINED ENV{AXL_IT_TIMEOUT} AND NOT "$ENV{AXL_IT_TIMEOUT}" STREQUAL "")
+    set(_inner "$ENV{AXL_IT_TIMEOUT}")
+else()
+    set(_inner 900)
+endif()
+if(NOT _inner MATCHES "^[0-9]+$")
+    # math() on it would abort ctest's reading of the whole tree, silently.
+    add_test(integration.bad-timeout bash -c "echo 'AXL_IT_TIMEOUT=${_inner}: not a number of seconds' >&2; exit 1")
+    set_tests_properties(integration.bad-timeout PROPERTIES LABELS integration)
+    return()
+endif()
+# ctest's TIMEOUT is a BACKSTOP above all run-one.sh may legitimately take:
+# a pooled attempt, its booted rerun after a pool miss, and the --retry, each
+# under the test's own limit, plus the 3 s drain and 30 s to report and clean
+# up. The test's own limit (AXL_TEST_TIMEOUT) is what fires; this only catches
+# a run-one that itself hung. It was limit + 30 while ctest's --repeat did the
+# retrying, and with the retry inside run-one that killed a slow or hung test
+# partway through its retry, pre-empting run-qemu.sh's cleanup.
+math(EXPR AXL_IT_TIMEOUT "3 * ${_inner} + 36")
+# AXL_IT_BACKSTOP: that backstop in seconds, in place of the computed one --
+# a self-test seam (test-ctest-integration.sh fires it on a stub), not a knob.
+if(DEFINED ENV{AXL_IT_BACKSTOP} AND "$ENV{AXL_IT_BACKSTOP}" MATCHES "^[1-9][0-9]*$")
+    set(AXL_IT_TIMEOUT "$ENV{AXL_IT_BACKSTOP}")
+endif()
+
+# WHEN THE BACKSTOP FIRES it sends SIGTERM, then KILLs the process tree
+# TIMEOUT_SIGNAL_GRACE_PERIOD later (CMake 3.27+), instead of the bare KILL
+# that ran no cleanup: a pool lease, a container (conmon is outside the tree)
+# or a guest in a session of its own outlived it. ctest signals the test's OWN
+# process only, so this goes on a test only when that process ACTS on a TERM:
+#   integration.test-*  lib/run-one.sh, which passes it to the attempt in
+#                       flight (lib/fwd-signal.sh) and says the run was stopped
+#   unit.<App>          lib/pool-or-boot.sh, the same (pooled); booted, it
+#                       execs test-axl.sh, whose common-test.sh handler acts
+#   unit.one-boot       test-axl.sh, likewise
+# Every other test keeps the KILL. Its process is a script with no TERM
+# handling, which a TERM kills on the spot -- orphaning its children (ninja,
+# clang-tidy, a build) outside the tree the KILL reaches: worse than the KILL.
+#
+# The grace is what that cleanup takes, measured (docs/AXL-Build-System-
+# Design.md §10.15): a pooled test the lease client must KILL after its own
+# 10 s (axlpool client.py CHILD_TERM_GRACE_S) and then release, with margin.
+set(AXL_IT_TERM TIMEOUT_SIGNAL_NAME SIGTERM TIMEOUT_SIGNAL_GRACE_PERIOD 30)
+
+# A front end's paths must be absolute: a relative one would be created here,
+# against ctest's working directory, and read by the tests against theirs
+# (the source root) -- two places.
+foreach(_pv AXL_IT_LOGDIR AXL_IT_QEMU_TMPDIR AXL_IT_CACHE_DIR)
+    if(DEFINED ENV{${_pv}} AND NOT "$ENV{${_pv}}" STREQUAL "" AND NOT IS_ABSOLUTE "$ENV{${_pv}}")
+        add_test(integration.bad-env bash -c "echo \"$0=$1: not an absolute path\" >&2; exit 1"
+                 "${_pv}" "$ENV{${_pv}}")
+        set_tests_properties(integration.bad-env PROPERTIES LABELS integration)
+        return()
+    endif()
+endforeach()
+
+set(_dir "${_src}/test/integration")
+set(_logs "${_bin}/integration-logs")
+set(_stub_env "")
+if(DEFINED ENV{AXL_IT_DIR} AND NOT "$ENV{AXL_IT_DIR}" STREQUAL "")
+    set(_dir "$ENV{AXL_IT_DIR}")
+    set(_logs "${_bin}/integration-logs-stub")
+    # The prep must not build the real tree for stub tests (suite-prep.sh's
+    # own seam, as the runner self-test uses it).
+    set(_stub_env "RUN_INTEGRATION_DIR=${_dir}")
+endif()
+# The project the tests and the pool check work against: the tree, or -- for
+# a stub run only -- the self-test's stub project (RUN_PROJECT_DIR), whose
+# fake tools (axlpool, a CMake project) the runner's stub runs are built on.
+set(_proj "${_src}")
+if(_stub_env AND DEFINED ENV{RUN_PROJECT_DIR} AND NOT "$ENV{RUN_PROJECT_DIR}" STREQUAL "")
+    set(_proj "$ENV{RUN_PROJECT_DIR}")
+endif()
+file(MAKE_DIRECTORY "${_logs}")
+# AXL_IT_LOGDIR (a front end's, at ctest time): where THIS run's test logs,
+# tallies and prep manifest go -- a fresh directory per run, as the runner's
+# were, instead of beside every earlier run's in the tree. The registration
+# cache, the gate lists and the temp-base key stay with ${_logs}: they are
+# the tree's, not the run's.
+if(DEFINED ENV{AXL_IT_LOGDIR} AND NOT "$ENV{AXL_IT_LOGDIR}" STREQUAL "")
+    set(_runlogs "$ENV{AXL_IT_LOGDIR}")
+    file(MAKE_DIRECTORY "${_runlogs}")
+else()
+    set(_runlogs "${_logs}")
+endif()
+set(_manifest "${_runlogs}/_prebuilt")
+
+# The per-run temp base the runner creates for run-qemu.sh's scratch (on
+# tmpfs when it can) and removes at exit -- here a setup / cleanup fixture
+# pair owns it (lib/ctest-tmpbase.sh, which also refuses a second concurrent
+# run on the tree, by an owner record kept apart from the base). A caller's
+# base (AXL_IT_QEMU_TMPDIR) is not owned: never created or removed.
+#
+# Keyed on the LOG directory, so a stub run (AXL_IT_DIR) never shares -- or
+# cleans up -- a real run's base. Short, because tests make UNIX sockets
+# under it.
+string(SHA256 _tag "${_logs}")
+string(SUBSTRING "${_tag}" 0 10 _tag)
+# AXL_IT_QEMU_TMPDIR (a front end's): a caller's temp base, used AS-IS and
+# never removed -- the runner's rule for an AXL_QEMU_TMPDIR it was handed --
+# so the setup/cleanup pair below does not own it.
+set(_qtmp_owned TRUE)
+if(DEFINED ENV{AXL_IT_QEMU_TMPDIR} AND NOT "$ENV{AXL_IT_QEMU_TMPDIR}" STREQUAL "")
+    set(_qtmp "$ENV{AXL_IT_QEMU_TMPDIR}")
+    set(_qtmp_owned FALSE)
+elseif(IS_DIRECTORY /dev/shm)
+    set(_qtmp "/dev/shm/axl-ct-${_tag}")
+else()
+    set(_qtmp "/tmp/axl-ct-${_tag}")
+endif()
+
+if(DEFINED ENV{AXL_SHELL_LAUNCHER} AND NOT "$ENV{AXL_SHELL_LAUNCHER}" STREQUAL "")
+    set(_launcher "$ENV{AXL_SHELL_LAUNCHER}")
+else()
+    set(_launcher 1)
+endif()
+
+# What every test runs with: run-one.sh's configuration (lib/run-one.sh), the
+# manifest suite-prep wrote, the temp base, and the -delay 0 Shell launcher
+# (run-integration.sh explains why it is forced on for the suite).
+set(AXL_IT_ENV
+    "AXL_ONE_LOGDIR=${_runlogs}"
+    "AXL_ONE_ARCH=@AXL_IT_ARCH@"
+    "AXL_ONE_PROJECT_DIR=${_proj}"
+    "AXL_TEST_TIMEOUT=${_inner}"
+    "AXL_PREBUILT_MANIFEST=${_manifest}"
+    "AXL_QEMU_TMPDIR=${_qtmp}"
+    "AXL_SHELL_LAUNCHER=${_launcher}")
+if(NOT "$ENV{AXL_IT_CACHE}" STREQUAL "0")
+    # AXL_IT_CACHE_DIR: a private cache (a front end's self-test seam).
+    if(DEFINED ENV{AXL_IT_CACHE_DIR} AND NOT "$ENV{AXL_IT_CACHE_DIR}" STREQUAL "")
+        set(_cache "$ENV{AXL_IT_CACHE_DIR}")
+    else()
+        set(_cache "${_src}/test/integration/.test-cache")
+    endif()
+    file(MAKE_DIRECTORY "${_cache}")
+    list(APPEND AXL_IT_ENV "AXL_TEST_CACHE=${_cache}")
+endif()
+set(AXL_IT_PREP_ENV
+    "AXL_PREBUILT_MANIFEST=${_manifest}"
+    "AXL_PREP_ARCH=@AXL_ARCH@"
+    "AXL_PREP_LOGDIR=${_runlogs}")
+if(_stub_env)
+    list(APPEND AXL_IT_PREP_ENV "${_stub_env}")
+endif()
+
+# The generated registration, cached per log directory. Regenerated when the
+# set of test-*.sh changes, or when any of them, discover.sh, or this
+# script's configured copy is newer than the cached output. Written to a
+# temporary name and RENAMED into place, so a second ctest on the same tree
+# never includes a half-written file.
+set(_gen "${_logs}/axl-integration-tests.cmake")
+set(_genlist "${_logs}/axl-integration-tests.list")
+# Freshness is judged against a stamp taken BEFORE discovery runs: a script
+# edited while discover.sh was still writing (5-8 s) is then newer than the
+# stamp, where it would not be newer than the finished output.
+set(_stamp "${_logs}/axl-integration-tests.stamp")
+file(GLOB _scripts "${_dir}/test-*.sh")
+list(SORT _scripts)
+string(SHA256 _set "${_scripts}")
+set(_fresh FALSE)
+if(EXISTS "${_gen}" AND EXISTS "${_genlist}" AND EXISTS "${_stamp}")
+    file(READ "${_genlist}" _oldset)
+    if(_oldset STREQUAL _set)
+        set(_fresh TRUE)
+        foreach(_f IN LISTS _scripts ITEMS "${_lib}/discover.sh" "${_bin}/axl-integration-ctest.cmake")
+            # IS_NEWER_THAN is also true for EQUAL times: a regeneration in
+            # doubt is only a few seconds.
+            if("${_f}" IS_NEWER_THAN "${_stamp}")
+                set(_fresh FALSE)
+                break()
+            endif()
+        endforeach()
+    endif()
+endif()
+
+if(NOT _fresh)
+    string(RANDOM LENGTH 12 _rnd)
+    set(_tmp "${_gen}.${_rnd}.tmp")
+    set(_err "${_logs}/axl-integration-discover.${_rnd}.err")
+    file(TOUCH "${_stamp}.${_rnd}")
+    execute_process(
+        # The tree's own discover.sh, told which directory to discover: a
+        # stub directory needs no lib/ copy of its own.
+        COMMAND "@CMAKE_COMMAND@" -E env "AXL_DISCOVER_DIR=${_dir}"
+                bash "${_lib}/discover.sh" --emit-ctest @AXL_IT_ARCH@
+                "${_lib}/run-one.sh" "${_lib}/suite-prep.sh"
+        OUTPUT_FILE "${_tmp}"
+        ERROR_FILE "${_err}"
+        RESULT_VARIABLE _rc)
+    if(_rc EQUAL 0)
+        file(RENAME "${_tmp}" "${_gen}")
+        file(WRITE "${_genlist}" "${_set}")
+        file(RENAME "${_stamp}.${_rnd}" "${_stamp}")
+        file(REMOVE "${_err}")
+    else()
+        file(REMOVE "${_tmp}" "${_stamp}.${_rnd}")
+        # A registration that fails must not read as "no integration tests":
+        # register one test that fails and prints why.
+        add_test(integration.discovery-failed bash -c
+            "echo 'discover.sh --emit-ctest failed (exit ${_rc}):' >&2; cat \"$0\" >&2; exit 1"
+            "${_err}")
+        set_tests_properties(integration.discovery-failed PROPERTIES LABELS integration)
+        return()
+    endif()
+endif()
+# AXL_IT_COSTED: the integration tests the tree's CTestCostData.txt has
+# measured. The registration gives est= as a test's COST only when it is NOT
+# here, because ctest uses its own measured average only for a test with no
+# COST property -- and for one with a COST, it also writes that COST back
+# into the average, so an unconditional est= threw the measurement away on
+# every run. The file is ctest's own (<tree>/Testing/Temporary/), rewritten
+# at the end of EVERY run -- -j1 included, where ctest does not load the
+# averages and so writes back elapsed/(runs+1), and a cache hit counts as a
+# ~0 s pass -- so a developer tree's record drifts low; scripts/release-suite.sh
+# keeps a store of cache-off suite runs and seeds the tree from it. Read as
+# ctest reads it: name, run count, average, up to the `---` that begins the
+# failed-test list -- and ctest abandons the whole file at the first line
+# with fewer than three fields, so this does too, rather than claim a
+# measurement ctest will not use.
+#   AXL_IT_COST_DATA overrides the file (a self-test seam: the registration's
+#   own test reads the real tree, which may or may not have run before).
+if(DEFINED ENV{AXL_IT_COST_DATA} AND NOT "$ENV{AXL_IT_COST_DATA}" STREQUAL "")
+    set(_costdata "$ENV{AXL_IT_COST_DATA}")
+else()
+    set(_costdata "${_bin}/Testing/Temporary/CTestCostData.txt")
+endif()
+set(AXL_IT_COSTED "")
+if(EXISTS "${_costdata}")
+    file(STRINGS "${_costdata}" _cost_lines)
+    foreach(_l IN LISTS _cost_lines)
+        # ctest splits on single spaces, empty fields counted: three fields
+        # is two spaces.
+        if(_l STREQUAL "---" OR NOT _l MATCHES "^[^ ]* [^ ]* ")
+            break()
+        endif()
+        if(_l MATCHES "^(integration\\.[^ ]+) [1-9][0-9]* ")
+            list(APPEND AXL_IT_COSTED "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+endif()
+include("${_gen}")
+
+# The temp base's fixtures. EVERY test requires integration.tmp itself (the
+# emitted FIXTURES_REQUIRED): a cleanup runs once every test requiring its
+# fixture is done, so requiring it only through prep would remove the base
+# right after prep.
+# The owner record is the TREE's (one run per tree, lib/ctest-tmpbase.sh),
+# whoever's temp base the run uses.
+set(_owner "${_logs}/.run-owner")
+if(_qtmp_owned)
+    set(_tb_mode "")
+else()
+    set(_tb_mode "--foreign")
+endif()
+add_test(integration.tmp-setup bash "${_lib}/ctest-tmpbase.sh" setup "${_qtmp}" "${_owner}" ${_tb_mode})
+add_test(integration.tmp-cleanup bash "${_lib}/ctest-tmpbase.sh" cleanup "${_qtmp}" "${_owner}" ${_tb_mode})
+set_tests_properties(integration.tmp-setup PROPERTIES LABELS prep FIXTURES_SETUP integration.tmp)
+set_tests_properties(integration.tmp-cleanup PROPERTIES LABELS prep FIXTURES_CLEANUP integration.tmp)
+set_tests_properties(integration.prep PROPERTIES FIXTURES_REQUIRED integration.tmp)
+
+# ---------------------------------------------------------------------------
+# The unit binaries: one CTest test each, unit.<App> (slice 5a step 4). Each
+# is test-axl.sh with TEST_APPS_ONLY=<App> -- the same staging, networking and
+# per-binary leak verdict as the one-boot run -- booted, or on a leased `unit`
+# guest when the pool decision below pools (lib/pool-or-boot.sh: a pool miss
+# runs it booted). The ratchet over all of them is the unit.counts fixture's
+# cleanup (lib/unit-ratchet.sh), summing what each wrote to TEST_COUNT_FILE;
+# it judges the one-boot wall-clock budget only over POOLED runs, whose
+# times hold no boot (pool design §6.7). Not in a stub run.
+# ---------------------------------------------------------------------------
+if(NOT _stub_env)
+    execute_process(
+        COMMAND bash "${_src}/test/integration/test-axl.sh" --list-apps
+        OUTPUT_VARIABLE _apps
+        RESULT_VARIABLE _apps_rc)
+    string(STRIP "${_apps}" _apps)
+    string(REPLACE "\n" ";" _apps "${_apps}")
+    if(NOT _apps_rc EQUAL 0 OR NOT _apps)
+        add_test(unit.list-failed bash -c "echo 'test-axl.sh --list-apps failed (${_apps_rc})' >&2; exit 1")
+        set_tests_properties(unit.list-failed PROPERTIES LABELS unit)
+    else()
+        set(_counts "${_runlogs}/unit-counts")
+        # The unit runs are not run-one.sh's: no skip cache (it keys on the
+        # runner's arch, which they would not set), so its variable goes.
+        set(_unit_env ${AXL_IT_ENV})
+        list(FILTER _unit_env EXCLUDE REGEX "^AXL_TEST_CACHE=")
+        # ...nor the suite's FORCED -delay 0 launcher: the unit runs boot as
+        # test-axl.sh's one-boot run (verify.sh's arch jobs) boots them.
+        list(FILTER _unit_env EXCLUDE REGEX "^AXL_SHELL_LAUNCHER=")
+        if("@AXL_IT_ARCH@" STREQUAL "X64")
+            set(_write 1)
+        else()
+            set(_write 0)
+        endif()
+        # Each through lib/pool-or-boot.sh: with no pool (AXL_ONE_POOL_SOCK
+        # unset -- set below for a pooled tree) it runs the binary booted at
+        # once; pooled, on a leased `unit` guest, and a pool MISS runs it
+        # booted instead, said (docs/AXL-Test-Guest-Pool-Design.md §6.7).
+        set(_unit_apps ${_apps})
+        file(MAKE_DIRECTORY "${_runlogs}/unit-pool")
+        foreach(_a IN LISTS _apps)
+            # Kept by name: a pooled tree sets it again plus the socket (the
+            # ctest script context has no set_property ... APPEND).
+            set(_uenv_${_a} "${_unit_env};TEST_APPS_ONLY=${_a};TEST_SKIP_RATCHET=1;TEST_COUNT_FILE=${_counts}/${_a};TEST_TIMEOUT_SCALE=2")
+            add_test("unit.${_a}" bash "${_lib}/pool-or-boot.sh" --class unit --arch @AXL_IT_ARCH@
+                --tree "${_src}" --log "${_runlogs}/unit-pool/${_a}.log"
+                -- bash "${_src}/test/integration/test-axl.sh" --arch @AXL_IT_ARCH@)
+            set_tests_properties("unit.${_a}" PROPERTIES
+                LABELS "unit;arch:@AXL_ARCH@"
+                COST 10
+                TIMEOUT 300
+                ${AXL_IT_TERM}
+                ENVIRONMENT "${_uenv_${_a}}"
+                FIXTURES_REQUIRED "integration.prep;integration.tmp;unit.counts"
+                WORKING_DIRECTORY "${_src}")
+        endforeach()
+        add_test(unit.counts-reset bash -c "rm -rf \"$0\" && mkdir -p \"$0\"" "${_counts}")
+        set_tests_properties(unit.counts-reset PROPERTIES LABELS unit FIXTURES_SETUP unit.counts)
+        add_test(unit.ratchet bash "${_lib}/unit-ratchet.sh" "${_counts}" ${_write} ${_apps})
+        set_tests_properties(unit.ratchet PROPERTIES LABELS unit FIXTURES_CLEANUP unit.counts
+            SKIP_RETURN_CODE 77)
+        add_test(unit.inventory bash "${_src}/test/integration/test-axl.sh" --check-inventory "${_bin}")
+        set_tests_properties(unit.inventory PROPERTIES LABELS unit
+            FIXTURES_REQUIRED "integration.prep" WORKING_DIRECTORY "${_src}")
+        # THE ONE-BOOT RUN: every binary in ONE guest, with test-axl.sh's
+        # ratchet and wall-clock budget. x64 writes the ratchet; aa64 gets
+        # TEST_SKIP_RATCHET=1, which skips its ratchet AND its budget (as the
+        # old verify.sh ran it). verify.sh's x64 and aa64 jobs select it when
+        # the registration does not pool the units (verify.sh, THE UNITS ON
+        # THE POOL; pooled, nothing boots): run BOOTED
+        # per binary they took 357 s against 162 s, 49 boots per arch -- TCG
+        # on aa64 -- competing with each other and the gates (decided by Mike
+        # 2026-11-06, design §10.8). Labelled unit-boot, NOT unit: the suite
+        # presets run the per-binary tests and leave this out.
+        # STRICT unless told otherwise: the hang-timeout and budget scales
+        # come from AXL_UNIT_TIMEOUT_SCALE / AXL_UNIT_BUDGET_SCALE at RUN time,
+        # set by the front end that knows what it runs beside (verify.sh, by
+        # the rules it always had). A lone `ctest -R unit.one-boot` judges the
+        # real budget, as a lone `verify.sh --only=x64` did. A caller's own
+        # TEST_TIMEOUT_SCALE / TEST_BUDGET_SCALE is OVERRIDDEN here (to 1
+        # unless AXL_UNIT_* says otherwise): this test's scales are stated in
+        # one place. The plain and suite test presets exclude it (label
+        # unit-boot); a bare `ctest --test-dir` with no -L/-LE runs it AND the
+        # per-binary tests -- the unit suite twice.
+        set(_boot_env ${_unit_env})
+        if(NOT _write)
+            list(APPEND _boot_env "TEST_SKIP_RATCHET=1")
+        endif()
+        add_test(unit.one-boot bash -c
+            "export TEST_TIMEOUT_SCALE=\"\${AXL_UNIT_TIMEOUT_SCALE:-1}\" TEST_BUDGET_SCALE=\"\${AXL_UNIT_BUDGET_SCALE:-1}\"; exec \"\$@\""
+            unit.one-boot bash "${_src}/test/integration/test-axl.sh" --arch @AXL_IT_ARCH@)
+        set_tests_properties(unit.one-boot PROPERTIES
+            LABELS "unit-boot;arch:@AXL_ARCH@"
+            COST 120
+            TIMEOUT 900
+            ${AXL_IT_TERM}
+            ENVIRONMENT "${_boot_env}"
+            FIXTURES_REQUIRED "integration.prep;integration.tmp"
+            WORKING_DIRECTORY "${_src}")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# verify.sh's other jobs as CTest tests (slice 5a step 5; the gates ported off
+# the Makefile in slice 5c, docs/AXL-Build-System-Design.md §10.11, and the
+# Makefile retired in slice 6, §10.12).
+#   gate.check-<name> each check gate, its command run directly against THIS
+#                     tree: the scripts read its compile_commands.json (the
+#                     compile-only gates), its images and archives (label
+#                     `artifact`: verify.sh's imggates job), or only the
+#                     sources (verify.sh's gates job). Arch-independent gates
+#                     are registered in the x64 tree; the ones that read an
+#                     arch's own compiler or images in EACH arch's tree, as
+#                     the Makefile's `ARCH=aa64 check-...` used to run them
+#                     (its two gates of ITSELF, check-dep-tracking and
+#                     check-build-mode, went with it in 5.0.0). Every gate is
+#                     ordered after the prep, and an artifact gate REQUIRES it
+#                     (it reads what the prep built).
+#   gate.lint         scripts/lint.sh (the x64-lint preset, incremental)
+#   gate.docs         scripts/build-docs.sh (zero-warning Sphinx)
+#   gate.qloop        scripts/qloop-verdict.sh, RUN_SERIAL: AxlTestLoop's
+#                     timing cases judged alone on the box -- the one copy of
+#                     that verdict, which verify.sh's qloop job runs too
+#                     (docs/AXL-Build-System-Design.md §10.14). Its
+#                     UNJUDGED (exit 3) is this test's SKIP: a timing gate
+#                     that judged nothing has not passed, and ctest lists it
+#                     under "did not run" -- but ctest's own exit stays 0, so
+#                     a front end that reports green must read the skip, and
+#                     ctest shows a skipped test's output to nobody: the
+#                     verdict line is qloop-logs/qloop-verdict.txt, beside
+#                     the run's files (one run's worth, overwritten by the
+#                     next -- never left in /tmp). LastTest.log is no home
+#                     for it: every ctest invocation rewrites that file.
+# ---------------------------------------------------------------------------
+if(NOT _stub_env)
+    set(_py "@Python3_EXECUTABLE@")
+    set(_bu "@AXL_BINUTILS_PREFIX@")
+    # The TUs whose compile the compile-only gates borrow (compile-like.py):
+    # an application's C and C++ TU in every debug tree.
+    set(_like_c "sdk/examples/hello.c")
+    set(_like_cxx "test/integration/cxx-seam-selftest.cpp")
+    set(_gates_registered "")
+    # NICED, as verify.sh runs lint, the gates and docs beside the guests:
+    # unniced the box ran at load 19-21 and a guest hit its own hang timeout
+    # (verify.sh's NICE comment). DEPENDS integration.prep: ORDER (unordered,
+    # ctest starts the gates at t=0, their compiles push the load past
+    # --test-load, and the prep the one-boot unit run needs waited ~60 s).
+    macro(_axl_gate name kind)
+        add_test("gate.${name}" nice -n 15 ${ARGN})
+        set_tests_properties("gate.${name}" PROPERTIES
+            LABELS "gate;check" TIMEOUT 1800 WORKING_DIRECTORY "${_src}"
+            DEPENDS integration.prep)
+        if("${kind}" STREQUAL "artifact")
+            set_tests_properties("gate.${name}" PROPERTIES
+                LABELS "gate;check;artifact" FIXTURES_REQUIRED integration.prep)
+        endif()
+        list(APPEND _gates_registered "${name}")
+    endmacro()
+
+    # THIS TREE'S ARCH: read its own compiler, objects and images.
+    _axl_gate(check-cxx-entry lint "${_src}/scripts/check-cxx-entry.sh"
+        --tree "${_bin}" --binutils-prefix "${_bu}" --like "${_like_cxx}")
+    _axl_gate(check-ctors artifact "${_src}/scripts/check-ctors.sh"
+        --tree "${_bin}" --binutils-prefix "${_bu}")
+    _axl_gate(check-libc-overlap artifact "${_py}" "${_src}/scripts/check-libc-overlap.py"
+        --arch "@AXL_ARCH@" --tree "${_bin}")
+    _axl_gate(check-nx-compat artifact "${_py}" "${_src}/scripts/check-pe-nx.py"
+        "${_bin}/cpu-topology-selftest.efi" "${_bin}/SmbusHcShim.efi"
+        "${_bin}/build/axl-pack-stub-app-empty.efi" "${_bin}/build/axl-pack-stub-drv-empty.efi"
+        "${_bin}/build/axl-legacy-ip4cfg.efi")
+    _axl_gate(check-log-linkage artifact env "CROSS=${_bu}" "${_py}"
+        "${_src}/scripts/check-log-linkage.py" "${_bin}/hello.efi" "${_bin}/driver.efi"
+        "${_bin}/cxx-seam-selftest.efi" "${_bin}/minimal-log-on.efi" "${_bin}/minimal-log-off.efi")
+    _axl_gate(check-reloc-coverage artifact env "CROSS=${_bu}" "${_py}" "${_src}/scripts/check-reloc-coverage.py"
+        "${_bin}/cpu-topology-selftest.efi" "${_bin}/build/axl-pack-stub-app-empty.efi"
+        "${_bin}/build/axl-legacy-ip4cfg.efi")
+    _axl_gate(check-bss-clear artifact env "CROSS=${_bu}" "${_py}" "${_src}/scripts/check-bss-clear.py"
+        "@AXL_BSS_CRT0@")
+    # Both arches: aa64's objcopy left a COFF string table (for the 9-byte
+    # `.rela.dyn`) behind a ZERO-symbol pointer until pe-set-debug dropped
+    # it. A wrapped tool too: the pack wrap runs pe-set-debug on its stub.
+    _axl_gate(check-pe-stripped artifact "${_py}" "${_src}/scripts/check-pe-stripped.py"
+        "${_bin}/cpu-topology-selftest.efi" "${_bin}/hello.efi"
+        "${_bin}/build/axl-pack-stub-app-empty.efi" "${_bin}/tools/hexdump.efi")
+
+    if("@AXL_IT_ARCH@" STREQUAL "X64")
+        # x64 only: AVX is an x86 hazard (UEFI boots CR4.OSXSAVE clear). The
+        # C and C++ runtime archives every link carries are scanned too --
+        # CMake's configure already refused a toolchain without them.
+        _axl_gate(check-no-avx artifact "${_py}" "${_src}/scripts/check-no-avx.py"
+            "${_bin}/lib/libaxl.a" "${_bin}/cpu-topology-selftest.so"
+            "${_bin}/build/axl-pack-stub-app-empty.so" "${_bin}/build/axl-legacy-ip4cfg.so"
+            @AXL_RUNTIME_ARCHIVES@)
+        # The derivation of the size gate's inputs is ninja's record, so it
+        # needs a BUILT tree.
+        # Bounded, and a hang SAID: a bare exit 124 explains nothing. (Lines,
+        # not `;`: a `;` in a CMake argument splits it into a list.)
+        _axl_gate(check-size-gate-paths artifact bash -c
+            "timeout 300 \"\$0\" --tree \"\$1\" --check\nrc=\$?\n[ \$rc -ne 124 ] || echo 'check-size-gate-paths: TIMED OUT after 300 s -- scripts/size-gate-inputs.sh --check hung' >&2\nexit \$rc"
+            "${_src}/scripts/size-gate-inputs.sh" "${_bin}")
+
+        # The C++ contract fixtures and the consumer-shaped example compile.
+        _axl_gate(check-cb-noexcept lint "${_src}/scripts/check-compile-fixtures.sh"
+            cb-noexcept --tree "${_bin}" --like "${_like_cxx}")
+        _axl_gate(check-handle-exclusions lint "${_src}/scripts/check-compile-fixtures.sh"
+            handle-exclusions --tree "${_bin}" --like "${_like_cxx}")
+        _axl_gate(check-examples lint "${_src}/scripts/check-examples.sh"
+            --tree "${_bin}" --like-c "${_like_c}" --like-cxx "${_like_cxx}")
+
+        # Source lints: read files, build nothing.
+        foreach(_g ascii:check-output-ascii docs:check-doc-coverage dogfood nul
+                test-registered json-dialect flag-parity toolchain-conf uefi-scope
+                log-levels awk-portability devkit-conf tool-version tool-docs
+                asset-names tools-sidecars no-inner-map-refresh test-est)
+            string(REPLACE ":" ";" _g "${_g}")
+            list(GET _g 0 _name)
+            list(LENGTH _g _n)
+            if(_n EQUAL 2)
+                list(GET _g 1 _script)
+            else()
+                set(_script "check-${_name}")
+            endif()
+            _axl_gate(check-${_name} lint "${_py}" "${_src}/scripts/${_script}.py")
+        endforeach()
+        _axl_gate(check-test-meta lint bash "${_src}/test/integration/lib/discover.sh" --lint)
+        # Reads this tree's build GRAPH (builds= products), not its images:
+        # a configured tree is enough, so lint, not artifact.
+        _axl_gate(check-test-inputs lint "${_py}" "${_src}/scripts/check-test-inputs.py"
+            --tree "${_bin}")
+        _axl_gate(check-tautology lint "${_src}/scripts/check-tautology.sh")
+        _axl_gate(check-version lint "${_src}/scripts/check-version.sh")
+        _axl_gate(check-fuzz-link lint "${_src}/scripts/check-fuzz-link.sh")
+    endif()
+    list(LENGTH _gates_registered _ngates)
+    if(_ngates LESS 5)
+        # A gate runner that runs nothing reports green forever.
+        add_test(gate.check-list-failed bash -c "echo 'only ${_ngates} gate(s) registered' >&2; exit 1")
+        set_tests_properties(gate.check-list-failed PROPERTIES LABELS "gate;check")
+    endif()
+endif()
+
+if(NOT _stub_env AND "@AXL_IT_ARCH@" STREQUAL "X64")
+    add_test(gate.lint nice -n 15 "${_src}/scripts/lint.sh")
+    set_tests_properties(gate.lint PROPERTIES LABELS "gate;lint" TIMEOUT 1800
+        WORKING_DIRECTORY "${_src}")
+    add_test(gate.docs nice -n 15 "${_src}/scripts/build-docs.sh")
+    set_tests_properties(gate.docs PROPERTIES LABELS "gate;docs" TIMEOUT 1800
+        WORKING_DIRECTORY "${_src}")
+    file(MAKE_DIRECTORY "${_bin}/qloop-logs")
+    add_test(gate.qloop "${_src}/scripts/qloop-verdict.sh" --dir "${_bin}/qloop-logs")
+    set_tests_properties(gate.qloop PROPERTIES LABELS "gate;qloop" RUN_SERIAL ON
+        SKIP_RETURN_CODE 3 TIMEOUT 600 WORKING_DIRECTORY "${_src}")
+    set(_qloop_registered 1)   # pooled below, as the unit binaries are
+endif()
+
+# ---------------------------------------------------------------------------
+# AXL_IT_POOL (at ctest time): 1 for the user service's socket, or a socket
+# path, or auto. Every guest= test then takes one slot of
+# guest_<class>_<arch>, runs on a pooled guest through run-one.sh (a pool miss
+# reruns it booted), and requires integration.pool -- lib/pool-check.sh,
+# which refuses a pool that is not answering or has no agent for this arch,
+# as run-integration.sh --pool does. Unset or empty: every test boots, and
+# takes no guest resource.
+# auto -- the default of the plain and suite presets, and what the runner
+# passes for a run it was not asked to pool (the pool exists to cut boots and
+# wall time; Mike, 2026-11-06): pooled only when the user service ANSWERS
+# and serves this arch (lib/pool-check.sh ... auto -- a socket that merely
+# accepts is not enough, the installed unit is socket-activated). No socket
+# file: nothing pooled, nothing said. The pool check then runs in AUTO mode,
+# which says why an unhealthy service is not used and lets the tests miss and
+# boot instead of failing them all; and a resource spec the pool's classes
+# could not give leaves everything booted,
+# said by a check that passes.
+if(NOT DEFINED _unit_apps)
+    set(_unit_apps "")   # a stub run registers no unit binaries
+endif()
+set(_pool_mode "")
+if(DEFINED ENV{AXL_IT_POOL} AND NOT "$ENV{AXL_IT_POOL}" STREQUAL "")
+    set(_pool_mode "$ENV{AXL_IT_POOL}")
+elseif(DEFINED ENV{AXL_IT_POOL_DEFAULT} AND NOT "$ENV{AXL_IT_POOL_DEFAULT}" STREQUAL "")
+    # A preset's DEFAULT (base: auto). A preset's `environment` overrides the
+    # caller's, so the default cannot be AXL_IT_POOL itself: a caller's
+    # explicit AXL_IT_POOL=1 / socket would be silently turned into auto.
+    set(_pool_mode "$ENV{AXL_IT_POOL_DEFAULT}")
+endif()
+set(_pool_said "")   # auto, but not used: the line saying why (a check prints it)
+# 0 / off: booted, said -- the way to opt out under a preset, whose
+# AXL_IT_POOL_DEFAULT a caller cannot unset (a preset's environment wins).
+if(_pool_mode STREQUAL "0" OR _pool_mode STREQUAL "off")
+    set(_pool_said "pool: off (AXL_IT_POOL=${_pool_mode}) -- guest= tests boot")
+    set(_pool_mode "")
+endif()
+if(_pool_mode STREQUAL "1" OR _pool_mode STREQUAL "auto")
+    if(DEFINED ENV{XDG_RUNTIME_DIR} AND NOT "$ENV{XDG_RUNTIME_DIR}" STREQUAL "")
+        set(_rt "$ENV{XDG_RUNTIME_DIR}")
+    else()
+        execute_process(COMMAND id -u OUTPUT_VARIABLE _uid OUTPUT_STRIP_TRAILING_WHITESPACE)
+        set(_rt "/run/user/${_uid}")
+    endif()
+    set(_sock "${_rt}/axlpool/pool.sock")
+    if(_pool_mode STREQUAL "auto")
+        # The SERVICE must answer and serve this arch -- the runner's own
+        # decision, by the same check. A socket that accepts is not enough:
+        # the installed unit is socket-activated, so systemd keeps it
+        # listening while the service itself has failed.
+        if(NOT EXISTS "${_sock}")
+            set(_pool_mode "")   # no service here: nothing pooled
+            # ...said on a CI runner (CI is set by GitHub Actions and most CI
+            # systems): a hosted runner's log must state that everything
+            # booted. A developer's host with no service says nothing.
+            if(DEFINED ENV{CI} AND NOT "$ENV{CI}" STREQUAL "")
+                set(_pool_said "pool: none (no service at ${_sock}) -- guest= tests boot")
+            endif()
+        else()
+            execute_process(
+                COMMAND bash "${_lib}/pool-check.sh" "${_sock}" @AXL_IT_ARCH@ "${_proj}" "ctest" auto
+                OUTPUT_VARIABLE _pc_out ERROR_VARIABLE _pc_err RESULT_VARIABLE _pc_rc
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+            # stdout only, as the runner reads it: a stray stderr line ahead of
+            # the verdict must not make an unhealthy service read as healthy.
+            if(NOT _pc_rc EQUAL 0 OR _pc_out MATCHES "(^|\n)pool: unavailable")
+                if(_pc_out STREQUAL "")
+                    set(_pc_out "pool-check exited ${_pc_rc}: ${_pc_err}")
+                endif()
+                set(_pool_mode "")   # the service does not serve: everything boots
+                set(_pool_said "${_pc_out}")
+                if(NOT _pool_said MATCHES "^pool: unavailable")
+                    set(_pool_said "pool: unavailable (${_pc_out}) -- guest= tests boot")
+                endif()
+            endif()
+        endif()
+    endif()
+elseif(NOT _pool_mode STREQUAL "")
+    set(_sock "${_pool_mode}")
+endif()
+set(_pool_check_mode "")
+if(_pool_mode STREQUAL "auto")
+    set(_pool_check_mode "auto")
+    if(NOT _spec_rc EQUAL 0)
+        # No resource spec, so no guest slot to take: everything boots.
+        string(REPLACE "'" "" _spec_err "${_spec_err}")
+        set(_pool_said "pool: unavailable (no resource spec: axlpool resource-spec failed (${_spec_rc}): ${_spec_err}) -- guest= tests boot")
+        set(_pool_mode "")
+    endif()
+endif()
+if(NOT _pool_said STREQUAL "")
+    # Said by a check that PASSES (auto was not asked for, only defaulted to),
+    # and that every guest= test REQUIRES -- so a run that selects any of them
+    # by name (the runner does) prints why none was pooled.
+    string(REPLACE "'" "" _pool_said "${_pool_said}")
+    string(REPLACE "\n" " " _pool_said "${_pool_said}")
+    add_test(integration.pool bash -c "echo '${_pool_said}'")
+    set_tests_properties(integration.pool PROPERTIES LABELS prep FIXTURES_SETUP integration.pool)
+    foreach(_g IN LISTS AXL_IT_GUEST)
+        string(FIND "${_g}" "=" _eq REVERSE)
+        string(SUBSTRING "${_g}" 0 ${_eq} _gname)
+        set_tests_properties("${_gname}" PROPERTIES
+            FIXTURES_REQUIRED "integration.prep;integration.tmp;integration.pool")
+    endforeach()
+    foreach(_a IN LISTS _unit_apps)
+        set_tests_properties("unit.${_a}" PROPERTIES
+            FIXTURES_REQUIRED "integration.prep;integration.tmp;unit.counts;integration.pool")
+    endforeach()
+endif()
+if(NOT _pool_mode STREQUAL "")
+    if(_spec_rc EQUAL 0)
+        add_test(integration.pool bash "${_lib}/pool-check.sh" "${_sock}" @AXL_IT_ARCH@ "${_proj}"
+            "ctest AXL_IT_POOL=${_pool_mode}" ${_pool_check_mode})
+    else()
+        string(REPLACE "'" "" _spec_err "${_spec_err}")
+        add_test(integration.pool bash -c
+            "echo 'AXL_IT_POOL, but no resource spec: axlpool resource-spec failed (${_spec_rc}): ${_spec_err}' >&2; exit 1")
+    endif()
+    set_tests_properties(integration.pool PROPERTIES LABELS prep FIXTURES_SETUP integration.pool)
+    # The CODE the service runs, asked ONCE per run, here (a ctest reads this
+    # file once): a pooled test's skip-cache key holds it (lib/test-cache.sh),
+    # and each lease is held to it (lib/pool-or-boot.sh, `axlpool run
+    # --expect-code`), so a service restarted with other code mid-run misses
+    # and boots rather than letting a key name code a test did not run on.
+    # No answer -- no service yet, or one older than the identity -- is EMPTY,
+    # set explicitly so a stray AXL_POOL_CODE_ID cannot stand in: no pooled
+    # key, and every pooled test runs.
+    set(_pool_code "")
+    if(_spec_rc EQUAL 0)
+        execute_process(
+            COMMAND [==[@Python3_EXECUTABLE@]==] -m axlpool code --socket "${_sock}"
+            WORKING_DIRECTORY "${_proj}/test/pool"
+            OUTPUT_VARIABLE _pool_code_out ERROR_QUIET RESULT_VARIABLE _pool_code_rc
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_pool_code_rc EQUAL 0 AND _pool_code_out MATCHES "^[0-9a-f]+$")
+            set(_pool_code "${_pool_code_out}")
+        endif()
+    endif()
+    foreach(_g IN LISTS AXL_IT_GUEST)
+        string(FIND "${_g}" "=" _eq REVERSE)
+        string(SUBSTRING "${_g}" 0 ${_eq} _gname)
+        math(EXPR _eq "${_eq} + 1")
+        string(SUBSTRING "${_g}" ${_eq} -1 _gclass)
+        set_tests_properties("${_gname}" PROPERTIES
+            RESOURCE_GROUPS "guest_${_gclass}_@AXL_ARCH@:1"
+            ENVIRONMENT "${AXL_IT_ENV};AXL_ONE_POOL_SOCK=${_sock};AXL_POOL_CODE_ID=${_pool_code}"
+            FIXTURES_REQUIRED "integration.prep;integration.tmp;integration.pool")
+    endforeach()
+    # The unit binaries, one leased `unit` guest each (test/pool/classes.toml).
+    # TIMEOUT doubled: a pool MISS runs the binary booted after the attempt,
+    # in the same test (lib/pool-or-boot.sh), and the booted run alone is
+    # what 300 s was sized for.
+    foreach(_a IN LISTS _unit_apps)
+        set_tests_properties("unit.${_a}" PROPERTIES
+            ENVIRONMENT "${_uenv_${_a}};AXL_ONE_POOL_SOCK=${_sock}"
+            RESOURCE_GROUPS "guest_unit_@AXL_ARCH@:1"
+            TIMEOUT 600
+            FIXTURES_REQUIRED "integration.prep;integration.tmp;unit.counts;integration.pool")
+    endforeach()
+    # The quiet slot on a leased `unit` guest (scripts/qloop-verdict.sh, pool
+    # design §6.7 step 5): one slot, the socket, the pool check. TIMEOUT 780:
+    # the script's worst case -- the settle (90 s), a pooled attempt that
+    # misses just inside its 300 s (plus the wrapper's 10 s KILL grace), then
+    # the booted rerun's 300 s -- is ~700 s; ctest must not cut it short.
+    if(DEFINED _qloop_registered)
+        set_tests_properties(gate.qloop PROPERTIES
+            TIMEOUT 780
+            ENVIRONMENT "AXL_ONE_POOL_SOCK=${_sock}"
+            RESOURCE_GROUPS "guest_unit_@AXL_ARCH@:1"
+            FIXTURES_REQUIRED "integration.pool")
+    endif()
+endif()

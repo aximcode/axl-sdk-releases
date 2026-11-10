@@ -1,0 +1,395 @@
+# axl-config.cmake — CMake support for building AXL applications (GCC toolchain).
+#
+# Usage (preferred):
+#   find_package(axl REQUIRED)
+#   axl_add_app(myapp myapp.c)                  # → myapp.efi
+#   axl_add_app(myapp myapp.cpp)                # C++, std::vector/string/map included
+#                                               # (HOSTED was removed; it is an error)
+#   axl_add_driver(myDxe myDxe.c)               # → myDxe.efi (DriverEntry, subsystem 11)
+#   axl_add_app(myapp myapp.c ALLOW_UEFI)       # app that needs <uefi/...>
+#                                               # (drivers get it from TYPE)
+#   axl_add_app(my-launcher launcher.c          # launcher embeds the driver:
+#       EMBEDS ${CMAKE_CURRENT_BINARY_DIR}/myDxe.efi=my_driver
+#   )                                           # → my-launcher.efi (with .incbin'd blob)
+#
+# Also works via explicit include:
+#   include(/usr/lib/cmake/axl/axl-config.cmake)
+#   axl_add_app(myapp myapp.c)
+
+# CMake 3.20 or newer: add_custom_command(DEPFILE) -- the header dependency
+# tracking every axl_add_app object relies on -- reaches the Makefile
+# generators only from 3.20 (CMP0116). A package config must not call
+# cmake_minimum_required (that would reset the CONSUMER's policies), so the
+# version is checked here, first, and refused by name rather than left to
+# misbehave further down.
+#
+# Through find_package, the refusal is a NOT-FOUND with a reason: REQUIRED
+# still stops configure and prints it, while an optional find_package(axl)
+# gets axl_FOUND false and can fall back. Anything else is a FATAL_ERROR: a
+# bare include() has no such channel, and when ANOTHER package's config
+# include()s this file, CMAKE_FIND_PACKAGE_NAME is that package's -- marking
+# it not-found while returning from this file alone would let it carry on
+# and the consumer fail later on a missing axl_add_app. Compared lowercased:
+# find_package(AXL) loads this file too.
+if(CMAKE_VERSION VERSION_LESS 3.20)
+    set(_AXL_TOO_OLD "axl: the AXL SDK's CMake package requires CMake 3.20 or newer (this is CMake ${CMAKE_VERSION}).")
+    string(TOLOWER "${CMAKE_FIND_PACKAGE_NAME}" _AXL_FINDING)
+    if(_AXL_FINDING STREQUAL "axl")
+        set(${CMAKE_FIND_PACKAGE_NAME}_FOUND FALSE)
+        set(${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE "${_AXL_TOO_OLD}")
+        unset(_AXL_TOO_OLD)
+        unset(_AXL_FINDING)
+        return()
+    endif()
+    message(FATAL_ERROR "${_AXL_TOO_OLD}")
+endif()
+
+# Resolve the SDK root from this file's installed location:
+#   <prefix>/lib/cmake/axl/axl-config.cmake  →  <prefix>
+if(NOT DEFINED AXL_SDK_DIR)
+    get_filename_component(AXL_SDK_DIR "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+endif()
+
+if(NOT DEFINED AXL_ARCH)
+    set(AXL_ARCH "x64")
+endif()
+
+set(AXL_INCLUDE_DIR "${AXL_SDK_DIR}/include/axl-sdk")
+set(AXL_LIB_DIR     "${AXL_SDK_DIR}/lib/axl/${AXL_ARCH}")
+
+if(AXL_ARCH STREQUAL "x64")
+    # Our own binutils, so a consumer needs no system development tools.
+    # CMake list (unquoted) so ${AXL_GCC_ARCH} expands to multiple
+    # args in COMMAND — a quoted string would pass as one arg and
+    # gcc would reject "-mno-red-zone -march=x86-64" wholesale.
+elseif(AXL_ARCH STREQUAL "aa64")
+    # @AXL_AA64_BINUTILS_PREFIX@, not apt's aarch64-linux-gnu-: a consumer
+    # should need no system development tools, and ARM's toolchain ships the
+    # pei-aarch64-little target this package converts to. x64 keeps the empty
+    # prefix (host binutils) until its toolchain is rebuilt with PE support --
+    # see AXL-Libc-Substrate-Design.md §4.1d.
+    # -ffixed-x18: UEFI AArch64 binding (UEFI 2.11 §2) reserves x18
+    # as the platform register; without this gcc may clobber it,
+    # leading to post-ExitBootServices OS-side corruption.
+endif()
+
+# The driver every image is built by. This package used to reimplement what it
+# does; it calls it now, so there is one place the flags live.
+set(AXL_CC "${AXL_SDK_DIR}/bin/axl-cc")
+if(NOT EXISTS "${AXL_CC}")
+    message(FATAL_ERROR
+        "axl: ${AXL_CC} is missing -- this SDK install is incomplete.")
+endif()
+
+# Stack-smashing detection, matching the AXL build and axl-cc.
+#
+# -mstack-protector-guard=global is the load-bearing half on x86-64: GCC
+# otherwise reads the canary from %fs:0x28, glibc's TLS block, which UEFI never
+# sets up -- so the plain flag faults instead of protecting. AArch64 already
+# defaults to the global symbol. libaxl.a supplies __stack_chk_guard and
+# __stack_chk_fail.
+#
+# THE COMPILE FLAGS ARE NOT HERE ANY MORE, and that is the point.
+#
+# This used to be a THIRD copy of them (Makefile, axl-cc, here), and it
+# drifted: it kept -fno-stack-protector after the other two turned the
+# protector on, so a CMake-built app was unprotected while an axl-cc-built one
+# was not -- same SDK, same source, different security posture depending on
+# which build path the consumer picked. It drifted again later, missing
+# -fexceptions support entirely.
+#
+# _axl_build_efi calls axl-cc now, so the flags live in one place and this file
+# cannot disagree with it. `gate.check-flag-parity` still polices the remaining
+# two paths and asserts THIS one delegates -- reintroduce a hand-rolled compile
+# here and it rejoins the comparison.
+
+if(AXL_ARCH STREQUAL "aa64")
+    # The Linux-ABI cross's libstdc++ headers pull hosted typedefs; the
+    # bare-metal "none-elf" toolchain is the one that works. Matches axl-cc.
+    # Substituted at install time from scripts/axl-toolchains.conf, so this
+    # file cannot drift from the AXL build and axl-cc.
+    set(AXL_CXX_COMPILER "@AXL_AA64_GXX@")
+    set(AXL_C_COMPILER   "@AXL_AA64_GCC@")
+else()
+    set(AXL_CXX_COMPILER "@AXL_X64_GXX@")
+    set(AXL_C_COMPILER   "@AXL_X64_GCC@")
+endif()
+
+# Internal helper: build a TARGET.efi from C sources, optional embedded
+# blobs, and a chosen image type (app / driver). Most consumers reach
+# this via axl_add_app or axl_add_driver — call _axl_build_efi directly
+# only if you need behavior neither wrapper exposes.
+function(_axl_build_efi TARGET TYPE)
+    cmake_parse_arguments(_AXL "HOSTED;ALLOW_UEFI;COMPRESS" "" "SOURCES;EMBEDS;OPTIONS" ${ARGN})
+
+    # THIS FUNCTION CALLS axl-cc. It used to re-implement it -- its own compile
+    # line per source, its own ld, its own objcopy, its own pe-set-debug, ~200
+    # lines mirroring scripts/axl-cc.
+    #
+    # That duplication was the THIRD of the three build paths
+    # `gate.check-flag-parity` exists to police, and it was not merely untidy:
+    # when axl-c++ gained -fexceptions, this copy did not, so a consumer asking
+    # for exceptions here got an image that compiled, linked, and died at the
+    # first throw -- and the parity gate could not see it, because the gate
+    # compares flag SPELLINGS and both paths named the same objcopy sections.
+    # It also had no way to pass a compile flag at all: axl_add_app produces a
+    # custom target, so target_compile_options() errors with "non-compilable
+    # target type", which is how the missing -fexceptions was found.
+    #
+    # Calling the driver fixes all of that by construction. Anything axl-cc
+    # learns, CMake consumers get; there is one place for the flags to live.
+    # The cost is one process per image instead of one per source, which is
+    # nothing next to the compile itself, and losing per-source parallelism --
+    # acceptable because axl-cc is what a consumer would type by hand anyway.
+    if(_AXL_HOSTED)
+        message(FATAL_ERROR
+            "axl: HOSTED was removed -- C++ is compiled hosted unconditionally, "
+            "so the keyword selects nothing. Delete it from ${TARGET}; the "
+            "output is unchanged. (docs/AXL-Cxx-Design.md 6a-T3)")
+    endif()
+
+    if(NOT _AXL_SOURCES)
+        message(FATAL_ERROR "axl: ${TARGET} has no SOURCES")
+    endif()
+
+    # Raw UEFI access follows the IMAGE TYPE, matching axl-cc: a driver
+    # implements the protocol types it produces or interposes on, an app does
+    # not get them by default. ALLOW_UEFI is the deliberate opt-out, visible in
+    # the CMakeLists rather than buried in an #include. axl-cc applies the
+    # type rule itself, so only the explicit opt-out has to be forwarded.
+    set(_AXL_CC_ARGS "")
+    if(_AXL_ALLOW_UEFI)
+        list(APPEND _AXL_CC_ARGS --allow-uefi)
+    endif()
+
+    # EMBEDS: `PATH` or `PATH=name`, forwarded verbatim -- axl-cc takes the
+    # same spelling and owns the .incbin sidecar, the symbol-name derivation
+    # and the validation that a derived name is a C identifier.
+    #
+    # A relative path is resolved against the BINARY dir, not the source dir,
+    # because the overwhelmingly common embed is a driver .efi that another
+    # axl_add_driver() just produced. That was this function's behaviour before
+    # and is preserved deliberately.
+    set(_EMBED_DEPS "")
+    foreach(SPEC ${_AXL_EMBEDS})
+        if(SPEC MATCHES "^(.+)=([^=]+)$")
+            set(_EMBED_PATH "${CMAKE_MATCH_1}")
+            set(_EMBED_NAME "=${CMAKE_MATCH_2}")
+        else()
+            set(_EMBED_PATH "${SPEC}")
+            set(_EMBED_NAME "")
+        endif()
+        if(NOT IS_ABSOLUTE "${_EMBED_PATH}")
+            set(_EMBED_PATH "${CMAKE_CURRENT_BINARY_DIR}/${_EMBED_PATH}")
+        endif()
+        list(APPEND _AXL_CC_ARGS --embed "${_EMBED_PATH}${_EMBED_NAME}")
+        list(APPEND _EMBED_DEPS "${_EMBED_PATH}")
+    endforeach()
+
+    # Sources as ABSOLUTE paths: axl-cc runs in the build dir, and CMake
+    # resolves a relative SOURCES entry against the source dir.
+    set(_SRC_ABS "")
+    foreach(SRC ${_AXL_SOURCES})
+        get_filename_component(_A "${SRC}" ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+        list(APPEND _SRC_ABS "${_A}")
+    endforeach()
+
+    set(_EFI_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi")
+
+    # COMPRESS: the image is written packed when that pays (axl-cc
+    # --compress; axl-efi-pack decides), and the linked image is kept beside
+    # it as ${TARGET}.raw.efi. LINK step only -- it means nothing to a compile.
+    set(_LINK_ARGS "")
+    set(_LINK_BYPRODUCTS "")
+    if(_AXL_COMPRESS)
+        list(APPEND _LINK_ARGS --compress)
+        set(_LINK_BYPRODUCTS BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.raw.efi")
+    endif()
+
+    # TWO STEPS -- compile each source, then link -- rather than one axl-cc
+    # invocation over all of them. Two reasons, and the second is the one that
+    # forces it:
+    #
+    #   - per-source objects keep the generator's parallelism, which a single
+    #     compile-and-link call would throw away;
+    #   - dependency files are COMPILE-ONLY (they describe one TU), so a
+    #     one-shot call cannot produce one, and header dependency tracking is
+    #     the thing this package most needs. The previous re-implementation had
+    #     NONE -- its DEPENDS listed only the source -- so editing an SDK or
+    #     project header rebuilt nothing.
+    #
+    # The LINK step needs no COMPILE flags repeated to it. axl-cc derives what
+    # the link needs (libstdc++/libsupc++, the C++ linker script and the
+    # cxxrt glue objects) from the OBJECTS via `nm -u`,
+    # precisely so a staged build works -- so re-passing -O2 or -D would be
+    # noise, and forgetting to would be a silent defect. This is that design
+    # paying off.
+    #
+    # OPTIONS is forwarded to the link anyway, and the reason is at that call
+    # site: it is the only flag channel this package offers, so it legitimately
+    # carries link-side entries (-Wl,-Map=..., --minimal-runtime). Compile-only
+    # entries are inert there. An earlier version of this paragraph said the
+    # link "deliberately gets no OPTIONS", which described the code before that
+    # fix and shipped to consumers inside axl-config.cmake.
+    # PLAIN gcc -MD, not an axl-cc-specific flag. There was a `--depfile`
+    # option that post-processed the .d to make every path absolute, invented
+    # because a RELATIVE source made gcc emit compile-cwd-relative
+    # prerequisites that CMake resolved against the wrong directory. This
+    # function passes ABSOLUTE sources, so gcc's own output is already absolute
+    # and the workaround has nothing left to do.
+    #
+    # -MD and NOT -MMD, which is what --depfile used internally and is why this
+    # is not merely a rename: -MMD omits SYSTEM headers, the SDK arrives via
+    # -isystem, so editing an SDK header did NOT rebuild a consumer's object.
+    # Caught by the tracking assertions in test-cmake-package.sh.
+    #
+    # And NO -MP. Its phony header targets are what lets a Makefile survive a
+    # deleted header, but neither generator needs gcc's here: Ninja ignores a
+    # depfile input that has gone, and the Makefile generator writes its own
+    # phony entries into compiler_depend.make. CMake 3.20 also rewrites gcc's
+    # as `header.h::` -- Ninja then rejects the
+    # depfile ("mentions ... as an output") and make stops ("has both : and
+    # :: entries") on the first rebuild after any edit. Found by running the
+    # dependency cases under the floor, 3.20.6; a deleted header is asserted
+    # there under both generators.
+    #
+    # CMP0116 NEW: a depfile's relative paths are read against this
+    # directory's binary dir, the same under Ninja and Makefiles. The 3.20
+    # minimum (checked at the top of this file) is what makes the DEPFILE
+    # available to every generator; before it, a Makefile build tracked no
+    # headers at all. PUSHed: a policy set inside a function otherwise
+    # propagates to the CALLER's scope, and the consumer's own DEPFILE
+    # commands are not this package's to change.
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0116 NEW)
+
+    set(_OBJS "")
+    set(_I 0)
+    foreach(SRC ${_SRC_ABS})
+        get_filename_component(_BASE "${SRC}" NAME_WE)
+        set(_OBJ "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.${_I}.${_BASE}.o")
+        set(_DEP "${_OBJ}.d")
+        add_custom_command(
+            OUTPUT ${_OBJ}
+            COMMAND ${AXL_CC}
+                    --arch ${AXL_ARCH}
+                    --type ${TYPE}
+                    ${_AXL_CC_ARGS}
+                    ${_AXL_OPTIONS}
+                    -MD -MF ${_DEP}
+                    -c ${SRC}
+                    -o ${_OBJ}
+            DEPENDS ${SRC}
+            DEPFILE ${_DEP}
+            COMMENT "axl-cc: ${TARGET}.${_BASE}.o"
+            VERBATIM
+        )
+        list(APPEND _OBJS "${_OBJ}")
+        math(EXPR _I "${_I} + 1")
+    endforeach()
+    cmake_policy(POP)
+
+    # OPTIONS reaches the LINK as well as the compile. It is the only flag
+    # channel this package offers, and a consumer's OPTIONS legitimately holds
+    # link-side ones -- `-Wl,-Map=...`, `-Xlinker`, `--entry`,
+    # `--minimal-runtime`. Compile-only entries (`-O2`, `-D...`) are inert
+    # here, which is the cheap direction to be wrong in; dropping the link-side
+    # ones was silent, which is not.
+    add_custom_command(
+        OUTPUT ${_EFI_FILE}
+        COMMAND ${AXL_CC}
+                --arch ${AXL_ARCH}
+                --type ${TYPE}
+                ${_AXL_CC_ARGS}
+                ${_LINK_ARGS}
+                ${_AXL_OPTIONS}
+                ${_OBJS}
+                -o ${_EFI_FILE}
+        ${_LINK_BYPRODUCTS}
+        DEPENDS ${_OBJS} ${_EMBED_DEPS}
+        COMMENT "axl-cc: ${TARGET}.efi"
+        VERBATIM
+    )
+
+    add_custom_target(${TARGET} ALL DEPENDS ${_EFI_FILE})
+endfunction()
+
+# Public: build an application image (subsystem APPLICATION, main()).
+#
+#   axl_add_app(myapp myapp.c)
+#   axl_add_app(my-launcher launcher.c
+#       EMBEDS ${CMAKE_CURRENT_BINARY_DIR}/myDxe.efi=my_driver
+#   )
+#   axl_add_app(big-tool big-tool.c COMPRESS)   # packed when it pays
+#
+# EMBEDS entries each take the form `path` or `path=name`. Each blob is
+# wrapped in a .incbin sidecar and linked into the app; consumer code
+# reaches it via <axl/axl-embed.h>'s AXL_EMBED_DECLARE / DATA / SIZE.
+function(axl_add_app TARGET)
+    # OPTIONS: extra flags forwarded verbatim to axl-cc, e.g.
+    #   axl_add_app(app app.cpp OPTIONS -fexceptions -O2)
+    # target_compile_options() CANNOT be used on these targets -- axl_add_app
+    # produces a custom target, so CMake rejects it with "non-compilable target
+    # type". Until OPTIONS existed there was no way to pass a compile flag
+    # through this package AT ALL, which is how -fexceptions was unreachable
+    # here long after axl-c++ supported it.
+    cmake_parse_arguments(_AXL_ADD "HOSTED;ALLOW_UEFI;COMPRESS" "" "EMBEDS;OPTIONS" ${ARGN})
+    # Forwarded explicitly: cmake_parse_arguments STRIPS a recognised option
+    # from UNPARSED_ARGUMENTS, so without this the flag silently does nothing.
+    if(_AXL_ADD_HOSTED)
+        set(_HOSTED_ARG HOSTED)
+    else()
+        set(_HOSTED_ARG "")
+    endif()
+    if(_AXL_ADD_ALLOW_UEFI)
+        set(_UEFI_ARG ALLOW_UEFI)
+    else()
+        set(_UEFI_ARG "")
+    endif()
+    if(_AXL_ADD_COMPRESS)
+        set(_COMPRESS_ARG COMPRESS)
+    else()
+        set(_COMPRESS_ARG "")
+    endif()
+    _axl_build_efi(${TARGET} "app" ${_HOSTED_ARG} ${_UEFI_ARG} ${_COMPRESS_ARG}
+        SOURCES ${_AXL_ADD_UNPARSED_ARGUMENTS}
+        EMBEDS  ${_AXL_ADD_EMBEDS}
+        OPTIONS ${_AXL_ADD_OPTIONS}
+    )
+    # Re-export the .efi path so a launcher can EMBED it without
+    # re-deriving the path.
+    set(${TARGET}_EFI_PATH "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi"
+        PARENT_SCOPE)
+endfunction()
+
+# Public: build a DXE-style driver image (subsystem BOOT_SERVICE_DRIVER,
+# DriverEntry). Used for the "shared driver" pattern where a launcher
+# loads + LocateProtocol's into a resident driver image.
+#
+#   axl_add_driver(my-dxe my-dxe.c)
+#   axl_add_app(my-launcher launcher.c
+#       EMBEDS ${my-dxe_EFI_PATH}=my_driver
+#   )
+#   add_dependencies(my-launcher my-dxe)
+function(axl_add_driver TARGET)
+    # ALLOW_UEFI is accepted and ignored: a driver already has raw UEFI from its
+    # TYPE. Unregistered, cmake_parse_arguments would leave it in
+    # UNPARSED_ARGUMENTS, where it becomes a SOURCE named "ALLOW_UEFI" and the
+    # build fails with "no such file" instead of "you do not need it".
+    cmake_parse_arguments(_AXL_DRV "HOSTED;ALLOW_UEFI;COMPRESS" "" "OPTIONS" ${ARGN})
+    if(_AXL_DRV_HOSTED)
+        set(_HOSTED_ARG HOSTED)
+    else()
+        set(_HOSTED_ARG "")
+    endif()
+    if(_AXL_DRV_COMPRESS)
+        set(_COMPRESS_ARG COMPRESS)
+    else()
+        set(_COMPRESS_ARG "")
+    endif()
+    _axl_build_efi(${TARGET} "driver" ${_HOSTED_ARG} ${_COMPRESS_ARG}
+        SOURCES ${_AXL_DRV_UNPARSED_ARGUMENTS}
+        OPTIONS ${_AXL_DRV_OPTIONS})
+    set(${TARGET}_EFI_PATH "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi"
+        PARENT_SCOPE)
+endfunction()

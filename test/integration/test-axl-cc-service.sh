@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=8 local-only=0
+# test-meta: arch=x64 needs= est=8 local-only=0 guest=standard
 # test-axl-cc-service.sh — end-to-end proof that `axl-cc --service`
 # produces a working launcher + driver pair from a single .c file.
 #
@@ -12,7 +12,8 @@
 # service_demo.efi) and exercises the full pipeline end-to-end:
 # AXL_SERVICE macro -> axl_service_main -> launch_embedded -> driver
 # AXL_SERVICE_DRIVER -> setup. Asserts on the round-trip "setup: ..."
-# log line under the "service-demo" domain.
+# log line under the "service-demo" domain. The links must print no ld
+# warning.
 #
 # Requires scripts/install.sh --arch <arch> to have run first
 # (axl-cc + per-arch libs are the artifact under test). Exits 2 if
@@ -49,13 +50,26 @@ if [[ ! -f "$SRC" ]]; then
 fi
 
 OUT_DIR=$(mktemp -d)
-trap "rm -rf '$OUT_DIR'" EXIT
+# test_setup's own EXIT trap (test_cleanup) reaps the guest and TEST_TMPDIR;
+# replacing it rather than chaining left a /dev/shm/axl-ctest.* per run.
+trap "test_cleanup; rm -rf '$OUT_DIR'" EXIT
 
 # axl-cc --service writes outputs to CWD with fixed names
 # (NAME.efi + NAME-dxe.efi); cd into the temp dir so they land there.
 echo "+ axl-cc --arch $_native_arch --service service_demo $SRC"
 ( cd "$OUT_DIR" && "$AXL_CC" --arch "$_native_arch" \
-    --service service_demo "$SRC" )
+    --service service_demo "$SRC" ) > "$OUT_DIR/build.log" 2>&1
+cat "$OUT_DIR/build.log"
+
+# The link is warning-free. The embedded driver blob carries a
+# .note.GNU-stack and the toolchain's objects (newlib's memset) none, and ld
+# warned about the mix on every --embed link until axl-cc passed
+# -z noexecstack.
+ld_warnings=$(grep -cE -- '-ld: warning: ' "$OUT_DIR/build.log" || true)
+if [[ "$ld_warnings" != 0 ]]; then
+    echo "FAIL: the axl-cc link printed $ld_warnings ld warning(s)"
+    exit 1
+fi
 
 DEMO_EFI="$OUT_DIR/service_demo.efi"
 DXE_EFI="$OUT_DIR/service_demo-dxe.efi"
@@ -69,18 +83,7 @@ fi
 
 test_add_efi "$DEMO_EFI"
 
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    # Out-of-range --port (range [1,65535] declared on the config
-    # descriptor) must be rejected by the SYNTHESIZED CLI at parse time,
-    # before the service starts — proving axl_service_main propagated the
-    # descriptor's min/max into the AxlArgDesc it builds.
-    echo "service_demo.efi start --port 99999"
-    echo "service_demo.efi start --detach"
-    echo "reset -s"
-} | test_set_startup
+test_use_nsh
 
 test_build_image
 

@@ -1,5 +1,8 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=38 local-only=0
+# test-meta: arch=both needs= est=38 local-only=0 builds=sd-sibling guest=none
+# guest=none: its subject includes the default search's volume-root
+#   \drivers\<arch>\ path (the hardfail scenario's multi=OK finds driver-B
+#   there); on a leased guest the run's directory is not a volume's root.
 # sd-sibling — divergence-matrix fixture for the sibling-locate hard-fail +
 # default-search sibling-first reorder
 # (docs/superpowers/specs/2026-07-04-shared-driver-sibling-locate-design.md).
@@ -56,8 +59,8 @@ done
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     sd-sibling 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"

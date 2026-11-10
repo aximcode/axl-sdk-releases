@@ -164,7 +164,7 @@ print_redfish_error(
        BMC we do not control, and a Redfish service never sends JSON5 -- so
        accepting it would be applying the sidecar dialect to untrusted input.
        Same rule and same reasoning as axl_http_request_get_json() on the
-       server side, and make check-json-dialect now enforces it here. */
+       server side, and gate.check-json-dialect now enforces it here. */
     AxlJsonReader ctx;
     if (!axl_json_parse((const char *)body, body_size,
                         AXL_JSON_STRICT, &ctx)) {

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=11 local-only=0
+# test-meta: arch=both needs= est=11 local-only=0 builds=compositor-selftest guest=gpu
 # test-compositor-qemu.sh — AxlCompositor end-to-end present test.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
@@ -50,7 +50,7 @@ run_one() {
     efi="$out/compositor-selftest.efi"
 
     echo "=== AxlCompositor end-to-end present ($arch) ==="
-    make -C "$PROJECT_DIR" ARCH="$native_arch" compositor-selftest 2>&1 | tail -2
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" compositor-selftest 2>&1 | tail -2
 
     log="$(mktemp)"
     # --gpu wires a virtual GPU so OVMF publishes a linear-FB GOP.

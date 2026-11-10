@@ -135,7 +135,7 @@ EOF
     cp "$PROJECT_DIR/scripts/axl" "$mgr/bin/axl"
     chmod +x "$mgr/bin/axl"
     # The manager deliberately gets NO manifest and NO installer: that is what
-    # make-host-tools-tarball.sh produces, and reading them from $PREFIX is the
+    # the host-tools archive (packaging/host-tools) holds, and reading them from $PREFIX is the
     # bug these cases exist to prevent.
 
     ln -sfn "$sdk" "$WORK/opt/axl-sdk"
@@ -388,7 +388,7 @@ fi
 echo
 echo "=== 9. AXL_<ARCH>_GXX overrides are honoured ==="
 # axl-toolchains.conf documents `${AXL_X64_GXX:-$AXL_X64_GXX_DEFAULT}` and
-# axl-cc, install.sh and the Makefile all resolve that way. Reading _DEFAULT
+# axl-cc, install.sh and the CMake build all resolve that way. Reading _DEFAULT
 # alone reported MISSING for anyone who installed to a user prefix and
 # exported what install-toolchain.sh's own print_env told them to.
 setup

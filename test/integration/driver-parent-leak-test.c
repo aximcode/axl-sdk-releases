@@ -137,7 +137,18 @@ main(int argc, char **argv)
      *    path, then returns; the firmware unloads it, leaving the driver's
      *    parent handle dead and the launcher's side table gone. */
     AxlDriverHandle launcher = NULL;
-    if (axl_driver_load("fs0:\\stdio-bridge-fix.efi", &launcher) != AXL_OK
+    /* By ABSOLUTE path, as the device path this test examines depends on
+       how the image was named: beside this image, in the Shell's current
+       directory -- the fs0: root booted, a pooled guest's lease directory. */
+    char launcher_path[512];
+    {
+        AXL_AUTO_FREE char *cwd = axl_get_current_dir();
+        size_t n = cwd != NULL ? axl_strlen(cwd) : 0;
+        axl_snprintf(launcher_path, sizeof(launcher_path), "%s%sstdio-bridge-fix.efi",
+                     cwd != NULL ? cwd : "fs0:\\",
+                     (n > 0 && cwd[n - 1] == '\\') || cwd == NULL ? "" : "\\");
+    }
+    if (axl_driver_load(launcher_path, &launcher) != AXL_OK
         || launcher == NULL) {
         check(false, "load launcher stdio-bridge-fix.efi");
         goto done;

@@ -32,6 +32,7 @@ Usage: check-reloc-coverage.py <image.efi> [...]
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -44,6 +45,13 @@ SEC_RE = re.compile(
 
 
 def objdump_for(path: Path) -> str:
+    # CROSS (the build's own binutils prefix; the CTest gate passes the
+    # tree's) is the objdump of the toolchain that produced the image. The
+    # fallback below needs aarch64-linux-gnu-objdump for an aa64 image,
+    # which CI's containers no longer install.
+    cross = os.environ.get("CROSS")
+    if cross:
+        return cross + "objdump"
     try:
         subprocess.run(["objdump", "-f", str(path)],
                        check=True, capture_output=True)
@@ -52,19 +60,27 @@ def objdump_for(path: Path) -> str:
         return "aarch64-linux-gnu-objdump"
 
 
-def run(tool: str, args: list[str], path: Path) -> str | None:
+class ToolError(RuntimeError):
+    """objdump could not run, or failed: NOT "the image has no table"."""
+
+
+def run(tool: str, args: list[str], path: Path) -> str:
+    """objdump's output; ToolError when it cannot answer at all. A missing
+    or failing tool once read as "no RELA table" -- a static image, clean --
+    so a gate whose objdump was absent graded nothing and passed."""
     try:
         return subprocess.run([tool, *args, str(path)],
                               check=True, capture_output=True, text=True).stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
+    except FileNotFoundError as exc:
+        raise ToolError(f"{tool} not found") from exc
+    except subprocess.CalledProcessError as exc:
+        raise ToolError(f"{tool} {' '.join(args)} {path} exited {exc.returncode}: "
+                        f"{(exc.stderr or '').strip()[:200]}") from exc
 
 
 def sections(tool: str, path: Path) -> list[tuple[str, int, int]]:
     """[(name, vma, size)] for @a path."""
     out = run(tool, ["-h"], path)
-    if out is None:
-        return []
     found: list[tuple[str, int, int]] = []
     for line in out.splitlines():
         m = SEC_RE.match(line)
@@ -76,8 +92,6 @@ def sections(tool: str, path: Path) -> list[tuple[str, int, int]]:
 def dynamic_rela(tool: str, path: Path) -> tuple[int, int] | None:
     """(DT_RELA, DT_RELASZ), or None if the image has no RELA table."""
     out = run(tool, ["-x"], path)
-    if out is None:
-        return None
     vals: dict[str, int] = {}
     for line in out.splitlines():
         m = DYN_RE.match(line)
@@ -88,7 +102,7 @@ def dynamic_rela(tool: str, path: Path) -> tuple[int, int] | None:
     return (vals["RELA"], vals["RELASZ"])
 
 
-def check(efi: Path) -> list[str]:
+def check(efi: Path, graded: list[Path]) -> list[str]:
     so = efi.with_suffix(".so")
     if not efi.exists():
         return [f"{efi}: not found (build it first)"]
@@ -100,6 +114,7 @@ def check(efi: Path) -> list[str]:
     if rela is None:
         # A fully-static image with nothing to relocate is legitimate.
         return []
+    graded.append(efi)
     addr, size = rela
 
     # Invariant 1: one section, starting exactly at DT_RELA, covering it all.
@@ -119,10 +134,16 @@ def check(efi: Path) -> list[str]:
 
     # Invariant 2: objcopy carried it into the PE image.
     name = holder[0]
-    for pe_name, pe_vma, pe_sz in sections(objdump_for(efi), efi):
-        if pe_vma == addr and pe_sz >= size:
-            return []
-        if pe_name == name:
+    # The VMA match over EVERY section first: a name match listed earlier
+    # must not report a failure that a later section would have cleared.
+    pe_sections = sections(objdump_for(efi), efi)
+    if any(pe_vma == addr and pe_sz >= size for _, pe_vma, pe_sz in pe_sections):
+        return []
+    for pe_name, pe_vma, pe_sz in pe_sections:
+        # An image's section names are eight bytes (PE/COFF 3.4, and
+        # pe-set-debug cuts objcopy's longer ones): aa64's `.rela.dyn` is
+        # `.rela.dy` in the .efi.
+        if pe_name == name[:8]:
             return [f"{efi.name}: {name} is present but {pe_sz:#x} bytes at "
                     f"{pe_vma:#x}, not {size:#x} at {addr:#x}"]
     return [f"{efi.name}: section {name} (the DT_RELA table) did not survive "
@@ -136,8 +157,16 @@ def main(argv: list[str]) -> int:
         return 2
 
     problems: list[str] = []
-    for image in images:
-        problems.extend(check(image))
+    graded: list[Path] = []
+    try:
+        for image in images:
+            problems.extend(check(image, graded))
+    except ToolError as exc:
+        print(f"check-reloc-coverage: CANNOT RUN — {exc}")
+        print("  objdump must READ the images; an answer it could not give is "
+              "not \"no relocation table\". Set CROSS to the build's binutils "
+              "prefix.")
+        return 1
 
     if problems:
         print("check-reloc-coverage: FAIL — the relocation table the crt0 walks "
@@ -146,8 +175,14 @@ def main(argv: list[str]) -> int:
             print(f"  {p}")
         return 1
 
+    if not graded:
+        # A CONTROL: at least one image must HAVE a table, or nothing was
+        # graded (cpu-topology-selftest has one on both arches).
+        print("check-reloc-coverage: FAIL — no image named has a DT_RELA "
+              "table, so nothing was graded; name one that relocates")
+        return 1
     print(f"check-reloc-coverage: clean — DT_RELA table intact and carried in "
-          f"{len(images)} image(s)")
+          f"{len(images)} image(s), {len(graded)} with a table")
     return 0
 
 

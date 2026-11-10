@@ -20,7 +20,12 @@ Two tiers:
   build. ``axl_pk_available()`` / ``axl_tls_available()`` remain public
   API but are guaranteed true and report nothing worth branching on.
   The predicate that can still answer no is ``axl_pk_alg_available()``,
-  which reports whether this *image* linked a given algorithm.
+  which reports whether this *image* linked a given algorithm: every
+  ``AxlPkKey`` algorithm is opt-in, by calling
+  :c:func:`axl_pk_enable_mbedtls` (ECDSA, RSA) or
+  :c:func:`axl_pk_enable_ed25519` -- calling it is what links the
+  provider, as calling ``axl_tls_init()`` links TLS. AxlJose and AxlSsh
+  make the call themselves.
   ``--gc-sections`` drops the **TLS stack** — the handshake,
   X.509 and the cipher suites — from an image that never calls
   ``axl_tls_init()``; it does not drop the SHA-512 adapter above, which

@@ -149,10 +149,13 @@ typedef struct {
     void   *ctx;
 } NotifyTimerCtx;
 
-/* Shared by axl_loop_attach_driver's dispatch timers AND by every live
-   AxlTaskPool's before-ExitBootServices hook. Exhaustion is not just a
-   lost timer: a pool that cannot register its hook silently loses its
-   boot-hang protection on exactly the platforms that need it. */
+/* Shared by axl_loop_attach_driver -- THREE slots per attached loop, its
+   dispatch timer and its two idle-loop members -- by every live AxlTaskPool's
+   before-ExitBootServices hook, and by protocol notifies. Exhaustion is
+   not just a lost timer: a pool that cannot register its hook silently
+   loses its boot-hang protection on exactly the platforms that need it,
+   and a loop whose idle members cannot register keeps the busy-foreground
+   budget (the timer is created first). */
 #define NOTIFY_TIMER_TABLE_SIZE  64
 
 /* Tracks every notify-bridged event, not only timers: the event-group
@@ -168,6 +171,40 @@ typedef struct {
 
 static NotifyTimerEntry mNotifyTimerTable[NOTIFY_TIMER_TABLE_SIZE];
 
+/* One active AXL notify callback: its unwind point (a __builtin_setjmp
+   buffer -- the compiler's own non-local jump, which needs no C library, and
+   makes the function that sets it save every callee-saved register, the
+   ms_abi set of this EFIAPI trampoline included), its nesting depth, and the
+   TPL the firmware called it at. */
+typedef struct NotifyFrame {
+    void               *jb[5];
+    unsigned            depth;
+    uint64_t            tpl;
+    unsigned            saved_state;
+    struct NotifyFrame *outer;
+} NotifyFrame;
+
+static NotifyFrame *volatile mNotifyTop;
+static unsigned               mNotifyDepth;
+
+/* One counter a higher layer asks to have put back when a callback is
+   abandoned (AxlLoop's callback depth): the trampoline saves it on entry and
+   restores it on the unwind, so the abandoned callback does not leave it
+   raised. */
+static unsigned *mUnwindState;
+
+void
+axl_backend_notify_track_state(
+    unsigned *state
+    )
+{
+    mUnwindState = state;
+}
+
+/* The one place every AXL notify callback is entered from -- and so the one
+   place a deferred exit can unwind to (axl_backend_notify_unwind): the
+   callback's frames are abandoned and the trampoline returns to the firmware
+   as if the callback had. */
 static VOID EFIAPI
 notify_timer_trampoline(
     EFI_EVENT  event,
@@ -176,14 +213,58 @@ notify_timer_trampoline(
 {
     (void)event;
     NotifyTimerCtx *nc = (NotifyTimerCtx *)ctx_v;
-    if (nc != NULL && nc->notify != NULL) {
+    NotifyFrame     frame;
+
+    if (nc == NULL || nc->notify == NULL) {
+        return;
+    }
+    frame.outer       = mNotifyTop;
+    frame.depth       = ++mNotifyDepth;
+    frame.tpl         = (uint64_t)axl_backend_tpl_current();
+    frame.saved_state = (mUnwindState != NULL) ? *mUnwindState : 0;
+    if (__builtin_setjmp(frame.jb) == 0) {
+        mNotifyTop = &frame;
         nc->notify(nc->ctx);
+    } else if (mUnwindState != NULL) {
+        *mUnwindState = frame.saved_state;
+    }
+    mNotifyTop = frame.outer;
+    mNotifyDepth--;
+}
+
+unsigned
+axl_backend_notify_depth(void)
+{
+    return mNotifyDepth;
+}
+
+bool
+axl_backend_notify_unwind_ok(
+    unsigned newer_than
+    )
+{
+    /* Only to a callback entered AFTER @p newer_than (the depth when the
+       innermost child started): one that was already running when the child
+       started is under the child's frames -- jumping to it would cross
+       them -- and only at the TPL it was called at: a raw firmware notify
+       nested at a higher TPL, which this trampoline did not enter, would be
+       crossed too. */
+    return mNotifyTop != NULL
+        && mNotifyTop->depth > newer_than
+        && (uint64_t)axl_backend_tpl_current() == mNotifyTop->tpl;
+}
+
+void
+axl_backend_notify_unwind(void)
+{
+    if (mNotifyTop != NULL) {
+        __builtin_longjmp(mNotifyTop->jb, 1);
     }
 }
 
 /* Reserve a tracking slot and build the bridging context.
 
-   Split out because the two creators below differ only in which
+   Split out because the creators below differ only in which
    CreateEvent flavour they call: everything around it -- reserving the
    slot, bridging the firmware's (EFI_EVENT, void *) notify signature to
    AXL's (void *ctx) shape, publishing into the table, and recording the
@@ -304,18 +385,21 @@ axl_backend_event_create_notify_timer(
     return AXL_OK;
 }
 
-int
-axl_backend_event_create_before_exit_boot(
-    void (*notify)(void *ctx),
-    void  *ctx,
-    AxlEventHandle *event
+/* Join event group @p group with a notify at @p tpl: what the group
+   creators below share. Each says why its TPL is right for it. */
+static int
+group_notify_create(
+    const EFI_GUID  *group,
+    EFI_TPL          tpl,
+    void           (*notify)(void *ctx),
+    void            *ctx,
+    AxlEventHandle  *event
     )
 {
     EFI_STATUS       status;
     EFI_EVENT        ev = NULL;
     NotifyTimerCtx  *nc;
     size_t           slot;
-    EFI_GUID         group = gEfiEventBeforeExitBootServicesGuid;
 
     if (notify == NULL || event == NULL) {
         return AXL_ERR;
@@ -326,15 +410,8 @@ axl_backend_event_create_before_exit_boot(
         return AXL_ERR;
     }
 
-    /* TPL_CALLBACK, not TPL_NOTIFY. There is nothing to outrank: the
-       firmware's own ExitBootServices-group handlers are signalled after
-       this whole group regardless of TPL, which is the entire reason for
-       using the before-EBS group. Raising to TPL_NOTIFY would buy nothing
-       and cost I/O legality -- a handler that logs reaches the FAT driver,
-       whose lock asserts TPL <= TPL_CALLBACK, so the handler written to
-       prevent a hang at handoff could hang there itself. */
-    status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
-                                notify_timer_trampoline, nc, &group, &ev);
+    status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, tpl,
+                                notify_timer_trampoline, nc, group, &ev);
     if (EFI_ERROR(status)) {
         notify_bridge_abort(nc);
         return AXL_ERR;
@@ -342,6 +419,54 @@ axl_backend_event_create_before_exit_boot(
 
     notify_bridge_publish(slot, ev, nc, false, event);
     return AXL_OK;
+}
+
+int
+axl_backend_event_create_before_exit_boot(
+    void (*notify)(void *ctx),
+    void  *ctx,
+    AxlEventHandle *event
+    )
+{
+    /* TPL_CALLBACK, not TPL_NOTIFY. There is nothing to outrank: the
+       firmware's own ExitBootServices-group handlers are signalled after
+       this whole group regardless of TPL, which is the entire reason for
+       using the before-EBS group. Raising to TPL_NOTIFY would buy nothing
+       and cost I/O legality -- a handler that logs reaches the FAT driver,
+       whose lock asserts TPL <= TPL_CALLBACK, so the handler written to
+       prevent a hang at handoff could hang there itself. */
+    return group_notify_create(&gEfiEventBeforeExitBootServicesGuid, TPL_CALLBACK,
+                               notify, ctx, event);
+}
+
+int
+axl_backend_event_create_idle_notify(
+    void (*notify)(void *ctx),
+    void  *ctx,
+    bool   before_halt,
+    AxlEventHandle *event
+    )
+{
+    /* Where the notify runs relative to the CPU halt. The group is
+       signalled from CoreWaitForEvent at TPL_APPLICATION (MdeModulePkg
+       Core/Dxe/Event/Event.c, CoreWaitForEvent's idle signal). EDK2's
+       CpuDxe joins it at TPL_NOTIFY and halts the CPU there, on both
+       arches (UefiCpuPkg/CpuDxe/CpuDxe.c and ArmPkg/Drivers/CpuDxe/CpuDxe.c,
+       CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY, IdleLoopEventCallback,
+       ..., &gIdleLoopEventGuid)). Higher TPLs run first, so a TPL_CALLBACK
+       member runs AFTER the halt -- ahead of any TPL_CALLBACK timer notify
+       the waking interrupt queued, because it was queued at signal time.
+       Members of one TPL run in signal order, and the core signals a group
+       newest-first (CoreCreateEventInternal: InsertHeadList on
+       gEventSignalQueue; CoreNotifyEvent: InsertTailList on the TPL's
+       queue), so a TPL_NOTIFY member created after CpuDxe's -- any driver's
+       -- runs BEFORE the halt, at the idle pass itself. A firmware that
+       orders them otherwise runs it after the halt; callers must treat
+       that as possible. A TPL_NOTIFY notify may do no more than read
+       axl_backend_counter_ticks() and store. */
+    return group_notify_create(&gIdleLoopEventGuid,
+                               before_halt ? TPL_NOTIFY : TPL_CALLBACK,
+                               notify, ctx, event);
 }
 
 int

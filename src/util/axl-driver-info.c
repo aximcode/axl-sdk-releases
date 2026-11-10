@@ -457,11 +457,16 @@ axl_driver_bind(AxlHandle controller, AxlHandle driver)
        bind this driver to this controller, not the whole subtree (follow with
        axl_net_connect_stack to bring an upper network stack up). */
     EFI_HANDLE list[2] = { (EFI_HANDLE)driver, NULL };
+    /* Counted as a child: a connect can start images (option ROMs, bound
+       drivers' Start) -- see axl_backend_start_image. */
+    axl_backend_child_image_enter();
     EFI_STATUS st = axl_bs()->ConnectController(
         (EFI_HANDLE)controller,
         (driver != NULL) ? list : NULL,
         NULL,
         FALSE);
+    axl_backend_child_image_leave();
+    axl_backend_exit_if_deferred();
 
     /* ConnectController returns EFI_NOT_FOUND both when nothing NEW connected
        (the controller was already bound) and when no driver would bind — the

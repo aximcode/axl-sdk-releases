@@ -19,9 +19,62 @@
  * axl_driver_load_sibling()'s primary path is shell-independent: it builds the
  * sibling's device path from this image's own LoadedImage->DeviceHandle, so it
  * needs no EFI_SHELL_PROTOCOL and no fsN: mapping.
+ *
+ * An optional axl-shell.opt beside it (one line, ASCII) is appended to
+ * "-delay 0": the harness writes AXL_SHELL_OPTIONS there (stage_boot_shell,
+ * scripts/axl-common.sh), which is how a guest boots its Shell `-nonest` --
+ * the mode in which EFI_SHELL_PROTOCOL.Execute reports whether a command ran
+ * (docs/AXL-Test-Guest-Pool-Design.md §2.4).
  */
 
 #include <axl.h>
+
+#define LAUNCHER_OPT_FILE "axl-shell.opt"
+#define LAUNCHER_OPT_MAX  200
+
+/* The Shell's command line: "-delay 0", then axl-shell.opt's line if present.
+   An unreadable or oversized file is reported and left out; the Shell still
+   boots, and the caller that asked for the option sees it missing. */
+static void
+shell_options(
+    char   *out,
+    size_t  out_size
+    )
+{
+    axl_snprintf(out, out_size, "-delay 0");
+    char       path[256];
+    AxlFsEntry info;
+    if (axl_app_image_dir_path(LAUNCHER_OPT_FILE, path, sizeof(path)) != AXL_OK) {
+        /* Not "no options": we could not even look. Say so, or a caller
+           relying on an option sees only its absence. */
+        axl_printf("axl-shell-launcher: warning: cannot resolve %s beside me\n",
+                   LAUNCHER_OPT_FILE);
+        return;
+    }
+    if (axl_file_info(path, &info) != AXL_OK) {
+        return;   /* no options file: the usual case */
+    }
+    void   *buf = NULL;
+    size_t  len = 0;
+    if (axl_file_get_contents(path, &buf, &len) != AXL_OK) {
+        axl_printf("axl-shell-launcher: warning: cannot read %s\n", path);
+        return;
+    }
+    if (len > LAUNCHER_OPT_MAX) {
+        axl_printf("axl-shell-launcher: warning: %s is over %u bytes; ignored\n",
+                   path, (unsigned)LAUNCHER_OPT_MAX);
+        axl_free(buf);
+        return;
+    }
+    char extra[LAUNCHER_OPT_MAX + 1];
+    axl_memcpy(extra, buf, len);
+    extra[len] = '\0';
+    axl_free(buf);
+    axl_strstrip(extra);
+    if (extra[0] != '\0') {
+        axl_snprintf(out, out_size, "-delay 0 %s", extra);
+    }
+}
 
 int
 main(int argc, char **argv)
@@ -38,13 +91,21 @@ main(int argc, char **argv)
     /* The root Shell reads LoadedImage->LoadOptions as its argv; "-delay 0"
        sets Delay=0 and skips the startup countdown. UCS-2, NUL-terminated —
        the UEFI command-line convention. */
-    static const unsigned short delay0[] = {
-        '-', 'd', 'e', 'l', 'a', 'y', ' ', '0', 0
-    };
-    if (axl_driver_set_load_options(sh, delay0, sizeof(delay0)) != AXL_OK) {
-        /* Non-fatal: the Shell still boots, just with the 5 s countdown. */
-        axl_printf("axl-shell-launcher: warning: could not set -delay 0\n");
+    char opts[LAUNCHER_OPT_MAX + 16];
+    shell_options(opts, sizeof(opts));
+    unsigned short *wopts = axl_utf8_to_ucs2(opts);
+    /* Sized from the UCS-2 string itself: a UTF-8 byte count over-reads it
+       for anything non-ASCII (the conversion emits fewer code units). */
+    size_t units = 0;
+    while (wopts != NULL && wopts[units] != 0) {
+        units++;
     }
+    if (wopts == NULL ||
+        axl_driver_set_load_options(sh, wopts, (units + 1) * sizeof(*wopts)) != AXL_OK) {
+        /* Non-fatal: the Shell still boots, just with the 5 s countdown. */
+        axl_printf("axl-shell-launcher: warning: could not set \"%s\"\n", opts);
+    }
+    axl_free(wopts);
 
     /* Blocks until the Shell exits. In the harness the Shell's startup.nsh ends
        with `reset`, so control never returns here; but on an interactive exit it

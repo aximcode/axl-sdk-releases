@@ -89,20 +89,21 @@ O_WRONLY = 0x1
 O_RDWR = 0x2
 O_TRUNC = 0x200
 
-# Tsetattr `valid` bits (9P2000.L). Only SIZE is acted on by this server.
+# Tsetattr `valid` bits (9P2000.L). This server acts on SIZE and MTIME.
 SETATTR_MODE = 0x1
 SETATTR_UID = 0x2
 SETATTR_GID = 0x4
 SETATTR_SIZE = 0x8
 SETATTR_ATIME = 0x10
 SETATTR_MTIME = 0x20
+SETATTR_MTIME_SET = 0x100
 
 # Server-side ceilings the wire can reach, mirrored from
 # src/9p/axl-9p-server-internal.h. A drift here shows up as a failed
 # boundary assertion, which is the point of pinning them.
 MAX_GROW = 16 * 1024 * 1024          # AXL_9P_SERVER_MAX_GROW
 SERVER_MAX_MSIZE = 128 * 1024        # AXL_9P_SERVER_MAX_MSIZE
-MIN_MSIZE = 512                      # AXL_9P_MIN_MSIZE
+MIN_MSIZE = 1024                     # AXL_9P_MIN_MSIZE
 U64_MAX = 0xFFFFFFFFFFFFFFFF
 U32_MAX = 0xFFFFFFFF
 
@@ -130,6 +131,11 @@ EINVAL = 22
 EFBIG = 27
 EROFS = 30
 ENOTEMPTY = 39
+
+# Times the server clamps a Tsetattr mtime to (src/fs/axl-fs.h): the first
+# second every volume keeps, and FAT's last (stored as its even :58).
+MTIME_KEPT_MIN = 347155200
+MTIME_MAX_STORED = 4354819198
 EPROTO = 71
 
 # The tree 9p-server-selftest.c seeds before it listens.
@@ -181,6 +187,7 @@ class Attr:
     blksize: int
     blocks: int
     body_len: int
+    mtime_sec: int
 
 
 # --- wire primitives -------------------------------------------------------
@@ -431,8 +438,10 @@ class P9Client:
         off += 12
         nlink, rdev, size, blksize, blocks = struct.unpack_from("<QQQQQ",
                                                                 body, off)
+        off += 40
+        _asec, _ansec, mtime_sec = struct.unpack_from("<QQQ", body, off)
         return Attr(valid, qid, mode, uid, gid, nlink, rdev, size, blksize,
-                    blocks, len(body))
+                    blocks, len(body), mtime_sec)
 
     # -- open / read / write ------------------------------------------------
 
@@ -487,9 +496,9 @@ class P9Client:
         return sent
 
     def setattr(self, fid: int, valid: int, size: int = 0, mode: int = 0,
-                uid: int = 0, gid: int = 0) -> None:
+                uid: int = 0, gid: int = 0, mtime: int = 0) -> None:
         body = (struct.pack("<IIIII", fid, valid, mode, uid, gid)
-                + struct.pack("<QQQQQ", size, 0, 0, 0, 0))
+                + struct.pack("<QQQQQ", size, 0, 0, mtime, 0))
         self.rpc(TSETATTR, body, RSETATTR)
 
     def treaddir(self, fid: int, offset: int, count: int) -> list[DirEntry]:
@@ -920,13 +929,13 @@ def adv_framing(ck: Checks, host: str, port: int) -> None:
              f"got msize={got} version={ver!r}")
     got, ver = client.version(msize=MIN_MSIZE - 1)
     ck.check(got == MIN_MSIZE - 1 and ver == "unknown",
-             "CASE03 Tversion msize=511 = Rversion 511/unknown",
+             f"CASE03 Tversion msize={MIN_MSIZE - 1} = Rversion {MIN_MSIZE - 1}/unknown",
              f"got msize={got} version={ver!r}")
 
     # ...and the session is left UNNEGOTIATED, i.e. still at the 8192 the
     # connection was accepted with. Proven from the wire rather than from the
     # client's own bookkeeping: a frame of exactly 8192 bytes is accepted. Had
-    # the server adopted the refused 511, this frame would exceed the
+    # the server adopted the refused 1023, this frame would exceed the
     # negotiated msize and the connection would be reaped instead. The
     # trailing padding is never read -- the reader stops after fid+mask.
     root, _ = client.attach()
@@ -1631,39 +1640,150 @@ def adv_rename(ck: Checks, host: str, port: int) -> None:
     ck.check(self_size == len(payload),
              "CASE34 Trename onto itself = Rrename, no-op",
              f"size={self_size}")
+    # ...onto an existing name REPLACES it, as rename(2) does.
     other = create_file(client, dirA, "three.txt", b"other")
     client.clunk(other)
-    ck.expect_error(EEXIST, "CASE34 Trename onto an existing name = EEXIST",
-                    lambda: client.rename(fid, dirA, "three.txt"))
+    client.rename(fid, dirA, "three.txt")
+    replaced = client.walk_to(dirA, ["three.txt"])
+    client.lopen(replaced, O_RDONLY)
+    now_there = client.read_all(replaced, limit=4096)
+    client.clunk(replaced)
+    ck.check(now_there == payload and not exists(client, dirA, ["two.txt"]),
+             "CASE34 Trename onto an existing name replaces it = ok",
+             f"got {now_there!r}")
     rootclone, _ = client.walk(root, [])
     ck.expect_error(EPERM, "CASE34 Trename of the export root = EPERM",
                     lambda: client.rename(rootclone, dirA, "nope"))
     client.clunk(rootclone)
 
-    # Case 42 -- cross-directory is EXDEV, and nothing moves.
-    ck.expect_error(EXDEV, "CASE42 cross-directory Trename = EXDEV",
-                    lambda: client.rename(fid, dirB, "two.txt"))
-    ck.check(exists(client, dirA, ["two.txt"])
-             and not exists(client, dirB, ["two.txt"]),
-             "CASE42 the EXDEV rename moved nothing", "the tree changed")
+    # Case 42 -- across directories the node moves, in one step.
+    client.rename(fid, dirB, "two.txt")
+    ck.check(exists(client, dirB, ["two.txt"])
+             and not exists(client, dirA, ["three.txt"]),
+             "CASE42 cross-directory Trename moves the node = ok",
+             "the tree is wrong")
     src_size = client.getattr(fid).size
     ck.check(src_size == len(payload),
-             "CASE42 the fid still names the source after EXDEV",
+             "CASE42 the fid names the moved node",
              f"size={src_size}")
-
-    # ...and the copy+unlink fallback every rename(2) caller already has.
-    reader = client.walk_to(dirA, ["two.txt"])
-    client.lopen(reader, O_RDONLY)
-    content = client.read_all(reader, limit=4096)
-    client.clunk(reader)
-    dest = create_file(client, dirB, "two.txt", content)
-    client.clunk(dest)
-    client.remove(fid)
-    ck.check(exists(client, dirB, ["two.txt"])
-             and not exists(client, dirA, ["two.txt"]),
-             "CASE42 the client's copy+unlink fallback then works = ok",
-             "the fallback left the tree wrong")
+    mover = client.walk_to(dirB, ["two.txt"])
+    client.lopen(mover, O_RDONLY)
+    moved_body = client.read_all(mover, limit=4096)
+    client.clunk(mover)
+    ck.check(moved_body == payload,
+             "CASE42 the moved file kept its content = ok", f"got {moved_body!r}")
+    client.clunk(fid)
     still_alive(ck, client, root, "CASE42 connection alive after the renames")
+    conn.close()
+
+
+def adv_case_identity(ck: Checks, host: str, port: int) -> None:
+    """Case 47 -- qid.path names the ENTRY, not the spelling a client walked:
+    on FAT "case47.txt" and "CASE47.TXT" are one file, so both walks carry
+    one qid.path (what the mount's rename uses to tell "the file itself"
+    from "another entry"), and so does the readdir record. A case-only
+    Trename then changes the stored spelling."""
+    conn, client, root = session(host, port)
+    made = create_file(client, root, "case47.txt", b"case")
+    client.clunk(made)
+    lower = client.walk_to(root, ["case47.txt"])
+    upper = client.walk_to(root, ["CASE47.TXT"])
+    q_lower = client.getattr(lower).qid.path
+    q_upper = client.getattr(upper).qid.path
+    ck.check(q_lower == q_upper,
+             "CASE47 two spellings of one FAT entry share one qid.path",
+             f"lower={q_lower:#x} upper={q_upper:#x}")
+    lister, _ = client.walk(root, [])
+    client.lopen(lister, O_RDONLY)
+    rec = [e for e in client.treaddir(lister, 0, 8000) if e.name == "case47.txt"]
+    client.clunk(lister)
+    ck.check(len(rec) == 1 and rec[0].qid.path == q_lower,
+             "CASE47 the readdir record carries the same qid.path",
+             f"records={[(e.name, hex(e.qid.path)) for e in rec]}")
+    client.clunk(upper)
+    client.rename(lower, root, "Case47.txt")
+    lister, _ = client.walk(root, [])
+    client.lopen(lister, O_RDONLY)
+    names = [e.name for e in client.treaddir(lister, 0, 8000)]
+    client.clunk(lister)
+    ck.check("Case47.txt" in names and "case47.txt" not in names,
+             "CASE47 a case-only Trename stores the new spelling = ok",
+             f"names={names}")
+    client.clunk(lower)
+    conn.close()
+
+
+def adv_long_name(ck: Checks, host: str, port: int) -> None:
+    """A name past the 256 bytes AxlFsEntry.name once held -- 240 x U+20AC,
+    720 bytes, seeded by 9p-server-selftest under lng/ -- is listed whole
+    and walks and reads like any other."""
+    conn, client, root = session(host, port)
+    want = "€" * 240
+    lfid = client.walk_to(root, ["lng"])
+    client.lopen(lfid, O_RDONLY)
+    names = dirent_names(client.readdir_all(lfid, client.msize - RDATA_HDR_LEN))
+    client.clunk(lfid)
+    ck.check(want in names, "EXTRA a 720-byte name is listed whole",
+             f"name lengths={[len(n.encode()) for n in names]}")
+    ffid = client.walk_to(root, ["lng", want])
+    client.lopen(ffid, O_RDONLY)
+    body = client.read_all(ffid, limit=64)
+    client.clunk(ffid)
+    ck.check(body == b"fits\n", "EXTRA the 720-byte name walks and reads",
+             f"got {body!r}")
+    conn.close()
+
+
+def adv_rename_errno(ck: Checks, host: str, port: int) -> None:
+    """Case 45 -- rename(2)'s refusals, as axl_file_replace() answers them and
+    the server maps them (the newlib rename() table)."""
+    conn, client, root = session(host, port)
+    holder, _ = client.walk(root, [])
+    client.mkdir(holder, "renC")
+    dirC = client.walk_to(root, ["renC"])
+    for sub in ("full", "empty", "other"):
+        client.mkdir(dirC, sub)
+    for sub in ("full", "other"):
+        made = create_file(client, client.walk_to(dirC, [sub]), "in.txt", b"x")
+        client.clunk(made)
+    plain = create_file(client, dirC, "plain.txt", b"plain")
+    client.clunk(plain)
+
+    full = client.walk_to(dirC, ["full"])
+    ck.expect_error(ENOTEMPTY,
+                    "CASE45 a directory onto a non-empty directory = ENOTEMPTY",
+                    lambda: client.rename(full, dirC, "other"))
+    pfid = client.walk_to(dirC, ["plain.txt"])
+    ck.expect_error(EISDIR, "CASE45 a file onto a directory = EISDIR",
+                    lambda: client.rename(pfid, dirC, "empty"))
+    ck.expect_error(ENOTDIR, "CASE45 a directory onto a file = ENOTDIR",
+                    lambda: client.rename(full, dirC, "plain.txt"))
+    inside = client.walk_to(dirC, ["full"])
+    ck.expect_error(EINVAL, "CASE45 a directory into itself = EINVAL",
+                    lambda: client.rename(full, inside, "deeper"))
+    client.clunk(inside)
+    ck.check(exists(client, dirC, ["full", "in.txt"])
+             and exists(client, dirC, ["other", "in.txt"])
+             and exists(client, dirC, ["plain.txt"]),
+             "CASE45 the refused renames changed nothing", "the tree changed")
+
+    client.rename(full, dirC, "empty")
+    ck.check(exists(client, dirC, ["empty", "in.txt"])
+             and not exists(client, dirC, ["full"]),
+             "CASE45 a directory onto an EMPTY directory replaces it = ok",
+             "the tree is wrong")
+
+    client.rename(pfid, dirC, "PLAIN.TXT")
+    lister = client.walk_to(root, ["renC"])
+    client.lopen(lister, O_RDONLY)
+    names = [e.name for e in client.treaddir(lister, 0, 4096)]
+    client.clunk(lister)
+    ck.check("PLAIN.TXT" in names and "plain.txt" not in names,
+             "CASE45 a case-only rename changes the stored spelling = ok",
+             f"names={names}")
+    client.clunk(pfid)
+    client.clunk(full)
+    still_alive(ck, client, root, "CASE45 connection alive after the renames")
     conn.close()
 
 
@@ -1724,6 +1844,38 @@ def adv_setattr(ck: Checks, host: str, port: int) -> None:
              f"size={after_noop}")
     ck.expect_error(EBADF, "CASE36 Tsetattr on an unbound fid = EBADF",
                     lambda: client.setattr(5150, SETATTR_SIZE, size=0))
+
+    # Case 46 -- the modification time: MTIME_SET sets it (FAT keeps even
+    # seconds), out-of-range times are CLAMPED as Linux vfat clamps them,
+    # MTIME alone is "now", and a size change in the same message lands
+    # BEFORE the time, so the time survives it.
+    set_mt = SETATTR_MTIME | SETATTR_MTIME_SET
+    client.setattr(setter, set_mt, mtime=1767225600)
+    got = client.getattr(setter).mtime_sec
+    ck.check(got == 1767225600, "CASE46 Tsetattr MTIME_SET = the time is kept",
+             f"mtime={got}")
+    client.setattr(setter, set_mt, mtime=1767225601)
+    got = client.getattr(setter).mtime_sec
+    ck.check(got == 1767225600, "CASE46 an odd second is kept as the even one below",
+             f"mtime={got}")
+    client.setattr(setter, set_mt, mtime=0)
+    got = client.getattr(setter).mtime_sec
+    ck.check(got == MTIME_KEPT_MIN, "CASE46 a 1970 time clamps to 1981-01-01",
+             f"mtime={got}")
+    client.setattr(setter, set_mt, mtime=1 << 40)
+    got = client.getattr(setter).mtime_sec
+    ck.check(got == MTIME_MAX_STORED, "CASE46 a time past 2107 clamps to 2107",
+             f"mtime={got}")
+    client.setattr(setter, SETATTR_MTIME)
+    got = client.getattr(setter).mtime_sec
+    ck.check(abs(got - int(time.time())) < 2 * 86400,
+             "CASE46 MTIME without MTIME_SET = the server's now",
+             f"mtime={got} host={int(time.time())}")
+    client.setattr(setter, SETATTR_SIZE | set_mt, size=50, mtime=1767225600)
+    after = client.getattr(setter)
+    ck.check(after.size == 50 and after.mtime_sec == 1767225600,
+             "CASE46 SIZE and MTIME_SET together = both kept",
+             f"size={after.size} mtime={after.mtime_sec}")
     client.clunk(setter)
     still_alive(ck, client, root, "CASE36 connection alive after the setattrs")
     conn.close()
@@ -2193,6 +2345,9 @@ def run_adversarial(ck: Checks, host: str, port: int, ro_port: int) -> None:
     run_group(ck, "write", lambda: adv_write(ck, host, port))
     run_group(ck, "namespace", lambda: adv_namespace(ck, host, port))
     run_group(ck, "rename", lambda: adv_rename(ck, host, port))
+    run_group(ck, "rename-errno", lambda: adv_rename_errno(ck, host, port))
+    run_group(ck, "case-identity", lambda: adv_case_identity(ck, host, port))
+    run_group(ck, "long-name", lambda: adv_long_name(ck, host, port))
     run_group(ck, "setattr", lambda: adv_setattr(ck, host, port))
     run_group(ck, "multiconn", lambda: adv_multiconn(ck, host, port))
     run_group(ck, "rename-crossconn-rd",

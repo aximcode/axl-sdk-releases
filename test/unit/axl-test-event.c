@@ -547,6 +547,33 @@ test_cancellable_new_and_free(void)
     test_pass("cancellable: NULL ops are no-ops");
 }
 
+/* Claiming the break changes nothing until a break arrives: NULL-safe, a
+   wait on the token still times out, and the token is not cancelled by the
+   claim itself. A cancel still ends a wait at once. (A real Ctrl-C into a
+   driver's wait is test-sshd-start-qemu.sh's: the unit runner cannot type.) */
+static void
+test_cancellable_on_break(void)
+{
+    axl_cancellable_set_cancel_on_break(NULL, true);
+    test_pass("cancellable: set_cancel_on_break(NULL) is a no-op");
+
+    AxlCancellable *c = axl_cancellable_new();
+    if (c == NULL) {
+        test_fail("cancellable: on_break: new failed");
+        return;
+    }
+    axl_cancellable_set_cancel_on_break(c, true);
+    test_check(axl_wait_ms(c, 20) == AXL_OK,
+               "cancellable: on_break, no break: the wait runs its 20 ms out");
+    test_check(!axl_cancellable_is_cancelled(c),
+               "cancellable: on_break: claiming the break cancels nothing");
+    axl_cancellable_cancel(c);
+    test_check(axl_wait_ms(c, 5000) == AXL_CANCELLED,
+               "cancellable: on_break: a cancel still ends the wait");
+    axl_cancellable_set_cancel_on_break(c, false);
+    axl_cancellable_free(c);
+}
+
 static void
 test_cancellable_fresh_is_not_cancelled(void)
 {
@@ -800,6 +827,7 @@ test_event_main(
     /* AxlCancellable */
     test_cancellable_new_and_free();
     test_cancellable_fresh_is_not_cancelled();
+    test_cancellable_on_break();
     test_cancellable_cancel_sets_flag();
     test_cancellable_cancel_is_idempotent();
     test_cancellable_reset_clears_flag();

@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=x64 needs= est=7 local-only=0
+# test-meta: arch=x64 needs= est=7 local-only=0 builds=driver,driver-leak-test guest=standard
 # Driver-load LoadOptions leak regression.
 #
 # Boots driver-leak-test.efi which exercises:
@@ -33,8 +33,8 @@ declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
 # Build both binaries
-make -C "$PROJECT_DIR" \
-    ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
+"$PROJECT_DIR/scripts/axl-build.sh" \
+    ARCH="$_native_arch" \
     driver driver-leak-test 2>&1 | tail -3
 
 NATIVE_DIR="$(test_build_dir)"
@@ -44,13 +44,9 @@ test_add_efi "$NATIVE_DIR/driver-leak-test.efi"
 # Run the leak test, then shut down. driver.efi never starts (the test
 # app deliberately skips axl_driver_start so its DriverEntry doesn't
 # install protocols / allocate state that would muddy the leak check).
-{
-    echo "@echo -off"
-    echo "fs0:"
-    echo "cd \\"
-    echo "driver-leak-test.efi"
-    echo "reset -s"
-} | test_set_startup
+# The startup commands live in test-driver-leak.nsh.
+# Booted, test_use_nsh appends the reset -s that powers the guest off.
+test_use_nsh
 
 test_build_image
 

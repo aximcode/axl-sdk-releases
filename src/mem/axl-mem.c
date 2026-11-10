@@ -432,6 +432,14 @@ quarantine_drain(
     }
 }
 
+void
+_axl_mem_quarantine_drain(
+    void
+    )
+{
+    quarantine_drain();
+}
+
 #endif // AXL_MEM_DEBUG
 
 // ---------------------------------------------------------------------------

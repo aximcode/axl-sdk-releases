@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=12 local-only=0
+# test-meta: arch=both needs= est=12 local-only=0 guest=plain
 # test-lsproto-qemu.sh — lsproto names live protocols by their canonical spec
 # identifiers (EFI_*_PROTOCOL), not the Shell's short labels.
 #
@@ -49,11 +49,10 @@ run_one() {
     efi="$out/tools/lsproto.efi"
 
     echo "=== lsproto ($arch) ==="
-    # Relative target so it matches the Makefile's $(PREFIX)/tools/... rule
-    # (an absolute path is a different target and only "works" when the file
-    # already happens to exist).
-    make -C "$PROJECT_DIR" ARCH="$native_arch" \
-        ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/lsproto.efi" 2>&1 | tail -1
+    # A file target under the tree, which axl-build.sh turns into ninja's
+    # tree-relative output name.
+    "$PROJECT_DIR/scripts/axl-build.sh" ARCH="$native_arch" \
+        "$("$PROJECT_DIR/scripts/build-prefix.sh" "$native_arch")/tools/lsproto.efi" 2>&1 | tail -1
 
     nsh="$(mktemp)"
     cat > "$nsh" <<'NSH'

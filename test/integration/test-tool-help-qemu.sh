@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=both needs= est=10 local-only=0
+# test-meta: arch=both needs= est=10 local-only=0 guest=plain
 # test-tool-help-qemu.sh — every axl-sdk tool answers -h/--help uniformly.
 #
 # Companion to test-tool-version-qemu.sh. The axl_args_run framework already
@@ -38,7 +38,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TOOLS="$("$PROJECT_DIR/scripts/build-prefix.sh" --abs "$NATIVE")/tools"
 VERSION="$(cat "$PROJECT_DIR/VERSION")"
 
-make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
+"$PROJECT_DIR/scripts/axl-build.sh" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 [[ -d "$TOOLS" ]] || { echo "ERROR: $TOOLS not built"; exit 1; }
 
 # tool|tagline — the exact text after " - " in the `-h` header. Keep in sync

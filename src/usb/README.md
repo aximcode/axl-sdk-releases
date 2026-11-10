@@ -28,6 +28,37 @@ returns N entries that share `(bus, addr)` and differ only in
 dedupe on `(bus, addr)` (mirrors what Linux `lsusb` does in its
 default short form; see `tools/lsusb.c` for the reference renderer).
 
+## No controller, or nothing attached
+
+`axl_usb_next(NULL)` returns NULL both when the platform has no USB
+host controller and when it has one with nothing plugged in. To tell
+the two apart, ask for the controllers:
+
+```c
+size_t hc = 0;
+if (axl_usb_host_controller_count(&hc) != AXL_OK) {
+    /* the firmware could not be asked */
+} else if (hc == 0) {
+    /* no USB host controller */
+} else if (axl_usb_next(NULL) == NULL) {
+    /* controller(s), but no device */
+}
+```
+
+It counts `EFI_USB2_HC_PROTOCOL` handles -- every xHCI/EHCI driver in
+EDK2-derived firmware installs one -- so 0 means no such handle, not
+necessarily no USB hardware. Unlike the device enumeration, which
+`axl_usb_next` and `axl_usb_tree_for_each` build once and cache, the
+count is not cached: each call asks the firmware. `lsusb` uses it to print
+`lsusb: no USB host controller found` or `lsusb: no USB devices found`
+(exit 0) instead of empty output, and `lsusb: cannot enumerate USB host
+controllers` (exit 1) when the count itself fails, or `lsusb: cannot
+enumerate USB devices` (exit 1) when the device enumeration does
+(`axl_usb_tree_for_each` reports that; `axl_usb_next`'s NULL cannot tell
+it from "no devices"). A `-d`/`-s` filter
+that matches no device prints nothing and exits 1, as usbutils' lsusb
+does.
+
 ## Address tuple
 
 ```c

@@ -1569,16 +1569,18 @@ axl_piece_tree_save(AxlPieceTree *pt, const char *path)
         return AXL_ERR;
     }
 
-    int rc = axl_file_rename(temp, path);
-    if (rc != AXL_OK) {
-        /* FAT can't rename-over-existing: remove the target then rename. */
-        axl_file_delete(path);
-        rc = axl_file_rename(temp, path);
-    }
-    if (rc != AXL_OK) {
-        /* Both renames failed and the target may already be gone — leave
-           "<path>.tmp" in place: it holds the complete document for
-           recovery rather than deleting the only good copy. */
+    /* axl_file_replace puts the temp in the target's place without ever
+       deleting the target first (it is set aside, and put back if the
+       rename fails). The temp is litter after a failure unless the target
+       is gone although it was there -- one of the failures replace cannot
+       prevent -- and then it is the only complete document: keep it. */
+    AxlFsEntry before;
+    bool       existed = axl_file_info(path, &before) == AXL_OK;
+    if (axl_file_replace(temp, path, 0, NULL) != AXL_OK) {
+        AxlFsEntry after;
+        if (!existed || axl_file_info(path, &after) == AXL_OK) {
+            axl_file_delete(temp);
+        }
         axl_free(temp);
         return AXL_ERR;
     }
