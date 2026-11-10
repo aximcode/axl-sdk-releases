@@ -183,7 +183,10 @@ dispatches the suite after pushing the release commit; `--tag-untested`
 proceeds with a WARNING and writes a "Released untested" line into the
 release's CHANGELOG section (which `release.yml` publishes as the release
 notes) and the tag message; the cut dies if that line did not land, and a test
-runs `release.yml`'s own extraction (`scripts/changelog-section.sh`) over it.
+runs `release.yml`'s own notes builder (`scripts/release-notes.sh`, over
+`scripts/changelog-section.sh`) over it. That builder also holds the body under
+GitHub's 125,000-character cap: a longer section (5.0.0's was 228 KB) is cut
+between entries, keeping the first, with a note linking the full CHANGELOG.md.
 `--resume` goes through the same gate, but refuses `--tag-untested`: the
 release commit is already pushed, so the note could not reach the notes.
 Certify the commit instead (`--resume --ci-gate`, or `scripts/release-suite.sh`

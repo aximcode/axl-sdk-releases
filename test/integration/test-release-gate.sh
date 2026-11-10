@@ -753,10 +753,96 @@ cp "$CLF" "$TMP/CL2.md"
 printf '# Changelog\n\n## 9.9.9 — 2026-10-21\n\n- x\n' > "$TMP/CL2.md"
 release_gate_record_untested "$TMP/CL2.md" "## 1.2.3 — 2000-01-01" "$NOTE"
 check "control: a heading that is not there -> 1 (the note did not land)" "$?" "1"
-check "release.yml calls scripts/changelog-section.sh (one extraction, not two)" \
-    "$(grep -cF 'scripts/changelog-section.sh "$V"' "$PROJECT_DIR/.github/workflows/release.yml")" "1"
+check "release.yml builds the body with scripts/release-notes.sh (one builder, not two)" \
+    "$(grep -cF 'scripts/release-notes.sh "$V"' "$PROJECT_DIR/.github/workflows/release.yml")" "1"
+check "...which extracts with scripts/changelog-section.sh (one extraction, not two)" \
+    "$(grep -cF '/changelog-section.sh" "$V"' "$PROJECT_DIR/scripts/release-notes.sh")" "1"
 "$PROJECT_DIR/scripts/changelog-section.sh" 1.0.0 "$CLF" >/dev/null 2>&1
 check "control: an absent version -> the extraction fails (1)" "$?" "1"
+
+echo ""
+echo "=== the release body fits what GitHub accepts ==="
+# v5.0.0's first publish failed: its section was 228 KB, passed INLINE to the
+# publish action -- over Linux's 128 KB limit on one argument or environment
+# string ("Argument list too long"), and over GitHub's own 125,000-character
+# cap on a release body. release.yml now hands the action a FILE
+# (body_path:) that scripts/release-notes.sh builds and caps.
+NOTES="$PROJECT_DIR/scripts/release-notes.sh"
+FOOTER='📦 **Install / quick start:** see the [README on the releases repo](https://github.com/aximcode/axl-sdk-releases#install-the-sdk).
+📚 **API reference:** [axl.aximcode.com](https://axl.aximcode.com/).
+🔒 **Verify downloads:** [`SHA256SUMS`](https://github.com/aximcode/axl-sdk-releases/releases/download/v9.9.9/SHA256SUMS).
+📂 **Source archive:** [`v9.9.9.tar.gz`](https://github.com/aximcode/axl-sdk-releases/archive/refs/tags/v9.9.9.tar.gz).'
+TAIL=$'\n\n---\n\n'"$FOOTER"
+printf '# Changelog\n\n## 9.9.9 — 2026-11-10\n\n### Fixed\n\n- **a fix.**\n\n## 9.9.8\n\n- old\n' > "$TMP/small.md"
+OUT=$("$NOTES" 9.9.9 "$TMP/small.md"); rc=$?
+check "a short section: exit 0" "$rc" "0"
+check "a short section: the body is the section, a rule and the footer, exactly" \
+    "$OUT" $'### Fixed\n\n- **a fix.**'"$TAIL"
+"$NOTES" 1.0.0 "$TMP/small.md" >/dev/null 2>&1
+check "an absent version: the extraction's 1 comes through" "$?" "1"
+
+# A long section, multi-byte throughout (an e-acute is 2 bytes, 1 character):
+# the cap is counted in BYTES, which can only over-count GitHub's characters.
+{
+    printf '# Changelog\n\n## 9.9.9 — 2026-11-10\n\n### Breaking\n\n'
+    _pad=$(printf 'é%.0s' {1..100})
+    for _i in $(seq 1 1500); do
+        printf -- '- **entry %d.** %s\n  continued %d.\n\n' "$_i" "$_pad" "$_i"
+    done
+    printf '## 9.9.8\n\n- old\n'
+} > "$TMP/big.md"
+"$NOTES" 9.9.9 "$TMP/big.md" > "$TMP/big.out"; rc=$?
+check "a long section: exit 0" "$rc" "0"
+_bytes=$(wc -c < "$TMP/big.out")
+check "a long section: the body is at most 120000 bytes" \
+    "$(( _bytes <= 120000 ))" "1"
+check "...and not cut more than one entry short (over 119500 bytes)" \
+    "$(( _bytes > 119500 ))" "1"
+_k=$(grep -c '^- \*\*entry ' "$TMP/big.out")
+check "...and the kept entries are the FIRST ones, whole and in order" \
+    "$(grep '^- \*\*entry ' "$TMP/big.out" | sed 's/^- \*\*entry \([0-9]*\)\..*/\1/' | tr '\n' ' ')" \
+    "$(seq -s ' ' 1 "$_k") "
+check "...the last kept entry keeps its continuation line" \
+    "$(grep -c "^  continued ${_k}\.\$" "$TMP/big.out")" "1"
+_note="*These notes stop after ${_k} of 1500 entries: a GitHub release holds at most 125,000 characters. Every entry is in [CHANGELOG.md](https://github.com/aximcode/axl-sdk-releases/blob/v9.9.9/CHANGELOG.md).*"
+check "...it ends with the cut note and the footer, exactly" \
+    "$(tail -c "$(( ${#_note} * 4 + 2000 ))" "$TMP/big.out" | awk -v n="$_note" 'index($0, n) == 1 { f = 1 } f' | head -c 100000)" \
+    "$_note$TAIL"
+check "...nothing leaks in from the previous version" \
+    "$(grep -cx -- '- old' "$TMP/big.out")" "0"
+
+# The boundary, byte-exact: a body of exactly 120000 bytes is published whole;
+# one byte more is cut. The overhead is measured, not restated.
+_one() {   # $1 = pad length -> a one-entry section
+    printf '# Changelog\n\n## 9.9.9 — 2026-11-10\n\n### Fixed\n\n- **x.** %s\n' \
+        "$(head -c "$1" /dev/zero | tr '\0' 'a')" > "$TMP/one.md"
+    "$NOTES" 9.9.9 "$TMP/one.md" > "$TMP/one.out"
+}
+_one 0; _over=$(wc -c < "$TMP/one.out")
+_one $(( 120000 - _over ))
+check "exactly 120000 bytes: published whole" \
+    "$(wc -c < "$TMP/one.out") $(grep -c 'These notes stop' "$TMP/one.out")" "120000 0"
+_one $(( 120001 - _over ))
+check "120001 bytes: cut, and says so" \
+    "$(grep -c 'These notes stop after 0 of 1 entries' "$TMP/one.out")" "1"
+check "...still within the cap" "$(( $(wc -c < "$TMP/one.out") <= 120000 ))" "1"
+
+# A line inside a code fence is not an entry boundary, even when it starts
+# `- ` or `#` at column 0: a cut there leaves the fence open, and the note and
+# footer render as code. Fixture: one entry holding a long fenced listing of
+# `- ` lines that straddles the cap, then a few more entries.
+{
+    printf '# Changelog\n\n## 9.9.9 — 2026-11-10\n\n### Fixed\n\n- **fenced.**\n\n```\n'
+    for _i in $(seq 1 2000); do printf -- '- listing line %d %s\n' "$_i" "$(printf 'x%.0s' {1..60})"; done
+    printf '# a shell comment\n```\n\n- **after one.**\n\n- **after two.**\n'
+} > "$TMP/fence.md"
+"$NOTES" 9.9.9 "$TMP/fence.md" > "$TMP/fence.out"; rc=$?
+check "a fenced listing past the cap: exit 0" "$rc" "0"
+check "...no fence is left open (an even count of fence lines)" \
+    "$(( $(grep -c '^```' "$TMP/fence.out") % 2 ))" "0"
+check "...the cut falls before the fenced entry: nothing kept, says so" \
+    "$(grep -c '^\*These notes stop after 0 of 3 entries: ' "$TMP/fence.out")" "1"
+check "...within the cap" "$(( $(wc -c < "$TMP/fence.out") <= 120000 ))" "1"
 
 echo ""
 echo "=== cut-release's header describes the current flow ==="

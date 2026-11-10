@@ -2058,7 +2058,8 @@ implemented:
   `--tag-untested` is the explicit, loud override and is written into the
   release's CHANGELOG section (the published notes) and the tag message; the
   cut dies if the line did not land, and the extraction `release.yml`
-  publishes with is now `scripts/changelog-section.sh`, which a fixture test
+  publishes with is now `scripts/changelog-section.sh` (since 5.0.0 called
+  through `scripts/release-notes.sh`, which caps the body), which a fixture test
   runs over the inserted note. `--resume --tag-untested` is refused: the
   release commit is already pushed, so the note could not reach the notes.
 - **R-C — the `[release-cut]` push could cancel its parent's cheap run.**
